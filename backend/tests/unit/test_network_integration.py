@@ -53,12 +53,16 @@ import pytest
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.network_integration.constants import (
     MAX_SESSION_DURATION_SECONDS,
+    PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
+    PORTAL_REDIRECT_STALE_AFTER_SECONDS,
     AuthorizationStatus,
     ControllerAuthMode,
+    ControllerTlsMode,
     ErrorCode,
     IntegrationEventStatus,
     IntegrationEventType,
     IntegrationStatus,
+    NetworkIntegrationAuditAction,
     NetworkProviderKind,
     PortalReadinessGap,
     SyncStatus,
@@ -73,14 +77,21 @@ from app.domains.network_integration.exceptions import (
     CrossOrganizationNetworkIntegrationAccessError,
     GuestSessionNotActiveError,
     NetworkIntegrationDeauthorizationUnsupportedError,
+    NetworkIntegrationDisabledError,
     NetworkIntegrationFleetDeviceUnavailableError,
     NetworkIntegrationInventoryRequiresOpenApiError,
     NetworkIntegrationNotFoundError,
     NetworkIntegrationOrganizationRequiredError,
+    NetworkIntegrationSiteNotSelectedError,
+    NetworkIntegrationTlsPinRequiredError,
     NetworkIntegrationUrlRejectedError,
     ProviderAuthFailedError,
+    ProviderConnectionFailedError,
+    ProviderError,
     ProviderSessionExpiredError,
     ProviderTimeoutError,
+    ProviderTlsPinMismatchError,
+    ProviderTlsUntrustedError,
     ProviderUnsupportedApiError,
 )
 from app.domains.network_integration.models import (
@@ -92,24 +103,31 @@ from app.domains.network_integration.providers.base import (
     NetworkProvider,
     ProviderAuthorizationResult,
     ProviderClient,
+    ProviderConnectionConfig,
     ProviderControllerInfo,
     ProviderDevice,
     ProviderSite,
     ProviderSsid,
+    ProviderTlsObservation,
 )
 from app.domains.network_integration.router import _integration_response, portal_router
 from app.domains.network_integration.router import router as integration_router
 from app.domains.network_integration.service import (
     NetworkIntegrationService,
+    build_portal_authorize_diagnostics,
     redact_context,
     run_network_integration_sync_sweep,
 )
 from app.domains.network_integration.validators import (
     assert_address_is_public,
     build_external_portal_url,
+    describe_mac_wire_format,
+    describe_redirect_shape,
     normalize_client_mac,
     parse_controller_url,
     portal_readiness_gaps,
+    portal_redirect_timestamp_age_seconds,
+    summarize_redirect_url,
     synthesize_fleet_identity,
     validate_auth_mode_credentials,
     validate_controller_url,
@@ -123,6 +141,10 @@ from app.domains.router.vendor_capabilities import (
 # Shared helpers
 # ============================================================================
 
+#: A syntactically valid SHA-256, used wherever a test needs a pin. Not a
+#: real controller certificate: nothing here hashes anything, and a real one
+#: would rot the day that box is rebuilt.
+_PIN = "3504028b297fc3680517ecbea832d2e290fd29f478ffac40684e589615aa61ce"
 CONTROLLER_URL = "https://controller.example.com:8043"
 
 
@@ -203,6 +225,12 @@ def _integration(
         "is_enabled": True,
         "base_url": CONTROLLER_URL,
         "auth_mode": auth_mode,
+        # Mirrors the column default. A detached ORM object gets no
+        # server default, so without this every row built here would have
+        # tls_mode=None -- which is not a state the database can hold.
+        "tls_mode": ControllerTlsMode.STRICT.value,
+        "tls_pinned_sha256": None,
+        "tls_trust_decided_at": None,
         "controller_id": "abc123",
         "controller_version": "5.14.20",
         "external_site_id": "site-1",
@@ -439,6 +467,18 @@ class FakeProvider:
     calls: list[str] = field(default_factory=list)
     authorize_result: ProviderAuthorizationResult | None = None
     clients: list[ProviderClient] = field(default_factory=list)
+    # What `inspect_tls` reports. `None` models a provider that could not
+    # look at the certificate at all, which the service must render as
+    # absence rather than as a verdict.
+    tls_observation: ProviderTlsObservation | None = field(
+        default_factory=lambda: ProviderTlsObservation(
+            fingerprint_sha256="a" * 64,
+            chain_trusted=False,
+            matches_pin=None,
+            subject="CN=localhost",
+            issuer="CN=localhost",
+        )
+    )
 
     def _maybe_raise(self, method: str) -> None:
         self.calls.append(method)
@@ -460,6 +500,12 @@ class FakeProvider:
         return ProviderControllerInfo(
             controller_id="abc123", controller_version="5.14.20"
         )
+
+    async def inspect_tls(self, config) -> ProviderTlsObservation:
+        self._maybe_raise("inspect_tls")
+        if self.tls_observation is None:
+            raise ProviderConnectionFailedError()
+        return self.tls_observation
 
     async def list_sites(self, config) -> list[ProviderSite]:
         self._maybe_raise("list_sites")
@@ -555,6 +601,29 @@ class FakeGuestSessionLookup:
 
 
 @dataclass
+class FakeGuestSessionTerminator:
+    """``GuestService.disconnect_session``, and nothing else.
+
+    Records the keyword arguments rather than a bare call count, because
+    the interesting assertions are *what* was passed: the actor (so the
+    guest domain audits it as admin-initiated) and the requesting
+    organization (so the guest domain applies its own tenant scoping
+    instead of trusting ours).
+    """
+
+    calls: list[dict] = field(default_factory=list)
+    #: Set to model a session that is already over -- the guest domain's
+    #: status graph has no same-status no-op, by design.
+    raises: Exception | None = None
+
+    async def disconnect_session(self, **fields: object) -> object:
+        self.calls.append(dict(fields))
+        if self.raises is not None:
+            raise self.raises
+        return object()
+
+
+@dataclass
 class FakeRouter:
     """The shape `RouterService.create_router` returns, and nothing more."""
 
@@ -634,6 +703,7 @@ def _service(
     audit: FakeAuditWriter | None = None,
     guest_lookup: FakeGuestSessionLookup | None = None,
     fleet_provisioner: FakeFleetDeviceProvisioner | None = None,
+    guest_terminator: FakeGuestSessionTerminator | None = None,
     caller_location_scope=None,
 ) -> NetworkIntegrationService:
     fake_provider = provider or FakeProvider()
@@ -641,6 +711,7 @@ def _service(
         repository or FakeRepository(),
         audit_writer=audit or FakeAuditWriter(),
         guest_session_lookup=guest_lookup,
+        guest_session_terminator=guest_terminator,
         fleet_device_provisioner=fleet_provisioner,
         provider_resolver=lambda _kind: fake_provider,
         # Without this every service-level test does a REAL DNS lookup of
@@ -1923,7 +1994,7 @@ class TestConnectionTesting:
             _integration(organization_id=org, controller_version=None)
         )
         service = _service(repo)
-        info, error = await service.test_integration_connection(
+        info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert error is None
@@ -1944,7 +2015,7 @@ class TestConnectionTesting:
             raise_on={"test_connection": ProviderAuthFailedError()}
         )
         service = _service(repo, provider=provider)
-        info, error = await service.test_integration_connection(
+        info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert info is None
@@ -1958,7 +2029,7 @@ class TestConnectionTesting:
         integration = repo.add(_integration(organization_id=org))
         provider = FakeProvider(raise_on={"test_connection": ProviderTimeoutError()})
         service = _service(repo, provider=provider)
-        _info, error = await service.test_integration_connection(
+        _info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert error.code is ErrorCode.TIMEOUT
@@ -1975,7 +2046,7 @@ class TestConnectionTesting:
             raise_on={"test_connection": ProviderSessionExpiredError()}
         )
         service = _service(repo, provider=provider)
-        _info, error = await service.test_integration_connection(
+        _info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert error.code is ErrorCode.SESSION_EXPIRED
@@ -2000,7 +2071,7 @@ class TestConnectionTesting:
         repo = FakeRepository()
         audit = FakeAuditWriter()
         service = _service(repo, audit=audit)
-        info, error = await service.test_connection_unsaved(
+        info, error, _tls = await service.test_connection_unsaved(
             actor_user_id=uuid.uuid4(),
             requesting_organization_id=org,
             provider="omada",
@@ -2612,15 +2683,245 @@ class TestAFleetlessIntegrationSaysSoBeforeAGuestFindsOut:
 
 # ============================================================================
 # CR-001: deauthorization is unsupported, honestly
+# CR-006: the per-guest disconnect, which CR-001 said was impossible
 # ============================================================================
 
 
-class TestDeauthorizationIsUnsupported:
-    """Contract change CR-001. Omada publishes no deauthorization endpoint.
+class TestDisconnectGuest:
+    """The staff action that ends one guest's access now.
 
-    The assertion is that this platform *says so* rather than reporting a
-    success it did not achieve -- the exact failure
-    ``app.domains.guest_access.device_adapters`` was written to fix.
+    CR-001 said this could not be built, because TP-Link publishes no
+    client-deauthorization endpoint. TP-Link publishes none; the
+    controller has one anyway. These tests pin what the action claims --
+    the whole risk here is claiming more than was achieved, which is the
+    failure ``app.domains.guest_access.device_adapters`` exists to record.
+    """
+
+    @staticmethod
+    async def _seeded(repo, integration, org, location, *, mac="AA:BB:CC:DD:EE:FF"):
+        session_id = uuid.uuid4()
+        await repo.create_authorization(
+            integration_id=integration.id,
+            organization_id=org,
+            location_id=location,
+            guest_session_id=session_id,
+            client_mac=mac,
+            status=AuthorizationStatus.AUTHORIZED.value,
+            authorized_at=_now(),
+        )
+        return session_id
+
+    async def test_it_ends_the_authorization_and_the_guest_session(self) -> None:
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        session_id = await self._seeded(repo, integration, org, location)
+        provider = FakeProvider()
+        terminator = FakeGuestSessionTerminator()
+        actor = uuid.uuid4()
+        service = _service(repo, provider=provider, guest_terminator=terminator)
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=actor,
+            requesting_organization_id=org,
+            reason="abuse",
+        )
+
+        assert outcome.disconnected is True
+        assert outcome.had_active_authorization is True
+        assert outcome.guest_session_ended is True
+        assert "deauthorize_guest" in provider.calls
+        row = repo.authorizations[0]
+        assert row.status == AuthorizationStatus.DEAUTHORIZED.value
+        assert row.deauthorized_at is not None
+        assert terminator.calls[0]["session_id"] == session_id
+        # Passed through so the guest domain applies its own scoping rather
+        # than trusting this one's, and so it audits as admin-initiated.
+        assert terminator.calls[0]["requesting_organization_id"] == org
+        assert terminator.calls[0]["actor_user_id"] == actor
+
+    async def test_the_controller_is_asked_before_anything_is_written(self) -> None:
+        """A controller failure must leave no trace claiming otherwise.
+
+        The reverse order is the falsehood this domain keeps guarding
+        against: a row reading "ended" over a device still forwarding
+        traffic.
+        """
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        provider = FakeProvider(
+            raise_on={"deauthorize_guest": ProviderConnectionFailedError()}
+        )
+        terminator = FakeGuestSessionTerminator()
+        service = _service(repo, provider=provider, guest_terminator=terminator)
+
+        with pytest.raises(ProviderError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+
+        assert repo.authorizations[0].status == AuthorizationStatus.AUTHORIZED.value
+        assert repo.authorizations[0].deauthorized_at is None
+        assert terminator.calls == []
+
+    async def test_a_guest_who_was_already_off_is_a_success_not_an_error(self) -> None:
+        """Idempotent by design: a second click, an expired grant and a
+        guest an operator already removed all mean the same end state."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        service = _service(repo, guest_terminator=FakeGuestSessionTerminator())
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        assert outcome.disconnected is True
+        # ...and says plainly that this call is not what ended it.
+        assert outcome.had_active_authorization is False
+        assert outcome.guest_session_ended is False
+
+    async def test_an_already_ended_session_does_not_fail_the_disconnect(self) -> None:
+        """The controller half has already succeeded by then. Turning a
+        completed disconnect into a 4xx would just make the operator click
+        again."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        terminator = FakeGuestSessionTerminator(
+            raises=NetworkIntegrationDisabledError()
+        )
+        service = _service(repo, guest_terminator=terminator)
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        assert outcome.disconnected is True
+        assert outcome.guest_session_ended is False
+        assert repo.authorizations[0].deauthorized_at is not None
+
+    async def test_it_is_tenant_scoped_server_side(self) -> None:
+        """Through ``_load_owned_integration`` like every other by-id
+        operation -- the caller's organization is never read from the body."""
+        owner, intruder = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=owner))
+        provider = FakeProvider()
+        service = _service(repo, provider=provider)
+
+        with pytest.raises(CrossOrganizationNetworkIntegrationAccessError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=intruder,
+            )
+
+        assert provider.calls == []
+
+    async def test_an_unmapped_integration_refuses_before_calling_out(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(organization_id=org, external_site_id=None)
+        )
+        provider = FakeProvider()
+        service = _service(repo, provider=provider)
+
+        with pytest.raises(NetworkIntegrationSiteNotSelectedError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+        assert provider.calls == []
+
+    async def test_it_writes_an_audit_entry_of_its_own_action(self) -> None:
+        """Its own action, not the integration-level DISCONNECTED. An
+        auditor asking "who kicked this guest off" must not have to
+        disambiguate it from "who unplugged this controller"."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        audit = FakeAuditWriter()
+        service = _service(
+            repo, audit=audit, guest_terminator=FakeGuestSessionTerminator()
+        )
+
+        await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        actions = [e["action"] for e in audit.entries]
+        assert NetworkIntegrationAuditAction.GUEST_DISCONNECTED.value in actions
+        assert NetworkIntegrationAuditAction.DISCONNECTED.value not in actions
+
+    async def test_it_records_a_portal_deauthorize_event(self) -> None:
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        service = _service(repo, guest_terminator=FakeGuestSessionTerminator())
+
+        await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        events = [
+            e
+            for e in repo.events
+            if e.event_type == IntegrationEventType.PORTAL_DEAUTHORIZE.value
+        ]
+        assert len(events) == 1
+        assert events[0].status == IntegrationEventStatus.OK.value
+
+    async def test_a_malformed_mac_is_rejected_before_the_controller(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        provider = FakeProvider()
+        service = _service(repo, provider=provider)
+
+        with pytest.raises(NetworkIntegrationUrlRejectedError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="not-a-mac",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+        assert provider.calls == []
+
+
+class TestDeauthorizationRefusalIsNarrowNow:
+    """What is left of CR-001, and it is one configuration.
+
+    ``OMADA_API_UNSUPPORTED`` no longer means "Omada cannot do this". It
+    means the integration stores no hotspot operator credentials, which is
+    the same gap that makes ``authorize_guest`` refuse -- so an
+    integration that cannot disconnect a guest never connected one.
     """
 
     async def test_it_surfaces_api_unsupported_rather_than_faking_success(
@@ -2645,12 +2946,37 @@ class TestDeauthorizationIsUnsupported:
         assert caught.value.code is ErrorCode.API_UNSUPPORTED
         assert caught.value.status_code == 501
 
-    async def test_the_message_does_not_claim_the_device_was_disconnected(
+    async def test_the_staff_route_surfaces_it_too(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        provider = FakeProvider(
+            raise_on={"deauthorize_guest": ProviderUnsupportedApiError()}
+        )
+        terminator = FakeGuestSessionTerminator()
+        service = _service(repo, provider=provider, guest_terminator=terminator)
+
+        with pytest.raises(NetworkIntegrationDeauthorizationUnsupportedError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+        # And the guest session is NOT quietly ended instead, which would
+        # report diligence for an action that touched nothing.
+        assert terminator.calls == []
+
+    async def test_the_message_names_the_missing_credential_not_the_vendor(
         self,
     ) -> None:
+        """The old copy said Omada could not do this at all. It can; this
+        integration cannot ask it."""
         error = NetworkIntegrationDeauthorizationUnsupportedError()
-        assert "not disconnected" in error.message
-        assert "cannot be ended on demand" in error.message
+        assert "operator" in error.message.lower()
+        assert "nothing was changed on the network" in error.message.lower()
+        # ...and it must not resurrect the claim it replaced.
+        assert "cannot be ended on demand" not in error.message
 
     async def test_nothing_is_recorded_as_deauthorized(self) -> None:
         """Recording a deauthorization this platform did not achieve would
@@ -2685,14 +3011,27 @@ class TestDeauthorizationIsUnsupported:
         )
         assert repo.authorizations[0].deauthorized_at is None
 
-    def test_the_session_duration_ceiling_reflects_the_missing_revocation(
+    def test_the_session_duration_ceiling_is_unchanged_but_no_longer_load_bearing(
         self,
     ) -> None:
-        """With no deauthorization, the duration is the ONLY revocation
-        mechanism, so the ceiling is a security control. 24 hours is the
-        longest window in which "wait for it to expire" is a usable answer
-        to "this guest is abusing the WiFi"."""
-        assert MAX_SESSION_DURATION_SECONDS == 24 * 3600
+        """The ceiling was justified entirely on revocation being
+        impossible. It is not, so the number stopped being a safety
+        backstop and became a policy choice: the owner set it to 7 days
+        on 2026-09-11, the length of a hotel stay.
+
+        Pinned here because it is a policy number -- it should move by
+        decision, not by drift. It must also stay strictly below the
+        gateway's sanity ceiling (``omada.portal.MAX_DURATION_SECONDS``),
+        which *caps* silently where this one *rejects* loudly; if this
+        one ever exceeded it, the platform would promise a duration the
+        controller never receives.
+        """
+        from wyfy_device_gateway.omada.portal import (  # noqa: PLC0415
+            MAX_DURATION_SECONDS as GATEWAY_SANITY_CEILING,
+        )
+
+        assert MAX_SESSION_DURATION_SECONDS == 7 * 24 * 3600
+        assert MAX_SESSION_DURATION_SECONDS < GATEWAY_SANITY_CEILING
 
 
 # ============================================================================
@@ -3224,8 +3563,8 @@ class TestProviderSeamIsolation:
         assert isinstance(FakeProvider(), NetworkProvider)
 
     def test_every_gateway_error_code_maps_to_a_domain_exception(self) -> None:
-        """All ten normalized codes from contract §2, so a controller
-        failure can never escape as an unhandled 500."""
+        """Every normalized code from contract §2, so a controller failure
+        can never escape as an unhandled 500."""
         expected = {
             "OMADA_AUTH_FAILED",
             "OMADA_CONNECTION_FAILED",
@@ -3237,6 +3576,12 @@ class TestProviderSeamIsolation:
             "OMADA_AUTHORIZATION_FAILED",
             "OMADA_API_UNSUPPORTED",
             "OMADA_SESSION_EXPIRED",
+            # Added when certificate trust became a per-integration
+            # decision: a TLS refusal used to be reported as
+            # OMADA_CONNECTION_FAILED, which sent operators to check a URL
+            # and a port that were both already correct.
+            "OMADA_TLS_UNTRUSTED",
+            "OMADA_TLS_PIN_MISMATCH",
         }
         assert set(PROVIDER_ERRORS_BY_CODE) == expected
         for code, error_class in PROVIDER_ERRORS_BY_CODE.items():
@@ -3367,3 +3712,1043 @@ class TestEveryRouteRequiresPermission:
         for slug in ("reception-staff", "helpdesk", "guest-operator"):
             grants = by_slug[slug].grants()
             assert PermissionModule.NETWORK_INTEGRATIONS not in grants, slug
+
+
+# ============================================================================
+# Certificate trust: strict / pinned / insecure
+# ============================================================================
+
+
+class TestCertificateTrust:
+    """The trust decision is per-integration, recorded, and actually used.
+
+    The defect this closes: ``ProviderConnectionConfig.verify_tls`` existed,
+    defaulted to ``True``, and **nothing in ``app/`` ever set it** -- no
+    column, no schema field, no service parameter. Being unreachable it was
+    permanently ``True``, and a self-hosted Omada controller (which ships a
+    self-signed certificate) could not be integrated at all. The failure was
+    additionally reported as ``OMADA_CONNECTION_FAILED`` -- "check that the
+    controller URL and port are correct" -- when both were already correct.
+
+    So these tests assert three things in order: that the value is reachable,
+    that it reaches the provider, and that a trust failure no longer wears a
+    connectivity failure's clothes.
+    """
+
+    # -- the value is reachable and validated -----------------------------
+
+    async def test_an_integration_created_without_saying_anything_is_strict(
+        self,
+    ) -> None:
+        """The default must not be weaker than the platform's ordinary HTTPS
+        posture. An absent trust decision is not a decision to trust."""
+        org = uuid.uuid4()
+        service = _service()
+        integration = await service.create_integration(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            provider="omada",
+            name="Lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+        )
+        assert integration.tls_mode == ControllerTlsMode.STRICT.value
+        assert integration.tls_pinned_sha256 is None
+        # Nothing was decided, so nothing is stamped. A timestamp on every
+        # row would make "somebody reviewed this certificate" unreadable.
+        assert integration.tls_trust_decided_at is None
+
+    async def test_a_pinned_integration_stores_the_normalized_fingerprint(
+        self,
+    ) -> None:
+        """openssl prints colons and uppercase. Both are accepted, one form
+        is stored, so a later comparison is a string comparison."""
+        org = uuid.uuid4()
+        service = _service()
+        raw = ":".join(_PIN[i : i + 2] for i in range(0, 64, 2)).upper()
+        integration = await service.create_integration(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            provider="omada",
+            name="Lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+            tls_mode="pinned",
+            tls_pinned_sha256=raw,
+        )
+        assert integration.tls_mode == ControllerTlsMode.PINNED.value
+        assert integration.tls_pinned_sha256 == _PIN
+        assert integration.tls_trust_decided_at is not None
+
+    async def test_pinned_with_no_fingerprint_is_refused_before_anything_is_dialled(
+        self,
+    ) -> None:
+        """A row that claims to pin and pins nothing is worse than one that
+        admits it is insecure: the next person to read it believes it."""
+        repo = FakeRepository()
+        service = _service(repo)
+        with pytest.raises(NetworkIntegrationTlsPinRequiredError):
+            await service.create_integration(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                tls_mode="pinned",
+            )
+        assert repo.integrations == {}
+
+    async def test_a_malformed_fingerprint_is_refused(self) -> None:
+        service = _service()
+        with pytest.raises(NetworkIntegrationTlsPinRequiredError):
+            await service.create_integration(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                tls_mode="pinned",
+                tls_pinned_sha256="deadbeef",
+            )
+
+    async def test_an_unrecognised_mode_is_refused_rather_than_coerced(self) -> None:
+        service = _service()
+        with pytest.raises(NetworkIntegrationTlsPinRequiredError):
+            await service.create_integration(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                tls_mode="whatever",
+            )
+
+    # -- the value reaches the provider -----------------------------------
+
+    async def test_the_stored_decision_reaches_the_provider_on_every_call(
+        self,
+    ) -> None:
+        """The half that was missing entirely. A column nothing reads is a
+        column that does nothing."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256=_PIN,
+            )
+        )
+        service = _service(repo)
+        config = service._connection_config(integration, {"client_id": "c"})
+        assert config.tls_mode == "pinned"
+        assert config.tls_pinned_sha256 == _PIN
+
+    async def test_the_pre_save_probe_passes_the_requested_decision_through(
+        self,
+    ) -> None:
+        """The wizard probes before a row exists, so the decision travels in
+        the request or it does not travel at all."""
+        captured: list[ProviderConnectionConfig] = []
+
+        class _Capturing(FakeProvider):
+            async def test_connection(self, config):
+                captured.append(config)
+                return await super().test_connection(config)
+
+        service = _service(provider=_Capturing())
+        await service.test_connection_unsaved(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            client_id="cid",
+            client_secret="secret",
+            tls_mode="pinned",
+            tls_pinned_sha256=_PIN,
+        )
+        assert captured and captured[0].tls_mode == "pinned"
+        assert captured[0].tls_pinned_sha256 == _PIN
+
+    # -- changing the decision --------------------------------------------
+
+    async def test_leaving_pinned_mode_clears_the_stored_fingerprint(self) -> None:
+        """A pin that is stored but not consulted is a fact about the past
+        presented as a fact about the present. Coming back to pinned must
+        re-confirm the certificate."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256=_PIN,
+            )
+        )
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_mode": "strict"},
+        )
+        assert updated.tls_mode == ControllerTlsMode.STRICT.value
+        assert updated.tls_pinned_sha256 is None
+        assert updated.tls_trust_decided_at is None
+
+    async def test_switching_to_pinned_records_the_decision_and_the_moment(
+        self,
+    ) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_mode": "pinned", "tls_pinned_sha256": _PIN},
+        )
+        assert updated.tls_mode == ControllerTlsMode.PINNED.value
+        assert updated.tls_pinned_sha256 == _PIN
+        assert updated.tls_trust_decided_at is not None
+
+    async def test_a_new_fingerprint_alone_re_pins_an_already_pinned_row(
+        self,
+    ) -> None:
+        """The instruction OMADA_TLS_PIN_MISMATCH gives is "review the new
+        fingerprint and pin it". If that PATCH silently no-ops because the
+        mode was not restated, the row keeps the old pin and every call keeps
+        failing -- with the platform telling the operator to do the thing
+        they just did."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256="b" * 64,
+            )
+        )
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_pinned_sha256": _PIN},
+        )
+        assert updated.tls_mode == ControllerTlsMode.PINNED.value
+        assert updated.tls_pinned_sha256 == _PIN
+
+    async def test_a_fingerprint_alone_on_a_strict_row_is_still_refused(
+        self,
+    ) -> None:
+        """Re-pinning is not a way in. A strict row given only a fingerprint
+        stays strict and stores nothing -- accepting the pin while leaving
+        the mode alone would store a pin that is never consulted."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_pinned_sha256": _PIN},
+        )
+        assert updated.tls_mode == ControllerTlsMode.STRICT.value
+        assert updated.tls_pinned_sha256 is None
+
+    async def test_the_audit_entry_records_what_was_accepted_not_just_that_it_changed(
+        self,
+    ) -> None:
+        """"Somebody changed tls_mode" does not answer "what are we trusting
+        now". Both values are public, so both go in the trail."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        audit = FakeAuditWriter()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo, audit=audit)
+        await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_mode": "pinned", "tls_pinned_sha256": _PIN},
+        )
+        metadata = audit.entries[-1]["event_metadata"]
+        assert metadata["tls_mode"] == "pinned"
+        assert metadata["tls_pinned_sha256"] == _PIN
+
+    async def test_rotating_credentials_leaves_trust_alone_unless_asked(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256=_PIN,
+            )
+        )
+        service = _service(repo)
+        updated = await service.rotate_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            auth_mode="openapi",
+            client_id="new-id",
+            client_secret="new-secret",
+        )
+        assert updated.tls_mode == ControllerTlsMode.PINNED.value
+        assert updated.tls_pinned_sha256 == _PIN
+
+    async def test_rotating_credentials_can_re_pin_in_the_same_request(self) -> None:
+        """Re-entering a password is when an operator is most likely to be
+        looking at a controller whose certificate was replaced with it.
+        Forcing a separate PATCH sends them to 'insecure' instead."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+        updated = await service.rotate_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            auth_mode="openapi",
+            client_id="new-id",
+            client_secret="new-secret",
+            tls_mode="pinned",
+            tls_pinned_sha256=_PIN,
+        )
+        assert updated.tls_pinned_sha256 == _PIN
+
+    # -- the error no longer lies -----------------------------------------
+
+    def test_a_trust_failure_has_its_own_code_and_does_not_blame_the_url(
+        self,
+    ) -> None:
+        """The original message sent operators to check a URL and a port that
+        were both already correct. Nobody diagnoses a self-signed certificate
+        from that."""
+        error = ProviderTlsUntrustedError()
+        assert error.code is ErrorCode.TLS_UNTRUSTED
+        assert error.code.value == "OMADA_TLS_UNTRUSTED"
+        assert "certificate" in error.message.lower()
+        assert "url and port are correct" not in error.message.lower()
+
+    def test_a_pin_mismatch_is_a_different_code_from_an_untrusted_chain(
+        self,
+    ) -> None:
+        """Only one of the two can mean somebody is in the middle, and the
+        instruction differs: do not re-pin blindly."""
+        mismatch = ProviderTlsPinMismatchError()
+        assert mismatch.code is ErrorCode.TLS_PIN_MISMATCH
+        assert mismatch.code is not ProviderTlsUntrustedError().code
+        assert "intercept" in mismatch.message.lower()
+
+    async def test_a_trust_failure_records_its_own_code_on_the_row(self) -> None:
+        """The status ladder is four coarse buckets and a TLS failure lands
+        in the connection bucket -- but ``last_error_code`` must carry the
+        real cause, because that is the field an operator reads to find out
+        *what* to look at."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        provider = FakeProvider(
+            raise_on={"test_connection": ProviderTlsUntrustedError()}
+        )
+        service = _service(repo, provider=provider)
+        _info, error, _tls = await service.test_integration_connection(
+            integration.id, actor_user_id=None, requesting_organization_id=org
+        )
+        assert error is not None
+        assert integration.status == IntegrationStatus.CONNECTION_FAILED.value
+        assert integration.last_error_code == "OMADA_TLS_UNTRUSTED"
+
+    # -- the fingerprint is shown to the operator --------------------------
+
+    async def test_the_probe_returns_the_fingerprint_even_when_it_fails(
+        self,
+    ) -> None:
+        """The whole point of capturing it. The failing probe against a
+        self-signed controller is exactly when the operator needs to see the
+        fingerprint, because that is the decision the failure is asking them
+        to make -- and making them succeed first would require them to turn
+        verification off to find out they did not have to."""
+        provider = FakeProvider(
+            raise_on={"test_connection": ProviderTlsUntrustedError()}
+        )
+        service = _service(provider=provider)
+        info, error, observation = await service.test_connection_unsaved(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            client_id="cid",
+            client_secret="secret",
+        )
+        assert info is None and error is not None
+        assert observation is not None
+        assert observation.fingerprint_sha256 == "a" * 64
+        assert observation.chain_trusted is False
+
+    async def test_an_observation_failure_never_turns_a_good_probe_bad(
+        self,
+    ) -> None:
+        """The observation is decoration around the real answer. A provider
+        that cannot look at the certificate must report absence, not replace
+        a useful result with a TLS complaint."""
+        provider = FakeProvider(tls_observation=None)
+        service = _service(provider=provider)
+        info, error, observation = await service.test_connection_unsaved(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            client_id="cid",
+            client_secret="secret",
+        )
+        assert error is None and info is not None
+        assert observation is None
+
+    def test_the_response_shows_what_is_pinned_and_never_a_credential(
+        self,
+    ) -> None:
+        """A certificate fingerprint is a hash of something the controller
+        hands to anyone who connects. Showing it is what makes the pin
+        auditable; the credential columns stay a boolean."""
+        from app.domains.network_integration.router import _integration_response
+
+        integration = _integration(
+            tls_mode=ControllerTlsMode.PINNED.value, tls_pinned_sha256=_PIN
+        )
+        payload = _integration_response(integration).model_dump()
+        assert payload["tls_mode"] == "pinned"
+        assert payload["tls_pinned_sha256"] == _PIN
+        assert payload["has_credentials"] is True
+        assert "credentials_encrypted" not in payload
+        assert "client_secret" not in str(payload)
+
+    # -- the SSRF posture is untouched -------------------------------------
+
+    def test_trust_validation_does_not_widen_what_may_be_dialled(self) -> None:
+        """Certificate trust and reachability are different questions.
+        Answering the first must not widen the second -- the port allowlist
+        and the address rules are what they were."""
+        from app.domains.network_integration.constants import (
+            DEFAULT_CONTROLLER_PORTS,
+        )
+        from app.domains.network_integration.validators import (
+            allowed_controller_ports,
+            parse_controller_url,
+            validate_tls_trust,
+        )
+
+        assert allowed_controller_ports() >= DEFAULT_CONTROLLER_PORTS
+        # Pinning a certificate does not make a private address dialable.
+        validate_tls_trust(
+            tls_mode=ControllerTlsMode.PINNED, tls_pinned_sha256=_PIN
+        )
+        with pytest.raises(NetworkIntegrationUrlRejectedError):
+            parse_controller_url("https://controller.example.com:1234")
+
+# ============================================================================
+# Portal authorization diagnostics
+# ============================================================================
+
+
+class TestPortalRedirectDescriptions:
+    """The pure half: what could have been known before the call.
+
+    These describe, they never refuse. A test that asserted a malformed
+    redirect is rejected would be pinning a behaviour this platform has
+    deliberately not built -- see ``validators``'s own note on why.
+    """
+
+    def test_the_wire_spelling_of_a_mac_is_named_not_normalized(self) -> None:
+        """Omada redirects with dashes; the table stores colons; the body
+        sends whatever arrived. That difference is invisible everywhere else
+        we keep a record, and it is a live candidate for a bare -41501."""
+        assert describe_mac_wire_format("AA-BB-CC-DD-EE-FF") == "hyphen-upper"
+        assert describe_mac_wire_format("aa:bb:cc:dd:ee:ff") == "colon-lower"
+        assert describe_mac_wire_format("aA:bB:cc:dd:ee:ff") == "colon-mixed"
+        assert describe_mac_wire_format("AABBCCDDEEFF") == "bare"
+        assert describe_mac_wire_format("11:22:33:44:55:66") == "colon-nocase"
+        assert describe_mac_wire_format("not-a-mac") == "unrecognised"
+        assert describe_mac_wire_format(None) == "empty"
+
+    def test_a_redirect_with_no_device_fields_is_named_as_such(self) -> None:
+        """The one pre-call check that is decidable on its own: a body with
+        neither an AP nor a gateway identifies no session for the controller
+        to match, which is a guaranteed refusal."""
+        assert (
+            describe_redirect_shape(
+                ap_mac=None,
+                ssid_name=None,
+                radio_id=None,
+                gateway_mac=None,
+                vid=None,
+            )
+            == "neither"
+        )
+
+    def test_both_redirect_shapes_at_once_is_recorded_as_ambiguous(self) -> None:
+        """The body builder silently prefers the gateway fields and drops the
+        AP ones. Defensible, and not visible afterwards unless recorded."""
+        assert (
+            describe_redirect_shape(
+                ap_mac="11:11:11:11:11:11",
+                ssid_name="Guest",
+                radio_id=1,
+                gateway_mac="22:22:22:22:22:22",
+                vid=10,
+            )
+            == "ambiguous"
+        )
+        assert (
+            describe_redirect_shape(
+                ap_mac="11:11:11:11:11:11",
+                ssid_name=None,
+                radio_id=None,
+                gateway_mac=None,
+                vid=None,
+            )
+            == "ap-partial"
+        )
+
+    def test_a_stale_redirect_timestamp_is_measurable_in_both_units(self) -> None:
+        now = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+        milliseconds = str(int(now.timestamp() * 1000) - 3_600_000)
+        seconds = str(int(now.timestamp()) - 3600)
+        assert portal_redirect_timestamp_age_seconds(milliseconds, now=now) == 3600.0
+        assert portal_redirect_timestamp_age_seconds(seconds, now=now) == 3600.0
+
+    def test_an_unusable_timestamp_is_none_and_not_zero(self) -> None:
+        """Zero would read as "brand new", which is the opposite of what an
+        absent or unparseable value means."""
+        assert portal_redirect_timestamp_age_seconds(None) is None
+        assert portal_redirect_timestamp_age_seconds("") is None
+        assert portal_redirect_timestamp_age_seconds("later") is None
+        assert portal_redirect_timestamp_age_seconds("0") is None
+
+    def test_a_future_timestamp_is_reported_negative_not_clamped(self) -> None:
+        """Controller clock skew is itself a candidate cause. Clamping it to
+        zero would delete the evidence for it."""
+        now = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+        future = str(int(now.timestamp() * 1000) + 60_000)
+        assert portal_redirect_timestamp_age_seconds(future, now=now) == -60.0
+
+    def test_the_redirect_url_keeps_its_shape_and_drops_its_values(self) -> None:
+        """The only unbounded third-party string on this request, and the
+        only field that has ever plausibly carried a token."""
+        summary = summarize_redirect_url(
+            "https://auth.wyfyguest.com:8443/portal?sid=SECRETVALUE&cmac=AA"
+        )
+        assert summary == {
+            "origin": "https://auth.wyfyguest.com:8443",
+            "path": "/portal",
+            "query_keys": ["cmac", "sid"],
+            "length": 62,
+        }
+        assert "SECRETVALUE" not in json.dumps(summary)
+
+    def test_no_redirect_url_summarizes_to_none(self) -> None:
+        assert summarize_redirect_url(None) is None
+        assert summarize_redirect_url("   ") is None
+
+
+class TestPortalAuthorizeDiagnosticsBundle:
+    """The builder, in isolation from the service."""
+
+    def _context(self, **overrides):
+        from app.domains.network_integration.providers.base import (
+            ProviderPortalContext,
+        )
+
+        fields = {
+            "client_mac": "AA-BB-CC-DD-EE-FF",
+            "site": "site-1",
+            "ap_mac": "11:11:11:11:11:11",
+            "ssid_name": "Guest WiFi",
+            "radio_id": 1,
+            "t": "1757592000000",
+            "redirect_url": "https://example.com/welcome?sid=abc",
+        }
+        fields.update(overrides)
+        return ProviderPortalContext(**fields)
+
+    def test_matching_the_site_by_display_name_is_recorded_as_such(self) -> None:
+        """Passing the site check by *name* means the body then carries a
+        name where the controller may want a key. The check does not
+        distinguish the two; the record has to."""
+        integration = _integration()
+        integration.external_site_id = "606a1f"
+        integration.external_site_name = "Lobby"
+
+        bundle = build_portal_authorize_diagnostics(
+            context=self._context(site="Lobby"),
+            normalized_client_mac="AA:BB:CC:DD:EE:FF",
+            integration=integration,
+        )
+
+        assert bundle["precall"]["site_matched_by"] == "name"
+        assert bundle["precall"]["stored_site_id"] == "606a1f"
+
+    def test_a_rewritten_mac_is_flagged(self) -> None:
+        bundle = build_portal_authorize_diagnostics(
+            context=self._context(client_mac="AA-BB-CC-DD-EE-FF"),
+            normalized_client_mac="AA:BB:CC:DD:EE:FF",
+            integration=_integration(),
+        )
+        assert bundle["precall"]["client_mac_rewritten_for_wire"] is True
+        assert bundle["precall"]["client_mac_wire_format"] == "hyphen-upper"
+        assert bundle["precall"]["client_mac_normalized"] == "AA:BB:CC:DD:EE:FF"
+
+    def test_a_stale_redirect_is_flagged_against_the_threshold(self) -> None:
+        now = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+        stale = str(
+            int(now.timestamp() * 1000)
+            - (PORTAL_REDIRECT_STALE_AFTER_SECONDS + 60) * 1000
+        )
+        bundle = build_portal_authorize_diagnostics(
+            context=self._context(t=stale),
+            normalized_client_mac="AA:BB:CC:DD:EE:FF",
+            integration=_integration(),
+            now=now,
+        )
+        assert bundle["precall"]["t_stale"] is True
+
+    def test_an_unparseable_timestamp_leaves_staleness_unknown(self) -> None:
+        """``None`` rather than ``False``. "We could not tell" and "it was
+        fresh" are different answers and only one of them is true."""
+        bundle = build_portal_authorize_diagnostics(
+            context=self._context(t=None),
+            normalized_client_mac="AA:BB:CC:DD:EE:FF",
+            integration=_integration(),
+        )
+        assert bundle["precall"]["t_stale"] is None
+        assert bundle["precall"]["t_age_seconds"] is None
+
+    def test_the_raw_vendor_code_is_stored_uninterpreted(self) -> None:
+        """-41500 and -41501 are the one discrimination the controller makes.
+        The bundle keeps the integer and does not classify it: which codes
+        are specific is vendor knowledge and this module holds none."""
+        specific = build_portal_authorize_diagnostics(
+            context=self._context(),
+            normalized_client_mac="AA:BB:CC:DD:EE:FF",
+            integration=_integration(),
+            provider_code=-41500,
+        )
+        catch_all = build_portal_authorize_diagnostics(
+            context=self._context(),
+            normalized_client_mac="AA:BB:CC:DD:EE:FF",
+            integration=_integration(),
+            provider_code=-41501,
+        )
+        assert specific["controller"]["provider_code"] == -41500
+        assert catch_all["controller"]["provider_code"] == -41501
+
+    def test_the_bundle_is_json_serializable(self) -> None:
+        """It goes into a JSONB column. A value that cannot be encoded would
+        fail the write on the failure path, i.e. exactly when it matters."""
+        bundle = build_portal_authorize_diagnostics(
+            context=self._context(),
+            normalized_client_mac="AA:BB:CC:DD:EE:FF",
+            integration=_integration(),
+            request_snapshot={"clientMac": "AA-BB-CC-DD-EE-FF", "time": 3_600_000},
+            provider_code=-41501,
+        )
+        assert json.loads(json.dumps(bundle))["request"]["fields"] == [
+            "clientMac",
+            "time",
+        ]
+
+
+class TestPortalAuthorizeDiagnosticsAreRecorded:
+    """The whole feature, end to end through the service: after a failure,
+    what we sent and what we were redirected with are both recoverable from
+    the existing events feed."""
+
+    def _setup(self, provider: FakeProvider | None = None):
+        org, location = uuid.uuid4(), uuid.uuid4()
+        session_id = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        lookup = FakeGuestSessionLookup(
+            {session_id: FakeGuestSession(session_id, org, location)}
+        )
+        service = _service(repo, provider=provider, guest_lookup=lookup)
+        return service, repo, integration, org, location, session_id
+
+    async def _authorize(self, service, org, location, session_id, **overrides):
+        kwargs = {
+            "session_id": session_id,
+            "organization_id": org,
+            "location_id": location,
+            "provider": "omada",
+            "client_mac": "AA-BB-CC-DD-EE-FF",
+            "site": "site-1",
+            "ap_mac": "11:11:11:11:11:11",
+            "ssid_name": "Guest WiFi",
+            "radio_id": 1,
+            "t": "1757592000000",
+            "redirect_url": "https://example.com/welcome?sid=abc",
+        }
+        kwargs.update(overrides)
+        return await service.authorize_portal_client(**kwargs)
+
+    @staticmethod
+    def _diagnostics(repo) -> dict:
+        rows = [
+            event
+            for event in repo.events
+            if event.event_type == IntegrationEventType.PORTAL_AUTHORIZE.value
+        ]
+        assert rows, "no portal_authorize event was written at all"
+        return rows[-1].context[PORTAL_AUTHORIZE_DIAGNOSTICS_KEY]
+
+    async def test_a_failed_authorization_records_the_exact_body_we_sent(
+        self,
+    ) -> None:
+        """The first of the two halves a support engineer has to diff.
+        Recorded in the vendor's own spelling, because the point is to
+        compare it against TP-Link's documentation."""
+        error = ProviderError(
+            "refused", code=ErrorCode.AUTHORIZATION_FAILED
+        ).with_diagnostics(
+            provider_code=-41501,
+            request_snapshot={
+                "clientMac": "AA-BB-CC-DD-EE-FF",
+                "time": 3_600_000,
+                "authType": "4",
+                "apMac": "11:11:11:11:11:11",
+                "ssidName": "Guest WiFi",
+                "radioId": 1,
+                "site": "site-1",
+            },
+        )
+        provider = FakeProvider(raise_on={"authorize_guest": error})
+        service, repo, _i, org, location, session_id = self._setup(provider)
+
+        with pytest.raises(ProviderError):
+            await self._authorize(service, org, location, session_id)
+
+        body = self._diagnostics(repo)["request"]["body"]
+        assert body["clientMac"] == "AA-BB-CC-DD-EE-FF"
+        assert body["authType"] == "4"
+        assert body["time"] == 3_600_000
+        # The field list is what makes an *omission* visible. A missing
+        # clientIp -- which the controller answers with the same -41501 as
+        # everything else -- is only findable this way.
+        assert "clientIp" not in self._diagnostics(repo)["request"]["fields"]
+
+    async def test_a_failed_authorization_records_the_redirect_it_came_from(
+        self,
+    ) -> None:
+        """The other half. Without it there is nothing to diff the body
+        against, and the guest is long gone."""
+        provider = FakeProvider(
+            raise_on={
+                "authorize_guest": ProviderError(
+                    "refused", code=ErrorCode.AUTHORIZATION_FAILED
+                )
+            }
+        )
+        service, repo, _i, org, location, session_id = self._setup(provider)
+
+        with pytest.raises(ProviderError):
+            await self._authorize(service, org, location, session_id)
+
+        redirect = self._diagnostics(repo)["redirect"]
+        assert redirect["client_mac"] == "AA-BB-CC-DD-EE-FF"
+        assert redirect["site"] == "site-1"
+        assert redirect["ap_mac"] == "11:11:11:11:11:11"
+        assert redirect["ssid_name"] == "Guest WiFi"
+        assert redirect["radio_id"] == 1
+        assert redirect["t"] == "1757592000000"
+        assert redirect["redirect_url"]["origin"] == "https://example.com"
+        assert redirect["redirect_url"]["query_keys"] == ["sid"]
+
+    async def test_the_controllers_own_code_survives_into_the_event(self) -> None:
+        """-41500 names a field; -41501 names nothing. Both normalize to one
+        ``ErrorCode``, so the integer is the only place the distinction can
+        live once the call is over."""
+        for raw_code in (-41500, -41501):
+            provider = FakeProvider(
+                raise_on={
+                    "authorize_guest": ProviderError(
+                        "refused", code=ErrorCode.AUTHORIZATION_FAILED
+                    ).with_diagnostics(provider_code=raw_code)
+                }
+            )
+            service, repo, _i, org, location, session_id = self._setup(provider)
+            with pytest.raises(ProviderError):
+                await self._authorize(service, org, location, session_id)
+            assert self._diagnostics(repo)["controller"]["provider_code"] == raw_code
+
+    async def test_a_site_mismatch_is_recorded_with_the_same_shape(self) -> None:
+        """This failure never reaches the controller, so the controller was
+        never going to explain it. The record is the only account there is."""
+        service, repo, _i, org, location, session_id = self._setup()
+
+        with pytest.raises(GuestSessionNotActiveError):
+            await self._authorize(
+                service, org, location, session_id, site="somebody-elses-site"
+            )
+
+        bundle = self._diagnostics(repo)
+        assert bundle["precall"]["site_matched_by"] == "none"
+        assert bundle["redirect"]["site"] == "somebody-elses-site"
+        # Nothing was built, and the record says so rather than inventing one.
+        assert bundle["request"]["body"] is None
+        assert bundle["request"]["fields"] == []
+
+    async def test_a_successful_authorization_records_no_device_diagnostics(
+        self,
+    ) -> None:
+        """The retention decision, asserted rather than described. The bundle
+        names a guest's device; writing it for every successful join would
+        put one MAC per guest into a table that holds none today and has no
+        retention sweep, to answer a question nobody asks about a call that
+        worked."""
+        service, repo, _i, org, location, session_id = self._setup()
+
+        outcome = await self._authorize(service, org, location, session_id)
+
+        assert outcome.authorized is True
+        rows = [
+            event
+            for event in repo.events
+            if event.event_type == IntegrationEventType.PORTAL_AUTHORIZE.value
+        ]
+        assert rows
+        assert PORTAL_AUTHORIZE_DIAGNOSTICS_KEY not in rows[-1].context
+        assert rows[-1].context == {"ssid_name": "Guest WiFi"}
+
+    async def test_a_controller_that_declines_without_raising_is_diagnosed(
+        self,
+    ) -> None:
+        """The case with the least to go on: a negative result and no
+        exception. Treated as a failure for recording purposes."""
+        provider = FakeProvider(
+            authorize_result=ProviderAuthorizationResult(
+                authorized=False,
+                request_snapshot={"clientMac": "AA-BB-CC-DD-EE-FF", "authType": "4"},
+            )
+        )
+        service, repo, _i, org, location, session_id = self._setup(provider)
+
+        await self._authorize(service, org, location, session_id)
+
+        assert self._diagnostics(repo)["request"]["body"]["authType"] == "4"
+
+    async def test_a_secret_in_the_snapshot_is_redacted_before_it_is_stored(
+        self,
+    ) -> None:
+        """The snapshot is built from redirect parameters and a duration, so
+        no credential is an input to it. The domain's write-time redaction
+        still runs over it, because ``network_integration_events.context`` is
+        rendered into the customer dashboard and a second control on that
+        column costs nothing. See ``constants``'s module docstring."""
+        provider = FakeProvider(
+            raise_on={
+                "authorize_guest": ProviderError(
+                    "refused", code=ErrorCode.AUTHORIZATION_FAILED
+                ).with_diagnostics(
+                    request_snapshot={
+                        "clientMac": "AA-BB-CC-DD-EE-FF",
+                        "password": "hunter2",
+                        "csrf_token": "abc123",
+                    }
+                )
+            }
+        )
+        service, repo, _i, org, location, session_id = self._setup(provider)
+
+        with pytest.raises(ProviderError):
+            await self._authorize(service, org, location, session_id)
+
+        stored = json.dumps(self._diagnostics(repo))
+        assert "hunter2" not in stored
+        assert "abc123" not in stored
+
+    async def test_the_diagnostics_reach_the_events_endpoint_unchanged(
+        self,
+    ) -> None:
+        """Recoverable "through an existing surface" is the requirement, and
+        ``NetworkIntegrationEventResponse.context`` is that surface. A bundle
+        the response schema drops would be a bundle nobody can read."""
+        from app.domains.network_integration.schemas import (
+            NetworkIntegrationEventResponse,
+        )
+
+        provider = FakeProvider(
+            raise_on={
+                "authorize_guest": ProviderError(
+                    "refused", code=ErrorCode.AUTHORIZATION_FAILED
+                ).with_diagnostics(
+                    provider_code=-41501,
+                    request_snapshot={"clientMac": "AA-BB-CC-DD-EE-FF"},
+                )
+            }
+        )
+        service, repo, _i, org, location, session_id = self._setup(provider)
+        with pytest.raises(ProviderError):
+            await self._authorize(service, org, location, session_id)
+
+        row = repo.events[-1]
+        rendered = NetworkIntegrationEventResponse(
+            id=str(row.id),
+            event_type=row.event_type,
+            status=row.status,
+            error_code=row.error_code,
+            message=row.message,
+            context=row.context,
+            created_at=_now(),
+        ).model_dump()
+        bundle = rendered["context"][PORTAL_AUTHORIZE_DIAGNOSTICS_KEY]
+        assert bundle["controller"]["provider_code"] == -41501
+        assert bundle["request"]["body"]["clientMac"] == "AA-BB-CC-DD-EE-FF"
+
+
+class TestProviderCarriesDiagnosticsAcrossTheSeam:
+    """``providers/omada.py`` is the only module that may name a vendor, so
+    it is the only place the wire body and the raw controller code can be
+    obtained. Both used to stop there."""
+
+    def test_the_raw_vendor_code_survives_translation(self) -> None:
+        """The gateway's contract lets exactly one piece of the controller's
+        response into an exception -- this integer -- and the normalized
+        ``ErrorCode`` is deliberately coarser than it. Dropping it here left
+        -41500 and -41501 indistinguishable in every record we keep."""
+        from app.domains.network_integration.providers.omada import _translate
+
+        class _GatewayError(Exception):
+            code = "OMADA_AUTHORIZATION_FAILED"
+
+            def __init__(self, message: str, provider_code: int) -> None:
+                super().__init__(message)
+                self.provider_code = provider_code
+
+        translated = _translate(_GatewayError("refused", -41501))
+        assert translated.code is ErrorCode.AUTHORIZATION_FAILED
+        assert translated.provider_code == -41501
+
+        unmapped = _translate(_GatewayError("refused", -41500))
+        assert unmapped.provider_code == -41500
+
+    def test_an_error_without_a_vendor_code_carries_none(self) -> None:
+        """A timeout never reached the controller, so there is no code. That
+        must read as absent, not as zero."""
+        from app.domains.network_integration.providers.omada import _translate
+
+        class _NoCode(Exception):
+            code = "OMADA_TIMEOUT"
+
+        assert _translate(_NoCode("gave up")).provider_code is None
+
+    def test_a_bool_is_not_mistaken_for_a_vendor_code(self) -> None:
+        """``isinstance(True, int)`` is True in Python, and a gateway that
+        ever set this to a flag would otherwise store ``provider_code: 1``."""
+        from app.domains.network_integration.providers.omada import _translate
+
+        class _Boolish(Exception):
+            code = "OMADA_TIMEOUT"
+            provider_code = True
+
+        assert _translate(_Boolish("x")).provider_code is None
+
+    def test_partial_diagnostics_never_erase_fuller_ones(self) -> None:
+        error = ProviderError("x", code=ErrorCode.AUTHORIZATION_FAILED)
+        error.with_diagnostics(provider_code=-41501, request_snapshot={"a": 1})
+        error.with_diagnostics(request_snapshot={"a": 2})
+        assert error.provider_code == -41501
+        assert error.request_snapshot == {"a": 2}
+
+    async def test_the_snapshot_is_the_gateway_builder_output_not_a_copy(
+        self,
+    ) -> None:
+        """The snapshot is produced by ``build_authorize_body`` -- the same
+        pure function the gateway calls to make the request one layer down --
+        so it is the body, not a second transcription of it. A hand-written
+        dict here would be a *claim* about what was sent, and the field an
+        engineer is hunting is exactly the field a transcription would also
+        get wrong."""
+        from wyfy_device_gateway.controller_contract import PortalAuthContext
+        from wyfy_device_gateway.omada.portal import build_authorize_body
+
+        from app.domains.network_integration.providers.base import (
+            ProviderPortalContext,
+        )
+        from app.domains.network_integration.providers.omada import OmadaProvider
+
+        context = ProviderPortalContext(
+            client_mac="AA-BB-CC-DD-EE-FF",
+            site="site-1",
+            ap_mac="11:11:11:11:11:11",
+            ssid_name="Guest WiFi",
+            radio_id=1,
+        )
+        snapshot = OmadaProvider._authorize_snapshot(
+            PortalAuthContext(
+                client_mac=context.client_mac,
+                site=context.site,
+                ap_mac=context.ap_mac,
+                ssid_name=context.ssid_name,
+                radio_id=context.radio_id,
+            ),
+            duration_seconds=3600,
+            down_kbps=None,
+            up_kbps=None,
+        )
+        expected = build_authorize_body(
+            PortalAuthContext(
+                client_mac=context.client_mac,
+                site=context.site,
+                ap_mac=context.ap_mac,
+                ssid_name=context.ssid_name,
+                radio_id=context.radio_id,
+            ),
+            duration_seconds=3600,
+        )
+        assert snapshot == expected
+        # The redirect's own spelling goes on the wire, not the canonical one
+        # this platform stores. That difference is the reason the snapshot is
+        # worth keeping at all.
+        assert snapshot["clientMac"] == "AA-BB-CC-DD-EE-FF"
+        assert snapshot["authType"] == "4"
+
+    async def test_a_snapshot_that_cannot_be_built_never_fails_the_call(
+        self,
+    ) -> None:
+        """Diagnostics must not be able to cost a guest their internet. A
+        duration the builder rejects returns ``None`` here; ``_call`` raises
+        the real, translated error a moment later."""
+        from wyfy_device_gateway.controller_contract import PortalAuthContext
+
+        from app.domains.network_integration.providers.omada import OmadaProvider
+
+        assert (
+            OmadaProvider._authorize_snapshot(
+                PortalAuthContext(client_mac="AA:BB:CC:DD:EE:FF", site="s"),
+                duration_seconds=0,
+                down_kbps=None,
+                up_kbps=None,
+            )
+            is None
+        )

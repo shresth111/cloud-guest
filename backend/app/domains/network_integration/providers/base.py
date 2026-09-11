@@ -52,7 +52,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
     "NetworkProvider",
@@ -64,6 +64,7 @@ __all__ = [
     "ProviderPortalContext",
     "ProviderSite",
     "ProviderSsid",
+    "ProviderTlsObservation",
 ]
 
 
@@ -88,8 +89,55 @@ class ProviderConnectionConfig:
     auth_mode: str
     credentials: dict[str, str] = field(default_factory=dict)
     controller_id: str | None = None
-    verify_tls: bool = True
+    #: One of ``constants.ControllerTlsMode``: ``"strict"``, ``"pinned"`` or
+    #: ``"insecure"``. A ``str`` rather than the enum for the same reason
+    #: ``auth_mode`` is one -- this dataclass is the seam, and a provider
+    #: must be able to consume it without importing this domain's enums.
+    #:
+    #: This replaces a ``verify_tls: bool = True`` that no code in ``app/``
+    #: ever set. Being unreachable, it was permanently ``True``, which made
+    #: every self-signed controller -- i.e. almost every self-hosted Omada
+    #: install -- impossible to integrate. Defaulting it to ``False``
+    #: instead would have swapped that for "nothing is ever checked"; the
+    #: third value is what makes the honest answer available. See
+    #: ``constants.ControllerTlsMode``.
+    tls_mode: str = "strict"
+    #: Lowercase hex SHA-256 of the controller certificate's DER encoding.
+    #: Required by the provider when ``tls_mode`` is ``"pinned"``; ignored
+    #: otherwise. Public data -- a hash of a certificate the controller
+    #: hands to any caller -- so unlike ``credentials`` it is safe to log,
+    #: safe to store in plaintext and safe to return from an endpoint.
+    tls_pinned_sha256: str | None = None
     timeout_seconds: float = 15.0
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderTlsObservation:
+    """What the controller's TLS endpoint presented, right now.
+
+    Exists so the connect wizard can show an operator the fingerprint of the
+    box in front of them and ask them to confirm it. Asking an operator to
+    *produce* a fingerprint means asking them to run ``openssl`` against
+    their own controller, and the reliable outcome of that is that they pick
+    whichever option does not require it.
+
+    ``chain_trusted`` answers "would strict mode have worked", separately
+    from ``matches_pin``. Neither implies the other and a UI needs both: a
+    controller with a real certificate should be told it does not need to
+    pin at all.
+
+    ``subject`` / ``issuer`` / ``not_valid_after`` are best-effort. They are
+    parsed from the certificate for display and are ``None`` when parsing
+    fails -- a fingerprint that renders without a subject is still a usable
+    confirmation, and inventing a subject would not be.
+    """
+
+    fingerprint_sha256: str
+    chain_trusted: bool
+    matches_pin: bool | None = None
+    subject: str | None = None
+    issuer: str | None = None
+    not_valid_after: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,9 +236,23 @@ class ProviderPortalContext:
 
 @dataclass(frozen=True, slots=True)
 class ProviderAuthorizationResult:
+    """What the controller did with one authorization request.
+
+    ``request_snapshot`` is the exact body that went on the wire, field by
+    field, in the vendor's own spelling. It is on the *result* as well as on
+    ``exceptions.ProviderError`` because "the controller accepted a body we
+    did not intend to send" is a real outcome -- a successful authorization
+    against the wrong site still reads as success here -- and because a
+    caller that records it only on failure can never show an operator a
+    working request to compare a broken one against.
+
+    Opaque above this layer: ``service.py`` persists it without reading it.
+    """
+
     authorized: bool
     expires_at: datetime | None = None
     provider_code: str | None = None
+    request_snapshot: dict[str, Any] | None = None
 
 
 @runtime_checkable
@@ -245,6 +307,22 @@ class NetworkProvider(Protocol):
         self, config: ProviderConnectionConfig
     ) -> ProviderControllerInfo: ...
 
+    async def inspect_tls(
+        self, config: ProviderConnectionConfig
+    ) -> ProviderTlsObservation:
+        """Observe the controller's certificate without sending credentials.
+
+        Called by the pre-save probe and by Test Connection on a saved row,
+        on success *and* on failure -- the failing case is the one where the
+        operator most needs to see a fingerprint, because it is the case
+        where they are about to decide whether to pin it.
+
+        Must send no credential. It exists to be safe to call against an
+        address whose certificate is not trusted yet, which is the only
+        situation it is for.
+        """
+        ...
+
     async def list_sites(
         self, config: ProviderConnectionConfig
     ) -> list[ProviderSite]: ...
@@ -278,9 +356,11 @@ class NetworkProvider(Protocol):
 
         On a provider with no deauthorization (see
         :meth:`deauthorize_guest`), ``duration_seconds`` is not a default
-        -- it is the *only* thing that ever ends this access. Callers must
-        size it accordingly; ``constants.MAX_SESSION_DURATION_SECONDS``
-        bounds it at 24 hours for that reason and not for tidiness.
+        -- it is the *only* thing that ever ends this access, and callers
+        must size it accordingly. Omada is no longer such a provider.
+        ``constants.MAX_SESSION_DURATION_SECONDS`` bounds it at 7 days,
+        which is a policy bound on an unattended grant rather than a
+        technical limit or tidiness.
         """
         ...
 
