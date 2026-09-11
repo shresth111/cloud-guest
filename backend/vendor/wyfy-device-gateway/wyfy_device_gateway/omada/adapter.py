@@ -38,14 +38,22 @@ The only portal-authorization endpoint with primary TP-Link documentation is
 operator login. ``PortalAuthContext`` is literally the shape of that
 endpoint's redirect parameters.
 
-There are references in circulation to an Open API equivalent at
-``/openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/{clientMac}/auth``,
-but we could not tie that path to any primary TP-Link source or to any
-open-source client that calls it, so it is deliberately **not** implemented.
-Contract section 1's rule -- do not invent Omada API endpoints -- binds
-hardest on the one call that decides whether a paying guest gets internet.
-Guessing here and being wrong means a guest sits at a spinner while the
-controller 404s.
+An Open API equivalent does exist, and unlike when this was first written it
+now has a primary source: ``authClient``,
+``POST /openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/{clientMac}/auth``,
+in TP-Link's own OpenAPI specification at
+<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>. It is still
+deliberately **not** used for authorization, for a reason the spec itself
+supplies: it takes **no request body**, only the three path parameters. It
+cannot carry a duration, a rate limit, an SSID or an AP MAC. It is the
+"authorize this MAC" button from the controller's client list, not the
+external-portal grant. Authorizing a paying guest for a specific length of
+time is exactly what the legacy ``extPortal/auth`` endpoint is for, and it
+is the only one of the two that can express it.
+
+Its inverse, ``cancelAuthClient``, *is* used -- see ``deauthorize_guest``
+below. Revocation needs no duration, so the bodyless shape costs nothing
+there.
 
 So: an integration in ``openapi`` mode that also stores operator credentials
 authorizes through the legacy endpoint. One that does not gets

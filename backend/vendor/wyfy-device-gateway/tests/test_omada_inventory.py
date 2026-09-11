@@ -218,7 +218,15 @@ def test_device_type_normalization(raw, expected):
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("connected", "connected"), ("OFFLINE", "disconnected"), (1, "connected"),
-     (0, "disconnected"), (3, "pending"), ("adopting", "pending"), (None, "unknown")],
+     (0, "disconnected"), (2, "pending"), ("adopting", "pending"),
+     # VERIFIED against TP-Link's OpenAPI spec, ``DeviceInfo.status``:
+     # "3: Heartbeat Missed; 4: Isolated". Both are a device that has stopped
+     # answering, not one mid-adoption. The string map here always agreed;
+     # the integer map -- the one that actually runs, since the spec types
+     # this field as an integer -- said "pending" and was wrong.
+     (3, "disconnected"), (4, "disconnected"),
+     ("heartbeatmissed", "disconnected"), ("isolated", "disconnected"),
+     (None, "unknown")],
 )
 def test_device_status_normalization(raw, expected):
     assert normalize_device_status(raw) == expected
@@ -355,3 +363,95 @@ async def test_inventory_in_legacy_mode_raises_unsupported_with_a_useful_message
     assert "Open API" in str(excinfo.value)
     # It never even opened a connection.
     assert controller.requests == []
+
+
+# --- fields re-verified against TP-Link's published OpenAPI specification ---
+# <https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>. The rows below
+# use the field names and value ranges that specification actually documents,
+# rather than the ones this package originally guessed at.
+
+
+def test_signal_dbm_reads_rssi_and_never_the_0_to_5_bar_count():
+    """``rssi`` is documented "Signal strength, unit: dBm"; ``signalRank`` is
+    a 0-5 level and ``signalLevel`` a 0-100 percentage. Preferring either of
+    the latter would report a bar count as dBm -- wrong, and plausible enough
+    on screen that nobody would query it."""
+    parsed = parse_client(
+        {"mac": "AABBCCDDEEFF", "signalRank": 4, "signalLevel": 82, "rssi": -47}
+    )
+    assert parsed is not None
+    assert parsed.signal_dbm == -47
+
+
+def test_signal_dbm_is_none_when_the_controller_gives_no_dbm_figure():
+    parsed = parse_client({"mac": "AABBCCDDEEFF", "signalRank": 4, "signalLevel": 82})
+    assert parsed is not None
+    assert parsed.signal_dbm is None
+
+
+@pytest.mark.parametrize(
+    ("auth_status", "expected"),
+    [
+        (2, True),  # AUTHORIZED
+        (1, False),  # PENDING -- reached the portal, authentication failed
+        (0, False),  # CONNECTED -- no authentication method at all
+        (3, None),  # AUTH-FREE -- has access, but nothing authorized it
+    ],
+)
+def test_is_authorized_reads_the_documented_auth_status_enum(auth_status, expected):
+    parsed = parse_client({"mac": "AABBCCDDEEFF", "authStatus": auth_status})
+    assert parsed is not None
+    assert parsed.is_authorized is expected
+
+
+def test_spec_shaped_client_row_parses_end_to_end():
+    """Exactly the field names TP-Link's ``OpenApi Client Info`` documents --
+    note there is no ``connectTime``, no ``download``/``upload`` and no
+    ``authorized`` here, which is what the earlier parser was looking for."""
+    parsed = parse_client(
+        {
+            "mac": "11:22:33:44:55:66",
+            "hostName": "Pixel",
+            "ip": "10.0.0.99",
+            "ssid": "Wyfy Guest",
+            "apMac": "AA-BB-CC-DD-EE-FF",
+            "radioId": 1,
+            "vid": 30,
+            "guest": True,
+            "authStatus": 2,
+            "uptime": 1200,
+            "trafficDown": 5000,
+            "trafficUp": 900,
+            "rssi": -55,
+        }
+    )
+    assert parsed is not None
+    assert parsed.mac == "11-22-33-44-55-66"
+    assert parsed.name == "Pixel"
+    assert parsed.is_guest is True
+    assert parsed.is_authorized is True
+    assert parsed.duration_seconds == 1200
+    assert parsed.traffic_down_bytes == 5000
+    assert parsed.traffic_up_bytes == 900
+    assert parsed.signal_dbm == -55
+
+
+def test_spec_shaped_device_row_parses_and_admits_what_is_missing():
+    """``DeviceInfo`` documents ``status`` as an integer and carries no client
+    count at all -- so ``client_count`` is honestly ``None``, not zero."""
+    parsed = parse_device(
+        {
+            "mac": "AA-BB-CC-DD-EE-F0",
+            "name": "Lobby AP",
+            "type": "ap",
+            "model": "EAP245(EU) v3.0",
+            "ip": "10.0.0.5",
+            "status": 1,
+            "firmwareVersion": "5.0.9",
+        }
+    )
+    assert parsed is not None
+    assert parsed.status == "connected"
+    assert parsed.device_type == "ap"
+    assert parsed.firmware_version == "5.0.9"
+    assert parsed.client_count is None

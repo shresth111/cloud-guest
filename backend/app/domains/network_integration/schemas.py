@@ -783,6 +783,36 @@ class PortalAuthorizeRequest(BaseModel):
     redirect shapes are accepted: the EAP/AP path
     (``ap_mac``/``ssid_name``/``radio_id``) and the gateway path
     (``gateway_mac``/``vid``).
+
+    ``client_ip`` (CR-004) is one of those pass-through parameters and is
+    the one with a trap in it, so it is spelled out here:
+
+    * **Top level, not nested.** This model takes pydantic's default
+      ``extra="ignore"``, so a caller that posts
+      ``{"context": {"client_ip": ...}}`` -- or any other nesting -- has
+      the value dropped in silence and still gets a 2xx. That is exactly
+      how the one shipped cross-repo bug in this integration behaved, and
+      it is why the tests assert against the parsed model rather than
+      against the JSON a caller believes it sent.
+    * **Captured, never derived.** It carries whatever ``clientIp`` the
+      controller put on its own redirect. The server must not fill it in
+      from ``request.client.host`` or an ``X-Forwarded-For`` hop: this
+      endpoint is reached through a proxy and a NAT, so those addresses are
+      not the guest's, and authorizing a wrong address means authorizing
+      the wrong device or nobody. Absent means absent -- it travels as
+      ``None`` and the provider omits the field, which is also precisely
+      the right body for a controller older than v6.2.10, where the
+      parameter does not exist at all.
+    * **It may be stale, and that is accepted deliberately.** The value is
+      captured at redirect time; authorization happens after the guest
+      finishes OTP, which can be minutes later, so a DHCP lease that
+      changed in between makes this a stale address. Sending the captured
+      value is still the correct behaviour: the alternative is a derived
+      one that is wrong on every proxied request rather than on a rare
+      re-lease, and the controller is the component that can tell.
+
+    ``max_length`` is 45 so a full IPv6 form (including an IPv4-mapped
+    ``::ffff:255.255.255.255``) fits.
     """
 
     session_id: str
@@ -798,6 +828,7 @@ class PortalAuthorizeRequest(BaseModel):
     vid: int | None = Field(default=None, ge=0, le=4094)
     t: str | None = Field(default=None, max_length=64)
     redirect_url: str | None = Field(default=None, max_length=2048)
+    client_ip: str | None = Field(default=None, max_length=45)
 
 
 class PortalAuthorizeResponse(BaseModel):

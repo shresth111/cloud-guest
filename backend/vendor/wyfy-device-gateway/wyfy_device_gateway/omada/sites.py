@@ -3,23 +3,45 @@
 Both are inventory operations, so both are Open API only -- a hotspot
 operator credential cannot see them (see ``auth.py``'s docstring on why).
 
-## Sourcing
+## Sourcing -- VERIFIED (upgraded 2026-09-10)
 
-``GET /openapi/v1/{omadacId}/sites`` is **corroborated, not primary**:
-it is what the community client at
-<https://github.com/bullitt186/ha-omada-open-api> uses
-(``custom_components/omada_open_api/const.py``: ``API_SITES =
-"/openapi/v1/{omada_id}/sites"``), and TP-Link's own *How to Create Site in
-Omada Controller via Open API*
-(<https://support.omadanetworks.com/uk/document/109315/>) describes creating
-a site through the Open API and confirms the envelope returns ``errorCode``
-0 plus a site id -- but that page defers the exact path to the controller's
-built-in Online API Document, which is not publicly reachable.
+All three paths are **VERIFIED against a primary TP-Link source**: TP-Link's
+own OpenAPI 3.0.1 specification, served unauthenticated from its Open API
+cloud gateway at
+<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>
+and rendered as the Swagger UI at ``/doc.html`` on the same host, with human
+documentation at <https://omada-northbound-docs.tplinkcloud.com/>.
 
-SSIDs are a two-step walk -- WLAN groups first, then the SSIDs inside each --
-and are corroborated the same way, from the community client's
-``/sites/{siteId}/wireless-network/wlans`` and
-``/wireless-network/wlans/{wlanId}/ssids``.
+* ``GET /openapi/v1/{omadacId}/sites`` -- "Get site list". ``page`` and
+  ``pageSize`` are **required** query parameters (1-1000).
+* ``GET .../sites/{siteId}/wireless-network/wlans`` -- "Get WLAN Group list".
+  **Not paginated**: its ``result`` is a bare array, not the usual
+  ``{totalRows, currentPage, currentSize, data}`` grid. ``extract_page``
+  already accepts both shapes, so the extra ``page``/``pageSize`` this sends
+  are simply ignored.
+* ``GET .../wlans/{wlanId}/ssids`` -- "Get SSID list of Wlan group",
+  paginated normally.
+
+TP-Link marks the last two **deprecated**: "'WLAN Group' is the legacy name
+of 'AP Group'. This endpoint will be deprecated in future releases. Please
+use Get AP Group list." The replacements are ``GET .../ap-groups`` and
+``GET /openapi/v2/{omadacId}/sites/{siteId}/wireless-network/ssids`` ("Get
+SSID list by site"), the latter collapsing this two-step walk into one call.
+Not migrated yet, deliberately: the deprecated pair is present in every
+firmware we target including the oldest, the replacement is not, and this is
+not the moment to raise a version floor for a cleaner call graph. Revisit
+once there is a real controller to test both against.
+
+## What the spec says is NOT here
+
+``SiteSummaryInfo`` has no ``deviceCount`` and no ``clientCount``, and
+``SsidOpenApiVO`` has no ``portalEnable``/``portalEnabled``. So
+``ControllerSite.device_count`` / ``.client_count`` and
+``ControllerSsid.portal_enabled`` are ``None`` on a spec-conformant
+controller. They stay in the parser as harmless fallbacks, but a caller must
+not read ``portal_enabled is None`` as "portal is off" -- the nearest
+documented field is ``guestNetEnable``, which is a different setting and is
+deliberately not substituted for it.
 
 ## Why ``get_site`` filters a list instead of fetching one site
 
@@ -42,7 +64,7 @@ from .client import OmadaHttpClient
 from .errors import OmadaSiteNotFoundError
 from .types import coerce_bool, coerce_int, coerce_str, extract_page
 
-#: CORROBORATED (community client), not primary.
+#: VERIFIED (TP-Link OpenAPI spec). See module docstring.
 SITES_PATH = "/openapi/v1/{omadac_id}/sites"
 WLANS_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/wireless-network/wlans"
 SSIDS_PATH = (

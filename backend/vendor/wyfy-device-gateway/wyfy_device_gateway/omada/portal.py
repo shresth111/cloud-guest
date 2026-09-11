@@ -59,6 +59,25 @@ rejected or expire instantly -- a loud, immediately-obvious failure on first
 contact with real hardware, not a silent one. That is the main reason it is
 safe to ship the inference and verify it on the first real controller.
 
+## ``clientIp`` is required on v6.2.10+ and absent before it
+
+**VERIFIED**, and a genuine version split. Doc 132060 (v6.2.10 or above)
+says the body "must contain the following parameters" and lists
+``clientIp`` second in both the EAP and the Gateway shape:
+
+    For EAP: {"clientMac":"...","clientIp":"...","apMac":"...","ssidName":
+    "...","radioId":"...","time":"...","authType":"4","originUrl":"", ...}
+
+and the redirect it documents carries it too
+(``...?clientMac=...&clientIp=CLIENT_IP&apMac=...``). Doc 13080
+(v5.0.15-v6.2.0) does not contain the string ``clientIp`` at all -- not in
+the redirect, not in the body, not in the parameter table.
+
+So it is sent only when ``PortalAuthContext.client_ip`` is populated, which
+is exactly when the controller itself supplied it on the redirect. That
+makes the same code correct on both sides of the split without us having to
+predict a version.
+
 ## Bandwidth limits are v6.2.10+ only
 
 ``downloadRateLimitKbps`` / ``uploadRateLimitKbps`` /
@@ -90,9 +109,16 @@ from .auth import LEGACY_AUTHORIZE_PATH
 from .client import OmadaHttpClient
 from .errors import OmadaAuthorizationError
 from .redaction import sanitize_detail
+from .types import normalize_mac
 
 #: VERIFIED (TP-Link docs 13080 / 132060): external portal / RADIUS-free auth.
+#: Corroborated a second way by the Open API spec, whose
+#: ``AuthClientOpenApiVO.authType`` enumerates "4: External Portal Server".
 AUTH_TYPE_EXTERNAL_PORTAL = 4
+
+#: Sanity ceiling on a single authorization, 24 hours. A caller passing a
+#: nonsense duration (a timestamp mistaken for a duration, say) would
+#: otherwise ask the controller for a session lasting decades.
 
 #: Sanity ceiling on a single authorization. A caller passing a nonsense
 #: duration (a timestamp mistaken for a duration, say) would otherwise ask
@@ -139,6 +165,13 @@ def build_authorize_body(
         # have seen.
         "authType": str(AUTH_TYPE_EXTERNAL_PORTAL),
     }
+
+    # VERIFIED (doc 132060): required on v6.2.10+, and absent from doc 13080
+    # entirely. Sent only when the redirect actually carried it, which is the
+    # only situation in which we have a trustworthy value -- see
+    # ``PortalAuthContext.client_ip``.
+    if ctx.client_ip:
+        body["clientIp"] = ctx.client_ip
 
     is_gateway_path = ctx.gateway_mac is not None or ctx.vid is not None
     if is_gateway_path:
@@ -212,11 +245,19 @@ async def authorize_client(
         expires_at=started + timedelta(seconds=capped_seconds),
         provider_code=detail,
     )
-
+# NOTE: the Open API revocation path (`POST .../hotspot/clients/{mac}/unauth`,
+# `operationId: cancelAuthClient`) is real and is sourced in CHANGE-REQUESTS.md
+# CR-001. It is deliberately NOT implemented here. `adapter.deauthorize_guest`
+# revokes through the legacy hotspot session instead -- the path that was
+# actually run against a controller -- and this module briefly carried a second
+# `deauthorize_client` of the same name that nothing called. Wiring the Open API
+# path is its own change, and it needs its own run against real hardware before
+# anything claims it works.
 
 __all__ = [
     "AUTH_TYPE_EXTERNAL_PORTAL",
     "MAX_DURATION_SECONDS",
     "authorize_client",
     "build_authorize_body",
+    "deauthorize_client",
 ]

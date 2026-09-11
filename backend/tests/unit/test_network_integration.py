@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -107,6 +107,7 @@ from app.domains.network_integration.providers.base import (
     ProviderConnectionConfig,
     ProviderControllerInfo,
     ProviderDevice,
+    ProviderPortalContext,
     ProviderSite,
     ProviderSsid,
     ProviderTlsObservation,
@@ -468,6 +469,12 @@ class FakeProvider:
     calls: list[str] = field(default_factory=list)
     authorize_result: ProviderAuthorizationResult | None = None
     clients: list[ProviderClient] = field(default_factory=list)
+    # Every `ProviderPortalContext` this fake was handed, in order. The
+    # seam is where `service.py` hands the redirect's own values over, so
+    # it is the only place a test can see what the service decided to
+    # pass on -- an assertion on the outcome cannot tell a carried
+    # `client_ip` from a dropped one.
+    contexts: list[ProviderPortalContext] = field(default_factory=list)
     #: Every `ProviderConnectionConfig` handed to an identity call, so a test
     #: can assert what the service actually sent -- `controller_id` in
     #: particular, which a cloud-managed controller cannot work without.
@@ -549,6 +556,7 @@ class FakeProvider:
     async def authorize_guest(
         self, config, context, *, duration_seconds, down_kbps=None, up_kbps=None
     ) -> ProviderAuthorizationResult:
+        self.contexts.append(context)
         self._maybe_raise("authorize_guest")
         return self.authorize_result or ProviderAuthorizationResult(
             authorized=True,
@@ -2608,6 +2616,353 @@ class TestPortalAuthorize:
 
 
 # ============================================================================
+# CR-004: the redirect's `clientIp`, carried and never invented
+# ============================================================================
+
+
+class TestPortalClientIp:
+    """One value, four hops, and two ways to get it wrong.
+
+    TP-Link doc 132060 (controller v6.2.10 and above) lists ``clientIp``
+    among the parameters the external-portal authorize body "must
+    contain", in both the EAP and the Gateway shape, and puts it on the
+    302 that sends the guest to us. Doc 13080 (v5.0.15-v6.2.0) does not
+    contain the string at all. So the field is optional the whole way
+    down: present, it satisfies current firmware; absent, the request is
+    byte-identical to the one older controllers have always received.
+
+    The two failure modes these tests exist to catch:
+
+    * **Deriving it.** The obvious "fix" for an absent ``client_ip`` is
+      ``request.client.host`` or the first ``X-Forwarded-For`` hop. Both
+      are wrong here -- this endpoint is behind a proxy and behind the
+      venue's NAT, so those are infrastructure addresses, and a
+      confidently wrong client IP authorizes the wrong device or nobody.
+      A missing value must stay missing.
+    * **Nesting it.** ``PortalAuthorizeRequest`` takes pydantic's default
+      ``extra="ignore"``, so a body that puts the field one level down is
+      dropped in silence and still answers 2xx -- which is exactly how the
+      one shipped cross-repo bug in this integration behaved. The wire
+      tests below therefore post real JSON through a real FastAPI app and
+      assert on what the *service* was called with, not on the status code.
+    """
+
+    # -- request body -> service ------------------------------------------
+
+    def _body(self, **overrides) -> dict:
+        body = {
+            "session_id": str(uuid.uuid4()),
+            "organization_id": str(uuid.uuid4()),
+            "location_id": str(uuid.uuid4()),
+            "provider": "omada",
+            "client_mac": "AA-BB-CC-DD-EE-FF",
+            "site": "site-1",
+            "ap_mac": "11:11:11:11:11:11",
+            "ssid_name": "Guest WiFi",
+            "radio_id": 1,
+            "t": "1725945600000",
+            "redirect_url": "https://example.com/welcome",
+        }
+        body.update(overrides)
+        return body
+
+    def test_the_schema_reads_client_ip_from_the_top_level(self) -> None:
+        from app.domains.network_integration.schemas import PortalAuthorizeRequest
+
+        request = PortalAuthorizeRequest.model_validate(
+            self._body(client_ip="10.0.5.23")
+        )
+        assert request.client_ip == "10.0.5.23"
+
+    def test_a_nested_client_ip_is_dropped_and_the_body_still_parses(self) -> None:
+        """The silent-drop trap, pinned rather than described.
+
+        This asserts the *current, deliberate* behaviour: a nested value is
+        not read. It is here so that a frontend written against the wrong
+        shape fails in a test rather than in a venue, where the symptom is
+        a 200 and a guest with no internet.
+        """
+        from app.domains.network_integration.schemas import PortalAuthorizeRequest
+
+        request = PortalAuthorizeRequest.model_validate(
+            self._body(context={"client_ip": "10.0.5.23"})
+        )
+        assert request.client_ip is None
+
+    def test_an_omitted_client_ip_defaults_to_none(self) -> None:
+        from app.domains.network_integration.schemas import PortalAuthorizeRequest
+
+        assert PortalAuthorizeRequest.model_validate(self._body()).client_ip is None
+
+    def test_a_full_length_ipv6_fits_and_anything_longer_is_refused(self) -> None:
+        """45 is the longest legal textual IPv6, including the IPv4-mapped
+        form -- not a round number picked for tidiness."""
+        from app.domains.network_integration.schemas import PortalAuthorizeRequest
+
+        longest = "0000:0000:0000:0000:0000:ffff:255.255.255.255"
+        assert len(longest) == 45
+        parsed = PortalAuthorizeRequest.model_validate(self._body(client_ip=longest))
+        assert parsed.client_ip == longest
+
+        with pytest.raises(Exception):  # noqa: B017 -- pydantic ValidationError
+            PortalAuthorizeRequest.model_validate(self._body(client_ip="a" * 46))
+
+    def _wire(self):
+        """A real FastAPI app over the portal route, with a recording service.
+
+        Following ``tests/unit/test_demo_booking.py::make_client``. The
+        point is to exercise the JSON body the backend actually parses --
+        a ``model_validate`` call cannot show that the route hands the
+        parsed value on, and that hop is where a pass-through field is
+        most easily forgotten.
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.common.exceptions import register_exception_handlers
+        from app.domains.network_integration.dependencies import (
+            get_network_integration_service,
+        )
+        from app.domains.network_integration.router import portal_router
+        from app.domains.network_integration.service import (
+            PortalAuthorizationOutcome,
+        )
+
+        calls: list[dict] = []
+
+        class _RecordingService:
+            async def authorize_portal_client(self, **kwargs):
+                calls.append(kwargs)
+                return PortalAuthorizationOutcome(
+                    authorized=True,
+                    provider="omada",
+                    expires_at=None,
+                    redirect_url=kwargs.get("redirect_url"),
+                )
+
+        app = FastAPI()
+        register_exception_handlers(app)
+        app.include_router(portal_router, prefix="/api/v1")
+        app.dependency_overrides[get_network_integration_service] = (
+            lambda: _RecordingService()
+        )
+        return TestClient(app, raise_server_exceptions=False), calls
+
+    def test_a_top_level_client_ip_reaches_the_service_call(self) -> None:
+        client, calls = self._wire()
+        response = client.post(
+            "/api/v1/network-integrations/portal/authorize",
+            json=self._body(client_ip="10.0.5.23"),
+        )
+        assert response.status_code == 200
+        assert calls[0]["client_ip"] == "10.0.5.23"
+
+    def test_a_nested_client_ip_reaches_the_service_as_none(self) -> None:
+        """200 with the value silently gone. That is the bug shape."""
+        client, calls = self._wire()
+        response = client.post(
+            "/api/v1/network-integrations/portal/authorize",
+            json=self._body(client={"ip": "10.0.5.23"}),
+        )
+        assert response.status_code == 200
+        assert calls[0]["client_ip"] is None
+
+    def test_the_source_address_is_never_substituted_for_a_missing_one(self) -> None:
+        """The load-bearing negative test.
+
+        A body with no ``client_ip``, sent from an address, with an
+        ``X-Forwarded-For`` header sitting right there. If anyone ever
+        "improves" this by defaulting to either, this fails -- which is the
+        entire reason it exists, because the improved version looks more
+        complete and authorizes the wrong device.
+        """
+        client, calls = self._wire()
+        response = client.post(
+            "/api/v1/network-integrations/portal/authorize",
+            json=self._body(),
+            headers={"X-Forwarded-For": "203.0.113.9, 198.51.100.4"},
+        )
+        assert response.status_code == 200
+        assert calls[0]["client_ip"] is None
+
+    # -- service -> provider seam -----------------------------------------
+
+    def _setup(self):
+        org, location = uuid.uuid4(), uuid.uuid4()
+        session_id = uuid.uuid4()
+        repo = FakeRepository()
+        repo.add(_integration(organization_id=org, location_id=location))
+        provider = FakeProvider()
+        lookup = FakeGuestSessionLookup(
+            {session_id: FakeGuestSession(session_id, org, location)}
+        )
+        service = _service(repo, provider=provider, guest_lookup=lookup)
+        return service, repo, provider, org, location, session_id
+
+    async def _authorize(self, service, org, location, session_id, **extra):
+        return await service.authorize_portal_client(
+            session_id=session_id,
+            organization_id=org,
+            location_id=location,
+            provider="omada",
+            client_mac="AA-BB-CC-DD-EE-FF",
+            site="site-1",
+            ap_mac="11:11:11:11:11:11",
+            ssid_name="Guest WiFi",
+            radio_id=1,
+            t="1725945600000",
+            redirect_url="https://example.com/welcome",
+            **extra,
+        )
+
+    async def test_the_service_carries_client_ip_to_the_provider_context(self) -> None:
+        service, _repo, provider, org, location, session_id = self._setup()
+        await self._authorize(
+            service, org, location, session_id, client_ip="10.0.5.23"
+        )
+        assert provider.contexts[0].client_ip == "10.0.5.23"
+
+    async def test_the_context_is_otherwise_identical_with_and_without_it(
+        self,
+    ) -> None:
+        """Absent means absent, and means nothing else moved.
+
+        Compared as whole dataclasses rather than field by field, so a
+        future field that starts being dropped -- or invented -- when
+        ``client_ip`` is missing shows up here too.
+        """
+        service, repo, provider, org, location, session_id = self._setup()
+        await self._authorize(service, org, location, session_id)
+        without = provider.contexts[0]
+
+        service2, repo2, provider2, org2, location2, session2 = self._setup()
+        await self._authorize(
+            service2, org2, location2, session2, client_ip="10.0.5.23"
+        )
+        with_ip = provider2.contexts[0]
+
+        assert without == ProviderPortalContext(
+            client_mac="AA-BB-CC-DD-EE-FF",
+            site="site-1",
+            ap_mac="11:11:11:11:11:11",
+            ssid_name="Guest WiFi",
+            radio_id=1,
+            gateway_mac=None,
+            vid=None,
+            t="1725945600000",
+            redirect_url="https://example.com/welcome",
+            client_ip=None,
+        )
+        assert with_ip == replace(without, client_ip="10.0.5.23")
+
+        # And the recorded outcome of the two runs is the same, so the
+        # new field changed the request to the controller and nothing else.
+        assert len(repo.authorizations) == len(repo2.authorizations) == 1
+        assert (
+            repo.authorizations[0].status
+            == repo2.authorizations[0].status
+            == AuthorizationStatus.AUTHORIZED.value
+        )
+
+    async def test_the_gateway_shape_carries_it_too(self) -> None:
+        """The doc requires ``clientIp`` in the Gateway body as well as the
+        EAP one, so the gateway-originated redirect must not lose it."""
+        service, _repo, provider, org, location, session_id = self._setup()
+        await service.authorize_portal_client(
+            session_id=session_id,
+            organization_id=org,
+            location_id=location,
+            provider="omada",
+            client_mac="AA-BB-CC-DD-EE-FF",
+            site="site-1",
+            gateway_mac="22:22:22:22:22:22",
+            vid=10,
+            client_ip="10.0.5.23",
+        )
+        assert provider.contexts[0].gateway_mac == "22:22:22:22:22:22"
+        assert provider.contexts[0].client_ip == "10.0.5.23"
+
+    # -- provider -> gateway ----------------------------------------------
+
+    def _omada(self):
+        """``OmadaProvider`` with the one outbound call intercepted.
+
+        ``_call`` is the single point every gateway call goes through, so
+        overriding it stops the URL re-validation and the adapter lookup
+        without stubbing out the field mapping that is under test.
+        """
+        from app.domains.network_integration.providers.omada import OmadaProvider
+
+        captured: dict = {}
+
+        class _Capturing(OmadaProvider):
+            async def _call(self, config, method, *args, **kwargs):
+                captured["method"] = method
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+                class _Result:
+                    authorized = True
+                    expires_at = None
+                    provider_code = None
+
+                return _Result()
+
+        config = ProviderConnectionConfig(
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode=ControllerAuthMode.OPENAPI.value,
+            credentials={"client_id": "a", "client_secret": "b"},
+        )
+        return _Capturing(), config, captured
+
+    async def test_the_provider_hands_client_ip_to_the_gateway_context(self) -> None:
+        """The last hop, against the gateway's real dataclass.
+
+        Skipped rather than faked when the gateway is absent: this file's
+        header promises the suite runs without that package installed, and
+        this is the one assertion that genuinely needs it -- the field name
+        being checked is the vendor contract's, so asserting it against a
+        local stand-in would prove nothing.
+        """
+        pytest.importorskip("wyfy_device_gateway.controller_contract")
+        from wyfy_device_gateway.controller_contract import PortalAuthContext
+
+        provider, config, captured = self._omada()
+        await provider.authorize_guest(
+            config,
+            ProviderPortalContext(
+                client_mac="AA:BB:CC:DD:EE:FF",
+                site="site-1",
+                ap_mac="11:11:11:11:11:11",
+                ssid_name="Guest WiFi",
+                radio_id=1,
+                client_ip="10.0.5.23",
+            ),
+            duration_seconds=3600,
+        )
+        assert captured["method"] == "authorize_guest"
+        gateway_context = captured["args"][0]
+        assert isinstance(gateway_context, PortalAuthContext)
+        assert gateway_context.client_ip == "10.0.5.23"
+
+    async def test_the_gateway_context_carries_none_when_the_redirect_had_none(
+        self,
+    ) -> None:
+        pytest.importorskip("wyfy_device_gateway.controller_contract")
+
+        provider, config, captured = self._omada()
+        await provider.authorize_guest(
+            config,
+            ProviderPortalContext(
+                client_mac="AA:BB:CC:DD:EE:FF",
+                site="site-1",
+                ap_mac="11:11:11:11:11:11",
+            ),
+            duration_seconds=3600,
+        )
+        gateway_context = captured["args"][0]
+        assert gateway_context.client_ip is None
 # The External Portal Server URL an operator pastes into their controller
 # ============================================================================
 

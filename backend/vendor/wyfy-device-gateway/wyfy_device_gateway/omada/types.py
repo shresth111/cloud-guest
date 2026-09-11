@@ -298,19 +298,28 @@ _DEVICE_STATUS_BY_NAME: dict[str, str] = {
     "isolated": "disconnected",
 }
 
-# INFERRED, unverified: Omada's numeric device-status enum is documented only
-# in the controller's own Online API Document. 0 = disconnected and 1 =
-# connected are consistent across every community sample we found; the
-# adopting/provisioning range is grouped into "pending" because those are all
-# transitional states and the contract's vocabulary has one bucket for them.
-# Worst case a transitional device shows as "pending" instead of a more
-# specific transitional label -- again, display only.
+# VERIFIED (TP-Link's OpenAPI spec, ``DeviceInfo.status``): "Device status
+# should be a value as follows: 0: Disconnected; 1: Connected; 2: Pending;
+# 3: Heartbeat Missed; 4: Isolated".
+#
+# Note this map used to send 3 and 4 to "pending", which contradicted the
+# name map right above it -- that one has always sent "heartbeatmissed" and
+# "isolated" to "disconnected". The name map was right and the code map was
+# wrong, and since the spec types ``status`` as an *integer* the wrong branch
+# is the one that would actually have run. A heartbeat-missed AP is an AP
+# that has stopped answering; calling it "pending" reads as "still being
+# adopted, give it a minute" and would have hidden a real outage on the
+# customer's own inventory table.
+#
+# 5 is not in TP-Link's enumeration and is kept only as a harmless catch for
+# a firmware that extends it; anything unrecognised falls through to
+# "unknown" rather than being guessed at.
 _DEVICE_STATUS_BY_CODE: dict[int, str] = {
     0: "disconnected",
     1: "connected",
     2: "pending",
-    3: "pending",
-    4: "pending",
+    3: "disconnected",
+    4: "disconnected",
     5: "pending",
 }
 

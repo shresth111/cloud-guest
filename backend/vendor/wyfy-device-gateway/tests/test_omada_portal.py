@@ -11,6 +11,7 @@ from __future__ import annotations
 import random
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from wyfy_device_gateway.controller_contract import (
@@ -20,6 +21,7 @@ from wyfy_device_gateway.controller_contract import (
 from wyfy_device_gateway.omada.adapter import OmadaControllerAdapter
 from wyfy_device_gateway.omada.errors import (
     OmadaAuthorizationError,
+    OmadaError,
     OmadaUnsupportedApiError,
 )
 from wyfy_device_gateway.omada.portal import MAX_DURATION_SECONDS, build_authorize_body
@@ -29,6 +31,7 @@ from omada_support import (
     OMADAC_ID,
     SESSION_COOKIE_VALUE,
     FakeOmadaController,
+    envelope,
     make_creds,
     no_sleep,
 )

@@ -531,6 +531,11 @@ class OmadaProvider:
             vid=context.vid,
             t=context.t,
             redirect_url=context.redirect_url,
+            # CR-004. Passed straight through from the redirect, never
+            # synthesised: the gateway omits ``clientIp`` from the body
+            # when this is ``None``, which is what keeps a pre-v6.2.10
+            # controller's request byte-identical to what it was.
+            client_ip=context.client_ip,
         )
         snapshot = self._authorize_snapshot(
             gateway_context,
