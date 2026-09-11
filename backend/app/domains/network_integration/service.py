@@ -978,6 +978,7 @@ class NetworkIntegrationService:
         name: str,
         base_url: str,
         auth_mode: str,
+        controller_id: str | None = None,
         location_id: uuid.UUID | None = None,
         external_site_id: str | None = None,
         external_site_name: str | None = None,
@@ -1063,6 +1064,12 @@ class NetworkIntegrationService:
             is_enabled=is_enabled,
             base_url=validated.base_url,
             auth_mode=mode.value,
+            # Stored as given when supplied, and left None otherwise so the
+            # first successful identity call still discovers and persists it
+            # (`test_integration_connection` writes both identity columns).
+            # Required only for a cloud-managed controller, where there is
+            # nothing to discover.
+            controller_id=(controller_id or None),
             tls_mode=trust_mode.value,
             tls_pinned_sha256=pinned,
             # Only a decision that departs from the default is a decision
@@ -1130,6 +1137,7 @@ class NetworkIntegrationService:
         controller_model: str,
         session_duration_seconds: int,
         sync_interval_seconds: int,
+        controller_id: str | None = None,
         serial_number: str | None = None,
         mac_address: str | None = None,
         external_site_id: str | None = None,
@@ -1200,6 +1208,7 @@ class NetworkIntegrationService:
             name=name,
             base_url=base_url,
             auth_mode=auth_mode,
+            controller_id=controller_id,
             location_id=location_id,
             external_site_id=external_site_id,
             external_site_name=external_site_name,
@@ -1393,6 +1402,20 @@ class NetworkIntegrationService:
                 updates["controller_id"] = None
                 updates["controller_version"] = None
 
+        # Applied AFTER the base_url reset above, so an operator who changes
+        # the address and supplies the new controller's id in one request gets
+        # the id they typed rather than the reset to None. This is the only
+        # way to repair a cloud-managed row whose id is wrong or missing:
+        # nothing can rediscover it, because the cloud edge's address fronts
+        # every controller in the region.
+        if "controller_id" in fields and fields["controller_id"] is not None:
+            supplied_id = str(fields["controller_id"]).strip()
+            if supplied_id and supplied_id != integration.controller_id:
+                updates["controller_id"] = supplied_id
+                changed.append("controller_id")
+                # The version was read from whatever the old id identified.
+                updates["controller_version"] = None
+
         target_site = integration.external_site_id
         if "external_site_id" in fields:
             target_site = (
@@ -1488,9 +1511,20 @@ class NetworkIntegrationService:
 
         if changed:
             updates["updated_by"] = actor_user_id
-            if {"base_url", "external_site_id", "auth_mode", "tls_mode"} & set(
-                changed
-            ):
+            # `controller_id` joins this set for the same reason `base_url`
+            # is in it: a row whose Omada ID changed is pointed at a
+            # different controller, and a CONNECTED badge earned against the
+            # old one asserts a working connection nobody has tried.
+            # `tls_mode` is here for the same reason, from the other
+            # direction: a row whose trust decision changed has not proven
+            # anything under the new one.
+            if {
+                "base_url",
+                "controller_id",
+                "external_site_id",
+                "auth_mode",
+                "tls_mode",
+            } & set(changed):
                 has_credentials = (
                     updates.get(
                         "credentials_encrypted", integration.credentials_encrypted
@@ -1734,6 +1768,7 @@ class NetworkIntegrationService:
         provider: str,
         base_url: str,
         auth_mode: str,
+        controller_id: str | None = None,
         tls_mode: str | None = None,
         tls_pinned_sha256: str | None = None,
         client_id: str | None = None,
@@ -1791,6 +1826,13 @@ class NetworkIntegrationService:
             base_url=validated.base_url,
             auth_mode=mode.value,
             credentials=credentials,
+            # Forwarded because on a cloud-managed controller it is not
+            # optional: the provider cannot discover an id from a host that
+            # fronts every controller in a region. There is no row to read it
+            # from on this path, so if the operator did not type it, the probe
+            # fails with a message naming the field -- which is the honest
+            # outcome and the one the wizard can act on.
+            controller_id=(controller_id or None),
             tls_mode=trust_mode.value,
             tls_pinned_sha256=pinned,
             timeout_seconds=self.settings.omada_api_timeout_seconds,
@@ -1856,8 +1898,13 @@ class NetworkIntegrationService:
         the operator explicitly asking "is this working right now", and an
         answer that is not written down is one the dashboard immediately
         contradicts. Also persists the discovered ``controller_id`` /
-        ``controller_version``, which is how those columns are populated at
-        all: they are read from the controller, never typed in.
+        ``controller_version``. That is how those columns are normally
+        populated -- read from the controller rather than typed in -- with one
+        exception found on hardware: a cloud-managed controller cannot be
+        identified at all until an ``omadacId`` is supplied, because its
+        address fronts every controller in the region. So ``controller_id``
+        is also accepted at create/update time, and the write below keeps a
+        stored id when the probe returns none rather than clearing it.
         """
         integration = await self._load_owned_integration(
             integration_id, requesting_organization_id=requesting_organization_id

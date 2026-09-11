@@ -46,6 +46,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import parse_qs
 
 import pytest
@@ -474,6 +475,10 @@ class FakeProvider:
     # pass on -- an assertion on the outcome cannot tell a carried
     # `client_ip` from a dropped one.
     contexts: list[ProviderPortalContext] = field(default_factory=list)
+    #: Every `ProviderConnectionConfig` handed to an identity call, so a test
+    #: can assert what the service actually sent -- `controller_id` in
+    #: particular, which a cloud-managed controller cannot work without.
+    identity_configs: list[Any] = field(default_factory=list)
     # What `inspect_tls` reports. `None` models a provider that could not
     # look at the certificate at all, which the service must render as
     # absence rather than as a verdict.
@@ -494,6 +499,7 @@ class FakeProvider:
             raise error
 
     async def test_connection(self, config) -> ProviderControllerInfo:
+        self.identity_configs.append(config)
         self._maybe_raise("test_connection")
         return ProviderControllerInfo(
             controller_id="abc123",
@@ -503,6 +509,7 @@ class FakeProvider:
         )
 
     async def get_controller_info(self, config) -> ProviderControllerInfo:
+        self.identity_configs.append(config)
         self._maybe_raise("get_controller_info")
         return ProviderControllerInfo(
             controller_id="abc123", controller_version="5.14.20"
@@ -1209,6 +1216,91 @@ class TestIntegrationCrud:
         )
         assert integration.status == IntegrationStatus.UNCONFIGURED.value
         assert integration.credentials_encrypted is None
+
+    async def test_create_stores_a_supplied_omada_id(self) -> None:
+        """The only way a cloud-managed controller ever gets one.
+
+        `test_integration_connection` populates `controller_id` by reading it
+        off the controller, which works everywhere except the one place it is
+        mandatory: behind TP-Link's cloud edge, where identity is scoped BY
+        the id. Without this the column stays NULL forever and every call on
+        the row fails.
+        """
+        service = _service(FakeRepository())
+        integration = await service.create_integration(
+            actor_user_id=None,
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            name="Cloud lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="legacy",
+            controller_id="e1b99b469a8c0cfeee4466cfc1018c96",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+        )
+        assert integration.controller_id == "e1b99b469a8c0cfeee4466cfc1018c96"
+
+    async def test_create_leaves_the_omada_id_null_when_it_can_be_discovered(
+        self,
+    ) -> None:
+        service = _service(FakeRepository())
+        integration = await service.create_integration(
+            actor_user_id=None,
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            name="Direct lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+        )
+        assert integration.controller_id is None
+
+    async def test_updating_the_omada_id_repairs_a_row_nothing_can_rediscover(
+        self,
+    ) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        integration.controller_id = "wrong-id"
+        integration.controller_version = "5.14.20"
+        integration.status = IntegrationStatus.CONNECTED.value
+        service = _service(repo)
+
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=None,
+            requesting_organization_id=org,
+            fields={"controller_id": "e1b99b469a8c0cfeee4466cfc1018c96"},
+        )
+        assert updated.controller_id == "e1b99b469a8c0cfeee4466cfc1018c96"
+        # The version was read from whatever the old id identified.
+        assert updated.controller_version is None
+        # And CONNECTED was a claim about the old controller.
+        assert updated.status == IntegrationStatus.CONNECTING.value
+
+    async def test_changing_the_url_and_the_omada_id_together_keeps_the_new_id(
+        self,
+    ) -> None:
+        """The base_url change clears `controller_id`, so order matters: an
+        operator moving a venue onto the cloud edge supplies both at once and
+        must not have the id they just typed reset to NULL."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        integration.controller_id = "old-id"
+        service = _service(repo)
+
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=None,
+            requesting_organization_id=org,
+            fields={
+                "base_url": "https://aps1-api-omada-controller.tplinkcloud.com",
+                "controller_id": "e1b99b469a8c0cfeee4466cfc1018c96",
+            },
+        )
+        assert updated.controller_id == "e1b99b469a8c0cfeee4466cfc1018c96"
 
     async def test_create_refuses_an_ssrf_url(self) -> None:
         service = _service(FakeRepository())
@@ -2073,6 +2165,52 @@ class TestConnectionTesting:
             await service.test_integration_connection(
                 integration.id, actor_user_id=None, requesting_organization_id=org
             )
+
+    async def test_the_unsaved_probe_forwards_a_supplied_omada_id(self) -> None:
+        """A cloud-managed controller cannot be identified without one.
+
+        TP-Link's cloud edge answers one address for every controller in a
+        region, so ``GET /api/info`` there 404s and there is nothing to
+        discover from -- the Omada ID is what selects the controller. The
+        pre-save probe has no row to read it from, so if the wizard does not
+        forward what the operator typed, a cloud controller can be entered
+        and never connected. Verified on a live controller on 2026-09-11.
+        """
+        provider = FakeProvider()
+        service = _service(FakeRepository(), provider=provider)
+        info, error, _tls = await service.test_connection_unsaved(
+            actor_user_id=None,
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="legacy",
+            controller_id="e1b99b469a8c0cfeee4466cfc1018c96",
+            username="wyfyportal",
+            password="pw",
+        )
+        assert error is None and info is not None
+        assert provider.identity_configs[0].controller_id == (
+            "e1b99b469a8c0cfeee4466cfc1018c96"
+        )
+
+    async def test_the_unsaved_probe_sends_no_omada_id_when_none_was_typed(
+        self,
+    ) -> None:
+        """Direct controllers still discover it, so an empty box must not
+        become an empty string the provider then tries to scope a path with."""
+        provider = FakeProvider()
+        service = _service(FakeRepository(), provider=provider)
+        await service.test_connection_unsaved(
+            actor_user_id=None,
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            controller_id="",
+            client_id="cid",
+            client_secret="secret",
+        )
+        assert provider.identity_configs[0].controller_id is None
 
     async def test_the_unsaved_probe_persists_nothing_but_audits(self) -> None:
         org = uuid.uuid4()

@@ -218,9 +218,15 @@ class OmadaControllerAdapter:
     ) -> ControllerInfo:
         """Identify the controller without authenticating.
 
-        Uses ``GET /api/info``, which needs no credentials. That is what
-        makes it useful in the connect wizard: an operator can confirm they
-        have the right URL before they have finished entering secrets.
+        Reads the controller-identity endpoint, which needs no credentials.
+        That is what makes it useful in the connect wizard: an operator can
+        confirm they have the right URL before they have finished entering
+        secrets.
+
+        Which path that endpoint lives at depends on the host, not on
+        anything the caller configures -- ``client.fetch_controller_info``
+        owns that decision and its docstring explains why it is a fallback
+        rather than a declared ``direct``/``cloud`` mode.
         """
         async with self._client(creds) as client:
             return await self._controller_info(client, creds)
@@ -256,7 +262,20 @@ class OmadaControllerAdapter:
         return ControllerInfo(
             omadac_id=omadac_id,
             controller_version=version,
-            model=coerce_str(info.get("type")) or coerce_str(info.get("model")),
+            # ``type`` is NOT a model. It is an unpublished integer enum, and
+            # reading it as one put the string "1" in front of operators as
+            # their controller model. VERIFIED on hardware 2026-09-11:
+            #
+            #   Omada Software Controller 5.15.24.19 (direct) -> "type": 1
+            #   cloud-managed controller 6.3.0.100            -> "type": 20
+            #
+            # and *neither* payload carries a ``model`` key at all. Two
+            # samples are not a lookup table, TP-Link documents no mapping,
+            # and contract section 1 forbids inventing one -- so an unknown
+            # model is reported as unknown. ``model`` is still read because
+            # the field name is the one a controller would plausibly use if
+            # it ever sends one, and it is no longer shadowed by ``type``.
+            model=coerce_str(info.get("model")),
             supports_openapi=parsed is not None and parsed >= MIN_OPENAPI_VERSION,
         )
 

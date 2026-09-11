@@ -549,6 +549,7 @@ async def onboard_platform_integration(
         name=payload.name,
         base_url=payload.base_url,
         auth_mode=payload.auth_mode,
+        controller_id=payload.controller_id,
         controller_model=payload.controller_model,
         serial_number=payload.serial_number,
         mac_address=payload.mac_address,
@@ -621,6 +622,7 @@ async def test_connection(
         provider=payload.provider,
         base_url=payload.base_url,
         auth_mode=payload.auth_mode,
+        controller_id=payload.controller_id,
         tls_mode=payload.tls_mode,
         tls_pinned_sha256=payload.tls_pinned_sha256,
         client_id=payload.client_id,
@@ -711,6 +713,7 @@ async def create_integration(
         name=payload.name,
         base_url=payload.base_url,
         auth_mode=payload.auth_mode,
+        controller_id=payload.controller_id,
         location_id=(
             uuid.UUID(payload.location_id) if payload.location_id else None
         ),
