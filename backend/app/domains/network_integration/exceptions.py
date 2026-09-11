@@ -60,6 +60,7 @@ __all__ = [
     "NetworkIntegrationOrganizationRequiredError",
     "NetworkIntegrationRateLimitedError",
     "NetworkIntegrationSiteNotSelectedError",
+    "NetworkIntegrationTlsPinRequiredError",
     "NetworkIntegrationUrlRejectedError",
     "PROVIDER_ERRORS_BY_CODE",
     "ProviderAuthFailedError",
@@ -72,6 +73,8 @@ __all__ = [
     "ProviderSessionExpiredError",
     "ProviderSiteNotFoundError",
     "ProviderTimeoutError",
+    "ProviderTlsPinMismatchError",
+    "ProviderTlsUntrustedError",
     "ProviderUnsupportedApiError",
     "UnsupportedNetworkProviderError",
 ]
@@ -223,6 +226,27 @@ class NetworkIntegrationUrlRejectedError(NetworkIntegrationError):
             f"Controller URL rejected: {reason}",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             code=ErrorCode.URL_REJECTED,
+        )
+
+
+class NetworkIntegrationTlsPinRequiredError(NetworkIntegrationError):
+    """``tls_mode='pinned'`` with no usable fingerprint on the request.
+
+    A 422 from this platform rather than a 502 from the controller, because
+    nothing was dialled: the request describes an integration that would
+    claim to pin a certificate and would not actually pin anything. Storing
+    it and discovering the problem on the first guest authorization is the
+    failure mode this refuses.
+
+    ``reason`` is safe to show: it is a statement about the shape of a value
+    the caller sent, and a certificate fingerprint is public.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"Certificate pinning rejected: {reason}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code=ErrorCode.TLS_PIN_REQUIRED,
         )
 
 
@@ -440,6 +464,50 @@ class ProviderConnectionFailedError(ProviderError):
         )
 
 
+class ProviderTlsUntrustedError(ProviderError):
+    """The controller answered; this platform would not trust its certificate.
+
+    Separate from :class:`ProviderConnectionFailedError` because the copy
+    that goes with a connection failure -- check the URL, check the port,
+    check the firewall -- is actively misleading here. All three are already
+    right. This is the defect that motivated the whole change: a self-signed
+    controller, which is what nearly every self-hosted Omada install is,
+    reported as unreachable.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "The network controller answered, but this platform does not "
+            "trust its HTTPS certificate. Self-hosted controllers ship a "
+            "self-signed certificate, so this is expected -- run Test "
+            "Connection to review the controller's certificate fingerprint "
+            "and pin it to this integration.",
+            code=ErrorCode.TLS_UNTRUSTED,
+        )
+
+
+class ProviderTlsPinMismatchError(ProviderError):
+    """The certificate is not the one pinned to this integration.
+
+    Its own code rather than a flavour of :class:`ProviderTlsUntrustedError`
+    because it is the only one of the TLS failures that can mean an attack in
+    progress, and the operator instruction differs accordingly: do not
+    re-pin blindly.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "The network controller presented a different HTTPS "
+            "certificate than the one pinned to this integration. If the "
+            "certificate was replaced on purpose, run Test Connection to "
+            "review and confirm the new fingerprint. If it was not, stop: "
+            "something is intercepting this connection.",
+            code=ErrorCode.TLS_PIN_MISMATCH,
+        )
+
+
 class ProviderTimeoutError(ProviderError):
     def __init__(self, message: str | None = None) -> None:
         super().__init__(
@@ -528,4 +596,6 @@ PROVIDER_ERRORS_BY_CODE: dict[str, type[ProviderError]] = {
     ErrorCode.AUTHORIZATION_FAILED.value: ProviderAuthorizationFailedError,
     ErrorCode.API_UNSUPPORTED.value: ProviderUnsupportedApiError,
     ErrorCode.SESSION_EXPIRED.value: ProviderSessionExpiredError,
+    ErrorCode.TLS_UNTRUSTED.value: ProviderTlsUntrustedError,
+    ErrorCode.TLS_PIN_MISMATCH.value: ProviderTlsPinMismatchError,
 }

@@ -80,6 +80,8 @@ from .errors import (
     OmadaSessionExpiredError,
     OmadaSiteNotFoundError,
     OmadaTimeoutError,
+    OmadaTlsPinMismatchError,
+    OmadaTlsTrustError,
     OmadaUnsupportedApiError,
 )
 
@@ -96,5 +98,7 @@ __all__ = [
     "OmadaSessionExpiredError",
     "OmadaSiteNotFoundError",
     "OmadaTimeoutError",
+    "OmadaTlsPinMismatchError",
+    "OmadaTlsTrustError",
     "OmadaUnsupportedApiError",
 ]

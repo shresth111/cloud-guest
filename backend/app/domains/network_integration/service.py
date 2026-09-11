@@ -93,6 +93,7 @@ from app.domains.rbac.location_scope import LocationScope, enforce_entity_locati
 
 from .constants import (
     AUDIT_ENTITY_TYPE,
+    DEFAULT_CONTROLLER_TLS_MODE,
     PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW,
     PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE,
     PORTAL_AUTHORIZE_WINDOW_SECONDS,
@@ -101,6 +102,7 @@ from .constants import (
     SYNC_BACKOFF_CAP_MULTIPLIER,
     AuthorizationStatus,
     ControllerAuthMode,
+    ControllerTlsMode,
     ErrorCode,
     IntegrationEventStatus,
     IntegrationEventType,
@@ -128,6 +130,7 @@ from .exceptions import (
     NetworkIntegrationOrganizationRequiredError,
     NetworkIntegrationRateLimitedError,
     NetworkIntegrationSiteNotSelectedError,
+    NetworkIntegrationTlsPinRequiredError,
     NetworkIntegrationUrlRejectedError,
     ProviderAuthFailedError,
     ProviderError,
@@ -145,6 +148,7 @@ from .providers.base import (
     ProviderPortalContext,
     ProviderSite,
     ProviderSsid,
+    ProviderTlsObservation,
 )
 from .repository import NetworkIntegrationRepositoryProtocol
 from .validators import (
@@ -154,6 +158,7 @@ from .validators import (
     synthesize_fleet_identity,
     validate_auth_mode_credentials,
     validate_controller_url,
+    validate_tls_trust,
 )
 
 logger = logging.getLogger(__name__)
@@ -507,6 +512,51 @@ class NetworkIntegrationService:
                 "Re-enter them to reconnect."
             ) from None
 
+    @staticmethod
+    def _resolve_tls_trust(
+        tls_mode: str | None, tls_pinned_sha256: str | None
+    ) -> tuple[ControllerTlsMode, str | None]:
+        """Validate a requested trust decision, or refuse it.
+
+        One place, called by create, onboard, update, rotate and the
+        pre-save probe, so that "pinned with no fingerprint" cannot be
+        accepted on whichever path somebody forgets. Refusing is a 422 from
+        this platform: nothing has been dialled, and the request describes a
+        row that would claim to pin and pin nothing.
+        """
+        try:
+            mode = ControllerTlsMode(tls_mode or DEFAULT_CONTROLLER_TLS_MODE.value)
+        except ValueError as exc:
+            raise NetworkIntegrationTlsPinRequiredError(
+                f"'{tls_mode}' is not a recognised certificate trust mode"
+            ) from exc
+        try:
+            return validate_tls_trust(
+                tls_mode=mode, tls_pinned_sha256=tls_pinned_sha256
+            )
+        except ValueError as exc:
+            raise NetworkIntegrationTlsPinRequiredError(str(exc)) from exc
+
+    async def _observe_tls(
+        self, provider_impl: NetworkProvider, config: ProviderConnectionConfig
+    ) -> ProviderTlsObservation | None:
+        """Best-effort certificate observation for an operator-facing probe.
+
+        Never raises. This runs alongside a connection test whose own result
+        is the answer; an observation that fails must not turn a successful
+        test into a failure, and must not replace a *useful* connection
+        error with a TLS one. ``None`` means "we could not look", which the
+        response reports as absent rather than as anything.
+        """
+        try:
+            return await provider_impl.inspect_tls(config)
+        except Exception:  # noqa: BLE001 -- decoration around the real answer
+            logger.warning(
+                "network_integration_tls_observation_failed",
+                extra={"base_url": config.base_url},
+            )
+            return None
+
     def _connection_config(
         self, integration: NetworkIntegration, credentials: dict[str, str]
     ) -> ProviderConnectionConfig:
@@ -516,6 +566,12 @@ class NetworkIntegrationService:
             auth_mode=integration.auth_mode,
             credentials=credentials,
             controller_id=integration.controller_id,
+            # The row's own trust decision, not a platform-wide constant.
+            # `tls_mode` is NOT NULL with a server default of 'strict', so
+            # the `or` is for an object built in a test without touching the
+            # database rather than for a real row.
+            tls_mode=integration.tls_mode or DEFAULT_CONTROLLER_TLS_MODE.value,
+            tls_pinned_sha256=integration.tls_pinned_sha256,
             timeout_seconds=self.settings.omada_api_timeout_seconds,
         )
 
@@ -643,6 +699,16 @@ class NetworkIntegrationService:
             ErrorCode.CONNECTION_FAILED,
             ErrorCode.TIMEOUT,
             ErrorCode.INVALID_CONTROLLER,
+            # A rejected or changed certificate sits under CONNECTION_FAILED
+            # in the *status* ladder because the operational consequence is
+            # identical -- this integration is not talking to its controller
+            # and somebody has to go and look. The distinction that matters
+            # is in `last_error_code` and in the message, which is where an
+            # operator reads *what* to look at; the status vocabulary is
+            # four coarse buckets and inventing a fifth would change every
+            # consumer of it for no new decision. See ErrorCode.TLS_*.
+            ErrorCode.TLS_UNTRUSTED,
+            ErrorCode.TLS_PIN_MISMATCH,
         ):
             return IntegrationStatus.CONNECTION_FAILED
         if during_sync:
@@ -713,6 +779,8 @@ class NetworkIntegrationService:
         session_duration_seconds: int,
         sync_interval_seconds: int,
         is_enabled: bool = True,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
         username: str | None = None,
@@ -738,6 +806,7 @@ class NetworkIntegrationService:
             raise UnsupportedNetworkProviderError(provider)
 
         mode = ControllerAuthMode(auth_mode)
+        trust_mode, pinned = self._resolve_tls_trust(tls_mode, tls_pinned_sha256)
         validated = await self._validate_url(base_url)
 
         credentials_encrypted: str | None = None
@@ -787,6 +856,17 @@ class NetworkIntegrationService:
             is_enabled=is_enabled,
             base_url=validated.base_url,
             auth_mode=mode.value,
+            tls_mode=trust_mode.value,
+            tls_pinned_sha256=pinned,
+            # Only a decision that departs from the default is a decision
+            # worth timestamping. A row left on strict has had nothing
+            # accepted about it, and stamping it would make every row look
+            # like somebody reviewed a certificate.
+            tls_trust_decided_at=(
+                None
+                if trust_mode is DEFAULT_CONTROLLER_TLS_MODE
+                else datetime.now(UTC)
+            ),
             external_site_id=external_site_id,
             external_site_name=external_site_name,
             guest_ssid_id=guest_ssid_id,
@@ -807,6 +887,7 @@ class NetworkIntegrationService:
                 "base_url": validated.base_url,
                 "auth_mode": mode.value,
                 "has_credentials": credentials_encrypted is not None,
+                "tls_mode": trust_mode.value,
             },
         )
         await self._write_audit(
@@ -814,7 +895,18 @@ class NetworkIntegrationService:
             actor_user_id=actor_user_id,
             integration=integration,
             description=f"Network integration '{name}' created ({provider})",
-            metadata={"base_url": validated.base_url, "auth_mode": mode.value},
+            # The fingerprint goes in the audit metadata on purpose: it is
+            # public, and "which certificate did they accept, and when" is
+            # exactly the question an audit trail exists to answer. The
+            # redaction pass leaves it alone -- it matches no secret-shaped
+            # key name, and there is nothing in a certificate hash to
+            # protect.
+            metadata={
+                "base_url": validated.base_url,
+                "auth_mode": mode.value,
+                "tls_mode": trust_mode.value,
+                "tls_pinned_sha256": pinned,
+            },
         )
         return integration
 
@@ -838,6 +930,8 @@ class NetworkIntegrationService:
         guest_ssid_id: str | None = None,
         guest_ssid_name: str | None = None,
         is_enabled: bool = True,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
         username: str | None = None,
@@ -907,6 +1001,8 @@ class NetworkIntegrationService:
             session_duration_seconds=session_duration_seconds,
             sync_interval_seconds=sync_interval_seconds,
             is_enabled=is_enabled,
+            tls_mode=tls_mode,
+            tls_pinned_sha256=tls_pinned_sha256,
             client_id=client_id,
             client_secret=client_secret,
             username=username,
@@ -1131,6 +1227,39 @@ class NetworkIntegrationService:
                 updates[field_name] = fields[field_name]
                 changed.append(field_name)
 
+        if "tls_mode" in fields and fields["tls_mode"] is not None:
+            # Mode and fingerprint are resolved together even when only one
+            # of them was sent, because the pair has to be coherent: moving
+            # to 'pinned' needs a fingerprint from *somewhere*, and moving
+            # away from it must clear the one already stored. Taking the
+            # stored fingerprint as the fallback is what lets an operator
+            # switch strict -> pinned -> strict -> pinned without
+            # re-confirming a certificate that never changed... which is
+            # precisely why it is NOT the fallback: `validate_tls_trust`
+            # clears the column on the way out of pinned, so coming back
+            # requires a fresh confirmation.
+            requested_pin = fields.get("tls_pinned_sha256")
+            trust_mode, pinned = self._resolve_tls_trust(
+                str(fields["tls_mode"]),
+                (
+                    integration.tls_pinned_sha256
+                    if requested_pin is None
+                    else str(requested_pin)
+                ),
+            )
+            if (
+                trust_mode.value != integration.tls_mode
+                or pinned != integration.tls_pinned_sha256
+            ):
+                updates["tls_mode"] = trust_mode.value
+                updates["tls_pinned_sha256"] = pinned
+                updates["tls_trust_decided_at"] = (
+                    None
+                    if trust_mode is DEFAULT_CONTROLLER_TLS_MODE
+                    else datetime.now(UTC)
+                )
+                changed.append("tls_mode")
+
         if "is_enabled" in fields and fields["is_enabled"] is not None:
             is_enabled = bool(fields["is_enabled"])
             if is_enabled != integration.is_enabled:
@@ -1139,7 +1268,9 @@ class NetworkIntegrationService:
 
         if changed:
             updates["updated_by"] = actor_user_id
-            if {"base_url", "external_site_id", "auth_mode"} & set(changed):
+            if {"base_url", "external_site_id", "auth_mode", "tls_mode"} & set(
+                changed
+            ):
                 has_credentials = (
                     updates.get(
                         "credentials_encrypted", integration.credentials_encrypted
@@ -1199,7 +1330,22 @@ class NetworkIntegrationService:
                     f"Network integration '{updated.name}' updated: "
                     f"{', '.join(sorted(set(changed)))}"
                 ),
-                metadata={"changed_fields": sorted(set(changed))},
+                metadata=(
+                    {"changed_fields": sorted(set(changed))}
+                    | (
+                        # A trust change is the one config change whose
+                        # *value* belongs in the audit trail. "Somebody
+                        # changed tls_mode" is not an answer to "what are we
+                        # trusting now"; the mode and the fingerprint are,
+                        # and both are public.
+                        {
+                            "tls_mode": updates["tls_mode"],
+                            "tls_pinned_sha256": updates.get("tls_pinned_sha256"),
+                        }
+                        if "tls_mode" in changed
+                        else {}
+                    )
+                ),
             )
         return updated
 
@@ -1252,6 +1398,8 @@ class NetworkIntegrationService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
         auth_mode: str,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
         username: str | None = None,
@@ -1287,10 +1435,36 @@ class NetworkIntegrationService:
         except ValueError as exc:
             raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
 
+        # Trust is optional here and unchanged when omitted. Re-entering a
+        # password is the moment an operator is most likely to be sitting in
+        # front of a controller whose certificate has just been replaced --
+        # which is exactly when forcing them through a separate PATCH to
+        # re-pin it would send them to 'insecure' instead.
+        trust_updates: dict[str, object] = {}
+        if tls_mode is not None:
+            trust_mode, pinned = self._resolve_tls_trust(
+                tls_mode,
+                (
+                    integration.tls_pinned_sha256
+                    if tls_pinned_sha256 is None
+                    else tls_pinned_sha256
+                ),
+            )
+            trust_updates = {
+                "tls_mode": trust_mode.value,
+                "tls_pinned_sha256": pinned,
+                "tls_trust_decided_at": (
+                    None
+                    if trust_mode is DEFAULT_CONTROLLER_TLS_MODE
+                    else datetime.now(UTC)
+                ),
+            }
+
         updated = await self.repository.update_integration(
             integration,
             {
                 "auth_mode": mode.value,
+                **trust_updates,
                 "credentials_encrypted": encrypt_credentials(
                     credentials, settings=self.settings
                 ),
@@ -1340,11 +1514,17 @@ class NetworkIntegrationService:
         provider: str,
         base_url: str,
         auth_mode: str,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
         username: str | None = None,
         password: str | None = None,
-    ) -> tuple[ProviderControllerInfo | None, ProviderError | None]:
+    ) -> tuple[
+        ProviderControllerInfo | None,
+        ProviderError | None,
+        ProviderTlsObservation | None,
+    ]:
         """The connect wizard's pre-save probe. Persists nothing.
 
         No row exists yet, so there is nothing to set a status on and no
@@ -1355,15 +1535,25 @@ class NetworkIntegrationService:
         and it is the one action in this domain with no row to trace it
         back to later.
 
-        Returns ``(info, None)`` or ``(None, error)`` rather than raising,
-        because the wizard renders a failure inline next to the form -- a
-        502 would make the browser's own error handling swallow the
-        specific reason, which is the only useful part.
+        Returns ``(info, None, tls)`` or ``(None, error, tls)`` rather than
+        raising, because the wizard renders a failure inline next to the
+        form -- a 502 would make the browser's own error handling swallow
+        the specific reason, which is the only useful part.
+
+        The certificate observation is returned **on failure as well as on
+        success**, and that is the whole point of it being here. The failing
+        probe against a self-signed controller is the exact moment an
+        operator needs to be shown a fingerprint and asked whether to pin
+        it; making them succeed first in order to see it would require them
+        to turn verification off in order to find out that they did not need
+        to. It is ``None`` only when the observation itself could not be
+        made.
         """
         organization_id = self._require_organization(requesting_organization_id)
         if provider not in {kind.value for kind in NetworkProviderKind}:
             raise UnsupportedNetworkProviderError(provider)
         mode = ControllerAuthMode(auth_mode)
+        trust_mode, pinned = self._resolve_tls_trust(tls_mode, tls_pinned_sha256)
         validated = await self._validate_url(base_url)
         try:
             credentials = validate_auth_mode_credentials(
@@ -1381,9 +1571,12 @@ class NetworkIntegrationService:
             base_url=validated.base_url,
             auth_mode=mode.value,
             credentials=credentials,
+            tls_mode=trust_mode.value,
+            tls_pinned_sha256=pinned,
             timeout_seconds=self.settings.omada_api_timeout_seconds,
         )
         provider_impl = self._provider(provider)
+        observation = await self._observe_tls(provider_impl, config)
         try:
             info = await provider_impl.test_connection(config)
         except ProviderError as error:
@@ -1400,9 +1593,14 @@ class NetworkIntegrationService:
                     "base_url": validated.base_url,
                     "auth_mode": mode.value,
                     "error_code": error.code.value,
+                    "tls_mode": trust_mode.value,
+                    "observed_tls_sha256": (
+                        None if observation is None
+                        else observation.fingerprint_sha256
+                    ),
                 },
             )
-            return None, error
+            return None, error, observation
 
         await self._write_audit(
             action=NetworkIntegrationAuditAction.TEST_CONNECTION,
@@ -1410,9 +1608,16 @@ class NetworkIntegrationService:
             integration=None,
             organization_id=organization_id,
             description=f"Pre-save connection test to {validated.base_url} succeeded",
-            metadata={"base_url": validated.base_url, "auth_mode": mode.value},
+            metadata={
+                "base_url": validated.base_url,
+                "auth_mode": mode.value,
+                "tls_mode": trust_mode.value,
+                "observed_tls_sha256": (
+                    None if observation is None else observation.fingerprint_sha256
+                ),
+            },
         )
-        return info, None
+        return info, None, observation
 
     async def test_integration_connection(
         self,
@@ -1420,7 +1625,11 @@ class NetworkIntegrationService:
         *,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
-    ) -> tuple[ProviderControllerInfo | None, ProviderError | None]:
+    ) -> tuple[
+        ProviderControllerInfo | None,
+        ProviderError | None,
+        ProviderTlsObservation | None,
+    ]:
         """Probe a saved integration and record the outcome on the row.
 
         Unlike the unsaved probe, this one *does* move the status -- it is
@@ -1436,6 +1645,10 @@ class NetworkIntegrationService:
         credentials = self._credentials_for(integration)
         provider_impl = self._provider(integration.provider)
         config = self._connection_config(integration, credentials)
+        # Observed before the test, so that a test which fails *because of*
+        # the certificate still returns the fingerprint the operator needs
+        # in order to fix it.
+        observation = await self._observe_tls(provider_impl, config)
         try:
             info = await provider_impl.test_connection(config)
         except ProviderError as error:
@@ -1445,7 +1658,7 @@ class NetworkIntegrationService:
                 event_type=IntegrationEventType.TEST_CONNECTION,
                 during_sync=False,
             )
-            return None, error
+            return None, error, observation
 
         metadata = dict(integration.provider_metadata or {})
         metadata["consecutive_failure_count"] = 0
@@ -1477,7 +1690,7 @@ class NetworkIntegrationService:
                 f"'{updated.name}'"
             ),
         )
-        return info, None
+        return info, None, observation
 
     # -- live controller reads --------------------------------------------
 
@@ -2038,7 +2251,11 @@ class NetworkIntegrationService:
         integration_id: uuid.UUID,
         *,
         actor_user_id: uuid.UUID | None,
-    ) -> tuple[ProviderControllerInfo | None, ProviderError | None]:
+    ) -> tuple[
+        ProviderControllerInfo | None,
+        ProviderError | None,
+        ProviderTlsObservation | None,
+    ]:
         """Platform-operator connection test against any tenant's controller.
 
         Unscoped like the two reads above and gated the same way. Reuses

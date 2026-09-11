@@ -53,6 +53,7 @@ from app.domains.network_integration.constants import (
     MAX_SESSION_DURATION_SECONDS,
     AuthorizationStatus,
     ControllerAuthMode,
+    ControllerTlsMode,
     ErrorCode,
     IntegrationEventStatus,
     IntegrationEventType,
@@ -74,10 +75,14 @@ from app.domains.network_integration.exceptions import (
     NetworkIntegrationInventoryRequiresOpenApiError,
     NetworkIntegrationNotFoundError,
     NetworkIntegrationOrganizationRequiredError,
+    NetworkIntegrationTlsPinRequiredError,
     NetworkIntegrationUrlRejectedError,
     ProviderAuthFailedError,
+    ProviderConnectionFailedError,
     ProviderSessionExpiredError,
     ProviderTimeoutError,
+    ProviderTlsPinMismatchError,
+    ProviderTlsUntrustedError,
     ProviderUnsupportedApiError,
 )
 from app.domains.network_integration.models import (
@@ -89,10 +94,12 @@ from app.domains.network_integration.providers.base import (
     NetworkProvider,
     ProviderAuthorizationResult,
     ProviderClient,
+    ProviderConnectionConfig,
     ProviderControllerInfo,
     ProviderDevice,
     ProviderSite,
     ProviderSsid,
+    ProviderTlsObservation,
 )
 from app.domains.network_integration.router import portal_router
 from app.domains.network_integration.router import router as integration_router
@@ -118,6 +125,10 @@ from app.domains.router.vendor_capabilities import (
 # Shared helpers
 # ============================================================================
 
+#: A syntactically valid SHA-256, used wherever a test needs a pin. Not a
+#: real controller certificate: nothing here hashes anything, and a real one
+#: would rot the day that box is rebuilt.
+_PIN = "3504028b297fc3680517ecbea832d2e290fd29f478ffac40684e589615aa61ce"
 CONTROLLER_URL = "https://controller.example.com:8043"
 
 
@@ -192,6 +203,12 @@ def _integration(
         "is_enabled": True,
         "base_url": CONTROLLER_URL,
         "auth_mode": auth_mode,
+        # Mirrors the column default. A detached ORM object gets no
+        # server default, so without this every row built here would have
+        # tls_mode=None -- which is not a state the database can hold.
+        "tls_mode": ControllerTlsMode.STRICT.value,
+        "tls_pinned_sha256": None,
+        "tls_trust_decided_at": None,
         "controller_id": "abc123",
         "controller_version": "5.14.20",
         "external_site_id": "site-1",
@@ -428,6 +445,18 @@ class FakeProvider:
     calls: list[str] = field(default_factory=list)
     authorize_result: ProviderAuthorizationResult | None = None
     clients: list[ProviderClient] = field(default_factory=list)
+    # What `inspect_tls` reports. `None` models a provider that could not
+    # look at the certificate at all, which the service must render as
+    # absence rather than as a verdict.
+    tls_observation: ProviderTlsObservation | None = field(
+        default_factory=lambda: ProviderTlsObservation(
+            fingerprint_sha256="a" * 64,
+            chain_trusted=False,
+            matches_pin=None,
+            subject="CN=localhost",
+            issuer="CN=localhost",
+        )
+    )
 
     def _maybe_raise(self, method: str) -> None:
         self.calls.append(method)
@@ -449,6 +478,12 @@ class FakeProvider:
         return ProviderControllerInfo(
             controller_id="abc123", controller_version="5.14.20"
         )
+
+    async def inspect_tls(self, config) -> ProviderTlsObservation:
+        self._maybe_raise("inspect_tls")
+        if self.tls_observation is None:
+            raise ProviderConnectionFailedError()
+        return self.tls_observation
 
     async def list_sites(self, config) -> list[ProviderSite]:
         self._maybe_raise("list_sites")
@@ -1912,7 +1947,7 @@ class TestConnectionTesting:
             _integration(organization_id=org, controller_version=None)
         )
         service = _service(repo)
-        info, error = await service.test_integration_connection(
+        info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert error is None
@@ -1933,7 +1968,7 @@ class TestConnectionTesting:
             raise_on={"test_connection": ProviderAuthFailedError()}
         )
         service = _service(repo, provider=provider)
-        info, error = await service.test_integration_connection(
+        info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert info is None
@@ -1947,7 +1982,7 @@ class TestConnectionTesting:
         integration = repo.add(_integration(organization_id=org))
         provider = FakeProvider(raise_on={"test_connection": ProviderTimeoutError()})
         service = _service(repo, provider=provider)
-        _info, error = await service.test_integration_connection(
+        _info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert error.code is ErrorCode.TIMEOUT
@@ -1964,7 +1999,7 @@ class TestConnectionTesting:
             raise_on={"test_connection": ProviderSessionExpiredError()}
         )
         service = _service(repo, provider=provider)
-        _info, error = await service.test_integration_connection(
+        _info, error, _tls = await service.test_integration_connection(
             integration.id, actor_user_id=None, requesting_organization_id=org
         )
         assert error.code is ErrorCode.SESSION_EXPIRED
@@ -1989,7 +2024,7 @@ class TestConnectionTesting:
         repo = FakeRepository()
         audit = FakeAuditWriter()
         service = _service(repo, audit=audit)
-        info, error = await service.test_connection_unsaved(
+        info, error, _tls = await service.test_connection_unsaved(
             actor_user_id=uuid.uuid4(),
             requesting_organization_id=org,
             provider="omada",
@@ -2991,8 +3026,8 @@ class TestProviderSeamIsolation:
         assert isinstance(FakeProvider(), NetworkProvider)
 
     def test_every_gateway_error_code_maps_to_a_domain_exception(self) -> None:
-        """All ten normalized codes from contract §2, so a controller
-        failure can never escape as an unhandled 500."""
+        """Every normalized code from contract §2, so a controller failure
+        can never escape as an unhandled 500."""
         expected = {
             "OMADA_AUTH_FAILED",
             "OMADA_CONNECTION_FAILED",
@@ -3004,6 +3039,12 @@ class TestProviderSeamIsolation:
             "OMADA_AUTHORIZATION_FAILED",
             "OMADA_API_UNSUPPORTED",
             "OMADA_SESSION_EXPIRED",
+            # Added when certificate trust became a per-integration
+            # decision: a TLS refusal used to be reported as
+            # OMADA_CONNECTION_FAILED, which sent operators to check a URL
+            # and a port that were both already correct.
+            "OMADA_TLS_UNTRUSTED",
+            "OMADA_TLS_PIN_MISMATCH",
         }
         assert set(PROVIDER_ERRORS_BY_CODE) == expected
         for code, error_class in PROVIDER_ERRORS_BY_CODE.items():
@@ -3134,3 +3175,411 @@ class TestEveryRouteRequiresPermission:
         for slug in ("reception-staff", "helpdesk", "guest-operator"):
             grants = by_slug[slug].grants()
             assert PermissionModule.NETWORK_INTEGRATIONS not in grants, slug
+
+
+# ============================================================================
+# Certificate trust: strict / pinned / insecure
+# ============================================================================
+
+
+class TestCertificateTrust:
+    """The trust decision is per-integration, recorded, and actually used.
+
+    The defect this closes: ``ProviderConnectionConfig.verify_tls`` existed,
+    defaulted to ``True``, and **nothing in ``app/`` ever set it** -- no
+    column, no schema field, no service parameter. Being unreachable it was
+    permanently ``True``, and a self-hosted Omada controller (which ships a
+    self-signed certificate) could not be integrated at all. The failure was
+    additionally reported as ``OMADA_CONNECTION_FAILED`` -- "check that the
+    controller URL and port are correct" -- when both were already correct.
+
+    So these tests assert three things in order: that the value is reachable,
+    that it reaches the provider, and that a trust failure no longer wears a
+    connectivity failure's clothes.
+    """
+
+    # -- the value is reachable and validated -----------------------------
+
+    async def test_an_integration_created_without_saying_anything_is_strict(
+        self,
+    ) -> None:
+        """The default must not be weaker than the platform's ordinary HTTPS
+        posture. An absent trust decision is not a decision to trust."""
+        org = uuid.uuid4()
+        service = _service()
+        integration = await service.create_integration(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            provider="omada",
+            name="Lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+        )
+        assert integration.tls_mode == ControllerTlsMode.STRICT.value
+        assert integration.tls_pinned_sha256 is None
+        # Nothing was decided, so nothing is stamped. A timestamp on every
+        # row would make "somebody reviewed this certificate" unreadable.
+        assert integration.tls_trust_decided_at is None
+
+    async def test_a_pinned_integration_stores_the_normalized_fingerprint(
+        self,
+    ) -> None:
+        """openssl prints colons and uppercase. Both are accepted, one form
+        is stored, so a later comparison is a string comparison."""
+        org = uuid.uuid4()
+        service = _service()
+        raw = ":".join(_PIN[i : i + 2] for i in range(0, 64, 2)).upper()
+        integration = await service.create_integration(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            provider="omada",
+            name="Lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+            tls_mode="pinned",
+            tls_pinned_sha256=raw,
+        )
+        assert integration.tls_mode == ControllerTlsMode.PINNED.value
+        assert integration.tls_pinned_sha256 == _PIN
+        assert integration.tls_trust_decided_at is not None
+
+    async def test_pinned_with_no_fingerprint_is_refused_before_anything_is_dialled(
+        self,
+    ) -> None:
+        """A row that claims to pin and pins nothing is worse than one that
+        admits it is insecure: the next person to read it believes it."""
+        repo = FakeRepository()
+        service = _service(repo)
+        with pytest.raises(NetworkIntegrationTlsPinRequiredError):
+            await service.create_integration(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                tls_mode="pinned",
+            )
+        assert repo.integrations == {}
+
+    async def test_a_malformed_fingerprint_is_refused(self) -> None:
+        service = _service()
+        with pytest.raises(NetworkIntegrationTlsPinRequiredError):
+            await service.create_integration(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                tls_mode="pinned",
+                tls_pinned_sha256="deadbeef",
+            )
+
+    async def test_an_unrecognised_mode_is_refused_rather_than_coerced(self) -> None:
+        service = _service()
+        with pytest.raises(NetworkIntegrationTlsPinRequiredError):
+            await service.create_integration(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                tls_mode="whatever",
+            )
+
+    # -- the value reaches the provider -----------------------------------
+
+    async def test_the_stored_decision_reaches_the_provider_on_every_call(
+        self,
+    ) -> None:
+        """The half that was missing entirely. A column nothing reads is a
+        column that does nothing."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256=_PIN,
+            )
+        )
+        service = _service(repo)
+        config = service._connection_config(integration, {"client_id": "c"})
+        assert config.tls_mode == "pinned"
+        assert config.tls_pinned_sha256 == _PIN
+
+    async def test_the_pre_save_probe_passes_the_requested_decision_through(
+        self,
+    ) -> None:
+        """The wizard probes before a row exists, so the decision travels in
+        the request or it does not travel at all."""
+        captured: list[ProviderConnectionConfig] = []
+
+        class _Capturing(FakeProvider):
+            async def test_connection(self, config):
+                captured.append(config)
+                return await super().test_connection(config)
+
+        service = _service(provider=_Capturing())
+        await service.test_connection_unsaved(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            client_id="cid",
+            client_secret="secret",
+            tls_mode="pinned",
+            tls_pinned_sha256=_PIN,
+        )
+        assert captured and captured[0].tls_mode == "pinned"
+        assert captured[0].tls_pinned_sha256 == _PIN
+
+    # -- changing the decision --------------------------------------------
+
+    async def test_leaving_pinned_mode_clears_the_stored_fingerprint(self) -> None:
+        """A pin that is stored but not consulted is a fact about the past
+        presented as a fact about the present. Coming back to pinned must
+        re-confirm the certificate."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256=_PIN,
+            )
+        )
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_mode": "strict"},
+        )
+        assert updated.tls_mode == ControllerTlsMode.STRICT.value
+        assert updated.tls_pinned_sha256 is None
+        assert updated.tls_trust_decided_at is None
+
+    async def test_switching_to_pinned_records_the_decision_and_the_moment(
+        self,
+    ) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_mode": "pinned", "tls_pinned_sha256": _PIN},
+        )
+        assert updated.tls_mode == ControllerTlsMode.PINNED.value
+        assert updated.tls_pinned_sha256 == _PIN
+        assert updated.tls_trust_decided_at is not None
+
+    async def test_the_audit_entry_records_what_was_accepted_not_just_that_it_changed(
+        self,
+    ) -> None:
+        """"Somebody changed tls_mode" does not answer "what are we trusting
+        now". Both values are public, so both go in the trail."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        audit = FakeAuditWriter()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo, audit=audit)
+        await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_mode": "pinned", "tls_pinned_sha256": _PIN},
+        )
+        metadata = audit.entries[-1]["event_metadata"]
+        assert metadata["tls_mode"] == "pinned"
+        assert metadata["tls_pinned_sha256"] == _PIN
+
+    async def test_rotating_credentials_leaves_trust_alone_unless_asked(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256=_PIN,
+            )
+        )
+        service = _service(repo)
+        updated = await service.rotate_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            auth_mode="openapi",
+            client_id="new-id",
+            client_secret="new-secret",
+        )
+        assert updated.tls_mode == ControllerTlsMode.PINNED.value
+        assert updated.tls_pinned_sha256 == _PIN
+
+    async def test_rotating_credentials_can_re_pin_in_the_same_request(self) -> None:
+        """Re-entering a password is when an operator is most likely to be
+        looking at a controller whose certificate was replaced with it.
+        Forcing a separate PATCH sends them to 'insecure' instead."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+        updated = await service.rotate_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            auth_mode="openapi",
+            client_id="new-id",
+            client_secret="new-secret",
+            tls_mode="pinned",
+            tls_pinned_sha256=_PIN,
+        )
+        assert updated.tls_pinned_sha256 == _PIN
+
+    # -- the error no longer lies -----------------------------------------
+
+    def test_a_trust_failure_has_its_own_code_and_does_not_blame_the_url(
+        self,
+    ) -> None:
+        """The original message sent operators to check a URL and a port that
+        were both already correct. Nobody diagnoses a self-signed certificate
+        from that."""
+        error = ProviderTlsUntrustedError()
+        assert error.code is ErrorCode.TLS_UNTRUSTED
+        assert error.code.value == "OMADA_TLS_UNTRUSTED"
+        assert "certificate" in error.message.lower()
+        assert "url and port are correct" not in error.message.lower()
+
+    def test_a_pin_mismatch_is_a_different_code_from_an_untrusted_chain(
+        self,
+    ) -> None:
+        """Only one of the two can mean somebody is in the middle, and the
+        instruction differs: do not re-pin blindly."""
+        mismatch = ProviderTlsPinMismatchError()
+        assert mismatch.code is ErrorCode.TLS_PIN_MISMATCH
+        assert mismatch.code is not ProviderTlsUntrustedError().code
+        assert "intercept" in mismatch.message.lower()
+
+    async def test_a_trust_failure_records_its_own_code_on_the_row(self) -> None:
+        """The status ladder is four coarse buckets and a TLS failure lands
+        in the connection bucket -- but ``last_error_code`` must carry the
+        real cause, because that is the field an operator reads to find out
+        *what* to look at."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        provider = FakeProvider(
+            raise_on={"test_connection": ProviderTlsUntrustedError()}
+        )
+        service = _service(repo, provider=provider)
+        _info, error, _tls = await service.test_integration_connection(
+            integration.id, actor_user_id=None, requesting_organization_id=org
+        )
+        assert error is not None
+        assert integration.status == IntegrationStatus.CONNECTION_FAILED.value
+        assert integration.last_error_code == "OMADA_TLS_UNTRUSTED"
+
+    # -- the fingerprint is shown to the operator --------------------------
+
+    async def test_the_probe_returns_the_fingerprint_even_when_it_fails(
+        self,
+    ) -> None:
+        """The whole point of capturing it. The failing probe against a
+        self-signed controller is exactly when the operator needs to see the
+        fingerprint, because that is the decision the failure is asking them
+        to make -- and making them succeed first would require them to turn
+        verification off to find out they did not have to."""
+        provider = FakeProvider(
+            raise_on={"test_connection": ProviderTlsUntrustedError()}
+        )
+        service = _service(provider=provider)
+        info, error, observation = await service.test_connection_unsaved(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            client_id="cid",
+            client_secret="secret",
+        )
+        assert info is None and error is not None
+        assert observation is not None
+        assert observation.fingerprint_sha256 == "a" * 64
+        assert observation.chain_trusted is False
+
+    async def test_an_observation_failure_never_turns_a_good_probe_bad(
+        self,
+    ) -> None:
+        """The observation is decoration around the real answer. A provider
+        that cannot look at the certificate must report absence, not replace
+        a useful result with a TLS complaint."""
+        provider = FakeProvider(tls_observation=None)
+        service = _service(provider=provider)
+        info, error, observation = await service.test_connection_unsaved(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            client_id="cid",
+            client_secret="secret",
+        )
+        assert error is None and info is not None
+        assert observation is None
+
+    def test_the_response_shows_what_is_pinned_and_never_a_credential(
+        self,
+    ) -> None:
+        """A certificate fingerprint is a hash of something the controller
+        hands to anyone who connects. Showing it is what makes the pin
+        auditable; the credential columns stay a boolean."""
+        from app.domains.network_integration.router import _integration_response
+
+        integration = _integration(
+            tls_mode=ControllerTlsMode.PINNED.value, tls_pinned_sha256=_PIN
+        )
+        payload = _integration_response(integration).model_dump()
+        assert payload["tls_mode"] == "pinned"
+        assert payload["tls_pinned_sha256"] == _PIN
+        assert payload["has_credentials"] is True
+        assert "credentials_encrypted" not in payload
+        assert "client_secret" not in str(payload)
+
+    # -- the SSRF posture is untouched -------------------------------------
+
+    def test_trust_validation_does_not_widen_what_may_be_dialled(self) -> None:
+        """Certificate trust and reachability are different questions.
+        Answering the first must not widen the second -- the port allowlist
+        and the address rules are what they were."""
+        from app.domains.network_integration.constants import (
+            DEFAULT_CONTROLLER_PORTS,
+        )
+        from app.domains.network_integration.validators import (
+            allowed_controller_ports,
+            parse_controller_url,
+            validate_tls_trust,
+        )
+
+        assert allowed_controller_ports() >= DEFAULT_CONTROLLER_PORTS
+        # Pinning a certificate does not make a private address dialable.
+        validate_tls_trust(
+            tls_mode=ControllerTlsMode.PINNED, tls_pinned_sha256=_PIN
+        )
+        with pytest.raises(NetworkIntegrationUrlRejectedError):
+            parse_controller_url("https://controller.example.com:1234")

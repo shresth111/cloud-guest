@@ -95,6 +95,8 @@ from ..controller_contract import (
     ControllerInfo,
     ControllerSite,
     ControllerSsid,
+    ControllerTlsMode,
+    ControllerTlsObservation,
     ControllerVendor,
     PortalAuthContext,
 )
@@ -105,6 +107,7 @@ from . import sites as sites_module
 from .auth import SessionCache
 from .client import OmadaHttpClient, SleepFn
 from .errors import OmadaUnsupportedApiError
+from .tls import fingerprint_of, normalize_fingerprint, observe_certificate
 from .types import coerce_str
 
 #: Open API arrived in controller v5.13. Below that, ``openapi`` mode cannot
@@ -388,6 +391,31 @@ class OmadaControllerAdapter:
         )
 
 
+    # -- certificate trust -------------------------------------------------
+
+    async def inspect_tls(
+        self, creds: ControllerCredentials
+    ) -> ControllerTlsObservation:
+        """Look at the certificate. Send nothing. Trust nothing.
+
+        Deliberately does not reuse ``self._transport``: the injected
+        transport exists so tests can remove the network from the *HTTP*
+        path, and this method is below HTTP entirely -- it is a TLS handshake
+        and a hash. A test that wants to control what this returns stubs this
+        method, which is a smaller and more honest seam than pretending a
+        ``MockTransport`` has a certificate.
+        """
+        certificate, chain_trusted = await observe_certificate(creds)
+        fingerprint = fingerprint_of(certificate)
+        pin = normalize_fingerprint(creds.tls_pinned_sha256)
+        return ControllerTlsObservation(
+            fingerprint_sha256=fingerprint,
+            certificate_der=certificate,
+            chain_trusted=chain_trusted,
+            matches_pin=None if pin is None else pin == fingerprint,
+        )
+
+
 def _as_legacy(creds: ControllerCredentials) -> ControllerCredentials:
     """A copy of ``creds`` switched to legacy mode, for the portal call.
 
@@ -404,7 +432,8 @@ def _as_legacy(creds: ControllerCredentials) -> ControllerCredentials:
         username=creds.username,
         password=creds.password,
         omadac_id=creds.omadac_id,
-        verify_tls=creds.verify_tls,
+        tls_mode=creds.tls_mode,
+        tls_pinned_sha256=creds.tls_pinned_sha256,
         timeout_seconds=creds.timeout_seconds,
     )
 

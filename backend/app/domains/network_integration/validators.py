@@ -84,9 +84,15 @@ from .constants import (
     MIN_SYNC_INTERVAL_SECONDS,
     PORTAL_READINESS_GAP_LABELS,
     ControllerAuthMode,
+    ControllerTlsMode,
     PortalReadinessGap,
 )
 from .exceptions import NetworkIntegrationUrlRejectedError
+
+#: Lowercase hex alphabet, for the fingerprint check. A frozenset rather
+#: than a regex because the check is per-character over a 64-character
+#: string and the intent reads better.
+_HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdef")
 
 __all__ = [
     "CLOUD_METADATA_ADDRESSES",
@@ -95,6 +101,7 @@ __all__ = [
     "assert_address_is_public",
     "describe_portal_readiness_gaps",
     "normalize_client_mac",
+    "normalize_tls_fingerprint",
     "parse_controller_url",
     "portal_readiness_gaps",
     "synthesize_fleet_identity",
@@ -102,6 +109,7 @@ __all__ = [
     "validate_controller_url",
     "validate_session_duration_seconds",
     "validate_sync_interval_seconds",
+    "validate_tls_trust",
 ]
 
 
@@ -428,6 +436,73 @@ def validate_auth_mode_credentials(
             "remove them or switch auth_mode to 'openapi'"
         )
     return {"username": username, "password": password}
+
+
+def normalize_tls_fingerprint(raw: str | None) -> str | None:
+    """Canonicalize a SHA-256 certificate fingerprint, or ``None``.
+
+    Accepts the shapes a human will actually paste -- ``openssl x509
+    -fingerprint -sha256`` prints ``AB:CD:...``, browsers print
+    space-separated pairs, and an operator copying from the Omada UI gets
+    something else again. Refusing a correct fingerprint because it arrived
+    with colons would send them looking for a different tool, and in practice
+    they would find "switch verification off" first.
+
+    Returns ``None`` both for absent input and for input that is not 64 hex
+    characters once separators are stripped. The caller decides which of
+    those two is an error, because "no fingerprint" is legitimate in
+    ``strict`` and ``insecure`` modes and is a refusal in ``pinned``.
+
+    A fingerprint is a hash of a certificate the controller hands to anybody
+    who connects. It is public, safe to store unencrypted, safe to log, and
+    safe to return from an API -- unlike everything else on this row that
+    concerns the controller.
+    """
+    if raw is None:
+        return None
+    candidate = "".join(
+        ch for ch in raw.strip().lower() if ch not in {":", " ", "-", "\t"}
+    )
+    if len(candidate) != 64 or any(ch not in _HEX_DIGITS for ch in candidate):
+        return None
+    return candidate
+
+
+def validate_tls_trust(
+    *, tls_mode: ControllerTlsMode, tls_pinned_sha256: str | None
+) -> tuple[ControllerTlsMode, str | None]:
+    """Return the ``(mode, fingerprint)`` pair to persist, or raise.
+
+    Three rules, each of which exists because the alternative stores a row
+    that lies about itself:
+
+    * ``pinned`` without a usable fingerprint is refused. An integration that
+      claims to pin and pins nothing is worse than one that admits it is
+      insecure, because the next person to read the row believes it.
+    * ``strict`` and ``insecure`` **clear** any fingerprint rather than
+      keeping it. A stored pin that is not consulted is a fact about the past
+      presented as a fact about the present; if the operator switches back to
+      pinned later they re-confirm the certificate, which is the step that
+      made the pin mean anything.
+    * Nothing here touches host, port, scheme or address rules. Certificate
+      trust and reachability are different questions, and widening the second
+      while answering the first is how an SSRF defence quietly erodes. This
+      function cannot make any address reachable that was not reachable
+      before.
+
+    Raises ``ValueError``; the caller maps it to
+    ``NetworkIntegrationTlsPinRequiredError``.
+    """
+    if tls_mode is not ControllerTlsMode.PINNED:
+        return tls_mode, None
+    normalized = normalize_tls_fingerprint(tls_pinned_sha256)
+    if normalized is None:
+        raise ValueError(
+            "pinned mode needs the controller certificate's SHA-256 "
+            "fingerprint (64 hexadecimal characters). Run Test Connection "
+            "against the controller to capture and confirm it."
+        )
+    return tls_mode, normalized
 
 
 def validate_session_duration_seconds(value: int) -> int:

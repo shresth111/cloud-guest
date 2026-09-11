@@ -58,7 +58,9 @@ from enum import StrEnum
 __all__ = [
     "AuthorizationStatus",
     "ControllerAuthMode",
+    "ControllerTlsMode",
     "DEFAULT_CONTROLLER_PORTS",
+    "DEFAULT_CONTROLLER_TLS_MODE",
     "DEFAULT_SESSION_DURATION_SECONDS",
     "DEFAULT_SYNC_INTERVAL_SECONDS",
     "ErrorCode",
@@ -155,6 +157,58 @@ class ControllerAuthMode(StrEnum):
 
     OPENAPI = "openapi"
     LEGACY = "legacy"
+
+
+class ControllerTlsMode(StrEnum):
+    """How much this platform trusts the certificate a controller presents.
+
+    ## Why three modes and not a ``verify_tls`` boolean
+
+    There was a boolean. It lived on the provider config dataclass, defaulted
+    to ``True``, and **nothing in ``app/`` ever set it** -- no column, no
+    schema field, no service parameter -- so in practice it was the constant
+    ``True``. Which meant a self-hosted Omada controller could not be
+    integrated at all, because those ship a self-signed certificate: the one
+    this was first tested against answers with ``CN=localhost`` issued by
+    itself.
+
+    Making the boolean reachable would have fixed that by handing operators a
+    switch whose only two positions are "cannot connect" and "no certificate
+    check whatsoever". Everybody picks the second, once, on the day they are
+    trying to get a venue online, and nothing records what they accepted.
+
+    So the middle answer gets to exist:
+
+    * ``STRICT`` -- ordinary public-CA verification. The default, because a
+      default weaker than the rest of this platform's HTTPS posture is a
+      decision nobody consciously made.
+    * ``PINNED`` -- the controller's certificate must match the SHA-256
+      fingerprint recorded on the integration row. This is the right answer
+      for a self-signed controller and it is *stronger* than what a public CA
+      buys: an interceptor has to hold that exact certificate, not merely one
+      some CA will issue. The fingerprint is captured and shown to the
+      operator by Test Connection, so pinning is a thing they confirm rather
+      than a thing they have to go and find.
+    * ``INSECURE`` -- no check. Reachable on purpose, because a controller
+      behind something that reissues certificates constantly is a real
+      configuration and refusing to model it pushes people to worse places.
+      Never a default; the row records when it was chosen and the audit log
+      records who.
+
+    The mode is per-integration, not a platform setting, for the same reason
+    ``ControllerAuthMode`` is: one tenant's controller has a real certificate
+    and the next one's does not.
+    """
+
+    STRICT = "strict"
+    PINNED = "pinned"
+    INSECURE = "insecure"
+
+
+#: What an integration created without saying anything about TLS gets, and
+#: what every row that predates the column is backfilled to. Strict, so the
+#: migration changes no existing integration's behaviour.
+DEFAULT_CONTROLLER_TLS_MODE = ControllerTlsMode.STRICT
 
 
 class IntegrationStatus(StrEnum):
@@ -338,6 +392,19 @@ class ErrorCode(StrEnum):
     AUTHORIZATION_FAILED = "OMADA_AUTHORIZATION_FAILED"
     API_UNSUPPORTED = "OMADA_API_UNSUPPORTED"
     SESSION_EXPIRED = "OMADA_SESSION_EXPIRED"
+    # Two codes, not one, and neither is CONNECTION_FAILED. A rejected
+    # certificate and an unreachable address send an operator to opposite
+    # ends of the problem, and "the certificate changed" is a third thing
+    # again -- it is the only one of the three that might mean somebody is
+    # in the middle. Collapsing them is how the original defect happened:
+    # a self-signed controller reported as "check the URL and port" when
+    # the URL and the port were both correct.
+    TLS_UNTRUSTED = "OMADA_TLS_UNTRUSTED"
+    TLS_PIN_MISMATCH = "OMADA_TLS_PIN_MISMATCH"
+    # The request asked for pinning without supplying a fingerprint (or
+    # supplied one that is not a SHA-256). A 400 from this platform, not a
+    # 502 from the controller -- the controller was never contacted.
+    TLS_PIN_REQUIRED = "NETWORK_INTEGRATION_TLS_PIN_REQUIRED"
 
 
 # ============================================================================
