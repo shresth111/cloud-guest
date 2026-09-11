@@ -350,30 +350,59 @@ class ErrorCode(StrEnum):
 # here.
 DEFAULT_SESSION_DURATION_SECONDS = 3600
 MIN_SESSION_DURATION_SECONDS = 60
-# 24 hours, and this ceiling is a security control rather than a sanity
-# bound.
+# 7 days. **The reason this number was originally chosen no longer holds.**
+# It used to be a safety backstop; it is now a policy choice. Read both
+# halves before touching it.
 #
-# CR-001 (see /Users/shresth/wyfy-omada/CHANGE-REQUESTS.md).
-# TP-Link publishes **no client-deauthorization endpoint** in any
-# generation of the Omada API, so this platform cannot revoke a portal
-# authorization it has already granted. The duration is therefore not a
-# convenience default -- it is the *only* mechanism by which a guest's
-# network access ever ends.
+# ## The old reason, which was false
 #
-# That inverts how the number should be chosen. A generous ceiling would
-# normally be harmless; here a 30-day authorization is 30 days during
-# which an abusive guest cannot be removed from the venue's network by
-# any action this platform can take. Ending the WyfyGuest ``GuestSession``
-# row still works and is still required, but it does not touch the
-# controller -- claiming otherwise is precisely the class of falsehood
-# ``app.domains.guest_access.device_adapters`` was written to fix (read
-# its "mechanism 4" note).
+# This ceiling used to be justified entirely on CR-001's claim that
+# TP-Link publishes no client-deauthorization endpoint, and therefore that
+# this platform could never revoke an authorization it had granted. On
+# that premise the duration was not a convenience default but the *only*
+# mechanism by which a guest's access ever ended, which inverted how the
+# number had to be chosen: a 30-day authorization would have been 30 days
+# during which an abusive guest could not be removed from the venue's
+# network by any action available to us.
 #
-# 24 hours is the longest window in which "wait for it to expire" is a
-# usable answer to "this guest is abusing the WiFi". Venues wanting
-# longer sessions should re-authorize on the next portal hit, which costs
-# the guest nothing and keeps the revocation window bounded.
-MAX_SESSION_DURATION_SECONDS = 24 * 3600
+# **That premise is false.** CR-001 was overturned (2026-09-10) and then
+# found to be narrower still than its overturn said. A per-guest
+# disconnect exists on the controller and is implemented:
+# ``service.disconnect_guest`` -> the provider seam ->
+# ``omada.deauth``, which lists the Hotspot Manager's Authorized Clients
+# table and ends every live authorization the MAC holds. It needs only the
+# hotspot-operator credentials the portal authorization itself already
+# uses -- observed working against a live controller (5.15.24.19), not
+# inferred. So revocation is available in exactly the configurations that
+# can grant an authorization in the first place: there is no state in
+# which this platform can let a guest on and then not remove them.
+#
+# ## Why the value is a week, and not longer
+#
+# The owner raised it from 24 hours to 7 days on 2026-09-11, once the
+# disconnect above was verified on hardware. A week is the usual ask for a
+# hotel stay, which is the case that drove it. What the ceiling still
+# protects is narrower and weaker than what it protected before, and those
+# reasons are why it is a week rather than a month:
+#
+#   * Revocation is *operator-initiated*. Nobody watches the dashboard at
+#     03:00, so a long authorization is still a long unattended grant --
+#     it is now recoverable rather than irrevocable, which is a different
+#     thing from harmless.
+#   * The controller, not this database, is the authority on whether a
+#     client is still authorized (see ``AuthorizationStatus``). A longer
+#     window is a longer period over which the two can drift with nobody
+#     reconciling them.
+#   * A shorter authorization means the guest re-hits the portal, which is
+#     the only moment the platform re-checks consent, quota and blocklist
+#     state. That check is worth keeping frequent on its own merits, and
+#     it costs the guest nothing.
+#
+# What the ceiling no longer protects against is "an abusive guest cannot
+# be removed". So this is now a *policy* number, chosen for the length of
+# a stay, and not a safety backstop. Moving it again is the same kind of
+# decision and needs the same kind of reason -- not a code review.
+MAX_SESSION_DURATION_SECONDS = 7 * 24 * 3600
 
 DEFAULT_SYNC_INTERVAL_SECONDS = 300
 # A floor, and a real one. Every sync tick is a live HTTP round trip to a
@@ -522,6 +551,13 @@ class NetworkIntegrationAuditAction(StrEnum):
     # auditor asking "where did this Router row come from" must be able to
     # find it by action alone. Contract §11.6.
     FLEET_DEVICE_ONBOARDED = "network_integration_fleet_device_onboarded"
+    # One guest's access ended early by a human. Its own action rather
+    # than reusing DISCONNECTED, which means "the *integration* was
+    # disconnected from the controller" -- an integration-scoped
+    # administrative act, not a guest-scoped one. An auditor answering
+    # "who kicked this guest off the WiFi" must not have to disambiguate
+    # the two by reading the description.
+    GUEST_DISCONNECTED = "network_integration_guest_disconnected"
 
 # Audit entity_type for every entry this domain writes -- one value, so an
 # auditor can retrieve the whole trail for one integration by

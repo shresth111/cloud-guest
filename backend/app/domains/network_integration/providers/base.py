@@ -278,9 +278,11 @@ class NetworkProvider(Protocol):
 
         On a provider with no deauthorization (see
         :meth:`deauthorize_guest`), ``duration_seconds`` is not a default
-        -- it is the *only* thing that ever ends this access. Callers must
-        size it accordingly; ``constants.MAX_SESSION_DURATION_SECONDS``
-        bounds it at 24 hours for that reason and not for tidiness.
+        -- it is the *only* thing that ever ends this access, and callers
+        must size it accordingly. Omada is no longer such a provider.
+        ``constants.MAX_SESSION_DURATION_SECONDS`` bounds it at 7 days,
+        which is a policy bound on an unattended grant rather than a
+        technical limit or tidiness.
         """
         ...
 

@@ -22,7 +22,7 @@ directly from what each credential actually is (see ``auth.py``):
 | ``list_clients``     | **no**                        | yes                            |
 | ``get_client``       | **no**                        | yes                            |
 | ``authorize_guest``  | yes                           | yes, *if* operator credentials are also stored |
-| ``deauthorize_guest``| **no** (see below)            | **no** (see below)             |
+| ``deauthorize_guest``| yes                           | yes, *if* operator credentials are also stored |
 
 The legacy "no"s are not laziness. A hotspot operator account exists to
 authorize portal clients; the controller's inventory lives behind its admin
@@ -54,6 +54,12 @@ carries both credential pairs precisely so a single integration row can do
 inventory over Open API and portal auth over the operator account, which is
 the configuration we expect real deployments to use.
 
+``deauthorize_guest`` follows the same rule for the same reason, and the
+symmetry is the useful part: **any authorization this adapter can grant, it
+can also revoke.** The disconnect lives in the same ``/hotspot/`` API tree
+behind the same operator session (see ``deauth.py``), so there is no
+configuration in which a guest can be let on and then not be removed.
+
 ## Statelessness, and the one thing that is not stateless
 
 Every method takes ``creds`` and builds a fresh ``OmadaHttpClient``. The
@@ -69,13 +75,18 @@ mostly) can construct its own ``OmadaControllerAdapter``.
 
 ## Honest scope
 
-No line of this has run against a physical Omada controller. Endpoint paths,
-request bodies and response parsing are exercised against
-``httpx.MockTransport`` in ``tests/test_omada_*.py`` and nowhere else. What
-that proves is that this client does what we believe the API expects; it
-cannot prove the API expects it. The docstrings mark every claim as VERIFIED
-(primary TP-Link doc, with URL), CORROBORATED (open-source client or forum),
-or INFERRED.
+Most of this package is exercised only against ``httpx.MockTransport`` in
+``tests/test_omada_*.py``, which proves that this client does what we believe
+the API expects and cannot prove the API expects it. Docstrings mark every
+such claim as VERIFIED (primary TP-Link doc, with URL), CORROBORATED
+(open-source client or forum), or INFERRED.
+
+Two flows are no longer in that category. ``extPortal/auth`` and the
+``deauth.py`` pair have been run against a real Omada Software Controller
+(5.15.24.19) and are marked **OBSERVED**, which is a stronger claim about one
+firmware and a weaker one about every other: an observed endpoint is a fact,
+not a promise, and TP-Link documents neither of ``deauth.py``'s two paths at
+all.
 """
 
 from __future__ import annotations
@@ -99,6 +110,7 @@ from ..controller_contract import (
     PortalAuthContext,
 )
 from . import clients as clients_module
+from . import deauth as deauth_module
 from . import devices as devices_module
 from . import portal as portal_module
 from . import sites as sites_module
@@ -355,37 +367,54 @@ class OmadaControllerAdapter:
     async def deauthorize_guest(
         self, creds: ControllerCredentials, site_id: str, client_mac: str
     ) -> bool:
-        """Always raises ``OmadaUnsupportedApiError``. This is not a stub.
+        """End every live portal authorization this MAC holds on one site.
 
-        TP-Link documents no way to revoke an external-portal authorization.
-        Every version of the *API and Code Sample for External Portal Server*
-        document covers exactly two calls -- operator login and client
-        authorization -- and neither the v4, v5 nor v6.2.10 revision mentions
-        deauthorization, expiry-shortening, or session teardown.
+        Returns ``True`` when the MAC is no longer authorized, **including
+        when it was not authorized to begin with** -- an expired or
+        already-ended grant is the state the caller asked for, not an error
+        to raise at a dashboard. See ``deauth.py`` for the two endpoints,
+        why the disconnect is keyed on a record id rather than a MAC, and
+        why every valid row for the MAC is ended rather than just the newest.
 
-        The options were: invent an endpoint (forbidden by contract section
-        1, and a wrong guess on a write is how you knock a paying guest
-        offline); repurpose the Open API's ``clients/{mac}/block`` route,
-        which is a *blocklist* -- a materially more punitive and longer-lived
-        action than ending a portal session, and one an operator would have
-        to undo by hand; or say plainly that this cannot be done and let the
-        caller handle it.
+        This used to raise ``OmadaUnsupportedApiError`` unconditionally, on
+        the grounds that TP-Link publishes no revocation endpoint. TP-Link
+        indeed publishes none; the controller has one anyway, in the same
+        ``/hotspot/`` tree and behind the same operator session that
+        ``authorize_guest`` already uses.
 
-        We say plainly that it cannot be done. Access ends when the
-        ``duration_seconds`` passed to ``authorize_guest`` elapses, which is
-        the mechanism Omada actually provides, so the backend should size
-        that duration to the session it wants rather than planning to revoke
-        early. ``OMADA_API_UNSUPPORTED`` is a normalized, catchable code, so
-        a caller can degrade gracefully.
-
-        The signature keeps the contract's ``-> bool`` so the Protocol is
-        satisfied and the shape stays correct if TP-Link ever publishes one.
+        The one genuine refusal that remains is an integration with no
+        operator credentials at all: Open API client credentials alone can
+        read inventory but cannot open a hotspot session, so there is
+        nothing to send the disconnect with. That is reported as
+        ``OMADA_API_UNSUPPORTED`` with the fix named, exactly as
+        ``authorize_guest`` reports the mirror-image case -- and by
+        construction an integration that cannot deauthorize also cannot
+        authorize, so no guest can be stranded on the network by it.
         """
-        raise OmadaUnsupportedApiError(
-            "Omada does not provide a way to end a guest's network access "
-            "early. Access ends automatically when the authorized duration "
-            "expires."
+        if not creds.username or not creds.password:
+            raise OmadaUnsupportedApiError(
+                "Ending a guest's access early on Omada requires a hotspot "
+                "operator username and password. The controller's disconnect "
+                "lives in the Hotspot Manager API, which Open API client "
+                "credentials cannot open. Add an operator account "
+                "(controller: Hotspot Manager) to this integration."
+            )
+
+        # Same reasoning as ``authorize_guest``: the operator session lives
+        # under the legacy hotspot API whatever mode the integration uses
+        # for inventory, and ``session_key`` includes the auth mode, so this
+        # shares the cache slot the portal authorization already warmed.
+        portal_creds = (
+            creds
+            if creds.auth_mode == ControllerAuthMode.LEGACY
+            else _as_legacy(creds)
         )
+
+        async with self._client(portal_creds) as client:
+            omadac_id = await client.resolve_omadac_id()
+            return await deauth_module.deauthorize_client(
+                client, omadac_id, site_id, client_mac
+            )
 
 
 def _as_legacy(creds: ControllerCredentials) -> ControllerCredentials:

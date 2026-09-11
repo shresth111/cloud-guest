@@ -80,6 +80,8 @@ from .schemas import (
     NetworkIntegrationCredentialRotateRequest,
     NetworkIntegrationDeviceListResponse,
     NetworkIntegrationDeviceResponse,
+    NetworkIntegrationDisconnectGuestRequest,
+    NetworkIntegrationDisconnectGuestResponse,
     NetworkIntegrationEventListResponse,
     NetworkIntegrationEventResponse,
     NetworkIntegrationListResponse,
@@ -1077,6 +1079,65 @@ async def list_clients(
         success=True,
         message="Controller clients retrieved",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{integration_id}/clients/disconnect",
+    response_model=ApiResponse[NetworkIntegrationDisconnectGuestResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+)
+async def disconnect_guest(
+    request: Request,
+    integration_id: uuid.UUID,
+    payload: NetworkIntegrationDisconnectGuestRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """End one guest's network access now.
+
+    A sibling of ``GET /{integration_id}/clients`` and deliberately placed
+    under it: the integration id the caller already needs to *see* the
+    clients is the one that scopes the disconnect, so the control can live
+    on that table with nothing extra to fetch.
+
+    ``network_integrations.update`` rather than a new ``.execute``: the
+    module seeds create/read/update/delete/manage and nothing else, and
+    inventing an action here would leave every existing role without it
+    until the seed and its tests were changed too. ``update`` is the
+    right blast radius in the meantime -- a caller who can rewrite this
+    integration's credentials can certainly end one guest's session.
+
+    A 501 means the integration has no hotspot operator credentials, which
+    is the one configuration where the controller cannot be asked. It is
+    not the old "Omada cannot do this"; see
+    ``exceptions.NetworkIntegrationDeauthorizationUnsupportedError``.
+    """
+    outcome = await service.disconnect_guest(
+        integration_id,
+        client_mac=payload.client_mac,
+        reason=payload.reason,
+        actor_user_id=_actor_id(actor),
+        requesting_organization_id=requesting_organization_id,
+    )
+    body = NetworkIntegrationDisconnectGuestResponse(
+        disconnected=outcome.disconnected,
+        provider=outcome.provider,
+        client_mac=outcome.client_mac,
+        had_active_authorization=outcome.had_active_authorization,
+        deauthorized_at=outcome.deauthorized_at,
+        guest_session_id=(
+            str(outcome.guest_session_id) if outcome.guest_session_id else None
+        ),
+        guest_session_ended=outcome.guest_session_ended,
+    )
+    return build_response(
+        success=True,
+        message="Guest access ended",
+        data=body.model_dump(),
         request_id=_request_id(request),
     )
 
