@@ -342,6 +342,7 @@ def _session_response(
         data_limit_mb=session.data_limit_mb,
         session_timeout_minutes=session.session_timeout_minutes,
         disconnect_reason=session.disconnect_reason,
+        disconnect_enforced=session.disconnect_enforced,
         user_agent=session.user_agent,
         created_at=session.created_at,
     )
@@ -1405,6 +1406,34 @@ async def get_guest_session(
     )
 
 
+#: The operator-facing wording for a session-ending action.
+#:
+#: ``status`` going to DISCONNECTED/TERMINATED means this platform recorded
+#: the end of the session; it does NOT mean the guest's device was cut off.
+#: The RFC 5176 Disconnect-Request is sent after that transition has already
+#: committed and never raises, so until this function existed both outcomes
+#: produced the identical "Guest session terminated" and an operator had no
+#: way to tell which had happened. Measured on production 2026-09-11, the
+#: unenforced outcome was the only one occurring: the app server has no route
+#: to the tunnel range, so every Disconnect-Request was dropped.
+#:
+#: ``success`` on the envelope stays ``True`` deliberately -- the record
+#: update genuinely succeeded, and that is what the envelope describes. What
+#: changes is that the message stops claiming the device was disconnected
+#: when it was not, and ``disconnect_enforced`` on the payload carries the
+#: fact in a form a UI can act on.
+def _session_end_message(session, *, action: str) -> str:
+    if session.disconnect_enforced is False:
+        return (
+            f"Guest session {action} in records only -- the disconnect was "
+            "not acknowledged by the router, so the device may still be "
+            "online. Check the router's connectivity."
+        )
+    if session.disconnect_enforced is True:
+        return f"Guest session {action} and the device was disconnected"
+    return f"Guest session {action}"
+
+
 @admin_router.post(
     "/guest-sessions/{session_id}/disconnect",
     response_model=ApiResponse[GuestSessionResponse],
@@ -1427,7 +1456,7 @@ async def disconnect_guest_session(
     )
     return build_response(
         success=True,
-        message="Guest session disconnected",
+        message=_session_end_message(session, action="disconnected"),
         data=(
             await _session_response_resolved(
                 session,
@@ -1461,7 +1490,7 @@ async def terminate_guest_session(
     )
     return build_response(
         success=True,
-        message="Guest session terminated",
+        message=_session_end_message(session, action="terminated"),
         data=(
             await _session_response_resolved(
                 session,

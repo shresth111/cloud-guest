@@ -1236,14 +1236,82 @@ async def issue_live_disconnect(
     platform's own records. Returns ``True``/``False`` once a real
     Disconnect-ACK/NAK comes back, or ``None`` when there is no registered
     ``RadiusNasClient`` for ``session.router_id``, that NAS has no
-    ``ip_address`` on record, or the send itself failed/timed out (the
-    expected outcome in this sandbox -- see ``radius_coa``'s own module
-    docstring)."""
+    ``ip_address`` on record, or the send itself failed/timed out.
+
+    **A ``None`` return means the guest was NOT actually disconnected**, and
+    every path that produces one now says so at WARNING with
+    ``enforcement_delivered: False``. That used to be understated: the old
+    docstring called a timeout "the expected outcome in this sandbox", and
+    two of the three ``None`` paths logged nothing at all. It is not a
+    sandbox and it is not expected -- measured on production 2026-09-11, the
+    app server has **no route to the tunnel range at all**
+    (``ip route show`` has no ``10.20.0.0/24``, there is no WireGuard
+    interface, and ``ping 10.20.0.19`` is 100% loss), so every
+    Disconnect-Request leaves via the default gateway and is dropped.
+
+    That matters because this is the *only* enforcement mechanism behind
+    the data-cap and FUP-quota paths as well as the operator's own
+    "Terminate session": the row is flipped to ``EXPIRED``/``TERMINATED``
+    **before** this is called and this never raises, so without a loud log
+    the platform reports an enforcement action it did not perform. Making
+    the failure visible does not fix it -- the transport has to change (the
+    adapter in ``guest_access.device_adapters`` reaches fleet routers on
+    8728, which is the only port that answers) or the tunnel has to be
+    routable from the app server. This only stops it being invisible."""
+    async def _record(enforced: bool) -> None:
+        """Persist the outcome on the row itself.
+
+        Best-effort for the same reason the send is: this function is called
+        after a status transition that has already committed, and it must
+        never be the thing that fails an operator's disconnect. A failure to
+        record is logged and swallowed -- it would otherwise turn a
+        bookkeeping problem into a user-visible error on a path whose whole
+        contract is that it cannot raise."""
+        try:
+            await repository.update_session(session, {"disconnect_enforced": enforced})
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "guest_live_disconnect_record_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+
     nas_client = await repository.get_nas_client_by_router(session.router_id)
-    if nas_client is None or not nas_client.ip_address:
+    if nas_client is None:
+        #  Previously a bare `return None`. A session-ending path that cannot
+        #  even find a NAS silently performed no enforcement at all.
+        logger.warning(
+            "guest_live_disconnect_no_nas",
+            extra={
+                "session_id": str(session.id),
+                "router_id": str(session.router_id),
+                "enforcement_delivered": False,
+            },
+        )
+        await _record(False)
+        return None
+    if not nas_client.ip_address:
+        logger.warning(
+            "guest_live_disconnect_nas_has_no_address",
+            extra={
+                "session_id": str(session.id),
+                "router_id": str(session.router_id),
+                "nas_identifier": nas_client.nas_identifier,
+                "enforcement_delivered": False,
+            },
+        )
+        await _record(False)
         return None
     guest = await repository.get_guest_by_id(session.guest_id)
     if guest is None:
+        logger.warning(
+            "guest_live_disconnect_no_guest",
+            extra={
+                "session_id": str(session.id),
+                "guest_id": str(session.guest_id),
+                "enforcement_delivered": False,
+            },
+        )
+        await _record(False)
         return None
     try:
         shared_secret = decrypt_secret(nas_client.shared_secret_encrypted)
@@ -1264,20 +1332,42 @@ async def issue_live_disconnect(
     except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
         logger.warning(
             "guest_live_disconnect_failed",
-            extra={"session_id": str(session.id), "error": str(exc)},
+            extra={
+                "session_id": str(session.id),
+                "error": str(exc),
+                "enforcement_delivered": False,
+            },
         )
+        await _record(False)
         return None
     if response is None:
-        logger.info(
+        #  WARNING, not INFO. This is a silent no-op on the only enforcement
+        #  path the platform has, and on the current estate it is what
+        #  *always* happens -- the app server has no route to 10.20.0.0/24.
+        #  At INFO it sat below the threshold anyone reads.
+        logger.warning(
             "guest_live_disconnect_no_response",
-            extra={"session_id": str(session.id), "nas_ip": nas_client.ip_address},
+            extra={
+                "session_id": str(session.id),
+                "router_id": str(session.router_id),
+                "nas_ip": nas_client.ip_address,
+                "enforcement_delivered": False,
+            },
         )
+        await _record(False)
         return None
     acknowledged = parse_response_code(response) == RADIUS_CODE_DISCONNECT_ACK
+    #  A NAK is a real answer from a real NAS and is still a failure to
+    #  enforce, so `enforcement_delivered` tracks the ACK, not the reply.
     logger.info(
         "guest_live_disconnect_response",
-        extra={"session_id": str(session.id), "acknowledged": acknowledged},
+        extra={
+            "session_id": str(session.id),
+            "acknowledged": acknowledged,
+            "enforcement_delivered": acknowledged,
+        },
     )
+    await _record(acknowledged)
     return acknowledged
 
 

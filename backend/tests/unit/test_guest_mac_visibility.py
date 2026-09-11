@@ -120,6 +120,12 @@ def _session(**overrides: object) -> _Row:
         "data_limit_mb": None,
         "session_timeout_minutes": None,
         "disconnect_reason": None,
+        # Added 2026-09-11 alongside the column: this stand-in has to
+        # carry every attribute the response builder reads, and the
+        # builder now reads whether the disconnect was actually
+        # enforced. None is right here -- these fixtures are live
+        # sessions, for which no disconnect has been attempted.
+        "disconnect_enforced": None,
         "user_agent": None,
         "created_at": NOW,
     }

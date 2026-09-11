@@ -494,6 +494,13 @@ class GuestSessionResponse(BaseModel):
     data_limit_mb: int | None
     session_timeout_minutes: int | None
     disconnect_reason: str | None
+    #: Whether the guest's device was actually cut off, as distinct from this
+    #: platform recording that it was. ``None`` means no live disconnect was
+    #: attempted -- the session is still running, or the NAS told us it ended
+    #: -- which is the ordinary case. ``False`` means one was attempted and
+    #: did not land, so ``status`` says TERMINATED while the device may still
+    #: be online. See ``GuestSession.disconnect_enforced``.
+    disconnect_enforced: bool | None = None
     user_agent: str | None
     created_at: datetime
 
