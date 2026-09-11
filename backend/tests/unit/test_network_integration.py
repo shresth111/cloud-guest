@@ -4312,9 +4312,10 @@ class TestEveryRouteRequiresPermission:
             r for r in integration_router.routes if "/platform/" in r.path
         ]
         # summary, list, get, events, enable, disable, test-connection,
-        # onboard. Asserted as a count rather than a set so that adding a
-        # ninth platform route without a GLOBAL scope fails here loudly.
-        assert len(platform_routes) == 8
+        # onboard, and the org-less draft probe (platform/test-connection).
+        # Asserted as a count rather than a set so that adding a tenth
+        # platform route without a GLOBAL scope fails here loudly.
+        assert len(platform_routes) == 9
         for route in platform_routes:
             scopes = []
             for dep in route.dependant.dependencies:

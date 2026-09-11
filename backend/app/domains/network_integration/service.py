@@ -140,6 +140,7 @@ from .exceptions import (
     NetworkIntegrationUrlRejectedError,
     ProviderAuthFailedError,
     ProviderError,
+    ProviderSiteNotFoundError,
     UnsupportedNetworkProviderError,
 )
 from .models import NetworkIntegration
@@ -175,6 +176,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AuditLogWriter",
+    "ControllerDraftProbeOutcome",
     "FleetDeviceProvisionerProtocol",
     "GuestDisconnectOutcome",
     "GuestSessionLookupProtocol",
@@ -385,6 +387,30 @@ class GuestDisconnectOutcome:
     deauthorized_at: datetime | None = None
     guest_session_id: uuid.UUID | None = None
     guest_session_ended: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerDraftProbeOutcome:
+    """What :meth:`NetworkIntegrationService.probe_controller_draft` found.
+
+    ``error`` is the connection/credential verdict; ``inventory_error`` is a
+    separate, lesser one about reading sites and SSIDs afterwards. They are
+    kept apart because a controller that signed in fine and then refused a
+    site listing is *connected*, and the wizard must not tell the operator
+    otherwise.
+    """
+
+    info: ProviderControllerInfo | None
+    error: ProviderError | None
+    tls: ProviderTlsObservation | None
+    suggested_tls_mode: str | None = None
+    credentials_checked: bool = False
+    inventory_requires_openapi: bool = False
+    inventory_available: bool = False
+    inventory_error: ProviderError | None = None
+    sites: tuple[ProviderSite, ...] = ()
+    ssids_site_id: str | None = None
+    ssids: tuple[ProviderSsid, ...] = ()
 
 
 # ============================================================================
@@ -2642,6 +2668,191 @@ class NetworkIntegrationService:
             integration_id,
             actor_user_id=actor_user_id,
             requesting_organization_id=None,
+        )
+
+    async def probe_controller_draft(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        provider: str,
+        base_url: str,
+        auth_mode: str,
+        controller_id: str | None = None,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        site_id: str | None = None,
+    ) -> ControllerDraftProbeOutcome:
+        """The Master console's pre-save probe. No organization, persists nothing.
+
+        The platform twin of :meth:`test_connection_unsaved`, for the "Add
+        customer" wizard, which reaches its device step before the customer's
+        organization exists. Same gates in the same order -- provider, trust
+        decision, :meth:`_validate_url` (ports, private ranges; the provider
+        re-validates before every request), credential shape -- and the same
+        certificate observation made *before* the test, so a failure still
+        carries the fingerprint. What it adds is what lets the wizard fill
+        the form in for the operator: a suggested trust mode, and with Open
+        API credentials the controller's sites and SSIDs.
+
+        No integration row and no event row: there is nothing to hang either
+        on. One **audit entry** is written, with no organization, exactly as
+        the customer probe writes one -- this platform opening an
+        authenticated connection to an address a caller typed is the action
+        worth a record, and here there is no row to trace it back to later.
+
+        Inventory reads are best-effort. They run only after the connection
+        test passed, and a failure there is returned as ``inventory_error``
+        rather than turning a working connection into a failed probe.
+
+        **No credentials at all is a valid request**, and a deliberate one:
+        the wizard probes as soon as the address is typed. It then gets the
+        certificate and the controller's unauthenticated identity (version,
+        Omada ID) from ``get_controller_info``, with ``credentials_checked``
+        false so nobody reads ``ok`` as "the password works". Half a
+        credential is still refused, exactly as on every other path.
+        """
+        if provider not in {kind.value for kind in NetworkProviderKind}:
+            raise UnsupportedNetworkProviderError(provider)
+        mode = ControllerAuthMode(auth_mode)
+        trust_mode, pinned = self._resolve_tls_trust(tls_mode, tls_pinned_sha256)
+        validated = await self._validate_url(base_url)
+        credentials_checked = any((client_id, client_secret, username, password))
+        credentials: dict[str, str] = {}
+        if credentials_checked:
+            try:
+                credentials = validate_auth_mode_credentials(
+                    auth_mode=mode,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    username=username,
+                    password=password,
+                )
+            except ValueError as exc:
+                raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
+
+        config = ProviderConnectionConfig(
+            provider=provider,
+            base_url=validated.base_url,
+            auth_mode=mode.value,
+            credentials=credentials,
+            controller_id=(controller_id or None),
+            tls_mode=trust_mode.value,
+            tls_pinned_sha256=pinned,
+            timeout_seconds=self.settings.omada_api_timeout_seconds,
+        )
+        provider_impl = self._provider(provider)
+        observation = await self._observe_tls(provider_impl, config)
+        suggested = (
+            None
+            if observation is None
+            else (
+                ControllerTlsMode.STRICT.value
+                if observation.chain_trusted
+                else ControllerTlsMode.PINNED.value
+            )
+        )
+        # A property of the credential, not of this attempt: a hotspot
+        # operator login cannot read inventory whether or not it signed in.
+        operator_only = mode is ControllerAuthMode.LEGACY
+        audit_metadata: dict[str, Any] = {
+            "base_url": validated.base_url,
+            "auth_mode": mode.value,
+            "tls_mode": trust_mode.value,
+            "observed_tls_sha256": (
+                None if observation is None else observation.fingerprint_sha256
+            ),
+            "platform_action": True,
+            "credentials_checked": credentials_checked,
+        }
+
+        try:
+            if credentials_checked:
+                info = await provider_impl.test_connection(config)
+            else:
+                info = await provider_impl.get_controller_info(config)
+        except ProviderError as error:
+            await self._write_audit(
+                action=NetworkIntegrationAuditAction.TEST_CONNECTION,
+                actor_user_id=actor_user_id,
+                integration=None,
+                description=(
+                    f"Platform pre-save connection test to {validated.base_url} "
+                    f"failed ({error.code.value})"
+                ),
+                metadata={**audit_metadata, "error_code": error.code.value},
+            )
+            return ControllerDraftProbeOutcome(
+                info=None,
+                error=error,
+                tls=observation,
+                suggested_tls_mode=suggested,
+                credentials_checked=credentials_checked,
+                inventory_requires_openapi=operator_only,
+            )
+
+        sites: list[ProviderSite] = []
+        ssids: list[ProviderSsid] = []
+        ssids_site_id: str | None = None
+        inventory_error: ProviderError | None = None
+        inventory_available = False
+        if credentials_checked and not operator_only:
+            # Scoped with the id the test just discovered, so the reads below
+            # do not each repeat the controller-identity round trip.
+            inventory_config = dataclasses.replace(
+                config, controller_id=info.controller_id or config.controller_id
+            )
+            try:
+                sites = list(await provider_impl.list_sites(inventory_config))
+                inventory_available = True
+                known = {site.site_id for site in sites}
+                if site_id:
+                    if site_id not in known:
+                        raise ProviderSiteNotFoundError(
+                            "The controller has no site with that id. Choose "
+                            "one of the sites listed."
+                        )
+                    ssids_site_id = site_id
+                elif len(sites) == 1:
+                    ssids_site_id = sites[0].site_id
+                if ssids_site_id is not None:
+                    ssids = list(
+                        await provider_impl.list_ssids(inventory_config, ssids_site_id)
+                    )
+            except ProviderError as error:
+                inventory_error = error
+                ssids, ssids_site_id = [], None
+
+        await self._write_audit(
+            action=NetworkIntegrationAuditAction.TEST_CONNECTION,
+            actor_user_id=actor_user_id,
+            integration=None,
+            description=(
+                f"Platform pre-save connection test to {validated.base_url} "
+                "succeeded"
+            ),
+            metadata={
+                **audit_metadata,
+                "inventory_error_code": (
+                    None if inventory_error is None else inventory_error.code.value
+                ),
+            },
+        )
+        return ControllerDraftProbeOutcome(
+            info=info,
+            error=None,
+            tls=observation,
+            suggested_tls_mode=suggested,
+            credentials_checked=credentials_checked,
+            inventory_requires_openapi=operator_only,
+            inventory_available=inventory_available,
+            inventory_error=inventory_error,
+            sites=tuple(sites),
+            ssids_site_id=ssids_site_id,
+            ssids=tuple(ssids),
         )
 
     # -- portal authorize (public) ----------------------------------------
