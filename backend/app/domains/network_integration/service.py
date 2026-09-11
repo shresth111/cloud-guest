@@ -264,6 +264,12 @@ class GuestSessionLookupProtocol(Protocol):
         self, session_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Any: ...
 
+    # Needed to bind the MAC being authorized to the device that actually
+    # authenticated -- see `authorize_portal_client`. Satisfied as-is by
+    # `GuestRepository.get_device_by_id`, so widening this Protocol by one
+    # method costs no new wiring.
+    async def get_device_by_id(self, device_id: uuid.UUID) -> Any: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SyncOutcome:
@@ -2156,6 +2162,47 @@ class NetworkIntegrationService:
                 "network_integration_portal_session_rejected",
                 extra={
                     "session_present": session is not None,
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                },
+            )
+            raise GuestSessionNotActiveError()
+
+        # The MAC being authorized must be the device that authenticated.
+        #
+        # Without this, every check above is satisfied by a guest who did
+        # everything honestly -- their own session, their own venue -- while
+        # the body names SOMEONE ELSE'S device. That guest completes OTP once
+        # and then puts a stranger's phone, or a neighbouring shop's laptop,
+        # onto the venue's WiFi. The organization and location comparisons
+        # above stop a foreign tenant's controller being reached; they say
+        # nothing at all about *which device* is being let on.
+        #
+        # It is not a theoretical shape: this endpoint takes `client_mac`
+        # straight from the request body, and the only other thing it does
+        # with it is hand it to the controller.
+        #
+        # A session with no device is refused rather than waved through.
+        # `GuestSession.device_id` is nullable -- a guest can log in without
+        # presenting a MAC -- but on this path the MAC always arrives on
+        # Omada's own redirect, so a missing device means the binding cannot
+        # be established, and an authorization we cannot bind is exactly the
+        # one worth refusing. Same `GuestSessionNotActiveError` as every
+        # other failure of this check: the endpoint is unauthenticated, and
+        # distinguishing "wrong device" from "no session" for a caller who
+        # holds no credentials just tells a prober which half to vary.
+        device_id = getattr(session, "device_id", None)
+        device = (
+            await self.guest_session_lookup.get_device_by_id(device_id)
+            if device_id is not None
+            else None
+        )
+        session_mac = getattr(device, "mac_address", None)
+        if session_mac is None or normalize_client_mac(session_mac) != normalized_mac:
+            logger.warning(
+                "network_integration_portal_device_mismatch",
+                extra={
+                    "session_has_device": device is not None,
                     "organization_id": str(organization_id),
                     "location_id": str(location_id),
                 },
