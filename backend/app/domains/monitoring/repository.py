@@ -255,6 +255,10 @@ class MonitoringRepositoryProtocol(Protocol):
         self, *, since: datetime, organization_id: uuid.UUID | None
     ) -> list[AuthorizationOutcomeCounts]: ...
 
+    async def get_organization_and_location_names(
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+    ) -> tuple[str | None, str | None]: ...
+
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
     ) -> RouterHealthSnapshot | None: ...
@@ -977,6 +981,36 @@ class MonitoringRepository:
             )
             for row in result.all()
         ]
+
+    async def get_organization_and_location_names(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> tuple[str | None, str | None]:
+        """Display names for an alert's organization and venue -- what the
+        platform team's copy of a cross-tenant alert has to carry to be
+        actionable (see ``AlertService._dispatch_platform_copies``).
+
+        Two primary-key reads. Soft-deleted rows still answer: an alert about
+        a venue that was deleted a minute ago should still say which venue
+        it was.
+        """
+        organization_name: str | None = None
+        location_name: str | None = None
+        if organization_id is not None:
+            organization_name = (
+                await self.session.execute(
+                    select(Organization.name).where(Organization.id == organization_id)
+                )
+            ).scalar_one_or_none()
+        if location_id is not None:
+            location_name = (
+                await self.session.execute(
+                    select(Location.name).where(Location.id == location_id)
+                )
+            ).scalar_one_or_none()
+        return organization_name, location_name
 
     async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
         """Every open (not ``RESOLVED``) ``Alert`` for one rule, newest

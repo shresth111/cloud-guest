@@ -104,6 +104,7 @@ def get_alert_service(
         get_monitored_hardware_service
     ),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
+    settings: Settings = Depends(get_settings),
 ) -> AlertService:
     return AlertService(
         repository,
@@ -111,6 +112,7 @@ def get_alert_service(
         redis_client=redis_client,
         monitored_hardware_service=monitored_hardware_service,
         caller_location_scope=caller_location_scope,
+        platform_alert_emails=settings.platform_alert_email_list,
     )
 
 

@@ -68,6 +68,7 @@ import os
 import shutil
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1323,9 +1324,15 @@ class AlertService:
         redis_client: Redis | None = None,
         monitored_hardware_service: MonitoredHardwareService | None = None,
         caller_location_scope: LocationScope = None,
+        platform_alert_emails: Sequence[str] = (),
     ) -> None:
         self.repository = repository
         self.notification_service = notification_service
+        # ``Settings.platform_alert_email_list`` -- the WyFy team's own
+        # inboxes, copied on network-controller alerts for every tenant.
+        # Empty (the default, and every existing caller/test) sends nothing
+        # extra. See _dispatch_platform_copies.
+        self.platform_alert_emails = tuple(platform_alert_emails)
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
         # Real-Time (BE-011 Part 3): optional, additive -- see
@@ -2376,7 +2383,101 @@ class AlertService:
         return resolved
 
     async def _dispatch_for_alert(self, alert: Alert) -> None:
+        """The organization's own channels first, then -- for the
+        network-controller targets only -- the platform team's copy.
+
+        Two steps rather than one loop because the second must not depend
+        on the first: an organization with no channel configured, or with
+        every channel switched off, is exactly the venue the platform team
+        most needs to hear about, and ``_dispatch_to_rule_channels`` returns
+        early in both cases.
+        """
+        emailed = await self._dispatch_to_rule_channels(alert)
+        try:
+            await self._dispatch_platform_copies(alert, already_emailed=emailed)
+        except Exception as exc:  # noqa: BLE001 -- same isolation as per channel
+            logger.warning(
+                "platform_alert_copy_dispatch_failed",
+                extra={
+                    "alert_id": str(alert.id),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+
+    async def _dispatch_platform_copies(
+        self, alert: Alert, *, already_emailed: set[str]
+    ) -> None:
+        """Email ``Settings.platform_alert_emails`` about a network-
+        controller alert, naming the organization and venue.
+
+        ## Scope
+
+        Only the three ``ALERT_TARGET_NETWORK_CONTROLLER*`` targets. A venue
+        owner cannot fix a WiFi controller the platform team onboarded, and
+        the team runs the integration across every tenant -- so for these
+        alerts, and only these, the team hears too. Every other rule stays
+        exactly the organization's own business.
+
+        ## De-duplication
+
+        Against the addresses the organization's own email channels were
+        *successfully* sent to for this alert -- which, for the default
+        "Account email" channel, is the organization's ``contact_email``.
+        Against successful sends rather than the ``contact_email`` column
+        itself: if the organization's channel is switched off, or its send
+        failed, a platform address that happens to equal it would otherwise
+        lose the only copy anybody got.
+
+        ## Why no ``notification_logs`` row
+
+        ``notification_logs.channel_id`` is NOT NULL and these recipients
+        are a setting, not a channel. Inventing a channel row per address
+        would be a second source of truth that drifts from the env the
+        moment somebody edits it. Each copy is a structured log line
+        (``platform_alert_copy_sent`` / ``_failed``) instead.
+        """
+        if not self.platform_alert_emails or self.notification_service is None:
+            return
+        rule = await self.repository.get_alert_rule(alert.rule_id)
+        if (
+            rule is None
+            or rule.target_component not in NETWORK_CONTROLLER_TARGET_STATES
+        ):
+            return
+        recipients = [
+            address
+            for address in self.platform_alert_emails
+            if address.lower() not in already_emailed
+        ]
+        if not recipients:
+            return
+        (
+            organization_name,
+            location_name,
+        ) = await self.repository.get_organization_and_location_names(
+            organization_id=alert.organization_id, location_id=alert.location_id
+        )
+        organization_label = organization_name or (
+            f"organization {alert.organization_id}"
+            if alert.organization_id
+            else "no organization"
+        )
+        venue_label = location_name or (
+            f"location {alert.location_id}" if alert.location_id else "no venue mapped"
+        )
+        for address in recipients:
+            await self.notification_service.send_platform_alert_email(
+                alert=alert,
+                email=address,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+
+    async def _dispatch_to_rule_channels(self, alert: Alert) -> set[str]:
         """Fan one alert out to every active channel its rule is linked to.
+
+        Returns the email addresses a copy was successfully sent to, which
+        is what ``_dispatch_platform_copies`` de-duplicates against.
 
         ## Every silent exit here is now a log line
 
@@ -2404,8 +2505,9 @@ class AlertService:
         exception would then propagate into the per-rule isolation above
         and skip the whole rule. Same discipline, one level down.
         """
+        emailed: set[str] = set()
         if self.notification_service is None:
-            return
+            return emailed
         channel_ids = await self.repository.list_notification_channel_ids_for_rule(
             alert.rule_id
         )
@@ -2420,7 +2522,7 @@ class AlertService:
                     ),
                 },
             )
-            return
+            return emailed
         channels = await self.notification_service.list_channels_by_ids(channel_ids)
         active = [channel for channel in channels if channel.is_active]
         if not active:
@@ -2432,12 +2534,19 @@ class AlertService:
                     "linked_channels": len(channel_ids),
                 },
             )
-            return
+            return emailed
         for channel in active:
             try:
-                await self.notification_service.dispatch_notification(
+                log = await self.notification_service.dispatch_notification(
                     alert=alert, channel=channel
                 )
+                if (
+                    channel.channel_type == NotificationChannelType.EMAIL.value
+                    and log.status == NotificationStatus.SENT.value
+                ):
+                    address = _channel_email_address(channel)
+                    if address:
+                        emailed.add(address)
             except Exception as exc:  # noqa: BLE001 -- per-channel isolation, see docstring
                 logger.warning(
                     "alert_dispatch_channel_failed",
@@ -2448,6 +2557,7 @@ class AlertService:
                         "error": f"{type(exc).__name__}: {exc}",
                     },
                 )
+        return emailed
 
 
 # ============================================================================
@@ -2761,6 +2871,18 @@ _NETWORK_CONTROLLER_GONE_MESSAGE = (
 )
 
 
+def _channel_email_address(channel: NotificationChannel) -> str | None:
+    """The address an EMAIL channel delivers to, lower-cased, or ``None``
+    if its config cannot be read -- in which case its send failed too, and
+    there is nothing to de-duplicate against."""
+    try:
+        config = json.loads(decrypt_secret(channel.config_encrypted))
+    except Exception:  # noqa: BLE001 -- unreadable config is "no address"
+        return None
+    email = config.get("email") if isinstance(config, dict) else None
+    return str(email).strip().lower() if email else None
+
+
 def _format_alert_message(alert: Alert) -> str:
     """The shared, plain-text message body every notifier's payload is
     built from -- one place to change the wording, not duplicated per
@@ -2783,9 +2905,43 @@ class EmailNotifier:
 
     async def send(self, *, alert: Alert, config: dict[str, object]) -> str:
         email = str(config["email"])
+        await self._send(email, alert=alert, subject_prefix="Wyfy Guest alert")
+        return f"queued to {email} via EmailProviderProtocol"
+
+    async def send_platform_copy(
+        self,
+        email: str,
+        *,
+        alert: Alert,
+        organization_label: str,
+        venue_label: str,
+    ) -> None:
+        """The platform team's copy: the same alert, led by which tenant
+        and which venue it is about. An organization's own copy never needs
+        that line -- it is only ever about them -- and the team's copy is
+        useless without it, since it arrives for every tenant."""
+        await self._send(
+            email,
+            alert=alert,
+            subject_prefix="Wyfy Guest platform alert",
+            subject_suffix=organization_label,
+            lead=f"Organization: {organization_label}. Venue: {venue_label}.",
+        )
+
+    async def _send(
+        self,
+        email: str,
+        *,
+        alert: Alert,
+        subject_prefix: str,
+        subject_suffix: str | None = None,
+        lead: str | None = None,
+    ) -> None:
         resolved = alert.status == "resolved"
         subject_label = "RESOLVED" if resolved else alert.severity.upper()
-        subject = f"Wyfy Guest alert: {subject_label}"
+        subject = f"{subject_prefix}: {subject_label}"
+        if subject_suffix:
+            subject = f"{subject} -- {subject_suffix}"
         accent = (
             SUCCESS
             if resolved
@@ -2793,14 +2949,16 @@ class EmailNotifier:
         )
         content = heading(
             "Alert resolved" if resolved else f"{esc(alert.severity.upper())} alert"
-        ) + paragraph(esc(alert.message))
+        )
+        if lead:
+            content += paragraph(esc(lead))
+        content += paragraph(esc(alert.message))
         body = render_email(
             preheader=_format_alert_message(alert),
             content_html=content,
             accent=accent,
         )
         await self.email_provider.send(email, subject, body)
-        return f"queued to {email} via EmailProviderProtocol"
 
 
 class SmsNotifier:
@@ -3004,6 +3162,48 @@ class NotificationService:
             NotificationChannelType.DISCORD.value: DiscordNotifier(http_client),
             NotificationChannelType.WEBHOOK.value: WebhookNotifier(http_client),
         }
+
+    async def send_platform_alert_email(
+        self,
+        *,
+        alert: Alert,
+        email: str,
+        organization_label: str,
+        venue_label: str,
+    ) -> bool:
+        """Send the platform team's copy of one alert to one address.
+
+        Same resilience promise as ``dispatch_notification``: never raises.
+        Unlike it, writes no ``NotificationLog`` -- see
+        ``AlertService._dispatch_platform_copies`` for why -- so the outcome
+        is a structured log line either way, and the return value says
+        which.
+        """
+        notifier = self._notifiers[NotificationChannelType.EMAIL.value]
+        try:
+            if not isinstance(notifier, EmailNotifier):
+                raise TypeError("the email notifier is not an EmailNotifier")
+            await notifier.send_platform_copy(
+                email,
+                alert=alert,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see class docstring
+            logger.warning(
+                "platform_alert_copy_failed",
+                extra={
+                    "alert_id": str(alert.id),
+                    "email": email,
+                    "error": str(exc)[:500],
+                },
+            )
+            return False
+        logger.info(
+            "platform_alert_copy_sent",
+            extra={"alert_id": str(alert.id), "email": email},
+        )
+        return True
 
     async def dispatch_notification(
         self, *, alert: Alert, channel: NotificationChannel

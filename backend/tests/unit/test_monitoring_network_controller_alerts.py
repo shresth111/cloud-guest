@@ -19,13 +19,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.dialects import postgresql
 
+from app.core.config import Settings
 from app.domains.monitoring.constants import (
     ALERT_TARGET_NETWORK_CONTROLLER,
     ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
     ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
+    ALERT_TARGET_ROUTER_REACHABILITY,
     NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES,
     NETWORK_CONTROLLER_SETUP_GRACE_HOURS,
     NETWORK_CONTROLLER_STATE_FAILING,
@@ -35,6 +39,7 @@ from app.domains.monitoring.constants import (
     AlertSeverity,
     AlertStatus,
     AlertTriggerType,
+    NotificationChannelType,
 )
 from app.domains.monitoring.default_alerting import DEFAULT_ALERT_RULES
 from app.domains.monitoring.exceptions import InvalidAlertRuleConfigError
@@ -42,11 +47,16 @@ from app.domains.monitoring.repository import (
     AuthorizationOutcomeCounts,
     MonitoringRepository,
 )
-from app.domains.monitoring.service import AlertService, network_controller_verdict
+from app.domains.monitoring.service import (
+    AlertService,
+    NotificationService,
+    network_controller_verdict,
+)
 from app.domains.monitoring.validators import validate_alert_rule_condition_config
 from app.domains.network_integration.constants import ErrorCode, IntegrationStatus
 from tests.unit.test_monitoring_alerts import (
     FakeRepository,
+    FakeRouter,
     _alert_rule_fields,
     _ensure_defaults,
 )
@@ -502,3 +512,173 @@ async def test_the_authorization_count_is_one_grouped_filtered_query() -> None:
     assert "FILTER (WHERE network_integration_authorizations.status" in sql
     assert "network_integration_authorizations.created_at >=" in sql
     assert "network_integration_authorizations.organization_id =" in sql
+
+
+# ============================================================================
+# The platform team's copy (Settings.platform_alert_emails)
+# ============================================================================
+
+
+def test_the_setting_is_normalized_deduplicated_and_empty_by_default() -> None:
+    assert Settings(platform_alert_emails="").platform_alert_email_list == ()
+    settings = Settings(
+        platform_alert_emails=(
+            " Ops@WyFy.example , oncall@wyfy.example,,ops@wyfy.example "
+        )
+    )
+    assert settings.platform_alert_email_list == (
+        "ops@wyfy.example",
+        "oncall@wyfy.example",
+    )
+
+
+def test_a_malformed_address_is_refused_by_name() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(platform_alert_emails="ops@wyfy.example,not-an-address")
+    assert "not-an-address" in str(exc_info.value)
+
+
+@dataclass
+class CapturingEmailProvider:
+    sent: list[tuple[str, str, str]] = field(default_factory=list)
+
+    async def send(
+        self, email: str, subject: str, body: str, *, attachment: object = None
+    ) -> None:
+        self.sent.append((email, subject, body))
+
+
+async def _platform_harness(
+    *,
+    platform_emails: tuple[str, ...],
+    org_email: str | None = "owner@venue.example",
+    org_channel_active: bool = True,
+    target: str = ALERT_TARGET_NETWORK_CONTROLLER,
+) -> tuple[FakeRepository, AlertService, CapturingEmailProvider, FakeIntegration]:
+    org_id = uuid.uuid4()
+    repo = FakeRepository()
+    provider = CapturingEmailProvider()
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    )
+    notification_service = NotificationService(
+        repo, http_client, email_provider=provider
+    )
+    channel_ids = []
+    if org_email is not None:
+        channel = await notification_service.create_channel(
+            organization_id=org_id,
+            channel_type=NotificationChannelType.EMAIL,
+            name="Account email",
+            config={"email": org_email},
+            is_active=org_channel_active,
+        )
+        channel_ids.append(channel.id)
+    rule = await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=target,
+            condition_config={
+                "expected_status": (
+                    NETWORK_CONTROLLER_TARGET_STATES.get(target, "unreachable")
+                )
+            },
+            organization_id=org_id,
+        )
+    )
+    repo.rule_channels[rule.id] = channel_ids
+    integration = FakeIntegration(organization_id=org_id, name="Lobby Omada")
+    integration.failing(IntegrationStatus.CONNECTION_FAILED, 3)
+    repo.network_integrations.append(integration)
+    repo.organization_names[org_id] = "Seaview Hotels"
+    repo.location_names[integration.location_id] = "Seaview Goa"
+    service = AlertService(
+        repo,
+        notification_service=notification_service,
+        platform_alert_emails=platform_emails,
+    )
+    return repo, service, provider, integration
+
+
+async def test_the_platform_team_gets_a_copy_naming_the_tenant_and_venue() -> None:
+    _, service, provider, integration = await _platform_harness(
+        platform_emails=("ops@wyfy.example",)
+    )
+
+    await service.evaluate_alert_rules()
+
+    recipients = [email for email, _, _ in provider.sent]
+    assert sorted(recipients) == ["ops@wyfy.example", "owner@venue.example"]
+    _, subject, body = next(m for m in provider.sent if m[0] == "ops@wyfy.example")
+    assert "Seaview Hotels" in subject
+    assert "Organization: Seaview Hotels. Venue: Seaview Goa." in body
+    assert "Lobby Omada" in body
+    # The organization's own copy is unchanged: no tenant line, no suffix.
+    _, org_subject, org_body = next(
+        m for m in provider.sent if m[0] == "owner@venue.example"
+    )
+    assert org_subject == "Wyfy Guest alert: CRITICAL"
+    assert "Organization:" not in org_body
+
+    # Recovery reaches the team too.
+    integration.recovered()
+    provider.sent.clear()
+    await service.evaluate_alert_rules()
+    team = [m for m in provider.sent if m[0] == "ops@wyfy.example"]
+    assert len(team) == 1 and "RESOLVED" in team[0][1]
+
+
+async def test_an_empty_setting_changes_nothing() -> None:
+    _, service, provider, _ = await _platform_harness(platform_emails=())
+
+    await service.evaluate_alert_rules()
+
+    assert [email for email, _, _ in provider.sent] == ["owner@venue.example"]
+
+
+async def test_a_platform_address_equal_to_the_orgs_is_sent_once() -> None:
+    _, service, provider, _ = await _platform_harness(
+        platform_emails=("OWNER@venue.example", "ops@wyfy.example"),
+    )
+
+    await service.evaluate_alert_rules()
+
+    recipients = sorted(email for email, _, _ in provider.sent)
+    assert recipients == ["ops@wyfy.example", "owner@venue.example"]
+
+
+async def test_a_venue_nobody_is_told_about_still_reaches_the_team() -> None:
+    """An organization with its channel switched off is the case the team
+    most needs, and the one where de-duplicating against the
+    contact_email column would have dropped the only copy."""
+    _, service, provider, _ = await _platform_harness(
+        platform_emails=("owner@venue.example",), org_channel_active=False
+    )
+
+    await service.evaluate_alert_rules()
+
+    assert [email for email, _, _ in provider.sent] == ["owner@venue.example"]
+    assert "Organization: Seaview Hotels" in provider.sent[0][2]
+
+
+async def test_other_alerts_stay_the_organizations_own_business() -> None:
+    repo, service, provider, integration = await _platform_harness(
+        platform_emails=("ops@wyfy.example",),
+        target=ALERT_TARGET_ROUTER_REACHABILITY,
+    )
+    repo.network_integrations.clear()
+    repo.routers.append(
+        FakeRouter(
+            id=uuid.uuid4(),
+            organization_id=integration.organization_id,
+            location_id=integration.location_id,
+            name="hEX lite",
+            health_status="healthy",
+            reachability_state="unreachable",
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert [email for email, _, _ in provider.sent] == ["owner@venue.example"]

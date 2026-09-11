@@ -220,6 +220,8 @@ class FakeRepository:
     # ``tests/unit/test_monitoring_network_controller_alerts.py``.
     network_integrations: list[object] = field(default_factory=list)
     authorization_counts: list[object] = field(default_factory=list)
+    organization_names: dict[uuid.UUID, str] = field(default_factory=dict)
+    location_names: dict[uuid.UUID, str] = field(default_factory=dict)
     snapshots: dict[uuid.UUID, FakeSnapshot] = field(default_factory=dict)
     service_health_rows: dict[str, ServiceHealth] = field(default_factory=dict)
     platform_events: list[PlatformEvent] = field(default_factory=list)
@@ -409,6 +411,17 @@ class FakeRepository:
             )
         }
         return [c for c in self.authorization_counts if c.integration_id in wanted]
+
+    async def get_organization_and_location_names(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> tuple[str | None, str | None]:
+        return (
+            self.organization_names.get(organization_id) if organization_id else None,
+            self.location_names.get(location_id) if location_id else None,
+        )
 
     async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
         """The bulk de-duplication read. Same predicate and same
