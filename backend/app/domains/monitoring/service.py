@@ -68,6 +68,7 @@ import os
 import shutil
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -91,6 +92,7 @@ from app.core.logging import get_logger
 from app.database.utils.pagination import PaginationMeta
 from app.domains.monitored_hardware.constants import HardwareStatus
 from app.domains.monitored_hardware.service import MonitoredHardwareService
+from app.domains.network_integration.constants import ErrorCode, IntegrationStatus
 from app.domains.organization.exceptions import CrossOrganizationAccessError
 from app.domains.otp.service import (
     EmailProviderProtocol,
@@ -116,6 +118,9 @@ from .constants import (
     ALERT_EVENT_LOOKBACK_MINUTES,
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_NETWORK_CONTROLLER,
+    ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+    ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
     ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
     ALERT_TARGET_ROUTER_REACHABILITY,
@@ -133,6 +138,12 @@ from .constants import (
     HTTP_NOTIFICATION_TIMEOUT_SECONDS,
     MAX_EVENT_TIMELINE_LIMIT,
     MONITORING_LIVE_CHANNEL,
+    NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS,
+    NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO,
+    NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES,
+    NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES,
+    NETWORK_CONTROLLER_SETUP_GRACE_HOURS,
+    NETWORK_CONTROLLER_TARGET_STATES,
     ROGUE_DHCP_STATE_GUARDED,
     ROGUE_DHCP_STATE_UNGUARDED,
     ROUTER_EVENT_SOURCE_DOMAIN,
@@ -185,7 +196,7 @@ from .models import (
     SlaReport,
     SlaTarget,
 )
-from .repository import MonitoringRepositoryProtocol
+from .repository import AuthorizationOutcomeCounts, MonitoringRepositoryProtocol
 from .validators import (
     classify_storage_health,
     compare_threshold,
@@ -1313,9 +1324,15 @@ class AlertService:
         redis_client: Redis | None = None,
         monitored_hardware_service: MonitoredHardwareService | None = None,
         caller_location_scope: LocationScope = None,
+        platform_alert_emails: Sequence[str] = (),
     ) -> None:
         self.repository = repository
         self.notification_service = notification_service
+        # ``Settings.platform_alert_email_list`` -- the WyFy team's own
+        # inboxes, copied on network-controller alerts for every tenant.
+        # Empty (the default, and every existing caller/test) sends nothing
+        # extra. See _dispatch_platform_copies.
+        self.platform_alert_emails = tuple(platform_alert_emails)
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
         # Real-Time (BE-011 Part 3): optional, additive -- see
@@ -1835,6 +1852,9 @@ class AlertService:
         if rule.target_component == ALERT_TARGET_ROGUE_DHCP_GUARD:
             return await self._evaluate_rogue_dhcp_guard_rule(rule, expected_status)
 
+        if rule.target_component in NETWORK_CONTROLLER_TARGET_STATES:
+            return await self._evaluate_network_controller_rule(rule, expected_status)
+
         if rule.target_component == ALERT_TARGET_ROUTER_REACHABILITY:
             routers = await self._agent_managed_routers(rule.organization_id)
             for router in routers:
@@ -2084,6 +2104,131 @@ class AlertService:
                 )
         return triggered, resolved
 
+    async def _evaluate_network_controller_rule(
+        self, rule: AlertRule, expected_status: object
+    ) -> tuple[list[Alert], list[Alert]]:
+        """The three ``ALERT_TARGET_NETWORK_CONTROLLER*`` targets.
+
+        Reads ``network_integrations`` (and, for the authorize target, one
+        grouped count over ``network_integration_authorizations``) -- rows
+        that domain's own sync sweep and portal path already persist. No
+        controller I/O. See ``constants.ALERT_TARGET_NETWORK_CONTROLLER``
+        for why these exist and ``network_controller_verdict`` for exactly
+        what each one asks of a row.
+
+        ## Grouped by the de-duplication key
+
+        Integrations are grouped per ``(organization_id, location_id,
+        router_id)`` -- this engine's key has no integration column -- and a
+        group gets one alert naming every member that is firing. It
+        resolves only when every member has *positively* cleared; a member
+        with no answer (``None``) holds an open alert open and opens
+        nothing, the same "no answer is not an answer" rule
+        ``_evaluate_rogue_dhcp_guard_rule`` follows.
+
+        ## Alerts whose integration is gone
+
+        An open alert whose key no current integration produces -- the
+        integration was deleted, or re-mapped to another venue -- is
+        resolved with copy that says so. Without this it would sit open
+        forever: nothing would ever evaluate its key again.
+        """
+        triggered: list[Alert] = []
+        resolved: list[Alert] = []
+        target = str(rule.target_component)
+        # Belt and braces with the validator, as the rogue-DHCP branch does.
+        if expected_status != NETWORK_CONTROLLER_TARGET_STATES[target]:
+            return triggered, resolved
+
+        now = datetime.now(UTC)
+        integrations = await self.repository.list_network_integrations(
+            organization_id=rule.organization_id
+        )
+        counts: dict[uuid.UUID, AuthorizationOutcomeCounts] = {}
+        if target == ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE:
+            since = now - timedelta(minutes=NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES)
+            for row in await self.repository.count_authorization_outcomes_since(
+                since=since, organization_id=rule.organization_id
+            ):
+                counts[row.integration_id] = row
+
+        AlertKey = tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None]
+        open_alerts: dict[AlertKey, Alert] = {}
+        for alert in await self.repository.list_open_alerts_for_rule(rule_id=rule.id):
+            open_alerts.setdefault(
+                (alert.organization_id, alert.location_id, alert.router_id), alert
+            )
+
+        groups: dict[AlertKey, list[object]] = {}
+        for integration in integrations:
+            key = (
+                integration.organization_id,
+                integration.location_id,
+                integration.router_id,
+            )
+            groups.setdefault(key, []).append(integration)
+
+        for key, members in groups.items():
+            verdicts = [
+                (
+                    member,
+                    network_controller_verdict(
+                        target, member, now=now, counts=counts.get(member.id)
+                    ),
+                )
+                for member in members
+            ]
+            firing = [member for member, verdict in verdicts if verdict is True]
+            existing = open_alerts.get(key)
+            if firing:
+                if existing is None:
+                    triggered.append(
+                        await self._create_alert(
+                            rule,
+                            organization_id=key[0],
+                            location_id=key[1],
+                            router_id=key[2],
+                            message=" ".join(
+                                _network_controller_message(
+                                    target, member, counts=counts.get(member.id)
+                                )
+                                for member in firing
+                            ),
+                        )
+                    )
+                continue
+            if existing is None:
+                continue
+            if all(verdict is False for _, verdict in verdicts):
+                resolved.append(
+                    await self._auto_resolve(
+                        existing,
+                        resolved_message=" ".join(
+                            _network_controller_resolved_message(target, member)
+                            for member in members
+                        ),
+                    )
+                )
+            else:
+                logger.info(
+                    "network_controller_rule_state_unknown",
+                    extra={
+                        "rule_id": str(rule.id),
+                        "target_component": target,
+                        "open_alert_left_open": True,
+                    },
+                )
+
+        for key, alert in open_alerts.items():
+            if key not in groups:
+                resolved.append(
+                    await self._auto_resolve(
+                        alert,
+                        resolved_message=_NETWORK_CONTROLLER_GONE_MESSAGE,
+                    )
+                )
+        return triggered, resolved
+
     async def _evaluate_threshold_rule(
         self, rule: AlertRule
     ) -> tuple[list[Alert], list[Alert]]:
@@ -2238,7 +2383,101 @@ class AlertService:
         return resolved
 
     async def _dispatch_for_alert(self, alert: Alert) -> None:
+        """The organization's own channels first, then -- for the
+        network-controller targets only -- the platform team's copy.
+
+        Two steps rather than one loop because the second must not depend
+        on the first: an organization with no channel configured, or with
+        every channel switched off, is exactly the venue the platform team
+        most needs to hear about, and ``_dispatch_to_rule_channels`` returns
+        early in both cases.
+        """
+        emailed = await self._dispatch_to_rule_channels(alert)
+        try:
+            await self._dispatch_platform_copies(alert, already_emailed=emailed)
+        except Exception as exc:  # noqa: BLE001 -- same isolation as per channel
+            logger.warning(
+                "platform_alert_copy_dispatch_failed",
+                extra={
+                    "alert_id": str(alert.id),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+
+    async def _dispatch_platform_copies(
+        self, alert: Alert, *, already_emailed: set[str]
+    ) -> None:
+        """Email ``Settings.platform_alert_emails`` about a network-
+        controller alert, naming the organization and venue.
+
+        ## Scope
+
+        Only the three ``ALERT_TARGET_NETWORK_CONTROLLER*`` targets. A venue
+        owner cannot fix a WiFi controller the platform team onboarded, and
+        the team runs the integration across every tenant -- so for these
+        alerts, and only these, the team hears too. Every other rule stays
+        exactly the organization's own business.
+
+        ## De-duplication
+
+        Against the addresses the organization's own email channels were
+        *successfully* sent to for this alert -- which, for the default
+        "Account email" channel, is the organization's ``contact_email``.
+        Against successful sends rather than the ``contact_email`` column
+        itself: if the organization's channel is switched off, or its send
+        failed, a platform address that happens to equal it would otherwise
+        lose the only copy anybody got.
+
+        ## Why no ``notification_logs`` row
+
+        ``notification_logs.channel_id`` is NOT NULL and these recipients
+        are a setting, not a channel. Inventing a channel row per address
+        would be a second source of truth that drifts from the env the
+        moment somebody edits it. Each copy is a structured log line
+        (``platform_alert_copy_sent`` / ``_failed``) instead.
+        """
+        if not self.platform_alert_emails or self.notification_service is None:
+            return
+        rule = await self.repository.get_alert_rule(alert.rule_id)
+        if (
+            rule is None
+            or rule.target_component not in NETWORK_CONTROLLER_TARGET_STATES
+        ):
+            return
+        recipients = [
+            address
+            for address in self.platform_alert_emails
+            if address.lower() not in already_emailed
+        ]
+        if not recipients:
+            return
+        (
+            organization_name,
+            location_name,
+        ) = await self.repository.get_organization_and_location_names(
+            organization_id=alert.organization_id, location_id=alert.location_id
+        )
+        organization_label = organization_name or (
+            f"organization {alert.organization_id}"
+            if alert.organization_id
+            else "no organization"
+        )
+        venue_label = location_name or (
+            f"location {alert.location_id}" if alert.location_id else "no venue mapped"
+        )
+        for address in recipients:
+            await self.notification_service.send_platform_alert_email(
+                alert=alert,
+                email=address,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+
+    async def _dispatch_to_rule_channels(self, alert: Alert) -> set[str]:
         """Fan one alert out to every active channel its rule is linked to.
+
+        Returns the email addresses a copy was successfully sent to, which
+        is what ``_dispatch_platform_copies`` de-duplicates against.
 
         ## Every silent exit here is now a log line
 
@@ -2266,8 +2505,9 @@ class AlertService:
         exception would then propagate into the per-rule isolation above
         and skip the whole rule. Same discipline, one level down.
         """
+        emailed: set[str] = set()
         if self.notification_service is None:
-            return
+            return emailed
         channel_ids = await self.repository.list_notification_channel_ids_for_rule(
             alert.rule_id
         )
@@ -2282,7 +2522,7 @@ class AlertService:
                     ),
                 },
             )
-            return
+            return emailed
         channels = await self.notification_service.list_channels_by_ids(channel_ids)
         active = [channel for channel in channels if channel.is_active]
         if not active:
@@ -2294,12 +2534,19 @@ class AlertService:
                     "linked_channels": len(channel_ids),
                 },
             )
-            return
+            return emailed
         for channel in active:
             try:
-                await self.notification_service.dispatch_notification(
+                log = await self.notification_service.dispatch_notification(
                     alert=alert, channel=channel
                 )
+                if (
+                    channel.channel_type == NotificationChannelType.EMAIL.value
+                    and log.status == NotificationStatus.SENT.value
+                ):
+                    address = _channel_email_address(channel)
+                    if address:
+                        emailed.add(address)
             except Exception as exc:  # noqa: BLE001 -- per-channel isolation, see docstring
                 logger.warning(
                     "alert_dispatch_channel_failed",
@@ -2310,6 +2557,7 @@ class AlertService:
                         "error": f"{type(exc).__name__}: {exc}",
                     },
                 )
+        return emailed
 
 
 # ============================================================================
@@ -2448,6 +2696,193 @@ def _rogue_dhcp_guard_resolved_message(router_name: str) -> str:
     )
 
 
+# ``IntegrationStatus`` values meaning "this platform is not getting good
+# answers from the controller". ``CONNECTING`` is absent on purpose: it is a
+# moment inside a connection attempt, not a verdict.
+_NETWORK_CONTROLLER_FAILING_STATUSES = frozenset(
+    {
+        IntegrationStatus.AUTH_FAILED.value,
+        IntegrationStatus.CONNECTION_FAILED.value,
+        IntegrationStatus.SYNC_ERROR.value,
+    }
+)
+
+
+def _consecutive_sync_failures(integration: object) -> int:
+    """The counter ``NetworkIntegrationService._record_failure`` keeps in
+    ``provider_metadata`` and a successful sync resets to zero. Read the
+    same forgiving way that service reads it, so a malformed value means
+    "no failures on record" here too rather than an evaluation error."""
+    metadata = getattr(integration, "provider_metadata", None) or {}
+    try:
+        return int(metadata.get("consecutive_failure_count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def network_controller_verdict(
+    target: str,
+    integration: object,
+    *,
+    now: datetime,
+    counts: AuthorizationOutcomeCounts | None = None,
+) -> bool | None:
+    """What one integration row says about one network-controller target.
+
+    ``True`` -- the condition holds, fire. ``False`` -- positively clear,
+    an open alert may resolve. ``None`` -- no answer yet: neither fire nor
+    resolve. Pure, so every threshold below is tested without a database.
+
+    An integration an operator has switched off (``is_enabled = False``)
+    is ``False`` for every target. Off is a deliberate answer to the
+    problem, and an alert that stays open about something its owner turned
+    off is one they learn to ignore.
+    """
+    if not getattr(integration, "is_enabled", False):
+        return False
+    status = getattr(integration, "status", None)
+
+    if target == ALERT_TARGET_NETWORK_CONTROLLER:
+        if status in _NETWORK_CONTROLLER_FAILING_STATUSES:
+            # Failing, but not yet for long enough to page anybody -- and
+            # not recovered either, so an open alert stays open. See
+            # NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES.
+            if (
+                _consecutive_sync_failures(integration)
+                >= NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES
+            ):
+                return True
+            return None
+        if status == IntegrationStatus.CONNECTING.value:
+            return None
+        return False
+
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_SETUP:
+        if status != IntegrationStatus.UNCONFIGURED.value:
+            return False
+        created_at = getattr(integration, "created_at", None)
+        if created_at is None:
+            return None
+        return created_at <= now - timedelta(hours=NETWORK_CONTROLLER_SETUP_GRACE_HOURS)
+
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE:
+        if counts is None or counts.failed_attempts == 0:
+            return False
+        if (
+            counts.failed_guests >= NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS
+            and counts.failed_attempts
+            >= NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO * counts.attempts
+        ):
+            return True
+        # Some failures, below the bar: not a finding, and not a recovery.
+        # See NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES on the hysteresis.
+        return None
+
+    return None
+
+
+def _network_controller_message(
+    target: str,
+    integration: object,
+    *,
+    counts: AuthorizationOutcomeCounts | None = None,
+) -> str:
+    """Trigger copy, one sentence group per firing integration.
+
+    Written for a venue owner, not an engineer: what is wrong, what it
+    means for guests, and -- only where this platform actually knows it --
+    where to look. No raw error text: ``last_error_message`` is redacted
+    but still controller-shaped, and it is one click away on the
+    integration's own page.
+    """
+    name = getattr(integration, "name", "WiFi controller")
+    if target == ALERT_TARGET_NETWORK_CONTROLLER:
+        failures = _consecutive_sync_failures(integration)
+        status = getattr(integration, "status", None)
+        if status == IntegrationStatus.AUTH_FAILED.value:
+            return (
+                f"{name}: the WiFi controller is rejecting the saved login "
+                f"({failures} checks in a row). New guests at this venue "
+                "cannot get online until the controller credentials are "
+                "updated. Guests already online keep their access."
+            )
+        if status == IntegrationStatus.CONNECTION_FAILED.value:
+            return (
+                f"{name}: we cannot reach the WiFi controller ({failures} "
+                "checks in a row). New guests at this venue cannot get "
+                "online until it is reachable again -- please check that "
+                "the controller is running and reachable from the internet. "
+                "Guests already online keep their access."
+            )
+        return (
+            f"{name}: the WiFi controller answers, but reading from it has "
+            f"failed {failures} times in a row. Guest sign-in at this venue "
+            "may be affected."
+        )
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_SETUP:
+        detail = getattr(integration, "last_error_message", None)
+        reason = (
+            f": {detail}"
+            if detail
+            and getattr(integration, "last_error_code", None)
+            == ErrorCode.SETUP_INCOMPLETE.value
+            else " -- the platform has not completed a connection to it yet"
+        )
+        return (
+            f"{name}: this WiFi controller was added more than "
+            f"{NETWORK_CONTROLLER_SETUP_GRACE_HOURS} hours ago and still "
+            f"cannot let a single guest online{reason}."
+        )
+    failed_guests = counts.failed_guests if counts else 0
+    failed = counts.failed_attempts if counts else 0
+    attempts = counts.attempts if counts else 0
+    return (
+        f"{name}: the WiFi controller refused {failed_guests} guests in the "
+        f"last {NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES} minutes "
+        f"({failed} of {attempts} attempts failed). Guests are signing in "
+        "but not being let online. The integration's event log records "
+        "what was sent for each refusal."
+    )
+
+
+def _network_controller_resolved_message(target: str, integration: object) -> str:
+    """Resolution copy, replacing the trigger text for the reason
+    ``_auto_resolve``'s docstring gives. Says *why* it cleared, because
+    "switched off" and "working again" are different news."""
+    name = getattr(integration, "name", "WiFi controller")
+    if not getattr(integration, "is_enabled", False):
+        return (
+            f"{name}: this WiFi controller integration was switched off, so "
+            "this alert is closed."
+        )
+    if target == ALERT_TARGET_NETWORK_CONTROLLER:
+        return f"{name}: the WiFi controller is answering normally again."
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_SETUP:
+        return f"{name}: this WiFi controller's setup is complete."
+    return (
+        f"{name}: no guest has been refused by the WiFi controller in the "
+        f"last {NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES} minutes."
+    )
+
+
+_NETWORK_CONTROLLER_GONE_MESSAGE = (
+    "The WiFi controller integration this alert was about has been removed "
+    "or moved to a different venue, so this alert is closed."
+)
+
+
+def _channel_email_address(channel: NotificationChannel) -> str | None:
+    """The address an EMAIL channel delivers to, lower-cased, or ``None``
+    if its config cannot be read -- in which case its send failed too, and
+    there is nothing to de-duplicate against."""
+    try:
+        config = json.loads(decrypt_secret(channel.config_encrypted))
+    except Exception:  # noqa: BLE001 -- unreadable config is "no address"
+        return None
+    email = config.get("email") if isinstance(config, dict) else None
+    return str(email).strip().lower() if email else None
+
+
 def _format_alert_message(alert: Alert) -> str:
     """The shared, plain-text message body every notifier's payload is
     built from -- one place to change the wording, not duplicated per
@@ -2470,9 +2905,43 @@ class EmailNotifier:
 
     async def send(self, *, alert: Alert, config: dict[str, object]) -> str:
         email = str(config["email"])
+        await self._send(email, alert=alert, subject_prefix="Wyfy Guest alert")
+        return f"queued to {email} via EmailProviderProtocol"
+
+    async def send_platform_copy(
+        self,
+        email: str,
+        *,
+        alert: Alert,
+        organization_label: str,
+        venue_label: str,
+    ) -> None:
+        """The platform team's copy: the same alert, led by which tenant
+        and which venue it is about. An organization's own copy never needs
+        that line -- it is only ever about them -- and the team's copy is
+        useless without it, since it arrives for every tenant."""
+        await self._send(
+            email,
+            alert=alert,
+            subject_prefix="Wyfy Guest platform alert",
+            subject_suffix=organization_label,
+            lead=f"Organization: {organization_label}. Venue: {venue_label}.",
+        )
+
+    async def _send(
+        self,
+        email: str,
+        *,
+        alert: Alert,
+        subject_prefix: str,
+        subject_suffix: str | None = None,
+        lead: str | None = None,
+    ) -> None:
         resolved = alert.status == "resolved"
         subject_label = "RESOLVED" if resolved else alert.severity.upper()
-        subject = f"Wyfy Guest alert: {subject_label}"
+        subject = f"{subject_prefix}: {subject_label}"
+        if subject_suffix:
+            subject = f"{subject} -- {subject_suffix}"
         accent = (
             SUCCESS
             if resolved
@@ -2480,14 +2949,16 @@ class EmailNotifier:
         )
         content = heading(
             "Alert resolved" if resolved else f"{esc(alert.severity.upper())} alert"
-        ) + paragraph(esc(alert.message))
+        )
+        if lead:
+            content += paragraph(esc(lead))
+        content += paragraph(esc(alert.message))
         body = render_email(
             preheader=_format_alert_message(alert),
             content_html=content,
             accent=accent,
         )
         await self.email_provider.send(email, subject, body)
-        return f"queued to {email} via EmailProviderProtocol"
 
 
 class SmsNotifier:
@@ -2691,6 +3162,48 @@ class NotificationService:
             NotificationChannelType.DISCORD.value: DiscordNotifier(http_client),
             NotificationChannelType.WEBHOOK.value: WebhookNotifier(http_client),
         }
+
+    async def send_platform_alert_email(
+        self,
+        *,
+        alert: Alert,
+        email: str,
+        organization_label: str,
+        venue_label: str,
+    ) -> bool:
+        """Send the platform team's copy of one alert to one address.
+
+        Same resilience promise as ``dispatch_notification``: never raises.
+        Unlike it, writes no ``NotificationLog`` -- see
+        ``AlertService._dispatch_platform_copies`` for why -- so the outcome
+        is a structured log line either way, and the return value says
+        which.
+        """
+        notifier = self._notifiers[NotificationChannelType.EMAIL.value]
+        try:
+            if not isinstance(notifier, EmailNotifier):
+                raise TypeError("the email notifier is not an EmailNotifier")
+            await notifier.send_platform_copy(
+                email,
+                alert=alert,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see class docstring
+            logger.warning(
+                "platform_alert_copy_failed",
+                extra={
+                    "alert_id": str(alert.id),
+                    "email": email,
+                    "error": str(exc)[:500],
+                },
+            )
+            return False
+        logger.info(
+            "platform_alert_copy_sent",
+            extra={"alert_id": str(alert.id), "email": email},
+        )
+        return True
 
     async def dispatch_notification(
         self, *, alert: Alert, channel: NotificationChannel

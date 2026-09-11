@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, PostgresDsn, RedisDsn
+from email_validator import EmailNotValidError, validate_email
+from pydantic import Field, PostgresDsn, RedisDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The default for every Fernet key below. It is base64 of the ASCII string
@@ -1229,6 +1230,55 @@ class Settings(BaseSettings):
             "an arbitrary address."
         ),
     )
+
+    platform_alert_emails: str = Field(
+        default="",
+        description=(
+            "Comma-separated inbox(es) of the WyFy platform team that also "
+            "receive every WiFi-controller (TP-Link Omada) alert, for every "
+            "organization -- in addition to that organization's own alert "
+            "channels, never instead of them. See "
+            "app.domains.monitoring.service.AlertService"
+            "._dispatch_platform_copies. Scoped to the three "
+            "network_controller* alert targets only. Empty (the default) "
+            "sends no extra copy. A plain comma-separated string rather "
+            "than list[str] for the reason the demo-booking block below "
+            "gives (pydantic-settings would parse a list as JSON); "
+            "normalized and validated at startup, so a malformed address "
+            "stops the process from starting instead of silently mailing "
+            "nobody."
+        ),
+    )
+
+    @field_validator("platform_alert_emails")
+    @classmethod
+    def _normalize_platform_alert_emails(cls, value: str) -> str:
+        """Lower-cased, de-duplicated, order-preserving, and every entry a
+        real address -- naming the offending token, so the startup error
+        points at the typo rather than at the setting."""
+        addresses: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            try:
+                normalized = validate_email(
+                    candidate, check_deliverability=False
+                ).normalized.lower()
+            except EmailNotValidError as exc:
+                raise ValueError(
+                    f"platform_alert_emails: {candidate!r} is not a valid "
+                    f"email address ({exc})"
+                ) from exc
+            if normalized not in addresses:
+                addresses.append(normalized)
+        return ",".join(addresses)
+
+    @property
+    def platform_alert_email_list(self) -> tuple[str, ...]:
+        return tuple(
+            address for address in self.platform_alert_emails.split(",") if address
+        )
 
     # ======================================================================
     # Demo booking calendar (app.domains.demo_booking)

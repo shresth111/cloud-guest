@@ -152,6 +152,7 @@ async def _run_alert_rule_evaluation_sweep_async() -> AlertEvaluationResult:
                 notification_service=notification_service,
                 redis_client=redis,
                 monitored_hardware_service=monitored_hardware_service,
+                platform_alert_emails=settings.platform_alert_email_list,
             )
             try:
                 result = await alert_service.evaluate_alert_rules()

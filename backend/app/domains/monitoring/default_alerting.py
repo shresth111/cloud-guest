@@ -66,8 +66,14 @@ from app.domains.router.enums import RouterReachabilityState
 from .constants import (
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_NETWORK_CONTROLLER,
+    ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+    ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
     ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER_REACHABILITY,
+    NETWORK_CONTROLLER_STATE_FAILING,
+    NETWORK_CONTROLLER_STATE_REFUSING_GUESTS,
+    NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE,
     ROGUE_DHCP_STATE_UNGUARDED,
     AlertSeverity,
     AlertTriggerType,
@@ -134,6 +140,31 @@ DEFAULT_ALERT_RULES: tuple[dict[str, object], ...] = (
         "severity": AlertSeverity.CRITICAL.value,
     },
     {
+        # The Omada counterpart of "Site offline". An Omada venue has no
+        # MikroTik in the path, so the router rules above can never see it
+        # (AlertService._agent_managed_routers drops the controller's
+        # synthetic fleet row on purpose). What they would have caught is
+        # this: the platform can no longer talk to the venue's controller,
+        # and every guest authorization goes through that conversation.
+        #
+        # CRITICAL for the same reason "Site offline" is -- new guests at
+        # this venue cannot get online. Fires after three consecutive
+        # failed syncs, about half an hour at the default interval; see
+        # NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES for why not
+        # sooner.
+        "name": "WiFi controller unreachable",
+        "description": (
+            "Fires when the platform has failed to reach or sign in to a "
+            "venue's WiFi controller (TP-Link Omada) several checks in a "
+            "row -- about half an hour. While it lasts, new guests cannot "
+            "get online. Resolves on the next successful check."
+        ),
+        "trigger_type": AlertTriggerType.HEALTH_STATUS_CHANGE,
+        "target_component": ALERT_TARGET_NETWORK_CONTROLLER,
+        "condition_config": {"expected_status": NETWORK_CONTROLLER_STATE_FAILING},
+        "severity": AlertSeverity.CRITICAL.value,
+    },
+    {
         "name": "Network hardware down",
         "description": (
             "Fires when a registered access point, printer, camera, or "
@@ -142,6 +173,26 @@ DEFAULT_ALERT_RULES: tuple[dict[str, object], ...] = (
         "trigger_type": AlertTriggerType.HEALTH_STATUS_CHANGE,
         "target_component": ALERT_TARGET_MONITORED_HARDWARE,
         "condition_config": {"expected_status": "down"},
+        "severity": AlertSeverity.WARNING.value,
+    },
+    {
+        # The controller answers and says no. Not CRITICAL: it is inferred
+        # from a pattern of refusals rather than observed as an outage, and
+        # the thresholds (NETWORK_CONTROLLER_AUTHORIZE_*) are set so one
+        # misbehaving phone, or a few odd devices at a busy venue, does not
+        # page anybody.
+        "name": "WiFi controller refusing guests",
+        "description": (
+            "Fires when a venue's WiFi controller refuses at least three "
+            "different guests within fifteen minutes, and at least half of "
+            "all sign-in attempts there fail. Resolves once fifteen minutes "
+            "pass with no refusal."
+        ),
+        "trigger_type": AlertTriggerType.HEALTH_STATUS_CHANGE,
+        "target_component": ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+        "condition_config": {
+            "expected_status": NETWORK_CONTROLLER_STATE_REFUSING_GUESTS
+        },
         "severity": AlertSeverity.WARNING.value,
     },
     {
@@ -169,6 +220,26 @@ DEFAULT_ALERT_RULES: tuple[dict[str, object], ...] = (
         "trigger_type": AlertTriggerType.HEALTH_STATUS_CHANGE,
         "target_component": ALERT_TARGET_ROGUE_DHCP_GUARD,
         "condition_config": {"expected_status": ROGUE_DHCP_STATE_UNGUARDED},
+        "severity": AlertSeverity.WARNING.value,
+    },
+    {
+        # Least urgent, last: nothing broke, something was never finished.
+        # It is here because the failure it describes is silent -- a venue
+        # whose controller integration was started and abandoned looks
+        # "added" in every list, and authorizes nobody. A day's grace so an
+        # operator part-way through onboarding is never the recipient.
+        "name": "WiFi controller setup unfinished",
+        "description": (
+            "Fires when a WiFi controller (TP-Link Omada) added more than a "
+            "day ago still cannot let a single guest online -- for example "
+            "no site selected, or not linked to a location. Resolves once "
+            "setup is complete."
+        ),
+        "trigger_type": AlertTriggerType.HEALTH_STATUS_CHANGE,
+        "target_component": ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
+        "condition_config": {
+            "expected_status": NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE
+        },
         "severity": AlertSeverity.WARNING.value,
     },
 )
@@ -220,7 +291,7 @@ async def ensure_default_alerting(
     any default rule existing, and this is called on the organization
     creation path -- so every failure is logged and recorded in the report,
     and failure is per rule rather than per call, so one bad rule does not
-    cost the organization the other three. That is the same shape the
+    cost the organization the rest. That is the same shape the
     original ``_create_default_alert_rules`` had, kept deliberately.
     """
     report = DefaultAlertingReport(organization_id=organization_id)
