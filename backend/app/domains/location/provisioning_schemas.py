@@ -129,14 +129,26 @@ class ProvisionLocationRequest(BaseModel):
     )
     location: LocationInputSchema
     owner: OwnerInputSchema
-    router: RouterInputSchema
+    router: RouterInputSchema | None = Field(
+        default=None,
+        description=(
+            "The venue's MikroTik router. Omit (or send null) for a venue "
+            "whose WiFi is not a MikroTik -- e.g. a TP-Link Omada "
+            "controller, which is onboarded afterwards through "
+            "`POST /network-integrations/platform/onboard` with the "
+            "organization_id/location_id this call returns. Without a "
+            "router, nothing router-shaped is created: no router row, no "
+            "config template, no WireGuard peer."
+        ),
+    )
     router_config_template_id: str | None = Field(
         default=None,
         description=(
             "Explicit config template to apply. When omitted, the most "
             "recently created active system template is used; if none "
             "exists, provisioning fails with a clear, documented error "
-            "rather than silently skipping this step."
+            "rather than silently skipping this step. Only meaningful with "
+            "a `router` -- supplying it without one is rejected (422)."
         ),
     )
     plan_id: str = Field(..., description="The base subscription Plan to apply.")
@@ -151,6 +163,23 @@ class ProvisionLocationRequest(BaseModel):
             raise ValueError(
                 "Exactly one of existing_organization_id or new_organization "
                 "must be provided"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_template_requires_router(self) -> ProvisionLocationRequest:
+        """A config template is a RouterOS script, applied to a router row.
+        With no router there is nothing to apply it to, and silently
+        dropping the operator's explicit choice would hide a wizard bug
+        (the router step skipped while a template was still selected)
+        behind a 201. Rejected here, at the request boundary, so it is a
+        422 before anything is written -- the service re-checks the same
+        rule for callers that build ``ProvisionLocationInput`` directly."""
+        if self.router is None and self.router_config_template_id is not None:
+            raise ValueError(
+                "router_config_template_id was supplied without a router -- "
+                "a config template can only be applied to a router. Either "
+                "include `router`, or omit router_config_template_id."
             )
         return self
 
@@ -199,8 +228,11 @@ class ProvisionLocationResponse(BaseModel):
     plan_id: str
     plan_name: str
     feature_summary: dict[str, Any] = Field(default_factory=dict)
-    router_id: str
-    router_name: str
+    # All three are null when the request carried no `router` (a venue
+    # whose WiFi is onboarded separately, e.g. an Omada controller) --
+    # nothing router-shaped was created, so there is nothing to name.
+    router_id: str | None = None
+    router_name: str | None = None
     tunnel_ip_address: str | None = None
     owner_user_id: str
     owner_name: str
@@ -238,8 +270,12 @@ class ProvisionLocationPreviewResponse(BaseModel):
     )
     site_id: str = Field(..., description="Previewed Location.location_code.")
     nas_id: str = Field(..., description="Previewed RADIUS NAS code.")
-    controller_id: str = Field(
-        ..., description="The router's own serial_number -- the 'Controller ID'."
+    controller_id: str | None = Field(
+        default=None,
+        description=(
+            "The router's own serial_number -- the 'Controller ID'. Null "
+            "when previewing without a router."
+        ),
     )
     plan_id: str
     plan_name: str
@@ -247,7 +283,9 @@ class ProvisionLocationPreviewResponse(BaseModel):
     owner_name: str
     owner_email: str
     owner_username_preview: str
-    router_name: str
+    router_name: str | None = Field(
+        default=None, description="Null when previewing without a router."
+    )
 
 
 class ResendWelcomeEmailResponse(BaseModel):
