@@ -22,7 +22,8 @@ plus ``RadiusService.register_nas``'s own
 DB and service layer). Each client's ``ipaddr`` is now scoped to that
 router's real WireGuard tunnel address (``wireguard_peers.tunnel_ip_address``,
 ``/32``) instead, so distinct NAS clients no longer share one IP/CIDR key
-and can all load simultaneously. **2026-09-11 follow-up: that fallback is now gone entirely.** Emitting
+and can all load simultaneously. **2026-09-11 follow-up: that fallback is now
+gone entirely.** Emitting
 ``ipaddr = 0.0.0.0/0`` for a NAS row with no tunnel peer did not merely widen
 one stanza -- it minted a *catch-all client carrying that router's real
 ``shortname`` and ``backend_secret``*. FreeRADIUS matches clients by longest

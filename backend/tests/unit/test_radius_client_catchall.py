@@ -167,7 +167,9 @@ def test_catch_all_is_flagged_even_though_it_is_inert_today():
     assert catch_all.classification == audit.CATCH_ALL
     assert not catch_all.has_backend_secret
     assert any("no backend_secret" in r for r in catch_all.reasons)
-    assert not any("authenticates to the platform API as" in r for r in catch_all.reasons)
+    assert not any(
+        "authenticates to the platform API as" in r for r in catch_all.reasons
+    )
 
 
 def test_catch_all_carrying_backend_secret_is_reported_as_impersonation():

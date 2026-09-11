@@ -46,8 +46,8 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 #  FreeRADIUS ships ~290 lines of commented-out examples at the top of its
 #  stock clients.conf, several of them `#client foo {`. Matching without
@@ -252,7 +252,8 @@ def render_text(stanzas: list[Stanza], active_nas: set[str]) -> str:
         f"{len(stanzas)} client stanza(s); "
         + ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
     )
-    out.append(f"active NAS identifiers supplied: {', '.join(sorted(active_nas)) or '(none)'}")
+    supplied = ", ".join(sorted(active_nas)) or "(none)"
+    out.append(f"active NAS identifiers supplied: {supplied}")
     out.append("")
     for stanza in stanzas:
         out.append(
@@ -271,7 +272,8 @@ def render_text(stanzas: list[Stanza], active_nas: set[str]) -> str:
         for stanza in doomed:
             out.append(
                 f"  - client {stanza.label} (shortname="
-                f"{stanza.shortname or '(unset)'}, ipaddr={stanza.ipaddr or '(unset)'}) "
+                f"{stanza.shortname or '(unset)'}, "
+                f"ipaddr={stanza.ipaddr or '(unset)'}) "
                 f"at line {stanza.start + 1}-{stanza.end}"
             )
         out.append("")
