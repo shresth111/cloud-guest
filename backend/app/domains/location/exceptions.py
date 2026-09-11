@@ -131,6 +131,29 @@ class DefaultConfigTemplateNotFoundError(LocationError):
         super().__init__(message, status_code=status.HTTP_409_CONFLICT)
 
 
+class RouterConfigTemplateWithoutRouterError(LocationError):
+    """Smart Location Provisioning: an explicit ``router_config_template_id``
+    was supplied but no ``router`` was.
+
+    Provisioning without a router is legitimate (a venue on an Omada
+    controller has no MikroTik to register -- see ``docs/location/FLOW.md``
+    §1b), and then there is nothing to apply a template to. Ignoring the
+    template quietly would turn a caller bug into a 201, so it is refused.
+    ``ProvisionLocationRequest`` already rejects this shape as a 422 at the
+    request boundary; this is the same rule for any caller that builds
+    ``ProvisionLocationInput`` itself, with the same status."""
+
+    def __init__(
+        self,
+        message: str = (
+            "router_config_template_id was supplied without a router -- a "
+            "config template can only be applied to a router. Either include "
+            "`router`, or omit router_config_template_id."
+        ),
+    ) -> None:
+        super().__init__(message, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
 class LocationOrganizationMismatchError(LocationError):
     """The ``X-Location-Id`` header named a location that does not belong to
     the resolved ``X-Organization-Id`` organization context (RBAC's

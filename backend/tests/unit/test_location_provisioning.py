@@ -30,18 +30,26 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
+from app.domains.auth.models import AuthUser
 from app.domains.auth.service import AuthService, PasswordChangeRequiredError
 from app.domains.billing.constants import PlanFeatureKey, PlanFeatureType, PlanType
 from app.domains.location.enums import PropertyType
 from app.domains.location.exceptions import (
     DefaultConfigTemplateNotFoundError,
     NewOrganizationRequiredError,
+    RouterConfigTemplateWithoutRouterError,
 )
 from app.domains.location.number_generator import generate_location_code
+from app.domains.location.provisioning_schemas import (
+    ProvisionLocationRequest,
+    ProvisionLocationResponse,
+)
 from app.domains.location.provisioning_service import (
     FeatureOverride,
     LocationInput,
@@ -55,6 +63,12 @@ from app.domains.location.provisioning_service import (
     RouterTunnelProvisioningFailedError,
     _generate_temporary_password,
     _generate_username,
+)
+from app.domains.location.router import (
+    preview_provision_location as preview_provision_location_route,
+)
+from app.domains.location.router import (
+    provision_location as provision_location_route,
 )
 from app.domains.location.service import LocationService
 from app.domains.notification.constants import (
@@ -744,12 +758,21 @@ def make_service(
     return service, fakes, base_plan_id
 
 
+_DEFAULT_ROUTER = RouterInput(
+    name="Lobby Router",
+    serial_number="SN-00001",
+    mac_address="AA:BB:CC:DD:EE:01",
+    model="RB5009",
+)
+
+
 def _input(
     *,
     existing_organization_id: uuid.UUID | None = None,
     new_organization: NewOrganizationInput | None = None,
     plan_id: uuid.UUID,
     feature_overrides: tuple[FeatureOverride, ...] = (),
+    router: RouterInput | None = _DEFAULT_ROUTER,
 ) -> ProvisionLocationInput:
     return ProvisionLocationInput(
         location=LocationInput(
@@ -767,12 +790,7 @@ def _input(
             last_name="Shah",
             email="priya@example.com",
         ),
-        router=RouterInput(
-            name="Lobby Router",
-            serial_number="SN-00001",
-            mac_address="AA:BB:CC:DD:EE:01",
-            model="RB5009",
-        ),
+        router=router,
         plan_id=plan_id,
         existing_organization_id=existing_organization_id,
         new_organization=new_organization,
@@ -1498,6 +1516,284 @@ class TestDefaultConfigTemplate:
                 actor_user_id=uuid.uuid4(),
                 data=_input(new_organization=_new_org(), plan_id=base_plan_id),
             )
+
+
+# ============================================================================
+# Provisioning without a router (a venue on an Omada controller)
+# ============================================================================
+
+# Every call the fakes log that is router-shaped. "No router" means none of
+# these, not merely "no router row" -- a peer minted for nothing is a hub
+# address burned for good (the hub agent has no removal verb).
+_ROUTER_SHAPED_CALLS = (
+    "router.",
+    "router_provisioning.",
+    "wireguard.",
+)
+
+
+def _router_shaped(calls: list[str]) -> list[str]:
+    return [call for call in calls if call.startswith(_ROUTER_SHAPED_CALLS)]
+
+
+def _request_payload(**overrides: object) -> dict[str, object]:
+    """A wire-shaped ``POST /locations/provision`` body, router omitted."""
+    body: dict[str, object] = {
+        "new_organization": {
+            "name": "Omada Cafe",
+            "slug": f"omada-cafe-{uuid.uuid4().hex[:6]}",
+            "contact_email": "ops@omada-cafe.example.com",
+        },
+        "location": {
+            "name": "Omada Cafe Main",
+            "slug": "main",
+            "address_line1": "1 Mall Rd",
+            "city": "Dehradun",
+            "state_province": "UK",
+            "postal_code": "248001",
+            "country": "IN",
+        },
+        "owner": {
+            "first_name": "Asha",
+            "last_name": "Rawat",
+            "email": "asha@omada-cafe.example.com",
+        },
+        "plan_id": str(uuid.uuid4()),
+    }
+    body.update(overrides)
+    return body
+
+
+def _fake_request() -> Any:
+    # The route's `_request_id` only ever reads `request.state.request_id`.
+    return SimpleNamespace(state=SimpleNamespace())
+
+
+class TestProvisionWithoutRouter:
+    """A venue whose WiFi is a TP-Link Omada controller has no MikroTik, so
+    ``RouterInput`` (serial, MAC, model) has nothing honest to hold. Before
+    ``router`` became optional, such a customer could not be created at
+    all. The controller is onboarded afterwards through
+    ``POST /network-integrations/platform/onboard``, which makes its own
+    fleet ``Router`` row -- so this flow must make none."""
+
+    async def test_no_router_provisions_the_customer_and_nothing_router_shaped(
+        self,
+    ) -> None:
+        service, fakes, base_plan_id = make_service()
+
+        result = await run_within_transaction(
+            fakes.session,
+            service.provision_location(
+                actor_user_id=uuid.uuid4(),
+                data=_input(
+                    new_organization=_new_org(), plan_id=base_plan_id, router=None
+                ),
+            ),
+        )
+
+        # Zero routers, zero config templates, zero hub calls.
+        assert _router_shaped(fakes.calls) == []
+        assert _router_shaped(fakes.session.flushed) == []
+        assert result.router_id is None
+        assert result.router_name is None
+        assert result.tunnel_ip_address is None
+
+        # Everything else still happened, in order, and committed.
+        expected_order = [
+            "organization.create",
+            "user.create",
+            "identity.update_user",
+            "subscription.create",
+            "captive_portal.create_config",
+            "audit:location_provisioned",
+            "email.send",
+        ]
+        positions = [fakes.calls.index(step) for step in expected_order]
+        assert positions == sorted(positions), f"steps out of order: {fakes.calls}"
+        assert fakes.session.committed is True
+        assert result.location_code.startswith("LOC-")
+        assert result.owner_temporary_password
+
+        # The audit trail says "no router" as a real null, never "None".
+        (provisioned,) = [
+            entry
+            for entry in fakes.audit_entries
+            if entry["action"] == AuditAction.LOCATION_PROVISIONED.value
+        ]
+        assert provisioned["event_metadata"]["router_id"] is None  # type: ignore[index]
+
+    async def test_no_router_does_not_need_a_system_config_template(self) -> None:
+        """Without a router the default template is never looked up, so a
+        deployment with no seeded system template (the documented gap --
+        see ``TestDefaultConfigTemplate``) can still onboard an Omada
+        venue."""
+        service, fakes, base_plan_id = make_service()
+        fakes.system_templates.clear()
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id, router=None),
+        )
+
+        assert result.router_id is None
+        assert "router_provisioning.list_templates" not in fakes.calls
+
+    async def test_template_without_router_is_refused_before_anything_is_written(
+        self,
+    ) -> None:
+        service, fakes, base_plan_id = make_service()
+        data = dataclasses.replace(
+            _input(new_organization=_new_org(), plan_id=base_plan_id, router=None),
+            router_config_template_id=uuid.uuid4(),
+        )
+
+        with pytest.raises(RouterConfigTemplateWithoutRouterError) as excinfo:
+            await service.provision_location(actor_user_id=uuid.uuid4(), data=data)
+
+        assert excinfo.value.status_code == 422
+        assert "router_config_template_id" in excinfo.value.message
+        assert fakes.session.flushed == []
+        assert fakes.calls == []
+
+    async def test_preview_without_router_has_no_router_lines(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        fakes.system_templates.clear()
+
+        preview = await service.preview_provision_location(
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id, router=None)
+        )
+
+        assert preview.controller_id is None
+        assert preview.router_name is None
+        # Location-derived, not router-derived -- unchanged either way.
+        assert preview.nas_id == f"NAS-{preview.site_id}-0001"
+        assert "router_provisioning.list_templates" not in fakes.calls
+        assert fakes.session.flushed == []
+
+    async def test_preview_refuses_template_without_router_too(self) -> None:
+        service, _fakes, base_plan_id = make_service()
+        data = dataclasses.replace(
+            _input(new_organization=_new_org(), plan_id=base_plan_id, router=None),
+            router_config_template_id=uuid.uuid4(),
+        )
+
+        with pytest.raises(RouterConfigTemplateWithoutRouterError):
+            await service.preview_provision_location(data=data)
+
+    def test_request_accepts_an_omitted_or_null_router(self) -> None:
+        omitted = ProvisionLocationRequest.model_validate(_request_payload())
+        explicit_null = ProvisionLocationRequest.model_validate(
+            _request_payload(router=None)
+        )
+
+        assert omitted.router is None
+        assert explicit_null.router is None
+
+    def test_request_rejects_a_template_without_a_router(self) -> None:
+        with pytest.raises(ValidationError, match="router_config_template_id"):
+            ProvisionLocationRequest.model_validate(
+                _request_payload(router_config_template_id=str(uuid.uuid4()))
+            )
+
+    def test_template_without_router_is_a_422_through_the_real_handler(self) -> None:
+        """End to end through FastAPI's body validation and this app's own
+        ``RequestValidationError`` handler -- which once turned exactly
+        this shape (a ``ValueError`` from a validator, whose ``ctx`` holds
+        the raw exception) into an unrelated 500. The real provisioning
+        route cannot be mounted bare here (its ``RequirePermission`` runs
+        first), so this mounts the same request model on a bare route."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.common.exceptions import register_exception_handlers
+
+        app = FastAPI()
+        register_exception_handlers(app)
+
+        @app.post("/provision")
+        async def _provision(payload: ProvisionLocationRequest) -> dict[str, bool]:
+            return {"ok": True}
+
+        client = TestClient(app)
+        rejected = client.post(
+            "/provision",
+            json=_request_payload(router_config_template_id=str(uuid.uuid4())),
+        )
+        accepted = client.post("/provision", json=_request_payload())
+
+        assert rejected.status_code == 422
+        assert "router_config_template_id" in rejected.text
+        assert accepted.status_code == 200
+
+    async def test_route_returns_null_router_fields_without_a_router(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        payload = ProvisionLocationRequest.model_validate(
+            _request_payload(plan_id=str(base_plan_id))
+        )
+
+        response = await provision_location_route(
+            request=_fake_request(),
+            payload=payload,
+            user=AuthUser(id=str(uuid.uuid4()), email="admin@wyfy.example.com"),
+            provisioning_service=service,
+        )
+
+        data = response["data"]
+        assert response["success"] is True
+        assert data["router_id"] is None
+        assert data["router_name"] is None
+        assert data["tunnel_ip_address"] is None
+        # The ids the wizard hands to /network-integrations/platform/onboard.
+        assert uuid.UUID(data["organization_id"])
+        assert uuid.UUID(data["location_id"])
+        assert _router_shaped(fakes.calls) == []
+
+    async def test_route_with_a_router_is_unchanged(self) -> None:
+        """The other half of the contract: a request that carries a router
+        gets the same response as before, same keys, string ids."""
+        service, _fakes, base_plan_id = make_service()
+        payload = ProvisionLocationRequest.model_validate(
+            _request_payload(
+                plan_id=str(base_plan_id),
+                router={
+                    "name": "Lobby Router",
+                    "serial_number": "SN-00002",
+                    "mac_address": "AA:BB:CC:DD:EE:02",
+                    "model": "RB5009",
+                },
+            )
+        )
+
+        response = await provision_location_route(
+            request=_fake_request(),
+            payload=payload,
+            user=AuthUser(id=str(uuid.uuid4()), email="admin@wyfy.example.com"),
+            provisioning_service=service,
+        )
+
+        data = response["data"]
+        assert set(data) == set(ProvisionLocationResponse.model_fields)
+        assert isinstance(data["router_id"], str)
+        assert uuid.UUID(data["router_id"])
+        assert data["router_name"] == "Lobby Router"
+        assert data["tunnel_ip_address"] == "10.100.0.5"
+
+    async def test_preview_route_returns_null_router_lines(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        payload = ProvisionLocationRequest.model_validate(
+            _request_payload(plan_id=str(base_plan_id))
+        )
+
+        response = await preview_provision_location_route(
+            request=_fake_request(),
+            payload=payload,
+            provisioning_service=service,
+        )
+
+        assert response["data"]["controller_id"] is None
+        assert response["data"]["router_name"] is None
+        assert response["data"]["nas_id"].startswith("NAS-")
 
 
 # ============================================================================

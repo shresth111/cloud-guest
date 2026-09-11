@@ -42,6 +42,24 @@ Exactly one `try`/`except` appears in `provision_location`, around step
 5, and it **re-raises** -- see §2 for why that leaves the transactional
 guarantee intact, and §2a for what step 5 is doing at the end of the list.
 
+## 1b. Without a router
+
+`router` is optional on `POST /locations/provision` (and on
+`/locations/provision/preview`, which takes the same body). A venue whose
+WiFi is a TP-Link Omada controller has no MikroTik, so the Master
+console's "Add customer" wizard omits `router` and then onboards the
+controller through `POST /network-integrations/platform/onboard` with the
+`organization_id`/`location_id` the provision call returned (that endpoint
+creates the integration and its own fleet `Router` row).
+
+Omitted or `null` skips exactly steps 4, 5 and 6 above -- router row,
+WireGuard peer (so no hub call at all), config template. Everything else
+runs unchanged. In the response, `router_id`, `router_name` and
+`tunnel_ip_address` are `null`; in the preview, `controller_id` and
+`router_name` are. Sending `router_config_template_id` without a `router`
+is a 422: a template can only be applied to a router, and silently
+dropping it would hide a wizard bug behind a 201.
+
 ### Step 5 is the hub bridge, never `create_tunnel`
 
 `WireGuardService.create_tunnel` generates the keypair *on the platform*,
