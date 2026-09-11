@@ -40,6 +40,46 @@ jobs:
       - name: Ruff
         run: ruff check .
 
+      # `[tool.ruff] exclude` lists `vendor`, so the one ruff invocation above
+      # walks past the vendored gateway entirely -- which is where the Omada
+      # integration's code actually lives. That exclusion is right for style
+      # (it is an upstream package and reformatting it would fork it), but it
+      # also meant nothing checked the gateway for *breakage*.
+      #
+      # It cost us on 2026-09-11. Resolving the #206 conflict deleted an
+      # orphaned `deauthorize_client` from `omada/portal.py` and left its name
+      # in that module's `__all__`, so `from ... import *` raised
+      # AttributeError. `ruff check .` said "All checks passed", the 5,286-test
+      # suite was green, and a single `--select F` pass over the package found
+      # it in under a second.
+      #
+      # Deliberately only the pyflakes rules, and deliberately only the
+      # package (not its tests): F is the set that is about code being wrong
+      # rather than code being differently formatted, so this cannot drift
+      # into re-styling an upstream tree. `--isolated` because the repo config
+      # is what excludes this directory in the first place.
+      - name: Ruff (vendored gateway, pyflakes only)
+        run: |
+          ruff check --isolated --select F \
+            vendor/wyfy-device-gateway/wyfy_device_gateway/
+
+      # The gateway ships 544 tests of its own and this repo ran none of them:
+      # `[tool.pytest.ini_options] testpaths = ["tests"]` points at the
+      # backend's suite only. So `omada/deauth.py` and `omada/tls.py` -- both
+      # written on 2026-09-11, both the subject of merges resolved by hand
+      # that day -- landed with their tests executing nowhere. The gateway's
+      # own repository is behind the vendored copy, so it is not running them
+      # either.
+      #
+      # Run from the gateway's own directory rather than as another path
+      # argument to the backend's pytest: six MikroTik modules import
+      # `tests.fake_write_transport`, and from the backend root `tests` is the
+      # backend's own package, so collection fails on a name collision rather
+      # than on anything real.
+      - name: Pytest (vendored gateway)
+        working-directory: backend/vendor/wyfy-device-gateway
+        run: pytest tests -q
+
       # Fails in seconds, before the ~20-minute suite, and says exactly what
       # to do. There is already a pytest assertion for this
       # (`test_the_revision_graph_has_exactly_one_head`) and it is not

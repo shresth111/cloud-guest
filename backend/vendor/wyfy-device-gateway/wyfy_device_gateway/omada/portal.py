@@ -109,16 +109,11 @@ from .auth import LEGACY_AUTHORIZE_PATH
 from .client import OmadaHttpClient
 from .errors import OmadaAuthorizationError
 from .redaction import sanitize_detail
-from .types import normalize_mac
 
 #: VERIFIED (TP-Link docs 13080 / 132060): external portal / RADIUS-free auth.
 #: Corroborated a second way by the Open API spec, whose
 #: ``AuthClientOpenApiVO.authType`` enumerates "4: External Portal Server".
 AUTH_TYPE_EXTERNAL_PORTAL = 4
-
-#: Sanity ceiling on a single authorization, 24 hours. A caller passing a
-#: nonsense duration (a timestamp mistaken for a duration, say) would
-#: otherwise ask the controller for a session lasting decades.
 
 #: Sanity ceiling on a single authorization. A caller passing a nonsense
 #: duration (a timestamp mistaken for a duration, say) would otherwise ask
@@ -259,5 +254,4 @@ __all__ = [
     "MAX_DURATION_SECONDS",
     "authorize_client",
     "build_authorize_body",
-    "deauthorize_client",
 ]

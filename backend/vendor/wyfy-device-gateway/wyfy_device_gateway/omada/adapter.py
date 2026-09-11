@@ -114,7 +114,6 @@ from ..controller_contract import (
     ControllerInfo,
     ControllerSite,
     ControllerSsid,
-    ControllerTlsMode,
     ControllerTlsObservation,
     ControllerVendor,
     PortalAuthContext,
