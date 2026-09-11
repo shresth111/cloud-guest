@@ -127,7 +127,7 @@ from . import portal as portal_module
 from . import sites as sites_module
 from .auth import SessionCache
 from .client import OmadaHttpClient, SleepFn
-from .errors import OmadaUnsupportedApiError
+from .errors import OmadaAuthError, OmadaUnsupportedApiError
 from .tls import fingerprint_of, normalize_fingerprint, observe_certificate
 from .types import coerce_str
 
@@ -295,7 +295,32 @@ class OmadaControllerAdapter:
             # otherwise pressing "Test connection" twice would validate the
             # credentials once.
             await client.ensure_authenticated()
-            return info
+
+        # An Open API integration that also carries the hotspot operator
+        # login -- the configuration guest sign-in needs, see
+        # ``authorize_guest`` -- has two credentials, and a test that proved
+        # only the app would go green over a mistyped operator password that
+        # the venue's first guest then discovers. So the operator login is
+        # proven too, through the same legacy-mode view ``authorize_guest``
+        # uses, and a refusal says which of the two credentials it was.
+        if (
+            creds.auth_mode == ControllerAuthMode.OPENAPI
+            and creds.username
+            and creds.password
+        ):
+            async with self._client(_as_legacy(creds)) as client:
+                await client.resolve_omadac_id()
+                try:
+                    await client.ensure_authenticated()
+                except OmadaAuthError as exc:
+                    raise OmadaAuthError(
+                        "The Open API app signed in, but the controller "
+                        "rejected the hotspot operator account. Guest sign-in "
+                        "uses that account -- check its name and password in "
+                        "the controller's Hotspot Manager.",
+                        provider_code=exc.provider_code,
+                    ) from exc
+        return info
 
     # -- inventory (Open API only) ----------------------------------------
 

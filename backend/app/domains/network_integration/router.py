@@ -538,8 +538,9 @@ async def onboard_platform_integration(
     router domain resolves the location *with* that organization id and
     refuses one belonging to another tenant.
 
-    Customer self-service (``POST /network-integrations``) is unchanged and
-    still creates no fleet row.
+    Customer self-service (``POST /network-integrations``) writes the same
+    pair once the integration names a venue -- see
+    ``service.ensure_fleet_device``.
     """
     integration, fleet_device = await service.create_integration_with_fleet_device(
         actor_user_id=_actor_id(actor),
@@ -731,6 +732,17 @@ async def create_integration(
         username=payload.username,
         password=payload.password,
     )
+    if integration.location_id is not None:
+        # A venue was named, so the integration gets the fleet row its
+        # guests' sessions need, in this same request transaction -- the
+        # same pair Master onboarding writes. Without it the row would sit
+        # on `fleet_device_missing` with no portal link and nothing its
+        # operator could do about it.
+        integration = await service.ensure_fleet_device(
+            integration.id,
+            actor_user_id=_actor_id(actor),
+            requesting_organization_id=requesting_organization_id,
+        )
     return build_response(
         success=True,
         message="Network integration created",
@@ -799,6 +811,42 @@ async def update_integration(
     return build_response(
         success=True,
         message="Network integration updated",
+        data=_integration_response(
+            integration, counts=await service.counts_for(integration)
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{integration_id}/fleet-device",
+    response_model=ApiResponse[NetworkIntegrationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+)
+async def ensure_fleet_device(
+    request: Request,
+    integration_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Register this controller as its venue's fleet device, if it is not.
+
+    The repair for an integration created from the customer page before
+    that path registered one -- it shows ``fleet_device_missing`` and has
+    no portal link. Idempotent: a row that already has a fleet device comes
+    back unchanged. 409 ``NETWORK_INTEGRATION_LOCATION_REQUIRED`` when the
+    integration is not mapped to a venue yet.
+    """
+    integration = await service.ensure_fleet_device(
+        integration_id,
+        actor_user_id=_actor_id(actor),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Controller registered for this venue",
         data=_integration_response(
             integration, counts=await service.counts_for(integration)
         ).model_dump(),

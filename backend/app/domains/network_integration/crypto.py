@@ -89,6 +89,7 @@ __all__ = [
     "NetworkIntegrationCredentialDecryptionError",
     "decrypt_credentials",
     "encrypt_credentials",
+    "stored_credential_fields",
 ]
 
 
@@ -199,3 +200,29 @@ def decrypt_credentials(
             f"{type(decoded).__name__}, not an object"
         )
     return {str(k): str(v) for k, v in decoded.items()}
+
+
+def stored_credential_fields(
+    ciphertext: str | None, *, settings: Settings | None = None
+) -> frozenset[str] | None:
+    """Which credential fields a stored set holds -- names, never values.
+
+    Exists for one question the readiness check has to ask without handing
+    a secret to anybody: "does this Open API integration also hold a hotspot
+    operator login?" The answer is in the *shape* of the stored set, which
+    ``encrypt_credentials`` keeps honest by dropping empty keys. The values
+    are decrypted on this stack frame and discarded before it returns.
+
+    ``None`` means "cannot tell" -- nothing stored, or a ciphertext this key
+    cannot read. It is never an empty set standing in for either, because a
+    caller that read an empty set as "no operator login" would report a
+    missing account over what is really a key-management fault, which
+    ``_credentials_for`` already reports on its own path as re-enter the
+    credentials. Never raises.
+    """
+    if not ciphertext:
+        return None
+    try:
+        return frozenset(decrypt_credentials(ciphertext, settings=settings))
+    except NetworkIntegrationCredentialDecryptionError:
+        return None

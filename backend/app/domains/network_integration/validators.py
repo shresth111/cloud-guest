@@ -80,6 +80,7 @@ from app.domains.network_config.renderers import GUEST_PORTAL_HOST
 
 from .constants import (
     DEFAULT_CONTROLLER_PORTS,
+    GUEST_OPERATOR_CREDENTIAL_FIELDS,
     MAX_SESSION_DURATION_SECONDS,
     MAX_SYNC_INTERVAL_SECONDS,
     MIN_SESSION_DURATION_SECONDS,
@@ -89,6 +90,7 @@ from .constants import (
     ControllerTlsMode,
     PortalReadinessGap,
 )
+from .crypto import stored_credential_fields
 from .exceptions import NetworkIntegrationUrlRejectedError
 
 #: Lowercase hex alphabet, for the fingerprint check. A frozenset rather
@@ -416,10 +418,25 @@ def validate_auth_mode_credentials(
     """Return the credential set to encrypt, or raise ``ValueError``.
 
     Enforces "the fields you supplied must match the mode you chose"
-    rather than silently ignoring the pair that does not apply. A venue
-    operator who picks Open API and fills in the operator username has
-    made a mistake that would otherwise surface hours later as
-    ``AUTH_FAILED`` with nothing to explain it.
+    rather than silently ignoring the pair that does not apply.
+
+    ## Open API takes an operator login too, and has to
+
+    Open API mode used to *refuse* a hotspot operator username/password.
+    That made every Open API integration unable to let a single guest
+    online: the controller's only external-portal authorization endpoint
+    takes an operator login in either mode (the gateway's
+    ``authorize_guest`` says so and refuses without one), so the mode the
+    dashboard recommended was the one mode that could never serve a venue.
+
+    So the operator pair is optional in Open API mode -- the app alone is
+    still a valid row for inventory, and ``portal_readiness_gaps`` names
+    ``GUEST_OPERATOR_MISSING`` until the pair is added -- but when it is
+    given it must be given whole. Half a login is refused here rather than
+    discovered at the first guest.
+
+    Legacy mode is unchanged: an Open API client id/secret there is still a
+    mistake, because legacy mode never uses it.
     """
     if auth_mode is ControllerAuthMode.OPENAPI:
         if not client_id or not client_secret:
@@ -427,12 +444,18 @@ def validate_auth_mode_credentials(
                 "Open API mode requires both client_id and client_secret "
                 "(Settings > Platform Integration > Open API on the controller)"
             )
-        if username or password:
+        if bool(username) != bool(password):
             raise ValueError(
-                "Open API mode does not use an operator username/password -- "
-                "remove them or switch auth_mode to 'legacy'"
+                "The hotspot operator account needs both its name and its "
+                "password (controller: Hotspot Manager > Operators) -- or "
+                "leave both empty and add it later. Guest sign-in cannot "
+                "work until it is added."
             )
-        return {"client_id": client_id, "client_secret": client_secret}
+        credentials = {"client_id": client_id, "client_secret": client_secret}
+        if username and password:
+            credentials["username"] = username
+            credentials["password"] = password
+        return credentials
 
     if not username or not password:
         raise ValueError(
@@ -635,7 +658,9 @@ def parse_uuid(value: str, *, field_name: str) -> uuid.UUID:
 # ============================================================================
 
 
-def portal_readiness_gaps(integration: object) -> tuple[PortalReadinessGap, ...]:
+def portal_readiness_gaps(
+    integration: object, *, settings: Settings | None = None
+) -> tuple[PortalReadinessGap, ...]:
     """Everything standing between this integration and its first
     authorized guest, in the order an operator would fix it.
 
@@ -662,19 +687,29 @@ def portal_readiness_gaps(integration: object) -> tuple[PortalReadinessGap, ...]
     Neither should have to convert for the other.
     """
     gaps: list[PortalReadinessGap] = []
-    if not getattr(integration, "credentials_encrypted", None):
+    ciphertext = getattr(integration, "credentials_encrypted", None)
+    if not ciphertext:
         gaps.append(PortalReadinessGap.CREDENTIALS_MISSING)
+    elif getattr(integration, "auth_mode", None) == ControllerAuthMode.OPENAPI.value:
+        # Names only -- see `stored_credential_fields`. `None` ("cannot
+        # tell") adds nothing: an unreadable ciphertext is a key-management
+        # fault that `_credentials_for` reports on its own path, and naming
+        # a missing operator account over it would send somebody to the
+        # controller to create an account that may already be stored.
+        fields = stored_credential_fields(ciphertext, settings=settings)
+        if fields is not None and not fields >= GUEST_OPERATOR_CREDENTIAL_FIELDS:
+            gaps.append(PortalReadinessGap.GUEST_OPERATOR_MISSING)
     if getattr(integration, "location_id", None) is None:
         gaps.append(PortalReadinessGap.LOCATION_NOT_MAPPED)
     if not getattr(integration, "external_site_id", None):
         gaps.append(PortalReadinessGap.SITE_NOT_SELECTED)
     if getattr(integration, "router_id", None) is None:
-        # Last, because it is the one an operator cannot fix from the
-        # customer dashboard -- pairing a controller with a fleet row is the
-        # Master-driven onboarding path
-        # (`create_integration_with_fleet_device`). Listing it above the
-        # three they *can* fix would read as "give up" rather than "finish
-        # these, then ask us".
+        # Last, because it is normally the consequence of an earlier gap:
+        # the fleet row is registered the moment the integration is mapped
+        # to a venue (`ensure_fleet_device`), so on a row created today it
+        # only survives LOCATION_NOT_MAPPED. On a row created before the
+        # customer path did that, it is fixed with the "Register controller"
+        # action (`POST /{id}/fleet-device`).
         gaps.append(PortalReadinessGap.FLEET_DEVICE_MISSING)
     return tuple(gaps)
 

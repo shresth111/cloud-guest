@@ -215,8 +215,17 @@ def _integration(
     router_id: uuid.UUID | None = None,
     auth_mode: str = ControllerAuthMode.OPENAPI.value,
     with_credentials: bool = True,
+    with_guest_operator: bool = True,
     **overrides: object,
 ) -> NetworkIntegration:
+    # The default Open API row carries the hotspot operator login too,
+    # because that is the configuration that can actually sign a guest in
+    # (see `PortalReadinessGap.GUEST_OPERATOR_MISSING`). A test about the
+    # app-only row -- the one that used to sync green and authorize nobody
+    # -- passes `with_guest_operator=False`.
+    stored_credentials = {"client_id": "cid", "client_secret": "shh"}
+    if with_guest_operator:
+        stored_credentials |= {"username": "operator", "password": "pw"}
     fields: dict[str, object] = {
         "organization_id": organization_id or uuid.uuid4(),
         "location_id": location_id,
@@ -244,9 +253,7 @@ def _integration(
         "guest_ssid_id": "ssid-1",
         "guest_ssid_name": "Guest WiFi",
         "credentials_encrypted": (
-            encrypt_credentials({"client_id": "cid", "client_secret": "shh"})
-            if with_credentials
-            else None
+            encrypt_credentials(stored_credentials) if with_credentials else None
         ),
         "session_duration_seconds": 3600,
         "sync_interval_seconds": 300,
@@ -782,16 +789,40 @@ class TestAuthModeCredentials:
                 password=None,
             )
 
-    def test_openapi_mode_rejects_operator_fields(self) -> None:
-        """Silently ignoring the wrong pair is what produces an
-        AUTH_FAILED hours later with nothing to explain it."""
-        with pytest.raises(ValueError, match="does not use an operator"):
+    def test_openapi_mode_stores_an_operator_login_alongside_the_app(self) -> None:
+        """This used to be refused -- which made every Open API integration
+        unable to authorize a single guest, because the controller only
+        authorizes through an operator login (gateway ``authorize_guest``).
+        """
+        result = validate_auth_mode_credentials(
+            auth_mode=ControllerAuthMode.OPENAPI,
+            client_id="cid",
+            client_secret="secret",
+            username="operator",
+            password="pw",
+        )
+        assert result == {
+            "client_id": "cid",
+            "client_secret": "secret",
+            "username": "operator",
+            "password": "pw",
+        }
+
+    @pytest.mark.parametrize(
+        ("username", "password"), [("operator", None), (None, "pw")]
+    )
+    def test_openapi_mode_refuses_half_an_operator_login(
+        self, username: str | None, password: str | None
+    ) -> None:
+        """Half a login would be stored, sync green, and refuse the first
+        guest -- so it is refused here instead."""
+        with pytest.raises(ValueError, match="needs both its name and its password"):
             validate_auth_mode_credentials(
                 auth_mode=ControllerAuthMode.OPENAPI,
                 client_id="cid",
                 client_secret="secret",
-                username="operator",
-                password="pw",
+                username=username,
+                password=password,
             )
 
     def test_legacy_mode_rejects_openapi_fields(self) -> None:

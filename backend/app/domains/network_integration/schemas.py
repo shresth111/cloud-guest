@@ -184,7 +184,10 @@ class _CredentialFields(BaseModel):
         default=None,
         max_length=255,
         description=(
-            "Hotspot operator name. Required when auth_mode is 'legacy'. "
+            "Hotspot operator name. Required when auth_mode is 'legacy'; "
+            "optional alongside client_id/client_secret when auth_mode is "
+            "'openapi', but guest sign-in needs it in both modes -- the "
+            "controller authorizes guests only through an operator login. "
             "Write-only."
         ),
     )
@@ -193,9 +196,9 @@ class _CredentialFields(BaseModel):
         max_length=512,
         repr=False,
         description=(
-            "Hotspot operator password. Required when auth_mode is 'legacy'. "
-            "Stored Fernet-encrypted; never returned by any endpoint, never "
-            "logged."
+            "Hotspot operator password. Required when auth_mode is 'legacy', "
+            "and with username in 'openapi' mode for guest sign-in. Stored "
+            "Fernet-encrypted; never returned by any endpoint, never logged."
         ),
     )
 
