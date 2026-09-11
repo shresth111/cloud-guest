@@ -43,7 +43,7 @@ jobs:
       # `[tool.ruff] exclude` lists `vendor`, so the one ruff invocation above
       # walks past the vendored gateway entirely -- which is where the Omada
       # integration's code actually lives. That exclusion is right for style
-      # (it is an upstream package and reformatting it would fork it), but it
+      # (it keeps its own style, and reformatting it is churn), but it
       # also meant nothing checked the gateway for *breakage*.
       #
       # It cost us on 2026-09-11. Resolving the #206 conflict deleted an
@@ -67,9 +67,9 @@ jobs:
       # `[tool.pytest.ini_options] testpaths = ["tests"]` points at the
       # backend's suite only. So `omada/deauth.py` and `omada/tls.py` -- both
       # written on 2026-09-11, both the subject of merges resolved by hand
-      # that day -- landed with their tests executing nowhere. The gateway's
-      # own repository is behind the vendored copy, so it is not running them
-      # either.
+      # that day -- landed with their tests executing nowhere. The standalone
+      # gateway repository is archived (2026-09-11) and this directory is the
+      # canonical copy, so this step is the only place these tests run.
       #
       # Run from the gateway's own directory rather than as another path
       # argument to the backend's pytest: six MikroTik modules import

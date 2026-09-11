@@ -1151,6 +1151,19 @@ class MikroTikAdapter:
         except (LibRouterosError, OSError) as exc:
             raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
 
+    @staticmethod
+    def _safe_close(api) -> None:  # noqa: ANN001
+        """Best-effort ``api.close()`` for ``finally`` blocks whose command
+        may have died with the socket. ``close()`` on an already-broken
+        connection can itself raise, which would mask the real error the
+        command raised -- or turn a clean result into a spurious failure.
+        (From wyfy-device-gateway#1, folded in when this copy became the
+        canonical one.)"""
+        try:
+            api.close()
+        except (LibRouterosError, OSError, EOFError):
+            pass
+
     def _ssh_port(self, creds: DeviceCredentials) -> int:
         return _safe_int(creds.extra.get("ssh_port"), default=_DEFAULT_SSH_PORT) or (
             _DEFAULT_SSH_PORT
@@ -1933,8 +1946,18 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"read_active_default_route: {exc}"
                 ) from exc
+            # A router that goes quiet *mid-read* raises a bare socket error
+            # (OSError -- a recv TimeoutError included -- or EOFError), not a
+            # LibRouterosError: librouteros does no translation on read. It
+            # is a connectivity failure, so it maps to the connection error
+            # IspService already turns into IspDeviceConnectionError, rather
+            # than escaping as an unhandled exception.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"read_active_default_route: {_describe_exception(exc)}"
+                ) from exc
         finally:
-            api.close()
+            self._safe_close(api)
         return _select_default_gateway(rows)
 
     async def get_pppoe_interface_status(
@@ -1964,8 +1987,13 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"read_pppoe_interface_status: {exc}"
                 ) from exc
+            # See _get_active_default_gateway_sync.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"read_pppoe_interface_status: {_describe_exception(exc)}"
+                ) from exc
         finally:
-            api.close()
+            self._safe_close(api)
         row = next((r for r in rows if r.get("name") == interface_name), None)
         if row is None and len(rows) == 1:
             logger.warning(
@@ -2009,8 +2037,14 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"read_interface_traffic_counters: {exc}"
                 ) from exc
+            # See _get_active_default_gateway_sync.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host,
+                    f"read_interface_traffic_counters: {_describe_exception(exc)}",
+                ) from exc
         finally:
-            api.close()
+            self._safe_close(api)
         row = next((r for r in rows if r.get("name") == interface_name), None)
         if row is None:
             return None
@@ -2103,22 +2137,35 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"run_speed_test: {exc}"
                 ) from exc
+            # A router losing connectivity mid-download. See
+            # _get_active_default_gateway_sync.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"run_speed_test: {_describe_exception(exc)}"
+                ) from exc
             finally:
                 # Real cleanup regardless of outcome -- see docstring's
-                # "Real cleanup, not a real disk leak" section.
+                # "Real cleanup, not a real disk leak" section. If the socket
+                # just died, this cleanup fails the same way; that must be
+                # logged, never raised over the real fetch failure above.
                 try:
                     file_menu = api.path("file")
                     for row in file_menu:
                         if row.get("name") == filename:
                             file_menu.remove(row.get(".id"))
                             break
-                except LibRouterosError:
+                except (LibRouterosError, OSError, EOFError):
+                    # Not ``filename``: that is a reserved LogRecord
+                    # attribute, and logging raises KeyError on an ``extra``
+                    # that tries to overwrite it -- which turned every failed
+                    # cleanup into a KeyError that replaced both the real
+                    # fetch error and a successful result.
                     logger.warning(
                         "mikrotik_speed_test_cleanup_failed",
-                        extra={"host": creds.host, "filename": filename},
+                        extra={"host": creds.host, "speed_test_file": filename},
                     )
         finally:
-            api.close()
+            self._safe_close(api)
 
         if not rows:
             raise MikroTikDeviceError(

@@ -51,9 +51,11 @@ external-portal grant. Authorizing a paying guest for a specific length of
 time is exactly what the legacy ``extPortal/auth`` endpoint is for, and it
 is the only one of the two that can express it.
 
-Its inverse, ``cancelAuthClient``, *is* used -- see ``deauthorize_guest``
-below. Revocation needs no duration, so the bodyless shape costs nothing
-there.
+Its inverse, ``cancelAuthClient``, is not used either. ``deauthorize_guest``
+below revokes through the Hotspot Manager's authorized-client disconnect
+instead (see ``deauth.py``) -- the path that was actually run against a
+controller. The note at the end of ``portal.py`` says why the Open API
+revocation stays unwired.
 
 So: an integration in ``openapi`` mode that also stores operator credentials
 authorizes through the legacy endpoint. One that does not gets
