@@ -91,6 +91,7 @@ from app.core.logging import get_logger
 from app.database.utils.pagination import PaginationMeta
 from app.domains.monitored_hardware.constants import HardwareStatus
 from app.domains.monitored_hardware.service import MonitoredHardwareService
+from app.domains.network_integration.constants import ErrorCode, IntegrationStatus
 from app.domains.organization.exceptions import CrossOrganizationAccessError
 from app.domains.otp.service import (
     EmailProviderProtocol,
@@ -116,6 +117,9 @@ from .constants import (
     ALERT_EVENT_LOOKBACK_MINUTES,
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_NETWORK_CONTROLLER,
+    ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+    ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
     ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
     ALERT_TARGET_ROUTER_REACHABILITY,
@@ -133,6 +137,12 @@ from .constants import (
     HTTP_NOTIFICATION_TIMEOUT_SECONDS,
     MAX_EVENT_TIMELINE_LIMIT,
     MONITORING_LIVE_CHANNEL,
+    NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS,
+    NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO,
+    NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES,
+    NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES,
+    NETWORK_CONTROLLER_SETUP_GRACE_HOURS,
+    NETWORK_CONTROLLER_TARGET_STATES,
     ROGUE_DHCP_STATE_GUARDED,
     ROGUE_DHCP_STATE_UNGUARDED,
     ROUTER_EVENT_SOURCE_DOMAIN,
@@ -185,7 +195,7 @@ from .models import (
     SlaReport,
     SlaTarget,
 )
-from .repository import MonitoringRepositoryProtocol
+from .repository import AuthorizationOutcomeCounts, MonitoringRepositoryProtocol
 from .validators import (
     classify_storage_health,
     compare_threshold,
@@ -1835,6 +1845,9 @@ class AlertService:
         if rule.target_component == ALERT_TARGET_ROGUE_DHCP_GUARD:
             return await self._evaluate_rogue_dhcp_guard_rule(rule, expected_status)
 
+        if rule.target_component in NETWORK_CONTROLLER_TARGET_STATES:
+            return await self._evaluate_network_controller_rule(rule, expected_status)
+
         if rule.target_component == ALERT_TARGET_ROUTER_REACHABILITY:
             routers = await self._agent_managed_routers(rule.organization_id)
             for router in routers:
@@ -2080,6 +2093,131 @@ class AlertService:
                         resolved_message=_rogue_dhcp_guard_resolved_message(
                             router.name
                         ),
+                    )
+                )
+        return triggered, resolved
+
+    async def _evaluate_network_controller_rule(
+        self, rule: AlertRule, expected_status: object
+    ) -> tuple[list[Alert], list[Alert]]:
+        """The three ``ALERT_TARGET_NETWORK_CONTROLLER*`` targets.
+
+        Reads ``network_integrations`` (and, for the authorize target, one
+        grouped count over ``network_integration_authorizations``) -- rows
+        that domain's own sync sweep and portal path already persist. No
+        controller I/O. See ``constants.ALERT_TARGET_NETWORK_CONTROLLER``
+        for why these exist and ``network_controller_verdict`` for exactly
+        what each one asks of a row.
+
+        ## Grouped by the de-duplication key
+
+        Integrations are grouped per ``(organization_id, location_id,
+        router_id)`` -- this engine's key has no integration column -- and a
+        group gets one alert naming every member that is firing. It
+        resolves only when every member has *positively* cleared; a member
+        with no answer (``None``) holds an open alert open and opens
+        nothing, the same "no answer is not an answer" rule
+        ``_evaluate_rogue_dhcp_guard_rule`` follows.
+
+        ## Alerts whose integration is gone
+
+        An open alert whose key no current integration produces -- the
+        integration was deleted, or re-mapped to another venue -- is
+        resolved with copy that says so. Without this it would sit open
+        forever: nothing would ever evaluate its key again.
+        """
+        triggered: list[Alert] = []
+        resolved: list[Alert] = []
+        target = str(rule.target_component)
+        # Belt and braces with the validator, as the rogue-DHCP branch does.
+        if expected_status != NETWORK_CONTROLLER_TARGET_STATES[target]:
+            return triggered, resolved
+
+        now = datetime.now(UTC)
+        integrations = await self.repository.list_network_integrations(
+            organization_id=rule.organization_id
+        )
+        counts: dict[uuid.UUID, AuthorizationOutcomeCounts] = {}
+        if target == ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE:
+            since = now - timedelta(minutes=NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES)
+            for row in await self.repository.count_authorization_outcomes_since(
+                since=since, organization_id=rule.organization_id
+            ):
+                counts[row.integration_id] = row
+
+        AlertKey = tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None]
+        open_alerts: dict[AlertKey, Alert] = {}
+        for alert in await self.repository.list_open_alerts_for_rule(rule_id=rule.id):
+            open_alerts.setdefault(
+                (alert.organization_id, alert.location_id, alert.router_id), alert
+            )
+
+        groups: dict[AlertKey, list[object]] = {}
+        for integration in integrations:
+            key = (
+                integration.organization_id,
+                integration.location_id,
+                integration.router_id,
+            )
+            groups.setdefault(key, []).append(integration)
+
+        for key, members in groups.items():
+            verdicts = [
+                (
+                    member,
+                    network_controller_verdict(
+                        target, member, now=now, counts=counts.get(member.id)
+                    ),
+                )
+                for member in members
+            ]
+            firing = [member for member, verdict in verdicts if verdict is True]
+            existing = open_alerts.get(key)
+            if firing:
+                if existing is None:
+                    triggered.append(
+                        await self._create_alert(
+                            rule,
+                            organization_id=key[0],
+                            location_id=key[1],
+                            router_id=key[2],
+                            message=" ".join(
+                                _network_controller_message(
+                                    target, member, counts=counts.get(member.id)
+                                )
+                                for member in firing
+                            ),
+                        )
+                    )
+                continue
+            if existing is None:
+                continue
+            if all(verdict is False for _, verdict in verdicts):
+                resolved.append(
+                    await self._auto_resolve(
+                        existing,
+                        resolved_message=" ".join(
+                            _network_controller_resolved_message(target, member)
+                            for member in members
+                        ),
+                    )
+                )
+            else:
+                logger.info(
+                    "network_controller_rule_state_unknown",
+                    extra={
+                        "rule_id": str(rule.id),
+                        "target_component": target,
+                        "open_alert_left_open": True,
+                    },
+                )
+
+        for key, alert in open_alerts.items():
+            if key not in groups:
+                resolved.append(
+                    await self._auto_resolve(
+                        alert,
+                        resolved_message=_NETWORK_CONTROLLER_GONE_MESSAGE,
                     )
                 )
         return triggered, resolved
@@ -2446,6 +2584,181 @@ def _rogue_dhcp_guard_resolved_message(router_name: str) -> str:
         "interface serving DHCP. Detection only -- it logs, it does not "
         "block."
     )
+
+
+# ``IntegrationStatus`` values meaning "this platform is not getting good
+# answers from the controller". ``CONNECTING`` is absent on purpose: it is a
+# moment inside a connection attempt, not a verdict.
+_NETWORK_CONTROLLER_FAILING_STATUSES = frozenset(
+    {
+        IntegrationStatus.AUTH_FAILED.value,
+        IntegrationStatus.CONNECTION_FAILED.value,
+        IntegrationStatus.SYNC_ERROR.value,
+    }
+)
+
+
+def _consecutive_sync_failures(integration: object) -> int:
+    """The counter ``NetworkIntegrationService._record_failure`` keeps in
+    ``provider_metadata`` and a successful sync resets to zero. Read the
+    same forgiving way that service reads it, so a malformed value means
+    "no failures on record" here too rather than an evaluation error."""
+    metadata = getattr(integration, "provider_metadata", None) or {}
+    try:
+        return int(metadata.get("consecutive_failure_count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def network_controller_verdict(
+    target: str,
+    integration: object,
+    *,
+    now: datetime,
+    counts: AuthorizationOutcomeCounts | None = None,
+) -> bool | None:
+    """What one integration row says about one network-controller target.
+
+    ``True`` -- the condition holds, fire. ``False`` -- positively clear,
+    an open alert may resolve. ``None`` -- no answer yet: neither fire nor
+    resolve. Pure, so every threshold below is tested without a database.
+
+    An integration an operator has switched off (``is_enabled = False``)
+    is ``False`` for every target. Off is a deliberate answer to the
+    problem, and an alert that stays open about something its owner turned
+    off is one they learn to ignore.
+    """
+    if not getattr(integration, "is_enabled", False):
+        return False
+    status = getattr(integration, "status", None)
+
+    if target == ALERT_TARGET_NETWORK_CONTROLLER:
+        if status in _NETWORK_CONTROLLER_FAILING_STATUSES:
+            # Failing, but not yet for long enough to page anybody -- and
+            # not recovered either, so an open alert stays open. See
+            # NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES.
+            if (
+                _consecutive_sync_failures(integration)
+                >= NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES
+            ):
+                return True
+            return None
+        if status == IntegrationStatus.CONNECTING.value:
+            return None
+        return False
+
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_SETUP:
+        if status != IntegrationStatus.UNCONFIGURED.value:
+            return False
+        created_at = getattr(integration, "created_at", None)
+        if created_at is None:
+            return None
+        return created_at <= now - timedelta(hours=NETWORK_CONTROLLER_SETUP_GRACE_HOURS)
+
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE:
+        if counts is None or counts.failed_attempts == 0:
+            return False
+        if (
+            counts.failed_guests >= NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS
+            and counts.failed_attempts
+            >= NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO * counts.attempts
+        ):
+            return True
+        # Some failures, below the bar: not a finding, and not a recovery.
+        # See NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES on the hysteresis.
+        return None
+
+    return None
+
+
+def _network_controller_message(
+    target: str,
+    integration: object,
+    *,
+    counts: AuthorizationOutcomeCounts | None = None,
+) -> str:
+    """Trigger copy, one sentence group per firing integration.
+
+    Written for a venue owner, not an engineer: what is wrong, what it
+    means for guests, and -- only where this platform actually knows it --
+    where to look. No raw error text: ``last_error_message`` is redacted
+    but still controller-shaped, and it is one click away on the
+    integration's own page.
+    """
+    name = getattr(integration, "name", "WiFi controller")
+    if target == ALERT_TARGET_NETWORK_CONTROLLER:
+        failures = _consecutive_sync_failures(integration)
+        status = getattr(integration, "status", None)
+        if status == IntegrationStatus.AUTH_FAILED.value:
+            return (
+                f"{name}: the WiFi controller is rejecting the saved login "
+                f"({failures} checks in a row). New guests at this venue "
+                "cannot get online until the controller credentials are "
+                "updated. Guests already online keep their access."
+            )
+        if status == IntegrationStatus.CONNECTION_FAILED.value:
+            return (
+                f"{name}: we cannot reach the WiFi controller ({failures} "
+                "checks in a row). New guests at this venue cannot get "
+                "online until it is reachable again -- please check that "
+                "the controller is running and reachable from the internet. "
+                "Guests already online keep their access."
+            )
+        return (
+            f"{name}: the WiFi controller answers, but reading from it has "
+            f"failed {failures} times in a row. Guest sign-in at this venue "
+            "may be affected."
+        )
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_SETUP:
+        detail = getattr(integration, "last_error_message", None)
+        reason = (
+            f": {detail}"
+            if detail
+            and getattr(integration, "last_error_code", None)
+            == ErrorCode.SETUP_INCOMPLETE.value
+            else " -- the platform has not completed a connection to it yet"
+        )
+        return (
+            f"{name}: this WiFi controller was added more than "
+            f"{NETWORK_CONTROLLER_SETUP_GRACE_HOURS} hours ago and still "
+            f"cannot let a single guest online{reason}."
+        )
+    failed_guests = counts.failed_guests if counts else 0
+    failed = counts.failed_attempts if counts else 0
+    attempts = counts.attempts if counts else 0
+    return (
+        f"{name}: the WiFi controller refused {failed_guests} guests in the "
+        f"last {NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES} minutes "
+        f"({failed} of {attempts} attempts failed). Guests are signing in "
+        "but not being let online. The integration's event log records "
+        "what was sent for each refusal."
+    )
+
+
+def _network_controller_resolved_message(target: str, integration: object) -> str:
+    """Resolution copy, replacing the trigger text for the reason
+    ``_auto_resolve``'s docstring gives. Says *why* it cleared, because
+    "switched off" and "working again" are different news."""
+    name = getattr(integration, "name", "WiFi controller")
+    if not getattr(integration, "is_enabled", False):
+        return (
+            f"{name}: this WiFi controller integration was switched off, so "
+            "this alert is closed."
+        )
+    if target == ALERT_TARGET_NETWORK_CONTROLLER:
+        return f"{name}: the WiFi controller is answering normally again."
+    if target == ALERT_TARGET_NETWORK_CONTROLLER_SETUP:
+        return f"{name}: this WiFi controller's setup is complete."
+    return (
+        f"{name}: no guest has been refused by the WiFi controller in the "
+        f"last {NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES} minutes."
+    )
+
+
+_NETWORK_CONTROLLER_GONE_MESSAGE = (
+    "The WiFi controller integration this alert was about has been removed "
+    "or moved to a different venue, so this alert is closed."
+)
 
 
 def _format_alert_message(alert: Alert) -> str:

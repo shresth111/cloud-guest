@@ -49,6 +49,9 @@ from app.domains.isp.device_adapters import PingResult
 from app.domains.monitoring.constants import (
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_NETWORK_CONTROLLER,
+    ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+    ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
     ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
     ALERT_TARGET_ROUTER_REACHABILITY,
@@ -212,6 +215,11 @@ class FakeRepository:
     rogue_dhcp_rows: list[tuple[FakeRouter, FakeRogueDhcpStatus]] = field(
         default_factory=list
     )
+    # Duck-typed ``NetworkIntegration`` rows and per-integration
+    # ``AuthorizationOutcomeCounts`` -- see
+    # ``tests/unit/test_monitoring_network_controller_alerts.py``.
+    network_integrations: list[object] = field(default_factory=list)
+    authorization_counts: list[object] = field(default_factory=list)
     snapshots: dict[uuid.UUID, FakeSnapshot] = field(default_factory=dict)
     service_health_rows: dict[str, ServiceHealth] = field(default_factory=dict)
     platform_events: list[PlatformEvent] = field(default_factory=list)
@@ -371,6 +379,36 @@ class FakeRepository:
             for router, status in self.rogue_dhcp_rows
             if router.organization_id == organization_id
         ]
+
+    async def list_network_integrations(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[object]:
+        """Taught to this fake for the same reason as the rogue-DHCP read
+        above: every organization's defaults now include the three
+        network-controller rules, so every test here that evaluates default
+        rules calls this. A missing method would be swallowed by the
+        per-rule isolation and counted into ``skipped_rules``."""
+        return [
+            row
+            for row in self.network_integrations
+            if not getattr(row, "is_deleted", False)
+            and (organization_id is None or row.organization_id == organization_id)
+        ]
+
+    async def count_authorization_outcomes_since(
+        self, *, since: datetime, organization_id: uuid.UUID | None = None
+    ) -> list[object]:
+        """Counts are handed in pre-aggregated, the way the real grouped
+        query returns them; the window itself is the SQL's job and is
+        checked against the compiled statement in the network-controller
+        test file."""
+        wanted = {
+            row.id
+            for row in await self.list_network_integrations(
+                organization_id=organization_id
+            )
+        }
+        return [c for c in self.authorization_counts if c.integration_id in wanted]
 
     async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
         """The bulk de-duplication read. Same predicate and same
@@ -1574,6 +1612,9 @@ async def test_new_organizations_get_a_working_rogue_dhcp_rule_from_day_one():
         ALERT_TARGET_ISP_LINK,
         ALERT_TARGET_MONITORED_HARDWARE,
         ALERT_TARGET_ROGUE_DHCP_GUARD,
+        ALERT_TARGET_NETWORK_CONTROLLER,
+        ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+        ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
     }
     rogue_rule = rules[ALERT_TARGET_ROGUE_DHCP_GUARD]
     assert rogue_rule.organization_id == org_id

@@ -419,6 +419,119 @@ ROGUE_DHCP_STATE_UNGUARDED = "unguarded"
 ROGUE_DHCP_STATE_GUARDED = "guarded"
 ROGUE_DHCP_STATE_UNKNOWN = "unknown"
 
+# ----------------------------------------------------------------------------
+# Network-controller integrations (TP-Link Omada today)
+# ----------------------------------------------------------------------------
+#
+# ## The gap these close
+#
+# An Omada venue has no MikroTik in the path, so none of the router targets
+# above can see it: ``AlertService._agent_managed_routers`` deliberately
+# drops the controller's synthetic fleet row, because it runs no agent and
+# its health columns are NULL by construction. Until these targets existed,
+# a controller the platform could no longer reach -- which means no new
+# guest at that venue can be let onto the WiFi, because
+# ``authorize_portal_client`` calls the controller from this backend --
+# surfaced only as a red badge on an integration page nobody was looking
+# at.
+#
+# Three targets rather than one target with three ``expected_status``
+# values, because ``default_alerting`` matches an organization's existing
+# rules by ``(organization_id, target_component)``. One shared target would
+# let only the first of the three defaults ever be created.
+#
+# ## Persisted state only
+#
+# Same promise ``app.domains.monitoring.tasks`` makes for the whole engine:
+# no controller I/O here. ``network_integrations`` is already written by
+# that domain's own 60-second sync sweep (status, consecutive-failure
+# counter, readiness gaps), and ``network_integration_authorizations``
+# already records every guest authorization the controller accepted or
+# refused. These targets read those rows and nothing else.
+#
+# ## De-duplication
+#
+# The alert key is ``(rule_id, organization_id, location_id, router_id)``
+# and there is no integration column on ``alerts``. An integration's
+# ``router_id`` is its own fleet row whenever it can serve guests at all
+# (``PortalReadinessGap.FLEET_DEVICE_MISSING`` otherwise), so in practice
+# the key is one integration. Where two integrations *do* share a key --
+# two self-service rows with no fleet device in the same venue -- they are
+# grouped into one alert naming both, the way
+# ``_evaluate_rogue_dhcp_guard_rule`` groups interfaces per router, rather
+# than one of them silently losing its alert to the other.
+
+# The controller this platform talks to for a venue is failing: it cannot
+# be reached, its credentials are rejected, or reads from it keep failing.
+ALERT_TARGET_NETWORK_CONTROLLER = "network_controller"
+NETWORK_CONTROLLER_STATE_FAILING = "failing"
+
+# Guests are completing sign-in and the controller is refusing to let them
+# online.
+ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE = "network_controller_authorize"
+NETWORK_CONTROLLER_STATE_REFUSING_GUESTS = "refusing_guests"
+
+# An integration was added and left unable to authorize a single guest.
+ALERT_TARGET_NETWORK_CONTROLLER_SETUP = "network_controller_setup"
+NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE = "setup_incomplete"
+
+# The one ``expected_status`` each of the three targets accepts -- the only
+# value with a finding behind it, the same discipline the rogue-DHCP and
+# reachability targets apply in ``validators``.
+NETWORK_CONTROLLER_TARGET_STATES: dict[str, str] = {
+    ALERT_TARGET_NETWORK_CONTROLLER: NETWORK_CONTROLLER_STATE_FAILING,
+    ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE: NETWORK_CONTROLLER_STATE_REFUSING_GUESTS,
+    ALERT_TARGET_NETWORK_CONTROLLER_SETUP: NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE,
+}
+
+# How many consecutive failed syncs before "failing" fires.
+#
+# Three, because the sync backs off: the interval doubles per failure
+# (``network_integration.constants.SYNC_BACKOFF_CAP_MULTIPLIER``). At the
+# 300-second default, failures land at roughly 0, 10 and 30 minutes, so this
+# fires about half an hour after the controller first stopped answering. One
+# failure is a blip -- a controller reboot, a firmware update, a cloud
+# controller's own maintenance -- and paging a venue for each of those is
+# how an alert gets filtered to a folder nobody reads. Two would be ten
+# minutes, which is inside a routine controller upgrade.
+#
+# Resolution needs no threshold: the counter is reset to zero only by a
+# successful sync, so "below three" after having been at three means the
+# controller answered.
+NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES = 3
+
+# How long an integration may sit unable to authorize anybody before
+# "setup incomplete" fires, measured from when it was created.
+#
+# A day, because the onboarding flow is genuinely multi-step and
+# multi-person (credentials from the venue, site selection, location
+# mapping, a pre-auth entry on the controller) and an operator part-way
+# through it is not a fault. An integration still not ready a full day
+# later has been abandoned, and a venue that believes it is live is the
+# case this exists for.
+NETWORK_CONTROLLER_SETUP_GRACE_HOURS = 24
+
+# The "refusing guests" window, and the two conditions that must BOTH hold
+# inside it to fire:
+#
+# * at least ``MIN_FAILED_GUESTS`` distinct guest sessions were refused.
+#   Counted per session, not per attempt: the portal retries and a guest
+#   taps again, so one unlucky device can produce several failed rows, and
+#   one device is not a venue-wide problem.
+# * failures are at least ``MIN_FAILURE_RATIO`` of all attempts. A busy
+#   venue with a handful of odd devices among hundreds of successful joins
+#   is not "the controller is refusing guests".
+#
+# Resolution is deliberately stricter than the trigger: the alert closes
+# only once the window holds no failed attempt at all. Resolving on "back
+# under the trigger" would open and close the alert every time a sustained
+# problem drifted across the line, mailing the venue each time -- the
+# hysteresis the reachability sweep's two-miss debounce exists for on the
+# router side.
+NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES = 15
+NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS = 3
+NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO = 0.5
+
 
 class ThresholdMetric(StrEnum):
     """The exact, already-persisted
@@ -738,6 +851,18 @@ __all__ = [
     "ROGUE_DHCP_STATE_UNGUARDED",
     "ROGUE_DHCP_STATE_GUARDED",
     "ROGUE_DHCP_STATE_UNKNOWN",
+    "ALERT_TARGET_NETWORK_CONTROLLER",
+    "ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE",
+    "ALERT_TARGET_NETWORK_CONTROLLER_SETUP",
+    "NETWORK_CONTROLLER_STATE_FAILING",
+    "NETWORK_CONTROLLER_STATE_REFUSING_GUESTS",
+    "NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE",
+    "NETWORK_CONTROLLER_TARGET_STATES",
+    "NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES",
+    "NETWORK_CONTROLLER_SETUP_GRACE_HOURS",
+    "NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES",
+    "NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS",
+    "NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO",
     "ThresholdMetric",
     "ThresholdOperator",
     "AlertSeverity",

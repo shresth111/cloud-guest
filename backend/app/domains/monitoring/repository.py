@@ -30,10 +30,11 @@ edited to make this work.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
@@ -43,6 +44,11 @@ from app.domains.dhcp.models import RouterRogueDhcpStatus
 from app.domains.guest.models import GuestSession, RadiusNasClient
 from app.domains.isp.models import IspLink
 from app.domains.location.models import Location
+from app.domains.network_integration.constants import AuthorizationStatus
+from app.domains.network_integration.models import (
+    NetworkIntegration,
+    NetworkIntegrationAuthorization,
+)
 from app.domains.organization.models import Organization
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
@@ -72,6 +78,23 @@ from .models import (
     SlaReport,
     SlaTarget,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationOutcomeCounts:
+    """One integration's guest authorizations inside a time window -- the
+    read behind the ``ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE`` rule.
+
+    ``failed_guests`` counts distinct guest sessions, not rows: the portal
+    retries and guests tap twice, so one device can leave several failed
+    rows, and the rule's threshold is about how many *people* were
+    refused. See ``constants.NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS``.
+    """
+
+    integration_id: uuid.UUID
+    attempts: int
+    failed_attempts: int
+    failed_guests: int
 
 
 class MonitoringRepositoryProtocol(Protocol):
@@ -223,6 +246,14 @@ class MonitoringRepositoryProtocol(Protocol):
     ) -> list[tuple[Router, RouterRogueDhcpStatus]]: ...
 
     async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]: ...
+
+    async def list_network_integrations(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[NetworkIntegration]: ...
+
+    async def count_authorization_outcomes_since(
+        self, *, since: datetime, organization_id: uuid.UUID | None
+    ) -> list[AuthorizationOutcomeCounts]: ...
 
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
@@ -871,6 +902,81 @@ class MonitoringRepository:
             statement = statement.where(Router.organization_id == organization_id)
         result = await self.session.execute(statement)
         return [(row[0], row[1]) for row in result.all()]
+
+    async def list_network_integrations(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[NetworkIntegration]:
+        """Every live network-controller integration in scope -- the read
+        behind the three ``ALERT_TARGET_NETWORK_CONTROLLER*`` rules.
+
+        Same "query another domain's model directly, read-only" precedent
+        as ``list_isp_links``, and for the same reason:
+        ``NetworkIntegrationService``'s own list is paginated, tenant-guarded
+        for a request, and would drag the provider registry (and with it
+        the vendored gateway) into this domain for a read that needs none
+        of it. Disabled rows are returned too -- the evaluator needs to see
+        them to close an alert an operator answered by switching the
+        integration off.
+        """
+        statement = select(NetworkIntegration).where(
+            NetworkIntegration.is_deleted.is_(False)
+        )
+        if organization_id is not None:
+            statement = statement.where(
+                NetworkIntegration.organization_id == organization_id
+            )
+        result = await self.session.execute(statement.order_by(NetworkIntegration.id))
+        return list(result.scalars().all())
+
+    async def count_authorization_outcomes_since(
+        self, *, since: datetime, organization_id: uuid.UUID | None = None
+    ) -> list[AuthorizationOutcomeCounts]:
+        """Per-integration guest-authorization counts since ``since``, in one
+        grouped query rather than one per integration.
+
+        Only integrations with at least one attempt in the window appear.
+        That is the honest shape rather than a gap: an integration nobody
+        tried to join through has no evidence either way, and the caller
+        treats "no row" as "no failures", which is exactly what it is.
+
+        Every row in ``network_integration_authorizations`` is an attempt
+        the controller actually answered (or failed to answer) -- refusals
+        this platform makes *before* calling the controller (an inactive
+        session, a mismatched site) are events, not rows -- so a failed row
+        here is the controller's verdict, not a guest's typo.
+        """
+        failed = NetworkIntegrationAuthorization.status == (
+            AuthorizationStatus.FAILED.value
+        )
+        statement = (
+            select(
+                NetworkIntegrationAuthorization.integration_id,
+                func.count().label("attempts"),
+                func.count().filter(failed).label("failed_attempts"),
+                func.count(distinct(NetworkIntegrationAuthorization.guest_session_id))
+                .filter(failed)
+                .label("failed_guests"),
+            )
+            .where(
+                NetworkIntegrationAuthorization.is_deleted.is_(False),
+                NetworkIntegrationAuthorization.created_at >= since,
+            )
+            .group_by(NetworkIntegrationAuthorization.integration_id)
+        )
+        if organization_id is not None:
+            statement = statement.where(
+                NetworkIntegrationAuthorization.organization_id == organization_id
+            )
+        result = await self.session.execute(statement)
+        return [
+            AuthorizationOutcomeCounts(
+                integration_id=row.integration_id,
+                attempts=int(row.attempts),
+                failed_attempts=int(row.failed_attempts),
+                failed_guests=int(row.failed_guests),
+            )
+            for row in result.all()
+        ]
 
     async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
         """Every open (not ``RESOLVED``) ``Alert`` for one rule, newest
@@ -1556,6 +1662,7 @@ class MonitoringRepository:
 
 
 __all__ = [
+    "AuthorizationOutcomeCounts",
     "MonitoringRepositoryProtocol",
     "MonitoringRepository",
 ]

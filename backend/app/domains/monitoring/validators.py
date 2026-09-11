@@ -30,6 +30,7 @@ from .constants import (
     ALERT_TARGET_ROUTER,
     ALERT_TARGET_ROUTER_REACHABILITY,
     INCIDENT_STATUS_TRANSITIONS,
+    NETWORK_CONTROLLER_TARGET_STATES,
     ROGUE_DHCP_STATE_UNGUARDED,
     ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES,
     ROUTER_HEARTBEAT_WARNING_STALE_MINUTES,
@@ -101,20 +102,28 @@ def validate_alert_rule_condition_config(
             raise InvalidAlertRuleConfigError(
                 "health_status_change rules require target_component "
                 "(a HealthComponent value, 'router', 'router_reachability', "
-                "'isp_link', 'monitored_hardware', or 'rogue_dhcp_guard')"
+                "'isp_link', 'monitored_hardware', 'rogue_dhcp_guard', "
+                "'network_controller', 'network_controller_authorize', or "
+                "'network_controller_setup')"
             )
-        valid_components = {c.value for c in HealthComponent} | {
-            ALERT_TARGET_ROUTER,
-            ALERT_TARGET_ROUTER_REACHABILITY,
-            ALERT_TARGET_ISP_LINK,
-            ALERT_TARGET_MONITORED_HARDWARE,
-            ALERT_TARGET_ROGUE_DHCP_GUARD,
-        }
+        valid_components = (
+            {c.value for c in HealthComponent}
+            | {
+                ALERT_TARGET_ROUTER,
+                ALERT_TARGET_ROUTER_REACHABILITY,
+                ALERT_TARGET_ISP_LINK,
+                ALERT_TARGET_MONITORED_HARDWARE,
+                ALERT_TARGET_ROGUE_DHCP_GUARD,
+            }
+            | set(NETWORK_CONTROLLER_TARGET_STATES)
+        )
         if target_component not in valid_components:
             raise InvalidAlertRuleConfigError(
                 f"target_component '{target_component}' is not a known "
                 "HealthComponent value, 'router', 'router_reachability', "
-                "'isp_link', 'monitored_hardware', or 'rogue_dhcp_guard'"
+                "'isp_link', 'monitored_hardware', 'rogue_dhcp_guard', "
+                "'network_controller', 'network_controller_authorize', or "
+                "'network_controller_setup'"
             )
         expected_status = condition_config.get("expected_status")
         if not isinstance(expected_status, str) or not expected_status:
@@ -161,6 +170,17 @@ def validate_alert_rule_condition_config(
                 "'guarded' has no finding behind it and 'unknown' means "
                 "the detector could not reach the router, which is an "
                 "unanswered question, not an alert"
+            )
+        required_state = NETWORK_CONTROLLER_TARGET_STATES.get(target_component)
+        if required_state is not None and expected_status != required_state:
+            # Same discipline again: each network-controller target has
+            # exactly one state with a finding behind it, and the
+            # evaluator computes that state itself from the integration's
+            # persisted row. Any other value would be a rule that can never
+            # fire, which an operator should hear about when they save it.
+            raise InvalidAlertRuleConfigError(
+                f"{target_component} rules require condition_config"
+                f".expected_status == '{required_state}'"
             )
     elif trigger_type == AlertTriggerType.THRESHOLD:
         if target_component:
