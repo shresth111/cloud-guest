@@ -78,6 +78,8 @@ __all__ = [
     "PORTAL_READINESS_GAP_LABELS",
     "PortalReadinessGap",
     "ROUTER_VENDOR_BY_PROVIDER",
+    "FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER",
+    "GUEST_OPERATOR_CREDENTIAL_FIELDS",
     "PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE",
     "PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW",
     "PORTAL_AUTHORIZE_DIAGNOSTICS_KEY",
@@ -136,6 +138,24 @@ class NetworkProviderKind(StrEnum):
 ROUTER_VENDOR_BY_PROVIDER: dict[str, str] = {
     NetworkProviderKind.OMADA.value: "tplink_omada",
 }
+
+# What lands in ``routers.model`` (NOT NULL) when a fleet row is registered
+# for a controller whose operator was never asked for a model -- the
+# customer self-service path and the "Register controller" repair action.
+# The Master onboarding wizard asks, and what it is told wins. Keyed by
+# provider for the same reason the table above is: ``service.py`` does not
+# name vendors.
+FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
+    NetworkProviderKind.OMADA.value: "Omada Controller",
+}
+
+# The credential pair that authorizes a guest. Omada's only external-portal
+# authorization endpoint takes a hotspot *operator* login, in either auth
+# mode -- an Open API app can read inventory but cannot let anybody online.
+# So an Open API integration needs this pair stored alongside its client
+# id/secret before it can serve a venue; see
+# ``PortalReadinessGap.GUEST_OPERATOR_MISSING``.
+GUEST_OPERATOR_CREDENTIAL_FIELDS: frozenset[str] = frozenset({"username", "password"})
 
 
 class ControllerAuthMode(StrEnum):
@@ -261,6 +281,13 @@ class PortalReadinessGap(StrEnum):
     ``authorize_portal_client`` actually stops:
 
     * ``CREDENTIALS_MISSING`` -- ``_credentials_for`` raises.
+    * ``GUEST_OPERATOR_MISSING`` -- an Open API integration whose stored
+      credential set has no hotspot operator login. The provider refuses
+      every guest with ``OMADA_API_UNSUPPORTED``, because the controller's
+      only external-portal authorization endpoint takes an operator login
+      whatever mode the integration reads inventory with. Before this gap
+      existed such a row synced green -- the Open API app works -- and
+      authorized nobody.
     * ``LOCATION_NOT_MAPPED`` -- the portal path resolves an integration by
       ``(organization_id, location_id, provider)``, so a NULL
       ``location_id`` means this row is never selected for any venue.
@@ -281,7 +308,9 @@ class PortalReadinessGap(StrEnum):
 
       Nothing consumed that fact until the Omada guest flow existed, which
       is exactly why it was invisible; now it decides whether the dashboard
-      can give a venue a portal URL at all.
+      can give a venue a portal URL at all. The customer path now registers
+      the fleet row itself once the integration is mapped to a venue, and
+      ``POST /{id}/fleet-device`` repairs a row created before it did.
 
     ``guest_ssid_id`` is deliberately **not** here. The wizard asks for it
     and the list view shows it, but nothing on the authorize path reads it
@@ -296,6 +325,7 @@ class PortalReadinessGap(StrEnum):
     """
 
     CREDENTIALS_MISSING = "credentials_missing"
+    GUEST_OPERATOR_MISSING = "guest_operator_missing"
     LOCATION_NOT_MAPPED = "location_not_mapped"
     SITE_NOT_SELECTED = "site_not_selected"
     FLEET_DEVICE_MISSING = "fleet_device_missing"
@@ -306,6 +336,10 @@ class PortalReadinessGap(StrEnum):
 PORTAL_READINESS_GAP_LABELS: dict[PortalReadinessGap, str] = {
     PortalReadinessGap.CREDENTIALS_MISSING: (
         "no controller credentials have been saved"
+    ),
+    PortalReadinessGap.GUEST_OPERATOR_MISSING: (
+        "it has an Open API app but no hotspot operator account, and guest "
+        "sign-in needs the operator account"
     ),
     PortalReadinessGap.LOCATION_NOT_MAPPED: (
         "it is not mapped to a location, so no venue's guests resolve to it"
@@ -398,6 +432,10 @@ class ErrorCode(StrEnum):
     # than a user error -- see the exception of the same name for why this
     # refuses instead of falling back to a plain integration create.
     FLEET_DEVICE_UNAVAILABLE = "NETWORK_INTEGRATION_FLEET_DEVICE_UNAVAILABLE"
+    # A fleet row was asked for (the "Register controller" repair action) on
+    # an integration that is not mapped to a venue. A device must be
+    # somewhere; the fix is to pick the location first.
+    LOCATION_REQUIRED = "NETWORK_INTEGRATION_LOCATION_REQUIRED"
     # The controller answered, and the integration still authorizes nobody
     # because the operator has not finished mapping it. Distinct from
     # CREDENTIALS_REQUIRED (which is one specific half of the same story)

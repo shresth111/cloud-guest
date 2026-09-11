@@ -95,6 +95,7 @@ from app.domains.rbac.location_scope import LocationScope, enforce_entity_locati
 from .constants import (
     AUDIT_ENTITY_TYPE,
     DEFAULT_CONTROLLER_TLS_MODE,
+    FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
     PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS,
     PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW,
@@ -130,6 +131,7 @@ from .exceptions import (
     NetworkIntegrationDisabledError,
     NetworkIntegrationFleetDeviceUnavailableError,
     NetworkIntegrationInventoryRequiresOpenApiError,
+    NetworkIntegrationLocationRequiredError,
     NetworkIntegrationNotFoundError,
     NetworkIntegrationOrganizationRequiredError,
     NetworkIntegrationRateLimitedError,
@@ -1157,10 +1159,10 @@ class NetworkIntegrationService:
         Returns ``(integration, fleet_device)``.
 
         The Master-driven onboarding path (contract §11.6). The customer
-        self-service path -- :meth:`create_integration` -- is unchanged and
-        deliberately creates no fleet row: a tenant connecting a controller
-        this platform never deployed is registering an integration, not
-        taking delivery of a device.
+        self-service path writes the same pair through
+        :meth:`ensure_fleet_device` once the integration names a venue --
+        it used to create no fleet row at all, which left every
+        customer-created integration unable to sign a single guest in.
 
         ## Why a venue needs the second row at all
 
@@ -1225,6 +1227,45 @@ class NetworkIntegrationService:
             password=password,
         )
 
+        return await self._register_fleet_device(
+            integration,
+            actor_user_id=actor_user_id,
+            organization_id=organization_id,
+            location_id=location_id,
+            controller_model=controller_model,
+            serial_number=serial_number,
+            mac_address=mac_address,
+        )
+
+    async def _register_fleet_device(
+        self,
+        integration: NetworkIntegration,
+        *,
+        actor_user_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        controller_model: str | None = None,
+        serial_number: str | None = None,
+        mac_address: str | None = None,
+    ) -> tuple[NetworkIntegration, Any]:
+        """Write the fleet row for ``integration`` and link it. One place.
+
+        Shared by Master onboarding, the customer path once a venue is
+        mapped, and the "Register controller" repair action, so the three
+        cannot drift into registering controllers three different ways.
+        Nothing here commits: the caller's request-scoped session holds this
+        write and whatever wrote the integration, and a failure rolls both
+        back together.
+
+        ``controller_model`` falls back to the provider's generic model name
+        when nobody was asked for one -- only the Master wizard asks.
+        """
+        if self.fleet_device_provisioner is None:
+            raise NetworkIntegrationFleetDeviceUnavailableError()
+        name = integration.name
+        model = controller_model or FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER.get(
+            integration.provider, "Network controller"
+        )
         # A hardware controller (an OC200/OC300) has a serial plate and a
         # real MAC, and using them means the fleet row matches the sticker
         # on the box an engineer is holding. A software controller has
@@ -1244,14 +1285,14 @@ class NetworkIntegrationService:
             name=name,
             serial_number=fleet_serial,
             mac_address=fleet_mac,
-            model=controller_model,
+            model=model,
             # From the provider, never from a branch here. `service.py` does
             # not know any vendor's name, and the column this lands in
             # defaults to a different vendor entirely -- so a provider that
             # failed to declare one would produce a fleet row that every
             # RouterOS-assuming sweep in the product would then report as a
             # broken MikroTik.
-            vendor=self._provider(provider).fleet_device_vendor,
+            vendor=self._provider(integration.provider).fleet_device_vendor,
             # Nothing here enables an agent path: no API credentials, no
             # SNMP, and the router domain's own default status is
             # PENDING_PROVISIONING rather than ONLINE. Those omissions are
@@ -1278,17 +1319,65 @@ class NetworkIntegrationService:
             integration=integration,
             description=(
                 f"Controller '{name}' onboarded and registered as a fleet "
-                f"device ({controller_model})"
+                f"device ({model})"
             ),
             organization_id=organization_id,
             location_id=location_id,
             metadata={
                 "router_id": str(fleet_device.id),
-                "model": controller_model,
+                "model": model,
                 "synthetic_identity": not supplied,
             },
         )
         return integration, fleet_device
+
+    async def ensure_fleet_device(
+        self,
+        integration_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> NetworkIntegration:
+        """Give a mapped integration the fleet row its guests need. Idempotent.
+
+        ## Why the customer path needs this at all
+
+        ``guest_sessions.router_id`` is NOT NULL, so a venue whose only
+        equipment is a controller cannot issue a guest session until
+        something in the fleet represents the controller. Only Master
+        onboarding used to write that row, so an integration added from the
+        customer page could be credentialled, mapped and CONNECTED and still
+        show ``fleet_device_missing`` forever, with no portal link and no
+        way for its operator to fix it.
+
+        It is called in three places: after the customer create when a
+        location was given, after an update that maps a location, and by
+        ``POST /{id}/fleet-device`` -- the explicit repair for rows created
+        before this existed. That last one is deliberately an action a
+        person takes rather than a sweep that rewrites production rows on
+        its own.
+
+        ## Idempotent, and never moves anything
+
+        A row that already has a fleet device is returned untouched. That
+        includes a row whose location was changed after its device was
+        registered: moving a fleet row between venues is a decision about
+        inventory, not something a repair button should do silently.
+        """
+        integration = await self._load_owned_integration(
+            integration_id, requesting_organization_id=requesting_organization_id
+        )
+        if integration.router_id is not None:
+            return integration
+        if integration.location_id is None:
+            raise NetworkIntegrationLocationRequiredError()
+        integration, _ = await self._register_fleet_device(
+            integration,
+            actor_user_id=actor_user_id,
+            organization_id=integration.organization_id,
+            location_id=integration.location_id,
+        )
+        return integration
 
     async def get_integration(
         self,
@@ -1600,6 +1689,24 @@ class NetworkIntegrationService:
                         else {}
                     )
                 ),
+            )
+        if (
+            "location_id" in changed
+            and updated.location_id is not None
+            and updated.router_id is None
+            and self.fleet_device_provisioner is not None
+        ):
+            # Mapping a venue is the moment an integration can have a fleet
+            # row, so it gets one here, in the same transaction as the
+            # mapping -- otherwise "Finish setup" would end on a
+            # `fleet_device_missing` gap its operator cannot clear. Skipped
+            # (not refused) when no provisioner is wired, which only happens
+            # outside the real dependency graph; the gap then says so.
+            updated, _ = await self._register_fleet_device(
+                updated,
+                actor_user_id=actor_user_id,
+                organization_id=updated.organization_id,
+                location_id=updated.location_id,
             )
         return updated
 
@@ -2316,7 +2423,7 @@ class NetworkIntegrationService:
         # would `authorize_portal_client` actually get as far as the
         # controller for a guest at this venue -- and every gap it can
         # return is a branch that method really takes.
-        gaps = portal_readiness_gaps(integration)
+        gaps = portal_readiness_gaps(integration, settings=self.settings)
         updates: dict[str, object] = {
             "status": (
                 IntegrationStatus.UNCONFIGURED.value

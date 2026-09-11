@@ -354,6 +354,54 @@ async def test_test_connection_works_in_legacy_mode():
     assert controller.login_count == 1
 
 
+async def test_openapi_test_connection_also_proves_a_stored_operator_login():
+    """The app and the operator account are two credentials; guest sign-in
+    uses the second. A test that proved only the first would go green over
+    a mistyped operator password."""
+    from omada_support import OPERATOR_PASSWORD, OPERATOR_USERNAME
+
+    controller = FakeOmadaController()
+    info = await _adapter(controller).test_connection(
+        make_creds(
+            ControllerAuthMode.OPENAPI,
+            username=OPERATOR_USERNAME,
+            password=OPERATOR_PASSWORD,
+        )
+    )
+
+    assert info.omadac_id == OMADAC_ID
+    assert controller.token_count == 1
+    assert controller.login_count == 1
+
+
+async def test_openapi_test_connection_names_the_operator_account_when_it_is_refused():
+    from omada_support import OPERATOR_USERNAME
+
+    from wyfy_device_gateway.omada.errors import OmadaAuthError
+
+    controller = FakeOmadaController()
+    with pytest.raises(OmadaAuthError, match="hotspot operator account"):
+        await _adapter(controller).test_connection(
+            make_creds(
+                ControllerAuthMode.OPENAPI,
+                username=OPERATOR_USERNAME,
+                password="not-the-operator-password",
+            )
+        )
+    # The app itself was fine: its token was issued before the operator
+    # login was tried.
+    assert controller.token_count == 1
+
+
+async def test_openapi_test_connection_without_an_operator_login_tries_none():
+    """No operator pair stored means nothing to prove -- and no operator
+    login attempt that would read as a failure."""
+    controller = FakeOmadaController()
+    await _adapter(controller).test_connection(make_creds(ControllerAuthMode.OPENAPI))
+
+    assert controller.login_count == 0
+
+
 # --- gateway purity --------------------------------------------------------
 
 

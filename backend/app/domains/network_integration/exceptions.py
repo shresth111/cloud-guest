@@ -55,6 +55,7 @@ __all__ = [
     "NetworkIntegrationDisabledError",
     "NetworkIntegrationEncryptionKeyNotConfiguredError",
     "NetworkIntegrationFleetDeviceUnavailableError",
+    "NetworkIntegrationLocationRequiredError",
     "NetworkIntegrationInventoryRequiresOpenApiError",
     "NetworkIntegrationError",
     "NetworkIntegrationNotFoundError",
@@ -310,6 +311,26 @@ class NetworkIntegrationFleetDeviceUnavailableError(NetworkIntegrationError):
             "integration was created.",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             code=ErrorCode.FLEET_DEVICE_UNAVAILABLE,
+        )
+
+
+class NetworkIntegrationLocationRequiredError(NetworkIntegrationError):
+    """A fleet row was asked for on an integration mapped to no venue.
+
+    A fleet device must be somewhere -- ``routers.location_id`` is what the
+    guest flow resolves a venue by -- and inventing a location would put a
+    controller in a venue nobody chose. 409: the request is fine, the row
+    is not ready for it, and mapping the location first fixes it (mapping
+    also registers the fleet row on its own).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This integration is not mapped to a location yet. Choose the "
+            "venue it serves first -- the controller is registered as that "
+            "venue's device as soon as it is mapped.",
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.LOCATION_REQUIRED,
         )
 
 
