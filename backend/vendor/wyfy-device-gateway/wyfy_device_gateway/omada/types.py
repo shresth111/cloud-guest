@@ -51,6 +51,46 @@ OPENAPI_ERROR_TOKEN_OTHER = (-44106, -44111)
 OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND = -7131
 OPENAPI_ERROR_OPERATION_UNSUPPORTED = -1600
 
+# --- External-portal (legacy hotspot) error codes --------------------------
+# MEASURED against a live 6.3.0.100 cloud controller on 2026-09-11 by probing
+# `POST /{omadacId}/api/v2/hotspot/extPortal/auth` with a non-existent client
+# MAC and varying one body field at a time. Both codes came back from that
+# endpoint and nowhere else, which is why they are named for it.
+#
+# The two are not equally useful, and the asymmetry is the whole reason they
+# are written down here:
+#
+#   -41500  "Invalid authentication type."  Precise. Only `authType` produces
+#           it, so it says exactly which field is wrong.
+#   -41501  "Failed to authenticate."       A catch-all. Every other fault
+#           collapses into it -- a wrong MAC, a stale `time`, a site the
+#           controller does not recognise, an AP that never saw the client, a
+#           missing `clientMac` (which is beyond argument required), a
+#           `clientIp` the controller disliked.
+#
+# So -41501 carries almost no information on its own. It is still worth
+# carrying across the seam as an integer, because the one discrimination the
+# controller *does* make -- -41500 vs -41501 -- is the difference between "our
+# request was malformed in a named way" and "the controller will not say".
+# Narrowing -41501 any further has to be done by the caller, from what it knew
+# before it called; see the backend's portal authorize diagnostics.
+PORTAL_ERROR_INVALID_AUTH_TYPE = -41500
+PORTAL_ERROR_AUTHENTICATION_FAILED = -41501
+
+#: Codes from the external-portal authorize endpoint that mean "the controller
+#: answered, and refused". Mapped to ``OmadaAuthorizationError`` rather than
+#: being left to the generic fallback: the fallback's normalized code is
+#: ``OMADA_ERROR``, which the backend does not recognise and therefore files
+#: under "could not reach the network controller" -- a statement that is
+#: plainly false about a controller that just replied, and that sends whoever
+#: reads it to look at the network instead of at the request.
+PORTAL_AUTHORIZATION_ERROR_CODES: frozenset[int] = frozenset(
+    {
+        PORTAL_ERROR_INVALID_AUTH_TYPE,
+        PORTAL_ERROR_AUTHENTICATION_FAILED,
+    }
+)
+
 #: Codes that mean "your token is no good any more, get another one". These
 #: drive the single automatic re-login.
 SESSION_EXPIRED_ERROR_CODES: frozenset[int] = frozenset(
@@ -341,6 +381,9 @@ __all__ = [
     "OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND",
     "OPENAPI_ERROR_OPERATION_UNSUPPORTED",
     "OPENAPI_ERROR_REFRESH_TOKEN_INVALID",
+    "PORTAL_AUTHORIZATION_ERROR_CODES",
+    "PORTAL_ERROR_AUTHENTICATION_FAILED",
+    "PORTAL_ERROR_INVALID_AUTH_TYPE",
     "SESSION_EXPIRED_ERROR_CODES",
     "OmadaEnvelope",
     "coerce_bool",

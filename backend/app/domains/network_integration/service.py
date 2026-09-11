@@ -88,15 +88,19 @@ from typing import Any, Protocol
 
 from redis.asyncio import Redis
 
+from app.common.exceptions import CloudGuestError
 from app.core.config import Settings, get_settings
 from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
 
 from .constants import (
     AUDIT_ENTITY_TYPE,
     DEFAULT_CONTROLLER_TLS_MODE,
+    PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
+    PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS,
     PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW,
     PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE,
     PORTAL_AUTHORIZE_WINDOW_SECONDS,
+    PORTAL_REDIRECT_STALE_AFTER_SECONDS,
     REDACTED_CONTEXT_KEYS,
     REDACTION_PLACEHOLDER,
     SYNC_BACKOFF_CAP_MULTIPLIER,
@@ -152,9 +156,13 @@ from .providers.base import (
 )
 from .repository import NetworkIntegrationRepositoryProtocol
 from .validators import (
+    describe_mac_wire_format,
     describe_portal_readiness_gaps,
+    describe_redirect_shape,
     normalize_client_mac,
     portal_readiness_gaps,
+    portal_redirect_timestamp_age_seconds,
+    summarize_redirect_url,
     synthesize_fleet_identity,
     validate_auth_mode_credentials,
     validate_controller_url,
@@ -166,7 +174,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AuditLogWriter",
     "FleetDeviceProvisionerProtocol",
+    "GuestDisconnectOutcome",
     "GuestSessionLookupProtocol",
+    "GuestSessionTerminatorProtocol",
     "NetworkIntegrationService",
     "PortalAuthorizationOutcome",
     "SyncOutcome",
@@ -276,6 +286,46 @@ class GuestSessionLookupProtocol(Protocol):
     async def get_device_by_id(self, device_id: uuid.UUID) -> Any: ...
 
 
+class GuestSessionTerminatorProtocol(Protocol):
+    """How this domain *ends* a ``GuestSession``. One method.
+
+    Deliberately a second Protocol rather than two more lines on
+    ``GuestSessionLookupProtocol``, because the two have different
+    callers and different risks. The lookup is read-only and is used by
+    the anonymous portal route; this one writes, and is used only by the
+    RBAC-gated staff disconnect. Keeping them apart means the portal path
+    cannot acquire the ability to end sessions by accident.
+
+    ## Why a service here, where the lookup is a repository
+
+    Ending a session is not a row update. ``GuestService.disconnect_session``
+    validates the status transition, stamps ``ended_at`` and the reason,
+    writes the audit entry, and issues the live RFC 5176 disconnect for
+    the venue's *other* enforcement path. Writing to ``guest_sessions``
+    from this domain would reimplement four of those and silently skip
+    the fifth. So this composes the real service, exactly as
+    ``FleetDeviceProvisionerProtocol`` composes ``RouterService`` rather
+    than writing ``routers`` rows itself.
+
+    The dependency direction is one-way and stays that way: this domain
+    may reach into ``app.domains.guest``; nothing in ``app.domains.guest``
+    may reach back, or the portal authorize endpoint stops being able to
+    fail without taking guest login down with it.
+
+    Satisfied as-is by ``GuestService`` -- the signature below is that
+    method's, unchanged.
+    """
+
+    async def disconnect_session(
+        self,
+        *,
+        session_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None = None,
+        actor_user_id: uuid.UUID | None = None,
+        reason: str | None = None,
+    ) -> Any: ...
+
+
 @dataclass(frozen=True, slots=True)
 class SyncOutcome:
     integration_id: uuid.UUID
@@ -302,6 +352,37 @@ class PortalAuthorizationOutcome:
     provider: str
     expires_at: datetime | None = None
     redirect_url: str | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GuestDisconnectOutcome:
+    """What one staff-initiated disconnect actually achieved.
+
+    Three separate booleans rather than one, because they are three
+    separate facts and the whole history of this feature is people
+    collapsing them:
+
+    * ``disconnected`` -- the controller ended the authorization. This is
+      the only one that means the device stopped forwarding traffic.
+    * ``had_active_authorization`` -- whether this platform held a live
+      authorization row for the MAC before the call. ``False`` with
+      ``disconnected`` ``True`` is normal and not an error: the guest's
+      grant had already lapsed, or was made outside this platform.
+    * ``guest_session_ended`` -- the WyfyGuest session row was ended, so
+      the guest cannot silently re-authorize. ``False`` here means the
+      session was already over, not that anything failed.
+
+    A caller rendering "Disconnected" must read the first. A caller
+    explaining what happened should read all three.
+    """
+
+    disconnected: bool
+    provider: str
+    client_mac: str
+    had_active_authorization: bool
+    deauthorized_at: datetime | None = None
+    guest_session_id: uuid.UUID | None = None
+    guest_session_ended: bool = False
 
 
 # ============================================================================
@@ -340,6 +421,126 @@ def redact_context(value: Any, *, _depth: int = 0) -> Any:
 
 
 # ============================================================================
+# Portal authorization diagnostics
+# ============================================================================
+
+
+def build_portal_authorize_diagnostics(
+    *,
+    context: ProviderPortalContext,
+    normalized_client_mac: str,
+    integration: NetworkIntegration,
+    request_snapshot: dict[str, Any] | None = None,
+    provider_code: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Everything a support engineer needs to diff a failed authorization.
+
+    Two halves, deliberately kept apart in the output:
+
+    * ``request`` -- the exact body that went to the controller, field by
+      field, in the vendor's own spelling, produced by the same builder the
+      gateway uses to make the request (see
+      ``providers/omada.py::_authorize_snapshot``). ``None`` when the call
+      never got that far.
+    * ``redirect`` -- the parameters the controller put on the redirect that
+      sent the guest here in the first place.
+
+    Diffing those two is the entire feature. Today neither is recoverable
+    after the fact, so a venue reporting "the WiFi did not work at 19:40"
+    leaves nothing to look at but a timestamp and a code that means "no".
+
+    ``precall`` is the third part and the one that does not come from either
+    side: the checks this platform could have made from its own state before
+    calling. They exist because the controller's ``-41501`` is a catch-all
+    (see ``constants``'s own write-up) and every candidate cause that can be
+    decided here is one an engineer does not have to chase. They describe;
+    they never refuse -- see ``validators``'s note on why a guard built on
+    this would be a guess that costs real guests their internet.
+
+    ## What is not in here
+
+    No credential, cookie, token or controller response body -- none of those
+    is an input to any value above. No client IP: this platform's authorize
+    body has no ``clientIp`` field, so there is nothing to record, and this
+    function does not invent one. The redirect URL is reduced to its origin,
+    path and query-parameter *names* (``validators.summarize_redirect_url``
+    explains why the values are dropped).
+
+    The raw ``provider_code`` is passed through as an integer and is not
+    interpreted here. Which codes are specific and which are catch-alls is
+    vendor knowledge, and this module does not hold vendor knowledge -- the
+    gateway classifies, this records. Keeping the number is what preserves
+    the one discrimination the controller makes.
+    """
+    stored_site_id = integration.external_site_id or None
+    stored_site_name = integration.external_site_name or None
+    if stored_site_id is not None and context.site == stored_site_id:
+        site_matched_by = "id"
+    elif stored_site_name is not None and context.site == stored_site_name:
+        # The redirect named the site's *display name* and the check passed on
+        # that. Worth recording rather than flattening into "matched": the
+        # body then carries a name where the controller may want a key, which
+        # is one of the causes the catch-all covers.
+        site_matched_by = "name"
+    else:
+        site_matched_by = "none"
+
+    age_seconds = portal_redirect_timestamp_age_seconds(context.t, now=now)
+    wire_format = describe_mac_wire_format(context.client_mac)
+
+    return {
+        "request": {
+            # The vendor's spelling, on purpose. A "friendlier" rename here
+            # would mean an engineer comparing this against TP-Link's own
+            # documentation has to translate it back, which is the one job
+            # this record exists to remove.
+            "body": request_snapshot,
+            "fields": sorted(request_snapshot) if request_snapshot else [],
+        },
+        "redirect": {
+            "client_mac": context.client_mac,
+            "site": context.site,
+            "ap_mac": context.ap_mac,
+            "ssid_name": context.ssid_name,
+            "radio_id": context.radio_id,
+            "gateway_mac": context.gateway_mac,
+            "vid": context.vid,
+            "t": context.t,
+            "redirect_url": summarize_redirect_url(context.redirect_url),
+        },
+        "precall": {
+            "site_matched_by": site_matched_by,
+            "stored_site_id": stored_site_id,
+            "redirect_shape": describe_redirect_shape(
+                ap_mac=context.ap_mac,
+                ssid_name=context.ssid_name,
+                radio_id=context.radio_id,
+                gateway_mac=context.gateway_mac,
+                vid=context.vid,
+            ),
+            "client_mac_wire_format": wire_format,
+            "client_mac_normalized": normalized_client_mac,
+            # True means the controller was sent a different spelling from the
+            # one this platform stored and compares on. Harmless on every
+            # firmware anyone has tested, and exactly the kind of thing that
+            # stops being harmless without warning.
+            "client_mac_rewritten_for_wire": (
+                (context.client_mac or "").strip() != normalized_client_mac
+            ),
+            "t_age_seconds": age_seconds,
+            "t_stale": (
+                None
+                if age_seconds is None
+                else age_seconds > PORTAL_REDIRECT_STALE_AFTER_SECONDS
+            ),
+            "requested_duration_seconds": integration.session_duration_seconds,
+        },
+        "controller": {"provider_code": provider_code},
+    }
+
+
+# ============================================================================
 # Service
 # ============================================================================
 
@@ -353,6 +554,7 @@ class NetworkIntegrationService:
         *,
         audit_writer: AuditLogWriter | None = None,
         guest_session_lookup: GuestSessionLookupProtocol | None = None,
+        guest_session_terminator: GuestSessionTerminatorProtocol | None = None,
         fleet_device_provisioner: FleetDeviceProvisionerProtocol | None = None,
         provider_resolver=get_network_provider,
         url_resolver=None,
@@ -363,6 +565,11 @@ class NetworkIntegrationService:
         self.repository = repository
         self.audit_writer = audit_writer
         self.guest_session_lookup = guest_session_lookup
+        # Optional in the same way, and for the same reason: a unit test
+        # constructs this service directly. Its absence is *not* a silent
+        # degradation -- ``disconnect_guest`` refuses rather than
+        # reporting a guest session ended that it never ended.
+        self.guest_session_terminator = guest_session_terminator
         # Optional, and its absence is an error rather than a degradation:
         # only the Master onboarding path uses it, and that path refuses
         # outright when it is missing. See
@@ -2450,27 +2657,6 @@ class NetworkIntegrationService:
             )
         if not integration.external_site_id:
             raise NetworkIntegrationSiteNotSelectedError()
-        if site != integration.external_site_id and site != (
-            integration.external_site_name or ""
-        ):
-            # The controller that issued this redirect is not the one this
-            # integration is configured against. Recorded, then refused --
-            # authorizing against a site we were not configured for would
-            # be acting on an attacker's choice of target.
-            await self._record_event(
-                integration,
-                event_type=IntegrationEventType.PORTAL_AUTHORIZE,
-                status=IntegrationEventStatus.ERROR,
-                error_code=ErrorCode.SITE_NOT_FOUND.value,
-                message="Portal redirect named a site this integration is not "
-                "configured for",
-                context={"requested_site": site},
-            )
-            raise GuestSessionNotActiveError()
-
-        credentials = self._credentials_for(integration)
-        provider_impl = self._provider(integration.provider)
-        config = self._connection_config(integration, credentials)
         context = ProviderPortalContext(
             client_mac=client_mac,
             site=site,
@@ -2482,6 +2668,44 @@ class NetworkIntegrationService:
             t=t,
             redirect_url=redirect_url,
         )
+        if site != integration.external_site_id and site != (
+            integration.external_site_name or ""
+        ):
+            # The controller that issued this redirect is not the one this
+            # integration is configured against. Recorded, then refused --
+            # authorizing against a site we were not configured for would
+            # be acting on an attacker's choice of target.
+            #
+            # The full diagnostics go on this row too, even though no request
+            # was ever built. This is the one failure the controller would
+            # never have explained anyway -- it never saw the call -- and it
+            # is a leading candidate whenever a venue's guests stop working
+            # after somebody re-created a site on the controller. An operator
+            # looking at a failed join should find the same shape of record
+            # whichever side refused.
+            await self._record_event(
+                integration,
+                event_type=IntegrationEventType.PORTAL_AUTHORIZE,
+                status=IntegrationEventStatus.ERROR,
+                error_code=ErrorCode.SITE_NOT_FOUND.value,
+                message="Portal redirect named a site this integration is not "
+                "configured for",
+                context={
+                    "requested_site": site,
+                    PORTAL_AUTHORIZE_DIAGNOSTICS_KEY: (
+                        build_portal_authorize_diagnostics(
+                            context=context,
+                            normalized_client_mac=normalized_mac,
+                            integration=integration,
+                        )
+                    ),
+                },
+            )
+            raise GuestSessionNotActiveError()
+
+        credentials = self._credentials_for(integration)
+        provider_impl = self._provider(integration.provider)
+        config = self._connection_config(integration, credentials)
         try:
             result = await provider_impl.authorize_guest(
                 config,
@@ -2504,6 +2728,17 @@ class NetworkIntegrationService:
                 status=IntegrationEventStatus.ERROR,
                 error_code=error.code.value,
                 message=error.message,
+                context={
+                    PORTAL_AUTHORIZE_DIAGNOSTICS_KEY: (
+                        build_portal_authorize_diagnostics(
+                            context=context,
+                            normalized_client_mac=normalized_mac,
+                            integration=integration,
+                            request_snapshot=error.request_snapshot,
+                            provider_code=error.provider_code,
+                        )
+                    )
+                },
             )
             raise
 
@@ -2530,7 +2765,12 @@ class NetworkIntegrationService:
                 if result.authorized
                 else "Controller declined the authorization"
             ),
-            context={"ssid_name": ssid_name},
+            context=self._portal_authorize_event_context(
+                context=context,
+                normalized_client_mac=normalized_mac,
+                integration=integration,
+                result=result,
+            ),
         )
         return PortalAuthorizationOutcome(
             authorized=result.authorized,
@@ -2540,6 +2780,249 @@ class NetworkIntegrationService:
             redirect_url=redirect_url,
         )
 
+    @staticmethod
+    def _portal_authorize_event_context(
+        *,
+        context: ProviderPortalContext,
+        normalized_client_mac: str,
+        integration: NetworkIntegration,
+        result: ProviderAuthorizationResult,
+    ) -> dict[str, Any]:
+        """The event context for a call the controller actually answered.
+
+        A declined authorization gets the full diagnostics; a successful one
+        gets what it always got and nothing more.
+
+        That asymmetry is the retention decision, not an oversight. The
+        bundle names a guest's device, and writing it on every success would
+        put one MAC per guest per join into
+        ``network_integration_events`` -- a table that holds no per-guest
+        identifier today and has no retention sweep -- in order to answer a
+        question nobody asks about a call that worked. Failures are the small
+        population anybody ever diffs, and confining the record to them
+        bounds the new data by the failure rate rather than by traffic. See
+        ``constants.PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS``, which is the
+        switch and is off.
+
+        ``result.authorized`` is False here only defensively: the provider
+        raises on every refusal the controller reports, so this branch is
+        reached by a gateway that returned a negative result instead of
+        raising. That is exactly the case where an engineer has least to go
+        on, which is why it is treated as a failure for recording purposes.
+        """
+        event_context: dict[str, Any] = {"ssid_name": context.ssid_name}
+        if result.authorized and not PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS:
+            return event_context
+        event_context[PORTAL_AUTHORIZE_DIAGNOSTICS_KEY] = (
+            build_portal_authorize_diagnostics(
+                context=context,
+                normalized_client_mac=normalized_client_mac,
+                integration=integration,
+                request_snapshot=result.request_snapshot,
+            )
+        )
+        return event_context
+
+    async def disconnect_guest(
+        self,
+        integration_id: uuid.UUID,
+        *,
+        client_mac: str,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        reason: str | None = None,
+    ) -> GuestDisconnectOutcome:
+        """End one guest's network access now, on the controller and here.
+
+        The staff-facing half of the portal authorize flow, and the one
+        this domain spent its first release unable to perform. It does two
+        distinct things in a deliberate order:
+
+        1. **The controller.** The provider ends every live authorization
+           the MAC holds on the integration's site. This is the part that
+           actually takes the device off the network, and it is the part
+           that used to be impossible.
+        2. **This platform.** The authorization row is marked
+           ``DEAUTHORIZED``/``deauthorized_at``, and the guest's
+           ``GuestSession`` is ended through ``app.domains.guest`` so the
+           next portal hit does not find an ``ACTIVE`` session and
+           re-admit them.
+
+        ## Why the controller goes first
+
+        Because the failure modes are not symmetric. If the controller
+        call fails we raise and nothing is written -- no row claiming a
+        revocation that did not happen, no session marked ended while the
+        guest is still streaming. The reverse order would produce exactly
+        the falsehood this domain's docstrings keep pointing at: a record
+        reading "ended" over a device still forwarding traffic.
+
+        The consequence is that a controller failure leaves the guest
+        session untouched and the operator with a real error. Ending the
+        session *alone* remains available and remains meaningful -- it
+        prevents re-authorization -- but it is a different action on a
+        different route, and it is not silently substituted here.
+
+        ## Idempotence, and what "success" claims
+
+        Disconnecting a guest who is already disconnected succeeds. The
+        provider contract treats "this MAC holds no live authorization" as
+        the end state the caller asked for, so a second click, a guest
+        whose hour ran out, and a guest an operator already removed in the
+        controller's own UI all return ``disconnected=True`` with
+        ``had_active_authorization=False``. That is the honest reading:
+        the guest is not authorized. It is not a claim that this call is
+        what ended it.
+
+        ## Tenant authorization
+
+        Through ``_load_owned_integration`` like every other by-id
+        operation in this domain, so the organization and location checks
+        cannot be forgotten here -- the caller's organization is never
+        read from the request body. The guest-session end is additionally
+        passed ``requesting_organization_id``, so the guest domain applies
+        its own scoping rather than trusting ours.
+        """
+        integration = await self._load_owned_integration(
+            integration_id, requesting_organization_id=requesting_organization_id
+        )
+        if not integration.external_site_id:
+            raise NetworkIntegrationSiteNotSelectedError()
+        try:
+            normalized_mac = normalize_client_mac(client_mac)
+        except ValueError as exc:
+            raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
+
+        # Read *before* the controller call, so the outcome can say whether
+        # this platform believed the guest was authorized -- which is no
+        # longer knowable once the row has been flipped.
+        active = await self.repository.find_active_authorization(
+            integration_id=integration.id, client_mac=normalized_mac
+        )
+
+        credentials = self._credentials_for(integration)
+        provider_impl = self._provider(integration.provider)
+        config = self._connection_config(integration, credentials)
+        try:
+            result = await provider_impl.deauthorize_guest(
+                config, str(integration.external_site_id), normalized_mac
+            )
+        except ProviderError as error:
+            await self._record_event(
+                integration,
+                event_type=IntegrationEventType.PORTAL_DEAUTHORIZE,
+                status=IntegrationEventStatus.ERROR,
+                error_code=error.code.value,
+                message=error.message,
+            )
+            if error.code is ErrorCode.API_UNSUPPORTED:
+                raise NetworkIntegrationDeauthorizationUnsupportedError() from error
+            raise
+
+        deauthorized_at: datetime | None = None
+        if active is not None:
+            deauthorized_at = datetime.now(UTC)
+            await self.repository.update_authorization(
+                active,
+                {
+                    "status": AuthorizationStatus.DEAUTHORIZED.value,
+                    "deauthorized_at": deauthorized_at,
+                },
+            )
+
+        guest_session_id = getattr(active, "guest_session_id", None)
+        session_ended = await self._end_guest_session(
+            guest_session_id,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+            reason=reason,
+        )
+
+        await self._record_event(
+            integration,
+            event_type=IntegrationEventType.PORTAL_DEAUTHORIZE,
+            status=IntegrationEventStatus.OK,
+            message="Guest access ended on the controller",
+            context={
+                "had_active_authorization": active is not None,
+                "guest_session_ended": session_ended,
+                "reason": reason,
+            },
+        )
+        await self._write_audit(
+            action=NetworkIntegrationAuditAction.GUEST_DISCONNECTED,
+            actor_user_id=actor_user_id,
+            integration=integration,
+            description=(
+                "Ended a guest's network access early"
+                + (f": {reason}" if reason else "")
+            ),
+            metadata={
+                "had_active_authorization": active is not None,
+                "guest_session_ended": session_ended,
+                "guest_session_id": (
+                    str(guest_session_id) if guest_session_id else None
+                ),
+            },
+        )
+        return GuestDisconnectOutcome(
+            disconnected=bool(result),
+            provider=integration.provider,
+            client_mac=normalized_mac,
+            had_active_authorization=active is not None,
+            deauthorized_at=deauthorized_at,
+            guest_session_id=guest_session_id,
+            guest_session_ended=session_ended,
+        )
+
+    async def _end_guest_session(
+        self,
+        guest_session_id: uuid.UUID | None,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        reason: str | None,
+    ) -> bool:
+        """End the guest's session, and report honestly whether it ended.
+
+        Returns ``False`` rather than raising when there is nothing to
+        end. Three distinct cases land there and none of them is a failure
+        of the disconnect the operator asked for:
+
+        * no authorization row, so no session to point at;
+        * the session is already ``DISCONNECTED``/``EXPIRED``/terminated,
+          which ``app.domains.guest``'s transition graph rejects by design
+          (it has no same-status no-op, deliberately);
+        * no terminator wired -- which happens only in a unit test that
+          constructed this service directly.
+
+        The controller-side revocation has already happened by the time
+        this runs and is the load-bearing half. Failing the whole request
+        because a session row was already closed would turn a completed
+        disconnect into a 4xx, and the operator would click again.
+
+        The guest domain's own error is logged rather than swallowed
+        silently, and the ``False`` is carried all the way out to the API
+        response so nobody has to infer it.
+        """
+        if guest_session_id is None or self.guest_session_terminator is None:
+            return False
+        try:
+            await self.guest_session_terminator.disconnect_session(
+                session_id=guest_session_id,
+                requesting_organization_id=requesting_organization_id,
+                actor_user_id=actor_user_id,
+                reason=reason or "Disconnected by venue staff",
+            )
+        except CloudGuestError:
+            logger.info(
+                "network_integration_guest_session_not_ended",
+                extra={"guest_session_id": str(guest_session_id)},
+                exc_info=True,
+            )
+            return False
+        return True
+
     async def deauthorize_portal_client(
         self,
         *,
@@ -2548,51 +3031,57 @@ class NetworkIntegrationService:
         provider: str,
         client_mac: str,
     ) -> bool:
-        """End a guest's *controller* authorization. Omada cannot do this.
+        """End a guest's *controller* authorization, resolved by venue.
 
-        Contract change **CR-001**: TP-Link publishes no
-        client-deauthorization endpoint in any generation of the Omada
-        API, so this method reaches the provider, the provider reaches the
-        gateway, and the gateway raises ``OMADA_API_UNSUPPORTED`` -- which
-        arrives here as ``ProviderUnsupportedApiError`` and is re-raised as
+        The location-keyed sibling of :meth:`disconnect_guest`. Same
+        provider call underneath; the difference is how the integration is
+        found and who is allowed to ask.
+
+        * :meth:`disconnect_guest` takes an integration id and runs it
+          through ``_load_owned_integration``, so a staff caller's
+          organization and location confinement are enforced from their
+          token. That is the method a dashboard route uses.
+        * This one takes ``organization_id``/``location_id`` as **trusted
+          arguments** and resolves the venue's enabled integration from
+          them. It is for internal callers that have already established
+          whose venue this is -- an expiry sweep, or a guest-side flow
+          acting on a session it has already validated. It must never be
+          reached directly from a request body.
+
+        ## What changed here
+
+        This used to raise unconditionally. Its previous docstring
+        explained, at length, that TP-Link publishes no
+        client-deauthorization endpoint and that a guest's access
+        therefore ended only when the duration expired. TP-Link does
+        publish none; the controller has one anyway, in the Hotspot
+        Manager API tree behind the operator session the portal
+        authorization already opens, and it is implemented. So the success
+        path below is now the ordinary path rather than dead code kept for
+        a hypothetical second provider.
+
+        ``OMADA_API_UNSUPPORTED`` still arrives here, and is still
+        re-raised as
         :class:`~.exceptions.NetworkIntegrationDeauthorizationUnsupportedError`
-        with a message a human can act on.
+        -- but it now means one specific, narrow thing: the integration
+        stores no hotspot operator credentials, so there is no session to
+        send the disconnect with. The same gap makes ``authorize_guest``
+        refuse, so such an integration never put a guest on the network to
+        begin with.
 
-        ## Why this method exists at all, given it always fails
+        ## What has not changed
 
-        It is not dead code and it is not decoration. It is the seam that
-        stops the next person implementing a *false success*.
+        Nothing is written for an attempt that raised. Recording a
+        deauthorization this platform did not achieve would move the
+        falsehood out of the response and into the database, which is
+        worse and not better.
 
-        Without it, a "Disconnect guest" feature reaching for Omada has
-        two tempting options, and both are lies: return 200 having done
-        nothing, or terminate this platform's own ``GuestSession`` row and
-        report "disconnected". The second is worse because it looks
-        diligent. It is precisely the bug
-        ``app.domains.guest_access.device_adapters`` was written to fix --
-        a row reading "ended" while the device is still forwarding traffic,
-        under dashboard copy promising it "takes effect immediately".
-
-        So the capability is present, wired, and refuses. A caller that
-        wants to end a guest's session must handle a 501 and must word its
-        own outcome accordingly.
-
-        ## What still works, and must still happen
-
-        Terminating the WyfyGuest ``GuestSession`` row remains correct and
-        remains **required** -- without it the next re-authorization finds
-        an ``ACTIVE`` session and re-admits the guest. That is
-        ``app.domains.guest``'s job and this domain does not do it. The
-        distinction to hold onto: ending the session prevents the guest
-        getting back on, and does nothing whatsoever to the connection they
-        currently have. Their network access ends when the authorization
-        expires -- within 24 hours at the outside, which is why
-        ``constants.MAX_SESSION_DURATION_SECONDS`` is bounded there.
-
-        The row is still marked ``DEAUTHORIZED`` before the attempt is
-        made? No -- deliberately not. Nothing is written, because nothing
-        happened. Recording a deauthorization this platform did not achieve
-        would put the same falsehood in the database instead of the
-        response.
+        Ending the WyfyGuest ``GuestSession`` row is still required and is
+        still ``app.domains.guest``'s job: it is what stops the next
+        re-authorization finding an ``ACTIVE`` session and re-admitting
+        the guest. This method does not do it -- :meth:`disconnect_guest`
+        does, through the terminator seam, after the controller has
+        confirmed.
         """
         if provider not in {kind.value for kind in NetworkProviderKind}:
             raise UnsupportedNetworkProviderError(provider)
@@ -2631,10 +3120,12 @@ class NetworkIntegrationService:
                 raise NetworkIntegrationDeauthorizationUnsupportedError() from error
             raise
 
-        # Unreachable against Omada today. Kept, and kept correct, because
-        # a second provider that genuinely supports deauthorization must
-        # not need this method rewritten -- that is the whole premise of
-        # the provider seam.
+        # This was unreachable against Omada when it was written, and was
+        # kept correct anyway on the premise that a second provider which
+        # genuinely supported deauthorization must not need the method
+        # rewritten. Omada turned out to be that provider, and the branch
+        # was already right when it became live -- which is the argument
+        # for the provider seam, made by accident.
         active = await self.repository.find_active_authorization(
             integration_id=integration.id, client_mac=normalized_mac
         )

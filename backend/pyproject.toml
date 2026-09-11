@@ -21,11 +21,24 @@ authors = [{ name = "CloudGuest Engineering" }]
 # and still pass.
 #
 # The two files are not redundant. `requirements.txt` additionally pins
-# transitive packages (`greenlet`, `pyasn1`, `psycopg2-binary`) so a
-# rebuilt image is byte-identical; this list is the honest set of DIRECT
-# dependencies. Every entry here that `app/` imports is named below with
-# where it is imported, so the next person adding an import can see
-# immediately that this file is one of the two places to update.
+# transitive packages (`pyasn1`, `psycopg2-binary`) so a rebuilt image is
+# byte-identical; this list is the honest set of DIRECT dependencies. Every
+# entry here that `app/` imports is named below with where it is imported,
+# so the next person adding an import can see immediately that this file is
+# one of the two places to update.
+#
+# `greenlet` used to be on that transitive list and did not belong there.
+# It is not transitive in any sense a resolver can see: plain `SQLAlchemy`
+# does not require it, and `sqlalchemy.ext.asyncio` -- which is the only
+# way this application talks to its database -- does not work without it.
+# So an environment built from this file alone installed no greenlet, and
+# nine tests that drive a real `AsyncSession` failed with
+# `ModuleNotFoundError: No module named 'greenlet'`. Not on CI, which
+# installs `requirements.txt` and got it by accident; only for anyone
+# working from this file, which is every local `uv sync`. The fix is the
+# `[asyncio]` extra below, which declares the dependency the way SQLAlchemy
+# itself models it, rather than pinning greenlet directly and leaving the
+# next reader to wonder what pulls it in.
 #
 # Nothing under `tests/` can prove this list is complete -- only installing
 # from it into a clean environment can. That is the check to run when you
@@ -75,7 +88,12 @@ dependencies = [
     # stale copy ends up on the path. It brings librouteros/asyncssh/pysnmp
     # with it through its own pyproject.
     "wyfy-device-gateway",
-    "SQLAlchemy==2.0.36",
+    # The `asyncio` extra, not bare SQLAlchemy: it is what pulls in
+    # `greenlet`, without which `sqlalchemy.ext.asyncio` raises at the first
+    # `await session.commit()`. `app/database/session.py` builds an
+    # `AsyncSession` on every request, so this is a hard runtime dependency
+    # and not an optional nicety. See the note above the list.
+    "SQLAlchemy[asyncio]==2.0.36",
     "stripe==15.3.1",
     "uvicorn[standard]==0.34.0",
 ]
@@ -127,6 +145,22 @@ ignore = ["B008"]
 # hurts readability far more than it helps.
 "app/core/email_layout.py" = ["E501"]
 "app/domains/network_config/wan/renderers.py" = ["E501"]
+
+[tool.uv]
+# `greenlet` is constrained, not declared. `SQLAlchemy[asyncio]` above is
+# what *requires* it; this pins *which* one the lockfile resolves, so a
+# local `uv sync` and the image built from `requirements.txt` (which pins
+# `greenlet==3.5.3`) run the same code.
+#
+# Without this the resolver takes the newest greenlet and the two files
+# disagree about a package that is now load-bearing for every database
+# call. That is the same shape as the httpx 0.28.1-vs-0.27.2 split
+# documented under `[project.optional-dependencies]` -- which went unnoticed
+# precisely because nothing forced the two files to agree. `pyasn1` is
+# already aligned across both; this keeps greenlet aligned too.
+#
+# When `requirements.txt` bumps greenlet, bump this line with it.
+constraint-dependencies = ["greenlet==3.5.3"]
 
 [tool.uv.sources]
 # The gateway is vendored, so it is installed editable from the tree. See

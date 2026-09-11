@@ -72,7 +72,8 @@ import socket
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from datetime import UTC, datetime
+from urllib.parse import parse_qsl, urlsplit
 
 from app.core.config import Settings, get_settings
 
@@ -99,11 +100,15 @@ __all__ = [
     "ValidatedControllerUrl",
     "allowed_controller_ports",
     "assert_address_is_public",
+    "describe_mac_wire_format",
     "describe_portal_readiness_gaps",
+    "describe_redirect_shape",
     "normalize_client_mac",
     "normalize_tls_fingerprint",
     "parse_controller_url",
     "portal_readiness_gaps",
+    "portal_redirect_timestamp_age_seconds",
+    "summarize_redirect_url",
     "synthesize_fleet_identity",
     "validate_auth_mode_credentials",
     "validate_controller_url",
@@ -684,3 +689,199 @@ def describe_portal_readiness_gaps(gaps: Sequence[PortalReadinessGap]) -> str:
         "Until it is finished, guests at this venue complete sign-in and "
         "still have no internet."
     )
+
+
+# ============================================================================
+# Portal-redirect diagnostics
+# ============================================================================
+#
+# Everything below is pure and answers one question: what could this platform
+# have known about a portal redirect *before* it called the controller? It
+# exists because the controller's own answer to a failed authorization is
+# almost content-free -- Omada collapses a wrong MAC, a stale timestamp, an
+# unknown site, an AP that never saw the client and a missing required field
+# into a single `-41501 "Failed to authenticate."` (measured against a live
+# 6.3.0.100 controller, 2026-09-11). Nothing here can make the controller more
+# specific. What it can do is remove candidates from that list using facts we
+# held all along, so the residue an engineer has to investigate is smaller.
+#
+# Every function returns a *description*, never a verdict, and none of them
+# refuses anything. A redirect this module finds odd is still authorized: the
+# platform has never run against enough Omada firmware revisions to know which
+# oddities are faults and which are normal, and a guard built on that guess
+# would deny real guests internet in order to enforce a hunch. Describing is
+# honest; refusing would not be.
+
+
+def describe_mac_wire_format(raw: str | None) -> str:
+    """Name the spelling of a MAC as it arrived, without normalizing it.
+
+    ``normalize_client_mac`` answers "is this a MAC, and what is its canonical
+    form". This answers the different question an engineer diffing a failed
+    authorization is actually asking: *in what shape did we hand it to the
+    controller*. The portal path sends the redirect's own spelling on the wire
+    (``providers/omada.py`` passes ``context.client_mac`` through untouched,
+    deliberately -- see that module), while the row this platform stores is
+    normalized. So the two can differ, and if Omada is fussy about case or
+    separator on some firmware, that difference is the whole bug and is
+    invisible in every record we keep today.
+
+    Returns one of ``"colon-upper"``, ``"colon-lower"``, ``"colon-mixed"``,
+    ``"hyphen-upper"``, ``"hyphen-lower"``, ``"hyphen-mixed"``, ``"bare"``,
+    ``"empty"`` or ``"unrecognised"``. Never raises.
+    """
+    candidate = (raw or "").strip()
+    if not candidate:
+        return "empty"
+    if _MAC_PATTERN.match(candidate):
+        separator = "colon" if ":" in candidate else "hyphen"
+        letters = [char for char in candidate if char.isalpha()]
+        if not letters:
+            # All-digit MAC: the case question does not arise. "upper" would
+            # be a claim about evidence that is not there.
+            return f"{separator}-nocase"
+        if all(char.isupper() for char in letters):
+            return f"{separator}-upper"
+        if all(char.islower() for char in letters):
+            return f"{separator}-lower"
+        return f"{separator}-mixed"
+    if re.fullmatch(r"[0-9A-Fa-f]{12}", candidate):
+        return "bare"
+    return "unrecognised"
+
+
+def portal_redirect_timestamp_age_seconds(
+    raw: str | None, *, now: datetime | None = None
+) -> float | None:
+    """How old the redirect's ``t`` parameter is, in seconds, or ``None``.
+
+    ``None`` means "could not be determined" -- absent, non-numeric, or
+    implausible once interpreted -- and is deliberately not 0, which would
+    read as "brand new".
+
+    ## The units are inferred, and the inference is stated rather than hidden
+
+    Omada's portal redirect carries ``t`` as an epoch, and this platform has
+    never confirmed against hardware whether it is seconds or milliseconds;
+    the authorize *body*'s ``time`` field is separately verified to be
+    milliseconds, which is suggestive and is not the same field. So the value
+    is disambiguated by magnitude: a number large enough to be a millisecond
+    epoch of the current era is read as milliseconds, otherwise as seconds.
+    That guess is wrong only for a value more than ~1000x out of date, which
+    is a broken redirect either way.
+
+    A negative age (a redirect timestamped in the future) is returned as-is
+    rather than clamped, because clock skew between the controller and this
+    platform is itself a candidate explanation for a failed authorization and
+    hiding it would remove the evidence for it.
+    """
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    try:
+        value = int(candidate)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    # 1e11 seconds is the year 5138; 1e11 milliseconds is 1973. Anything at or
+    # above the boundary is therefore milliseconds on any clock this code will
+    # ever see, and anything below it is seconds.
+    seconds = value / 1000.0 if value >= 100_000_000_000 else float(value)
+    reference = (now or datetime.now(UTC)).timestamp()
+    return round(reference - seconds, 3)
+
+
+def summarize_redirect_url(raw: str | None) -> dict[str, object] | None:
+    """The shape of the controller's ``redirect_url``, without its values.
+
+    Returns ``{"origin", "path", "query_keys", "length"}``, or ``None`` when
+    there is no URL.
+
+    ## Why the query *values* are dropped and the keys are kept
+
+    This is the one field on the portal request that is an arbitrary
+    third-party string of unbounded content, and it is the only one that has
+    ever plausibly carried a token: it is the address the controller wants the
+    guest's browser sent to after sign-in, and venues put session handles,
+    voucher codes and analytics identifiers in exactly that position. Nothing
+    in ``REDACTED_CONTEXT_KEYS`` would catch one, because the redaction pass
+    matches dictionary keys and this arrives as a single opaque string.
+
+    Keeping the keys and dropping the values is what a diff of a failed
+    authorization actually needs -- "the controller redirected to a different
+    host than last time", "the ``clientMac`` parameter the portal expects is
+    missing" -- and it answers those without persisting a value nobody has
+    audited into a column the customer dashboard renders.
+
+    ``length`` is kept because a redirect truncated by the 2048-character
+    schema bound looks identical to a short one in every other field here.
+
+    Never raises: a URL this cannot parse is described as unparseable rather
+    than discarded, since "the controller sent us something that is not a URL"
+    is itself a finding.
+    """
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return {
+            "origin": None,
+            "path": None,
+            "query_keys": [],
+            "length": len(candidate),
+        }
+    has_origin = bool(parts.scheme or parts.netloc)
+    origin = f"{parts.scheme}://{parts.netloc}" if has_origin else None
+    query_keys = sorted(
+        {key for key, _ in parse_qsl(parts.query, keep_blank_values=True)}
+    )
+    return {
+        "origin": origin,
+        "path": parts.path or None,
+        "query_keys": query_keys,
+        "length": len(candidate),
+    }
+
+
+def describe_redirect_shape(
+    *,
+    ap_mac: str | None,
+    ssid_name: str | None,
+    radio_id: int | None,
+    gateway_mac: str | None,
+    vid: int | None,
+) -> str:
+    """Which of Omada's two redirect shapes this one is, if either.
+
+    Omada enforces the portal from either an EAP (``apMac`` + ``ssidName`` +
+    ``radioId``) or a gateway (``gatewayMac`` + ``vid``), and the authorize
+    body is selected by which of those arrived. The two failure modes worth
+    naming are the ones the body-builder cannot report on its own:
+
+    * ``"neither"`` -- no device fields at all, so the body goes out with a
+      MAC, a time and an auth type and nothing identifying the session the
+      controller is meant to match it to. That is a guaranteed ``-41501`` and
+      it is decidable here, before the call.
+    * ``"ambiguous"`` -- both shapes present. The builder resolves this by
+      preferring the gateway fields and silently dropping the AP ones, which
+      is a defensible tie-break and is not a fact anyone can see afterwards.
+
+    ``"ap-partial"`` is the third: an AP-shaped redirect missing one of its
+    three fields. Not necessarily fatal -- the fields are individually
+    optional in the body -- but it is a strong candidate when the controller
+    will not say what it disliked.
+    """
+    has_gateway = gateway_mac is not None or vid is not None
+    ap_fields = [ap_mac, ssid_name, radio_id]
+    has_ap = any(field is not None for field in ap_fields)
+    if has_gateway and has_ap:
+        return "ambiguous"
+    if has_gateway:
+        complete = gateway_mac is not None and vid is not None
+        return "gateway" if complete else "gateway-partial"
+    if has_ap:
+        return "ap" if all(field is not None for field in ap_fields) else "ap-partial"
+    return "neither"

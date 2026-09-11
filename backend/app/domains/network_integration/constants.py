@@ -80,6 +80,9 @@ __all__ = [
     "ROUTER_VENDOR_BY_PROVIDER",
     "PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE",
     "PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW",
+    "PORTAL_AUTHORIZE_DIAGNOSTICS_KEY",
+    "PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS",
+    "PORTAL_REDIRECT_STALE_AFTER_SECONDS",
     "PORTAL_AUTHORIZE_WINDOW_SECONDS",
     "REDACTED_CONTEXT_KEYS",
     "REDACTION_PLACEHOLDER",
@@ -417,30 +420,59 @@ class ErrorCode(StrEnum):
 # here.
 DEFAULT_SESSION_DURATION_SECONDS = 3600
 MIN_SESSION_DURATION_SECONDS = 60
-# 24 hours, and this ceiling is a security control rather than a sanity
-# bound.
+# 7 days. **The reason this number was originally chosen no longer holds.**
+# It used to be a safety backstop; it is now a policy choice. Read both
+# halves before touching it.
 #
-# CR-001 (see /Users/shresth/wyfy-omada/CHANGE-REQUESTS.md).
-# TP-Link publishes **no client-deauthorization endpoint** in any
-# generation of the Omada API, so this platform cannot revoke a portal
-# authorization it has already granted. The duration is therefore not a
-# convenience default -- it is the *only* mechanism by which a guest's
-# network access ever ends.
+# ## The old reason, which was false
 #
-# That inverts how the number should be chosen. A generous ceiling would
-# normally be harmless; here a 30-day authorization is 30 days during
-# which an abusive guest cannot be removed from the venue's network by
-# any action this platform can take. Ending the WyfyGuest ``GuestSession``
-# row still works and is still required, but it does not touch the
-# controller -- claiming otherwise is precisely the class of falsehood
-# ``app.domains.guest_access.device_adapters`` was written to fix (read
-# its "mechanism 4" note).
+# This ceiling used to be justified entirely on CR-001's claim that
+# TP-Link publishes no client-deauthorization endpoint, and therefore that
+# this platform could never revoke an authorization it had granted. On
+# that premise the duration was not a convenience default but the *only*
+# mechanism by which a guest's access ever ended, which inverted how the
+# number had to be chosen: a 30-day authorization would have been 30 days
+# during which an abusive guest could not be removed from the venue's
+# network by any action available to us.
 #
-# 24 hours is the longest window in which "wait for it to expire" is a
-# usable answer to "this guest is abusing the WiFi". Venues wanting
-# longer sessions should re-authorize on the next portal hit, which costs
-# the guest nothing and keeps the revocation window bounded.
-MAX_SESSION_DURATION_SECONDS = 24 * 3600
+# **That premise is false.** CR-001 was overturned (2026-09-10) and then
+# found to be narrower still than its overturn said. A per-guest
+# disconnect exists on the controller and is implemented:
+# ``service.disconnect_guest`` -> the provider seam ->
+# ``omada.deauth``, which lists the Hotspot Manager's Authorized Clients
+# table and ends every live authorization the MAC holds. It needs only the
+# hotspot-operator credentials the portal authorization itself already
+# uses -- observed working against a live controller (5.15.24.19), not
+# inferred. So revocation is available in exactly the configurations that
+# can grant an authorization in the first place: there is no state in
+# which this platform can let a guest on and then not remove them.
+#
+# ## Why the value is a week, and not longer
+#
+# The owner raised it from 24 hours to 7 days on 2026-09-11, once the
+# disconnect above was verified on hardware. A week is the usual ask for a
+# hotel stay, which is the case that drove it. What the ceiling still
+# protects is narrower and weaker than what it protected before, and those
+# reasons are why it is a week rather than a month:
+#
+#   * Revocation is *operator-initiated*. Nobody watches the dashboard at
+#     03:00, so a long authorization is still a long unattended grant --
+#     it is now recoverable rather than irrevocable, which is a different
+#     thing from harmless.
+#   * The controller, not this database, is the authority on whether a
+#     client is still authorized (see ``AuthorizationStatus``). A longer
+#     window is a longer period over which the two can drift with nobody
+#     reconciling them.
+#   * A shorter authorization means the guest re-hits the portal, which is
+#     the only moment the platform re-checks consent, quota and blocklist
+#     state. That check is worth keeping frequent on its own merits, and
+#     it costs the guest nothing.
+#
+# What the ceiling no longer protects against is "an abusive guest cannot
+# be removed". So this is now a *policy* number, chosen for the length of
+# a stay, and not a safety backstop. Moving it again is the same kind of
+# decision and needs the same kind of reason -- not a code review.
+MAX_SESSION_DURATION_SECONDS = 7 * 24 * 3600
 
 DEFAULT_SYNC_INTERVAL_SECONDS = 300
 # A floor, and a real one. Every sync tick is a live HTTP round trip to a
@@ -544,6 +576,78 @@ PORTAL_AUTHORIZE_WINDOW_SECONDS = 300
 
 
 # ============================================================================
+# Portal authorization diagnostics
+# ============================================================================
+#
+# ## The problem this exists for
+#
+# Probed against a live Omada 6.3.0.100 cloud controller on 2026-09-11, one
+# body field varied at a time:
+#
+#     authType omitted        -> -41500  "Invalid authentication type."
+#     clientIp omitted        -> -41501  "Failed to authenticate."
+#     clientMac omitted       -> -41501  "Failed to authenticate."
+#     apMac/ssidName/radioId  -> -41501  "Failed to authenticate."
+#     time omitted            -> -41501  "Failed to authenticate."
+#     clientMac malformed     -> -41501  "Failed to authenticate."
+#
+# The endpoint validates its parameters -- `authType` has a code of its own --
+# and then collapses every other fault into one opaque code, including a
+# missing `clientMac`, which is beyond argument required. So when a guest in a
+# real venue cannot get online, the controller hands this platform a single
+# code covering a wrong MAC, a stale timestamp, the wrong site, an AP that
+# never saw the client, a missing field, and a `clientIp` it disliked.
+#
+# **No operator-facing error can be more specific than that.** The mitigation
+# therefore cannot be a better message; it has to be a better *record*. What
+# is stored on a failure is the exact body that went on the wire, the redirect
+# parameters that produced it, the raw vendor code, and the handful of checks
+# this platform could have made from its own state before calling -- so a
+# support engineer can diff the two sides afterwards, without asking a guest
+# who has long since left the building to reproduce it.
+#
+# ## Why this is a key in the existing event context and not a new table
+#
+# `network_integration_events.context` is already a JSONB column, already
+# written through `redact_context` on the way in, already scoped per
+# organization, and already rendered by `GET /{id}/events`. A new log sink
+# would need a migration, a retention policy, an endpoint and a permission of
+# its own to reach parity with a column that has all four today. Nesting under
+# one key keeps the bundle identifiable in a query
+# (`context ? 'authorize_diagnostics'`) without colonising the top level of a
+# context other event types share.
+PORTAL_AUTHORIZE_DIAGNOSTICS_KEY = "authorize_diagnostics"
+
+# Written on failure only.
+#
+# This is the retention control, and it is deliberately the *only* one. The
+# bundle names a guest's device, so recording it for every successful
+# authorization would put a MAC per guest per join into a table that has never
+# held a per-guest identifier, forever, to answer a question nobody asks about
+# a call that worked. Failures are the small minority and the only population
+# anybody diffs. A successful authorization still records what it always did.
+#
+# The MAC itself is not a new disclosure: the identical address for the
+# identical attempt is already persisted unmasked and indefinitely in
+# `network_integration_authorizations.client_mac`, in the same organization's
+# scope, and `app.common.masking.mask_mac` is a documented no-op because
+# venues need the real address to identify a device for support. What changes
+# is only which table it is in. No client IP is recorded because none is sent:
+# the authorize body this platform builds has no `clientIp` field at all.
+PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS = False
+
+# How old a redirect's `t` has to be before the record calls it stale.
+#
+# Not a validation threshold -- nothing refuses a redirect for exceeding it,
+# and a request that does is still authorized. It exists so that a human
+# reading a failure is not left to eyeball an epoch. Fifteen minutes is longer
+# than any guest spends between the redirect landing and finishing sign-in,
+# and short enough that a page reopened from a browser's history -- one of the
+# few `-41501` causes that is decidable from our side -- is visibly flagged.
+PORTAL_REDIRECT_STALE_AFTER_SECONDS = 900
+
+
+# ============================================================================
 # Audit actions
 # ============================================================================
 
@@ -589,6 +693,13 @@ class NetworkIntegrationAuditAction(StrEnum):
     # auditor asking "where did this Router row come from" must be able to
     # find it by action alone. Contract §11.6.
     FLEET_DEVICE_ONBOARDED = "network_integration_fleet_device_onboarded"
+    # One guest's access ended early by a human. Its own action rather
+    # than reusing DISCONNECTED, which means "the *integration* was
+    # disconnected from the controller" -- an integration-scoped
+    # administrative act, not a guest-scoped one. An auditor answering
+    # "who kicked this guest off the WiFi" must not have to disambiguate
+    # the two by reading the description.
+    GUEST_DISCONNECTED = "network_integration_guest_disconnected"
 
 # Audit entity_type for every entry this domain writes -- one value, so an
 # auditor can retrieve the whole trail for one integration by
