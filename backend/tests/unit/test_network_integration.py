@@ -41,10 +41,12 @@ assertion.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -58,6 +60,7 @@ from app.domains.network_integration.constants import (
     IntegrationEventType,
     IntegrationStatus,
     NetworkProviderKind,
+    PortalReadinessGap,
     SyncStatus,
 )
 from app.domains.network_integration.crypto import (
@@ -94,7 +97,7 @@ from app.domains.network_integration.providers.base import (
     ProviderSite,
     ProviderSsid,
 )
-from app.domains.network_integration.router import portal_router
+from app.domains.network_integration.router import _integration_response, portal_router
 from app.domains.network_integration.router import router as integration_router
 from app.domains.network_integration.service import (
     NetworkIntegrationService,
@@ -103,8 +106,10 @@ from app.domains.network_integration.service import (
 )
 from app.domains.network_integration.validators import (
     assert_address_is_public,
+    build_external_portal_url,
     normalize_client_mac,
     parse_controller_url,
+    portal_readiness_gaps,
     synthesize_fleet_identity,
     validate_auth_mode_credentials,
     validate_controller_url,
@@ -179,6 +184,7 @@ def _integration(
     *,
     organization_id: uuid.UUID | None = None,
     location_id: uuid.UUID | None = None,
+    router_id: uuid.UUID | None = None,
     auth_mode: str = ControllerAuthMode.OPENAPI.value,
     with_credentials: bool = True,
     **overrides: object,
@@ -186,6 +192,11 @@ def _integration(
     fields: dict[str, object] = {
         "organization_id": organization_id or uuid.uuid4(),
         "location_id": location_id,
+        # Defaults to None, like the column, and like `location_id` above.
+        # A self-service integration genuinely has no fleet row (see the
+        # column's own docstring), so None is the honest default -- a test
+        # that means "a venue guests can actually sign in at" passes one.
+        "router_id": router_id,
         "provider": NetworkProviderKind.OMADA.value,
         "name": "Lobby controller",
         "status": IntegrationStatus.CONNECTED.value,
@@ -2388,6 +2399,218 @@ class TestPortalAuthorize:
 
 
 # ============================================================================
+# The External Portal Server URL an operator pastes into their controller
+# ============================================================================
+
+# TP-Link's OWN validation pattern for `ExternalServerPortalSetting
+# .serverUrl`, transcribed from the published Open API schema
+# (`.../v3/api-docs`, `components.schemas.ExternalServerPortalSetting
+# .serverUrl.pattern`).
+#
+# This is the assertion the whole design rests on. What the dashboard hands
+# an operator has to be something the controller will actually accept --
+# and there is no way to learn that from our own code, only from theirs.
+_TPLINK_SERVER_URL_PATTERN = re.compile(
+    r"^(([-a-zA-Z0-9@:%._+~#=]{2,256}\.[a-z]{2,63})|"
+    r"((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
+    r"(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))"
+    r"((:([0-9]{1,5}))?)(/([-a-zA-Z0-9@:%_+.~#?&//=]*))?$"
+)
+
+
+class TestTheExternalPortalUrl:
+    """`GET /network-integrations/{id}` carries the string an operator has
+    to paste into `Authentication Type: External Portal Server -> URL`.
+
+    Nothing else can tell them. Unlike the MikroTik path -- where this
+    platform generates the override page and writes it onto the device --
+    an Omada controller is configured by a human, by hand, from whatever
+    the dashboard shows them.
+    """
+
+    def _url(self, **overrides: object):
+        fields: dict[str, object] = {
+            "organization_id": uuid.uuid4(),
+            "location_id": uuid.uuid4(),
+            "router_id": uuid.uuid4(),
+        }
+        fields.update(overrides)
+        integration = _integration(**fields)
+        return (
+            build_external_portal_url(
+                organization_id=integration.organization_id,
+                location_id=integration.location_id,
+                router_id=integration.router_id,
+                provider=integration.provider,
+            ),
+            integration,
+        )
+
+    def test_the_url_field_carries_no_scheme(self) -> None:
+        """`serverUrl`'s own pattern has no scheme in it, so an operator who
+        pastes a full `https://...` string gets a validation error from the
+        controller. That is the single most likely paste mistake, which is
+        why the scheme is handed over as its own value."""
+        url, _ = self._url()
+        assert url is not None
+        assert url.scheme == "https"
+        assert "://" not in url.host_and_query
+        assert not url.host_and_query.startswith("http")
+
+    def test_it_matches_tplinks_own_serverurl_pattern(self) -> None:
+        url, _ = self._url()
+        assert url is not None
+        assert _TPLINK_SERVER_URL_PATTERN.fullmatch(url.host_and_query)
+
+    def test_the_full_url_does_not_match_which_is_why_they_are_two_fields(
+        self,
+    ) -> None:
+        url, _ = self._url()
+        assert url is not None
+        joined = f"{url.scheme}://{url.host_and_query}"
+        assert not _TPLINK_SERVER_URL_PATTERN.fullmatch(joined)
+
+    def test_the_query_string_is_only_legal_after_a_path_segment(self) -> None:
+        """The `?` lives inside the pattern's PATH character class, which is
+        only reachable after a `/`. So `/portal` is not cosmetic -- it is
+        what makes the query string legal at all, and a bare
+        `host?organizationId=...` is rejected outright."""
+        url, _ = self._url()
+        assert url is not None
+        assert "/portal?" in url.host_and_query
+        bare = url.host_and_query.replace("/portal?", "?", 1)
+        assert not _TPLINK_SERVER_URL_PATTERN.fullmatch(bare)
+
+    def test_it_is_the_same_route_and_the_same_ids_a_mikrotik_guest_gets(
+        self,
+    ) -> None:
+        """The product decision this shape exists to satisfy: an Omada guest
+        sees exactly the captive portal a MikroTik guest sees. Same route,
+        same three ids, same page -- not a second entry point.
+
+        Possible because the controller **appends** its parameters to a
+        configured query string with `&`, observed on real hardware
+        2026-09-11. An earlier design read doc 132060's redirect template as
+        evidence it might emit a second `?` and swallow `clientMac`; that
+        reading was wrong.
+        """
+        url, integration = self._url()
+        assert url is not None
+        assert url.host_and_query.startswith("auth.wyfyguest.com/portal?")
+        query = parse_qs(url.host_and_query.split("?", 1)[1])
+        assert query["organizationId"] == [str(integration.organization_id)]
+        assert query["locationId"] == [str(integration.location_id)]
+        assert query["routerId"] == [str(integration.router_id)]
+
+    def test_it_stamps_the_provider_so_success_knows_which_gate_to_open(
+        self,
+    ) -> None:
+        """`/portal/success` chooses between the controller authorize call
+        and the RouterOS `link-login-only` form POST on this value. It is
+        stamped here because this is the only place that knows the answer
+        for certain -- inferring it downstream from "`clientMac` is present"
+        would put the decision in whichever parameter survived the trip."""
+        url, integration = self._url()
+        assert url is not None
+        query = parse_qs(url.host_and_query.split("?", 1)[1])
+        assert query["netProvider"] == [integration.provider]
+
+    def test_it_carries_no_routeros_parameter(self) -> None:
+        """`mac`/`ip` would contradict Omada's own `clientMac`/`clientIp`,
+        which the controller appends itself. `dst`/`link-login-only` name a
+        NAS that is not in the path. And `hspage` is RouterOS's stamp for
+        which of ITS five stock pages redirected the browser -- a claim
+        about a router that does not exist here, on a value
+        `portal-nas-state.ts` reads as evidence the gate may already be
+        open. Absent is a legal answer there; a fabricated one is not."""
+        url, _ = self._url()
+        assert url is not None
+        query = parse_qs(url.host_and_query.split("?", 1)[1])
+        for routeros_only in ("mac", "ip", "dst", "link-login-only", "hspage"):
+            assert routeros_only not in query
+
+    def test_no_url_at_all_when_it_could_not_serve_a_guest(self) -> None:
+        """A partial URL is something an operator pastes that turns every
+        guest away. `guest_sessions.router_id` is NOT NULL, and an
+        unmapped integration has no location -- so there is nothing honest
+        to build, and `portal_readiness_gaps` names the reason instead."""
+        assert self._url(router_id=None)[0] is None
+        assert self._url(location_id=None)[0] is None
+
+    def test_the_wire_response_carries_both_halves(self) -> None:
+        rendered = _integration_response(
+            _integration(location_id=uuid.uuid4(), router_id=uuid.uuid4())
+        )
+        assert rendered.portal_url_scheme == "https"
+        assert rendered.portal_url_host_and_query is not None
+        assert "/portal?" in rendered.portal_url_host_and_query
+        assert rendered.portal_readiness_gaps == []
+
+    def test_the_wire_response_withholds_it_when_it_cannot_work(self) -> None:
+        rendered = _integration_response(
+            _integration(location_id=uuid.uuid4(), router_id=None)
+        )
+        assert rendered.portal_url_scheme is None
+        assert rendered.portal_url_host_and_query is None
+        assert rendered.portal_readiness_gaps == [
+            PortalReadinessGap.FLEET_DEVICE_MISSING.value
+        ]
+
+    def test_it_names_the_same_host_the_walled_garden_permits(self) -> None:
+        """Not a style point. `render_hotspot_walled_garden` decides which
+        hosts a pre-auth guest device can reach at all, and it is built from
+        `GUEST_PORTAL_HOST`. If this named a different host, Omada guests
+        would be sent somewhere the walled garden does not permit -- a
+        portal page that never loads, on a device with no other way out."""
+        from app.domains.network_config.renderers import GUEST_PORTAL_HOST
+
+        url, _ = self._url()
+        assert url is not None
+        assert url.host_and_query.startswith(f"{GUEST_PORTAL_HOST}/")
+
+
+class TestAFleetlessIntegrationSaysSoBeforeAGuestFindsOut:
+    """CONTRACT §11.5: a screen that writes a row and changes nothing on a
+    device is the failure this domain is under standing orders to avoid.
+
+    An integration with no fleet row is credentialled, mapped,
+    site-selected, CONNECTED -- and cannot issue a single guest session,
+    because `guest_sessions.router_id` is NOT NULL. Shipping the guest flow
+    without surfacing that would produce exactly that screen: a portal URL
+    an operator pastes, and a venue where nobody gets online.
+    """
+
+    def test_it_is_a_readiness_gap(self) -> None:
+        ready = _integration(location_id=uuid.uuid4(), router_id=uuid.uuid4())
+        assert portal_readiness_gaps(ready) == ()
+
+        fleetless = _integration(location_id=uuid.uuid4(), router_id=None)
+        assert portal_readiness_gaps(fleetless) == (
+            PortalReadinessGap.FLEET_DEVICE_MISSING,
+        )
+
+    async def test_the_sync_refuses_to_call_it_connected(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org, location_id=uuid.uuid4(), router_id=None
+            )
+        )
+        outcome = await _service(repo).sync_integration(
+            integration.id, requesting_organization_id=org
+        )
+        # The controller conversation succeeded and the venue still
+        # authorizes nobody. Two facts, two columns.
+        assert outcome.synced is True
+        assert integration.last_sync_status == SyncStatus.OK.value
+        assert integration.status == IntegrationStatus.UNCONFIGURED.value
+        assert outcome.error_code == ErrorCode.SETUP_INCOMPLETE.value
+        assert outcome.message is not None
+        assert "fleet device" in outcome.message
+
+
+# ============================================================================
 # CR-001: deauthorization is unsupported, honestly
 # ============================================================================
 
@@ -2481,13 +2704,20 @@ class TestSyncAndBackoff:
     async def test_a_successful_sync_caches_the_counts(self) -> None:
         org = uuid.uuid4()
         repo = FakeRepository()
-        # `location_id` is passed explicitly: `_integration()` defaults it
-        # to None, which is a real half-configured state (the portal path
-        # resolves an integration BY location, so a NULL one is never
-        # selected for any venue) and now reports itself as such. This test
-        # is about the fully-configured case.
+        # `location_id` and `router_id` are passed explicitly:
+        # `_integration()` defaults both to None, and each is a real
+        # half-configured state that now reports itself as such -- a NULL
+        # location is never selected for any venue by the portal path, and a
+        # NULL router means there is no `routerId` to put in the venue's
+        # portal URL and no value for `guest_sessions.router_id` (NOT NULL)
+        # if a guest reached a sign-in screen anyway. This test is about the
+        # fully-configured case.
         integration = repo.add(
-            _integration(organization_id=org, location_id=uuid.uuid4())
+            _integration(
+                organization_id=org,
+                location_id=uuid.uuid4(),
+                router_id=uuid.uuid4(),
+            )
         )
         service = _service(repo)
         outcome = await service.sync_integration(
@@ -2603,7 +2833,10 @@ class TestSyncAndBackoff:
         repo = FakeRepository()
         integration = repo.add(
             _integration(
-                organization_id=org, location_id=uuid.uuid4(), external_site_id=None
+                organization_id=org,
+                location_id=uuid.uuid4(),
+                router_id=uuid.uuid4(),
+                external_site_id=None,
             )
         )
         service = _service(repo)

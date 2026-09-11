@@ -391,6 +391,42 @@ class NetworkIntegrationResponse(BaseModel):
     active_authorization_count: int = 0
     # NEVER the credentials themselves. See the module docstring.
     has_credentials: bool
+    # The External Portal Server URL for this venue, split the way TP-Link's
+    # own form splits it -- a `Scheme` field and a `URL` field. See
+    # `validators.build_external_portal_url`, which is the only place the
+    # shape is decided.
+    #
+    # Returned to the operator ON PURPOSE, and this is not the same category
+    # as `has_credentials: bool` two lines up. A credential is a secret this
+    # platform holds on a customer's behalf and may never render; this is a
+    # URL that will be in every one of that venue's guests' address bars
+    # within minutes of being pasted, and there is no other way for the
+    # operator to learn it. Nothing in it is a capability: the three ids are
+    # the same three a MikroTik venue's portal URL already carries in plain
+    # sight, and every one of them is re-proven against an ACTIVE
+    # `GuestSession` at `POST /portal/authorize` before any device reaches a
+    # controller.
+    #
+    # Both are NULL together, and only when the integration cannot serve a
+    # guest at all (no mapped location, or no fleet device). A partial URL
+    # would be something an operator pastes that turns every guest away;
+    # `portal_readiness_gaps` below names the reason instead.
+    portal_url_scheme: str | None = None
+    portal_url_host_and_query: str | None = None
+    # Everything standing between this integration and its first authorized
+    # guest, machine-readable, from `validators.portal_readiness_gaps`.
+    #
+    # On the row rather than only inside `last_error_message`'s sentence
+    # because the dashboard has to ACT on it: the portal-configuration block
+    # shows a copyable URL or names a blocker, and parsing that decision out
+    # of English prose is the coupling this domain's `ErrorCode` enum exists
+    # to avoid.
+    #
+    # An empty list means "nothing missing", which is a stronger and
+    # different statement from `status == CONNECTED` -- see
+    # `PortalReadinessGap` on the venue that showed a green badge and
+    # authorized nobody.
+    portal_readiness_gaps: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 

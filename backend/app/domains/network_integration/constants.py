@@ -209,6 +209,22 @@ class PortalReadinessGap(StrEnum):
       ``location_id`` means this row is never selected for any venue.
     * ``SITE_NOT_SELECTED`` -- an explicit
       ``NetworkIntegrationSiteNotSelectedError``.
+    * ``FLEET_DEVICE_MISSING`` -- there is no ``router_id`` to put in the
+      venue's portal URL, and none to put in ``guest_sessions.router_id``
+      (NOT NULL) if a guest somehow reached a sign-in screen anyway.
+
+      This one is not a branch inside ``authorize_portal_client``; it is
+      *earlier* than the whole flow, and it is here because
+      ``network_integrations.router_id`` is nullable and must stay nullable
+      -- a customer self-service integration legitimately has no fleet row
+      (see that column's own docstring). So an integration can be
+      credentialled, mapped, site-selected and CONNECTED, and still be
+      unable to issue a single guest session, because there is no value to
+      put in that NOT NULL column and no router id to hand the portal.
+
+      Nothing consumed that fact until the Omada guest flow existed, which
+      is exactly why it was invisible; now it decides whether the dashboard
+      can give a venue a portal URL at all.
 
     ``guest_ssid_id`` is deliberately **not** here. The wizard asks for it
     and the list view shows it, but nothing on the authorize path reads it
@@ -225,6 +241,7 @@ class PortalReadinessGap(StrEnum):
     CREDENTIALS_MISSING = "credentials_missing"
     LOCATION_NOT_MAPPED = "location_not_mapped"
     SITE_NOT_SELECTED = "site_not_selected"
+    FLEET_DEVICE_MISSING = "fleet_device_missing"
 
 
 # One human sentence per gap, written for the operator who has to fix it
@@ -238,6 +255,9 @@ PORTAL_READINESS_GAP_LABELS: dict[PortalReadinessGap, str] = {
     ),
     PortalReadinessGap.SITE_NOT_SELECTED: (
         "no controller site has been selected"
+    ),
+    PortalReadinessGap.FLEET_DEVICE_MISSING: (
+        "it has no fleet device, so no guest session can be created for it"
     ),
 }
 

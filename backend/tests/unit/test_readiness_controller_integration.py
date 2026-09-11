@@ -73,6 +73,7 @@ class _FakeIntegration:
         *,
         credentials_encrypted: str | None = "cipher",
         location_id: uuid.UUID | None = None,
+        router_id: uuid.UUID | None = None,
         external_site_id: str | None = "site-1",
         is_enabled: bool = True,
         status: str = "connected",
@@ -80,6 +81,13 @@ class _FakeIntegration:
         self.id = uuid.uuid4()
         self.credentials_encrypted = credentials_encrypted
         self.location_id = location_id or uuid.uuid4()
+        # Defaults to a real id rather than None, unlike the column. This
+        # checklist item finds its integration through
+        # `find_integration_for_router(router.id)`, which matches on
+        # `network_integrations.router_id` -- so on this code path the
+        # column is non-null by construction, and a fake that left it None
+        # would be testing a row that cannot reach this check at all.
+        self.router_id = router_id or uuid.uuid4()
         self.external_site_id = external_site_id
         self.is_enabled = is_enabled
         self.status = status

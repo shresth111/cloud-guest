@@ -72,9 +72,10 @@ import socket
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from app.core.config import Settings, get_settings
+from app.domains.network_config.renderers import GUEST_PORTAL_HOST
 
 from .constants import (
     DEFAULT_CONTROLLER_PORTS,
@@ -90,6 +91,8 @@ from .exceptions import NetworkIntegrationUrlRejectedError
 
 __all__ = [
     "CLOUD_METADATA_ADDRESSES",
+    "ExternalPortalUrl",
+    "build_external_portal_url",
     "ValidatedControllerUrl",
     "allowed_controller_ports",
     "assert_address_is_public",
@@ -585,6 +588,14 @@ def portal_readiness_gaps(integration: object) -> tuple[PortalReadinessGap, ...]
         gaps.append(PortalReadinessGap.LOCATION_NOT_MAPPED)
     if not getattr(integration, "external_site_id", None):
         gaps.append(PortalReadinessGap.SITE_NOT_SELECTED)
+    if getattr(integration, "router_id", None) is None:
+        # Last, because it is the one an operator cannot fix from the
+        # customer dashboard -- pairing a controller with a fleet row is the
+        # Master-driven onboarding path
+        # (`create_integration_with_fleet_device`). Listing it above the
+        # three they *can* fix would read as "give up" rather than "finish
+        # these, then ask us".
+        gaps.append(PortalReadinessGap.FLEET_DEVICE_MISSING)
     return tuple(gaps)
 
 
@@ -608,4 +619,144 @@ def describe_portal_readiness_gaps(gaps: Sequence[PortalReadinessGap]) -> str:
         f"This integration cannot authorize any guest: {joined}. "
         "Until it is finished, guests at this venue complete sign-in and "
         "still have no internet."
+    )
+
+
+# ============================================================================
+# The External Portal Server URL an operator pastes into their controller
+# ============================================================================
+
+# The host the guest portal SPA is actually served from.
+#
+# Imported from `network_config.renderers` rather than re-declared, and that
+# is deliberate. That constant's own docstring says the value "must stay
+# equal to the host in the `location.replace()` those generated login.html
+# pages perform, or this function walls in a host no guest is sent to while
+# the host they ARE sent to stays blocked" -- and the walled-garden renderer
+# is the thing that decides which hosts a pre-auth guest can reach at all.
+#
+# An Omada venue lands on the SAME host, through the same portal route, as a
+# MikroTik venue. If these two ever named different hosts, one of the two
+# vendors' guests would be sent somewhere the other vendor's walled garden
+# does not permit. A third copy of the string is a third thing to drift, so
+# there is one.
+_GUEST_PORTAL_HOST = GUEST_PORTAL_HOST
+
+# The route the guest portal SPA is mounted at. The SAME route a MikroTik
+# guest lands on -- see `build_external_portal_url`.
+_GUEST_PORTAL_PATH = "/portal"
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalPortalUrl:
+    """One venue's External Portal Server URL, split the way TP-Link's own
+    form splits it.
+
+    `ExternalServerPortalSetting` has three fields, not one: `hostType`
+    (`1: IP`, `2: URL`), `serverUrlScheme` (pattern `http|https`) and
+    `serverUrl`. Handing an operator a single `https://...` string produces
+    a validation error from the controller, because `serverUrl`'s own
+    pattern contains no scheme:
+
+        ^(([-a-zA-Z0-9@:%._+~#=]{2,256}\\.[a-z]{2,63})|(<IPv4>))
+         ((:<port>)?)(/([-a-zA-Z0-9@:%_+.~#?&//=]*))?$
+
+    Two further things that pattern decides, both checked mechanically
+    against the real published regex and both asserted in the tests:
+
+    * `?`, `&` and `=` are inside the PATH character class, so a query
+      string is legal -- but only *after* a `/`. `auth.wyfyguest.com/portal
+      ?organizationId=...` matches; `auth.wyfyguest.com?organizationId=...`
+      is REJECTED. The `/portal` segment is not cosmetic; it is what makes
+      the query string reachable at all.
+    * `hostType: 1` (IP + port) has no path field whatsoever, so an
+      IP-configured portal cannot carry a query string either. Omada venues
+      must use `hostType: 2`.
+    """
+
+    scheme: str
+    """Goes in the controller's own `Scheme` field. Never inside the URL."""
+
+    host_and_query: str
+    """Goes in the controller's `URL` field: host, path and query, no
+    scheme."""
+
+
+def build_external_portal_url(
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+    router_id: uuid.UUID | None,
+    provider: str,
+) -> ExternalPortalUrl | None:
+    """The URL a venue operator pastes into their Omada controller.
+
+    ## It is the MikroTik URL, and that is the whole design
+
+    ``buildPortalUrl()`` in the frontend's ``RouterDetailTabs.tsx`` stamps
+    this exact shape into the RouterOS override page at provisioning time.
+    An Omada guest now lands on the same route, with the same three ids, and
+    sees the same portal -- because the controller **appends** its own
+    parameters to a configured query string with ``&``, which was observed
+    on real hardware on 2026-09-11 rather than inferred:
+
+        configured: portal.example/omada?locationId=LOC123&orgId=ORG456
+        emitted:    ...?locationId=LOC123&orgId=ORG456&clientMac=...&site=...
+
+    An earlier design read TP-Link doc 132060's redirect *template* -- which
+    is written as a literal concatenation with a hardcoded ``?`` -- as
+    evidence the controller might emit ``...?ours=X?clientMac=...`` and
+    silently swallow ``clientMac``. That reading was wrong. The pessimistic
+    branch is closed, and with it the only technical reason to give Omada
+    guests a different entry point from MikroTik guests.
+
+    ## What is deliberately NOT in the URL
+
+    * ``mac``/``ip`` -- RouterOS's ``$(mac)``/``$(ip)`` substitutions. Omada
+      supplies the same facts under its own names (``clientMac``,
+      ``clientIp``) by appending them, so putting placeholders here would
+      produce two contradictory answers to one question.
+    * ``dst``/``link-login-only`` -- RouterOS-only. An Omada venue has no
+      NAS login URL to POST to; the equivalent step is
+      ``POST /network-integrations/portal/authorize``.
+    * ``hspage`` -- RouterOS's own stamp for *which of its five stock
+      hotspot pages* redirected the browser here, which
+      ``portal-nas-state.ts`` reads as evidence about whether the NAS gate
+      is already open. No Omada controller ever served one of those pages,
+      so any value here would be a claim about a router that is not in the
+      path. That file's three-valued handling exists precisely so that
+      *absent* is a legal answer; this leaves it absent.
+
+    ``netProvider`` IS included, and is the one parameter that is ours
+    rather than either vendor's. ``/portal/success`` branches on it to
+    choose between the controller authorize call and the RouterOS
+    ``link-login-only`` form POST. It is stamped here, from the integration
+    row, because this is the only place that knows the answer for certain --
+    inferring it downstream from "``clientMac`` is present" would put the
+    decision in whichever parameter happened to survive the trip.
+
+    ## Returns ``None`` rather than a URL that cannot work
+
+    An integration with no mapped location, or no fleet device, has no
+    ``locationId``/``routerId`` to put in the URL -- and
+    ``guest_sessions.router_id`` is NOT NULL, so a guest arriving at such a
+    link would complete OTP and fail at session creation. Returning a
+    partial URL would be handing an operator something to paste that turns
+    every guest away. ``portal_readiness_gaps`` names the reason.
+    """
+    if location_id is None or router_id is None:
+        return None
+    query = urlencode(
+        {
+            "organizationId": str(organization_id),
+            "locationId": str(location_id),
+            "routerId": str(router_id),
+            "netProvider": provider,
+        }
+    )
+    return ExternalPortalUrl(
+        # The bare word, not `https:`. The controller's own field pattern is
+        # literally `http|https`.
+        scheme="https",
+        host_and_query=f"{_GUEST_PORTAL_HOST}{_GUEST_PORTAL_PATH}?{query}",
     )
