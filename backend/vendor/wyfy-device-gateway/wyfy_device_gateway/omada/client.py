@@ -97,6 +97,7 @@ from .tls import (
     ssl_verify_argument,
 )
 from .types import (
+    OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND,
     SESSION_EXPIRED_ERROR_CODES,
     OmadaEnvelope,
     coerce_str,
@@ -121,14 +122,53 @@ DEFAULT_PAGE_SIZE = 100
 #: beyond any realistic single-site fleet or guest population.
 MAX_PAGES = 100
 
-#: CORROBORATED, not primary: ``GET /api/info`` as the unauthenticated
-#: controller-identity endpoint is used universally by community tooling and
-#: is referenced by the coordinator's own research, but we could not find it
-#: in a TP-Link document. It is only ever used to *discover* ``omadacId`` and
-#: the version string; if it is absent the adapter requires ``omadac_id`` to
-#: have been configured explicitly, which is always possible (it is visible
-#: in the controller's own URL).
+#: VERIFIED on hardware 2026-09-11, still not in any TP-Link document.
+#: ``GET /api/info`` is the unauthenticated controller-identity endpoint used
+#: universally by community tooling. Against Omada Software Controller
+#: 5.15.24.19 it answers::
+#:
+#:     {"errorCode":0,"msg":"Success.","result":{"controllerVer":"5.15.24.19",
+#:      "apiVer":"3","configured":false,"type":1,"supportApp":true,
+#:      "omadacId":"24eaf8e5c95e88902a966e69763cfb0d","registeredRoot":false,
+#:      "omadacCategory":"advanced","mspMode":false,
+#:      "omadaCloudUrl":"https://omada.tplinkcloud.com"}}
+#:
+#: It is the only path that can *discover* ``omadacId``, which is why it is
+#: tried first and why the id-scoped path below cannot replace it.
 CONTROLLER_INFO_PATH = "/api/info"
+
+
+def controller_info_path(omadac_id: str) -> str:
+    """The id-scoped identity path, ``GET /{omadacId}/api/info``.
+
+    **VERIFIED on hardware 2026-09-11 against two real controllers**, and it
+    is the fix for the cloud-managed case:
+
+    * TP-Link's cloud edge (``https://aps1-api-omada-controller.tplinkcloud
+      .com``) answers **404 with an empty body** on the unscoped
+      ``/api/info`` -- there is no controller to identify until you say which
+      one -- but answers the *scoped* path with the full identity payload,
+      ``omadacId`` and ``controllerVer`` included.
+    * A direct controller answers **both** paths with the identical payload.
+
+    So this is not a cloud-only path; it is the same endpoint namespaced the
+    way every other v5.0.15+ route already is (``/{omadacId}/api/v2/...``). A
+    wrong id returns Omada ``-7131``, so a mistyped Omada ID is reported as a
+    mistyped Omada ID rather than as an unreachable controller.
+    """
+    return f"/{omadac_id}/api/info"
+
+
+#: What to tell an operator when neither identity path can be used: the host
+#: does not serve the unscoped path and we were given no id to scope with.
+#: Composed from constants only (see ``errors.py``).
+_NO_IDENTITY_PATH_MESSAGE = (
+    "This address did not answer at /api/info, which is how a controller is "
+    "identified when no Omada ID is stored. Cloud-managed controllers never "
+    "answer it -- their address fronts many controllers at once. Enter the "
+    "Omada ID (Settings > Controller Settings, or the long identifier in the "
+    "controller's own web address) and try again."
+)
 
 SleepFn = Callable[[float], Awaitable[None]]
 
@@ -383,9 +423,78 @@ class OmadaHttpClient:
         return omadac_id
 
     async def fetch_controller_info(self) -> dict[str, Any]:
-        """Raw ``GET /api/info`` result. Unauthenticated by design."""
-        result = await self._send_raw("GET", CONTROLLER_INFO_PATH)
+        """Raw controller-identity result. Unauthenticated by design.
+
+        Tries the unscoped ``GET /api/info`` first and, if the host does not
+        serve it (HTTP 404, which ``_raise_for_status`` turns into
+        ``OmadaUnsupportedApiError``), retries at the id-scoped
+        ``GET /{omadacId}/api/info`` when an ``omadacId`` is known.
+
+        ## Why a fallback rather than a configured ``direct``/``cloud`` mode
+
+        The cloud-northbound assessment proposed a ``controller_access``
+        column to record that a controller is reached through TP-Link's cloud
+        edge, and to skip discovery on that basis. Hardware says the
+        behaviour does not need declaring, because the request itself answers
+        the question better than a column could:
+
+        * **A column can be wrong; a 404 cannot.** An operator who picks
+          ``direct`` for a cloud controller reproduces exactly the defect this
+          fixes, and one who picks ``cloud`` for a direct controller loses
+          discovery for no reason. The failure mode of a self-declared enum is
+          a support ticket that looks identical to the bug.
+        * **It is not a cloud-only condition.** Any controller behind a
+          reverse proxy that does not forward the unscoped path lands here
+          too, and the fallback fixes that case for free.
+        * **The unscoped path is still required**, so the "cloud" branch could
+          never have been a clean fork: it is the only way to *discover* an
+          ``omadacId``, and the scoped path is the only way to identify a
+          controller once discovery is impossible. Both paths exist in both
+          worlds; which one works is a property of the host, not of the row.
+        * **Discovery is genuinely unnecessary on the cloud host anyway.** The
+          Omada ID is handed to the operator with the credentials and TP-Link's
+          own console puts it in the URL bar, so requiring it there costs
+          nothing -- which is why the "no id, no unscoped path" case raises a
+          message naming that field instead of degrading silently.
+
+        The cost is one wasted 404 round trip per *identity* call on a cloud
+        host. It is not paid on the hot path: ``resolve_omadac_id`` returns the
+        configured id without any request at all, so sync and portal
+        authorization never reach this method.
+        """
+        try:
+            return await self._fetch_controller_info_at(CONTROLLER_INFO_PATH)
+        except OmadaUnsupportedApiError:
+            scoped_id = self._omadac_id
+
+        if not scoped_id:
+            # Nothing left to try: this host does not publish identity
+            # unscoped, and we have no id to scope the request with.
+            raise OmadaInvalidControllerError(_NO_IDENTITY_PATH_MESSAGE) from None
+
+        self._log(
+            logging.INFO,
+            "omada_controller_info_scoped_fallback",
+            path=CONTROLLER_INFO_PATH,
+        )
+        return await self._fetch_controller_info_at(controller_info_path(scoped_id))
+
+    async def _fetch_controller_info_at(self, path: str) -> dict[str, Any]:
+        """One identity request, envelope-checked. Raises, never returns None."""
+        result = await self._send_raw("GET", path)
         if not result.envelope.ok:
+            if result.envelope.error_code == OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND:
+                # VERIFIED on hardware: both a direct controller and the cloud
+                # edge answer the scoped path with -7131 for an id they do not
+                # hold. The default "does not look like an Omada controller"
+                # would be false here and would send the operator to check the
+                # URL, which is the one field that is right.
+                raise OmadaInvalidControllerError(
+                    "The Omada controller does not recognise that controller "
+                    "ID. Check the identifier in the controller's own web "
+                    "address.",
+                    provider_code=result.envelope.error_code,
+                )
             detail = sanitize_detail(result.envelope.msg)
             raise OmadaInvalidControllerError(
                 f"{OmadaInvalidControllerError.default_message} Controller said: {detail}"
@@ -629,4 +738,5 @@ __all__ = [
     "MAX_ATTEMPTS",
     "MAX_PAGES",
     "OmadaHttpClient",
+    "controller_info_path",
 ]
