@@ -183,12 +183,14 @@ class NetworkIntegrationCreateRequest(_CredentialFields):
         ge=MIN_SESSION_DURATION_SECONDS,
         le=MAX_SESSION_DURATION_SECONDS,
         description=(
-            "How long a guest's authorization lasts on the controller. This "
-            "is not merely a default: Omada's API offers no way to revoke an "
-            "authorization once granted, so this duration is the ONLY "
-            "mechanism by which a guest's network access ever ends. Ending "
-            "the WyfyGuest guest session prevents re-authorization but does "
-            "not disconnect the device. Capped at 24 hours for that reason."
+            "How long a guest's authorization lasts on the controller. An "
+            "authorization can also be ended early: see the per-guest "
+            "disconnect, which needs the same hotspot-operator credentials "
+            "this integration already uses. Ending the WyfyGuest guest "
+            "session on its own prevents re-authorization but does not "
+            "disconnect the device. Capped at 7 days, which is a policy "
+            "bound on how long an unattended grant may run, not a technical "
+            "limit."
         ),
     )
     sync_interval_seconds: int = Field(

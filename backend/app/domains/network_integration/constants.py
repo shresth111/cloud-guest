@@ -350,9 +350,9 @@ class ErrorCode(StrEnum):
 # here.
 DEFAULT_SESSION_DURATION_SECONDS = 3600
 MIN_SESSION_DURATION_SECONDS = 60
-# 24 hours. **The reason this number was chosen no longer holds, and the
-# number has deliberately not been changed with it.** Read both halves
-# before touching it.
+# 7 days. **The reason this number was originally chosen no longer holds.**
+# It used to be a safety backstop; it is now a policy choice. Read both
+# halves before touching it.
 #
 # ## The old reason, which was false
 #
@@ -377,12 +377,13 @@ MIN_SESSION_DURATION_SECONDS = 60
 # can grant an authorization in the first place: there is no state in
 # which this platform can let a guest on and then not remove them.
 #
-# ## Why the value stays 24 hours anyway
+# ## Why the value is a week, and not longer
 #
-# Raising it is a product decision, not a code-comment decision, and it
-# is the owner's to make -- so this comment states the facts and leaves
-# the number alone. What the ceiling now protects is narrower and weaker
-# than what it protected before:
+# The owner raised it from 24 hours to 7 days on 2026-09-11, once the
+# disconnect above was verified on hardware. A week is the usual ask for a
+# hotel stay, which is the case that drove it. What the ceiling still
+# protects is narrower and weaker than what it protected before, and those
+# reasons are why it is a week rather than a month:
 #
 #   * Revocation is *operator-initiated*. Nobody watches the dashboard at
 #     03:00, so a long authorization is still a long unattended grant --
@@ -398,10 +399,10 @@ MIN_SESSION_DURATION_SECONDS = 60
 #     it costs the guest nothing.
 #
 # What the ceiling no longer protects against is "an abusive guest cannot
-# be removed". If the owner decides the re-authorization friction is not
-# worth it, the honest new bound is a *policy* number -- a week is the
-# usual ask for a hotel stay -- and not this one.
-MAX_SESSION_DURATION_SECONDS = 24 * 3600
+# be removed". So this is now a *policy* number, chosen for the length of
+# a stay, and not a safety backstop. Moving it again is the same kind of
+# decision and needs the same kind of reason -- not a code review.
+MAX_SESSION_DURATION_SECONDS = 7 * 24 * 3600
 
 DEFAULT_SYNC_INTERVAL_SECONDS = 300
 # A floor, and a real one. Every sync tick is a live HTTP round trip to a

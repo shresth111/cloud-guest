@@ -2750,12 +2750,23 @@ class TestDeauthorizationRefusalIsNarrowNow:
         self,
     ) -> None:
         """The ceiling was justified entirely on revocation being
-        impossible. It is not impossible, and the value has deliberately
-        not moved with the justification -- raising it is a product
-        decision. This test pins the value; ``constants.py`` carries the
-        corrected reasoning.
+        impossible. It is not, so the number stopped being a safety
+        backstop and became a policy choice: the owner set it to 7 days
+        on 2026-09-11, the length of a hotel stay.
+
+        Pinned here because it is a policy number -- it should move by
+        decision, not by drift. It must also stay strictly below the
+        gateway's sanity ceiling (``omada.portal.MAX_DURATION_SECONDS``),
+        which *caps* silently where this one *rejects* loudly; if this
+        one ever exceeded it, the platform would promise a duration the
+        controller never receives.
         """
-        assert MAX_SESSION_DURATION_SECONDS == 24 * 3600
+        from wyfy_device_gateway.omada.portal import (  # noqa: PLC0415
+            MAX_DURATION_SECONDS as GATEWAY_SANITY_CEILING,
+        )
+
+        assert MAX_SESSION_DURATION_SECONDS == 7 * 24 * 3600
+        assert MAX_SESSION_DURATION_SECONDS < GATEWAY_SANITY_CEILING
 
 
 # ============================================================================
