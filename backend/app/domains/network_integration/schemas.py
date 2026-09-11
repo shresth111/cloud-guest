@@ -93,6 +93,39 @@ _Provider = Literal["omada"]
 # ============================================================================
 
 
+#: The Omada ID (``omadacId``) of the controller this row points at.
+#:
+#: Optional everywhere, because on a controller this platform can reach
+#: directly it is *discovered*: ``GET /api/info`` answers unauthenticated
+#: and reports it, so asking an operator to copy a 32-character hex string
+#: they do not need would be a worse wizard.
+#:
+#: It stops being optional in exactly one situation, and hardware found it on
+#: 2026-09-11: a controller reached through TP-Link's cloud edge. One address
+#: there fronts every controller in a region, so the unscoped ``/api/info``
+#: 404s and there is nothing to discover from -- the id is what selects the
+#: controller. Without this field a cloud-managed controller could be typed
+#: into the wizard but never identified, and so never connected.
+#:
+#: Supplying it costs a cloud operator nothing: TP-Link hands them the Omada
+#: ID on the same screen as the credentials, and its own console puts it in
+#: the URL bar.
+def _controller_id_field() -> Any:
+    return Field(
+        default=None,
+        max_length=64,
+        description=(
+            "The controller's Omada ID (omadacId). Optional for a controller "
+            "reached directly -- it is discovered from the controller itself. "
+            "Required for a cloud-managed controller reached through a "
+            "*-api-omada-controller.tplinkcloud.com address, where one host "
+            "fronts many controllers and nothing can be discovered without "
+            "it. Visible in the controller's own web address and on the "
+            "Open API / hotspot credential screen."
+        ),
+    )
+
+
 class _CredentialFields(BaseModel):
     """The four write-only credential fields, in one place.
 
@@ -162,6 +195,7 @@ class NetworkIntegrationCreateRequest(_CredentialFields):
         ),
     )
     auth_mode: _AuthMode = "openapi"
+    controller_id: str | None = _controller_id_field()
     location_id: str | None = Field(
         default=None,
         description=(
@@ -238,6 +272,7 @@ class PlatformOnboardRequest(_CredentialFields):
     name: str = Field(min_length=1, max_length=120)
     base_url: str = Field(min_length=1, max_length=512)
     auth_mode: _AuthMode = "openapi"
+    controller_id: str | None = _controller_id_field()
     controller_model: str = Field(
         min_length=1,
         max_length=100,
@@ -329,6 +364,7 @@ class NetworkIntegrationUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     base_url: str | None = Field(default=None, min_length=1, max_length=512)
     auth_mode: _AuthMode | None = None
+    controller_id: str | None = _controller_id_field()
     location_id: str | None = None
     external_site_id: str | None = Field(default=None, max_length=128)
     external_site_name: str | None = Field(default=None, max_length=255)
@@ -431,6 +467,7 @@ class TestConnectionRequest(_CredentialFields):
     provider: _Provider = "omada"
     base_url: str = Field(min_length=1, max_length=512)
     auth_mode: _AuthMode = "openapi"
+    controller_id: str | None = _controller_id_field()
 
 
 class TestConnectionResponse(BaseModel):

@@ -148,6 +148,12 @@ class FakeOmadaController:
 
         self.controller_version = "5.15.24.18"
         self.info_payload: dict[str, Any] | None = None
+        #: Whether the host answers the *unscoped* ``GET /api/info``.
+        #: VERIFIED on hardware 2026-09-11: a direct controller does, and
+        #: TP-Link's cloud edge does not -- it 404s with an empty body,
+        #: because one address there fronts many controllers. Set this False
+        #: to model a cloud-managed controller.
+        self.serves_unscoped_info = True
 
         self.routes: dict[str, Any] = {}
         #: Set to a callable taking the request and returning a
@@ -189,6 +195,19 @@ class FakeOmadaController:
         path = request.url.path
 
         if path == "/api/info":
+            if not self.serves_unscoped_info:
+                # Exactly what the cloud edge sends: 404, empty body.
+                return httpx.Response(404)
+            return self._info_response()
+        if path.endswith("/api/info"):
+            # The id-scoped identity path, served by direct controllers and
+            # by the cloud edge alike.
+            requested_id = path.rsplit("/api/info", 1)[0].strip("/")
+            if requested_id != OMADAC_ID:
+                return httpx.Response(
+                    200,
+                    json={"errorCode": -7131, "msg": "OmadacId does not exist"},
+                )
             return self._info_response()
         if path.endswith("/api/v2/hotspot/login"):
             return self._login_response(body)
@@ -204,13 +223,27 @@ class FakeOmadaController:
     def _info_response(self) -> httpx.Response:
         if self.info_payload is not None:
             return httpx.Response(200, json=envelope(self.info_payload))
+        # This is a real payload, field for field, from Omada Software
+        # Controller 5.15.24.19 on 2026-09-11 -- with the version made
+        # scriptable. It used to say ``"type": "Omada Software Controller"``,
+        # a string nobody has ever seen a controller send, and that invention
+        # is exactly why the suite could not catch ``model`` being read from
+        # ``type``. Note there is no ``model`` key: real controllers do not
+        # send one.
         return httpx.Response(
             200,
             json=envelope(
                 {
                     "controllerVer": self.controller_version,
+                    "apiVer": "3",
+                    "configured": False,
+                    "type": 1,
+                    "supportApp": True,
                     "omadacId": OMADAC_ID,
-                    "type": "Omada Software Controller",
+                    "registeredRoot": False,
+                    "omadacCategory": "advanced",
+                    "mspMode": False,
+                    "omadaCloudUrl": "https://omada.tplinkcloud.com",
                 }
             ),
         )

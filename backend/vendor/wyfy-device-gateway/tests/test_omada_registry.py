@@ -199,6 +199,120 @@ async def test_a_non_omada_endpoint_is_reported_as_an_invalid_controller():
         await _adapter(controller).get_controller_info(make_creds())
 
 
+# --- controller identity on a cloud-managed controller ---------------------
+#
+# Everything in this block is a regression test for a defect that met real
+# hardware on 2026-09-11 and that 5,135 passing tests could not see, because
+# the fake controller answered the shape we had written rather than the shape
+# a controller sends.
+#
+# TP-Link's cloud edge (https://aps1-api-omada-controller.tplinkcloud.com)
+# 404s the unscoped ``/api/info`` -- one address there fronts many
+# controllers -- so `_controller_info` raised OmadaUnsupportedApiError and
+# `test_connection` refused a controller whose hotspot login worked perfectly
+# on the very same host, seconds earlier, by curl.
+
+
+def _cloud(controller: FakeOmadaController) -> FakeOmadaController:
+    """The fake, switched to the cloud edge's behaviour."""
+    controller.serves_unscoped_info = False
+    return controller
+
+
+async def test_a_cloud_controller_is_identified_through_the_scoped_path():
+    controller = _cloud(FakeOmadaController())
+
+    info = await _adapter(controller).get_controller_info(make_creds())
+
+    assert info.omadac_id == OMADAC_ID
+    assert info.controller_version == "5.15.24.18"
+    # The unscoped path was tried and 404'd; the scoped one answered.
+    assert controller.paths() == ["/api/info", f"/{OMADAC_ID}/api/info"]
+    assert controller.auth_calls == 0
+
+
+async def test_test_connection_accepts_a_cloud_controller():
+    """The defect, stated as a test: before the fallback this raised
+    OmadaUnsupportedApiError while the operator login below succeeded."""
+    controller = _cloud(FakeOmadaController())
+
+    info = await _adapter(controller).test_connection(
+        make_creds(ControllerAuthMode.LEGACY)
+    )
+
+    assert info.omadac_id == OMADAC_ID
+    assert controller.login_count == 1
+
+
+async def test_a_cloud_controller_with_no_omadac_id_names_the_field_to_fill_in():
+    """There is nothing to scope the request with, so this genuinely cannot
+    work -- but "does not support the requested operation" sent operators to
+    check the wrong thing. The message has to name the Omada ID."""
+    controller = _cloud(FakeOmadaController())
+
+    with pytest.raises(OmadaInvalidControllerError) as excinfo:
+        await _adapter(controller).get_controller_info(make_creds(omadac_id=None))
+
+    message = str(excinfo.value)
+    assert "Omada ID" in message
+    assert "/api/info" in message
+
+
+async def test_a_wrong_omadac_id_is_reported_as_a_wrong_omadac_id():
+    """VERIFIED on hardware: the scoped path answers -7131 for an id the host
+    does not hold, on the cloud edge and on a direct controller alike. The
+    generic "does not look like an Omada controller" would point at the URL,
+    which is the one field that is right."""
+    controller = _cloud(FakeOmadaController())
+
+    with pytest.raises(OmadaInvalidControllerError) as excinfo:
+        await _adapter(controller).get_controller_info(make_creds(omadac_id="0" * 32))
+
+    assert "controller ID" in str(excinfo.value)
+    assert excinfo.value.provider_code == -7131
+
+
+async def test_a_direct_controller_does_not_pay_for_the_fallback():
+    """The unscoped path still answers first everywhere it ever did, so no
+    controller that works today makes an extra round trip."""
+    controller = FakeOmadaController()
+
+    await _adapter(controller).get_controller_info(make_creds())
+
+    assert controller.paths() == ["/api/info"]
+
+
+# --- model is not the type enum -------------------------------------------
+
+
+async def test_model_is_not_reported_from_the_type_enum():
+    """Real controllers send ``type`` as an integer and no ``model`` at all
+    (1 on Omada Software Controller 5.15.24.19, 20 on a cloud-managed
+    6.3.0.100). Reading ``type`` as the model showed operators the string
+    "1" as their controller model after Test Connection."""
+    controller = FakeOmadaController()
+
+    info = await _adapter(controller).get_controller_info(make_creds())
+
+    assert info.model is None
+
+
+async def test_a_real_model_field_is_used_and_no_longer_shadowed():
+    """``type`` was checked first, so a controller that did send a ``model``
+    would have had it hidden behind the enum."""
+    controller = FakeOmadaController()
+    controller.info_payload = {
+        "controllerVer": "5.15.24.18",
+        "omadacId": OMADAC_ID,
+        "type": 1,
+        "model": "OC200",
+    }
+
+    info = await _adapter(controller).get_controller_info(make_creds())
+
+    assert info.model == "OC200"
+
+
 # --- test_connection -------------------------------------------------------
 
 
