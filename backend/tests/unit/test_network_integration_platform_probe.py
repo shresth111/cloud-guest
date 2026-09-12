@@ -941,3 +941,111 @@ class TestTheResponseCarriesTheFleetRouterId:
         payload = _integration_response(_integration(router_id=None))
         assert payload.router_id is None
         assert payload.model_dump(mode="json")["router_id"] is None
+
+
+# ============================================================================
+# The saved-integration probe's envelope
+# ============================================================================
+
+
+async def _post_saved(app: FastAPI, integration_id: uuid.UUID) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post(
+            "/api/v1/network-integrations/platform/integrations"
+            f"/{integration_id}/test-connection",
+            json={},
+        )
+
+
+class TestTheProbeEnvelopeFollowsItsVerdict:
+    """A probe must not lead with a success-shaped sentence while the
+    controller is refusing us.
+
+    ## What was wrong, and what was not
+
+    All four probe routes passed one constant, ``"Connection test
+    completed"``, on BOTH branches. The verdict itself was never lost --
+    ``success`` has always been ``error is None`` and the body has always
+    carried ``ok``, ``error_code`` and the provider's own sentence. But the
+    two things a human or a shell script reads first were
+    outcome-independent. Measured on the live QA integration on 2026-09-12,
+    which sits in ``auth_failed`` with ten consecutive failures::
+
+        POST /platform/integrations/{id}/test-connection
+        HTTP 200
+        {"success": false, "message": "Connection test completed",
+         "data": {"ok": false, "error_code": "OMADA_AUTH_FAILED", ...}}
+
+    ## The 200 stays
+
+    Deliberate, not an oversight: a refused probe still returns the
+    certificate it observed, which is what lets the console offer "pin this
+    fingerprint" for a self-signed controller --
+    ``test_a_self_signed_controller_fails_with_its_fingerprint_and_pinned``
+    above pins exactly that -- and the console reads ``ok``, never the
+    status line. So the sentence is the fix, not the status code.
+
+    ## Why these are HTTP-level
+
+    ``TestConnectionTesting`` in ``test_network_integration.py`` already
+    covers the service, and it passes: it asserts the returned tuple and the
+    row's state, and never goes through the router. Every existing probe
+    test at this level asserts ``response.json()["data"]`` only, so nothing
+    in the suite has ever looked at the envelope. That is the gap that let a
+    constant message sit on both branches of four routes.
+    """
+
+    @staticmethod
+    def _saved(provider: FakeProvider):
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=uuid.uuid4()))
+        return integration, _app(_service(repo, provider=provider))
+
+    async def test_a_refused_probe_does_not_say_completed(self) -> None:
+        integration, app = self._saved(
+            FakeProvider(raise_on={"test_connection": ProviderAuthFailedError()})
+        )
+        response = await _post_saved(app, integration.id)
+        body = response.json()
+
+        # The contract that stays.
+        assert response.status_code == 200
+        assert body["success"] is False
+        assert body["data"]["ok"] is False
+        assert body["data"]["error_code"] == ErrorCode.AUTH_FAILED.value
+
+        # The contract that changed.
+        assert "completed" not in body["message"]
+        assert "failed" in body["message"].lower()
+        # The machine code, so a log line names WHICH failure without the
+        # reader having to open the body.
+        assert ErrorCode.AUTH_FAILED.value in body["message"]
+
+    async def test_a_successful_probe_says_so(self) -> None:
+        integration, app = self._saved(FakeProvider())
+        body = (await _post_saved(app, integration.id)).json()
+        assert body["success"] is True
+        assert body["data"]["ok"] is True
+        assert "succeeded" in body["message"].lower()
+
+    async def test_the_envelope_does_not_restate_the_provider_message(self) -> None:
+        """The provider's sentence is already in ``data.message``, and the
+        console owns the customer-facing copy (``describeIntegrationError``).
+        An envelope that restated it would be a second copy free to drift."""
+        integration, app = self._saved(
+            FakeProvider(raise_on={"test_connection": ProviderAuthFailedError()})
+        )
+        body = (await _post_saved(app, integration.id)).json()
+        assert body["data"]["message"]
+        assert body["data"]["message"] not in body["message"]
+
+    async def test_the_draft_probe_answers_the_same_way(self) -> None:
+        """Four routes shared the constant; all four share the fix. A draft
+        probe that reported differently from a saved one would be the
+        drift ``_tls_fields`` was extracted to prevent."""
+        provider = FakeProvider(raise_on={"test_connection": ProviderAuthFailedError()})
+        body = (await _post(_app(_service(provider=provider)), _legacy_body())).json()
+        assert body["success"] is False
+        assert "completed" not in body["message"]
+        assert "failed" in body["message"].lower()
