@@ -1018,6 +1018,60 @@ class NetworkIntegrationService:
         return IntegrationStatus.SYNC_ERROR
 
     @staticmethod
+    def _reset_failure_counter(
+        integration: NetworkIntegration, updates: dict[str, object]
+    ) -> None:
+        """Put the failure counter back with the status ladder it belongs to.
+
+        Every path that resets `status` and clears `last_error_*` was
+        leaving `provider_metadata["consecutive_failure_count"]` where it
+        was. The result is a row that reads `connecting` with no error code,
+        no error message and no error timestamp -- a confident claim -- on
+        top of six failures nothing on the row can any longer explain, and
+        still serving a 32x backoff from them: at the 300s default, the next
+        sync is 2.7 hours away, so the change the operator just made is not
+        checked for most of an afternoon.
+
+        The counter is one half of a single fact ("how is this integration
+        doing"), and clearing the other half without it is what made the two
+        disagree. Reset together or not at all.
+        """
+        metadata = dict(
+            updates.get("provider_metadata", integration.provider_metadata) or {}
+        )
+        if not metadata.get("consecutive_failure_count"):
+            return
+        metadata["consecutive_failure_count"] = 0
+        updates["provider_metadata"] = metadata
+
+    @staticmethod
+    def _is_capability_boundary(
+        integration: NetworkIntegration, error: ProviderError
+    ) -> bool:
+        """True when the controller refused because of what these
+        credentials *are*, not because anything is wrong.
+
+        A hotspot-operator login cannot read the controller's inventory.
+        That is CR-002, it is documented, it is deliberately chosen at
+        onboarding, and it is the only mode available below controller
+        v5.13 -- so it can never be fixed by anyone looking at this venue.
+        Recording it as a fault gives the platform a state it can never
+        leave: `sync_error` forever, a counter that only climbs, and an
+        alert that opens at three failures and never resolves.
+
+        Kept as a guard on the *recording* side as well as on the calling
+        side (`_sync` no longer asks) because `_record_failure` has several
+        callers and a future one must not be able to re-create that state.
+        A boundary is still written to the events feed -- an operator who
+        triggered the operation is owed the refusal -- but it does not move
+        the row's status and does not count as a failure.
+        """
+        return (
+            error.code is ErrorCode.API_UNSUPPORTED
+            and integration.auth_mode == ControllerAuthMode.LEGACY.value
+        )
+
+    @staticmethod
     def _consecutive_failures(integration: NetworkIntegration) -> int:
         metadata = integration.provider_metadata or {}
         try:
@@ -1034,6 +1088,24 @@ class NetworkIntegrationService:
         during_sync: bool,
     ) -> NetworkIntegration:
         now = datetime.now(UTC)
+        if self._is_capability_boundary(integration, error):
+            # Recorded, visible, and not a fault. Nothing about the row
+            # moves: not `status`, not the failure counter, not
+            # `last_sync_status` -- so the backoff, the "Needs attention"
+            # tile and the alert evaluator all see a healthy integration,
+            # which is what this one is.
+            await self._record_event(
+                integration,
+                event_type=event_type,
+                status=IntegrationEventStatus.ERROR,
+                error_code=error.code.value,
+                message=error.message,
+                context={
+                    "capability_boundary": True,
+                    "auth_mode": integration.auth_mode,
+                },
+            )
+            return integration
         status = self._status_for_provider_error(error, during_sync=during_sync)
         metadata = dict(integration.provider_metadata or {})
         metadata["consecutive_failure_count"] = self._consecutive_failures(
@@ -1746,12 +1818,14 @@ class NetworkIntegrationService:
                 updates["last_error_code"] = None
                 updates["last_error_message"] = None
                 updates["last_error_at"] = None
+                self._reset_failure_counter(integration, updates)
             elif "is_enabled" in changed:
                 updates["status"] = (
                     IntegrationStatus.DISABLED.value
                     if not updates["is_enabled"]
                     else IntegrationStatus.CONNECTING.value
                 )
+                self._reset_failure_counter(integration, updates)
 
         updated = (
             await self.repository.update_integration(integration, updates)
@@ -1951,24 +2025,25 @@ class NetworkIntegrationService:
                 ),
             }
 
+        rotation_updates: dict[str, object] = {
+            "auth_mode": mode.value,
+            **trust_updates,
+            "credentials_encrypted": encrypt_credentials(
+                credentials, settings=self.settings
+            ),
+            "status": (
+                IntegrationStatus.CONNECTING.value
+                if integration.is_enabled
+                else IntegrationStatus.DISABLED.value
+            ),
+            "last_error_code": None,
+            "last_error_message": None,
+            "last_error_at": None,
+            "updated_by": actor_user_id,
+        }
+        self._reset_failure_counter(integration, rotation_updates)
         updated = await self.repository.update_integration(
-            integration,
-            {
-                "auth_mode": mode.value,
-                **trust_updates,
-                "credentials_encrypted": encrypt_credentials(
-                    credentials, settings=self.settings
-                ),
-                "status": (
-                    IntegrationStatus.CONNECTING.value
-                    if integration.is_enabled
-                    else IntegrationStatus.DISABLED.value
-                ),
-                "last_error_code": None,
-                "last_error_message": None,
-                "last_error_at": None,
-                "updated_by": actor_user_id,
-            },
+            integration, rotation_updates
         )
         await self._record_event(
             updated,
@@ -2511,18 +2586,43 @@ class NetworkIntegrationService:
                 error_code=ErrorCode.CREDENTIALS_REQUIRED.value,
                 message="No stored credentials",
             )
+        # CR-002, applied to the sweep as it already is to every live read
+        # (`_for_live_read`). A hotspot-operator credential authorizes guests
+        # and cannot read inventory -- that is the documented, supported
+        # shape of a `legacy` integration, not a degraded one, and
+        # `NetworkIntegrationInventoryRequiresOpenApiError`'s own docstring
+        # says so. The sweep nonetheless called `list_sites` on every row,
+        # so every legacy venue answered OMADA_API_UNSUPPORTED forever:
+        # `sync_error`, a red "Needs attention" tile, a climbing
+        # `consecutive_failure_count` that pushed the row onto a 32x backoff,
+        # and -- past three failures, i.e. within half an hour -- a CRITICAL
+        # alert to the venue and to the platform inbox that could never
+        # resolve, because nothing about the configuration was ever going to
+        # change. A supported configuration must not be a permanent fault.
+        #
+        # So the sweep asks a legacy row only what a legacy row can answer:
+        # is the controller there, and what is it running. That is the whole
+        # question "do we still reach this controller" means here, and it is
+        # the question the sweep exists to answer.
+        inventory_readable = (
+            integration.auth_mode == ControllerAuthMode.OPENAPI.value
+        )
         try:
             credentials = self._credentials_for(integration)
             provider_impl = self._provider(integration.provider)
             config = self._connection_config(integration, credentials)
             info = await provider_impl.get_controller_info(config)
-            sites = await provider_impl.list_sites(config)
-            devices: Sequence[ProviderDevice] = []
-            clients: Sequence[ProviderClient] = []
-            if integration.external_site_id:
-                site_id = str(integration.external_site_id)
-                devices = await provider_impl.list_devices(config, site_id)
-                clients = await provider_impl.list_clients(config, site_id)
+            sites: Sequence[ProviderSite] | None = None
+            devices: Sequence[ProviderDevice] | None = None
+            clients: Sequence[ProviderClient] | None = None
+            if inventory_readable:
+                sites = await provider_impl.list_sites(config)
+                devices = []
+                clients = []
+                if integration.external_site_id:
+                    site_id = str(integration.external_site_id)
+                    devices = await provider_impl.list_devices(config, site_id)
+                    clients = await provider_impl.list_clients(config, site_id)
         except ProviderError as error:
             await self._record_failure(
                 integration,
@@ -2542,9 +2642,25 @@ class NetworkIntegrationService:
 
         now = datetime.now(UTC)
         metadata = dict(integration.provider_metadata or {})
-        metadata["device_count"] = len(devices)
-        metadata["client_count"] = len(clients)
-        metadata["site_count"] = len(sites)
+        if inventory_readable:
+            metadata["device_count"] = len(devices or ())
+            metadata["client_count"] = len(clients or ())
+            metadata["site_count"] = len(sites or ())
+        else:
+            # Not zero. Zero is a count, and "this controller has no access
+            # points" is a claim about the venue's hardware that nothing
+            # here measured -- the same false statement an empty list would
+            # be on the live-read path, which is why that one raises instead
+            # of returning `[]`. Dropped rather than left in place so a row
+            # moved from `openapi` to `legacy` cannot keep rendering counts
+            # from credentials it no longer holds. Absent reads as "not
+            # measured here"; the console already renders it that way.
+            for key in ("device_count", "client_count", "site_count"):
+                metadata.pop(key, None)
+        # What this sync was able to ask, recorded on the row so the events
+        # feed and any later reader can tell "we read everything and the
+        # venue is empty" from "we were never able to read this".
+        metadata["sync_scope"] = "full" if inventory_readable else "portal_only"
         metadata["consecutive_failure_count"] = 0
         # A successful controller conversation is not the same claim as a
         # working venue, and reporting it as one is how an operator ends up
@@ -2577,8 +2693,11 @@ class NetworkIntegrationService:
         }
         # Refresh the cached site name if the controller renamed it. The
         # *id* is never overwritten from a name match -- that would be
-        # guessing at a mapping (see providers/omada.py).
-        for site in sites:
+        # guessing at a mapping (see providers/omada.py). Skipped entirely
+        # on a legacy row: there is no site list to compare against, and the
+        # stored name is the operator's own label, which is legitimately
+        # unknown there (see `external_site_name`'s description).
+        for site in sites or ():
             if site.site_id == integration.external_site_id:
                 if site.name != integration.external_site_name:
                     updates["external_site_name"] = site.name
@@ -2598,12 +2717,32 @@ class NetworkIntegrationService:
             ),
             error_code=ErrorCode.SETUP_INCOMPLETE.value if gaps else None,
             message=(
-                describe_portal_readiness_gaps(gaps) if gaps else "Sync completed"
+                describe_portal_readiness_gaps(gaps)
+                if gaps
+                else (
+                    "Sync completed"
+                    if inventory_readable
+                    else (
+                        "Sync completed. This integration signs in with a "
+                        "hotspot operator account, so the controller was "
+                        "checked for reachability and version only -- "
+                        "devices, clients and sites are not readable with "
+                        "those credentials, and the captive portal is "
+                        "unaffected."
+                    )
+                )
             ),
             context={
-                "site_count": len(sites),
-                "device_count": len(devices),
-                "client_count": len(clients),
+                "sync_scope": "full" if inventory_readable else "portal_only",
+                **(
+                    {
+                        "site_count": len(sites or ()),
+                        "device_count": len(devices or ()),
+                        "client_count": len(clients or ()),
+                    }
+                    if inventory_readable
+                    else {}
+                ),
                 **({"readiness_gaps": [gap.value for gap in gaps]} if gaps else {}),
             },
         )
@@ -2611,9 +2750,9 @@ class NetworkIntegrationService:
             integration_id=updated.id,
             synced=True,
             status=updated.status,
-            site_count=len(sites),
-            device_count=len(devices),
-            client_count=len(clients),
+            site_count=len(sites or ()),
+            device_count=len(devices or ()),
+            client_count=len(clients or ()),
             error_code=ErrorCode.SETUP_INCOMPLETE.value if gaps else None,
             message=describe_portal_readiness_gaps(gaps) if gaps else None,
         )
@@ -2708,17 +2847,21 @@ class NetworkIntegrationService:
         )
         if integration.is_enabled == is_enabled:
             return integration
+        enable_updates: dict[str, object] = {
+            "is_enabled": is_enabled,
+            "status": (
+                IntegrationStatus.CONNECTING.value
+                if is_enabled
+                else IntegrationStatus.DISABLED.value
+            ),
+            "updated_by": actor_user_id,
+        }
+        # Switching a row back on and leaving it on a 32x backoff from
+        # failures that happened before it was switched off means the
+        # re-enable is not actually tried for hours. Same fact, same reset.
+        self._reset_failure_counter(integration, enable_updates)
         updated = await self.repository.update_integration(
-            integration,
-            {
-                "is_enabled": is_enabled,
-                "status": (
-                    IntegrationStatus.CONNECTING.value
-                    if is_enabled
-                    else IntegrationStatus.DISABLED.value
-                ),
-                "updated_by": actor_user_id,
-            },
+            integration, enable_updates
         )
         await self._record_event(
             updated,

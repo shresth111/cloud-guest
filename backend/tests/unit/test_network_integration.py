@@ -4058,6 +4058,200 @@ class TestSyncAndBackoff:
         assert integration.last_error_code is None
 
 
+class TestLegacyModeIsASteadyStateNotAFault:
+    """A hotspot-operator integration is a documented, supported, chosen
+    configuration. The sweep used to ask it for inventory it can never
+    return, so every legacy venue sat in `sync_error` for ever: a red
+    "Needs attention" tile, a counter that only climbed, a 32x backoff, and
+    a CRITICAL alert that opened at three failures and could not resolve.
+    """
+
+    @staticmethod
+    def _legacy(**overrides: object) -> NetworkIntegration:
+        integration = _integration(
+            auth_mode=ControllerAuthMode.LEGACY.value,
+            location_id=uuid.uuid4(),
+            router_id=uuid.uuid4(),
+            **overrides,
+        )
+        # The legacy row holds the operator login and nothing else -- there
+        # is no Open API application on it, which is the whole point.
+        integration.credentials_encrypted = encrypt_credentials(
+            {"username": "operator", "password": "pw"}
+        )
+        return integration
+
+    async def test_the_sweep_never_asks_a_legacy_row_for_inventory(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(self._legacy(organization_id=org))
+        # Armed exactly as the real adapter is: `_require_openapi` refuses
+        # each of these outright. If the service asks, the test fails the
+        # way production did.
+        provider = FakeProvider(
+            raise_on={
+                "list_sites": ProviderUnsupportedApiError(),
+                "list_devices": ProviderUnsupportedApiError(),
+                "list_clients": ProviderUnsupportedApiError(),
+            }
+        )
+        service = _service(repo, provider=provider)
+        outcome = await service._sync(integration)
+        assert outcome.synced is True
+        assert "get_controller_info" in provider.calls
+        assert "list_sites" not in provider.calls
+        assert "list_devices" not in provider.calls
+        assert "list_clients" not in provider.calls
+
+    async def test_a_legacy_sync_settles_in_a_steady_state(self) -> None:
+        repo = FakeRepository()
+        integration = repo.add(
+            self._legacy(
+                organization_id=uuid.uuid4(),
+                status=IntegrationStatus.SYNC_ERROR.value,
+                last_error_code=ErrorCode.API_UNSUPPORTED.value,
+                last_error_message="cannot read the controller's inventory",
+                provider_metadata={"consecutive_failure_count": 6},
+            )
+        )
+        service = _service(repo)
+        await service._sync(integration)
+        assert integration.status == IntegrationStatus.CONNECTED.value
+        assert integration.last_sync_status == SyncStatus.OK.value
+        assert integration.last_error_code is None
+        assert integration.provider_metadata["consecutive_failure_count"] == 0
+        assert integration.provider_metadata["sync_scope"] == "portal_only"
+
+    async def test_a_legacy_sync_reports_no_counts_rather_than_zero(self) -> None:
+        """Zero is a count. "This venue has no access points" is a claim
+        about the customer's hardware that nothing here measured, and it is
+        the same false statement the live-read path refuses to make by
+        returning an empty list."""
+        repo = FakeRepository()
+        integration = repo.add(
+            self._legacy(
+                organization_id=uuid.uuid4(),
+                # Stale counts from when this row was an `openapi` one.
+                provider_metadata={"device_count": 4, "client_count": 31},
+            )
+        )
+        service = _service(repo)
+        await service._sync(integration)
+        assert "device_count" not in integration.provider_metadata
+        assert "client_count" not in integration.provider_metadata
+        assert "site_count" not in integration.provider_metadata
+
+    async def test_an_openapi_row_still_reads_and_caches_everything(self) -> None:
+        """The fix must not quietly stop the mode that CAN read."""
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                router_id=uuid.uuid4(),
+            )
+        )
+        provider = FakeProvider()
+        service = _service(repo, provider=provider)
+        await service._sync(integration)
+        assert "list_sites" in provider.calls
+        assert "device_count" in integration.provider_metadata
+        assert integration.provider_metadata["sync_scope"] == "full"
+
+    async def test_a_capability_refusal_never_moves_the_row(self) -> None:
+        """The belt to `_sync`'s braces: `_record_failure` has several
+        callers, and none of them may be able to put a legacy row back into
+        a permanent fault."""
+        repo = FakeRepository()
+        integration = repo.add(
+            self._legacy(
+                organization_id=uuid.uuid4(),
+                status=IntegrationStatus.CONNECTED.value,
+                provider_metadata={"consecutive_failure_count": 0},
+            )
+        )
+        service = _service(repo)
+        await service._record_failure(
+            integration,
+            ProviderUnsupportedApiError(),
+            event_type=IntegrationEventType.SYNC,
+            during_sync=True,
+        )
+        assert integration.status == IntegrationStatus.CONNECTED.value
+        assert integration.provider_metadata["consecutive_failure_count"] == 0
+        # Still visible. An operator who triggered the operation is owed
+        # the refusal, it just is not a fault against the venue.
+        assert any(
+            e.error_code == ErrorCode.API_UNSUPPORTED.value for e in repo.events
+        )
+
+    async def test_an_openapi_row_still_records_that_refusal_as_a_failure(
+        self,
+    ) -> None:
+        """On an Open API row the same code means something is genuinely
+        wrong -- the controller is too old, or the app was revoked."""
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=uuid.uuid4(),
+                provider_metadata={"consecutive_failure_count": 0},
+            )
+        )
+        service = _service(repo)
+        await service._record_failure(
+            integration,
+            ProviderUnsupportedApiError(),
+            event_type=IntegrationEventType.SYNC,
+            during_sync=True,
+        )
+        assert integration.status == IntegrationStatus.SYNC_ERROR.value
+        assert integration.provider_metadata["consecutive_failure_count"] == 1
+
+
+class TestTheFailureCounterIsResetWithTheStatusLadder:
+    """A row PATCHed back to `connecting` with `last_error_*` cleared and
+    `consecutive_failure_count` still at 6 is a confident claim standing on
+    six failures nothing on the row can explain -- and it stays on a 32x
+    backoff, so the operator's change is not re-checked for 2.7 hours."""
+
+    async def test_a_config_change_resets_the_counter(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                status=IntegrationStatus.SYNC_ERROR.value,
+                provider_metadata={"consecutive_failure_count": 6},
+            )
+        )
+        service = _service(repo)
+        await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"base_url": "https://moved.example.com:8043"},
+        )
+        assert integration.status == IntegrationStatus.CONNECTING.value
+        assert integration.last_error_code is None
+        assert integration.provider_metadata["consecutive_failure_count"] == 0
+
+    async def test_re_enabling_resets_the_counter(self) -> None:
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=uuid.uuid4(),
+                is_enabled=False,
+                status=IntegrationStatus.DISABLED.value,
+                provider_metadata={"consecutive_failure_count": 9},
+            )
+        )
+        service = _service(repo)
+        await service.set_platform_enabled(
+            integration.id, actor_user_id=uuid.uuid4(), is_enabled=True
+        )
+        assert integration.provider_metadata["consecutive_failure_count"] == 0
+
+
 # ============================================================================
 # Platform surface
 # ============================================================================

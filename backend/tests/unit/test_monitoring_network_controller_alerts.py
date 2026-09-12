@@ -53,7 +53,11 @@ from app.domains.monitoring.service import (
     network_controller_verdict,
 )
 from app.domains.monitoring.validators import validate_alert_rule_condition_config
-from app.domains.network_integration.constants import ErrorCode, IntegrationStatus
+from app.domains.network_integration.constants import (
+    ControllerAuthMode,
+    ErrorCode,
+    IntegrationStatus,
+)
 from tests.unit.test_monitoring_alerts import (
     FakeRepository,
     FakeRouter,
@@ -76,6 +80,10 @@ class FakeIntegration:
     location_id: uuid.UUID | None = field(default_factory=uuid.uuid4)
     router_id: uuid.UUID | None = field(default_factory=uuid.uuid4)
     status: str = IntegrationStatus.CONNECTED.value
+    # Read by the capability-boundary predicate. Defaults to the mode that
+    # CAN read inventory, so every pre-existing test here keeps meaning
+    # exactly what it meant.
+    auth_mode: str = ControllerAuthMode.OPENAPI.value
     is_enabled: bool = True
     is_deleted: bool = False
     provider_metadata: dict[str, Any] = field(default_factory=dict)
@@ -203,6 +211,59 @@ async def test_an_unreachable_controller_alerts_once_and_resolves_on_recovery() 
     assert [a.id for a in second.resolved] == [alert.id]
     assert alert.status == AlertStatus.RESOLVED.value
     assert "answering normally again" in alert.message
+
+
+async def test_a_hotspot_operator_venue_never_pages_anybody() -> None:
+    """The defect this exists to stop. A `legacy` integration cannot read
+    the controller's inventory -- that is CR-002, it is documented, it is
+    chosen deliberately at onboarding, and below controller v5.13 it is the
+    only mode there is. The sweep used to ask anyway, so the row sat in
+    `sync_error` with a counter that only climbed, and this CRITICAL rule
+    fired on the third failure and could never resolve: the venue and the
+    platform inbox were paged for ever about a correctly-configured venue
+    whose captive portal was working."""
+    org_id = uuid.uuid4()
+    repo, service = await _harness(ALERT_TARGET_NETWORK_CONTROLLER, org_id)
+    integration = FakeIntegration(
+        organization_id=org_id, auth_mode=ControllerAuthMode.LEGACY.value
+    )
+    integration.failing(IntegrationStatus.SYNC_ERROR, 6)
+    integration.last_error_code = ErrorCode.API_UNSUPPORTED.value
+    repo.network_integrations.append(integration)
+
+    assert (await service.evaluate_alert_rules()).triggered == []
+
+
+async def test_an_alert_already_open_on_one_resolves() -> None:
+    """Rows are already carrying this state in production. They must be
+    able to close on the next evaluation rather than wait for a sync --
+    which is why the verdict is `False` and not `None`."""
+    org_id = uuid.uuid4()
+    repo, service = await _harness(ALERT_TARGET_NETWORK_CONTROLLER, org_id)
+    integration = FakeIntegration(organization_id=org_id)
+    integration.failing(IntegrationStatus.SYNC_ERROR, 6)
+    repo.network_integrations.append(integration)
+    (alert,) = (await service.evaluate_alert_rules()).triggered
+
+    integration.auth_mode = ControllerAuthMode.LEGACY.value
+    integration.last_error_code = ErrorCode.API_UNSUPPORTED.value
+    result = await service.evaluate_alert_rules()
+
+    assert [a.id for a in result.resolved] == [alert.id]
+
+
+async def test_an_openapi_row_refused_the_same_way_still_pages() -> None:
+    """On an Open API row the identical code means something is genuinely
+    wrong -- the controller is below 5.13, or the app was revoked -- and
+    somebody has to go and look."""
+    org_id = uuid.uuid4()
+    repo, service = await _harness(ALERT_TARGET_NETWORK_CONTROLLER, org_id)
+    integration = FakeIntegration(organization_id=org_id)
+    integration.failing(IntegrationStatus.SYNC_ERROR, 6)
+    integration.last_error_code = ErrorCode.API_UNSUPPORTED.value
+    repo.network_integrations.append(integration)
+
+    assert len((await service.evaluate_alert_rules()).triggered) == 1
 
 
 async def test_rejected_credentials_say_so() -> None:
