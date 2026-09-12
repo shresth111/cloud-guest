@@ -89,6 +89,9 @@ async def test_authorize_eap_posts_the_documented_body_to_extportal_auth():
         "clientMac": "AA-BB-CC-DD-EE-FF",
         "time": 3_600_000,  # duration in MILLISECONDS
         "authType": "4",
+        # Doc 132060's "must contain" list, carried from the redirect's
+        # `redirectUrl`. See `omada/portal.py`'s docstring.
+        "originUrl": "https://wyfyguest.com/welcome",
         "apMac": "11-22-33-44-55-66",
         "ssidName": "Wyfy Guest",
         "radioId": 1,
@@ -200,6 +203,70 @@ def test_a_context_with_only_vid_still_takes_the_gateway_path():
     body = build_authorize_body(ctx, duration_seconds=60)
     assert body["vid"] == 10
     assert "apMac" not in body
+
+
+# --- the two v6.2.10+ "must contain" fields the redirect supplies ----------
+#
+# `clientIp` and `originUrl` are the two body fields doc 132060 adds to doc
+# 13080's shape and lists as required. Neither can be derived locally and
+# both arrive on the controller's own redirect. Until these tests existed
+# `clientIp` had no coverage at all and `originUrl` was never sent -- and
+# neither omission was detectable from a controller's reply, because a
+# 6.3.0.100 controller answers every body fault with the same `-41501`.
+
+
+def test_client_ip_is_sent_when_the_redirect_carried_one():
+    ctx = PortalAuthContext(
+        client_mac="AA-BB-CC-DD-EE-FF", site="S", client_ip="10.0.5.23"
+    )
+    assert build_authorize_body(ctx, duration_seconds=60)["clientIp"] == "10.0.5.23"
+
+
+def test_client_ip_is_absent_rather_than_guessed_when_the_redirect_had_none():
+    ctx = PortalAuthContext(client_mac="AA-BB-CC-DD-EE-FF", site="S")
+    assert "clientIp" not in build_authorize_body(ctx, duration_seconds=60)
+
+
+def test_origin_url_is_sent_from_the_redirects_own_landing_page():
+    ctx = PortalAuthContext(
+        client_mac="AA-BB-CC-DD-EE-FF", site="S", redirect_url="http://neverssl.com/"
+    )
+    assert (
+        build_authorize_body(ctx, duration_seconds=60)["originUrl"]
+        == "http://neverssl.com/"
+    )
+
+
+def test_origin_url_is_absent_when_the_redirect_carried_none():
+    ctx = PortalAuthContext(client_mac="AA-BB-CC-DD-EE-FF", site="S")
+    assert "originUrl" not in build_authorize_body(ctx, duration_seconds=60)
+
+
+def test_origin_url_is_sent_on_the_gateway_shape_too():
+    """Doc 132060 elides the tail of the Gateway body with `...`, and the
+    field is not EAP-specific in any reading of it. The gateway path gets the
+    same treatment rather than a second rule nobody can source."""
+    ctx = PortalAuthContext(
+        client_mac="AA-BB-CC-DD-EE-FF",
+        site="S",
+        gateway_mac="99-88-77-66-55-44",
+        vid=30,
+        redirect_url="http://neverssl.com/",
+    )
+    body = build_authorize_body(ctx, duration_seconds=60)
+    assert body["originUrl"] == "http://neverssl.com/"
+    assert "apMac" not in body
+
+
+def test_the_redirects_t_is_never_put_in_the_authorize_body():
+    """`t` is the redirect's timestamp; `time` is the duration we are asking
+    for. They are different values with confusable names, and EAP_CTX carries
+    a `t` precisely so this test can prove it does not leak into the body --
+    putting it there would ask the controller for a session lasting until the
+    year 56000."""
+    body = build_authorize_body(EAP_CTX, duration_seconds=3600)
+    assert "t" not in body
+    assert body["time"] == 3_600_000
 
 
 def test_zero_rate_limits_are_treated_as_no_limit():

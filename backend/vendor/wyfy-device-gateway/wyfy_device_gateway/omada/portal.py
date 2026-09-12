@@ -112,6 +112,48 @@ is exactly when the controller itself supplied it on the redirect. That
 makes the same code correct on both sides of the split without us having to
 predict a version.
 
+## ``originUrl`` is in the v6.2.10+ "must contain" list, and we were omitting it
+
+**VERIFIED against the same document, and previously missed.** The body shape
+quoted immediately above is doc 132060's own, and ``originUrl`` is in it --
+inside the sentence "The client information should be encapsulated in JSON
+format in the HTTP message body, and **must contain** the following
+parameters." Until this change the string ``originUrl`` appeared exactly once
+in this entire codebase: in that quoted docstring. It was never sent.
+
+This is ``clientIp``'s defect in a second field, and it hid for the same
+reason ``clientIp``'s could have: on a live 6.3.0.100 controller every body
+fault collapses into one ``-41501 "Failed to authenticate."`` (measured
+2026-09-11, HARDWARE-FINDINGS.md), so a controller rejecting us for a missing
+``originUrl`` is indistinguishable from one rejecting a wrong MAC. The only
+controller this package has ever authorized a real guest on is a **5.15**,
+whose documented body (13080) does not list ``originUrl`` at all -- so the
+one success we have proves nothing about the field either way.
+
+The value is the redirect's own ``redirectUrl`` (doc 132060's
+``LANDING_PAGE``): where the controller says to send the guest once it has
+authorized them. ``PortalAuthContext.redirect_url`` already carries it,
+captured from the redirect and threaded through the portal and the backend
+untouched; nothing derives it.
+
+Gated exactly like ``clientIp`` rather than sent unconditionally, for the
+reason the next section states in general: it is a v6.2.10+ field, doc
+13080's body shape does not have it, and the redirect that carries
+``redirectUrl`` is the same redirect that carries ``clientIp``. In practice
+that means it is sent on every real v6.2.10+ flow -- a controller's
+``/portal/entry`` returns **500** when the interception has no original URL
+at all (measured on our own 5.15, 2026-09-12), so a redirect reaching us
+without one is not a shape the controller emits.
+
+TP-Link's own sample writes it as ``"originUrl":""``, so an empty value is
+legal on the controller side; an absent one is what this platform has been
+sending, and that is the thing the document does not permit.
+
+**UNVERIFIED on hardware.** The authorize call needs a hotspot-operator
+session, and no 6.2.10+ controller with a licensed AP and a real client has
+been available to run it. If this ever has to be reverted, the revert is the
+four lines below and nothing else.
+
 ## Bandwidth limits are v6.2.10+ only
 
 ``downloadRateLimitKbps`` / ``uploadRateLimitKbps`` /
@@ -216,6 +258,15 @@ def build_authorize_body(
     # ``PortalAuthContext.client_ip``.
     if ctx.client_ip:
         body["clientIp"] = ctx.client_ip
+
+    # VERIFIED (doc 132060): named in the same "must contain" list as
+    # ``clientIp``, and absent from doc 13080's body. Carried from the
+    # redirect's ``redirectUrl`` (132060's ``LANDING_PAGE``), never derived.
+    # See this module's docstring for why it is gated rather than always
+    # sent, and for why its absence could not have been detected from the
+    # controller's replies.
+    if ctx.redirect_url:
+        body["originUrl"] = ctx.redirect_url
 
     is_gateway_path = ctx.gateway_mac is not None or ctx.vid is not None
     if is_gateway_path:
