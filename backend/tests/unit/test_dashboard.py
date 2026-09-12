@@ -35,7 +35,7 @@ import uuid
 import pytest
 
 from app.domains.analytics.dashboard_service import OverviewCounts
-from app.domains.dashboard.service import DashboardService
+from app.domains.dashboard.service import AGENT_SHAPED_WIDGET_IDS, DashboardService
 
 
 class _FakeAnalyticsDashboard:
@@ -199,3 +199,179 @@ class TestOverviewHonoursTheSelectedOrganization:
 
         assert overview.total_organizations == 14
         assert analytics.seen_organization_ids == [None]
+
+
+# ===========================================================================
+# Agent-shaped widgets on a fleet that runs no agent
+# ===========================================================================
+#
+# `_get_widgets` hands the console a fixed list of descriptors. Two of them
+# -- `routers-online` and `router-health` -- describe heartbeat liveness and
+# RouterOS health, which only exist for a device running this platform's
+# agent. A TP-Link Omada controller is a `Router` row that runs no agent, is
+# created `pending_provisioning` with NULL credentials, and never becomes
+# ONLINE. So at a controller-only venue those two tiles do not read "no
+# data": they read a healthy venue as an offline, unhealthy fleet.
+#
+# The rule is narrow on purpose, and most of what is pinned below is the
+# cases that must NOT change -- because the cost of widening the predicate
+# is paid by MikroTik venues, which are every venue in production today.
+
+
+class _FakeFleetRepository:
+    """Counts only, mirroring `DashboardFleetRepository`'s real signature.
+
+    `raises` exists because "the count query broke" and "this tenant has no
+    agent-managed devices" must not produce the same dashboard.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_managed: int = 0,
+        total: int = 0,
+        raises: Exception | None = None,
+    ) -> None:
+        self._agent_managed = agent_managed
+        self._total = total
+        self._raises = raises
+        self.seen_organization_ids: list[uuid.UUID] = []
+
+    async def count_agent_managed_routers(self, organization_id: uuid.UUID) -> int:
+        self.seen_organization_ids.append(organization_id)
+        if self._raises is not None:
+            raise self._raises
+        return self._agent_managed
+
+    async def count_routers(self, organization_id: uuid.UUID) -> int:
+        if self._raises is not None:
+            raise self._raises
+        return self._total
+
+
+def _widget_service(fleet: _FakeFleetRepository | None) -> DashboardService:
+    return DashboardService(
+        analytics_dashboard=_FakeAnalyticsDashboard(),
+        platform_dashboard=None,
+        billing_dashboard=None,
+        rbac_service=None,
+        organization_service=None,
+        fleet_repository=fleet,
+    )
+
+
+async def _widget_ids(
+    fleet: _FakeFleetRepository | None, organization_id: uuid.UUID | None
+) -> list[str]:
+    widgets = await _widget_service(fleet)._get_widgets(uuid.uuid4(), organization_id)
+    return [w.id for w in widgets]
+
+
+# The full list as it stood before this behaviour existed. Spelled out
+# rather than derived, so a future edit to `_get_widgets` has to come
+# through this constant and be looked at.
+_ALL_WIDGET_IDS = [
+    "kpi-overview",
+    "active-guests",
+    "routers-online",
+    "revenue-mrr",
+    "alerts",
+    "guest-trend",
+    "router-health",
+    "recent-activity",
+]
+
+
+class TestAMikrotikVenueIsUntouched:
+    """The hard constraint. Every one of these must return the list
+    unchanged, in the same order, including the two agent-shaped tiles."""
+
+    async def test_a_fleet_of_mikrotiks_keeps_every_widget(self) -> None:
+        fleet = _FakeFleetRepository(agent_managed=3, total=3)
+        assert await _widget_ids(fleet, uuid.uuid4()) == _ALL_WIDGET_IDS
+
+    async def test_a_mixed_venue_keeps_every_widget(self) -> None:
+        """One MikroTik alongside a controller. Agent-shaped health is
+        meaningful the moment a single agent-managed device exists, and a
+        mixed site is exactly where an operator needs it."""
+        fleet = _FakeFleetRepository(agent_managed=1, total=2)
+        assert await _widget_ids(fleet, uuid.uuid4()) == _ALL_WIDGET_IDS
+
+    async def test_a_brand_new_customer_with_no_fleet_keeps_every_widget(
+        self,
+    ) -> None:
+        """An empty fleet is a customer mid-onboarding, not an Omada venue.
+        Their dashboard must look like every other new customer's -- this is
+        the case a naive `agent_managed == 0` check would break for
+        MikroTik."""
+        fleet = _FakeFleetRepository(agent_managed=0, total=0)
+        assert await _widget_ids(fleet, uuid.uuid4()) == _ALL_WIDGET_IDS
+
+    async def test_the_platform_estate_view_keeps_every_widget(self) -> None:
+        """No organization selected. A per-tenant fact must never remove a
+        tile from the platform's own dashboard."""
+        fleet = _FakeFleetRepository(agent_managed=0, total=1)
+        assert await _widget_ids(fleet, None) == _ALL_WIDGET_IDS
+
+    async def test_the_estate_view_does_not_even_ask(self) -> None:
+        fleet = _FakeFleetRepository(agent_managed=0, total=1)
+        await _widget_ids(fleet, None)
+        assert fleet.seen_organization_ids == []
+
+    async def test_no_fleet_repository_wired_keeps_every_widget(self) -> None:
+        """ "Cannot tell" must read as "behave exactly as before", never as
+        "hide the tiles"."""
+        assert await _widget_ids(None, uuid.uuid4()) == _ALL_WIDGET_IDS
+
+    async def test_a_broken_count_query_keeps_every_widget(self) -> None:
+        """A dashboard that drops tiles because a query failed would turn a
+        transient database fault into a silent, apparently-deliberate UI
+        change."""
+        fleet = _FakeFleetRepository(raises=RuntimeError("connection reset"))
+        assert await _widget_ids(fleet, uuid.uuid4()) == _ALL_WIDGET_IDS
+
+
+class TestAControllerOnlyVenueLosesTheAgentShapedTiles:
+    async def test_routers_online_and_router_health_are_withheld(self) -> None:
+        fleet = _FakeFleetRepository(agent_managed=0, total=1)
+        assert await _widget_ids(fleet, uuid.uuid4()) == [
+            "kpi-overview",
+            "active-guests",
+            "revenue-mrr",
+            "alerts",
+            "guest-trend",
+            "recent-activity",
+        ]
+
+    async def test_every_other_widget_survives_in_order(self) -> None:
+        """Withholding two tiles is the whole change -- this is not a
+        redesign of the widget list."""
+        fleet = _FakeFleetRepository(agent_managed=0, total=2)
+        kept = await _widget_ids(fleet, uuid.uuid4())
+        assert kept == [w for w in _ALL_WIDGET_IDS if w not in AGENT_SHAPED_WIDGET_IDS]
+
+    async def test_the_tiles_are_dropped_not_merely_marked_invisible(self) -> None:
+        """`WidgetConfig.visible` has never been set by anything, so no
+        consumer is known to honour it. A tile that renders anyway would go
+        on making the false claim this branch exists to stop."""
+        fleet = _FakeFleetRepository(agent_managed=0, total=1)
+        widgets = await _widget_service(fleet)._get_widgets(uuid.uuid4(), uuid.uuid4())
+        assert not [w for w in widgets if w.id in AGENT_SHAPED_WIDGET_IDS]
+
+    async def test_the_question_is_asked_about_the_selected_organization(
+        self,
+    ) -> None:
+        organization_id = uuid.uuid4()
+        fleet = _FakeFleetRepository(agent_managed=0, total=1)
+        await _widget_ids(fleet, organization_id)
+        assert fleet.seen_organization_ids == [organization_id]
+
+
+class TestTheAgentShapedSetIsWhatItClaims:
+    def test_it_names_exactly_the_two_agent_shaped_widgets(self) -> None:
+        """Pinned so that adding a third agent-shaped tile to
+        `_get_widgets` without adding it here is a visible omission."""
+        assert {"router-health", "routers-online"} == AGENT_SHAPED_WIDGET_IDS
+
+    def test_every_named_widget_actually_exists_in_the_list(self) -> None:
+        assert set(_ALL_WIDGET_IDS) >= AGENT_SHAPED_WIDGET_IDS

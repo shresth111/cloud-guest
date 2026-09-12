@@ -18,6 +18,7 @@ from app.domains.monitoring.service import PlatformDashboardService
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.service import RBACService
 
+from .repository import DashboardFleetRepositoryProtocol
 from .schemas import (
     DashboardModulesResponse,
     DashboardOverview,
@@ -31,6 +32,12 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 
+# The widgets that describe facts only an agent-managed device produces:
+# heartbeat liveness and RouterOS health. See
+# `_fleet_has_no_agent_managed_devices` for when they are withheld and why
+# withholding is more honest than rendering them empty.
+AGENT_SHAPED_WIDGET_IDS = frozenset({"router-health", "routers-online"})
+
 
 class DashboardService:
     """Composes domain services into unified dashboard configuration."""
@@ -42,12 +49,18 @@ class DashboardService:
         billing_dashboard: SuperAdminBillingDashboardService,
         rbac_service: RBACService,
         organization_service: OrganizationService,
+        fleet_repository: DashboardFleetRepositoryProtocol | None = None,
     ) -> None:
         self.analytics_dashboard = analytics_dashboard
         self.platform_dashboard = platform_dashboard
         self.billing_dashboard = billing_dashboard
         self.rbac_service = rbac_service
         self.organization_service = organization_service
+        # Optional, and its absence means "answer exactly as this service
+        # always has". Every caller in the application wires it; the
+        # default keeps a construction that predates it -- a test double,
+        # a script -- from silently changing which widgets it sees.
+        self.fleet_repository = fleet_repository
 
     async def get_dashboard(
         self, user_id: uuid.UUID, organization_id: uuid.UUID | None = None
@@ -253,10 +266,67 @@ class DashboardService:
             total_routers=counts.total_routers,
         )
 
+    async def _fleet_has_no_agent_managed_devices(
+        self, organization_id: uuid.UUID | None
+    ) -> bool:
+        """True only for a tenant that owns fleet devices and **none** of
+        them runs this platform's agent.
+
+        The predicate is deliberately this narrow, because the cost of
+        widening it is paid by MikroTik venues. Every other case answers
+        ``False`` and therefore changes nothing:
+
+        * **No organization selected** (the platform estate view). The
+          estate contains agent-managed routers; a per-tenant fact must not
+          remove a tile from the platform's own dashboard.
+        * **No fleet repository wired.** The question cannot be asked, and
+          "cannot tell" must read as "behave exactly as before" rather than
+          as "hide the tiles".
+        * **A fleet with any agent-managed row**, including a mixed venue
+          that runs both a MikroTik and a controller. Agent-shaped health
+          is meaningful the moment one agent-managed device exists, and a
+          mixed site is precisely where an operator needs it.
+        * **An empty fleet.** A brand-new customer with nothing registered
+          yet is not an Omada venue; they are a customer mid-onboarding,
+          and their dashboard must look like every other new customer's.
+        * **The read failing.** A dashboard that drops tiles because a
+          count query broke would turn a transient database problem into a
+          silent, apparently-deliberate UI change. Logged and treated as
+          "cannot tell".
+
+        What is left is exactly the venue this exists for: one whose only
+        registered equipment is a vendor controller. There the tiles are
+        not merely empty, they are *wrong* -- a controller is created
+        ``pending_provisioning`` with NULL credentials and never becomes
+        ``ONLINE``, so "Routers Online" reads 0 of 1 and "Router Health"
+        reads unhealthy for a venue that is serving guests perfectly.
+
+        Withholding rather than reporting is the owner's call recorded as
+        code: vendor-appropriate, not parity. This does **not** hide the
+        controller from the fleet inventory, where it must appear -- see
+        ``RouterRepository.list_routers``'s own entry in
+        ``tests/unit/test_router_read_vendor_coverage.py``.
+        """
+        if organization_id is None or self.fleet_repository is None:
+            return False
+        try:
+            agent_managed = await self.fleet_repository.count_agent_managed_routers(
+                organization_id
+            )
+            if agent_managed > 0:
+                return False
+            return await self.fleet_repository.count_routers(organization_id) > 0
+        except Exception:
+            logger.exception(
+                "dashboard_fleet_composition_unavailable",
+                extra={"organization_id": str(organization_id)},
+            )
+            return False
+
     async def _get_widgets(
         self, user_id: uuid.UUID, organization_id: uuid.UUID | None = None
     ) -> list[WidgetConfig]:
-        return [
+        widgets = [
             WidgetConfig(
                 id="kpi-overview", type="kpi-grid", title="Overview", size="full"
             ),
@@ -281,6 +351,14 @@ class DashboardService:
                 size="large",
             ),
         ]
+        if await self._fleet_has_no_agent_managed_devices(organization_id):
+            # Dropped from the list rather than returned with
+            # `visible=False`. `WidgetConfig.visible` has never been set by
+            # anything, so no consumer is known to honour it, and a tile
+            # that renders anyway would keep making the false claim this
+            # whole branch exists to stop.
+            return [w for w in widgets if w.id not in AGENT_SHAPED_WIDGET_IDS]
+        return widgets
 
     async def _get_modules(
         self, user_id: uuid.UUID, organization_id: uuid.UUID | None = None

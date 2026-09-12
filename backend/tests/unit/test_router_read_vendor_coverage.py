@@ -114,6 +114,15 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "a controller-managed row at a shared site would be handed another "
         "vendor's hardware to ping through a session it can never open."
     ),
+    "app/domains/dashboard/repository.py::"
+    "DashboardFleetRepository.count_agent_managed_routers": (
+        "Answers the one question `_get_widgets` needs: may this tenant's "
+        "dashboard show agent-shaped health tiles at all. The count is the "
+        "number of devices those tiles can honestly speak for, so a "
+        "controller must not be in it -- counting one would keep 'Routers "
+        "Online' on a venue where it can only ever read 0 of 1. Narrowed in "
+        "SQL rather than filtered afterwards so the row is never loaded."
+    ),
     "app/domains/dhcp/repository.py::DhcpRepository.list_all_router_ids": (
         "The captive-portal DHCP-option convergence sweep. Every id goes "
         "straight to a RouterOS write. Note this method's docstring "
@@ -140,6 +149,18 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- dashboard ----------------------------------------------------------
+    "app/domains/dashboard/repository.py::DashboardFleetRepository.count_routers": (
+        "The denominator next to `count_agent_managed_routers` above, and "
+        "the two are only useful because they disagree about controllers. "
+        "Its caller needs to separate 'this tenant owns fleet devices, none "
+        "agent-managed' -- an Omada venue, which loses the agent-shaped "
+        "tiles -- from 'this tenant owns nothing yet', a customer "
+        "mid-onboarding whose dashboard must be unchanged. Only a total "
+        "that counts the controller can tell those apart; narrowing this "
+        "one would collapse both cases to zero and take the tiles off every "
+        "brand-new MikroTik customer too."
+    ),
     # -- the router domain's own accessors ---------------------------------
     "app/domains/router/repository.py::RouterRepository.__init__": (
         "Constructs the `GenericRepository(Router, ...)` that backs "
