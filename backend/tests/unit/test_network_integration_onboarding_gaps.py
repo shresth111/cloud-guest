@@ -412,7 +412,9 @@ class TestTheCustomerRoutes:
             "client_secret": "secret",
             "username": "operator",
             "password": "pw",
-            "external_site_id": "site-1",
+            # A real Omada site id. A display name here is refused by the
+            # request model -- see validators.validate_external_site_id.
+            "external_site_id": "6aa3913c3ee1605f71ac35a1",
         }
         body.update(overrides)
         return NetworkIntegrationCreateRequest.model_validate(body)
