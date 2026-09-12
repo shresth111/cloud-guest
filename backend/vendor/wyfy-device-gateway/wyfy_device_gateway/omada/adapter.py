@@ -23,6 +23,7 @@ directly from what each credential actually is (see ``auth.py``):
 | ``get_client``       | **no**                        | yes                            |
 | ``authorize_guest``  | yes                           | yes, *if* operator credentials are also stored |
 | ``deauthorize_guest``| yes                           | yes, *if* operator credentials are also stored |
+| ``configure_external_portal`` | **no**               | yes (portal, pre-auth access, operator account; see ``portal_setup.py``) |
 
 The legacy "no"s are not laziness. A hotspot operator account exists to
 authorize portal clients; the controller's inventory lives behind its admin
@@ -103,6 +104,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 
 import httpx
@@ -119,11 +121,14 @@ from ..controller_contract import (
     ControllerTlsObservation,
     ControllerVendor,
     PortalAuthContext,
+    PortalSetupReport,
+    PortalSetupSpec,
 )
 from . import clients as clients_module
 from . import deauth as deauth_module
 from . import devices as devices_module
 from . import portal as portal_module
+from . import portal_setup as portal_setup_module
 from . import sites as sites_module
 from .auth import SessionCache
 from .client import OmadaHttpClient, SleepFn
@@ -472,6 +477,57 @@ class OmadaControllerAdapter:
                 client, omadac_id, site_id, client_mac
             )
 
+    # -- automatic controller configuration (Open API only) ----------------
+
+    async def configure_external_portal(
+        self, creds: ControllerCredentials, spec: PortalSetupSpec
+    ) -> PortalSetupReport:
+        """Put one site's external portal, Pre-Authentication Access entry
+        and hotspot operator into the state ``spec`` describes.
+
+        Open API only: every write is an Open API call, so a hotspot operator
+        login cannot do it -- and the refusal names the fix instead of letting
+        the controller answer with what looks like a wrong password. The
+        operator login, when the integration holds one, is still *proven*
+        here, through the same legacy-mode view ``authorize_guest`` uses.
+
+        See ``portal_setup.py`` for the plan-then-write rules and for what is
+        and is not verified on hardware.
+        """
+        if (
+            creds.auth_mode != ControllerAuthMode.OPENAPI
+            or not creds.client_id
+            or not creds.client_secret
+        ):
+            raise OmadaUnsupportedApiError(
+                "Configuring the controller automatically needs Omada Open API "
+                "access: an app created under Settings > Platform Integration "
+                "> Open API (controller v5.13+). This integration has no Open "
+                "API app credentials."
+            )
+        stored_operator = (
+            (creds.username, creds.password)
+            if creds.username and creds.password
+            else None
+        )
+
+        async def verify_operator_login(username: str, password: str) -> None:
+            login_creds = _as_legacy(
+                replace(creds, username=username, password=password)
+            )
+            async with self._client(login_creds) as client:
+                await client.resolve_omadac_id()
+                await client.ensure_authenticated()
+
+        async with self._client(creds) as client:
+            omadac_id = await client.resolve_omadac_id()
+            return await portal_setup_module.configure_external_portal(
+                client,
+                omadac_id,
+                spec,
+                stored_operator=stored_operator,
+                verify_operator_login=verify_operator_login,
+            )
 
     # -- certificate trust -------------------------------------------------
 

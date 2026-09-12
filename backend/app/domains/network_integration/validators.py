@@ -101,6 +101,7 @@ _HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdef")
 __all__ = [
     "CLOUD_METADATA_ADDRESSES",
     "ExternalPortalUrl",
+    "EXTERNAL_PORTAL_OWNERSHIP_PARAM",
     "build_external_portal_url",
     "ValidatedControllerUrl",
     "allowed_controller_ports",
@@ -761,6 +762,12 @@ _GUEST_PORTAL_HOST = GUEST_PORTAL_HOST
 # guest lands on -- see `build_external_portal_url`.
 _GUEST_PORTAL_PATH = "/portal"
 
+# The query parameter of the portal URL that is unique to one integration:
+# its fleet device id. "Configure controller automatically" uses it to
+# recognise its own portal on a controller after a venue renames it, so it
+# is named once here rather than repeated as a literal in the service.
+EXTERNAL_PORTAL_OWNERSHIP_PARAM = "routerId"
+
 
 @dataclass(frozen=True, slots=True)
 class ExternalPortalUrl:
@@ -865,7 +872,7 @@ def build_external_portal_url(
         {
             "organizationId": str(organization_id),
             "locationId": str(location_id),
-            "routerId": str(router_id),
+            EXTERNAL_PORTAL_OWNERSHIP_PARAM: str(router_id),
             "netProvider": provider,
         }
     )

@@ -82,6 +82,7 @@ from .errors import (
     OmadaAuthorizationError,
     OmadaConnectionError,
     OmadaInvalidControllerError,
+    OmadaPermissionDeniedError,
     OmadaRateLimitedError,
     OmadaSessionExpiredError,
     OmadaTimeoutError,
@@ -557,11 +558,23 @@ class OmadaHttpClient:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         authenticated: bool = True,
+        retry_on_transport_error: bool = True,
     ) -> OmadaEnvelope:
         """Send a request, retrying and re-logging-in per the policy above.
 
         Returns the envelope only on ``errorCode == 0``; every other outcome
         raises one of the normalized errors.
+
+        ``retry_on_transport_error=False`` is for requests that are not safe
+        to repeat -- a ``POST`` that *creates* something. A timeout or a
+        dropped connection leaves it unknowable whether the controller acted,
+        and replaying a create is how one click becomes two portals or two
+        operator accounts. Such a request is sent once and a transport
+        failure is raised to the caller, which is expected to re-read state
+        before trying again. HTTP 429 is still retried: it is the controller
+        saying it did *not* process the request. Re-login on an expired
+        session is still performed for the same reason -- a 401 or a token
+        error is a request the controller refused before acting on it.
         """
         relogin_used = False
         last_error: Exception | None = None
@@ -592,6 +605,10 @@ class OmadaHttpClient:
             except (OmadaTimeoutError, OmadaConnectionError, OmadaRateLimitedError) as exc:
                 last_error = exc
                 if attempt >= MAX_ATTEMPTS:
+                    raise
+                if not retry_on_transport_error and not isinstance(
+                    exc, OmadaRateLimitedError
+                ):
                     raise
                 delay = self._backoff_delay(attempt)
                 self._log(
@@ -692,6 +709,7 @@ class OmadaHttpClient:
         from .types import (
             OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND,
             OPENAPI_ERROR_OPERATION_UNSUPPORTED,
+            PERMISSION_DENIED_ERROR_CODES,
             PORTAL_AUTHORIZATION_ERROR_CODES,
         )
 
@@ -723,6 +741,13 @@ class OmadaHttpClient:
             )
         if code == OPENAPI_ERROR_OPERATION_UNSUPPORTED:
             return OmadaUnsupportedApiError(provider_code=code)
+        if code in PERMISSION_DENIED_ERROR_CODES:
+            # The controller answered and named the problem: this credential
+            # may not do that. Without this branch it fell through to the
+            # generic ``OmadaError``, which the backend reports as "could not
+            # reach the network controller". The message is a constant -- the
+            # fix is always the app's role -- so no controller text is needed.
+            return OmadaPermissionDeniedError(provider_code=code)
 
         message = (
             f"{OmadaError.default_message} Controller said: {detail}" if detail else None

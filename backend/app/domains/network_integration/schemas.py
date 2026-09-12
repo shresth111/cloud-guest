@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.common.masking import MaskedMac
 from app.domains.auth.schemas import MessageResponse
@@ -55,6 +55,9 @@ from .constants import (
 )
 
 __all__ = [
+    "ControllerConfigureRequest",
+    "ControllerConfigureResponse",
+    "ControllerConfigureStepResponse",
     "MessageResponse",
     "NetworkIntegrationAuthorizationResponse",
     "NetworkIntegrationClientListResponse",
@@ -961,3 +964,66 @@ class NetworkIntegrationDisconnectGuestResponse(BaseModel):
     deauthorized_at: datetime | None = None
     guest_session_id: str | None = None
     guest_session_ended: bool = False
+
+
+# ============================================================================
+# "Configure controller automatically"
+# ============================================================================
+
+
+class ControllerConfigureRequest(BaseModel):
+    """Body of ``POST /{integration_id}/configure-controller`` (and its
+    platform twin).
+
+    ``extra="forbid"``, unlike the rest of this module, and on purpose: this
+    endpoint writes to a customer's controller, and the failure mode of a
+    permissive parser is a misspelt ``dryRun`` silently becoming a real run.
+    A body that is not exactly this shape is a 422. ``dry_run`` has no
+    default for the same reason -- the caller says which one it means.
+
+    Nothing here names a site, an SSID, a URL or an operator: every value the
+    run writes is derived from the integration row itself.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool
+    take_over_ssid_portal: bool = False
+
+
+class ControllerConfigureStepResponse(BaseModel):
+    """One step of the run.
+
+    ``step`` is ``ssid_takeover`` (only when take-over released the SSID from
+    another portal), ``portal``, ``pre_auth_access`` or ``hotspot_operator``.
+    ``outcome`` is ``created``, ``updated``, ``unchanged``, ``skipped`` or
+    ``failed``; on a dry run it is what *would* happen. ``details`` carries
+    identifiers and counts (portal id, entries preserved), never a
+    credential. ``provider_code`` is the controller's raw error code on a
+    failed step, for support.
+    """
+
+    step: str
+    outcome: Literal["created", "updated", "unchanged", "skipped", "failed"]
+    message: str
+    provider_code: int | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ControllerConfigureResponse(BaseModel):
+    """The report. ``ok`` is false when any step failed -- the run still
+    returns 200 with the envelope's ``success`` false, so the per-step
+    reasons reach the screen. Refusals before any write (preconditions, a
+    foreign portal on the SSID, a shared site) are 409s with a typed
+    ``data.code`` instead."""
+
+    integration_id: str
+    dry_run: bool
+    ok: bool
+    changed: bool
+    steps: list[ControllerConfigureStepResponse]
+    portal_id: str | None = None
+    guest_ssid_id: str | None = None
+    portal_url_scheme: str
+    portal_url_host_and_query: str
+    pre_auth_host: str

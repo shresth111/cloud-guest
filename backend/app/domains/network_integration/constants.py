@@ -57,7 +57,12 @@ from enum import StrEnum
 
 __all__ = [
     "AuthorizationStatus",
+    "CONTROLLER_SETUP_GAP_LABELS",
+    "CONTROLLER_SETUP_OPERATOR_PREFIX",
+    "CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH",
+    "CONTROLLER_SETUP_PORTAL_NAME_PREFIX",
     "ControllerAuthMode",
+    "ControllerSetupGap",
     "ControllerTlsMode",
     "DEFAULT_CONTROLLER_PORTS",
     "DEFAULT_CONTROLLER_TLS_MODE",
@@ -353,6 +358,63 @@ PORTAL_READINESS_GAP_LABELS: dict[PortalReadinessGap, str] = {
 }
 
 
+class ControllerSetupGap(StrEnum):
+    """Why "Configure controller automatically" cannot run for a row.
+
+    Checked all at once, before any controller is contacted, so an operator
+    sees every missing piece in one answer instead of fixing them one refusal
+    at a time. Four members share their value -- and their wording, via
+    ``CONTROLLER_SETUP_GAP_LABELS`` -- with ``PortalReadinessGap``, because
+    they are the same fact. ``guest_operator_missing`` is deliberately absent:
+    creating that account is one of the things the run does.
+    """
+
+    INTEGRATION_DISABLED = "integration_disabled"
+    PROVIDER_UNSUPPORTED = "provider_unsupported"
+    OPENAPI_REQUIRED = "openapi_required"
+    CREDENTIALS_MISSING = PortalReadinessGap.CREDENTIALS_MISSING.value
+    LOCATION_NOT_MAPPED = PortalReadinessGap.LOCATION_NOT_MAPPED.value
+    SITE_NOT_SELECTED = PortalReadinessGap.SITE_NOT_SELECTED.value
+    FLEET_DEVICE_MISSING = PortalReadinessGap.FLEET_DEVICE_MISSING.value
+    GUEST_SSID_MISSING = "guest_ssid_missing"
+
+
+CONTROLLER_SETUP_GAP_LABELS: dict[ControllerSetupGap, str] = {
+    ControllerSetupGap.INTEGRATION_DISABLED: "the integration is disabled",
+    ControllerSetupGap.PROVIDER_UNSUPPORTED: (
+        "this controller type cannot be configured automatically"
+    ),
+    ControllerSetupGap.OPENAPI_REQUIRED: (
+        "it signs in with a hotspot operator login, and automatic setup needs "
+        "an Open API app (controller Settings > Platform Integration > Open "
+        "API, controller v5.13 or newer)"
+    ),
+    ControllerSetupGap.CREDENTIALS_MISSING: (
+        "no Open API app credentials (client ID and secret) have been saved"
+    ),
+    ControllerSetupGap.LOCATION_NOT_MAPPED: PORTAL_READINESS_GAP_LABELS[
+        PortalReadinessGap.LOCATION_NOT_MAPPED
+    ],
+    ControllerSetupGap.SITE_NOT_SELECTED: PORTAL_READINESS_GAP_LABELS[
+        PortalReadinessGap.SITE_NOT_SELECTED
+    ],
+    ControllerSetupGap.FLEET_DEVICE_MISSING: PORTAL_READINESS_GAP_LABELS[
+        PortalReadinessGap.FLEET_DEVICE_MISSING
+    ],
+    ControllerSetupGap.GUEST_SSID_MISSING: "no guest SSID has been chosen",
+}
+
+#: The display name given to the portal automatic setup creates, before the
+#: integration's short id is appended -- see
+#: ``service._controller_setup_portal_name``.
+CONTROLLER_SETUP_PORTAL_NAME_PREFIX = "Wyfy Guest"
+#: ``PortalSetting.name`` is 1 to 128 characters in TP-Link's spec.
+CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH = 128
+#: The hotspot operator account automatic setup creates is named this plus
+#: the first 12 hex digits of the integration id.
+CONTROLLER_SETUP_OPERATOR_PREFIX = "wyfy-"
+
+
 class IntegrationEventType(StrEnum):
     """What happened, for the operational feed
     (``network_integration_events``).
@@ -378,6 +440,9 @@ class IntegrationEventType(StrEnum):
     SYNC = "sync"
     PORTAL_AUTHORIZE = "portal_authorize"
     PORTAL_DEAUTHORIZE = "portal_deauthorize"
+    # One row per real (non-dry) "Configure controller automatically" run,
+    # carrying the per-step report. A dry run writes nothing, this included.
+    CONTROLLER_CONFIGURED = "controller_configured"
 
 
 class IntegrationEventStatus(StrEnum):
@@ -462,6 +527,10 @@ class ErrorCode(StrEnum):
     # the URL and the port were both correct.
     TLS_UNTRUSTED = "OMADA_TLS_UNTRUSTED"
     TLS_PIN_MISMATCH = "OMADA_TLS_PIN_MISMATCH"
+    # The controller answered and refused: the Open API app's role or site
+    # privileges do not cover the call (Omada -1005 / -1505). Not an auth
+    # failure -- the credential is valid -- and not a connection failure.
+    PERMISSION_DENIED = "OMADA_PERMISSION_DENIED"
     # The request asked for pinning without supplying a fingerprint (or
     # supplied one that is not a SHA-256). A 400 from this platform, not a
     # 502 from the controller -- the controller was never contacted.
@@ -470,6 +539,24 @@ class ErrorCode(StrEnum):
     # committed to the public repository. A 503 from this platform: nothing
     # the operator typed is wrong, and nothing was stored.
     ENCRYPTION_KEY_NOT_CONFIGURED = "NETWORK_INTEGRATION_ENCRYPTION_KEY_NOT_CONFIGURED"
+    # "Configure controller automatically" refused before contacting the
+    # controller: the integration is missing something the run needs. The
+    # response's ``data.missing`` lists ``ControllerSetupGap`` values.
+    AUTOCONFIG_PRECONDITIONS = "NETWORK_INTEGRATION_AUTOCONFIG_PRECONDITIONS"
+    # Another organization's integration manages the same controller site.
+    # Two tenants writing one site's portal and pre-auth settings would undo
+    # each other, so neither may automate it. The other tenant is not named.
+    CONTROLLER_SITE_SHARED = "NETWORK_INTEGRATION_CONTROLLER_SITE_SHARED"
+    # Another integration in the same organization already uses this guest
+    # SSID on this controller site. Two portals cannot both own one SSID.
+    GUEST_SSID_IN_USE = "NETWORK_INTEGRATION_GUEST_SSID_IN_USE"
+    # The guest SSID is bound to a portal this integration did not create.
+    # Nothing was changed; ``take_over_ssid_portal`` releases it.
+    PORTAL_CONFLICT = "NETWORK_INTEGRATION_PORTAL_CONFLICT"
+    # The stored guest SSID does not exist on the site, or its name matches
+    # more than one SSID there.
+    GUEST_SSID_NOT_FOUND = "NETWORK_INTEGRATION_GUEST_SSID_NOT_FOUND"
+    GUEST_SSID_AMBIGUOUS = "NETWORK_INTEGRATION_GUEST_SSID_AMBIGUOUS"
 
 
 # ============================================================================
@@ -762,6 +849,10 @@ class NetworkIntegrationAuditAction(StrEnum):
     # "who kicked this guest off the WiFi" must not have to disambiguate
     # the two by reading the description.
     GUEST_DISCONNECTED = "network_integration_guest_disconnected"
+    # "Configure controller automatically": this platform wrote portal,
+    # pre-auth and operator settings onto a customer's controller. Recorded
+    # on real runs only; a dry run reads and writes nothing.
+    CONTROLLER_CONFIGURED = "network_integration_controller_configured"
 
 # Audit entity_type for every entry this domain writes -- one value, so an
 # auditor can retrieve the whole trail for one integration by

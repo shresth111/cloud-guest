@@ -196,6 +196,10 @@ def test_every_error_class_exposes_its_contract_code():
         "OmadaAuthorizationError": "OMADA_AUTHORIZATION_FAILED",
         "OmadaUnsupportedApiError": "OMADA_API_UNSUPPORTED",
         "OmadaSessionExpiredError": "OMADA_SESSION_EXPIRED",
+        # Omada -1005/-1505: the Open API app's role or site privileges do
+        # not cover the call. Codes from the 5.15.24.19 controller's own
+        # Open API Access Guide.
+        "OmadaPermissionDeniedError": "OMADA_PERMISSION_DENIED",
     }
     actual = {cls.__name__: cls.code for cls in ALL_ERRORS}
     assert actual == expected

@@ -514,6 +514,10 @@ _PATH_ID_ROUTES = [
     # Discloses whether an arbitrary guest id anywhere on the platform is
     # mapped to a bandwidth policy, and names the policy.
     ("/api/v1/policies/guest-mapping/{guest_id}", "GET"),
+    # Writes a portal, a walled-garden entry and an operator account onto the
+    # customer's own controller. Loaded WITH the caller's organization in the
+    # query (a foreign id is a 404), which needs that organization resolved.
+    ("/api/v1/network-integrations/{integration_id}/configure-controller", "POST"),
 ]
 
 

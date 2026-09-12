@@ -43,12 +43,17 @@ from fastapi import status
 
 from app.common.exceptions import CloudGuestError
 
-from .constants import ErrorCode
+from .constants import CONTROLLER_SETUP_GAP_LABELS, ControllerSetupGap, ErrorCode
 
 __all__ = [
+    "ControllerSetupPreconditionsError",
+    "ControllerSiteSharedError",
     "CrossLocationNetworkIntegrationAccessError",
     "CrossOrganizationNetworkIntegrationAccessError",
     "GuestSessionNotActiveError",
+    "GuestSsidAmbiguousError",
+    "GuestSsidInUseError",
+    "GuestSsidNotFoundError",
     "NetworkIntegrationAlreadyExistsError",
     "NetworkIntegrationCredentialsRequiredError",
     "NetworkIntegrationDeauthorizationUnsupportedError",
@@ -65,12 +70,14 @@ __all__ = [
     "NetworkIntegrationTlsPinRequiredError",
     "NetworkIntegrationUrlRejectedError",
     "PROVIDER_ERRORS_BY_CODE",
+    "PortalConflictError",
     "ProviderAuthFailedError",
     "ProviderAuthorizationFailedError",
     "ProviderClientNotFoundError",
     "ProviderConnectionFailedError",
     "ProviderError",
     "ProviderInvalidControllerError",
+    "ProviderPermissionDeniedError",
     "ProviderRateLimitedError",
     "ProviderSessionExpiredError",
     "ProviderSiteNotFoundError",
@@ -482,6 +489,113 @@ class NetworkIntegrationDeauthorizationUnsupportedError(NetworkIntegrationError)
 
 
 # ============================================================================
+# "Configure controller automatically"
+# ============================================================================
+
+
+class ControllerSetupPreconditionsError(NetworkIntegrationError):
+    """Automatic setup refused before the controller was contacted.
+
+    Every missing piece is named at once (``data.missing``), in the order an
+    operator would fix them, reusing ``PortalReadinessGap``'s wording where
+    the fact is the same one. 409: the request is fine; the row is not ready.
+    """
+
+    def __init__(self, gaps: list[ControllerSetupGap]) -> None:
+        reasons = [CONTROLLER_SETUP_GAP_LABELS[gap] for gap in gaps]
+        joined = (
+            reasons[0]
+            if len(reasons) == 1
+            else ", ".join(reasons[:-1]) + " and " + reasons[-1]
+        )
+        super().__init__(
+            f"This controller cannot be configured automatically yet: {joined}. "
+            "Nothing was changed on the controller.",
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.AUTOCONFIG_PRECONDITIONS,
+            data={"missing": [gap.value for gap in gaps]},
+        )
+
+
+class ControllerSiteSharedError(NetworkIntegrationError):
+    """Another organization's integration points at the same controller site.
+
+    A site's portal list and Pre-Authentication Access are shared state on
+    the controller. Two tenants each configuring them would be one tenant
+    able to redirect the other's guests, so automatic setup refuses for both
+    rather than guessing whose site it is. The other tenant is deliberately
+    not named, and no id of theirs is returned.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This controller site is also connected to Wyfy Guest by another "
+            "customer account, so it cannot be configured automatically from "
+            "either one. Nothing was changed. Contact support to confirm who "
+            "manages this site.",
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.CONTROLLER_SITE_SHARED,
+        )
+
+
+class GuestSsidInUseError(NetworkIntegrationError):
+    """A second integration in the same organization wants the same SSID on
+    the same controller site. One SSID can be bound to one portal."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Another location in your organization already uses this guest "
+            "SSID on this controller site. Each location needs its own guest "
+            "SSID. Nothing was changed.",
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.GUEST_SSID_IN_USE,
+        )
+
+
+class PortalConflictError(NetworkIntegrationError):
+    """The guest SSID is bound to a portal this integration did not create.
+
+    Refused with nothing changed. ``data`` names the portal so the operator
+    can find it on their own controller -- that name came from the tenant's
+    own controller, so it discloses nothing. ``take_over_ssid_portal`` is the
+    explicit way through, and it removes only the SSID from that portal.
+    """
+
+    def __init__(
+        self, message: str, *, portal_id: str | None, portal_name: str | None
+    ) -> None:
+        super().__init__(
+            message,
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.PORTAL_CONFLICT,
+            data={
+                "portal_id": portal_id,
+                "portal_name": portal_name,
+                "resolution": "take_over_ssid_portal",
+            },
+        )
+
+
+class GuestSsidNotFoundError(NetworkIntegrationError):
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.GUEST_SSID_NOT_FOUND,
+        )
+
+
+class GuestSsidAmbiguousError(NetworkIntegrationError):
+    def __init__(self, message: str, *, match_count: int | None) -> None:
+        super().__init__(
+            message,
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.GUEST_SSID_AMBIGUOUS,
+            data={"match_count": match_count},
+        )
+
+
+# ============================================================================
 # Provider (controller) failures
 # ============================================================================
 
@@ -692,6 +806,25 @@ class ProviderUnsupportedApiError(ProviderError):
         )
 
 
+class ProviderPermissionDeniedError(ProviderError):
+    """The controller refused a call the credential is not allowed to make.
+
+    502 like the other controller failures: the caller's request to this
+    platform was fine and a 403 here would read as "you lack a Wyfy Guest
+    permission", which is the wrong building entirely.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "The network controller refused this request: the Open API app "
+            "is not allowed to make it. Give the app a role with Modify "
+            "access to Site Settings and Hotspot, with this site in its site "
+            "privileges.",
+            code=ErrorCode.PERMISSION_DENIED,
+        )
+
+
 class ProviderSessionExpiredError(ProviderError):
     def __init__(self, message: str | None = None) -> None:
         super().__init__(
@@ -717,4 +850,5 @@ PROVIDER_ERRORS_BY_CODE: dict[str, type[ProviderError]] = {
     ErrorCode.SESSION_EXPIRED.value: ProviderSessionExpiredError,
     ErrorCode.TLS_UNTRUSTED.value: ProviderTlsUntrustedError,
     ErrorCode.TLS_PIN_MISMATCH.value: ProviderTlsPinMismatchError,
+    ErrorCode.PERMISSION_DENIED.value: ProviderPermissionDeniedError,
 }

@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import secrets
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -94,8 +95,12 @@ from app.domains.rbac.location_scope import LocationScope, enforce_entity_locati
 
 from .constants import (
     AUDIT_ENTITY_TYPE,
+    CONTROLLER_SETUP_OPERATOR_PREFIX,
+    CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH,
+    CONTROLLER_SETUP_PORTAL_NAME_PREFIX,
     DEFAULT_CONTROLLER_TLS_MODE,
     FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER,
+    GUEST_OPERATOR_CREDENTIAL_FIELDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
     PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS,
     PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW,
@@ -107,6 +112,7 @@ from .constants import (
     SYNC_BACKOFF_CAP_MULTIPLIER,
     AuthorizationStatus,
     ControllerAuthMode,
+    ControllerSetupGap,
     ControllerTlsMode,
     ErrorCode,
     IntegrationEventStatus,
@@ -119,12 +125,18 @@ from .constants import (
 from .crypto import (
     NetworkIntegrationCredentialDecryptionError,
     encrypt_credentials,
+    stored_credential_fields,
 )
 from .crypto import decrypt_credentials as _decrypt_credentials
 from .exceptions import (
+    ControllerSetupPreconditionsError,
+    ControllerSiteSharedError,
     CrossLocationNetworkIntegrationAccessError,
     CrossOrganizationNetworkIntegrationAccessError,
     GuestSessionNotActiveError,
+    GuestSsidAmbiguousError,
+    GuestSsidInUseError,
+    GuestSsidNotFoundError,
     NetworkIntegrationAlreadyExistsError,
     NetworkIntegrationCredentialsRequiredError,
     NetworkIntegrationDeauthorizationUnsupportedError,
@@ -138,6 +150,7 @@ from .exceptions import (
     NetworkIntegrationSiteNotSelectedError,
     NetworkIntegrationTlsPinRequiredError,
     NetworkIntegrationUrlRejectedError,
+    PortalConflictError,
     ProviderAuthFailedError,
     ProviderError,
     ProviderSiteNotFoundError,
@@ -151,6 +164,9 @@ from .providers.base import (
     ProviderClient,
     ProviderConnectionConfig,
     ProviderControllerInfo,
+    ProviderControllerSetupBlock,
+    ProviderControllerSetupRequest,
+    ProviderControllerSetupStep,
     ProviderDevice,
     ProviderPortalContext,
     ProviderSite,
@@ -159,6 +175,8 @@ from .providers.base import (
 )
 from .repository import NetworkIntegrationRepositoryProtocol
 from .validators import (
+    EXTERNAL_PORTAL_OWNERSHIP_PARAM,
+    build_external_portal_url,
     describe_mac_wire_format,
     describe_portal_readiness_gaps,
     describe_redirect_shape,
@@ -177,6 +195,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AuditLogWriter",
     "ControllerDraftProbeOutcome",
+    "ControllerSetupOutcome",
     "FleetDeviceProvisionerProtocol",
     "GuestDisconnectOutcome",
     "GuestSessionLookupProtocol",
@@ -416,6 +435,29 @@ class ControllerDraftProbeOutcome:
 # ============================================================================
 # Redaction
 # ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerSetupOutcome:
+    """What one "Configure controller automatically" run did (or, on a dry
+    run, would do). ``ok`` is false when any step failed; ``changed`` is true
+    when any step created or updated something."""
+
+    integration_id: uuid.UUID
+    dry_run: bool
+    ok: bool
+    changed: bool
+    steps: tuple[ProviderControllerSetupStep, ...]
+    portal_id: str | None
+    guest_ssid_id: str | None
+    portal_url_scheme: str
+    portal_url_host_and_query: str
+    pre_auth_host: str
+
+
+#: Step outcomes, as the provider seam reports them.
+_SETUP_FAILED = "failed"
+_SETUP_CHANGING = frozenset({"created", "updated"})
 
 
 def redact_context(value: Any, *, _depth: int = 0) -> Any:
@@ -696,6 +738,7 @@ class NetworkIntegrationService:
         integration_id: uuid.UUID,
         *,
         requesting_organization_id: uuid.UUID | None,
+        scope_read_to_organization: bool = False,
     ) -> NetworkIntegration:
         """The chokepoint every by-id operation funnels through.
 
@@ -703,8 +746,20 @@ class NetworkIntegrationService:
         integration by id any other way -- which is what makes the tenant
         check impossible to forget on a new endpoint, rather than
         something a reviewer has to notice.
+
+        ``scope_read_to_organization`` puts the caller's organization into
+        the *query*, so another tenant's id is not found at all (404) rather
+        than read and then refused (403). It is opt-in so the existing
+        routes keep the 403 their clients already handle; the verification
+        below still runs either way, which is what keeps location
+        confinement in force.
         """
-        integration = await self.repository.get_integration_by_id(integration_id)
+        if scope_read_to_organization and requesting_organization_id is not None:
+            integration = await self.repository.get_integration_for_organization(
+                integration_id, organization_id=requesting_organization_id
+            )
+        else:
+            integration = await self.repository.get_integration_by_id(integration_id)
         if integration is None:
             raise NetworkIntegrationNotFoundError(integration_id)
         self._enforce_tenant_scope(integration, requesting_organization_id)
@@ -2668,6 +2723,438 @@ class NetworkIntegrationService:
             integration_id,
             actor_user_id=actor_user_id,
             requesting_organization_id=None,
+        )
+
+    # -- configure controller automatically -------------------------------
+
+    async def configure_controller(
+        self,
+        integration_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        dry_run: bool,
+        take_over_ssid_portal: bool = False,
+    ) -> ControllerSetupOutcome:
+        """Configure the venue's controller for guest sign-in -- customer path.
+
+        Portal, Pre-Authentication Access entry and hotspot operator account,
+        through the provider's automatic setup. See
+        :meth:`_configure_controller` for the rules.
+
+        The integration is read **with** the caller's organization in the
+        query, so a path id from another tenant is a 404, never a read
+        followed by a refusal. ``None`` is refused outright: on this route it
+        would mean "no tenant filter", and the platform has its own route.
+        """
+        organization_id = self._require_organization(requesting_organization_id)
+        integration = await self._load_owned_integration(
+            integration_id,
+            requesting_organization_id=organization_id,
+            scope_read_to_organization=True,
+        )
+        return await self._configure_controller(
+            integration,
+            actor_user_id=actor_user_id,
+            dry_run=dry_run,
+            take_over_ssid_portal=take_over_ssid_portal,
+            platform_action=False,
+        )
+
+    async def configure_platform_controller(
+        self,
+        integration_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        dry_run: bool,
+        take_over_ssid_portal: bool = False,
+    ) -> ControllerSetupOutcome:
+        """The same run for a platform operator, against any tenant's row.
+
+        Unscoped like :meth:`test_platform_connection` and gated the same way
+        -- GLOBAL scope at the route. Everything written is still derived
+        from the loaded row's own organization, location and fleet device,
+        exactly as on the customer path; a platform caller chooses *which*
+        integration, never what it points at. Audited as a platform action.
+        """
+        integration = await self._load_owned_integration(
+            integration_id, requesting_organization_id=None
+        )
+        return await self._configure_controller(
+            integration,
+            actor_user_id=actor_user_id,
+            dry_run=dry_run,
+            take_over_ssid_portal=take_over_ssid_portal,
+            platform_action=True,
+        )
+
+    def _controller_setup_gaps(
+        self, integration: NetworkIntegration, provider_impl: NetworkProvider
+    ) -> list[ControllerSetupGap]:
+        """Everything automatic setup needs that this row lacks, in fix order.
+
+        Stored credential *names* only -- ``stored_credential_fields`` never
+        returns a value. An unreadable ciphertext adds no gap here:
+        ``_credentials_for`` reports that on its own path, as re-enter the
+        credentials, which is the true fix.
+        """
+        gaps: list[ControllerSetupGap] = []
+        if not integration.is_enabled:
+            gaps.append(ControllerSetupGap.INTEGRATION_DISABLED)
+        if not callable(getattr(provider_impl, "configure_controller", None)):
+            gaps.append(ControllerSetupGap.PROVIDER_UNSUPPORTED)
+        if integration.auth_mode != ControllerAuthMode.OPENAPI.value:
+            gaps.append(ControllerSetupGap.OPENAPI_REQUIRED)
+        elif not integration.credentials_encrypted:
+            gaps.append(ControllerSetupGap.CREDENTIALS_MISSING)
+        else:
+            fields = stored_credential_fields(
+                integration.credentials_encrypted, settings=self.settings
+            )
+            if fields is not None and not {"client_id", "client_secret"} <= fields:
+                gaps.append(ControllerSetupGap.CREDENTIALS_MISSING)
+        if integration.location_id is None:
+            gaps.append(ControllerSetupGap.LOCATION_NOT_MAPPED)
+        if not integration.external_site_id:
+            gaps.append(ControllerSetupGap.SITE_NOT_SELECTED)
+        if integration.router_id is None:
+            gaps.append(ControllerSetupGap.FLEET_DEVICE_MISSING)
+        if not integration.guest_ssid_id and not integration.guest_ssid_name:
+            gaps.append(ControllerSetupGap.GUEST_SSID_MISSING)
+        return gaps
+
+    async def _refuse_shared_controller_site(
+        self, integration: NetworkIntegration
+    ) -> None:
+        """Refuse when anyone else already manages this controller site.
+
+        Two rules, both about state that lives on the controller and is
+        shared by every integration pointed at one site:
+
+        * **Another organization** on the same site: refused for both. The
+          other tenant is not named and nothing of theirs is returned.
+        * **Another integration in this organization** with the same guest
+          SSID: refused, because one SSID can be bound to one portal and two
+          locations would take it from each other on every run. A second
+          location on the same site with its *own* SSID is the supported
+          multi-location layout and passes.
+
+        "Same controller" is same normalized ``base_url`` and, when both rows
+        know one, same ``controller_id``. A row that has not discovered its
+        id yet is assumed to be the same controller: site ids are per-
+        controller object ids, so a coincidental match across controllers
+        behind one address is not a realistic case, and guessing "different"
+        is the unsafe direction.
+        """
+        others = await self.repository.list_live_integrations_on_controller_site(
+            provider=integration.provider,
+            base_url=integration.base_url,
+            external_site_id=str(integration.external_site_id),
+            exclude_id=integration.id,
+        )
+        mine = (integration.controller_id or "").strip().lower()
+        same_controller = [
+            other
+            for other in others
+            if not mine
+            or not (other.controller_id or "").strip()
+            or (other.controller_id or "").strip().lower() == mine
+        ]
+        if any(
+            other.organization_id != integration.organization_id
+            for other in same_controller
+        ):
+            raise ControllerSiteSharedError()
+        for other in same_controller:
+            if (
+                integration.guest_ssid_id
+                and other.guest_ssid_id == integration.guest_ssid_id
+            ) or (
+                integration.guest_ssid_name
+                and other.guest_ssid_name == integration.guest_ssid_name
+            ):
+                raise GuestSsidInUseError()
+
+    @staticmethod
+    def _controller_setup_portal_name(
+        integration: NetworkIntegration, location_name: str | None
+    ) -> str:
+        """``Wyfy Guest - <venue> (<8 hex of the integration id>)``.
+
+        The id suffix is what makes the name safe to match on: two locations
+        of one customer on one site can share a display name, never a suffix.
+        Truncated on the venue part to the controller's 128-character limit,
+        and stripped of control characters and edge spaces its pattern
+        refuses.
+        """
+        suffix = f" ({integration.id.hex[:8]})"
+        label = " ".join((location_name or integration.name or "").split())
+        label = "".join(ch for ch in label if ch.isprintable())
+        base = (
+            f"{CONTROLLER_SETUP_PORTAL_NAME_PREFIX} - {label}"
+            if label
+            else CONTROLLER_SETUP_PORTAL_NAME_PREFIX
+        )
+        room = CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH - len(suffix)
+        return base[:room].rstrip() + suffix
+
+    @staticmethod
+    def _setup_block_error(block: ProviderControllerSetupBlock) -> Exception:
+        if block.kind == "ssid_portal_conflict":
+            return PortalConflictError(
+                block.message,
+                portal_id=block.portal_id,
+                portal_name=block.portal_name,
+            )
+        if block.kind == "guest_ssid_ambiguous":
+            return GuestSsidAmbiguousError(block.message, match_count=block.match_count)
+        return GuestSsidNotFoundError(block.message)
+
+    async def _record_setup_event(
+        self,
+        integration: NetworkIntegration,
+        *,
+        dry_run: bool,
+        ok: bool,
+        message: str,
+        error_code: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """The one event row a real run leaves behind. A dry run writes
+        nothing to this database, this row included."""
+        if dry_run:
+            return
+        await self._record_event(
+            integration,
+            event_type=IntegrationEventType.CONTROLLER_CONFIGURED,
+            status=IntegrationEventStatus.OK if ok else IntegrationEventStatus.ERROR,
+            error_code=error_code,
+            message=message,
+            context=context,
+        )
+
+    async def _configure_controller(
+        self,
+        integration: NetworkIntegration,
+        *,
+        actor_user_id: uuid.UUID | None,
+        dry_run: bool,
+        take_over_ssid_portal: bool,
+        platform_action: bool,
+    ) -> ControllerSetupOutcome:
+        """The run itself. Tenancy has already been settled by the caller.
+
+        ## Everything written derives from this row
+
+        The portal URL is ``validators.build_external_portal_url`` over this
+        row's own organization, location and fleet device -- the same URL the
+        integration card shows; the site, SSID and operator name are this
+        row's; nothing comes from the request except ``dry_run`` and
+        ``take_over_ssid_portal``. That is what makes the platform variant
+        safe to share this body.
+
+        ## Order of refusals, all before any controller write
+
+        preconditions (no controller contact) -> another tenant or another
+        location on this site (no controller contact) -> credentials readable
+        -> the provider's own read-only planning (SSID resolution, a foreign
+        portal on the SSID). Each refusal on a real run records one event.
+
+        ## The operator password
+
+        Generated here with ``secrets`` and encrypted *before* the controller
+        is asked to create the account, so a deployment that cannot store it
+        (the public-key refusal) refuses before anything is created. It is
+        stored only when the provider reports it was actually set on the
+        controller. It is never logged, returned, or put in an event.
+
+        Known edge, stated rather than hidden: two real runs racing on one
+        integration each generate a password, and the last database write may
+        not be the last controller write. The next run then reports the
+        stored login as refused, and the documented recovery (save the Open
+        API app alone and run again) resets this integration's own account.
+        """
+        provider_impl = self._provider(integration.provider)
+        gaps = self._controller_setup_gaps(integration, provider_impl)
+        if gaps:
+            error = ControllerSetupPreconditionsError(gaps)
+            await self._record_setup_event(
+                integration,
+                dry_run=dry_run,
+                ok=False,
+                message=error.message,
+                error_code=error.code.value,
+                context={"missing": [gap.value for gap in gaps]},
+            )
+            raise error
+
+        try:
+            await self._refuse_shared_controller_site(integration)
+        except (ControllerSiteSharedError, GuestSsidInUseError) as error:
+            await self._record_setup_event(
+                integration,
+                dry_run=dry_run,
+                ok=False,
+                message=error.message,
+                error_code=error.code.value,
+            )
+            raise
+
+        credentials = self._credentials_for(integration)
+        portal_url = build_external_portal_url(
+            organization_id=integration.organization_id,
+            location_id=integration.location_id,
+            router_id=integration.router_id,
+            provider=integration.provider,
+        )
+        if portal_url is None:  # pragma: no cover - excluded by the gaps above
+            raise ControllerSetupPreconditionsError(
+                [ControllerSetupGap.FLEET_DEVICE_MISSING]
+            )
+        pre_auth_host = portal_url.host_and_query.split("/", 1)[0]
+        _, location_name = (
+            await self.repository.resolve_display_names([integration])
+        ).get(integration.id, (None, None))
+        operator_name = f"{CONTROLLER_SETUP_OPERATOR_PREFIX}{integration.id.hex[:12]}"
+
+        has_operator = set(credentials) >= GUEST_OPERATOR_CREDENTIAL_FIELDS
+        new_password: str | None = None
+        pending_ciphertext: str | None = None
+        if not has_operator and not dry_run:
+            # ~190 bits, URL-safe alphabet: inside the operator password
+            # pattern (printable ASCII, 1-128 characters) by construction.
+            new_password = secrets.token_urlsafe(24)
+            pending_ciphertext = encrypt_credentials(
+                {**credentials, "username": operator_name, "password": new_password},
+                settings=self.settings,
+            )
+
+        request = ProviderControllerSetupRequest(
+            site_id=str(integration.external_site_id),
+            portal_name=self._controller_setup_portal_name(integration, location_name),
+            portal_url_scheme=portal_url.scheme,
+            portal_url_host_and_query=portal_url.host_and_query,
+            ownership_query=(
+                EXTERNAL_PORTAL_OWNERSHIP_PARAM,
+                str(integration.router_id),
+            ),
+            pre_auth_host=pre_auth_host,
+            auth_timeout_minutes=max(
+                1, -(-integration.session_duration_seconds // 60)
+            ),
+            operator_name=operator_name,
+            operator_note=(
+                f"Managed by Wyfy Guest for integration {integration.id}. "
+                "Do not edit or delete."
+            ),
+            operator_marker=str(integration.id),
+            guest_ssid_id=integration.guest_ssid_id,
+            guest_ssid_name=integration.guest_ssid_name,
+            create_operator_if_missing=not has_operator,
+            new_operator_password=new_password,
+            take_over_ssid_portal=take_over_ssid_portal,
+            dry_run=dry_run,
+        )
+        config = self._connection_config(integration, credentials)
+        try:
+            report = await provider_impl.configure_controller(config, request)
+        except ProviderError as error:
+            await self._record_setup_event(
+                integration,
+                dry_run=dry_run,
+                ok=False,
+                message=error.message,
+                error_code=error.code.value,
+                context={"provider_code": error.provider_code},
+            )
+            raise
+
+        if report.block is not None:
+            error = self._setup_block_error(report.block)
+            await self._record_setup_event(
+                integration,
+                dry_run=dry_run,
+                ok=False,
+                message=error.message,
+                error_code=error.code.value,
+                context={"block": report.block.kind},
+            )
+            raise error
+
+        saved: list[str] = []
+        if not dry_run:
+            updates: dict[str, object] = {}
+            resolved_ssid = report.guest_ssid_id
+            if resolved_ssid and resolved_ssid != integration.guest_ssid_id:
+                updates["guest_ssid_id"] = report.guest_ssid_id
+                saved.append("guest_ssid_id")
+            if report.operator_credentials_set and pending_ciphertext is not None:
+                updates["credentials_encrypted"] = pending_ciphertext
+                saved.append("hotspot_operator_login")
+            if updates:
+                updates["updated_by"] = actor_user_id
+                integration = await self.repository.update_integration(
+                    integration, updates
+                )
+
+        ok = all(step.outcome != _SETUP_FAILED for step in report.steps)
+        changed = any(step.outcome in _SETUP_CHANGING for step in report.steps)
+        summary = ", ".join(f"{step.step} {step.outcome}" for step in report.steps)
+        await self._record_setup_event(
+            integration,
+            dry_run=dry_run,
+            ok=ok,
+            message=(
+                f"Controller configured automatically: {summary}"
+                if ok
+                else f"Automatic controller configuration incomplete: {summary}"
+            ),
+            context={
+                "take_over_ssid_portal": take_over_ssid_portal,
+                "platform_action": platform_action,
+                "portal_id": report.portal_id,
+                "guest_ssid_id": report.guest_ssid_id,
+                "saved": saved,
+                "steps": [
+                    {
+                        "step": step.step,
+                        "outcome": step.outcome,
+                        "message": step.message,
+                        "provider_code": step.provider_code,
+                        "details": step.details,
+                    }
+                    for step in report.steps
+                ],
+            },
+        )
+        if not dry_run:
+            await self._write_audit(
+                action=NetworkIntegrationAuditAction.CONTROLLER_CONFIGURED,
+                actor_user_id=actor_user_id,
+                integration=integration,
+                description=(
+                    f"Controller for network integration '{integration.name}' "
+                    f"configured automatically"
+                    f"{' by a platform operator' if platform_action else ''}: "
+                    f"{summary}"
+                ),
+                metadata={
+                    "platform_action": platform_action,
+                    "take_over_ssid_portal": take_over_ssid_portal,
+                    "outcomes": {step.step: step.outcome for step in report.steps},
+                },
+            )
+        return ControllerSetupOutcome(
+            integration_id=integration.id,
+            dry_run=dry_run,
+            ok=ok,
+            changed=changed,
+            steps=report.steps,
+            portal_id=report.portal_id,
+            guest_ssid_id=report.guest_ssid_id,
+            portal_url_scheme=portal_url.scheme,
+            portal_url_host_and_query=portal_url.host_and_query,
+            pre_auth_host=pre_auth_host,
         )
 
     async def probe_controller_draft(
