@@ -129,6 +129,48 @@ class TestBlockParsing:
         _, removed = radius_agent._strip_clients_with_shortname(text, "cg-5d3a509e")
         assert len(removed) == 1
 
+    def test_a_block_with_no_shortname_line_answers_to_its_label(self) -> None:
+        """FreeRADIUS defaults shortname to the ``client <name>`` label when
+        the directive is absent, so a stanza written without one still
+        answers to that name at runtime -- and this parser has to agree.
+
+        Reporting ``None`` instead made such a block undeletable by any
+        request, because ``None`` equals nothing a caller can ask for. The
+        live hub's ``client cloudguest-dynamic-wan { ipaddr = 0.0.0.0/0 }``
+        had no shortname line, so every DELETE for it answered
+        ``{"removed": 0}`` -- indistinguishable from "already gone". A
+        wildcard client with a fixed shared secret survived weeks of
+        deletion attempts on that one word.
+        """
+        text = _STOCK_PREAMBLE + (
+            "client cloudguest-dynamic-wan {\n"
+            "\tipaddr = 0.0.0.0/0\n"
+            "\tsecret = doesnotmatter\n"
+            "\trequire_message_authenticator = yes\n"
+            "}\n"
+        )
+        blocks = radius_agent._split_client_blocks(text)
+        assert blocks[-1][2] == "cloudguest-dynamic-wan"
+
+        out, removed = radius_agent._strip_clients_with_shortname(
+            text, "cloudguest-dynamic-wan"
+        )
+        assert len(removed) == 1
+        assert "0.0.0.0/0" not in out
+        assert "cloudguest-dynamic-wan" not in out
+
+    def test_an_explicit_shortname_still_wins_over_the_label(self) -> None:
+        """The fallback must not become a second way to name a stanza: a
+        block that declares a shortname is reachable by that and by nothing
+        else, or `cg-cg-*` labels start matching too."""
+        text = _STOCK_PREAMBLE + _stanza("cg-5d3a509e", "10.20.0.28")
+        blocks = radius_agent._split_client_blocks(text)
+        assert blocks[-1][2] == "cg-5d3a509e"
+        _, removed = radius_agent._strip_clients_with_shortname(
+            text, "cg-cg-5d3a509e"
+        )
+        assert removed == []
+
 
 # ---------------------------------------------------------------------------
 # Removal
