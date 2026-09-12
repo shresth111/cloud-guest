@@ -92,7 +92,7 @@ from app.core.logging import get_logger
 from app.database.utils.pagination import PaginationMeta
 from app.domains.monitored_hardware.constants import HardwareStatus
 from app.domains.monitored_hardware.service import MonitoredHardwareService
-from app.domains.network_integration.constants import ErrorCode, IntegrationStatus
+from app.domains.network_integration.constants import IntegrationStatus
 from app.domains.organization.exceptions import CrossOrganizationAccessError
 from app.domains.otp.service import (
     EmailProviderProtocol,

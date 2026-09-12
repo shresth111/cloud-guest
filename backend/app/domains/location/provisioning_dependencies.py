@@ -46,6 +46,7 @@ from app.domains.billing.service import PlanService, SubscriptionService
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.monitoring.default_alerting import ensure_default_alerting
+
 # Aliased on import, both of them. `monitoring` and `notification` each
 # export a class called `NotificationService` and a provider called
 # `get_notification_service`, and they are different objects for different
@@ -55,10 +56,14 @@ from app.domains.monitoring.default_alerting import ensure_default_alerting
 # wrong one.
 from app.domains.monitoring.dependencies import (
     get_alert_service,
+)
+from app.domains.monitoring.dependencies import (
     get_notification_service as get_alert_notification_service,
 )
 from app.domains.monitoring.service import (
     AlertService,
+)
+from app.domains.monitoring.service import (
     NotificationService as AlertNotificationService,
 )
 from app.domains.notification.dependencies import get_notification_service
