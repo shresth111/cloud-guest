@@ -136,6 +136,7 @@ from .exceptions import (
     ControllerSiteSharedError,
     CrossLocationNetworkIntegrationAccessError,
     CrossOrganizationNetworkIntegrationAccessError,
+    GuestOperatorLoginRequiredError,
     GuestSessionNotActiveError,
     GuestSsidAmbiguousError,
     GuestSsidInUseError,
@@ -2067,6 +2068,111 @@ class NetworkIntegrationService:
                 f"'{updated.name}'"
             ),
             metadata={"auth_mode": mode.value},
+        )
+        return updated
+
+    async def clear_operator_credentials(
+        self,
+        integration_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> NetworkIntegration:
+        """Forget the stored hotspot operator login, keep the Open API app.
+
+        ## Why this exists as its own operation
+
+        :meth:`rotate_credentials` is a wholesale overwrite that re-validates
+        against the declared mode, so in ``openapi`` mode it *requires* the
+        client id and secret. That makes "drop the operator pair" impossible
+        for anyone who cannot produce the Open API secret a second time --
+        and the secret is shown once, on the controller screen that created
+        it. A venue whose stored operator login is wrong is then stuck:
+        ``configure_controller`` will not mint a replacement account while
+        ``has_operator`` is true, and the only documented recovery is the one
+        rotation they cannot perform.
+
+        Measured on hardware 2026-09-13, which is what prompted this: an
+        integration had the controller's *admin* account stored as its
+        operator. Omada's hotspot login accepts operator accounts only, so it
+        answered ``-30109`` forever, and the obvious repair -- create an
+        operator of that name -- is refused by the controller because admin
+        and operator names share one namespace. No password could have fixed
+        it; only forgetting the pair could.
+
+        ## Why it does not decrypt-and-rewrite blindly
+
+        It does decrypt, which :meth:`rotate_credentials` deliberately never
+        does -- but the plaintext never leaves this frame, nothing is logged
+        from it, and only the two operator keys are removed. Everything else
+        is re-encrypted exactly as it was read. The alternative (store the
+        client pair in a second column so it can be preserved without a
+        decrypt) is a migration and a second place for a secret to live,
+        which is worse.
+
+        Idempotent: an integration with no operator pair is already in the
+        requested state, so this returns it untouched rather than raising.
+        A caller retrying after a dropped response must not get an error.
+        """
+        integration = await self._load_owned_integration(
+            integration_id, requesting_organization_id=requesting_organization_id
+        )
+        if integration.auth_mode != ControllerAuthMode.OPENAPI.value:
+            raise GuestOperatorLoginRequiredError()
+
+        credentials = self._credentials_for(integration)
+        remaining = {
+            key: value
+            for key, value in credentials.items()
+            if key not in GUEST_OPERATOR_CREDENTIAL_FIELDS
+        }
+        if remaining.keys() == credentials.keys():
+            return integration
+
+        updates: dict[str, object] = {
+            "credentials_encrypted": encrypt_credentials(
+                remaining, settings=self.settings
+            ),
+            # The previous status was earned by a credential set that no
+            # longer exists, exactly as in a rotation. "Not proven yet" is
+            # the honest claim until something authenticates again.
+            "status": (
+                IntegrationStatus.CONNECTING.value
+                if integration.is_enabled
+                else IntegrationStatus.DISABLED.value
+            ),
+            "last_error_code": None,
+            "last_error_message": None,
+            "last_error_at": None,
+            "updated_by": actor_user_id,
+        }
+        self._reset_failure_counter(integration, updates)
+        updated = await self.repository.update_integration(integration, updates)
+        await self._record_event(
+            updated,
+            event_type=IntegrationEventType.CREDENTIALS_ROTATED,
+            status=IntegrationEventStatus.OK,
+            message=(
+                "Stored hotspot operator login forgotten. The Open API app "
+                "is unchanged; Configure controller will now create a "
+                "dedicated operator account."
+            ),
+            # Field *names* only, never a value or a length -- the same rule
+            # rotation follows.
+            context={
+                "auth_mode": integration.auth_mode,
+                "credential_fields": sorted(remaining),
+            },
+        )
+        await self._write_audit(
+            action=NetworkIntegrationAuditAction.CREDENTIALS_ROTATED,
+            actor_user_id=actor_user_id,
+            integration=updated,
+            description=(
+                f"Hotspot operator login cleared for network integration "
+                f"'{updated.name}'"
+            ),
+            metadata={"auth_mode": updated.auth_mode, "cleared": "guest_operator"},
         )
         return updated
 

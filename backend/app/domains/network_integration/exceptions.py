@@ -240,6 +240,31 @@ class NetworkIntegrationUrlRejectedError(NetworkIntegrationError):
         )
 
 
+class GuestOperatorLoginRequiredError(NetworkIntegrationError):
+    """Asked to forget the hotspot operator login on a legacy-mode row.
+
+    In ``legacy`` mode that pair is the whole credential: dropping it would
+    leave an integration that cannot authenticate and cannot be repaired
+    from the dashboard, which is materially "delete this integration"
+    wearing a different name. Open API mode is the case this operation
+    exists for -- there the client pair keeps working and the operator pair
+    is the disposable half.
+
+    409 rather than 422: the request is well-formed and the caller has the
+    right idea, it is this integration that cannot answer it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This integration signs in with the hotspot operator account "
+            "itself, so that login cannot be forgotten -- it is the only "
+            "credential it has. Switch it to an Open API app first, or "
+            "replace the operator credentials instead.",
+            status_code=status.HTTP_409_CONFLICT,
+            code=ErrorCode.GUEST_OPERATOR_REQUIRED,
+        )
+
+
 class NetworkIntegrationTlsPinRequiredError(NetworkIntegrationError):
     """``tls_mode='pinned'`` with no usable fingerprint on the request.
 

@@ -58,6 +58,7 @@ from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.network_integration import crypto as crypto_module
 from app.domains.network_integration.constants import (
     DEFAULT_PORTAL_AUTH_MODE,
+    GUEST_OPERATOR_CREDENTIAL_FIELDS,
     MAX_SESSION_DURATION_SECONDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
     PORTAL_REDIRECT_STALE_AFTER_SECONDS,
@@ -83,6 +84,7 @@ from app.domains.network_integration.crypto import (
 from app.domains.network_integration.exceptions import (
     PROVIDER_ERRORS_BY_CODE,
     CrossOrganizationNetworkIntegrationAccessError,
+    GuestOperatorLoginRequiredError,
     GuestSessionNotActiveError,
     NetworkIntegrationDeauthorizationUnsupportedError,
     NetworkIntegrationDisabledError,
@@ -4608,11 +4610,11 @@ class TestEveryRouteRequiresPermission:
     def test_every_route_on_router_requires_global_scope(self) -> None:
         """Structural enforcement promised by the router module docstring:
         a new route added to ``router`` without ``scope=ScopeType.GLOBAL``
-        fails the suite.  This covers all 30 routes, not only the
+        fails the suite.  This covers all 31 routes, not only the
         ``/platform/`` subset above."""
         from app.domains.rbac.enums import ScopeType
 
-        assert len(integration_router.routes) == 30
+        assert len(integration_router.routes) == 31
         for route in integration_router.routes:
             scopes = []
             for dep in route.dependant.dependencies:
@@ -6040,3 +6042,154 @@ class TestExternalSiteIdMustBeAnId:
             {"external_site_id": site}
         )
         assert parsed.external_site_id == site
+
+
+class TestForgettingTheHotspotOperatorLogin:
+    """The escape hatch from an operator account that can never work.
+
+    Found on hardware 2026-09-13: an Open API integration had the
+    controller's *admin* account stored as its hotspot operator. Omada's
+    hotspot login accepts operator accounts only, so it answered -30109
+    forever; creating an operator of that name is refused by the controller
+    because admin and operator names share one namespace. No password could
+    fix it. Rotation could not either -- it overwrites the whole set and so
+    demands the Open API secret, which is shown once and was long gone --
+    and `configure_controller` refuses to mint a replacement while an
+    operator pair is stored. The row was unrecoverable from the dashboard.
+    """
+
+    async def test_it_drops_the_operator_pair_and_keeps_the_open_api_app(
+        self,
+    ) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+
+        updated = await service.clear_operator_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        stored = decrypt_credentials(updated.credentials_encrypted)
+        assert stored == {"client_id": "cid", "client_secret": "shh"}
+
+    async def test_configure_controller_will_now_create_an_operator(self) -> None:
+        """The whole point: `create_operator_if_missing` is derived from
+        whether an operator pair is stored, so clearing it re-arms the
+        automatic account creation that was switched off."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+
+        updated = await service.clear_operator_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        stored = decrypt_credentials(updated.credentials_encrypted)
+        assert not set(stored) >= GUEST_OPERATOR_CREDENTIAL_FIELDS
+
+    async def test_the_status_stops_claiming_a_connection_it_no_longer_has(
+        self,
+    ) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                status=IntegrationStatus.AUTH_FAILED.value,
+                last_error_code=ErrorCode.AUTH_FAILED.value,
+                last_error_message="rejected",
+            )
+        )
+        service = _service(repo)
+
+        updated = await service.clear_operator_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        assert updated.status == IntegrationStatus.CONNECTING.value
+        assert updated.last_error_code is None
+        assert updated.last_error_message is None
+
+    async def test_it_is_idempotent(self) -> None:
+        """A caller retrying after a dropped response must not get an error."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(organization_id=org, with_guest_operator=False)
+        )
+        service = _service(repo)
+
+        updated = await service.clear_operator_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        assert decrypt_credentials(updated.credentials_encrypted) == {
+            "client_id": "cid",
+            "client_secret": "shh",
+        }
+
+    async def test_legacy_mode_is_refused_because_that_pair_is_all_it_has(
+        self,
+    ) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                auth_mode=ControllerAuthMode.LEGACY.value,
+            )
+        )
+        service = _service(repo)
+
+        with pytest.raises(GuestOperatorLoginRequiredError) as excinfo:
+            await service.clear_operator_credentials(
+                integration.id,
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+
+        assert excinfo.value.code is ErrorCode.GUEST_OPERATOR_REQUIRED
+
+    async def test_another_tenant_cannot_clear_it(self) -> None:
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=uuid.uuid4()))
+        service = _service(repo)
+
+        with pytest.raises(CrossOrganizationNetworkIntegrationAccessError):
+            await service.clear_operator_credentials(
+                integration.id,
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+    async def test_the_event_names_no_secret(self) -> None:
+        """Field names only -- the rule rotation already follows."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+
+        await service.clear_operator_credentials(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        event = repo.events[-1]
+        assert event.context["credential_fields"] == [
+            "client_id",
+            "client_secret",
+        ]
+        serialized = repr(event.context) + str(event.message)
+        assert "shh" not in serialized
+        assert "pw" not in serialized
