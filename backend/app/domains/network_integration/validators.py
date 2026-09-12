@@ -115,6 +115,10 @@ __all__ = [
     "normalize_tls_fingerprint",
     "parse_controller_url",
     "portal_readiness_gaps",
+    "OMADA_SITE_ID_PATTERN",
+    "OMADA_SITE_ID_EXAMPLE",
+    "is_omada_site_id",
+    "validate_external_site_id",
     "portal_redirect_timestamp_age_seconds",
     "summarize_redirect_url",
     "synthesize_fleet_identity",
@@ -738,6 +742,117 @@ def describe_portal_readiness_gaps(gaps: Sequence[PortalReadinessGap]) -> str:
         "Until it is finished, guests at this venue complete sign-in and "
         "still have no internet."
     )
+
+
+# ============================================================================
+# `external_site_id` must be an ID, never a display name
+# ============================================================================
+
+#: An Omada site id: 24 lowercase hex characters (a MongoDB ObjectId).
+#:
+#: VERIFIED on one controller -- Omada Software Controller 5.15.24.19, site
+#: named ``wyfyguest``, id ``6aa3913c3ee1605f71ac35a1``, read off its own
+#: portal redirect on 2026-09-12. The same alphabet is what ``omadacId``
+#: uses, at 32 characters. UNVERIFIED across other controller generations,
+#: which is precisely why the pattern is declared ONCE, here: if a real id
+#: ever fails this check, widening it is a one-line change in a named place
+#: rather than a hunt through four call sites.
+OMADA_SITE_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+
+#: A real one, for error messages. Ours.
+OMADA_SITE_ID_EXAMPLE = "6aa3913c3ee1605f71ac35a1"
+
+
+def is_omada_site_id(value: str) -> bool:
+    """Does this look like an Omada site id rather than a site name?"""
+    return bool(OMADA_SITE_ID_PATTERN.match(value.strip()))
+
+
+def validate_external_site_id(value: str | None) -> str | None:
+    """Refuse a site *name* where a site *id* belongs.
+
+    ## What went wrong, and what it cost
+
+    The live QA integration was stored with ``external_site_id`` =
+    ``"wyfyguest"`` and ``external_site_name`` = ``"wyfyguest"``. The
+    controller's real site id is ``6aa3913c3ee1605f71ac35a1``. One wizard
+    field fed both columns and its help text invited either -- "The ``site=``
+    value in the guest's sign-in URL, or the site id".
+
+    They are not alternatives. VERIFIED against the live controller on
+    2026-09-12 by driving its own ``/portal/entry`` with no wireless client
+    involved::
+
+        Location: https://auth.wyfyguest.com/portal?...
+                    &site=6aa3913c3ee1605f71ac35a1&...
+
+    The redirect carries the **id**. It has never carried the name.
+
+    Two independent things therefore break when a name is stored:
+
+    1. ``service.authorize_portal_client`` compares the redirect's ``site``
+       against this column and refuses a mismatch with the same
+       deliberately-indistinguishable 403 every other failure returns. So a
+       name-stored integration turns away EVERY guest at the venue, and the
+       guest-visible symptom carries no hint of the cause. The venue's own
+       event row says ``SITE_NOT_FOUND`` and names a "requested site" the
+       operator has never seen, because it is an id and they typed a name.
+
+    2. This column is passed straight through as ``site_id`` into
+       ``/{omadacId}/api/v2/sites/{siteId}/...`` -- listing devices and
+       clients, writing the external-portal configuration, disconnecting a
+       guest. A name in that position addresses a site that does not exist.
+
+    ## Why a name cannot simply be resolved to an id here
+
+    Because on the credentials this integration actually uses, there is no
+    call that can do it. Resolving a name needs the site list
+    (``provider.list_sites``), and CR-002: a hotspot-operator login -- the
+    ``legacy`` auth mode, which the live QA integration uses -- **cannot read
+    inventory at all**. The controller's refusal reads as "wrong password",
+    so a resolve-on-write would report a credential fault for a correct
+    credential.
+
+    Where resolution IS possible -- ``openapi`` mode, with an Open API
+    application's client id and secret -- it already exists and is already
+    wired: ``service._inventory_for_integration`` lists the sites and the
+    console renders a picker (``OmadaSiteMapping``). That path produces an
+    id by construction and never reaches the failure this function refuses.
+
+    So: **openapi mode picks from the real list; legacy mode types the id in
+    by hand; neither mode ever accepts a name.** An operator reads the id the
+    one way it is always available to them -- connect a phone to the guest
+    WiFi and take the ``site=`` value out of the address bar when the sign-in
+    page appears.
+
+    ## Why refusing beats storing
+
+    What shipped stores the value, passes it into every controller call, and
+    surfaces the mistake as "guests at this venue cannot get online" with no
+    error anywhere naming the field. Refusing costs an operator one
+    re-read of a value they can obtain in under a minute, and it fails at
+    the moment they are looking at the field.
+
+    Returns the stripped value, or ``None`` when nothing was supplied --
+    "no site selected yet" is a legal state (``PortalReadinessGap
+    .SITE_NOT_SELECTED`` reports it) and is not this function's business.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if not is_omada_site_id(stripped):
+        raise ValueError(
+            "external_site_id must be the Omada site id -- 24 letters and "
+            f"digits, for example {OMADA_SITE_ID_EXAMPLE} -- not the site's "
+            "name. It is the site= value on the controller's own portal "
+            "redirect, which an operator can read out of the address bar "
+            "when the guest sign-in page appears. A name here is stored, "
+            "sent to the controller as a site that does not exist, and "
+            "refuses every guest at the venue."
+        )
+    return stripped
 
 
 # ============================================================================

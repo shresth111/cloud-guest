@@ -16,6 +16,7 @@ live Postgres/Redis in this environment.
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -36,6 +37,12 @@ from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.audit_changes import (
+    OPAQUE_ROUTER_FIELDS,
+    REDACTED_ROUTER_FIELDS,
+    describe_router_changes,
+    router_field_changes,
+)
 from app.domains.router.constants import (
     ROUTER_REACHABILITY_HITS_TO_RESOLVE,
     ROUTER_REACHABILITY_MISSES_TO_ALERT,
@@ -367,8 +374,7 @@ class FakeRouterRepository:
             (r, self.agent_contact[r.id])
             for r in self.routers.values()
             if not r.is_deleted
-            and r.status
-            in (RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value)
+            and r.status in (RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value)
             and r.id in self.agent_contact
         ]
 
@@ -2254,6 +2260,8 @@ class TestLivenessFieldsSurviveOnTheCustomerShape:
             "created_at",
             "updated_at",
         } <= set(RouterResponse.model_fields)
+
+
 # api_secret/api_username: RouterOS script injection hardening
 #
 # GatewayDeviceCredentialRotator.rotate_password interpolates these values
@@ -2650,9 +2658,9 @@ class TestSweepRouterReachability:
         assert result["skipped_platform_gap"] == 1
         assert result["marked_unreachable"] == 0
         assert repo.routers[router.id].reachability_state is None
-        assert repo.routers[router.id].reachability_consecutive_misses == 0, (
-            "a window we slept through must not even count as a miss"
-        )
+        assert (
+            repo.routers[router.id].reachability_consecutive_misses == 0
+        ), "a window we slept through must not even count as a miss"
 
     async def test_a_first_ever_run_judges_nobody(self) -> None:
         """No recorded previous sweep means a cold worker. Failing safe
@@ -3000,9 +3008,9 @@ class TestSweepRouterReachability:
         assert (
             stored.reachability_state == RouterReachabilityState.UNREACHABLE.value
         ), "the fast verdict is in"
-        assert stored.status == RouterStatus.ONLINE.value, (
-            "but Router.status is untouched -- it belongs to the 15-minute sweep"
-        )
+        assert (
+            stored.status == RouterStatus.ONLINE.value
+        ), "but Router.status is untouched -- it belongs to the 15-minute sweep"
         assert stored.health_status == RouterHealthStatus.HEALTHY.value
         assert stored.last_seen_at == now - timedelta(seconds=200)
 
@@ -3067,9 +3075,9 @@ class TestReachabilitySweepIsActuallyScheduled:
         assert entry is not None, "the fast outage path has no Beat entry"
         assert entry["task"] == TASK_RUN_ROUTER_REACHABILITY_SWEEP
         assert entry["schedule"] == ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS
-        assert TASK_RUN_ROUTER_REACHABILITY_SWEEP in celery_app.tasks, (
-            "scheduled under a task name nothing registered"
-        )
+        assert (
+            TASK_RUN_ROUTER_REACHABILITY_SWEEP in celery_app.tasks
+        ), "scheduled under a task name nothing registered"
 
     def test_the_two_minute_budget_still_adds_up(self) -> None:
         """The founder's number, as arithmetic rather than as a comment.
@@ -3107,3 +3115,551 @@ class TestReachabilitySweepIsActuallyScheduled:
             f"recovery needs only {recovery_seconds}s of uptime; the real "
             "outage came back for ~4 minutes before dropping again"
         )
+
+
+# ============================================================================
+# Router update audit detail -- what actually changed
+# ============================================================================
+
+
+def _router_updated_entries(audit: FakeAuditLogWriter) -> list[dict[str, object]]:
+    return [e for e in audit.entries if e["action"] == "router_updated"]
+
+
+def _only_router_updated_entry(audit: FakeAuditLogWriter) -> dict[str, object]:
+    entries = _router_updated_entries(audit)
+    assert len(entries) == 1, entries
+    return entries[0]
+
+
+def _changes_of(entry: dict[str, object]) -> dict[str, dict[str, object]]:
+    """The change set as the audit reader sees it.
+
+    ``FakeAuditLogWriter`` records the kwargs ``_audit`` passes through, so
+    the metadata lives under ``event_metadata`` -- the column name, not the
+    ``metadata=`` parameter name ``RouterService._audit`` takes.
+    """
+    metadata = entry["event_metadata"]
+    assert isinstance(metadata, dict), metadata
+    assert set(metadata) == {"changes"}, metadata
+    changes = metadata["changes"]
+    assert isinstance(changes, dict), changes
+    return changes
+
+
+def _redacted_keys(changes: dict[str, dict[str, object]], *stems: str) -> list[str]:
+    """Keys recorded as redacted whose name contains one of ``stems``.
+
+    The service renames ``api_secret`` to ``api_credentials_encrypted`` on
+    its way to the column, so the audited key may be either spelling. What
+    matters for this suite is that *some* key names the field and that its
+    value carries no ``from``/``to``.
+    """
+    return [
+        key
+        for key, delta in changes.items()
+        if delta == {"redacted": True} and any(stem in key for stem in stems)
+    ]
+
+
+async def _audited_router(
+    repo: FakeRouterRepository,
+    organization_id: uuid.UUID,
+    **attributes: object,
+) -> Router:
+    """A router with ``attributes`` forced on directly.
+
+    ``Router.vendor`` carries a SQLAlchemy column ``default``, which fires on
+    INSERT and never on plain instantiation -- and these fakes never reach a
+    database. A router built by ``make_router`` therefore has ``vendor is
+    None``, which is not the state any of these tests are about.
+    """
+    router_device = await make_router(
+        repo, location_id=uuid.uuid4(), organization_id=organization_id
+    )
+    for key, value in attributes.items():
+        setattr(router_device, key, value)
+    return router_device
+
+
+class TestRouterUpdateAuditDetail:
+    """``router_updated`` has to say what changed, not merely that something did.
+
+    On 2026-09-10 seven routers were silently relabelled to ``tplink_omada``.
+    The audit trail recorded the fact of each update and nothing else --
+    ``Router 'X' updated``, with ``event_metadata`` an empty ``{}`` -- so
+    there was no way to learn from the log which field had moved or what it
+    had moved from. Recovering the old vendor values meant diffing the
+    database by hand against a backup.
+
+    So the update audit now carries a change set: every field that actually
+    moved, with its before and after, and a human-readable summary in the
+    description so the answer is visible without opening the metadata. The
+    hard constraint is that gaining this detail must not turn the audit log
+    into a place secrets are written down -- see the redaction tests below,
+    which are the load-bearing half of this class.
+    """
+
+    async def test_a_vendor_change_records_the_old_and_the_new_vendor(self) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"vendor": "tplink_omada"},
+        )
+
+        entry = _only_router_updated_entry(audit)
+        assert _changes_of(entry)["vendor"] == {
+            "from": "mikrotik",
+            "to": "tplink_omada",
+        }
+        # The bit a human sees without opening the metadata column -- the
+        # 2026-09-10 investigation never got that far.
+        assert "vendor mikrotik -> tplink_omada" in entry["description"]
+
+    async def test_the_description_names_the_router_and_lists_the_change(self) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"vendor": "tplink_omada"},
+        )
+
+        entry = _only_router_updated_entry(audit)
+        assert entry["description"] == (
+            "Router 'Front Desk AP' updated: vendor mikrotik -> tplink_omada"
+        )
+
+    async def test_a_multi_field_update_records_every_field_that_moved(self) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(
+            repo,
+            organization.id,
+            vendor="mikrotik",
+            management_ip_address="10.0.0.1",
+        )
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={
+                "name": "Office Guest",
+                "vendor": "tplink_omada",
+                "management_ip_address": "10.0.9.9",
+            },
+        )
+
+        entry = _only_router_updated_entry(audit)
+        changes = _changes_of(entry)
+        assert changes["name"] == {"from": "Front Desk AP", "to": "Office Guest"}
+        assert changes["vendor"] == {"from": "mikrotik", "to": "tplink_omada"}
+        assert changes["management_ip_address"] == {
+            "from": "10.0.0.1",
+            "to": "10.0.9.9",
+        }
+
+    async def test_the_description_names_every_field_of_a_multi_field_update(
+        self,
+    ) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(
+            repo,
+            organization.id,
+            vendor="mikrotik",
+            management_ip_address="10.0.0.1",
+        )
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={
+                "name": "Office Guest",
+                "vendor": "tplink_omada",
+                "management_ip_address": "10.0.9.9",
+            },
+        )
+
+        description = _only_router_updated_entry(audit)["description"]
+        # The new name, because the description describes the router as it
+        # now stands and the change list says where it came from.
+        assert description.startswith("Router 'Office Guest' updated: ")
+        assert "name 'Front Desk AP' -> 'Office Guest'" in description
+        assert "vendor mikrotik -> tplink_omada" in description
+        assert "management_ip_address 10.0.0.1 -> 10.0.9.9" in description
+
+    async def test_an_update_that_changes_nothing_records_an_empty_change_set(
+        self,
+    ) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"name": router_device.name},
+        )
+
+        assert _changes_of(_only_router_updated_entry(audit)) == {}
+
+    async def test_an_update_that_changes_nothing_says_so_without_a_field_list(
+        self,
+    ) -> None:
+        """A trailing ``: `` with nothing after it reads as a truncated log."""
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"name": router_device.name},
+        )
+
+        description = _only_router_updated_entry(audit)["description"]
+        assert description == "Router 'Front Desk AP' updated"
+        assert ":" not in description
+
+    async def test_an_api_secret_never_reaches_any_audit_entry(self) -> None:
+        """The load-bearing one: detail must not become disclosure."""
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"api_secret": "sup3r-s3cret-value", "vendor": "tplink_omada"},
+        )
+
+        assert audit.entries
+        for entry in audit.entries:
+            serialized = json.dumps(entry, default=str)
+            assert "sup3r-s3cret-value" not in serialized, entry
+
+    async def test_an_api_secret_change_is_named_but_carries_no_value(self) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"api_secret": "sup3r-s3cret-value", "vendor": "tplink_omada"},
+        )
+
+        changes = _changes_of(_only_router_updated_entry(audit))
+        named = _redacted_keys(changes, "api_secret", "api_credentials")
+        assert named, changes
+        for key in named:
+            assert changes[key] == {"redacted": True}
+            assert "from" not in changes[key]
+            assert "to" not in changes[key]
+
+    async def test_a_non_secret_field_changed_alongside_a_secret_is_still_recorded(
+        self,
+    ) -> None:
+        """Redaction is per field. One secret in the payload must not blank
+        out the rest of the change set -- that would reproduce the 2026-09-10
+        blindness for any update that happened to rotate a credential."""
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"api_secret": "sup3r-s3cret-value", "vendor": "tplink_omada"},
+        )
+
+        entry = _only_router_updated_entry(audit)
+        assert _changes_of(entry)["vendor"] == {
+            "from": "mikrotik",
+            "to": "tplink_omada",
+        }
+        assert "vendor mikrotik -> tplink_omada" in entry["description"]
+
+    async def test_an_snmp_community_never_reaches_any_audit_entry(self) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"snmp_community": "sup3r-s3cret-value", "vendor": "tplink_omada"},
+        )
+
+        assert audit.entries
+        for entry in audit.entries:
+            serialized = json.dumps(entry, default=str)
+            assert "sup3r-s3cret-value" not in serialized, entry
+
+    async def test_an_snmp_community_change_is_named_but_carries_no_value(self) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"snmp_community": "sup3r-s3cret-value", "vendor": "tplink_omada"},
+        )
+
+        changes = _changes_of(_only_router_updated_entry(audit))
+        named = _redacted_keys(changes, "snmp_community")
+        assert named, changes
+        for key in named:
+            assert changes[key] == {"redacted": True}
+        assert changes["vendor"] == {"from": "mikrotik", "to": "tplink_omada"}
+
+    async def test_the_encrypted_columns_never_carry_a_from_or_a_to(self) -> None:
+        """Fernet ciphertext is still the secret, just wearing a hat. The
+        column the service actually writes is the encrypted one, so the
+        redaction has to hold at that spelling and not only at the
+        write-only ``api_secret``/``snmp_community`` request fields."""
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={
+                "api_secret": "sup3r-s3cret-value",
+                "snmp_community": "public-ish-but-still-a-credential",
+                "vendor": "tplink_omada",
+            },
+        )
+
+        encrypted_columns = ("api_credentials_encrypted", "snmp_community_encrypted")
+        for entry in _router_updated_entries(audit):
+            changes = _changes_of(entry)
+            for column in encrypted_columns:
+                delta = changes.get(column)
+                if delta is None:
+                    continue
+                assert "from" not in delta, (column, delta)
+                assert "to" not in delta, (column, delta)
+                assert delta == {"redacted": True}, (column, delta)
+
+    async def test_the_stored_ciphertext_itself_never_appears_in_an_entry(self) -> None:
+        service, repo, _location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        router_device = await _audited_router(repo, organization.id, vendor="mikrotik")
+
+        updated = await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"api_secret": "sup3r-s3cret-value"},
+        )
+        ciphertext = updated.api_credentials_encrypted
+        assert ciphertext  # the service really did store something
+
+        for entry in audit.entries:
+            assert ciphertext not in json.dumps(entry, default=str), entry
+
+
+class TestRouterFieldChangeHelpers:
+    """``router_field_changes``/``describe_router_changes`` on their own.
+
+    The service tests above prove the wiring; these pin the encoding, so a
+    future refactor of the helpers cannot quietly change what the audit log
+    means. Same 2026-09-10 incident -- see ``TestRouterUpdateAuditDetail``.
+    """
+
+    def test_an_unchanged_field_is_absent_rather_than_recorded_as_equal(self) -> None:
+        changes = router_field_changes(
+            {"name": "Lobby AP", "vendor": "mikrotik"},
+            {"name": "Lobby AP", "vendor": "tplink_omada"},
+        )
+        assert "name" not in changes
+        assert changes == {"vendor": {"from": "mikrotik", "to": "tplink_omada"}}
+
+    def test_nothing_changed_is_an_empty_change_set(self) -> None:
+        assert router_field_changes({"name": "Lobby AP"}, {"name": "Lobby AP"}) == {}
+
+    def test_a_uuid_is_recorded_as_its_string_form(self) -> None:
+        before_id = uuid.uuid4()
+        after_id = uuid.uuid4()
+
+        changes = router_field_changes({"tag": before_id}, {"tag": after_id})
+
+        assert changes == {"tag": {"from": str(before_id), "to": str(after_id)}}
+        json.dumps(changes)  # must survive the JSONB column as-is
+
+    def test_a_datetime_is_recorded_as_its_string_form(self) -> None:
+        before_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+        after_at = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+
+        changes = router_field_changes(
+            {"last_seen_at": before_at}, {"last_seen_at": after_at}
+        )
+
+        assert changes == {
+            "last_seen_at": {"from": str(before_at), "to": str(after_at)}
+        }
+        json.dumps(changes)
+
+    def test_a_field_arriving_from_none_records_none_not_a_missing_key(self) -> None:
+        changes = router_field_changes(
+            {"management_ip_address": None}, {"management_ip_address": "10.0.0.1"}
+        )
+        assert changes == {"management_ip_address": {"from": None, "to": "10.0.0.1"}}
+
+    def test_a_field_cleared_to_none_is_still_a_recorded_change(self) -> None:
+        changes = router_field_changes(
+            {"management_ip_address": "10.0.0.1"}, {"management_ip_address": None}
+        )
+        assert changes == {"management_ip_address": {"from": "10.0.0.1", "to": None}}
+
+    def test_none_renders_as_lowercase_none_in_the_description(self) -> None:
+        changes = router_field_changes(
+            {"management_ip_address": None}, {"management_ip_address": "10.0.0.1"}
+        )
+        assert (
+            describe_router_changes(changes) == "management_ip_address none -> 10.0.0.1"
+        )
+
+    def test_only_a_value_containing_a_space_is_quoted(self) -> None:
+        changes = router_field_changes(
+            {"name": "Lobby AP", "vendor": "mikrotik"},
+            {"name": "Office Guest", "vendor": "tplink_omada"},
+        )
+        assert describe_router_changes(changes) == (
+            "name 'Lobby AP' -> 'Office Guest', vendor mikrotik -> tplink_omada"
+        )
+
+    def test_the_named_secret_fields_are_redacted_by_name_only(self) -> None:
+        for field_name in (
+            "api_secret",
+            "api_credentials_encrypted",
+            "snmp_community",
+            "snmp_community_encrypted",
+            "token_hash",
+            "password",
+            "secret",
+            "token",
+        ):
+            assert field_name in REDACTED_ROUTER_FIELDS, field_name
+            changes = router_field_changes({field_name: "old"}, {field_name: "new"})
+            assert changes == {field_name: {"redacted": True}}, field_name
+            assert "old" not in json.dumps(changes)
+            assert "new" not in json.dumps(changes)
+
+    def test_a_secret_looking_key_outside_the_explicit_set_is_still_redacted(
+        self,
+    ) -> None:
+        """``radius_secret`` is not in the list and never will be until
+        someone adds it. The stem match is what makes the redaction hold for
+        the field nobody thought to enumerate."""
+        assert "radius_secret" not in REDACTED_ROUTER_FIELDS
+
+        changes = router_field_changes(
+            {"radius_secret": "old-radius"}, {"radius_secret": "new-radius"}
+        )
+
+        assert changes == {"radius_secret": {"redacted": True}}
+        assert "radius" not in json.dumps(changes).replace("radius_secret", "")
+
+    def test_every_secret_stem_redacts_a_key_that_merely_contains_it(self) -> None:
+        for stem in ("secret", "password", "token", "credentials", "community"):
+            field_name = f"vendor_{stem}_field"
+            changes = router_field_changes(
+                {field_name: "leak-me"}, {field_name: "leak-me-too"}
+            )
+            assert changes == {field_name: {"redacted": True}}, field_name
+            assert "leak-me" not in json.dumps(changes), field_name
+
+    def test_a_redacted_field_says_the_value_is_not_recorded(self) -> None:
+        changes = router_field_changes({"api_secret": "a"}, {"api_secret": "b"})
+        assert (
+            describe_router_changes(changes)
+            == "api_secret changed (value not recorded)"
+        )
+
+    def test_settings_is_opaque_and_records_no_values(self) -> None:
+        assert isinstance(OPAQUE_ROUTER_FIELDS, frozenset)
+        assert set(OPAQUE_ROUTER_FIELDS) == {"settings"}
+
+        changes = router_field_changes(
+            {"settings": {"portal_theme": "dark"}},
+            {"settings": {"portal_theme": "light", "quirks": ["omada"]}},
+        )
+
+        assert changes == {"settings": {"changed": True}}
+        serialized = json.dumps(changes)
+        assert "portal_theme" not in serialized
+        assert "omada" not in serialized
+
+    def test_unchanged_settings_are_absent_like_any_other_field(self) -> None:
+        same = {"portal_theme": "dark"}
+        assert router_field_changes({"settings": same}, {"settings": dict(same)}) == {}
+
+    def test_settings_reads_as_changed_with_no_arrow(self) -> None:
+        changes = router_field_changes({"settings": {}}, {"settings": {"a": 1}})
+        assert describe_router_changes(changes) == "settings changed"
+
+    def test_the_description_lists_fields_in_alphabetical_order(self) -> None:
+        changes = router_field_changes(
+            {
+                "vendor": "mikrotik",
+                "name": "Lobby AP",
+                "api_secret": "old",
+                "settings": {},
+            },
+            {
+                "vendor": "tplink_omada",
+                "name": "Office Guest",
+                "api_secret": "new",
+                "settings": {"a": 1},
+            },
+        )
+
+        assert describe_router_changes(changes) == (
+            "api_secret changed (value not recorded), "
+            "name 'Lobby AP' -> 'Office Guest', "
+            "settings changed, "
+            "vendor mikrotik -> tplink_omada"
+        )
+
+    def test_the_ordering_does_not_follow_the_insertion_order_of_the_dicts(
+        self,
+    ) -> None:
+        """Dicts preserve insertion order, so a description built by
+        iterating one reads differently depending on which order the caller
+        happened to pass the fields. Two orders, one string."""
+        before = {"vendor": "mikrotik", "name": "Lobby AP"}
+        after = {"vendor": "tplink_omada", "name": "Office Guest"}
+        reversed_before = {"name": "Lobby AP", "vendor": "mikrotik"}
+        reversed_after = {"name": "Office Guest", "vendor": "tplink_omada"}
+
+        assert describe_router_changes(
+            router_field_changes(before, after)
+        ) == describe_router_changes(
+            router_field_changes(reversed_before, reversed_after)
+        )
+
+    def test_an_empty_change_set_describes_as_the_empty_string(self) -> None:
+        assert describe_router_changes({}) == ""
