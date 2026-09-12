@@ -209,6 +209,71 @@ class RouterResponse(BaseModel):
             "has been removed -- see redact_customer_router_settings below."
         ),
     )
+    # ---- FIX-PLAN D2: one status vocabulary, computed once, here -------
+    #
+    # Three surfaces gave three different answers about one router in one
+    # session -- the venue dashboard from `location-liveness.ts`, Fix a
+    # Problem from `connection-verdicts.ts`, the Master fleet from its own
+    # local badge map. That was three independent derivations of a fact the
+    # console cannot actually see: whether this platform is talking to the
+    # controller. One server-computed value makes the contradiction
+    # structurally impossible rather than fixed three times over.
+    #
+    # NULL ON EVERY AGENT-MANAGED ROW, AND THAT IS THE DESIGN. See
+    # `vendor_capabilities.ControllerState` -- `Router.reachability_state`
+    # is unexposed precisely so the platform never has two answers to "is
+    # this router up", and a field carrying a value on an agent-managed row
+    # would be that second answer. By EVIDENCE, not by label: a mislabelled
+    # MikroTik is agent-managed here too, so this can never contradict a
+    # heartbeat.
+    controller_state: str | None = Field(
+        default=None,
+        description=(
+            "The state of this platform's connection to the controller "
+            "that runs this device's network: one of not_registered, "
+            "disabled, credentials_rejected, certificate_unverified, "
+            "unreachable, not_mapped, reachable. NULL when this row is not "
+            "reached through a controller -- an agent checks in and "
+            "status/last_seen_at are the answer. Never a claim about the "
+            "venue's access points or a guest's internet."
+        ),
+    )
+    controller_state_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why controller_state holds that value -- a machine-readable "
+            "code (an OMADA_* error code, 'site_not_selected', "
+            "'no_integration', 'integration_disabled', 'ok'), never prose. "
+            "It is what distinguishes a certificate that was never trusted "
+            "from one that CHANGED, which share a state because the next "
+            "action is the same. The console owns the words."
+        ),
+    )
+    controller_last_contacted_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When a scheduled sync last completed against the controller. "
+            "NOT a liveness timestamp for this device and not comparable "
+            "with last_seen_at: nothing heartbeats a controller, and a "
+            "manual probe deliberately persists nothing, so this is the "
+            "only honest answer to 'when did we last reach it'. Render it "
+            "as 'Last contacted the controller', never as 'last seen'."
+        ),
+    )
+    vendor_claim_is_contradicted: bool = Field(
+        default=False,
+        description=(
+            "True when this row's vendor says it is controller-managed "
+            "while its own data says an agent has run on it -- a "
+            "heartbeat, a RouterOS version, a health check, or RouterOS "
+            "API credentials on file. Reported beside controller_state "
+            "rather than folded into it: this is a statement about the "
+            "ROW, every controller_state value is a statement about a "
+            "CONTROLLER, and it is also the reason controller_state is "
+            "null on a row whose vendor claims otherwise."
+        ),
+    )
+
     created_at: datetime
     updated_at: datetime
 
