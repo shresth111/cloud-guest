@@ -47,10 +47,11 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import pytest
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 
 from app.core.config import INSECURE_LOCAL_DEV_FERNET_KEY, Settings
 from app.database.utils.pagination import PageParams, PaginationMeta
@@ -118,6 +119,11 @@ from app.domains.network_integration.providers.base import (
 )
 from app.domains.network_integration.router import _integration_response, portal_router
 from app.domains.network_integration.router import router as integration_router
+from app.domains.network_integration.schemas import (
+    NetworkIntegrationCreateRequest,
+    NetworkIntegrationUpdateRequest,
+    PlatformOnboardRequest,
+)
 from app.domains.network_integration.service import (
     NetworkIntegrationService,
     build_portal_authorize_diagnostics,
@@ -125,6 +131,7 @@ from app.domains.network_integration.service import (
     run_network_integration_sync_sweep,
 )
 from app.domains.network_integration.validators import (
+    OMADA_SITE_ID_EXAMPLE,
     assert_address_is_public,
     build_external_portal_url,
     describe_mac_wire_format,
@@ -5520,3 +5527,141 @@ class TestProviderCarriesDiagnosticsAcrossTheSeam:
             )
             is None
         )
+
+
+class TestExternalSiteIdMustBeAnId:
+    """`external_site_id` holds the controller's site ID, never its name.
+
+    The live QA integration was stored with ``external_site_id`` =
+    ``"wyfyguest"`` -- the site's display NAME -- while the controller's real
+    site id is ``6aa3913c3ee1605f71ac35a1``. One wizard field fed both
+    columns and its help text invited either.
+
+    They are not alternatives. Driven against the live controller's own
+    ``/portal/entry`` on 2026-09-12, with no wireless client involved, the
+    redirect came back carrying
+    ``&site=6aa3913c3ee1605f71ac35a1&`` -- the id. It has never carried the
+    name. So a name in this column:
+
+    * fails the site check in ``authorize_portal_client`` and refuses EVERY
+      guest at the venue behind the deliberately-indistinguishable 403, and
+    * is passed through as ``site_id`` into every
+      ``/{omadacId}/api/v2/sites/{siteId}/...`` call, addressing a site that
+      does not exist.
+
+    Neither failure names the field anywhere an operator can see. Hence a
+    refusal at the request boundary rather than a stored value.
+    """
+
+    # The three request models that can WRITE the column. The response model
+    # is deliberately not here: it has to be able to render rows that were
+    # created before this boundary existed, including the bad ones.
+    WRITE_MODELS = (
+        (
+            NetworkIntegrationCreateRequest,
+            {
+                "name": "Lobby",
+                "base_url": CONTROLLER_URL,
+                "auth_mode": "openapi",
+                "client_id": "cid",
+                "client_secret": "secret",
+                "username": "operator",
+                "password": "pw",
+            },
+        ),
+        (
+            PlatformOnboardRequest,
+            {
+                "organization_id": str(uuid.uuid4()),
+                "location_id": str(uuid.uuid4()),
+                "name": "Lobby",
+                "controller_model": "Omada Software Controller",
+                "base_url": CONTROLLER_URL,
+                "auth_mode": "legacy",
+                "username": "operator",
+                "password": "pw",
+            },
+        ),
+        (NetworkIntegrationUpdateRequest, {}),
+    )
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # The value the live QA integration really holds.
+            "wyfyguest",
+            # What the old placeholder invited, on every one of the three
+            # typed-entry fields. It is a display name; even a single-site
+            # controller's `site=` parameter is an id.
+            "Default",
+            "Main Site",
+            # Right alphabet, wrong length -- an id truncated on paste.
+            "6aa3913c3ee1605f71ac35",
+            # Right length, wrong alphabet.
+            "6AA3913C3EE1605F71AC35A1",
+            "zzz3913c3ee1605f71ac35a1",
+        ],
+    )
+    def test_a_site_name_is_refused_by_every_model_that_can_store_one(
+        self, name: str
+    ) -> None:
+        for model, base in self.WRITE_MODELS:
+            with pytest.raises(ValidationError) as exc:
+                model.model_validate({**base, "external_site_id": name})
+            rendered = str(exc.value)
+            assert "external_site_id" in rendered
+            # The message has to tell the operator what to type and where to
+            # read it, or they will type the name again.
+            assert OMADA_SITE_ID_EXAMPLE in rendered
+            assert "site=" in rendered
+
+    def test_a_real_site_id_is_accepted_and_stripped(self) -> None:
+        for model, base in self.WRITE_MODELS:
+            parsed = model.model_validate(
+                {**base, "external_site_id": f"  {OMADA_SITE_ID_EXAMPLE}  "}
+            )
+            assert parsed.external_site_id == OMADA_SITE_ID_EXAMPLE
+
+    def test_absent_and_empty_remain_legal(self) -> None:
+        """"No site selected yet" is a real state -- `PortalReadinessGap
+        .SITE_NOT_SELECTED` reports it, and the connect wizard saves
+        credentials before the operator picks one. Both spellings normalise
+        to None rather than being refused."""
+        for model, base in self.WRITE_MODELS:
+            assert model.model_validate(base).external_site_id is None
+            blank = model.model_validate({**base, "external_site_id": "   "})
+            assert blank.external_site_id is None
+
+    def test_the_name_column_is_untouched_by_the_rule(self) -> None:
+        """`external_site_name` is the human label, and on a legacy
+        integration it is legitimately unknown -- a hotspot-operator login
+        cannot list sites (CR-002). It must not inherit the id's rule, or the
+        one place a name legitimately belongs would refuse it."""
+        for model, base in self.WRITE_MODELS:
+            parsed = model.model_validate(
+                {
+                    **base,
+                    "external_site_id": OMADA_SITE_ID_EXAMPLE,
+                    "external_site_name": "wyfyguest",
+                }
+            )
+            assert parsed.external_site_name == "wyfyguest"
+
+    def test_the_site_the_live_controller_really_sends_passes(self) -> None:
+        """Captured verbatim from the live controller's 302 on 2026-09-12.
+        The point of the test is that the shape the rule enforces is the
+        shape real hardware emits, not one derived from a document."""
+        redirect = (
+            "https://auth.wyfyguest.com/portal?organizationId=..."
+            "&locationId=...&routerId=...&netProvider=omada"
+            "&clientMac=02-00-00-DE-AD-07&clientIp=103.84.202.195"
+            "&t=1789202287942&site=6aa3913c3ee1605f71ac35a1"
+            "&redirectUrl=http%3A%2F%2Fneverssl.com%2F"
+            "&apMac=B8-FB-B3-5D-64-3E&ssidName=WyfyGuest&radioId=1"
+        )
+        site = dict(parse_qsl(urlsplit(redirect).query))["site"]
+        assert site == OMADA_SITE_ID_EXAMPLE
+        parsed = NetworkIntegrationUpdateRequest.model_validate(
+            {"external_site_id": site}
+        )
+        assert parsed.external_site_id == site

@@ -841,22 +841,65 @@ def _closure_values(route) -> list:
     return values
 
 
-def test_the_routes_are_scoped_as_their_audiences_require() -> None:
+def test_both_configure_controller_routes_are_master_only() -> None:
+    """Both routes are GLOBAL-scoped, and the by-id one still resolves the
+    caller's organization.
+
+    ## This test used to assert the opposite, and the assertion was stale
+
+    It was written as ``test_the_routes_are_scoped_as_their_audiences_require``
+    and required ``ScopeType.GLOBAL`` to be **absent** from
+    ``POST /network-integrations/{integration_id}/configure-controller``,
+    because that route was the *customer* half of a two-audience design.
+
+    There is no customer audience in this domain any more. ``router``'s own
+    module docstring states the product decision in the owner's words --
+    "customer dashboard se tp link hatao, sab master dashboard se hoga" --
+    and spells out the mechanism: ``RequirePermission`` with no ``scope=``
+    resolves its scope from whatever ``X-Organization-Id`` the *caller*
+    sent, so an Organization Owner holding the key at ORGANIZATION scope
+    satisfied it, which is how eighteen of these routes were reachable from
+    a venue admin's session. ``rbac.seed`` retired the non-GLOBAL grants to
+    match (``RETIRED_NON_GLOBAL_MODULES``), and
+    ``test_network_integration.py::TestEveryRouteRequiresPermission
+    ::test_every_route_on_router_requires_global_scope`` asserts the rule
+    for all thirty routes.
+
+    So this assertion did not describe a guarantee that had been lost -- it
+    described a design that had been deliberately replaced, and it
+    contradicted three other places that all agree with each other. It is
+    rewritten to the current intent rather than deleted, because the rest
+    of what it pins is still worth pinning.
+
+    ## What is still being pinned, and why each line earns its place
+
+    * **Both routes name the permission key.** A route with no
+      ``RequirePermission`` at all would still pass a GLOBAL-only check
+      vacuously, since there would be no closure to look in.
+    * **Both are GLOBAL.** This is the narrower, per-route restatement of
+      the structural rule, kept here so that a change to *this pair*
+      fails in the file somebody editing autoconfig is actually reading.
+    * **The by-id route declares ``CurrentOrganization``.** This is the
+      path-id defect class -- a route that reads a resource by path id and
+      never resolves the caller's organization hands ``None`` to the
+      service, and ``None`` means "platform caller, no filter". Declaring
+      it is what makes the service-layer comparison possible at all.
+    """
     from app.domains.rbac.dependencies import CurrentOrganization
     from app.domains.rbac.enums import ScopeType
     from app.main import create_app
 
     app = create_app()
-    customer = _route(
+    by_id = _route(
         app, "/api/v1/network-integrations/{integration_id}/configure-controller"
     )
     platform = _route(
         app,
         "/api/v1/network-integrations/platform/integrations/{integration_id}/configure-controller",
     )
-    assert CurrentOrganization in _calls(customer.dependant)
-    assert "network_integrations.update" in _closure_values(customer)
-    assert ScopeType.GLOBAL not in _closure_values(customer)
+    assert CurrentOrganization in _calls(by_id.dependant)
+    assert "network_integrations.update" in _closure_values(by_id)
+    assert ScopeType.GLOBAL in _closure_values(by_id)
     assert ScopeType.GLOBAL in _closure_values(platform)
     assert "network_integrations.update" in _closure_values(platform)
 
