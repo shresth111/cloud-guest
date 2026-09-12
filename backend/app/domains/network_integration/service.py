@@ -3573,6 +3573,17 @@ class NetworkIntegrationService:
             # provider then omits the field entirely.
             client_ip=client_ip,
         )
+        # The name half of this comparison is, as of 2026-09-12, dead for any
+        # row written after `validators.validate_external_site_id` landed: the
+        # controller's redirect carries the site ID and never the display
+        # name (verified on hardware -- see that function), and
+        # `external_site_id` can no longer be written with a name. It is
+        # retained deliberately rather than deleted: rows created BEFORE that
+        # boundary existed may still hold a name in both columns, and a
+        # comparison against a value no controller ever sends can never
+        # wrongly admit anything. `build_portal_authorize_diagnostics` records
+        # `site_matched_by == "name"` when it does fire, which is the signal
+        # that a legacy row needs its id corrected.
         if site != integration.external_site_id and site != (
             integration.external_site_name or ""
         ):

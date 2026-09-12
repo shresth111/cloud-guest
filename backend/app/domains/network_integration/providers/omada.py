@@ -85,13 +85,33 @@ unverified here:
 * whether ``AuthorizationResult.expires_at`` is populated by the gateway or
   must be derived from ``duration_seconds`` -- so this module derives it
   when the gateway leaves it ``None``, which is safe either way;
-* whether the gateway's ``ControllerSite.site_id`` is Omada's internal site
-  key or its display name. The portal redirect's ``site`` parameter and the
-  Open API's ``siteId`` are documented as different things in TP-Link's own
-  material, which is why :meth:`authorize_guest` passes the *redirect's*
-  ``site`` value straight through untouched instead of substituting the
-  integration's stored ``external_site_id``. Substituting would be
-  inventing a mapping nobody has confirmed.
+* ~~whether the gateway's ``ControllerSite.site_id`` is Omada's internal
+  site key or its display name~~ -- **SETTLED 2026-09-12, on hardware.** It
+  is the **id**, and so is the portal redirect's ``site`` parameter. Driving
+  the live controller's own ``/portal/entry`` with no wireless client
+  involved produced::
+
+      Location: https://auth.wyfyguest.com/portal?...
+                  &site=6aa3913c3ee1605f71ac35a1&...
+
+  -- the 24-hex site id, on a site whose display NAME is ``wyfyguest``. The
+  redirect has never carried the name. TP-Link's material describes the
+  redirect's ``site`` and the Open API's ``siteId`` separately, which is
+  what made this look open; on this controller they are the same value.
+
+  Two consequences, both now enforced rather than commented:
+
+  - ``external_site_id`` must hold an id. A name there is refused at the
+    request boundary (``validators.validate_external_site_id``), because
+    what it used to do was get stored, passed through as ``site_id`` into
+    every ``/sites/{siteId}/...`` call, and compared against a redirect that
+    carries an id -- turning away every guest at the venue behind the
+    deliberately-opaque 403.
+  - :meth:`authorize_guest` still passes the *redirect's* ``site`` straight
+    through untouched rather than substituting the stored value, and that is
+    still right: the check that the two agree
+    (``service.authorize_portal_client``) is only worth anything while they
+    are independently sourced.
 
 Anything this module infers is marked ``# INFERRED, unverified`` inline.
 

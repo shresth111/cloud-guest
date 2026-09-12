@@ -38,9 +38,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 from app.common.masking import MaskedMac
 from app.domains.auth.schemas import MessageResponse
@@ -53,6 +53,24 @@ from .constants import (
     MIN_SESSION_DURATION_SECONDS,
     MIN_SYNC_INTERVAL_SECONDS,
 )
+from .validators import validate_external_site_id
+
+#: The controller's site, as it must be STORED: an id, never a display
+#: name. Declared once and reused by every request model that can write the
+#: column, so the refusal cannot be present on one write path and missing on
+#: another -- which is how the live QA integration came to hold "wyfyguest"
+#: in a column every controller call is addressed with.
+#:
+#: See `validators.validate_external_site_id` for the measurement that
+#: settles it (the controller's own redirect carries the id, verified
+#: 2026-09-12), for why a name cannot be resolved to an id on the
+#: credentials this integration uses (CR-002), and for what each auth mode
+#: should collect instead.
+ExternalSiteId = Annotated[
+    str | None,
+    Field(max_length=128),
+    AfterValidator(validate_external_site_id),
+]
 
 __all__ = [
     "ControllerConfigureRequest",
@@ -238,8 +256,18 @@ class NetworkIntegrationCreateRequest(_CredentialFields):
             "resolution is by location."
         ),
     )
-    external_site_id: str | None = Field(default=None, max_length=128)
-    external_site_name: str | None = Field(default=None, max_length=255)
+    external_site_id: ExternalSiteId = None
+    external_site_name: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "The site's human-readable label, for display only. Never used "
+            "to address the controller and never compared against a portal "
+            "redirect -- see `external_site_id`. A hotspot-operator login "
+            "cannot list sites (CR-002), so on a legacy integration this is "
+            "legitimately unknown and stays empty."
+        ),
+    )
     guest_ssid_id: str | None = Field(default=None, max_length=128)
     guest_ssid_name: str | None = Field(default=None, max_length=255)
     session_duration_seconds: int = Field(
@@ -338,8 +366,18 @@ class PlatformOnboardRequest(_CredentialFields):
             "address is generated, never a fabricated vendor one."
         ),
     )
-    external_site_id: str | None = Field(default=None, max_length=128)
-    external_site_name: str | None = Field(default=None, max_length=255)
+    external_site_id: ExternalSiteId = None
+    external_site_name: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "The site's human-readable label, for display only. Never used "
+            "to address the controller and never compared against a portal "
+            "redirect -- see `external_site_id`. A hotspot-operator login "
+            "cannot list sites (CR-002), so on a legacy integration this is "
+            "legitimately unknown and stays empty."
+        ),
+    )
     guest_ssid_id: str | None = Field(default=None, max_length=128)
     guest_ssid_name: str | None = Field(default=None, max_length=255)
     session_duration_seconds: int = Field(
@@ -408,8 +446,18 @@ class NetworkIntegrationUpdateRequest(BaseModel):
     auth_mode: _AuthMode | None = None
     controller_id: str | None = _controller_id_field()
     location_id: str | None = None
-    external_site_id: str | None = Field(default=None, max_length=128)
-    external_site_name: str | None = Field(default=None, max_length=255)
+    external_site_id: ExternalSiteId = None
+    external_site_name: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "The site's human-readable label, for display only. Never used "
+            "to address the controller and never compared against a portal "
+            "redirect -- see `external_site_id`. A hotspot-operator login "
+            "cannot list sites (CR-002), so on a legacy integration this is "
+            "legitimately unknown and stays empty."
+        ),
+    )
     guest_ssid_id: str | None = Field(default=None, max_length=128)
     guest_ssid_name: str | None = Field(default=None, max_length=255)
     session_duration_seconds: int | None = Field(
