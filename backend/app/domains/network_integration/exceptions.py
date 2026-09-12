@@ -65,6 +65,8 @@ __all__ = [
     "NetworkIntegrationError",
     "NetworkIntegrationNotFoundError",
     "NetworkIntegrationOrganizationRequiredError",
+    "NetworkIntegrationPortalModeNotPermittedError",
+    "RadiusNasPreconditionsError",
     "NetworkIntegrationRateLimitedError",
     "NetworkIntegrationSiteNotSelectedError",
     "NetworkIntegrationTlsPinRequiredError",
@@ -369,6 +371,53 @@ class GuestSessionNotActiveError(NetworkIntegrationError):
             "No active guest session matches this authorization request",
             status_code=status.HTTP_403_FORBIDDEN,
             code=ErrorCode.GUEST_SESSION_NOT_ACTIVE,
+        )
+
+
+class NetworkIntegrationPortalModeNotPermittedError(NetworkIntegrationError):
+    """An organization-scoped caller tried to change ``portal_mode``.
+
+    The customer update body carries no such field, so reaching this means
+    the request went somewhere the schema did not expect -- and the check
+    is here, in the service, precisely so the schema split is not the only
+    thing standing between a self-service PATCH and a venue whose guests
+    stop being able to log in.
+
+    Not a 403 for tenancy reasons (the caller may own the row perfectly
+    well) but a 400: what they asked for is not theirs to ask for on this
+    surface. Moving a venue onto the RADIUS contract needs an inbound UDP
+    path to this platform's FreeRADIUS, a NAS client keyed on the
+    controller's public address and a certificate the guest's browser
+    accepts -- see ``ops/runbooks/omada-radius-mode.md``. A toggle that
+    could be flipped without them would be a switch labelled "break guest
+    WiFi later".
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The captive-portal mode of an integration is set by a platform "
+            "operator, not on this surface.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ErrorCode.PORTAL_MODE_NOT_PERMITTED,
+        )
+
+
+class RadiusNasPreconditionsError(NetworkIntegrationError):
+    """This integration cannot have a RADIUS NAS client yet, and here is
+    exactly what is missing.
+
+    Every message this raises names one concrete, fixable thing -- the
+    integration is not in RADIUS mode, it has no fleet device to hang a NAS
+    row on, or its controller address is not something a ``client{}``
+    stanza can be keyed on. A single "preconditions not met" would make an
+    operator go and check all three.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            detail,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code=ErrorCode.SETUP_INCOMPLETE,
         )
 
 

@@ -56,18 +56,21 @@ from app.core.config import INSECURE_LOCAL_DEV_FERNET_KEY, Settings
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.network_integration import crypto as crypto_module
 from app.domains.network_integration.constants import (
+    DEFAULT_PORTAL_AUTH_MODE,
     MAX_SESSION_DURATION_SECONDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
     PORTAL_REDIRECT_STALE_AFTER_SECONDS,
     AuthorizationStatus,
     ControllerAuthMode,
     ControllerTlsMode,
+    DisconnectMechanism,
     ErrorCode,
     IntegrationEventStatus,
     IntegrationEventType,
     IntegrationStatus,
     NetworkIntegrationAuditAction,
     NetworkProviderKind,
+    PortalAuthMode,
     PortalReadinessGap,
     SyncStatus,
 )
@@ -87,6 +90,7 @@ from app.domains.network_integration.exceptions import (
     NetworkIntegrationInventoryRequiresOpenApiError,
     NetworkIntegrationNotFoundError,
     NetworkIntegrationOrganizationRequiredError,
+    NetworkIntegrationPortalModeNotPermittedError,
     NetworkIntegrationSiteNotSelectedError,
     NetworkIntegrationTlsPinRequiredError,
     NetworkIntegrationUrlRejectedError,
@@ -244,6 +248,13 @@ def _integration(
         # server default, so without this every row built here would have
         # tls_mode=None -- which is not a state the database can hold.
         "tls_mode": ControllerTlsMode.STRICT.value,
+        # Mirrors the column default, for the same reason tls_mode above
+        # does: a detached ORM object gets no server default, and
+        # `portal_mode=None` is not a state the database can hold. Every
+        # row here is therefore on the proven External Portal Server
+        # contract unless a test deliberately says otherwise -- which is
+        # also the product rule.
+        "portal_mode": PortalAuthMode.EXTERNAL_PORTAL.value,
         "tls_pinned_sha256": None,
         "tls_trust_decided_at": None,
         "controller_id": "abc123",
@@ -4328,11 +4339,12 @@ class TestEveryRouteRequiresPermission:
             r for r in integration_router.routes if "/platform/" in r.path
         ]
         # summary, list, get, events, enable, disable, test-connection,
-        # configure-controller, onboard, and the org-less draft probe
-        # (platform/test-connection). Asserted as a count rather than a
-        # set so that adding an eleventh platform route without a GLOBAL
-        # scope fails here loudly.
-        assert len(platform_routes) == 11
+        # configure-controller, onboard, the org-less draft probe
+        # (platform/test-connection), and the controller RADIUS NAS
+        # registration. Asserted as a count rather than a set so that
+        # adding a further platform route without a GLOBAL scope fails
+        # here loudly.
+        assert len(platform_routes) == 12
         for route in platform_routes:
             scopes = []
             for dep in route.dependant.dependencies:
@@ -4347,11 +4359,11 @@ class TestEveryRouteRequiresPermission:
     def test_every_route_on_router_requires_global_scope(self) -> None:
         """Structural enforcement promised by the router module docstring:
         a new route added to ``router`` without ``scope=ScopeType.GLOBAL``
-        fails the suite.  This covers all 29 routes, not only the
+        fails the suite.  This covers all 30 routes, not only the
         ``/platform/`` subset above."""
         from app.domains.rbac.enums import ScopeType
 
-        assert len(integration_router.routes) == 29
+        assert len(integration_router.routes) == 30
         for route in integration_router.routes:
             scopes = []
             for dep in route.dependant.dependencies:
@@ -5472,3 +5484,174 @@ class TestProviderCarriesDiagnosticsAcrossTheSeam:
             )
             is None
         )
+
+
+# ============================================================================
+# RADIUS portal mode -- the second contract, and what it changes
+# ============================================================================
+
+
+class TestRadiusPortalMode:
+    """The stored ``portal_mode`` and the three surfaces that dispatch on it.
+
+    The rule these tests exist to hold: **External Portal Server is the
+    default for every integration, and nothing infers the mode from a
+    redirect's parameters.** The two contracts send different parameters,
+    submit to different endpoints and reverse the direction of trust, so a
+    surface that guessed would be guessing about whether a guest gets
+    online.
+    """
+
+    def test_a_new_integration_is_on_the_proven_contract(self) -> None:
+        """Not a restatement of the column default -- it is the product
+        rule. RADIUS mode needs an inbound UDP path, a NAS client keyed on
+        a public address and a controller certificate a phone will accept;
+        none of those can be arranged by a row being created."""
+        assert DEFAULT_PORTAL_AUTH_MODE is PortalAuthMode.EXTERNAL_PORTAL
+        assert _integration().portal_mode == PortalAuthMode.EXTERNAL_PORTAL.value
+
+    async def test_a_customer_caller_cannot_move_a_venue_to_radius(self) -> None:
+        """The schema split is not the only guard. This method is the one
+        entry point both PATCH routes go through, so the check lives here
+        rather than resting on which body a future edit uses."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+
+        with pytest.raises(NetworkIntegrationPortalModeNotPermittedError):
+            await service.update_integration(
+                integration.id,
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+                fields={"portal_mode": PortalAuthMode.RADIUS.value},
+            )
+        assert integration.portal_mode == PortalAuthMode.EXTERNAL_PORTAL.value
+
+    async def test_a_platform_caller_can_and_it_is_audited_by_value(self) -> None:
+        repo = FakeRepository()
+        audit = FakeAuditWriter()
+        integration = repo.add(_integration())
+        service = _service(repo, audit=audit)
+
+        updated = await service.update_platform_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            fields={"portal_mode": PortalAuthMode.RADIUS.value},
+        )
+
+        assert updated.portal_mode == PortalAuthMode.RADIUS.value
+        metadata = audit.entries[-1]["event_metadata"]
+        # The VALUE, not just the field name: "somebody changed portal_mode"
+        # does not answer "which contract are this venue's guests on now",
+        # and neither value is a secret.
+        assert metadata["portal_mode"] == PortalAuthMode.RADIUS.value
+
+    async def test_the_authorize_endpoint_refuses_a_radius_venue(self) -> None:
+        """In RADIUS mode this platform is not in the authorization path at
+        all -- the controller is. A call arriving here is a stale portal URL
+        or a controller still on the other contract, and authorizing anyway
+        would open a gate nobody asked us to open."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        session_id = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                location_id=location,
+                portal_mode=PortalAuthMode.RADIUS.value,
+            )
+        )
+        lookup = FakeGuestSessionLookup(
+            {session_id: FakeGuestSession(session_id, org, location)}
+        )
+        provider = FakeProvider()
+        service = _service(repo, provider=provider, guest_lookup=lookup)
+
+        with pytest.raises(GuestSessionNotActiveError):
+            await service.authorize_portal_client(
+                session_id=session_id,
+                organization_id=org,
+                location_id=location,
+                provider="omada",
+                client_mac="AA-BB-CC-DD-EE-FF",
+                site="site-1",
+            )
+
+        # Nothing was asked of the controller, and no authorization row was
+        # written -- the refusal is before both.
+        assert "authorize_guest" not in provider.calls
+        assert repo.authorizations == []
+        # The guest sees the same opaque 403 as every other failure; the
+        # venue's own operator sees the real reason.
+        event = repo.events[-1]
+        assert event.error_code == ErrorCode.PORTAL_MODE_MISMATCH.value
+        assert event.context["portal_mode"] == PortalAuthMode.RADIUS.value
+        assert integration.portal_mode == PortalAuthMode.RADIUS.value
+
+    async def test_disconnect_names_the_weaker_mechanism_in_radius_mode(
+        self,
+    ) -> None:
+        """The three booleans are individually true in both modes and add
+        up to less in this one: this platform never issued the
+        authorization, so dropping the client does not stop the guest
+        logging straight back in."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                location_id=location,
+                portal_mode=PortalAuthMode.RADIUS.value,
+            )
+        )
+        provider = FakeProvider()
+        terminator = FakeGuestSessionTerminator()
+        service = _service(repo, provider=provider, guest_terminator=terminator)
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            reason=None,
+        )
+
+        assert outcome.mechanism == DisconnectMechanism.CONTROLLER_CLIENT_ONLY.value
+        # The controller was still asked -- it is the only outbound
+        # revocation this contract has.
+        assert "deauthorize_guest" in provider.calls
+        # And nothing claims the guest cannot come back: there is no
+        # authorization row in this mode, so no session was found to end.
+        assert outcome.guest_session_ended is False
+        assert outcome.had_active_authorization is False
+
+    async def test_disconnect_still_names_the_full_mechanism_otherwise(
+        self,
+    ) -> None:
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await repo.create_authorization(
+            integration_id=integration.id,
+            organization_id=org,
+            location_id=location,
+            guest_session_id=uuid.uuid4(),
+            client_mac="AA:BB:CC:DD:EE:FF",
+            status=AuthorizationStatus.AUTHORIZED.value,
+            authorized_at=_now(),
+        )
+        service = _service(repo, guest_terminator=FakeGuestSessionTerminator())
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            reason=None,
+        )
+
+        assert (
+            outcome.mechanism == DisconnectMechanism.CONTROLLER_AUTHORIZATION.value
+        )
+        assert outcome.guest_session_ended is True

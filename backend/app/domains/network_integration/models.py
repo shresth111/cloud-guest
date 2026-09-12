@@ -92,6 +92,7 @@ from app.database.base import BaseModel
 
 from .constants import (
     DEFAULT_CONTROLLER_TLS_MODE,
+    DEFAULT_PORTAL_AUTH_MODE,
     DEFAULT_SESSION_DURATION_SECONDS,
     DEFAULT_SYNC_INTERVAL_SECONDS,
     AuthorizationStatus,
@@ -248,6 +249,30 @@ class NetworkIntegration(BaseModel):
     # hold an actor and cannot be overwritten by the next decision.
     tls_trust_decided_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # WHICH CAPTIVE-PORTAL CONTRACT THIS VENUE IS ON -- 'external_portal'
+    # (TP-Link authType 4) or 'radius' (authType 2 + External Web Portal).
+    # See constants.PortalAuthMode for what each one actually does and why
+    # the answer is stored rather than sniffed off a redirect's parameters.
+    #
+    # Three surfaces dispatch on this one column and none of them guesses:
+    # `validators.build_external_portal_url` (what the operator pastes into
+    # the controller), `service.authorize_portal_client` (which refuses
+    # outright in RADIUS mode -- this platform is not in that path) and
+    # `service.disconnect_guest` (whose two modes revoke by different
+    # mechanisms with genuinely different guarantees).
+    #
+    # server_default is the point of the column, exactly as it is for
+    # `tls_mode`: every row that predates it gets 'external_portal', which
+    # is what those rows have always done. The migration changes no
+    # integration's behaviour, and no code path turns RADIUS mode on by
+    # itself -- it is set deliberately, by a platform operator, on a venue
+    # whose network path has been arranged first.
+    portal_mode: Mapped[str] = mapped_column(
+        String(30),
+        default=DEFAULT_PORTAL_AUTH_MODE.value,
+        server_default=DEFAULT_PORTAL_AUTH_MODE.value,
+        nullable=False,
     )
     # Fernet ciphertext of a JSON credential set. See crypto.py. Never
     # returned by any endpoint; never logged.

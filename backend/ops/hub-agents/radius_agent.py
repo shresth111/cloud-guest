@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Minimal per-router FreeRADIUS client-provisioning HTTP agent.
 
-Adds a real `client <tunnel_ip>/32 { ... }` block to clients.conf so this
-specific router gets its own genuine NAS identity resolvable via
+Adds a real `client <address>/32 { ... }` block to clients.conf so this
+specific NAS gets its own genuine NAS identity resolvable via
 `%{client:shortname}`/`%{client:backend_secret}` in sites-enabled/default
 (see docs -- this is the fix for "every router shared one NAS identity").
 
@@ -212,24 +212,53 @@ def _backup() -> str:
     return backup_path
 
 
-def add_client(tunnel_ip: str, nas_identifier: str, secret: str) -> dict:
+def add_client(
+    address: str,
+    nas_identifier: str,
+    secret: str,
+    require_message_authenticator: bool | None = None,
+) -> dict:
     """Serialised against every other mutating call -- see `_WRITE_LOCK`.
 
     Argument validation stays OUTSIDE the lock: it touches nothing shared
     and a malformed request should not queue behind a live restart.
+
+    `address` was called `tunnel_ip` when every NAS on this server was a
+    MikroTik on the WireGuard overlay. An Omada controller in RADIUS mode
+    is a NAS too and it has no tunnel -- its stanza is keyed on its public
+    address -- so the parameter is named for what it is. The HTTP handler
+    accepts BOTH spellings (see `do_POST`), because a backend newer than
+    this file must keep working and a backend older than it must too.
+
+    `require_message_authenticator` is `None` for "keep this agent's
+    existing behaviour" (carry `yes` over from a superseded stanza, else
+    `no`) and `True` to demand it. It is not defaulted to `True` here:
+    flipping that default would hard-reject every router in the fleet that
+    does not send a Message-Authenticator, which is a fleet-wide behaviour
+    change and not this function's business. It exists because an
+    internet-facing client -- which is what a controller stanza is -- has a
+    spoofable source address, and Omada demonstrably sends the attribute on
+    every request (measured on the wire, 2026-09-11).
     """
-    if not valid_ip(tunnel_ip):
-        raise ValueError("invalid tunnel_ip")
+    if not valid_ip(address):
+        raise ValueError("invalid address")
     if not _IDENTIFIER_RE.match(nas_identifier):
         raise ValueError("invalid nas_identifier")
     if not secret or len(secret) < 8:
         raise ValueError("secret too short")
 
     with _WRITE_LOCK:
-        return _add_client_locked(tunnel_ip, nas_identifier, secret)
+        return _add_client_locked(
+            address, nas_identifier, secret, require_message_authenticator
+        )
 
 
-def _add_client_locked(tunnel_ip: str, nas_identifier: str, secret: str) -> dict:
+def _add_client_locked(
+    address: str,
+    nas_identifier: str,
+    secret: str,
+    require_message_authenticator: bool | None = None,
+) -> dict:
     backup_path = _backup()
 
     with open(CLIENTS_CONF) as f:
@@ -258,11 +287,18 @@ def _add_client_locked(tunnel_ip: str, nas_identifier: str, secret: str) -> dict
         m = re.search(r"^\s*require_message_authenticator\s*=\s*(\S+)", old, re.M)
         if m and m.group(1) == "yes":
             require_msg_auth = "yes"
+    # An explicit `yes` from the caller wins over both the default and the
+    # carried-over value. It can only ever HARDEN: there is no way to ask
+    # this agent to turn the requirement off, so a request cannot silently
+    # downgrade a client somebody deliberately hardened -- the exact
+    # asymmetry the carry-over above exists to protect.
+    if require_message_authenticator:
+        require_msg_auth = "yes"
 
     block_name = f"cg-{nas_identifier}".replace(".", "-")
     block = (
         f"\nclient {block_name} {{\n"
-        f"\tipaddr = {tunnel_ip}/32\n"
+        f"\tipaddr = {address}/32\n"
         f"\tsecret = {secret}\n"
         f"\tshortname = {nas_identifier}\n"
         f"\tbackend_secret = {secret}\n"
@@ -355,8 +391,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = self._authed_payload()
             if payload is None:
                 return
+            # `address` is the current spelling, `tunnel_ip` the one every
+            # deployed backend before 2026-09-12 sends. Accepting both is
+            # what lets this agent and the backend be upgraded in either
+            # order -- which matters more than usual here, because nobody
+            # currently has shell on this host to upgrade it at all.
+            address = payload.get("address") or payload.get("tunnel_ip")
+            if not address:
+                self._json(400, {"error": "address (or tunnel_ip) is required"})
+                return
             result = add_client(
-                payload["tunnel_ip"], payload["nas_identifier"], payload["secret"]
+                address,
+                payload["nas_identifier"],
+                payload["secret"],
+                bool(payload.get("require_message_authenticator")) or None,
             )
             self._json(200, result)
         except Exception as e:  # noqa: BLE001 -- single-purpose agent

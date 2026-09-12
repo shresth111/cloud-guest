@@ -437,7 +437,10 @@ class TestWriteSerialisation:
         monkeypatch.setattr(radius_agent, "CLIENTS_CONF", str(conf))
         radius_agent._WRITE_LOCK.acquire()
         try:
-            with pytest.raises(ValueError, match="invalid tunnel_ip"):
+            # "address", not "tunnel_ip": the parameter is named for what it
+            # is now that a NAS can also be an Omada controller with a
+            # public address and no tunnel.
+            with pytest.raises(ValueError, match="invalid address"):
                 radius_agent.add_client("not-an-ip", "cg-x", "secret-aaaaaaa")
             with pytest.raises(ValueError, match="invalid nas_identifier"):
                 radius_agent.remove_client("has space")
