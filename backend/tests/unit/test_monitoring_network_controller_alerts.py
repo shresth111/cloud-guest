@@ -329,7 +329,26 @@ async def test_setup_gets_a_day_before_anybody_is_told() -> None:
     assert (await service.evaluate_alert_rules()).triggered == []
 
 
-async def test_abandoned_setup_alerts_with_the_readiness_reason() -> None:
+async def test_abandoned_setup_does_not_leak_controller_detail_to_the_venue() -> None:
+    """The reason is deliberately NOT in the message, and that is the test.
+
+    This asserted the opposite until the branch in
+    ``monitoring/service.py`` stopped interpolating
+    ``last_error_message``. Its own comment gives the reason: every other
+    branch of that function is vendor-neutral and never quotes provider
+    text, because the alert is delivered to a **venue owner** and the
+    product decision is that a venue owner is not shown the controller.
+    This branch pasted in ``describe_portal_readiness_gaps``, which names
+    controller configuration field by field ("no controller site has been
+    selected"), on the alert most likely to fire -- ``SETUP_INCOMPLETE`` is
+    where a freshly onboarded integration sits.
+
+    Rewritten rather than relaxed, and now stronger: it fails if that
+    string ever comes back. The detail is not lost -- ``last_error_message``,
+    ``last_error_code`` and ``portal_readiness_gaps`` are all on
+    ``GET /platform/integrations/{id}``, and the alert names the
+    integration, so an operator is one click from the specific reason.
+    """
     org_id = uuid.uuid4()
     repo, service = await _harness(ALERT_TARGET_NETWORK_CONTROLLER_SETUP, org_id)
     integration = FakeIntegration(
@@ -342,7 +361,8 @@ async def test_abandoned_setup_alerts_with_the_readiness_reason() -> None:
     repo.network_integrations.append(integration)
 
     (alert,) = (await service.evaluate_alert_rules()).triggered
-    assert "no controller site has been selected" in alert.message
+    assert "no controller site has been selected" not in alert.message
+    assert "setup has not been completed" in alert.message
 
     integration.status = IntegrationStatus.CONNECTED.value
     result = await service.evaluate_alert_rules()
@@ -367,7 +387,10 @@ async def test_setup_never_started_does_not_invent_a_reason() -> None:
 
     (alert,) = (await service.evaluate_alert_rules()).triggered
     assert "stale text" not in alert.message
-    assert "has not completed a connection" in alert.message
+    # The copy this branch settled on. The load-bearing half of this test is
+    # the line above -- that nothing from another code path is borrowed --
+    # and it is unchanged.
+    assert "setup has not been completed" in alert.message
 
 
 # ============================================================================
