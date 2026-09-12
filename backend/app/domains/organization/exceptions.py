@@ -81,6 +81,39 @@ class OrganizationArchivedError(OrganizationError):
         )
 
 
+class OrganizationSuspendedNewServiceError(OrganizationError):
+    """A new unit of service was requested for a suspended tenant.
+
+    Suspension used to mean nothing at all to writes. ``QA Test Co`` was
+    ``suspended`` in production on 2026-09-12 and
+    ``POST /organizations/{id}/locations`` still returned **201** -- a new
+    venue, live, under an account whose service is stopped, with no warning
+    before, during or after. The Master console's own tenant dropdown offered
+    it, because there was no server-side rule for the dropdown to reflect.
+
+    Deliberately narrower than :class:`OrganizationArchivedError`, which
+    refuses every modification. Archiving is terminal; suspension is a
+    reversible administrative state, and a suspended tenant must still be
+    readable and correctable -- an operator fixing an address, a billing
+    contact or a misconfigured venue *before* reinstating is the normal way
+    a suspension ends. What suspension must stop is service growing while it
+    is stopped.
+
+    409 rather than 403: the caller's permissions are fine and the refusal is
+    genuinely temporary. Reinstate the tenant and the identical request
+    succeeds, which is exactly what a conflict means and what a 403 would
+    wrongly deny.
+    """
+
+    def __init__(self, organization_id: uuid.UUID, entity: str) -> None:
+        super().__init__(
+            f"Organization {organization_id} is suspended, so no new "
+            f"{entity} can be added to it. Existing ones stay readable and "
+            "editable. Reinstate the organization first if this is intended.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class CrossOrganizationAccessError(OrganizationError):
     """A caller acting within organization A attempted to read/mutate
     organization B, where B is neither A itself nor a child of A."""

@@ -41,7 +41,7 @@ from app.domains.network_integration.validators import (
 )
 from app.domains.router.vendor_capabilities import (
     NOT_APPLICABLE_REASON,
-    is_agent_managed,
+    is_agent_managed_row,
 )
 
 from .constants import (
@@ -225,7 +225,8 @@ class ReadinessService:
         }
 
         rows: list[RouterChecklistItem] = []
-        for definition in checklist_items_for(agent_managed=is_agent_managed(router)):
+        agent_managed = is_agent_managed_row(router)
+        for definition in checklist_items_for(agent_managed=agent_managed):
             key = definition.key.value
             if key in auto_results:
                 status_value, detail, evidence = auto_results[key]
@@ -326,7 +327,7 @@ class ReadinessService:
     ) -> dict[str, tuple[ChecklistItemStatus, str, dict[str, Any]]]:
         results: dict[str, tuple[ChecklistItemStatus, str, dict[str, Any]]] = {}
 
-        if not is_agent_managed(router):
+        if not is_agent_managed_row(router):
             # Contract §11.5. Every auto check below asks a question about a
             # MikroTik running a platform agent, and this device is not one
             # -- a TP-Link Omada controller has no agent, no WireGuard peer

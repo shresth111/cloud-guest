@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import uuid
 from datetime import datetime
 from typing import Protocol
@@ -22,6 +23,7 @@ from typing import Protocol
 from app.domains.rbac.models import AuditLogEntry
 
 from .constants import AUDIT_EXPORT_MAX_ROWS, AUDIT_EXPORT_PAGE_SIZE, CSV_EXPORT_HEADERS
+from .redaction import redact_event_metadata
 
 
 class AuditRepositoryProtocol(Protocol):
@@ -137,6 +139,15 @@ def _csv_row(entry: AuditLogEntry) -> tuple[str, ...]:
         str(entry.organization_id) if entry.organization_id else "",
         str(entry.location_id) if entry.location_id else "",
         entry.description or "",
+        # JSON rather than `str(dict)`: the CSV is opened in a spreadsheet
+        # and pasted into tickets, and `{'vendor': {'from': 'mikrotik'}}` is
+        # not parseable by anything. `default=str` because the column is
+        # JSONB and a writer may have put a UUID or a datetime in it.
+        json.dumps(
+            redact_event_metadata(entry.event_metadata), default=str, sort_keys=True
+        )
+        if entry.event_metadata
+        else "",
     )
 
 

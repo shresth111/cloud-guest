@@ -29,6 +29,8 @@ __all__ = [
     "ProvisioningTokenRouterStateError",
     "ProvisioningTokenGenerationNotAllowedError",
     "RouterVendorNotProvisionableError",
+    "RouterVendorNotSupportedError",
+    "RouterVendorChangeRefusedError",
     "RouterLiveCredentialRotationFailedError",
 ]
 
@@ -243,4 +245,62 @@ class RouterLiveCredentialRotationFailedError(RouterError):
             f"Could not rotate the live API credential on router {router_id}'s "
             f"device -- the stored secret was left unchanged: {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class RouterVendorNotSupportedError(RouterError):
+    """A vendor string was submitted that this platform has no machinery for.
+
+    ``routers.vendor`` is a free ``String(50)`` with no enum and no CHECK
+    constraint, so until this existed any string at all could be written to
+    it -- and a string outside
+    :data:`~app.domains.router.vendor_capabilities.CONTROLLER_MANAGED_VENDORS`
+    is treated as an agent-managed MikroTik by every predicate in this
+    codebase. Writing ``"unifi"`` therefore did not mark a device
+    unsupported; it silently promised that a platform agent was running on a
+    UniFi controller. Refusing the write is the only way the column can mean
+    what it says.
+    """
+
+    def __init__(self, vendor: str, supported: tuple[str, ...]) -> None:
+        super().__init__(
+            f"'{vendor}' is not a device type this platform manages. "
+            f"Supported types: {', '.join(supported)}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+class RouterVendorChangeRefusedError(RouterError):
+    """The device's own data contradicts the vendor being claimed for it.
+
+    A vendor change is not a correction when the device has already told us
+    what it is. On 2026-09-10 seven live MikroTiks were relabelled
+    ``tplink_omada`` from a dropdown; every one of them had heartbeated,
+    several had RouterOS API credentials on file, and one -- an RB750r2 that
+    had been checking in for months -- went offline four days later with
+    nobody watching, because the label had removed it from the alert
+    evaluator's roster.
+
+    422 rather than 409 for the same reason
+    :class:`RouterVendorNotProvisionableError` is: a retry does not help. The
+    caller either has the wrong device or genuinely intends to overrule the
+    evidence, and the second of those is a different, deliberate request --
+    hence ``override_contradicting_evidence`` on the schema rather than a
+    conflict the console can retry its way through.
+
+    The message names the evidence, because "refused" without "here is what
+    the device said about itself" is the kind of refusal an operator works
+    around rather than reads.
+    """
+
+    def __init__(
+        self, router_id: uuid.UUID, vendor: str, reasons: list[str]
+    ) -> None:
+        super().__init__(
+            f"Router {router_id} cannot be recorded as a '{vendor}' device: "
+            + "; ".join(reasons)
+            + ". If this is genuinely a controller and the evidence above is "
+            "stale, resubmit with override_contradicting_evidence=true and a "
+            "reason -- the override is recorded in the audit trail.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )

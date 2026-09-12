@@ -92,6 +92,7 @@ from redis.asyncio import Redis
 
 from app.domains.location.scoping import enforce_target_location
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 
 from .constants import (
@@ -306,6 +307,10 @@ class NetworkDiagnosticsService:
         -- but it is a bound on the client's wait, not on thread
         occupancy, and it is worth knowing that the two are different.
         """
+        # Before credentials. A controller row has none by construction, and
+        # "this router is missing device connection credentials" sends a duty
+        # manager looking for a setting to fill in that does not exist.
+        ensure_not_controller_managed(router, feature="Network Tests")
         credentials = self._resolve_credentials(router)
         adapter: BaseDiagnosticsAdapter = self._get_device_adapter(router.vendor)
 

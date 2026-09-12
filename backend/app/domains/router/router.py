@@ -169,6 +169,7 @@ from .schemas import (
     RouterPlatformResponse,
     RouterResponse,
     RouterUpdateRequest,
+    RouterVendorChangeRequest,
     WebfigSessionResponse,
     redact_customer_router_settings,
 )
@@ -431,6 +432,53 @@ async def get_router_platform_view(
         success=True,
         message="Router retrieved",
         data=_router_platform_response(router_device).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/platform/routers/{router_id}/vendor",
+    response_model=ApiResponse[RouterPlatformResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.update", scope=ScopeType.GLOBAL))],
+)
+async def change_router_vendor(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: RouterVendorChangeRequest,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Records what kind of device this fleet row is.
+
+    ``vendor`` used to ride on ``RouterUpdateRequest``, i.e. on the
+    organization-scoped ``PUT /routers/{router_id}``, whose ``routers.update``
+    permission every ``organization-owner`` holds in full -- so a venue owner
+    could relabel their own device, and under the label-based predicates that
+    switched off their own monitoring. It is not on that schema any more;
+    this route is the only way in, and it is GLOBAL-only. Exactly the move
+    ``api_username``/``api_secret`` made onto ``management-access`` above,
+    for the same reason and after the same discovery.
+
+    A separate route from ``management-access`` rather than another field on
+    it: that one sets *how we reach* a device, this one sets *what the device
+    is*, and only the second needs a written reason and can be refused by the
+    device's own history.
+
+    Returns the platform view, because the only caller is the Master console
+    and the row it is holding open is the platform one.
+    """
+    updated = await router_service.change_router_vendor(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        vendor=payload.vendor,
+        reason=payload.reason,
+        override_contradicting_evidence=payload.override_contradicting_evidence,
+    )
+    return build_response(
+        success=True,
+        message="Router device type updated",
+        data=_router_platform_response(updated).model_dump(),
         request_id=_request_id(request),
     )
 

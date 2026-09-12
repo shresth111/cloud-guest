@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 from .constants import MAX_VLAN_ID, MIN_VLAN_ID
 
@@ -270,11 +271,19 @@ class VlanMissingCredentialsError(VlanError):
 
 
 class UnsupportedVlanVendorError(VlanError):
-    """No VLAN device adapter is registered for the router's vendor."""
+    """No VLAN device adapter is registered for the router's vendor.
+
+    The message is chosen by
+    ``app.domains.router.device_domain_gate.unsupported_vendor_message``: a
+    controller-managed vendor gets the sentence a venue owner can act on, an
+    unrecognised vendor string keeps the engineer-facing wording. Both keep
+    this domain's own type and 400 -- the change is what the customer reads,
+    not what the caller catches.
+    """
 
     def __init__(self, vendor: str) -> None:
         super().__init__(
-            f"No VLAN device adapter is registered for vendor '{vendor}'",
+            unsupported_vendor_message(feature="Network Zones", vendor=vendor),
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

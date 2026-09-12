@@ -259,6 +259,16 @@ class FakeRouterRepository:
             None,
         )
 
+    # How many live `network_integrations` rows point at a router. The real
+    # repository counts them in SQL; here a test sets the number it wants.
+    # Only `change_router_vendor` reads it -- an integration's provider is
+    # what chose the fleet row's vendor, so the value cannot be changed out
+    # from under one.
+    integration_counts: dict[uuid.UUID, int] = field(default_factory=dict)
+
+    async def count_integrations_referencing_router(self, router_id: uuid.UUID) -> int:
+        return self.integration_counts.get(router_id, 0)
+
     async def create_router(self, **fields: object) -> Router:
         defaults = {
             "routeros_version": None,

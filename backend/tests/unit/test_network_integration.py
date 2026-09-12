@@ -146,8 +146,10 @@ from app.domains.network_integration.validators import (
     validate_controller_url,
 )
 from app.domains.router.vendor_capabilities import (
+    AGENT_EVIDENCE_FIELDS,
     is_agent_managed,
     is_controller_managed,
+    is_controller_managed_row,
 )
 
 # ============================================================================
@@ -1688,6 +1690,52 @@ class TestMasterFleetOnboarding:
         assert router.vendor == "tplink_omada"
         assert not is_agent_managed(router.vendor)
         assert is_controller_managed(router.vendor)
+
+    async def test_the_synthetic_row_carries_no_agent_evidence(self) -> None:
+        """The onboard path must never stamp a column only an agent writes.
+
+        `is_controller_managed_row` treats a fleet row as controller-managed
+        only when the vendor says so AND there is no agent evidence -- that
+        asymmetry is what keeps a mislabelled-but-live MikroTik inside
+        monitoring and alerting. It inverts badly: if this path ever wrote
+        `last_seen_at`, `routeros_version`, `last_health_check_at` or an API
+        credential on the synthetic row it creates, then *every genuine
+        controller* would start reading as agent-managed and would be polled,
+        health-checked, readiness-scored and alerted on as though it ran our
+        agent -- which it never will.
+
+        Asserted at the call boundary rather than on the returned object, so
+        this fails on the day someone adds the kwarg, not on the day a real
+        database happens to expose it."""
+        provisioner = FakeFleetDeviceProvisioner()
+        service = _service(FakeRepository(), fleet_provisioner=provisioner)
+
+        _, router = await service.create_integration_with_fleet_device(
+            actor_user_id=None,
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            provider="omada",
+            name="Lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            controller_model="TP-Link OC200",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+            client_id="cid",
+            client_secret="secret",
+        )
+
+        call = provisioner.calls[0]
+        for column in AGENT_EVIDENCE_FIELDS:
+            assert call.get(column) is None, (
+                f"the onboard path passed {column} to create_router; every "
+                "genuine controller would now read as agent-managed"
+            )
+        # And the controller's own credentials stay on the integration row,
+        # which is the only place that can hold them honestly.
+        assert call.get("api_secret") is None
+        assert call.get("api_username") is None
+        assert is_controller_managed_row(router) is True
 
     async def test_the_vendor_comes_from_the_provider_not_from_the_service(
         self,

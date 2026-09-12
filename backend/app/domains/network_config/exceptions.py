@@ -22,6 +22,7 @@ __all__ = [
     "NetworkConfigError",
     "EmptyNetworkConfigError",
     "NetwatchIntegrationUnavailableError",
+    "NetworkConfigVendorGateUnavailableError",
     "NoNetwatchTargetsError",
     "NoWanLinksError",
     "MissingStaticWanAddressError",
@@ -51,6 +52,30 @@ class NetwatchIntegrationUnavailableError(NetworkConfigError):
             f"Netwatch integration is not configured for router {router_id} "
             "-- isp_link_lookup/agent_credential_issuer/router_lookup must "
             "all be composed on NetworkConfigService",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+class NetworkConfigVendorGateUnavailableError(NetworkConfigError):
+    """A write path in this service could not ask what kind of device it was
+    about to configure, because ``router_lookup`` was not composed.
+
+    Same shape and the same reasoning as
+    ``NetwatchIntegrationUnavailableError`` above -- ``dependencies.py``
+    always composes it, so this is a wiring gap and deserves an honest 500.
+
+    It exists rather than a ``self.router_lookup is None`` early-return
+    because a vendor gate that quietly does nothing when a dependency is
+    missing is indistinguishable, in production, from no gate at all -- and
+    "the check was there, it just never ran" is the exact failure mode this
+    whole change set was written to remove.
+    """
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Cannot determine the device type of router {router_id} "
+            "-- router_lookup must be composed on NetworkConfigService "
+            "before any configuration is written or pushed",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 

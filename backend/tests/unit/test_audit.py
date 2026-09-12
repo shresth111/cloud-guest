@@ -210,6 +210,11 @@ async def test_export_csv_includes_header_and_rows() -> None:
         "organization_id",
         "location_id",
         "description",
+        # Appended, never inserted -- see CSV_EXPORT_HEADERS. Until this
+        # column existed, an export of a router update read "updated" and
+        # nothing else, because the field-level diff the writers record in
+        # `event_metadata` had no read path at all.
+        "event_metadata",
     ]
     assert len(rows) == 3  # header + 2 data rows
     assert truncated is False

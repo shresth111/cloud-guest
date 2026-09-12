@@ -183,6 +183,33 @@ class CrossTenantAccessError(RBACError):
         super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
 
 
+#: What ``AccessValidator._describe_scope`` renders for a GLOBAL-scope check.
+#: Matched as a string rather than passing a ``ScopeType`` down, so this
+#: module keeps its one-way dependency on ``enums`` unchanged and the
+#: description stays the single thing both the audit row and the message are
+#: built from.
+GLOBAL_SCOPE_DESCRIPTION = "global scope"
+
+#: Appended to a GLOBAL-scope denial.
+#:
+#: A permission held at ORGANIZATION scope can never satisfy a GLOBAL check,
+#: whatever ``X-Organization-Id`` the caller sends (``ScopeResolver.satisfies``)
+#: -- so for a venue account this refusal is permanent, and the bare original
+#: message ("Permission denied: 'network_integrations.create' is required at
+#: global scope") invited exactly the two wrong responses: switch organization
+#: and retry, or open a ticket asking for the permission to be granted.
+#:
+#: It names no internal surface a venue account cannot reach, and no user,
+#: role or organization -- a 403 that discloses the shape of the permission
+#: model is its own problem. "A platform operator" is what the reader needs
+#: and all of it.
+GLOBAL_SCOPE_DENIAL_GUIDANCE = (
+    ". This action is performed by a Wyfy Guest platform operator, not from a "
+    "venue account -- selecting a different organization will not change "
+    "that. If you need it done for your venue, ask your Wyfy Guest contact."
+)
+
+
 class PermissionDeniedError(RBACError):
     """The authenticated user lacks the permission required for this action."""
 
@@ -190,6 +217,8 @@ class PermissionDeniedError(RBACError):
         message = f"Permission denied: '{permission_key}' is required"
         if scope_description:
             message += f" at {scope_description}"
+        if scope_description == GLOBAL_SCOPE_DESCRIPTION:
+            message += GLOBAL_SCOPE_DENIAL_GUIDANCE
         super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
 
 

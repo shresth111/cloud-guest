@@ -81,6 +81,38 @@ def _make_router(*, status: str = "online", health_status: str | None = None) ->
     )
 
 
+#: The agent-written columns a genuinely onboarded controller never has.
+#:
+#: `create_integration_with_fleet_device` -> `RouterService.create_router`
+#: writes `status = pending_provisioning` and leaves every one of these NULL,
+#: and `vendor_capabilities.is_controller_managed_row` reads exactly them.
+CONTROLLER_AGENT_COLUMNS = (
+    "last_seen_at",
+    "routeros_version",
+    "last_health_check_at",
+    "api_credentials_encrypted",
+)
+
+
+def make_controller_router(*, status: str = "pending_provisioning") -> Router:
+    """A fleet row shaped like a real TP-Link Omada controller.
+
+    `_make_router` above builds a MikroTik that has heartbeated and has
+    RouterOS credentials on file, and for most of this suite that is the right
+    default. Setting `vendor = "tplink_omada"` on top of it does NOT produce a
+    controller -- it produces the seven-row production defect: a device that
+    checked in, wearing a controller's label. Since
+    `is_controller_managed_row` weighs the evidence over the label, a test
+    that wants a controller has to build one, and this is that builder.
+    """
+    router = _make_router(status=status)
+    router.vendor = "tplink_omada"
+    router.api_username = None
+    for column in CONTROLLER_AGENT_COLUMNS:
+        setattr(router, column, None)
+    return router
+
+
 @dataclass
 class FakeIspLink:
     is_enabled: bool

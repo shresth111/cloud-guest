@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -1418,6 +1419,25 @@ class TestEveryRouteRequiresPermission:
         assert _permission_keys(get_route) == ["channel_partners.read"]
 
 
+def _denial_audit_to(repository):
+    """A ``denial_audit_repository`` factory that writes into ``repository``.
+
+    The real one opens a transaction of its own, because a PERMISSION_DENIED
+    row written on the request's session is destroyed by the rollback the
+    denial itself triggers (``get_db_session``) -- which is why no denied
+    request in this platform's history left a persisted trace. That property
+    is asserted separately in ``TestDeniedPermissionsAreActuallyPersisted``;
+    here the seam is pointed at the fake so the *content* of the row can be
+    checked without a database.
+    """
+
+    @asynccontextmanager
+    async def factory():
+        yield repository
+
+    return factory
+
+
 class TestRevokeRequiresManagePermission:
     """A genuine, executable 403: an actor holding no roles/grants at all
     is denied ``channel_partners.manage`` -- exercises the real
@@ -1430,7 +1450,10 @@ class TestRevokeRequiresManagePermission:
 
     async def test_actor_without_manage_permission_gets_403(self) -> None:
         repository = FakeRBACRepository()
-        validator = AccessValidator(repository)
+        validator = AccessValidator(
+            repository,
+            denial_audit_repository=_denial_audit_to(repository),
+        )
         user_id = uuid.uuid4()
 
         with pytest.raises(PermissionDeniedError) as exc_info:

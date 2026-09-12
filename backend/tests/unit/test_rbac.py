@@ -14,6 +14,7 @@ this environment.
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -914,6 +915,25 @@ class TestScopeResolver:
 # ============================================================================
 
 
+def _denial_audit_to(repository):
+    """A ``denial_audit_repository`` factory that writes into ``repository``.
+
+    The real one opens a transaction of its own, because a PERMISSION_DENIED
+    row written on the request's session is destroyed by the rollback the
+    denial itself triggers (``get_db_session``) -- which is why no denied
+    request in this platform's history left a persisted trace. That property
+    is asserted separately in ``TestDeniedPermissionsAreActuallyPersisted``;
+    here the seam is pointed at the fake so the *content* of the row can be
+    checked without a database.
+    """
+
+    @asynccontextmanager
+    async def factory():
+        yield repository
+
+    return factory
+
+
 class TestAccessValidator:
     async def test_has_permission_true_for_matching_grant(self) -> None:
         repo = FakeRBACRepository()
@@ -994,7 +1014,9 @@ class TestAccessValidator:
 
     async def test_check_raises_and_logs_permission_denied(self) -> None:
         repo = FakeRBACRepository()
-        validator = AccessValidator(repo)
+        validator = AccessValidator(
+            repo, denial_audit_repository=_denial_audit_to(repo)
+        )
         user_id = uuid.uuid4()
 
         with pytest.raises(PermissionDeniedError):
