@@ -35,6 +35,8 @@ new was invented here.
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import Depends
 
 from app.core.config import Settings, get_settings
@@ -43,6 +45,22 @@ from app.domains.billing.dependencies import get_plan_service, get_subscription_
 from app.domains.billing.service import PlanService, SubscriptionService
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.monitoring.default_alerting import ensure_default_alerting
+# Aliased on import, both of them. `monitoring` and `notification` each
+# export a class called `NotificationService` and a provider called
+# `get_notification_service`, and they are different objects for different
+# jobs: notification's is the outbox this wizard sends the welcome email
+# through, monitoring's owns alert *channels*. An unaliased second import
+# would silently shadow the first and hand `LocationProvisioningService` the
+# wrong one.
+from app.domains.monitoring.dependencies import (
+    get_alert_service,
+    get_notification_service as get_alert_notification_service,
+)
+from app.domains.monitoring.service import (
+    AlertService,
+    NotificationService as AlertNotificationService,
+)
 from app.domains.notification.dependencies import get_notification_service
 from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
@@ -81,8 +99,22 @@ def get_location_provisioning_service(
     subscription_service: SubscriptionService = Depends(get_subscription_service),
     captive_portal_service: CaptivePortalService = Depends(get_captive_portal_service),
     notification_service: NotificationService = Depends(get_notification_service),
+    alert_service: AlertService = Depends(get_alert_service),
+    alert_notification_service: AlertNotificationService = Depends(
+        get_alert_notification_service
+    ),
     settings: Settings = Depends(get_settings),
 ) -> LocationProvisioningService:
+    async def _default_alerting(
+        *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> object:
+        return await ensure_default_alerting(
+            alert_service,
+            alert_notification_service,
+            organization_id=organization_id,
+            contact_email=contact_email,
+        )
+
     return LocationProvisioningService(
         location_service,
         organization_service,
@@ -99,6 +131,7 @@ def get_location_provisioning_service(
         LoggingSmsProvider(),
         login_url_base=settings.frontend_base_url,
         notification_service=notification_service,
+        default_alerting=_default_alerting,
     )
 
 

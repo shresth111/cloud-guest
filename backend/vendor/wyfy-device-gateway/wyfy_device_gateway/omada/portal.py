@@ -49,15 +49,49 @@ Expiration time", which reads like an absolute epoch. It is not:
 
 So ``duration_seconds`` is multiplied by 1000 and sent as ``time``.
 
-**INFERRED, unverified:** that ``time`` is a *duration* rather than an
-absolute epoch-milliseconds expiry is an inference from the sample code's
-parameter name and from the redirect's separate ``t`` parameter already
-carrying "current timestamp in milliseconds". We could not find a sentence
-in any TP-Link document that states it outright. If this inference is wrong,
+**VERIFIED** (2026-09-12). This used to be tagged INFERRED because no
+*current* TP-Link document states it outright. The older ones in the same
+document family do, verbatim and unambiguously:
+
+* *API and Code Sample for External Portal Server (Omada Controller 2.5.4
+  or below)*, <https://support.omadanetworks.com/en/document/12916/>:
+  "The **time** parameter here is the number of seconds before client
+  authentication expires. This parameter is defined by the portal server."
+* *(Omada Controller 2.6.0 to 3.2.17)*,
+  <https://support.omadanetworks.com/us/document/12990/>: the identical
+  sentence.
+
+"the number of seconds before client authentication expires" is a duration,
+and the same pages set it against ``t=time_since_epoch`` -- their name for a
+value that genuinely *is* absolute. That contrast survives every later
+revision: 13023, 13080 and 132060 all still document the redirect's ``t`` as
+``TIME_SINCE_EPOCH`` while documenting the body's ``time`` only as
+"Authentication Expiration time", never as an epoch. What changed at v4.1.5
+is the *unit*, seconds -> milliseconds (13023's sample renames the same
+argument ``$seconds`` -> ``$milliseconds``), not the meaning.
+
+Corroborated a second way from TP-Link's own Open API specification, where
+the same product calls a duration a "timestamp" in exactly this style --
+``ExtendOpenApiVO.period`` (``POST .../hotspot/authed-records/{id}/period``,
+extend an authorization): "Extended timestamp. Unit:ms. Period should be
+within the range of 60000 to 86400000000000(60s to 1000000days)." A minimum
+of 60000 glossed as "60s" cannot be an epoch.
+
+Caveat kept deliberately: the explicit sentence is from documents predating
+the v4.1.5 rename of the endpoint and of every other field
+(``cid``/``ap``/``ssid``/``rid`` -> ``clientMac``/``apMac``/``ssidName``/
+``radioId``), so this is a chain of primary documents rather than one
+sentence about this exact endpoint. Confirm it anyway on the first real
+controller -- ``OMADA_HARDWARE_VERIFICATION.md`` test 1, which is designed
+to tell the two readings apart in one call. If it were wrong,
 authorizations would be granted for an interval ending in 1970 and would be
-rejected or expire instantly -- a loud, immediately-obvious failure on first
-contact with real hardware, not a silent one. That is the main reason it is
-safe to ship the inference and verify it on the first real controller.
+rejected or expire instantly: a loud failure on first contact with real
+hardware, not a silent one.
+
+Note that a community implementation sending an absolute epoch here is not
+evidence against this. Both readings "succeed" for anyone who sends a large
+number (either a far-future expiry or a ~55,000-year duration); only the
+small numbers this module sends can tell them apart.
 
 ## ``clientIp`` is required on v6.2.10+ and absent before it
 
@@ -111,8 +145,21 @@ from .errors import OmadaAuthorizationError
 from .redaction import sanitize_detail
 
 #: VERIFIED (TP-Link docs 13080 / 132060): external portal / RADIUS-free auth.
-#: Corroborated a second way by the Open API spec, whose
-#: ``AuthClientOpenApiVO.authType`` enumerates "4: External Portal Server".
+#: The full enumeration is VERIFIED from TP-Link's own OpenAPI 3.0.1
+#: specification (<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>),
+#: which gives it twice, from the two sides of the API:
+#:
+#: * ``AuthClientOpenApiVO.authType`` (what an authorization record reports):
+#:   "0: No Auth; 1: Simple Password; 2: Exrternal Radius; 3: Voucher;
+#:   4: External Portal Server; 5: Local User; 6: SMS; 7: Facebook;
+#:   8: Hotspot Radius; 9: Mac Auth (with fail over); 10: Admin auth;
+#:   12: Form auth" (TP-Link's spelling of "Exrternal" preserved);
+#: * ``PortalSetting.authType`` (what a portal may be configured as):
+#:   "0: No Authentication; 1: Simple Password; 2: External RADIUS Server;
+#:   4: External Portal Server; 11: Hotspot; 15: Ldap; 16: Social Login".
+#:
+#: 4 is the only value this package ever sends, and it is the only one that
+#: means "an external server has already decided this client may pass".
 AUTH_TYPE_EXTERNAL_PORTAL = 4
 
 #: Sanity ceiling on a single authorization. A caller passing a nonsense
@@ -151,7 +198,9 @@ def build_authorize_body(
 
     body: dict[str, Any] = {
         "clientMac": ctx.client_mac,
-        # VERIFIED: milliseconds. See this module's docstring.
+        # VERIFIED: a DURATION, in milliseconds -- not an epoch expiry. Both
+        # halves of that are sourced in this module's docstring (TP-Link docs
+        # 12916/12990 for "duration", 132060 for "millisecond").
         "time": capped * 1000,
         # Sent as the string "4": that is how both the v5 and v6.2.10 docs
         # write it in the JSON body (``"authType":"4"``), even though the

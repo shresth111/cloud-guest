@@ -21,6 +21,7 @@ from .schemas import (
     ChecklistItemResponse,
     ChecklistResponse,
     ConfirmChecklistItemRequest,
+    redact_customer_evidence,
 )
 from .service import ReadinessService
 
@@ -32,6 +33,19 @@ def _request_id(request: Request) -> str:
 
 
 def _item_response(row: RouterChecklistItem) -> ChecklistItemResponse:
+    """The wire shape for one checklist row.
+
+    ``evidence`` goes through ``redact_customer_evidence`` rather than out
+    of the JSONB column verbatim. Both routes in this module are gated on a
+    bare ``readiness.read``/``readiness.manage``, i.e. reachable by an
+    organization-scoped role, and this domain has no platform-scoped view
+    to keep the unredacted copy on -- so the redaction is unconditional
+    here rather than a branch on the caller. There is nothing in the
+    withheld set a MikroTik checklist emits; see
+    ``CUSTOMER_FORBIDDEN_EVIDENCE_KEYS`` for why, and for what a Master
+    operator should read instead (the integration's own
+    ``/platform/integrations/{id}`` view, which carries all of it).
+    """
     definition = DEFINITIONS_BY_KEY[row.item_key]
     return ChecklistItemResponse(
         item_key=row.item_key,
@@ -41,7 +55,7 @@ def _item_response(row: RouterChecklistItem) -> ChecklistItemResponse:
         status=row.status,
         detection_mode=row.detection_mode,
         detail=row.detail,
-        evidence=row.evidence or {},
+        evidence=redact_customer_evidence(row.evidence),
         last_checked_at=row.last_checked_at,
         checked_by_user_id=(
             str(row.checked_by_user_id) if row.checked_by_user_id else None

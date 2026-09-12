@@ -715,16 +715,38 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # identical ScopeType.GLOBAL reasoning as PermissionModule.QUOTATIONS'
     # own entry above.
     PermissionModule.CHANNEL_PARTNERS: ScopeType.GLOBAL,
-    # A network integration's own location_id is nullable (one controller
-    # can serve several of a tenant's venues, or be registered before the
-    # operator maps it to a WyfyGuest location) -- ScopeType.LOCATION, the
-    # identical "no mandatory router, and no mandatory location either"
-    # reasoning PermissionModule.NETWORK_DEVICE's own entry above already
-    # documents. LOCATION is the narrowest scope that is *meaningful*
-    # here: the controller itself is not one of this platform's routers, so
-    # ScopeType.ROUTER would be a scope no integration row can ever be
-    # assigned at.
-    PermissionModule.NETWORK_INTEGRATIONS: ScopeType.LOCATION,
+    # ScopeType.GLOBAL -- and this one is a *product* decision, not a
+    # property of the row, so it is worth stating plainly rather than
+    # reasoning from the model's nullable columns the way the entries
+    # above do.
+    #
+    # A third-party network controller (TP-Link Omada) is onboarded,
+    # credentialled, mapped, repaired and removed from the Master console
+    # only. Every new customer and every new venue is set up by platform
+    # staff, who hold the controller's address and its login; a venue
+    # admin never sees any of it. The routes enforce that directly --
+    # every authenticated route in
+    # ``app.domains.network_integration.router`` names
+    # ``scope=ScopeType.GLOBAL`` (see that module's docstring) -- and this
+    # entry is the seed-data half of the same statement: with GLOBAL as
+    # the narrowest allowed scope, ``allowed_scope_types_for_module``
+    # returns ``(GLOBAL,)``, no ORGANIZATION/LOCATION/ROUTER permission-
+    # scope row is ever created for these keys, and
+    # ``test_rbac``'s "every module a system role grants must be
+    # assignable at that role's scope" check *fails* for any
+    # organization- or location-scoped role that still carries them. That
+    # test is what makes this line load-bearing instead of decorative.
+    #
+    # This used to be ScopeType.LOCATION, on the reasoning that an
+    # integration's ``location_id`` is nullable so LOCATION is the
+    # narrowest *meaningful* scope. That reasoning was sound about the
+    # data and wrong about the audience.
+    #
+    # Identical GLOBAL-only shape to PermissionModule.DEMO_REQUESTS /
+    # QUOTATIONS / CHANNEL_PARTNERS above, which is why every
+    # non-GLOBAL system role below now carries the same explicit
+    # ``_L.NONE`` override those three do.
+    PermissionModule.NETWORK_INTEGRATIONS: ScopeType.GLOBAL,
 }
 
 
@@ -950,6 +972,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- identical reasoning,
+            # and the one on this list that is a product decision rather
+            # than a property of the row: a third-party network controller
+            # is onboarded and credentialled from the Master console only.
+            # See MODULE_NARROWEST_SCOPE's own entry.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -978,6 +1006,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
+            # identical override above.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1020,6 +1051,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
+            # identical override above.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1050,6 +1084,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
+            # identical override above.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1086,19 +1123,26 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
             _M.READINESS: _L.FULL,
             _M.NETWORK_DEVICE: _L.FULL,
-            # Connecting this location's own third-party network
-            # controller (Omada) and pointing the captive portal at it is
-            # squarely this role's job -- FULL, matching its own
-            # NETWORK_DEVICE level immediately above. Deliberately NOT
-            # granted to the guest-facing location roles (Location
-            # Manager, Reception Staff, Helpdesk, Guest Operator, Office
-            # Admin): configuring a venue's network controller, and
-            # holding the credentials that reach it, is not front-desk
-            # work -- exactly why NETWORK_DEVICE is not granted to them
-            # either. All five have default_level=_L.NONE, so they get
-            # nothing here without an explicit override, and none is
-            # added.
-            _M.NETWORK_INTEGRATIONS: _L.FULL,
+            # NETWORK_INTEGRATIONS is GLOBAL-only now (see
+            # MODULE_NARROWEST_SCOPE) -- a LOCATION-scoped role can never
+            # hold any of its permissions, the same shape as this file's
+            # DEMO_REQUESTS/QUOTATIONS/CHANNEL_PARTNERS overrides.
+            #
+            # This override used to read _L.FULL, and argued that
+            # connecting a venue's own Omada controller was "squarely this
+            # role's job". Under the product decision recorded on that
+            # MODULE_NARROWEST_SCOPE entry it is not: a controller is
+            # onboarded and credentialled from the Master console for
+            # every new customer and every new venue, and a venue-side
+            # role -- however technical -- must not reach the controller's
+            # address, its login, or the probe that opens an outbound
+            # connection to a host of the caller's choosing.
+            #
+            # Removing it from this definition is not, on its own, enough
+            # for a database that has already been seeded: the seeder is
+            # additive. See RETIRED_NON_GLOBAL_MODULES below, which is
+            # what actually revokes the rows this line used to create.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,
@@ -1140,13 +1184,11 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
             _M.READINESS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
-            # Same "this location's own network controller" posture as
-            # Network Administrator's own override, at OPERATE rather than
-            # FULL -- matching every other module's level on this role,
-            # which excludes DELETE/MANAGE and so leaves removing an
-            # integration (and the platform-console enable/disable) to
-            # Network Administrator and org admins.
-            _M.NETWORK_INTEGRATIONS: _L.OPERATE,
+            # GLOBAL-only -- see Network Administrator's own identical
+            # override above and MODULE_NARROWEST_SCOPE. This used to be
+            # _L.OPERATE for the same "this location's own network
+            # controller" reason, retired for the same product decision.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
             # Day-to-day network operations plainly includes knowing
             # whether THIS location's own internet uplink is up (ISP) and
             # what hardware is registered on its network (MONITORED_
@@ -1291,6 +1333,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEMO_REQUESTS: _L.NONE,
             _M.QUOTATIONS: _L.NONE,
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only too -- and note what this
+            # line withholds: at _L.READ this role held
+            # network_integrations.read, which serves the controller's
+            # base_url, its Omada id and its site/SSID mapping to anyone
+            # with tenant-wide "read-only visibility".
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1320,6 +1368,11 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see Read Only's own
+            # identical override above. An auditor's trail into this domain
+            # is the audit log (_L.FULL above), which records every
+            # controller action without exposing the controller.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1348,6 +1401,51 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
 
 
 # ============================================================================
+# Grants this seed used to create and no longer does
+# ============================================================================
+
+# ``seed_rbac`` is otherwise purely additive -- every write is preceded by an
+# existence check and nothing is ever deleted -- which is the right default:
+# an operator may legitimately have attached an extra permission to a system
+# role through the roles UI, and a seeder that reconciled the whole grant set
+# every deploy would silently undo their work.
+#
+# The cost of that default is that *removing* a module from a
+# ``SystemRoleDefinition`` above has no effect on any database that has
+# already been seeded. Deleting ``_M.NETWORK_INTEGRATIONS: _L.FULL`` from
+# Network Administrator changes what a fresh database gets and leaves every
+# existing Network Administrator holding ``network_integrations.create``,
+# ``.read``, ``.update``, ``.delete`` and ``.manage`` forever. That is not a
+# theoretical gap: those rows are what an organization-scoped session
+# actually presents at the routes, and the routes are the thing being
+# closed.
+#
+# So the retirement is stated explicitly, as narrowly as it can be:
+#
+#   * only the modules named here,
+#   * only on roles this file owns (``is_system_role``, matched by slug from
+#     ``SYSTEM_ROLES``),
+#   * and only on roles whose ``scope_type`` is not GLOBAL -- Super Admin,
+#     Platform Admin and Platform Support keep every one of these keys,
+#     because the Master console is where the surface moved *to*.
+#
+# It is idempotent (a grant already absent is not an error and is not
+# counted) and it is a no-op on a fresh database, where the additive pass
+# never created the rows in the first place.
+#
+# A module belongs here only once it is GLOBAL-only in
+# MODULE_NARROWEST_SCOPE *and* removed from every non-GLOBAL role's grants
+# above; the two halves are checked against each other in
+# ``tests/unit/test_seed.py``.
+RETIRED_NON_GLOBAL_MODULES: tuple[PermissionModule, ...] = (
+    # Controller configuration and credentials are Master-console-only --
+    # see this module's MODULE_NARROWEST_SCOPE entry and
+    # ``app.domains.network_integration.router``'s docstring.
+    PermissionModule.NETWORK_INTEGRATIONS,
+)
+
+
+# ============================================================================
 # Seeding entrypoint
 # ============================================================================
 
@@ -1359,6 +1457,9 @@ class SeedSummary:
     permission_scopes_created: int = 0
     roles_created: int = 0
     role_permissions_created: int = 0
+    #: Grants deleted from an already-seeded system role because the module
+    #: is now GLOBAL-only. See RETIRED_NON_GLOBAL_MODULES.
+    role_permissions_revoked: int = 0
 
 
 async def seed_rbac(session: AsyncSession) -> SeedSummary:
@@ -1436,6 +1537,24 @@ async def seed_rbac(session: AsyncSession) -> SeedSummary:
                         role.id, permission.id, granted_by=None
                     )
                     summary.role_permissions_created += 1
+
+        # The one subtractive pass, and it runs after the additive one on
+        # purpose: if a module were ever both granted above and retired here,
+        # the retirement is the statement that wins rather than a race
+        # between two loops. Today that cannot happen -- the modules named
+        # in RETIRED_NON_GLOBAL_MODULES are absent from every non-GLOBAL
+        # role's `grants()` -- and the ordering keeps it true if it ever
+        # stops being.
+        if role_def.scope_type is not ScopeType.GLOBAL:
+            for module in RETIRED_NON_GLOBAL_MODULES:
+                for action in MODULE_ACTIONS[module]:
+                    permission = permission_by_key[permission_key(module, action)]
+                    if permission.id not in existing_permission_ids:
+                        continue
+                    if await repository.remove_role_permission(
+                        role.id, permission.id
+                    ):
+                        summary.role_permissions_revoked += 1
 
     logger.info("rbac_seed_completed", extra=vars(summary))
     return summary

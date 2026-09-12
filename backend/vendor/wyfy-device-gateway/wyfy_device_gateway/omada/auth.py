@@ -78,13 +78,47 @@ being precise about because ``Bearer`` is the natural guess for an OAuth-style
 client-credentials flow, it is what at least one user tried on TP-Link's own
 forum, and it does not work.
 
-The token URL, body field names and envelope field names are **corroborated,
-not primary**: they come from the open-source client at
-<https://github.com/bullitt186/ha-omada-open-api> (``custom_components/
-omada_open_api/auth.py``, ``const.py``) and from TP-Link forum threads. The
-authoritative specification is the "Online API Document" that a running
-controller serves at ``/doc.html``, which is not publicly reachable. They are
-marked accordingly below.
+Sourcing, revised 2026-09-12. This used to be tagged wholly CORROBORATED. It
+now splits three ways:
+
+* **VERIFIED -- the token path, and ``grant_type`` being a *query* parameter.**
+  TP-Link runs the Open API northbound gateway for its own cloud controllers
+  at ``use1-omada-northbound.tplinkcloud.com``, and it answers this call
+  unauthenticated with structured Omada error envelopes. Probed directly:
+
+      POST /openapi/authorize/token?grant_type=client_credentials
+      {"omadacId":"x","client_id":"x","client_secret":"x"}
+        -> {"errorCode":-7131,"msg":"Controller ID not exist."}
+
+  i.e. the body was parsed and ``omadacId`` was reached and rejected on its
+  value. Drop the query parameter, move it into the body, or give it a
+  nonsense value, and the same request instead fails before the body is
+  looked at, with ``{"errorCode":-44116,"msg":"Open API Authorized failed,
+  please check whether the input parameters are legal."}``. So ``grant_type``
+  belongs in the query string, not the body -- and ``?grant_type=refresh_token``
+  is likewise a recognised grant (it reaches ``-1001 "Invalid request
+  parameters."`` on a bogus token, rather than -44116), while passing the
+  refresh fields as query parameters instead of a JSON body gives
+  ``-1004 "Invalid request type."``.
+
+* **VERIFIED -- the ``AccessToken=`` header prefix.** TP-Link's *How to
+  Create Site in Omada Controller via Open API*,
+  <https://support.omadanetworks.com/uk/document/109315/>: "The prefix in the
+  Authorization header must be AccessToken=".
+
+* **CORROBORATED, still not primary -- the response envelope's field names**
+  (``result.accessToken`` / ``result.refreshToken`` / ``result.expiresIn``)
+  and the exact body key spellings ``client_id`` / ``client_secret``. The
+  probe above cannot separate these from their camelCase alternatives,
+  because ``omadacId`` is validated first and short-circuits the rest. They
+  come from the open-source client at
+  <https://github.com/bullitt186/ha-omada-open-api> (``custom_components/
+  omada_open_api/auth.py``, ``const.py``) and from TP-Link forum threads.
+  Note that the token endpoint is genuinely absent from TP-Link's published
+  OpenAPI 3.0.1 document (1,918 paths, none under ``/openapi/authorize``);
+  the authoritative text is the "Online API Document" a running controller
+  serves at ``/doc.html``, which is not publicly reachable. Settle it on the
+  first controller: ``OMADA_HARDWARE_VERIFICATION.md`` test 2.
 """
 
 from __future__ import annotations
@@ -105,7 +139,10 @@ LEGACY_LOGIN_PATH = "/{omadac_id}/api/v2/hotspot/login"
 #: VERIFIED (TP-Link docs 13080 / 132060, prose; and 13023 in both prose and
 #: sample code). Client authorization.
 LEGACY_AUTHORIZE_PATH = "/{omadac_id}/api/v2/hotspot/extPortal/auth"
-#: CORROBORATED (community client + forum threads), not primary.
+#: VERIFIED: probed against TP-Link's own Open API northbound gateway, which
+#: parses the body and validates ``omadacId`` on this exact path with
+#: ``?grant_type=client_credentials``. The response *envelope* field names
+#: remain CORROBORATED only -- see this module's docstring.
 OPENAPI_TOKEN_PATH = "/openapi/authorize/token"
 
 #: VERIFIED (TP-Link docs 13080 / 132060): the CSRF header name, whose value

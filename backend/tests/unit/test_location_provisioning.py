@@ -689,8 +689,35 @@ class _NotificationServiceAdapter:
 # ============================================================================
 
 
+class RecordingDefaultAlerting:
+    """Stands in for ``ensure_default_alerting`` partially applied over its
+    two monitoring services -- see ``provisioning_dependencies.py``.
+
+    ``raises`` is as important as the recording. The real helper is
+    documented as never raising, and this is how we prove the wizard does
+    not lean on that: ``provision_location`` runs in one transaction, so an
+    exception escaping would roll back the whole customer over their
+    default alert rules.
+    """
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self.calls: list[dict] = []
+        self.raises = raises
+
+    async def __call__(self, *, organization_id, contact_email):
+        self.calls.append(
+            {"organization_id": organization_id, "contact_email": contact_email}
+        )
+        if self.raises is not None:
+            raise self.raises
+        return None
+
+
 def make_service(
-    *, fail_at: str | None = None, fail_with: Exception | None = None
+    *,
+    fail_at: str | None = None,
+    fail_with: Exception | None = None,
+    default_alerting: RecordingDefaultAlerting | None = None,
 ) -> tuple[LocationProvisioningService, ProvisioningFakes, FakeSharedSession]:
     session = FakeSharedSession()
     fakes = ProvisioningFakes(session=session, fail_at=fail_at, fail_with=fail_with)
@@ -754,6 +781,7 @@ def make_service(
         _EmailProviderAdapter(fakes),
         _SmsProviderAdapter(fakes),
         notification_service=_NotificationServiceAdapter(fakes),
+        default_alerting=default_alerting,
     )
     return service, fakes, base_plan_id
 
@@ -2043,3 +2071,145 @@ def _hash(password: str) -> str:
     from app.domains.auth.password import PasswordManager
 
     return PasswordManager.hash(password)
+
+
+# ============================================================================
+# Default alerting for a customer created by this wizard
+# ============================================================================
+#
+# `ensure_default_alerting` had exactly one caller, `POST /organizations`.
+# This wizard creates organizations too and is the path a master operator
+# actually uses, so a customer created here had no alert rules at all: the
+# 30s evaluation sweep had nothing to evaluate and their venue could go dark
+# without an email. For an Omada venue it also meant the three
+# `network_controller*` rules never existed, leaving the controller-health
+# alerting inert for exactly the customers it was built for.
+
+
+class TestDefaultAlertingOnOrganizationCreation:
+    async def test_a_new_organization_gets_default_alerting(self) -> None:
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert len(alerting.calls) == 1
+
+    async def test_it_names_the_organization_that_was_created(self) -> None:
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert alerting.calls[0]["organization_id"] == result.organization_id
+
+    async def test_the_contact_email_is_carried_through(self) -> None:
+        """Without it the organization gets rules that can notify nobody --
+        the half-configured state `default_alerting` exists to end."""
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+        new_org = _new_org()
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=new_org, plan_id=base_plan_id),
+        )
+
+        assert alerting.calls[0]["contact_email"] == new_org.contact_email
+
+    async def test_an_omada_venue_with_no_router_still_gets_alerting(self) -> None:
+        """The case that motivated this. A controller-only customer is
+        provisioned with `router=None`, and is precisely the customer whose
+        `network_controller*` rules must exist."""
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(
+                new_organization=_new_org(), plan_id=base_plan_id, router=None
+            ),
+        )
+
+        assert len(alerting.calls) == 1
+
+
+class TestExistingOrganizationsAreNotReconfigured:
+    async def test_provisioning_into_an_existing_organization_does_not_ask(
+        self,
+    ) -> None:
+        """A second location for a tenant that already exists must not
+        re-run the defaults. That tenant was given them when it was created,
+        and an operator who has since retuned or deleted a rule meant to."""
+        alerting = RecordingDefaultAlerting()
+        service, fakes, base_plan_id = make_service(default_alerting=alerting)
+        organization = await fakes.create_organization(
+            actor_user_id=uuid.uuid4(),
+            name="Existing Co",
+            slug=f"existing-{uuid.uuid4().hex[:6]}",
+            contact_email="ops@existing.example.com",
+            contact_phone=None,
+            legal_name=None,
+            timezone="UTC",
+            default_locale="en",
+            settings={},
+        )
+        fakes.organizations[organization.id] = organization
+        alerting.calls.clear()
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(
+                existing_organization_id=organization.id, plan_id=base_plan_id
+            ),
+        )
+
+        assert alerting.calls == []
+
+
+class TestAlertingNeverCostsTheCustomer:
+    async def test_a_raising_helper_does_not_roll_back_the_customer(self) -> None:
+        """`provision_location` runs inside one request-scoped session, so
+        an exception escaping here would roll back the organization, the
+        owner account, the location and the router. The customer existing
+        matters more than their default alert rules existing."""
+        alerting = RecordingDefaultAlerting(raises=RuntimeError("smtp exploded"))
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert result.organization_id is not None
+
+    async def test_the_rest_of_provisioning_still_completes(self) -> None:
+        alerting = RecordingDefaultAlerting(raises=RuntimeError("boom"))
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert result.location_id is not None and result.owner_email
+
+
+class TestNothingWiredIsSafe:
+    async def test_provisioning_works_with_no_alerting_wired(self) -> None:
+        """The default is a logging no-op, so a construction that predates
+        this parameter keeps working unchanged."""
+        service, _fakes, base_plan_id = make_service()
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert result.organization_id is not None

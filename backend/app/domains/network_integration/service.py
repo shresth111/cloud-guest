@@ -2788,6 +2788,49 @@ class NetworkIntegrationService:
             platform_action=True,
         )
 
+    async def update_platform_integration(
+        self,
+        integration_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        fields: dict[str, Any],
+    ) -> NetworkIntegration:
+        """Correct or complete any tenant's integration from the Master console.
+
+        The site id, guest SSID, TLS mode and Omada ID a controller needs
+        cannot all be known at ``POST /platform/onboard`` time -- listing
+        sites requires an authenticated call, which requires stored
+        credentials, which require the row the wizard is creating at that
+        moment. Something has to be able to fill them in afterwards, and
+        since ``PATCH /network-integrations/{id}`` is GLOBAL-scoped now
+        (see that router's docstring), a platform operator would otherwise
+        have had to complete a controller setup by sending organization
+        headers at a route that no longer honours them.
+
+        Deliberately a thin delegation to :meth:`update_integration` with
+        ``requesting_organization_id=None`` rather than a second
+        implementation: every rule that method enforces -- the SSRF
+        re-validation of ``base_url``, the status ladder reset when the
+        address/site/Omada id/trust changes, the duplicate-integration
+        check, the TLS mode/fingerprint coherence -- is exactly as
+        necessary for a platform operator, and a parallel copy would be a
+        second place for them to drift. ``None`` is the same "platform
+        caller, no filter" argument :meth:`configure_platform_controller`
+        and :meth:`set_platform_enabled` already make, and the audit entry
+        ``update_integration`` writes names the target organization.
+
+        Credentials are **not** reachable here, exactly as on the customer
+        body: ``NetworkIntegrationUpdateRequest`` carries no credential
+        field, and rotation keeps its own endpoint and its own audit
+        action.
+        """
+        return await self.update_integration(
+            integration_id,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=None,
+            fields=fields,
+        )
+
     def _controller_setup_gaps(
         self, integration: NetworkIntegration, provider_impl: NetworkProvider
     ) -> list[ControllerSetupGap]:

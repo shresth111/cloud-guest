@@ -34,7 +34,48 @@ future firmware, an observed one is a fact about one firmware. If TP-Link
 moves these paths, ``_disconnect_one`` fails loudly with ``-1600 "Unsupported
 request path."`` rather than quietly reporting a revocation it did not
 perform. That failure mode is the entire reason the previous implementation
-refused outright, and it is preserved.
+refused outright, and it is preserved. Those tags stay OBSERVED: the
+research below corroborates the *operation*, never these two paths.
+
+## What the operation is, in TP-Link's own words (added 2026-09-12)
+
+The two legacy paths remain undocumented -- no TP-Link page, no public code,
+nothing. But the operation they perform is documented twice over, and both
+descriptions match what was measured here field for field, which is a good
+deal more reassurance than "we saw it once".
+
+TP-Link's Open API exposes the same three actions on the same table, on the
+same controller, keyed the same way (spec:
+<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>):
+
+    GET  /openapi/v1/{omadacId}/sites/{siteId}/hotspot/authed-records
+    POST /openapi/v1/{omadacId}/sites/{siteId}/hotspot/authed-records/{id}/disconnect
+    POST /openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/{clientMac}/unauth
+
+The list returns ``AuthClientOpenApiVO``, whose documented fields are exactly
+the ones the legacy rows carry and exactly the ones matched on below:
+``id`` ("AuthRecord ID"), ``mac``, ``valid`` ("Is the client valid"),
+``duration`` ("Total Duration (s)"), ``start``, ``end``. So the record-id
+keying is not an accident of the web UI -- it is how Omada models this table,
+and ``.../authed-records/{id}/disconnect`` is the documented twin of the
+observed ``.../cmd/clients/{id}/disconnect``.
+
+TP-Link's user guide independently confirms the two behaviours this module's
+matching rule is built on: the Authorized Clients page shows "the clients
+authorized by portal system, **including the expired clients and the clients
+within the valid period**" -- a history, not a set of live grants -- and its
+action column offers extend, disconnect and delete.
+
+One difference is worth keeping in view, because it is the trap called out
+under "Paging" below: the documented Open API list pages with
+``page``/``pageSize`` ("within the range of 1-1000"), while the legacy
+hotspot list measured here pages with ``currentPage``/``currentPageSize``.
+Two conventions, two APIs. Same table.
+
+None of this makes the legacy paths safe to assume on firmware other than the
+one they were measured on, and nothing here has been run against an OC200,
+an OC300 or a cloud-based controller. See
+``backend/docs/network_integration/OMADA_HARDWARE_VERIFICATION.md`` test 5.
 
 ## The path takes a record id, not a MAC
 

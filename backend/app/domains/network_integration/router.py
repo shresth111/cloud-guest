@@ -9,8 +9,8 @@ permission keys (see ``app.domains.rbac.seed`` --
 
 ## Two routers, mounted at the same prefix, and why
 
-``router`` carries the customer and platform surfaces. ``portal_router``
-carries exactly one route, ``POST /network-integrations/portal/authorize``.
+``router`` carries every authenticated surface. ``portal_router`` carries
+exactly one route, ``POST /network-integrations/portal/authorize``.
 
 They are separate objects so that the *licence gate* can be applied to one
 and not the other. ``app.api.v1.router`` includes the first with
@@ -32,18 +32,38 @@ parameterised one. The same discipline
 ``app.domains.queue_management.router`` and ``app.domains.isp.router``
 already document for themselves.
 
-## Why the platform routes name their scope explicitly
+## Why EVERY authenticated route names ``scope=ScopeType.GLOBAL``
 
-``RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)``
-rather than the bare key. An Organization Owner holds
-``network_integrations.read`` at ORGANIZATION scope, and
-``_infer_scope_type`` would resolve ORGANIZATION from their
-``X-Organization-Id`` header -- so the bare key would let a customer read
-every tenant's integrations from the platform endpoints. The explicit
-GLOBAL is the entire access control on the cross-tenant reads; see
-``service.list_platform_integrations``, and
-``tests/unit/test_cross_tenant_path_id_reads.py`` for the precedent where
-omitting it leaked another tenant's data in this codebase.
+Not only the ``/platform/...`` block: every route on ``router`` does, and
+that is the product decision this module enforces. A network controller is
+onboarded, credentialled, mapped and repaired from the Master console --
+"customer dashboard se tp link hatao, sab master dashboard se hoga". A
+venue admin must not be able to create an integration, enter or rotate the
+controller credentials, read its hostname, probe an arbitrary host from
+this platform's network, push configuration onto the controller, or delete
+it. There is no organization-scoped surface here to get that wrong on.
+
+The mechanism matters, because the bare key looks safe and is not.
+``RequirePermission("network_integrations.read")`` with no ``scope=``
+resolves its scope from whatever ``X-Organization-Id`` /``X-Location-Id``
+the *caller* sent (``rbac.dependencies._infer_scope_type``), so an
+Organization Owner holding the key at ORGANIZATION scope satisfies it --
+which is exactly how eighteen of these routes were reachable from a venue
+admin's session. ``ScopeType.GLOBAL`` is satisfied only by a grant that is
+itself GLOBAL (``rbac.authorization.ScopeResolver.satisfies``), i.e. only
+by a Master-console role assignment, whatever headers the caller sends.
+
+Enforced structurally by
+``tests/unit/test_network_integration.py::TestEveryRouteRequiresPermission``:
+a new route added to this module without ``scope=ScopeType.GLOBAL`` fails the
+suite (``test_every_route_on_router_requires_global_scope``). The
+seed side is the matching half -- ``rbac.seed`` no longer grants
+``network_integrations.*`` to any organization- or location-scoped system
+role, and retires the grants it used to create (see
+``RETIRED_NON_GLOBAL_MODULES`` there).
+
+``POST /portal/authorize`` is the one exception and lives on the other
+router: it is public by design, because a guest holds no roles at all.
 
 ## ``CurrentOrganization`` is declared on every by-id route
 
@@ -446,6 +466,69 @@ async def list_platform_integration_events(
     )
 
 
+@router.patch(
+    "/platform/integrations/{integration_id}",
+    response_model=ApiResponse[NetworkIntegrationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
+)
+async def update_platform_integration(
+    request: Request,
+    integration_id: uuid.UUID,
+    payload: NetworkIntegrationUpdateRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Finish a controller setup from the Master console.
+
+    ``POST /platform/onboard`` already accepts ``external_site_id``,
+    ``guest_ssid_id``, ``tls_mode`` and ``controller_id`` -- but only at
+    creation, and at creation nobody can know most of them: listing a
+    controller's sites needs an authenticated call, which needs stored
+    credentials, which need the row the wizard is only creating at that
+    moment. Without this route the site/SSID mapping had exactly one home,
+    ``PATCH /network-integrations/{id}``, which is master-only now and
+    resolves its tenant from headers a platform operator does not have.
+
+    Registered before ``/{integration_id}`` like every other literal
+    ``/platform/...`` path, so Starlette's first-registered-wins matching
+    cannot hand ``platform`` to the parameterised route as an id.
+
+    No ``CurrentOrganization``: this is a ``/platform/...`` route, so the
+    caller is a platform operator with no organization of their own, and
+    the service is asked for the unscoped load by name -- the same shape
+    ``enable``/``disable``/``test-connection``/``configure-controller``
+    already use, and the reason those are absent from
+    ``tests/unit/test_cross_tenant_path_id_reads.py``'s by-id list.
+
+    No credential fields, deliberately: ``NetworkIntegrationUpdateRequest``
+    carries none, so rotating a secret stays a separate operation with its
+    own audit action at ``POST /network-integrations/{id}/credentials`` --
+    which a platform operator reaches, because that route is GLOBAL-scoped
+    too now.
+    """
+    fields = payload.model_dump(exclude_unset=True)
+    if "location_id" in fields and fields["location_id"] is not None:
+        fields["location_id"] = uuid.UUID(str(fields["location_id"]))
+    integration = await service.update_platform_integration(
+        integration_id,
+        actor_user_id=_actor_id(actor),
+        fields=fields,
+    )
+    return build_response(
+        success=True,
+        message="Network integration updated",
+        data=_integration_response(
+            integration, counts=await service.counts_for(integration)
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @router.post(
     "/platform/integrations/{integration_id}/enable",
     response_model=ApiResponse[NetworkIntegrationResponse],
@@ -756,7 +839,12 @@ async def onboard_platform_integration(
 
 
 # ============================================================================
-# Customer: pre-save probe (literal path, registered before `/{id}`)
+# Master console: pre-save probe (literal path, registered before `/{id}`)
+#
+# A near-duplicate of `/platform/test-connection` above, kept because it is
+# the probe that runs *with* a tenant already chosen (`CurrentOrganization`
+# reaches `service.test_connection_unsaved`, which audits the attempt
+# against that organization). GLOBAL-scoped like everything else here.
 # ============================================================================
 
 
@@ -764,7 +852,11 @@ async def onboard_platform_integration(
     "/test-connection",
     response_model=ApiResponse[TestConnectionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.create"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.create", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def test_connection(
     request: Request,
@@ -819,7 +911,15 @@ async def test_connection(
 
 
 # ============================================================================
-# Customer: integration CRUD
+# Master console: integration CRUD
+#
+# `CurrentOrganization` stays declared on every by-id route below even
+# though the caller is now always a platform operator -- see this module's
+# docstring and `tests/unit/test_cross_tenant_path_id_reads.py`, which
+# checks it structurally. A Master operator sending no `X-Organization-Id`
+# gets `None`, which the service reads as "platform caller, no filter";
+# sending one narrows the read to that tenant, which is a filter they chose
+# rather than a boundary they are held to.
 # ============================================================================
 
 
@@ -827,7 +927,11 @@ async def test_connection(
     "",
     response_model=ApiResponse[NetworkIntegrationListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def list_integrations(
     request: Request,
@@ -866,7 +970,11 @@ async def list_integrations(
     "",
     response_model=ApiResponse[NetworkIntegrationResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("network_integrations.create"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.create", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def create_integration(
     request: Request,
@@ -925,7 +1033,11 @@ async def create_integration(
     "/{integration_id}",
     response_model=ApiResponse[NetworkIntegrationResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def get_integration(
     request: Request,
@@ -950,7 +1062,11 @@ async def get_integration(
     "/{integration_id}",
     response_model=ApiResponse[NetworkIntegrationResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def update_integration(
     request: Request,
@@ -990,7 +1106,11 @@ async def update_integration(
     "/{integration_id}/fleet-device",
     response_model=ApiResponse[NetworkIntegrationResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def ensure_fleet_device(
     request: Request,
@@ -1026,7 +1146,11 @@ async def ensure_fleet_device(
     "/{integration_id}",
     response_model=ApiResponse[NetworkIntegrationResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.delete"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.delete", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def delete_integration(
     request: Request,
@@ -1052,7 +1176,11 @@ async def delete_integration(
     "/{integration_id}/test-connection",
     response_model=ApiResponse[TestConnectionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def test_integration_connection(
     request: Request,
@@ -1089,7 +1217,11 @@ async def test_integration_connection(
     "/{integration_id}/configure-controller",
     response_model=ApiResponse[ControllerConfigureResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def configure_integration_controller(
     request: Request,
@@ -1135,7 +1267,11 @@ async def configure_integration_controller(
     "/{integration_id}/credentials",
     response_model=ApiResponse[NetworkIntegrationResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def rotate_credentials(
     request: Request,
@@ -1178,7 +1314,11 @@ async def rotate_credentials(
     "/{integration_id}/sync",
     response_model=ApiResponse[NetworkIntegrationSyncResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def sync_integration(
     request: Request,
@@ -1214,7 +1354,11 @@ async def sync_integration(
     "/{integration_id}/status",
     response_model=ApiResponse[NetworkIntegrationStatusResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def get_integration_status(
     request: Request,
@@ -1237,7 +1381,7 @@ async def get_integration_status(
 
 
 # ============================================================================
-# Customer: live controller reads
+# Master console: live controller reads
 #
 # Every one of these four refuses a `legacy`-mode integration with
 # OMADA_API_UNSUPPORTED rather than returning an empty list (contract
@@ -1252,7 +1396,11 @@ async def get_integration_status(
     "/{integration_id}/sites",
     response_model=ApiResponse[NetworkIntegrationSiteListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def list_sites(
     request: Request,
@@ -1286,7 +1434,11 @@ async def list_sites(
     "/{integration_id}/ssids",
     response_model=ApiResponse[NetworkIntegrationSsidListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def list_ssids(
     request: Request,
@@ -1319,7 +1471,11 @@ async def list_ssids(
     "/{integration_id}/devices",
     response_model=ApiResponse[NetworkIntegrationDeviceListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def list_devices(
     request: Request,
@@ -1358,7 +1514,11 @@ async def list_devices(
     "/{integration_id}/clients",
     response_model=ApiResponse[NetworkIntegrationClientListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def list_clients(
     request: Request,
@@ -1402,7 +1562,11 @@ async def list_clients(
     "/{integration_id}/clients/disconnect",
     response_model=ApiResponse[NetworkIntegrationDisconnectGuestResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def disconnect_guest(
     request: Request,
@@ -1461,7 +1625,11 @@ async def disconnect_guest(
     "/{integration_id}/events",
     response_model=ApiResponse[NetworkIntegrationEventListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("network_integrations.read"))],
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def list_integration_events(
     request: Request,

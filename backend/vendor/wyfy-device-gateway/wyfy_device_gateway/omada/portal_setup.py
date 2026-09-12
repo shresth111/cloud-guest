@@ -73,11 +73,47 @@ body shapes are the controller's own spec; what the spec cannot say is:
   (``portalCustomize``, ``pageType``, ``importedPortalPage`` -- absent from
   the detail response, so they cannot be echoed) as "unchanged" or as
   "reset". That matters only for take-over of a *foreign* portal with a
-  customised local page. Verify on hardware before relying on take-over.
+  customised local page.
+
+  **Downgraded 2026-09-12: the evidence now points at RESET, not unchanged.**
+  It is no longer an even bet. TP-Link's own spec, on the very schema
+  ``modifyPortal`` takes, says of ``pageType``: "Page type, should be a
+  value as follows: 1: Use default page, 2: use uploaded page. **When
+  [pageType] is null, it defaults to 1**" -- and ``ImportedPortalPageOpenApiVO``
+  is described as "Imported portal page, required when parameter [pageType]
+  is 2". A body with no ``pageType`` is therefore documented to *mean* "use
+  default page", which on a portal currently set to 2 is a reset that also
+  strands its uploaded page. Two further tells point the same way: the
+  ``PortalSetting`` schema marks six fields required (``authTimeout``,
+  ``authType``, ``enable``, ``httpsRedirectEnable``, ``landingPage``,
+  ``name``), which is a whole-object replace wearing a PATCH's clothes; and
+  ``getPortalDetail`` really does omit all three fields, confirmed against
+  ``PortalDetailResOpenApiVO`` in the published spec, so no read-modify-write
+  can preserve them.
+
+  This is a documented *default*, not a documented *PATCH semantic*, and the
+  schema is shared with ``addPortal`` where "defaults to 1" is unremarkable.
+  So it is not proof. But ``take_over_ssid_portal`` should be treated as
+  unsafe against a portal with an uploaded page until it is measured:
+  ``OMADA_HARDWARE_VERIFICATION.md`` test 4, which is a must-fix if it
+  confirms. Note ``GET .../portal/{portalId}/customization`` exists and is
+  what a pre-write snapshot should capture.
 * whether an operator with ``operatorRoleType`` 0 (Administrator) is the
   least privilege that can call ``extPortal/auth``. 0 is what the one
   hardware-proven operator had (``HARDWARE-FINDINGS.md``); Viewer (1) was
   never tried.
+
+  **Still INFERRED after research.** TP-Link's user guide says only that for
+  a Hotspot Manager operator the "Admin role has read and write permissions"
+  and the "Viewer role has read-only permissions", and elsewhere that
+  operator accounts "can only be used to remotely log in to the Hotspot
+  Manager system and manage vouchers and local users for specified sites" --
+  neither of which says whether ``extPortal/auth`` is gated on the role.
+  Nothing in the Open API spec's ``Hotspot Operator`` schema says more than
+  "0: Administrator; 1: Viewer" either. Creating role 0 is the safe side of
+  an unresolved question and stays. Do not "optimise" it down to 1 on the
+  strength of least-privilege instinct; ``OMADA_HARDWARE_VERIFICATION.md``
+  test 3 is how that would be earned.
 """
 
 from __future__ import annotations

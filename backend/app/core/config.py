@@ -1847,6 +1847,40 @@ class Settings(BaseSettings):
             if getattr(self, name) == fields[name].default
         ]
 
+    def alerting_delivery_gaps(self) -> list[str]:
+        """Env var names of alerting settings whose *unset* value silently
+        delivers nothing, in a non-local environment. Empty on a developer
+        machine.
+
+        ## Why an unset value needs saying out loud
+
+        ``platform_alert_emails`` already fails loudly when it is
+        **malformed** -- ``_normalize_platform_alert_emails`` raises and the
+        process does not start. The gap is the other direction. Empty is a
+        legal value and the default, and
+        ``AlertService._dispatch_platform_copies`` returns immediately on
+        it, so an operator who believes the platform team is being copied on
+        every WiFi-controller alert gets no email, no error and no log line
+        saying why. "Configured wrong" is caught; "never configured" was
+        not.
+
+        Names only, never values, and returned rather than logged so the
+        caller decides -- the same shape and the same reasoning as
+        :meth:`secrets_at_public_default` directly above, including that
+        this must never raise: a deployment whose team inbox nobody has set
+        yet should start and say so, not crash-loop.
+
+        This is not a claim that the setting is required. Sending no
+        platform copy is a legitimate choice; it just has to be a visible
+        one.
+        """
+        if self.is_local_environment:
+            return []
+        gaps: list[str] = []
+        if not self.platform_alert_email_list:
+            gaps.append("CLOUDGUEST_PLATFORM_ALERT_EMAILS")
+        return gaps
+
     def uses_public_network_integration_key(self) -> bool:
         """True when controller credentials would be encrypted under the
         public default key outside a developer machine."""

@@ -2791,9 +2791,11 @@ def _network_controller_message(
 
     Written for a venue owner, not an engineer: what is wrong, what it
     means for guests, and -- only where this platform actually knows it --
-    where to look. No raw error text: ``last_error_message`` is redacted
-    but still controller-shaped, and it is one click away on the
-    integration's own page.
+    where to look. No raw error text in **any** branch:
+    ``last_error_message`` is redacted of secrets but still
+    controller-shaped, and controller detail belongs to the Master console
+    (``GET /platform/integrations/{id}``), which is one click away for the
+    operator who can act on it.
     """
     name = getattr(integration, "name", "WiFi controller")
     if target == ALERT_TARGET_NETWORK_CONTROLLER:
@@ -2820,18 +2822,39 @@ def _network_controller_message(
             "may be affected."
         )
     if target == ALERT_TARGET_NETWORK_CONTROLLER_SETUP:
-        detail = getattr(integration, "last_error_message", None)
-        reason = (
-            f": {detail}"
-            if detail
-            and getattr(integration, "last_error_code", None)
-            == ErrorCode.SETUP_INCOMPLETE.value
-            else " -- the platform has not completed a connection to it yet"
-        )
+        # No `last_error_message` here, deliberately -- this branch used to
+        # interpolate it.
+        #
+        # The rest of this function's copy is vendor-neutral on purpose:
+        # every other branch says "the WiFi controller" and none of them
+        # quotes provider text, because this alert is delivered to a venue
+        # owner and the product decision is that a venue owner is not shown
+        # the controller. This branch broke that rule for the one alert
+        # most likely to fire -- SETUP_INCOMPLETE is the state a freshly
+        # onboarded integration sits in -- and the string it pasted in is
+        # `describe_portal_readiness_gaps`, which names controller
+        # configuration field by field ("no controller site has been
+        # selected", "it has an Open API app but no hotspot operator
+        # account"). That is Master-console detail arriving by email at a
+        # venue.
+        #
+        # It is not lost: the integration's own `last_error_message`,
+        # `last_error_code` and `portal_readiness_gaps` are all on
+        # `GET /platform/integrations/{id}`, and the alert names the
+        # integration, so a platform operator has one click to the specific
+        # reason. What changes is who reads it.
+        #
+        # The remaining sentence is the half a venue owner can act on: this
+        # is not working, it has not been working since it was added, and
+        # somebody is expected to finish it -- which is the same
+        # this-is-being-handled shape as the CONNECTION_FAILED branch
+        # above.
         return (
             f"{name}: this WiFi controller was added more than "
             f"{NETWORK_CONTROLLER_SETUP_GRACE_HOURS} hours ago and still "
-            f"cannot let a single guest online{reason}."
+            "cannot let a single guest online -- its setup has not been "
+            "completed yet. Guests at this venue can sign in and will "
+            "still have no internet until it is."
         )
     failed_guests = counts.failed_guests if counts else 0
     failed = counts.failed_attempts if counts else 0

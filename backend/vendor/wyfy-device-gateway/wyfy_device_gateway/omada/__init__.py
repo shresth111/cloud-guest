@@ -7,11 +7,18 @@ is internal to this package and free to change.
 
 ## Read this before trusting anything here
 
-**No code in this package has ever run against a physical Omada controller.**
+**Most of this package has never run against a physical Omada controller.**
 It was written from TP-Link's published documentation, corroborated against
-an open-source client, and tested exclusively against ``httpx.MockTransport``.
-The tests prove this client behaves as we believe the API expects. They
-cannot prove the API expects it.
+an open-source client, and tested against ``httpx.MockTransport``. Those
+tests prove this client behaves as we believe the API expects. They cannot
+prove the API expects it.
+
+Two flows are the exception. ``extPortal/auth`` (``portal.py``) and the
+``deauth.py`` pair have been run against a real Omada Software Controller
+``5.15.24.19`` and are tagged **OBSERVED** -- a fact about that one firmware,
+not a promise about any other. See ``adapter.py``'s "Honest scope" section,
+which this summarises; if the two ever disagree, ``adapter.py`` is the one
+kept current.
 
 Every factual claim in this package's docstrings is tagged:
 

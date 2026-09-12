@@ -53,6 +53,10 @@ DOMAIN_DIR = pathlib.Path("app/domains/customer_provisioning")
 class _FakeOrg:
     id: uuid.UUID
     name: str
+    # The real `Organization` carries this and `onboard` reads it to seed
+    # the default alert channel. A fake without it would let a caller that
+    # forgot the field pass here and fail in production.
+    contact_email: str | None = None
 
 
 @dataclass
@@ -71,7 +75,11 @@ class _RecordingOrganizationService:
         if self.raises is not None:
             raise self.raises
         self.writes.append(kwargs)
-        return _FakeOrg(id=self.next_id, name=kwargs["name"])
+        return _FakeOrg(
+            id=self.next_id,
+            name=kwargs["name"],
+            contact_email=kwargs.get("contact_email"),
+        )
 
 
 @dataclass
@@ -103,10 +111,32 @@ class _RecordingRBACService:
         self.writes.append(kwargs)
 
 
+@dataclass
+class _RecordingDefaultAlerting:
+    """Stands in for ``ensure_default_alerting`` partially applied.
+
+    ``raises`` matters as much as the recording: the real helper is
+    documented as never raising, and this fake is how we prove the caller
+    does not depend on that promise.
+    """
+
+    calls: list[dict] = field(default_factory=list)
+    raises: Exception | None = None
+
+    async def __call__(self, *, organization_id, contact_email):
+        self.calls.append(
+            {"organization_id": organization_id, "contact_email": contact_email}
+        )
+        if self.raises is not None:
+            raise self.raises
+        return None
+
+
 def _make_service(
     *,
     org_service: _RecordingOrganizationService | None = None,
     rbac_service: _RecordingRBACService | None = None,
+    default_alerting: _RecordingDefaultAlerting | None = None,
 ) -> tuple[
     CustomerProvisioningService,
     _RecordingOrganizationService,
@@ -120,6 +150,7 @@ def _make_service(
         organization_service=orgs,  # type: ignore[arg-type]
         location_service=locations,  # type: ignore[arg-type]
         rbac_service=rbac,  # type: ignore[arg-type]
+        default_alerting=default_alerting,
     )
     return service, orgs, locations, rbac
 
@@ -376,3 +407,102 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# --------------------------------------------------------------------
+# A customer onboarded here gets the default alerting, like one created
+# through POST /organizations.
+# --------------------------------------------------------------------
+#
+# `ensure_default_alerting` had exactly one caller -- the organization
+# router. This endpoint creates organizations too, and is a path a master
+# operator actually uses, so every customer onboarded through it had no
+# alert rules at all: the 30s evaluation sweep had nothing to evaluate for
+# them and their venue could go dark without an email. For an Omada venue
+# it also meant the three `network_controller*` rules never existed, which
+# left the controller-health alerting inert for exactly the customers it
+# was built for.
+
+
+class TestOnboardConfiguresDefaultAlerting:
+    async def test_a_new_customer_gets_default_alerting(self) -> None:
+        alerting = _RecordingDefaultAlerting()
+        service, orgs, _locations, _rbac = _make_service(default_alerting=alerting)
+
+        await service.onboard(_request(), uuid.uuid4())
+
+        assert len(alerting.calls) == 1
+
+    async def test_it_is_asked_for_the_organization_that_was_just_created(
+        self,
+    ) -> None:
+        alerting = _RecordingDefaultAlerting()
+        service, orgs, _locations, _rbac = _make_service(default_alerting=alerting)
+
+        payload = await service.onboard(_request(), uuid.uuid4())
+
+        assert str(alerting.calls[0]["organization_id"]) == payload.organization_id
+
+    async def test_the_contact_email_is_carried_through(self) -> None:
+        """Without it `_ensure_default_email_channel` has nowhere to send,
+        and the organization gets rules that can notify nobody -- the exact
+        half-configured state `default_alerting` was written to end."""
+        alerting = _RecordingDefaultAlerting()
+        service, _orgs, _locations, _rbac = _make_service(default_alerting=alerting)
+
+        await service.onboard(
+            _request(admin_email="owner@blue-lagoon.example"), uuid.uuid4()
+        )
+
+        assert alerting.calls[0]["contact_email"] == "owner@blue-lagoon.example"
+
+    async def test_alerting_runs_before_the_location_is_created(self) -> None:
+        """An organization that exists is an organization something is
+        watching, even if a later step in the same request fails."""
+        alerting = _RecordingDefaultAlerting()
+        service, _orgs, locations, _rbac = _make_service(default_alerting=alerting)
+
+        await service.onboard(_request(location_name="Lobby"), uuid.uuid4())
+
+        assert alerting.calls and locations.writes
+
+
+class TestAlertingNeverCostsTheCustomer:
+    async def test_a_raising_alerting_helper_does_not_fail_the_onboard(self) -> None:
+        """`ensure_default_alerting` is documented as never raising. This
+        pins that the caller does not *depend* on that promise -- a customer
+        must not fail to be created over their default alert rules."""
+        alerting = _RecordingDefaultAlerting(raises=RuntimeError("smtp exploded"))
+        service, _orgs, _locations, _rbac = _make_service(default_alerting=alerting)
+
+        payload = await service.onboard(_request(), uuid.uuid4())
+
+        assert payload.organization_id
+
+    async def test_the_organization_is_still_returned_after_a_failure(self) -> None:
+        alerting = _RecordingDefaultAlerting(raises=RuntimeError("boom"))
+        service, orgs, _locations, _rbac = _make_service(default_alerting=alerting)
+
+        await service.onboard(_request(), uuid.uuid4())
+
+        assert len(orgs.writes) == 1
+
+    async def test_the_role_grant_still_happens_after_a_failure(self) -> None:
+        """The failure must not short-circuit the rest of onboarding."""
+        alerting = _RecordingDefaultAlerting(raises=RuntimeError("boom"))
+        service, _orgs, _locations, rbac = _make_service(default_alerting=alerting)
+
+        await service.onboard(_request(), uuid.uuid4())
+
+        assert len(rbac.writes) == 1
+
+
+class TestNothingWiredIsSafe:
+    async def test_onboarding_works_with_no_alerting_wired(self) -> None:
+        """The default is a logging no-op, not a crash -- a construction
+        that predates this parameter must keep working."""
+        service, orgs, _locations, _rbac = _make_service()
+
+        payload = await service.onboard(_request(), uuid.uuid4())
+
+        assert payload.organization_id and len(orgs.writes) == 1

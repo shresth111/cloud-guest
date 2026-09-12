@@ -144,6 +144,41 @@ class RouterResponse(BaseModel):
     serial_number: str
     mac_address: str
     model: str
+    # Kept on this customer-reachable shape, deliberately, after asking
+    # whether an organization-scoped caller should see it at all.
+    #
+    # The case for removing it: `vendor == "tplink_omada"` is the fact that
+    # this venue is on a third-party controller, and the owner's decision is
+    # that a venue admin has no business with the controller.
+    #
+    # The case that won: `vendor` is a statement about the *equipment in the
+    # venue*, which its own admin already owns, can see, and in the Omada
+    # case was very likely standing next to while somebody installed it. It
+    # is not controller configuration -- no hostname, no site, no
+    # credential, no identifier -- and this response carries nothing it can
+    # be joined to now that `settings.network_integration_id` is redacted
+    # (see CUSTOMER_FORBIDDEN_ROUTER_SETTINGS_KEYS below). Withholding it
+    # would not withhold the fact either: `status` sits at
+    # PENDING_PROVISIONING forever, `last_seen_at` is never set and
+    # `has_api_credentials` is false on every controller-managed row, so the
+    # shape is legible from the rest of this object regardless.
+    #
+    # What removing it *would* cost is the honesty this platform spent the
+    # vendor-gating work buying. Product decision #2 is that Omada venues
+    # legitimately lack QoS/VLAN/DHCP/port-forwarding/content-filtering, and
+    # those modules answer 400. The customer dashboard reads this exact
+    # field to say so in words -- it derives a "Managed by controller"
+    # liveness verdict instead of reporting the row as an offline MikroTik,
+    # disables the five inapplicable sidebar entries with a reason, and
+    # renders an explanatory notice in place of each blocked page. Take
+    # `vendor` away and every one of those degrades to the "reported as a
+    # broken MikroTik" failure `app.domains.router.vendor_capabilities`
+    # exists to prevent -- a venue that is serving guests perfectly,
+    # described to its owner as broken hardware, with the five 400s left
+    # unexplained.
+    #
+    # So: the vendor string stays, and the thing that made it actionable is
+    # what leaves.
     vendor: str
     routeros_version: str | None = None
     management_ip_address: str | None = None
@@ -164,7 +199,14 @@ class RouterResponse(BaseModel):
             "via routerService.listForLocation()."
         ),
     )
-    settings: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Free-form per-router configuration. On an organization-scoped "
+            "response every key in CUSTOMER_FORBIDDEN_ROUTER_SETTINGS_KEYS "
+            "has been removed -- see redact_customer_router_settings below."
+        ),
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -188,6 +230,80 @@ CUSTOMER_FORBIDDEN_ROUTER_FIELDS: frozenset[str] = frozenset(
         "snmp_port",
     }
 )
+
+
+#: Keys that must never appear inside ``RouterResponse.settings`` on an
+#: organization-scoped response.
+#:
+#: ``CUSTOMER_FORBIDDEN_ROUTER_FIELDS`` above cannot reach these, because
+#: they are not *fields*: ``settings`` is a ``dict[str, Any]`` served
+#: verbatim from a JSONB column, so a field-name allowlist has nothing to
+#: match on. That is how the pair below reached a venue admin.
+#:
+#: ``network_integration_id`` is the one that matters. It is written by
+#: ``network_integration.service.create_fleet_device`` as the back-reference
+#: an operator needs when they find a controller row in the fleet table --
+#: a reasonable thing to store, and a database key served straight to
+#: ``GET /locations/{id}/routers``. It is also the *only* value on this
+#: response that can be joined to anything actionable: the controller's
+#: hostname, credentials, site mapping and the "configure controller" and
+#: "delete" verbs all hang off ``/network-integrations/{id}``. Those routes
+#: are GLOBAL-scoped now, so the id alone opens nothing today -- which is
+#: exactly the argument that should not be the only thing standing between
+#: a venue admin and a controller. Two independent failures are required
+#: instead of one.
+#:
+#: ``synthetic_identity`` is lower severity and removed for honesty rather
+#: than for a join: it tells a venue admin that the serial number and MAC
+#: their fleet page is showing them were minted by this platform. That is a
+#: fact about how the integration is modelled, not about their equipment.
+#: (The identifiers themselves stay: ``synthesize_fleet_identity`` derives
+#: them through SHA-256, so neither can be turned back into the
+#: integration id.)
+#:
+#: **Inert for MikroTik by construction.** Both keys are written in exactly
+#: one place -- the controller-managed fleet row created by
+#: ``app.domains.network_integration`` -- and nothing in the product writes
+#: either onto an agent-managed row. A MikroTik row's ``settings`` dict
+#: contains neither, so the redaction below copies it and removes nothing.
+#: ``tests/unit/test_router.py`` asserts that byte-for-byte rather than
+#: leaving it to inspection.
+CUSTOMER_FORBIDDEN_ROUTER_SETTINGS_KEYS: frozenset[str] = frozenset(
+    {
+        "network_integration_id",
+        "synthetic_identity",
+    }
+)
+
+
+def redact_customer_router_settings(
+    settings: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """``settings`` with every controller-identifying key removed.
+
+    A denylist rather than an allowlist, deliberately, and the reasoning is
+    the same one ``vendor_capabilities`` gives for its own closed list:
+    ``routers.settings`` is an open extension point (captive-portal
+    branding overrides, vendor quirk flags -- see ``Router.settings``), and
+    an allowlist here would silently start withholding whatever a future
+    domain puts in it, from MikroTik venues that have every right to see
+    it. Every key named above is written by exactly one caller onto exactly
+    the controller-managed rows, so a denylist takes nothing from anyone
+    else.
+
+    The tradeoff is stated rather than hidden: a *new* controller-shaped
+    key added to a fleet row would leak until it is named above. What
+    guards that is ``test_router.py``'s assertion that a fleet row built by
+    ``network_integration.service`` carries nothing outside the redacted
+    set -- so the seam that would introduce one fails the suite.
+    """
+    if not settings:
+        return {}
+    return {
+        key: value
+        for key, value in settings.items()
+        if key not in CUSTOMER_FORBIDDEN_ROUTER_SETTINGS_KEYS
+    }
 
 
 class RouterPlatformResponse(RouterResponse):

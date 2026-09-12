@@ -4332,7 +4332,7 @@ class TestEveryRouteRequiresPermission:
         # (platform/test-connection). Asserted as a count rather than a
         # set so that adding an eleventh platform route without a GLOBAL
         # scope fails here loudly.
-        assert len(platform_routes) == 10
+        assert len(platform_routes) == 11
         for route in platform_routes:
             scopes = []
             for dep in route.dependant.dependencies:
@@ -4343,6 +4343,28 @@ class TestEveryRouteRequiresPermission:
                     if isinstance(cell.cell_contents, ScopeType)
                 )
             assert ScopeType.GLOBAL in scopes, f"{route.path} is not GLOBAL-scoped"
+
+    def test_every_route_on_router_requires_global_scope(self) -> None:
+        """Structural enforcement promised by the router module docstring:
+        a new route added to ``router`` without ``scope=ScopeType.GLOBAL``
+        fails the suite.  This covers all 29 routes, not only the
+        ``/platform/`` subset above."""
+        from app.domains.rbac.enums import ScopeType
+
+        assert len(integration_router.routes) == 29
+        for route in integration_router.routes:
+            scopes = []
+            for dep in route.dependant.dependencies:
+                closure = getattr(dep.call, "__closure__", None) or ()
+                scopes.extend(
+                    cell.cell_contents
+                    for cell in closure
+                    if isinstance(cell.cell_contents, ScopeType)
+                )
+            assert ScopeType.GLOBAL in scopes, (
+                f"{route.path} is not GLOBAL-scoped — every route on "
+                f"network_integration.router must be Master-console-only"
+            )
 
     def test_the_portal_route_is_deliberately_ungated(self) -> None:
         """A guest holds no roles, so there is no permission to check.
@@ -4371,7 +4393,10 @@ class TestEveryRouteRequiresPermission:
             PermissionModule.NETWORK_INTEGRATIONS
         ]
 
-    def test_the_module_is_location_scoped(self) -> None:
+    def test_the_module_is_global_scoped(self) -> None:
+        """Controller configuration and credentials are Master-console-only,
+        so the narrowest meaningful scope is GLOBAL -- identical to
+        DEMO_REQUESTS / QUOTATIONS / CHANNEL_PARTNERS."""
         from app.domains.rbac.enums import PermissionModule, ScopeType
         from app.domains.rbac.seed import (
             MODULE_DISPLAY_NAMES,
@@ -4380,21 +4405,31 @@ class TestEveryRouteRequiresPermission:
 
         assert (
             MODULE_NARROWEST_SCOPE[PermissionModule.NETWORK_INTEGRATIONS]
-            is ScopeType.LOCATION
+            is ScopeType.GLOBAL
         )
         assert MODULE_DISPLAY_NAMES[PermissionModule.NETWORK_INTEGRATIONS]
 
-    def test_the_network_roles_hold_the_permission(self) -> None:
-        """Same profile as NETWORK_DEVICE: the network roles get it, the
-        guest-facing front-desk roles do not."""
+    def test_only_global_roles_hold_the_permission(self) -> None:
+        """NETWORK_INTEGRATIONS is GLOBAL-only now: only Super Admin and
+        Platform Admin (both GLOBAL-scoped with FULL default) hold it.
+        All non-GLOBAL roles -- including network-administrator -- carry
+        an explicit ``_L.NONE`` override."""
         from app.domains.rbac.enums import PermissionModule
         from app.domains.rbac.seed import SYSTEM_ROLES
 
         by_slug = {role.slug: role for role in SYSTEM_ROLES}
-        for slug in ("network-administrator", "network-engineer"):
+        # GLOBAL roles with FULL default hold the permission
+        for slug in ("super-admin", "platform-admin"):
             grants = by_slug[slug].grants()
             assert PermissionModule.NETWORK_INTEGRATIONS in grants, slug
-        for slug in ("reception-staff", "helpdesk", "guest-operator"):
+        # Non-GLOBAL roles do NOT hold it (explicit _L.NONE)
+        for slug in (
+            "network-administrator",
+            "network-engineer",
+            "reception-staff",
+            "helpdesk",
+            "guest-operator",
+        ):
             grants = by_slug[slug].grants()
             assert PermissionModule.NETWORK_INTEGRATIONS not in grants, slug
 

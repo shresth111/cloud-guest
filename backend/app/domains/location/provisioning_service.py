@@ -625,6 +625,51 @@ class _NoopNotificationSender:
         )
 
 
+class DefaultAlertingProtocol(Protocol):
+    """Give a newly created organization the alert rules, email channel and
+    link between them that it would otherwise never have.
+
+    Satisfied structurally by
+    ``app.domains.monitoring.default_alerting.ensure_default_alerting``
+    partially applied over its two services -- see
+    ``provisioning_dependencies.py``. A narrow duck-typed protocol rather
+    than a hard import, for the reason that module's own docstring gives:
+    ``app.domains.location`` has no business knowing what an alert is, and
+    ``monitoring`` is the domain that owns both services.
+
+    ## Why this seam exists at all
+
+    ``POST /organizations`` has called ``ensure_default_alerting`` since it
+    was written. This wizard creates organizations too -- it is the path a
+    master operator actually uses -- and did not. So a customer onboarded
+    here had **no alert rules of any kind**: the 30s evaluation sweep found
+    nothing to evaluate for them, and their venue could go dark without a
+    single email. For an Omada venue that also means the three
+    ``network_controller*`` rules never exist, so the controller-health
+    alerting shipped in #223 was inert for exactly the customers it was
+    built for.
+    """
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> object: ...
+
+
+class _NoopDefaultAlerting:
+    """Honest fallback when no real ``DefaultAlertingProtocol`` is wired --
+    logs rather than silently leaving an organization unalerted, the same
+    posture as ``_NoopNotificationSender`` above. Never wired in
+    production; see ``provisioning_dependencies.py``."""
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> None:
+        logger.info(
+            "default_alerting_not_wired",
+            extra={"organization_id": str(organization_id)},
+        )
+
+
 # ============================================================================
 # Plain input/output value objects (dataclasses, not pydantic -- mirrors
 # ``app.domains.auth.service.DeviceInfo``'s own "service layer stays
@@ -954,6 +999,7 @@ class LocationProvisioningService:
         *,
         login_url_base: str = _DEFAULT_LOGIN_URL_BASE,
         notification_service: NotificationSenderProtocol | None = None,
+        default_alerting: DefaultAlertingProtocol | None = None,
     ) -> None:
         self.location_service = location_service
         self.organization_service = organization_service
@@ -971,6 +1017,9 @@ class LocationProvisioningService:
         self.login_url_base = login_url_base
         self.notification_service: NotificationSenderProtocol = (
             notification_service or _NoopNotificationSender()
+        )
+        self.default_alerting: DefaultAlertingProtocol = (
+            default_alerting or _NoopDefaultAlerting()
         )
 
     # -- preview (read-only dry run) ----------------------------------------
@@ -1450,7 +1499,7 @@ class LocationProvisioningService:
         if data.new_organization is None:
             raise NewOrganizationRequiredError()
 
-        return await self.organization_service.create_organization(
+        organization = await self.organization_service.create_organization(
             actor_user_id=actor_user_id,
             name=data.new_organization.name,
             slug=data.new_organization.slug,
@@ -1464,6 +1513,40 @@ class LocationProvisioningService:
                 "onboarding_completed": True,
             },
         )
+        await self._ensure_default_alerting(organization)
+        return organization
+
+    async def _ensure_default_alerting(self, organization: Organization) -> None:
+        """Give the organization the default alert rules and channel.
+
+        Only on the branch that *creates* an organization. Provisioning a
+        second location into an existing tenant does not re-ask: that
+        tenant was given its defaults when it was created, and an operator
+        who has since retuned or deleted a rule meant to.
+
+        ## Failures are swallowed, deliberately
+
+        ``ensure_default_alerting`` is documented as never raising, and this
+        guard is for the layer between here and it. ``provision_location``
+        runs inside one request-scoped ``AsyncSession``, so an exception
+        escaping here would roll back the organization, the owner account,
+        the location and the router -- the whole customer -- because their
+        alert rules could not be created. That trade is the wrong way
+        round. The customer existing matters more than the default rule
+        existing, which is the same judgement
+        ``default_alerting``'s own module made when it chose per-rule
+        failure over per-call failure.
+        """
+        try:
+            await self.default_alerting(
+                organization_id=organization.id,
+                contact_email=organization.contact_email,
+            )
+        except Exception:
+            logger.exception(
+                "default_alerting_failed_during_provisioning",
+                extra={"organization_id": str(organization.id)},
+            )
 
     async def _resolve_default_template_id(self) -> uuid.UUID:
         templates, _meta = await self.router_provisioning_service.list_templates(

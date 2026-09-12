@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from typing import Protocol
 
 from app.domains.location.service import LocationService
 from app.domains.organization.enums import OrganizationType
@@ -51,16 +52,63 @@ from .schemas import OnboardRequest, OnboardResponse
 logger = logging.getLogger(__name__)
 
 
+class DefaultAlertingProtocol(Protocol):
+    """Give a newly onboarded customer the default alert rules, an email
+    channel, and the link between them.
+
+    Structurally satisfied by
+    ``app.domains.monitoring.default_alerting.ensure_default_alerting``
+    partially applied over its two services (see ``dependencies.py``). A
+    narrow duck-typed protocol rather than a hard import, for the reason
+    that module's own docstring gives: this domain has no business knowing
+    what an alert is, and ``monitoring`` owns both services.
+
+    ## Why this was missing and what it cost
+
+    ``ensure_default_alerting`` had exactly one caller, ``POST
+    /organizations``. This endpoint creates organizations too -- it is a
+    path a master operator actually uses -- and did not call it, so a
+    customer onboarded here had **no alert rules at all**. The 30s alert
+    evaluation sweep had nothing to evaluate for them and their venue could
+    go dark in silence. For an Omada venue it also meant the three
+    ``network_controller*`` rules never existed, leaving the
+    controller-health alerting inert for precisely the customers it was
+    built for.
+    """
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> object: ...
+
+
+class _NoopDefaultAlerting:
+    """Honest fallback when nothing real is wired -- logs rather than
+    leaving an organization quietly unalerted. Never wired in production;
+    see ``dependencies.py``."""
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> None:
+        logger.info(
+            "default_alerting_not_wired",
+            extra={"organization_id": str(organization_id)},
+        )
+
+
 class CustomerProvisioningService:
     def __init__(
         self,
         organization_service: OrganizationService,
         location_service: LocationService,
         rbac_service: RBACService,
+        default_alerting: DefaultAlertingProtocol | None = None,
     ) -> None:
         self.organization_service = organization_service
         self.location_service = location_service
         self.rbac_service = rbac_service
+        self.default_alerting: DefaultAlertingProtocol = (
+            default_alerting or _NoopDefaultAlerting()
+        )
 
     async def onboard(
         self, request: OnboardRequest, actor_user_id: uuid.UUID
@@ -72,6 +120,22 @@ class CustomerProvisioningService:
             contact_email=request.admin_email,
             org_type=OrganizationType.STANDARD,
         )
+
+        # Before the role grant and the location, so that an organization
+        # that exists is an organization something is watching. Idempotent
+        # and never raises by contract -- the try/except guards the layer
+        # between here and it, because a customer must not fail to be
+        # created over their default alert rules. See
+        # `DefaultAlertingProtocol` for what was missing.
+        try:
+            await self.default_alerting(
+                organization_id=org.id, contact_email=org.contact_email
+            )
+        except Exception:
+            logger.exception(
+                "default_alerting_failed_during_onboarding",
+                extra={"organization_id": str(org.id)},
+            )
 
         org_admin_role = await self.rbac_service.repository.get_role_by_slug(
             "organization-admin", None

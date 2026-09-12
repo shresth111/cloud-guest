@@ -170,6 +170,7 @@ from .schemas import (
     RouterResponse,
     RouterUpdateRequest,
     WebfigSessionResponse,
+    redact_customer_router_settings,
 )
 from .service import RouterService
 
@@ -183,6 +184,21 @@ def _request_id(request: Request) -> str:
 
 
 def _router_response(router_device: Router) -> RouterResponse:
+    """The organization-scoped serialization -- what a venue admin receives.
+
+    ``settings`` goes through ``redact_customer_router_settings`` rather
+    than out of the column verbatim. The column is a free-form JSONB blob
+    and a controller-managed fleet row keeps its back-reference to the
+    network integration in it, so serving it as-is handed a venue admin the
+    integration's primary key on ``GET /locations/{id}/routers`` -- see
+    that function and ``CUSTOMER_FORBIDDEN_ROUTER_SETTINGS_KEYS`` for what
+    is removed and why it is a no-op on a MikroTik row.
+
+    Applied here, in the one place every organization-scoped route
+    serializes a router, rather than at each of the five call sites: a new
+    route that forgets is the failure this is guarding against, and it
+    cannot forget something it does not do.
+    """
     return RouterResponse(
         id=str(router_device.id),
         location_id=str(router_device.location_id),
@@ -200,7 +216,7 @@ def _router_response(router_device: Router) -> RouterResponse:
         last_health_check_at=router_device.last_health_check_at,
         health_status=router_device.health_status,
         has_api_credentials=router_device.api_credentials_encrypted is not None,
-        settings=router_device.settings,
+        settings=redact_customer_router_settings(router_device.settings),
         created_at=router_device.created_at,
         updated_at=router_device.updated_at,
     )
@@ -216,7 +232,16 @@ def _router_platform_response(router_device: Router) -> RouterPlatformResponse:
     field by forgetting to pass something.
     """
     return RouterPlatformResponse(
-        **_router_response(router_device).model_dump(),
+        **(
+            _router_response(router_device).model_dump()
+            # Undo the customer redaction: the back-reference from a
+            # controller's fleet row to its network integration is exactly
+            # what a Master operator opened this view to find, and the
+            # /platform/... routes are GLOBAL-only. Spelled as an explicit
+            # override rather than by rebuilding the object, so the two
+            # serializations cannot drift in any other field.
+            | {"settings": dict(router_device.settings or {})}
+        ),
         snmp_enabled=router_device.snmp_enabled,
         has_snmp_community=router_device.snmp_community_encrypted is not None,
         snmp_version=router_device.snmp_version,
