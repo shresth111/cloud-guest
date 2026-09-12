@@ -83,6 +83,8 @@ __all__ = [
     "PlatformNetworkIntegrationSummaryResponse",
     "PlatformOnboardRequest",
     "PlatformOnboardResponse",
+    "PlatformTestConnectionRequest",
+    "PlatformTestConnectionResponse",
     "PortalAuthorizeRequest",
     "PortalAuthorizeResponse",
     "TestConnectionRequest",
@@ -466,6 +468,12 @@ class NetworkIntegrationResponse(BaseModel):
     # where the caller already knows which organization they are in.
     organization_name: str | None = None
     location_name: str | None = None
+    # The fleet ("router") row that represents this controller, when one
+    # exists. Exposed so a client can match an integration to its fleet
+    # device directly instead of parsing `routerId=` back out of
+    # `portal_url_host_and_query`. NULL for a self-service integration that
+    # has no venue yet -- see `PortalReadinessGap.FLEET_DEVICE_MISSING`.
+    router_id: uuid.UUID | None = None
     provider: str
     name: str
     status: str
@@ -668,6 +676,70 @@ class NetworkIntegrationSsidResponse(BaseModel):
 
 class NetworkIntegrationSsidListResponse(BaseModel):
     ssids: list[NetworkIntegrationSsidResponse]
+
+
+# ============================================================================
+# Platform draft probe (Master console "Add customer" wizard)
+# ============================================================================
+
+
+class PlatformTestConnectionRequest(TestConnectionRequest):
+    """``POST /platform/test-connection``: the org-less pre-save probe.
+
+    The customer probe's body plus one optional field. It exists because the
+    Master console onboards a controller in the same wizard that creates the
+    customer, so at the device step there is often no organization yet --
+    and the customer probe requires one.
+
+    Unlike the customer probe, the credential fields may all be omitted: the
+    controller's certificate and unauthenticated identity are then probed on
+    the address alone (``credentials_checked: false`` in the response). A
+    partial credential is still refused.
+    """
+
+    site_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Optional. With Open API credentials, list the SSIDs of this site "
+            "(an id from the response's `sites`). When omitted, SSIDs are "
+            "listed only if the controller has exactly one site."
+        ),
+    )
+
+
+class PlatformTestConnectionResponse(TestConnectionResponse):
+    """The customer probe's answer, plus what the wizard needs to prefill.
+
+    Every field inherited from :class:`TestConnectionResponse` means what it
+    means there, including the certificate block being populated on failure.
+    """
+
+    #: ``"strict"`` when the certificate chains to a public CA (nothing to
+    #: pin), ``"pinned"`` when it does not (pin ``tls_fingerprint_sha256``).
+    #: ``None`` when no certificate could be observed at all -- there is then
+    #: nothing to suggest, and guessing would be a trust decision made for the
+    #: operator.
+    suggested_tls_mode: Literal["strict", "pinned"] | None = None
+    #: False when the request carried no credentials: only the address, the
+    #: certificate and the controller's unauthenticated identity were probed,
+    #: so ``ok`` says nothing about a password. True when they were used.
+    credentials_checked: bool = False
+    #: True when ``auth_mode`` is ``"legacy"`` (a hotspot operator login).
+    #: That account cannot list sites or SSIDs (runbook §6), so the two lists
+    #: below are empty *by construction*, not because the controller has none.
+    inventory_requires_openapi: bool = False
+    #: True only when ``sites`` was actually read from the controller.
+    inventory_available: bool = False
+    #: Set when Open API sign-in worked but reading sites/SSIDs did not. The
+    #: probe still succeeds -- the connection and the credentials are fine.
+    inventory_error_code: str | None = None
+    inventory_message: str | None = None
+    sites: list[NetworkIntegrationSiteResponse] = Field(default_factory=list)
+    #: The site ``ssids`` belongs to -- the request's ``site_id``, or the only
+    #: site when there is exactly one. ``None`` means no SSIDs were listed.
+    ssids_site_id: str | None = None
+    ssids: list[NetworkIntegrationSsidResponse] = Field(default_factory=list)
 
 
 class NetworkIntegrationDeviceResponse(BaseModel):

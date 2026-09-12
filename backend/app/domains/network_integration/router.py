@@ -100,6 +100,8 @@ from .schemas import (
     PlatformNetworkIntegrationSummaryResponse,
     PlatformOnboardRequest,
     PlatformOnboardResponse,
+    PlatformTestConnectionRequest,
+    PlatformTestConnectionResponse,
     PortalAuthorizeRequest,
     PortalAuthorizeResponse,
     TestConnectionRequest,
@@ -167,6 +169,7 @@ def _integration_response(
         ),
         organization_name=organization_name,
         location_name=location_name,
+        router_id=integration.router_id,
         provider=integration.provider,
         name=integration.name,
         status=integration.status,
@@ -582,6 +585,93 @@ async def configure_platform_integration_controller(
         success=outcome.ok,
         message=_configure_message(outcome),
         data=_controller_configure_response(outcome).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/test-connection",
+    response_model=ApiResponse[PlatformTestConnectionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.create", scope=ScopeType.GLOBAL)
+        )
+    ],
+)
+async def test_platform_draft_connection(
+    request: Request,
+    payload: PlatformTestConnectionRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Probe a controller before any customer or integration exists.
+
+    The Master "Add customer" wizard's device step. The customer probe
+    (``POST /test-connection``) needs an organization, and here there is
+    usually none yet -- so this is GLOBAL-scoped like ``/platform/onboard``
+    and takes no organization at all. It persists nothing but an audit
+    entry; see ``service.probe_controller_draft``.
+
+    ``.create`` for the same reason as the customer probe: it makes this
+    platform open an authenticated outbound connection to an address the
+    caller chose. 200 with ``ok: false`` on a controller failure, so the
+    wizard can render the reason next to the field.
+    """
+    outcome = await service.probe_controller_draft(
+        actor_user_id=_actor_id(actor),
+        provider=payload.provider,
+        base_url=payload.base_url,
+        auth_mode=payload.auth_mode,
+        controller_id=payload.controller_id,
+        tls_mode=payload.tls_mode,
+        tls_pinned_sha256=payload.tls_pinned_sha256,
+        client_id=payload.client_id,
+        client_secret=payload.client_secret,
+        username=payload.username,
+        password=payload.password,
+        site_id=payload.site_id,
+    )
+    info, error, inventory_error = outcome.info, outcome.error, outcome.inventory_error
+    response = PlatformTestConnectionResponse(
+        ok=error is None,
+        provider=payload.provider,
+        controller_id=info.controller_id if info else None,
+        controller_version=info.controller_version if info else None,
+        model=info.model if info else None,
+        supports_openapi=bool(info.supports_openapi) if info else False,
+        error_code=error.code.value if error else None,
+        message=error.message if error else None,
+        **_tls_fields(outcome.tls),
+        suggested_tls_mode=outcome.suggested_tls_mode,
+        credentials_checked=outcome.credentials_checked,
+        inventory_requires_openapi=outcome.inventory_requires_openapi,
+        inventory_available=outcome.inventory_available,
+        inventory_error_code=inventory_error.code.value if inventory_error else None,
+        inventory_message=inventory_error.message if inventory_error else None,
+        sites=[
+            NetworkIntegrationSiteResponse(
+                site_id=site.site_id,
+                name=site.name,
+                device_count=site.device_count,
+                client_count=site.client_count,
+            )
+            for site in outcome.sites
+        ],
+        ssids_site_id=outcome.ssids_site_id,
+        ssids=[
+            NetworkIntegrationSsidResponse(
+                ssid_id=ssid.ssid_id,
+                name=ssid.name,
+                portal_enabled=ssid.portal_enabled,
+            )
+            for ssid in outcome.ssids
+        ],
+    )
+    return build_response(
+        success=error is None,
+        message="Connection test completed",
+        data=response.model_dump(),
         request_id=_request_id(request),
     )
 
