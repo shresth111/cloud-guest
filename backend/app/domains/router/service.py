@@ -62,6 +62,11 @@ from app.domains.network_config.constants import BootstrapMode
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
+from .audit_changes import (
+    REDACTED_PLACEHOLDER,
+    describe_router_changes,
+    router_field_changes,
+)
 from .constants import (
     ROUTER_REACHABILITY_FLEET_OUTAGE_MIN_ROUTERS,
     ROUTER_REACHABILITY_FLEET_OUTAGE_RATIO,
@@ -361,8 +366,15 @@ class RouterService:
                 raise DuplicateSerialNumberError(normalized)
             update_data["serial_number"] = normalized
 
+        # The write-only secrets leave `update_data` under one name and come
+        # back under another; remember which spellings the *caller* actually
+        # sent so the audit trail can name the field the operator touched
+        # rather than only the column it landed in.
+        inbound_secret_fields: list[str] = []
+
         api_secret = update_data.pop("api_secret", None)
         if api_secret:
+            inbound_secret_fields.append("api_secret")
             await self._rotate_live_api_secret_if_needed(
                 router, update_data=update_data, new_secret=str(api_secret)
             )
@@ -373,18 +385,57 @@ class RouterService:
         # own docstring for why this gets the same Fernet treatment.
         snmp_community = update_data.pop("snmp_community", None)
         if snmp_community:
+            inbound_secret_fields.append("snmp_community")
             update_data["snmp_community_encrypted"] = encrypt_secret(
                 str(snmp_community)
             )
 
+        # Snapshot the pre-update values as PLAIN DATA, now, before the
+        # repository is called. `GenericRepository.update` setattrs onto the
+        # instance it is handed, so `router` and `updated` below are the very
+        # same ORM object -- a reference captured here would be read back
+        # already mutated and every diff would come out empty. Only keys the
+        # caller is actually writing are snapshotted; `updated_by` is
+        # bookkeeping the audit row already carries as its actor.
+        before_values = {key: getattr(router, key, None) for key in update_data}
+        changes = router_field_changes(before_values, update_data)
+
+        # `api_secret`/`snmp_community` were popped above, so the diff just
+        # taken names `api_credentials_encrypted`/`snmp_community_encrypted`
+        # -- the columns -- and not the fields the request carried. Diff the
+        # inbound names too, so a management-access PUT reads "an api_secret
+        # was set" and not only "a ciphertext column moved". These go through
+        # `router_field_changes` rather than having the `{"redacted": True}`
+        # sentinel written by hand here, so what counts as a secret is
+        # decided in exactly one place; REDACTED_PLACEHOLDER only ever stands
+        # in for "a value arrived", and because both keys are redacted it is
+        # discarded rather than recorded. (The ciphertext column always reads
+        # as changed, since Fernet is non-deterministic -- which is itself a
+        # reason it must stay redacted: a deterministic scheme would leak
+        # whether the same secret was re-submitted.)
+        changes.update(
+            router_field_changes(
+                dict.fromkeys(inbound_secret_fields),
+                dict.fromkeys(inbound_secret_fields, REDACTED_PLACEHOLDER),
+            )
+        )
+
         updated = await self.repository.update_router(
             router, {**update_data, "updated_by": actor_user_id}
         )
+        # A genuine no-op (the caller re-sent the values already on file)
+        # keeps the plain wording -- appending an empty or invented field
+        # list would be worse than the terse entry this replaces.
+        summary = describe_router_changes(changes)
+        description = f"Router '{updated.name}' updated"
+        if summary:
+            description = f"{description}: {summary}"
         await self._audit(
             actor_user_id,
             AuditAction.ROUTER_UPDATED,
             router=updated,
-            description=f"Router '{updated.name}' updated",
+            description=description,
+            metadata={"changes": changes},
         )
         return updated
 
