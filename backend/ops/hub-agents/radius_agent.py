@@ -113,14 +113,43 @@ def _split_client_blocks(text: str) -> list[tuple[int, int, str | None]]:
     ``#client foo {`` must not be treated as a block, which is why
     ``_CLIENT_OPEN_RE`` anchors on optional whitespace then a literal
     ``client``.
+
+    ## A block with no ``shortname`` line reports its LABEL
+
+    FreeRADIUS defaults a client's shortname to the ``client <name>``
+    label when the ``shortname`` directive is absent, so a stanza written
+    without one still answers to that name at runtime. This parser used to
+    report ``None`` for those, and ``None`` never equals anything a caller
+    asks for -- so such a block was invisible to
+    :func:`_strip_clients_with_shortname` and could not be deleted by any
+    request at all.
+
+    That was not hypothetical. The live hub carried
+
+        client cloudguest-dynamic-wan {
+            ipaddr = 0.0.0.0/0
+            ...
+        }
+
+    with no ``shortname`` line, and every
+    ``DELETE {"nas_identifier": "cloudguest-dynamic-wan"}`` answered
+    ``{"removed": 0}`` -- which reads as "already gone" and is the one
+    answer that makes an operator stop looking. A ``0.0.0.0/0`` client
+    with a fixed shared secret stayed on the RADIUS server for weeks
+    because of it, and removing it in the end took shell on a box nobody
+    had shell on. Matching what FreeRADIUS itself does is the fix.
     """
     lines = text.split("\n")
     blocks: list[tuple[int, int, str | None]] = []
     i = 0
     while i < len(lines):
-        if _CLIENT_OPEN_RE.match(lines[i]):
+        open_match = _CLIENT_OPEN_RE.match(lines[i])
+        if open_match:
             depth = 0
             start = i
+            # The label, used as the shortname when the block declares
+            # none -- FreeRADIUS's own rule. See this function's docstring.
+            label = open_match.group(1)
             shortname: str | None = None
             while i < len(lines):
                 stripped = lines[i].split("#", 1)[0]
@@ -138,7 +167,7 @@ def _split_client_blocks(text: str) -> list[tuple[int, int, str | None]]:
                     f"clients.conf has an unterminated client block at line "
                     f"{start + 1}; refusing to edit it"
                 )
-            blocks.append((start, i + 1, shortname))
+            blocks.append((start, i + 1, shortname or label))
         i += 1
     return blocks
 
