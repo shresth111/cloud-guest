@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
     "QosError",
@@ -199,10 +200,18 @@ class QosDeviceOperationError(QosError):
 
 class UnsupportedQosVendorError(QosError):
     """Raised by ``device_adapters.get_qos_queue_adapter`` when no real
-    adapter implementation is registered for a router's own ``vendor``."""
+    adapter implementation is registered for a router's own ``vendor``.
+
+    The message is chosen by
+    ``app.domains.router.device_domain_gate.unsupported_vendor_message``: a
+    controller-managed vendor gets the sentence a venue owner can act on, an
+    unrecognised vendor string keeps the engineer-facing wording. Both keep
+    this domain's own type and 400 -- the change is what the customer reads,
+    not what the caller catches.
+    """
 
     def __init__(self, vendor: str) -> None:
         super().__init__(
-            f"No QoS priority queue adapter registered for vendor '{vendor}'",
+            unsupported_vendor_message(feature="Call Priority", vendor=vendor),
             status_code=status.HTTP_400_BAD_REQUEST,
         )

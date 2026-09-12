@@ -66,6 +66,7 @@ from app.domains.isp.models import IspLink
 from app.domains.mac_authorization.models import MacAuthorizationEntry
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.models import QosTrafficRule
+from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.vlan.models import Vlan
@@ -76,6 +77,7 @@ from app.domains.wireguard.validators import hub_reserved_ip
 from .exceptions import (
     EmptyNetworkConfigError,
     NetwatchIntegrationUnavailableError,
+    NetworkConfigVendorGateUnavailableError,
     NoNetwatchTargetsError,
     NoWanLinksError,
 )
@@ -565,6 +567,38 @@ class NetworkConfigService:
             content_filter_rule_count=len(content_filter_rules),
         )
 
+    async def _refuse_if_controller_managed(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        feature: str,
+    ) -> None:
+        """The vendor gate for every write path in this service.
+
+        ``apply-live`` has had this gate since the vendor-gating work, in the
+        route layer, and it is the reason that path never decrypts a NULL
+        credential. The other four write paths never got one, and they are
+        the expensive ones: ``push_isp_netwatch_config`` *issues an agent
+        credential* for the router (``issue_credential_for_router``) before
+        it writes anything, so a controller row -- a device that will never
+        run an agent -- was being minted a real bearer credential, and then
+        given a ``ConfigVersion`` and a ``ProvisioningJob`` on top.
+
+        Fails closed when ``router_lookup`` is absent rather than skipping
+        the check. The DI wiring always provides it
+        (``dependencies.py``), so an instance without one is a construction
+        error, and a vendor gate that silently does nothing when a dependency
+        is missing is the precise shape of bug this whole change exists to
+        remove.
+        """
+        if self.router_lookup is None:
+            raise NetworkConfigVendorGateUnavailableError(router_id)
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature=feature)
+
     async def push_config(
         self,
         router_id: uuid.UUID,
@@ -572,6 +606,11 @@ class NetworkConfigService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> tuple[ConfigVersion, ProvisioningJob]:
+        await self._refuse_if_controller_managed(
+            router_id,
+            requesting_organization_id=requesting_organization_id,
+            feature="Internet Connection",
+        )
         (
             pools,
             vlans,
@@ -684,6 +723,13 @@ class NetworkConfigService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Before `issue_credential_for_router` below, which is the point.
+        # This method mints a real, plaintext agent bearer credential and
+        # embeds it in a RouterOS script; doing that for a device that runs
+        # no agent leaves a live credential on a row that can never present
+        # it, and then writes a ConfigVersion and a ProvisioningJob for a
+        # push that cannot land.
+        ensure_not_controller_managed(router, feature="Internet Connection")
         links, _meta = await self.isp_link_lookup.list_links(
             requesting_organization_id=requesting_organization_id,
             router_id=router_id,
@@ -791,6 +837,11 @@ class NetworkConfigService:
         Deliberately a standalone push path -- like Netwatch -- so WAN
         apply never silently rotates agent credentials or pulls unrelated
         DHCP/VLAN rows into the same script."""
+        await self._refuse_if_controller_managed(
+            router_id,
+            requesting_organization_id=requesting_organization_id,
+            feature="Internet Connection",
+        )
         _router, rendered, count = await self._gather_basic_wan_render(
             router_id,
             requesting_organization_id=requesting_organization_id,
@@ -864,6 +915,11 @@ class NetworkConfigService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> tuple[ConfigVersion, ProvisioningJob]:
+        await self._refuse_if_controller_managed(
+            router_id,
+            requesting_organization_id=requesting_organization_id,
+            feature="Internet Connection",
+        )
         rolled_back = await self.router_provisioning_lookup.rollback_to_version(
             actor_user_id=actor_user_id,
             router_id=router_id,

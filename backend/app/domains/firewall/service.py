@@ -28,6 +28,7 @@ from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
+from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 
 from .constants import DEFAULT_PRIORITY, FirewallAction, FirewallChain, FirewallProtocol
@@ -124,6 +125,13 @@ class FirewallService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Refused here, before a row exists. The adapter registry below would
+        # decline this vendor eventually -- but only on a later `push`, after
+        # this method has returned 201 and the venue has been shown a saved
+        # setting that will never reach any device. See
+        # `app.domains.router.device_domain_gate` for why the message is
+        # written for the venue rather than for the registry.
+        ensure_not_controller_managed(router, feature="Website Blocking")
         # Creating a rule on a router at a site the caller has no grant on is
         # the same defect as editing one there.
         enforce_entity_location(

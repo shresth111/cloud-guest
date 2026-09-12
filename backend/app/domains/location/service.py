@@ -45,7 +45,10 @@ from typing import Any, Protocol
 from app.common.exceptions import CloudGuestError
 from app.database.utils.pagination import PaginationMeta
 from app.domains.organization.enums import OrganizationStatus
-from app.domains.organization.exceptions import OrganizationArchivedError
+from app.domains.organization.exceptions import (
+    OrganizationArchivedError,
+    OrganizationSuspendedNewServiceError,
+)
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
@@ -191,7 +194,7 @@ class LocationService:
         await self._assert_organization_accessible(
             organization_id, requesting_organization_id
         )
-        await self._assert_organization_active(organization_id)
+        await self._assert_organization_active(organization_id, for_new_service=True)
 
         normalized_slug = _normalize_slug(slug)
         if await self.repository.get_by_slug(organization_id, normalized_slug):
@@ -374,14 +377,31 @@ class LocationService:
 
     # -- internal helpers -------------------------------------------------------
 
-    async def _assert_organization_active(self, organization_id: uuid.UUID) -> None:
+    async def _assert_organization_active(
+        self, organization_id: uuid.UUID, *, for_new_service: bool = False
+    ) -> None:
         """Raises if the parent organization does not exist
         (``OrganizationNotFoundError``, propagated from
         ``OrganizationLookupProtocol.get_organization``) or is archived
-        (``OrganizationArchivedError``)."""
+        (``OrganizationArchivedError``).
+
+        ``for_new_service`` additionally refuses a **suspended** tenant. Off
+        by default, and that asymmetry is the decision: edits to an existing
+        venue stay open while a tenant is suspended (an operator correcting
+        an address before reinstating is the normal path out of a
+        suspension), but a *new* venue is service growing under an account
+        whose service is stopped. See
+        :class:`OrganizationSuspendedNewServiceError` for the production
+        incident this refusal comes from.
+        """
         organization = await self.organization_lookup.get_organization(organization_id)
         if organization.status == OrganizationStatus.ARCHIVED.value:
             raise OrganizationArchivedError(organization_id)
+        if (
+            for_new_service
+            and organization.status == OrganizationStatus.SUSPENDED.value
+        ):
+            raise OrganizationSuspendedNewServiceError(organization_id, "locations")
 
     async def _assert_organization_accessible(
         self,

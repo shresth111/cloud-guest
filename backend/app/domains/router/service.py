@@ -100,11 +100,19 @@ from .exceptions import (
     RouterDecommissionedError,
     RouterLiveCredentialRotationFailedError,
     RouterNotFoundError,
+    RouterVendorChangeRefusedError,
     RouterVendorNotProvisionableError,
+    RouterVendorNotSupportedError,
 )
 from .models import Router, RouterProvisioningToken
 from .repository import RouterRepositoryProtocol
-from .vendor_capabilities import supports_zero_touch_provisioning
+from .vendor_capabilities import (
+    AGENT_EVIDENCE_FIELDS,
+    SUPPORTED_ROUTER_VENDORS,
+    is_controller_managed,
+    looks_like_mikrotik_hardware,
+    supports_zero_touch_provisioning,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +443,137 @@ class RouterService:
             AuditAction.ROUTER_UPDATED,
             router=updated,
             description=description,
+            metadata={"changes": changes},
+        )
+        return updated
+
+    async def change_router_vendor(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        vendor: str,
+        reason: str,
+        override_contradicting_evidence: bool = False,
+    ) -> Router:
+        """Records what kind of device a fleet row is.
+
+        Deliberately NOT a branch of :meth:`update_router`. ``vendor`` is not
+        a property of the row in the way ``name`` or ``model`` are -- it is
+        the switch that decides whether the alert evaluator judges this
+        device, whether the ZTP dashboard lists it, whether the readiness
+        checklist runs, and whether seven device domains will speak to it. A
+        field with that blast radius needs its own route, its own scope, its
+        own reason and its own refusals, and folding it back into the generic
+        update is how it ended up org-scoped and unaudited in the first
+        place.
+
+        The route above this is GLOBAL-scoped, so
+        ``requesting_organization_id`` is not a parameter: a platform
+        operator is looking at any tenant's device, the same shape
+        ``decommission_router`` and ``update_router_management_access`` use.
+
+        Three refusals, in order:
+
+        1. **A vendor the platform does not implement.** The column is free
+           text and everything outside ``CONTROLLER_MANAGED_VENDORS`` reads
+           as an agent-managed MikroTik, so ``"unifi"`` would not mark the
+           device unsupported -- it would claim an agent runs on it.
+        2. **A live network integration references this row.** Not evidence
+           about the device but a dependency on the value: the integration's
+           provider is what chose the vendor string, and
+           ``guest_sessions.router_id`` is NOT NULL, so changing it out from
+           under a live integration makes two rows disagree about the same
+           device. Not overridable -- detach the integration first.
+        3. **The device's own data contradicts the claim.** Only when moving
+           *to* a controller-managed vendor: a heartbeat, a RouterOS version,
+           RouterOS API credentials on file, or a MikroTik model string all
+           say this is not a controller. Overridable, explicitly and in
+           writing, because a genuinely re-purposed device is a real if rare
+           thing -- and because a refusal with no way past it is a refusal
+           people route around with a manual UPDATE.
+
+        Moving *to* an agent-managed vendor is never refused by (3). That
+        direction is the correction: the seven rows relabelled in 2026-09 all
+        carry agent evidence, and requiring an override to undo the damage
+        would be asking the operator to overrule the very evidence proving
+        them right.
+        """
+        if vendor not in SUPPORTED_ROUTER_VENDORS:
+            raise RouterVendorNotSupportedError(vendor, SUPPORTED_ROUTER_VENDORS)
+
+        router = await self.get_router(router_id, requesting_organization_id=None)
+        if router.status == RouterStatus.DECOMMISSIONED.value:
+            raise RouterDecommissionedError(router_id)
+
+        previous_vendor = router.vendor
+        if previous_vendor == vendor:
+            # A no-op is not an error -- the console may be replaying a
+            # request -- but it must not write an audit entry claiming a
+            # change, which is the exact dishonesty this work removes.
+            return router
+
+        integration_count = await self.repository.count_integrations_referencing_router(
+            router_id
+        )
+        if integration_count:
+            raise RouterVendorChangeRefusedError(
+                router_id,
+                vendor,
+                [
+                    f"{integration_count} live network integration(s) "
+                    "reference this device, and the integration's provider "
+                    "is what decides its type. Remove or re-point the "
+                    "integration first"
+                ],
+            )
+
+        contradictions: list[str] = []
+        if is_controller_managed(vendor):
+            evidence = [
+                field
+                for field in AGENT_EVIDENCE_FIELDS
+                if getattr(router, field, None) is not None
+            ]
+            if evidence:
+                contradictions.append(
+                    "this device has behaved like one of ours (" +
+                    ", ".join(evidence) + " is set), and a controller never "
+                    "checks in, reports a RouterOS version, or holds "
+                    "RouterOS API credentials"
+                )
+            if looks_like_mikrotik_hardware(router.model):
+                contradictions.append(
+                    f"its model is recorded as '{router.model}', which is "
+                    "MikroTik hardware"
+                )
+        if contradictions and not override_contradicting_evidence:
+            raise RouterVendorChangeRefusedError(router_id, vendor, contradictions)
+
+        updated = await self.repository.update_router(
+            router, {"vendor": vendor, "updated_by": actor_user_id}
+        )
+        # Built by hand rather than through `router_field_changes`, because
+        # this change set carries two things a generic field diff has no
+        # place knowing about: the operator's written reason, and whether
+        # they overruled the device's own evidence to get here. Both are the
+        # first things anyone asks six weeks later.
+        changes: dict[str, object] = {
+            "vendor": {"from": previous_vendor, "to": vendor},
+            "reason": reason,
+        }
+        description = (
+            f"Router '{updated.name}' device type changed: "
+            f"vendor {previous_vendor} -> {vendor}"
+        )
+        if contradictions:
+            changes["evidence_overridden"] = contradictions
+            description += " (contradicting evidence overridden)"
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_UPDATED,
+            router=updated,
+            description=f"{description}. Reason: {reason}",
             metadata={"changes": changes},
         )
         return updated

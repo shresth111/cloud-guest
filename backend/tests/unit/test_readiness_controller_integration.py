@@ -59,7 +59,7 @@ from app.domains.readiness.constants import (
 from app.domains.readiness.exceptions import UnknownChecklistItemError
 from app.domains.readiness.service import ReadinessService
 
-from .test_readiness import _build_service, _make_router
+from .test_readiness import _build_service, _make_router, make_controller_router
 
 _OMADA = "tplink_omada"
 _KEY = ChecklistItemKey.CONTROLLER_INTEGRATION.value
@@ -125,8 +125,14 @@ async def _checklist(
             agent,
             network_integration_lookup=lookup,
         )
-    router = _make_router(status="pending_provisioning")
-    router.vendor = vendor
+    # A controller has to be BUILT as one, not relabelled into one: the
+    # readiness gate now weighs agent evidence over the vendor string, and
+    # `_make_router` produces a row that has heartbeated.
+    if vendor == _OMADA:
+        router = make_controller_router(status="pending_provisioning")
+    else:
+        router = _make_router(status="pending_provisioning")
+        router.vendor = vendor
     router_lookup.add(router)
     rows = await service.get_checklist(router.id, requesting_organization_id=None)
     return {row.item_key: row for row in rows}, lookup, service, rows
@@ -296,8 +302,7 @@ class TestItCannotFakeAPass:
         override would put the green badge back over the dead venue --
         which is the whole failure."""
         service, _repo, router_lookup, *_ = _build_service()
-        router = _make_router(status="pending_provisioning")
-        router.vendor = _OMADA
+        router = make_controller_router(status="pending_provisioning")
         router_lookup.add(router)
 
         with pytest.raises(UnknownChecklistItemError):
@@ -316,8 +321,7 @@ class TestItCannotFakeAPass:
         """The refusal above has to be about this one item, not a
         side-effect that broke manual confirmation for controllers."""
         service, _repo, router_lookup, *_ = _build_service()
-        router = _make_router(status="pending_provisioning")
-        router.vendor = _OMADA
+        router = make_controller_router(status="pending_provisioning")
         router_lookup.add(router)
 
         row = await service.confirm_item(
@@ -373,8 +377,7 @@ class TestItReachesTheSummary:
         service = ReadinessService(
             repo, router_lookup, isp, wg, agent, network_integration_lookup=lookup
         )
-        router = _make_router(status="pending_provisioning")
-        router.vendor = _OMADA
+        router = make_controller_router(status="pending_provisioning")
         router_lookup.add(router)
 
         first = {

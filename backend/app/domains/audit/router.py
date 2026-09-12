@@ -75,6 +75,7 @@ from app.domains.rbac.models import AuditLogEntry
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .dependencies import get_audit_service
+from .redaction import redact_event_metadata
 from .schemas import AuditLogEntryListResponse, AuditLogEntryResponse
 from .service import AuditService
 
@@ -125,6 +126,17 @@ def _entry_response(entry: AuditLogEntry) -> AuditLogEntryResponse:
         entity_type=entry.entity_type,
         entity_id=str(entry.entity_id) if entry.entity_id else None,
         description=entry.description,
+        # Read surface for what the writers were already storing.
+        #
+        # `audit_log_entries.event_metadata` has existed and been written all
+        # along -- `SystemSettingsService._record_audit` puts a full
+        # `{"changes": ...}` diff in it, and `RouterService.update_router`
+        # now does too -- but no read path had ever passed it out. So a
+        # router update whose metadata named the field, the old value and
+        # the new value still reached every console as the bare word
+        # "updated". Fixing a writer without this is fixing nothing anybody
+        # can see.
+        event_metadata=redact_event_metadata(entry.event_metadata or {}),
         organization_id=str(entry.organization_id) if entry.organization_id else None,
         location_id=str(entry.location_id) if entry.location_id else None,
         created_at=entry.created_at,

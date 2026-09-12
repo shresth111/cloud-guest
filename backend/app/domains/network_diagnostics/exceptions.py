@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
     "NetworkDiagnosticsError",
@@ -104,11 +105,19 @@ class DiagnosticsDeviceOperationError(NetworkDiagnosticsError):
 class UnsupportedDiagnosticsVendorError(NetworkDiagnosticsError):
     """No diagnostics adapter is registered for this router's own
     ``vendor`` -- mirrors
-    ``app.domains.isp.exceptions.UnsupportedIspVendorError``."""
+    ``app.domains.isp.exceptions.UnsupportedIspVendorError``.
+
+    The message is chosen by
+    ``app.domains.router.device_domain_gate.unsupported_vendor_message``: a
+    controller-managed vendor gets the sentence a venue owner can act on, an
+    unrecognised vendor string keeps the engineer-facing wording. Both keep
+    this domain's own type and 400 -- the change is what the customer reads,
+    not what the caller catches.
+    """
 
     def __init__(self, vendor: str) -> None:
         super().__init__(
-            f"No diagnostics adapter registered for vendor '{vendor}'",
+            unsupported_vendor_message(feature="Network Tests", vendor=vendor),
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

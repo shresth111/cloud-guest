@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -391,9 +393,16 @@ class AccessValidator:
         repository: RBACRepositoryProtocol,
         *,
         cache: PermissionCache | None = None,
+        denial_audit_repository: DenialAuditRepositoryFactory | None = None,
     ) -> None:
         self.repository = repository
         self.cache = cache
+        # Where a PERMISSION_DENIED row is written. NOT `repository`, which
+        # is bound to the request's session and is rolled back by the very
+        # exception this row records -- see `_record_denial_out_of_band`.
+        # Injectable so a test can observe the write without a database;
+        # `None` means "a short transaction of its own on the real engine".
+        self.denial_audit_repository = denial_audit_repository
         self.resolver = PermissionResolver(repository)
         self.scope_resolver = ScopeResolver()
 
@@ -460,20 +469,74 @@ class AccessValidator:
                 "scope": scope_description,
             },
         )
-        await self.repository.create_audit_log_entry(
-            actor_user_id=user_id,
-            action=AuditAction.PERMISSION_DENIED.value,
-            entity_type="permission",
-            entity_id=None,
-            description=f"Permission '{permission_key}' denied at {scope_description}",
-            event_metadata={
-                "permission_key": permission_key,
-                "scope": scope_description,
-            },
-            organization_id=context.organization_id,
-            location_id=context.location_id,
+        # WRITTEN ON ITS OWN CONNECTION, AND THAT IS THE WHOLE POINT.
+        #
+        # This row used to be created on the request's session, and then the
+        # very next line raised. `get_db_session` rolls back on any exception
+        # (`app/database/session.py:38-40`), so the rollback took the denial
+        # record with it: *every* denied request in this platform's history
+        # left no persisted trace at all. The log line above was the only
+        # evidence, and a log line is not an audit trail -- it is not
+        # queryable by organization, it does not appear in the audit export
+        # the owner reads, and it is retained on a different schedule.
+        #
+        # A denial record must not be transactionally coupled to the request
+        # it is recording the failure of. Its own short transaction commits
+        # independently and survives the rollback.
+        #
+        # Failure to write it is swallowed, deliberately: a 403 the caller is
+        # entitled to must still be a 403 if the audit connection is
+        # unavailable. The denial is logged above regardless, so the
+        # swallowed case degrades to exactly the behaviour that existed
+        # before this block, never to silence.
+        await self._record_denial_out_of_band(
+            user_id=user_id,
+            permission_key=permission_key,
+            scope_description=scope_description,
+            context=context,
         )
         raise PermissionDeniedError(permission_key, scope_description)
+
+    async def _record_denial_out_of_band(
+        self,
+        *,
+        user_id: uuid.UUID,
+        permission_key: str,
+        scope_description: str,
+        context: ScopeContext,
+    ) -> None:
+        """Persist one ``PERMISSION_DENIED`` entry on a connection of its own.
+
+        Imported lazily so this module keeps importing without a configured
+        database -- ``authorization.py`` is pure policy and is unit-tested
+        that way, and a module-level import of the session factory would make
+        those tests depend on a connection string.
+        """
+        factory = self.denial_audit_repository or _own_transaction_repository
+
+        try:
+            async with factory() as repository:
+                await repository.create_audit_log_entry(
+                    actor_user_id=user_id,
+                    action=AuditAction.PERMISSION_DENIED.value,
+                    entity_type="permission",
+                    entity_id=None,
+                    description=(
+                        f"Permission '{permission_key}' denied at "
+                        f"{scope_description}"
+                    ),
+                    event_metadata={
+                        "permission_key": permission_key,
+                        "scope": scope_description,
+                    },
+                    organization_id=context.organization_id,
+                    location_id=context.location_id,
+                )
+        except Exception:  # pragma: no cover - defence in depth
+            logger.exception(
+                "rbac_permission_denied_audit_write_failed",
+                extra={"user_id": str(user_id), "permission_key": permission_key},
+            )
 
 
 def _describe_scope(scope_type: ScopeType, context: ScopeContext) -> str:
@@ -481,3 +544,27 @@ def _describe_scope(scope_type: ScopeType, context: ScopeContext) -> str:
     if scope_type == ScopeType.GLOBAL or identifier is None:
         return "global scope"
     return f"{scope_type.value} scope ({identifier})"
+
+
+#: A factory that yields something able to write one audit entry, and commits
+#: it when the block exits. See :func:`_own_transaction_repository`.
+DenialAuditRepositoryFactory = Callable[
+    [], AbstractAsyncContextManager[RBACRepositoryProtocol]
+]
+
+
+@asynccontextmanager
+async def _own_transaction_repository() -> AsyncIterator[RBACRepositoryProtocol]:
+    """An RBAC repository on a connection of its own, committed on exit.
+
+    Imported lazily inside the body so this module keeps importing without a
+    configured database: ``authorization.py`` is pure policy and most of its
+    tests never touch one.
+    """
+    from app.database.session import SessionLocal
+
+    from .repository import RBACRepository
+
+    async with SessionLocal() as session:
+        yield RBACRepository(session)
+        await session.commit()

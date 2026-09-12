@@ -32,6 +32,7 @@ from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 # ``app.domains.monitoring.repository`` already uses to read ``Router``/
 # ``IspLink``/``RouterRogueDhcpStatus``: this repository never writes a
 # ``RouterAgentCredential``, it only reads when one was last used.
+from app.domains.network_integration.models import NetworkIntegration
 from app.domains.router_agent.models import RouterAgentCredential
 
 from .enums import RouterStatus
@@ -141,6 +142,10 @@ class RouterRepositoryProtocol(Protocol):
 
     async def get_by_mac_address(self, mac_address: str) -> Router | None: ...
 
+    async def count_integrations_referencing_router(
+        self, router_id: uuid.UUID
+    ) -> int: ...
+
     async def create_router(self, **fields: object) -> Router: ...
 
     async def update_router(
@@ -215,6 +220,33 @@ class RouterRepository:
             filters={"mac_address": mac_address}, limit=1
         )
         return results[0] if results else None
+
+    async def count_integrations_referencing_router(
+        self, router_id: uuid.UUID
+    ) -> int:
+        """How many live network integrations point at this fleet row.
+
+        Read-only cross-domain read, the same shape as the
+        ``RouterAgentCredential`` import above: this repository never writes a
+        ``NetworkIntegration``.
+
+        Exists for one question -- may this row's ``vendor`` still be
+        changed. An integration's provider decides the vendor string
+        (``ROUTER_VENDOR_BY_PROVIDER``), and ``guest_sessions.router_id`` is
+        NOT NULL, so a live integration whose fleet row claims a different
+        vendor is a row disagreeing with the row that depends on it. Counted
+        rather than fetched because the caller needs a yes/no and has no use
+        for the integration itself.
+        """
+        result = await self.session.execute(
+            select(func.count())
+            .select_from(NetworkIntegration)
+            .where(
+                NetworkIntegration.router_id == router_id,
+                NetworkIntegration.is_deleted.is_(False),
+            )
+        )
+        return int(result.scalar_one())
 
     async def create_router(self, **fields: object) -> Router:
         return await self.routers.create(fields)

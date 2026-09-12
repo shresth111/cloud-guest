@@ -15,6 +15,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -1788,6 +1789,17 @@ class FakeAgentCredentialIssuer:
 class FakeRouterLookup:
     routers: dict[uuid.UUID, Router] = field(default_factory=dict)
 
+    #: What an unregistered router id resolves to.
+    #:
+    #: Every write path in `NetworkConfigService` now asks this lookup what
+    #: kind of device it is about to configure, before it writes anything --
+    #: so the lookup is no longer optional, and a test that never registered
+    #: a router still gets asked. A plain MikroTik is the honest default: it
+    #: is what every row in this suite is unless the test says otherwise, and
+    #: it is the answer that changes no existing behaviour. A test about
+    #: controllers registers a controller row and gets it.
+    default_vendor: str = "mikrotik"
+
     async def get_router(
         self,
         router_id: uuid.UUID,
@@ -1795,7 +1807,11 @@ class FakeRouterLookup:
         requesting_organization_id: uuid.UUID | None = None,
         include_deleted: bool = False,
     ) -> Router:
-        return self.routers[router_id]
+        if router_id in self.routers:
+            return self.routers[router_id]
+        return SimpleNamespace(
+            id=router_id, name="Test Router", vendor=self.default_vendor
+        )
 
 
 def _make_service(
@@ -1825,7 +1841,7 @@ def _make_service(
         content_filter_lookup=FakeContentFilterLookup(content_filter_rules or []),
         isp_link_lookup=isp_link_lookup,
         agent_credential_issuer=agent_credential_issuer,
-        router_lookup=router_lookup,
+        router_lookup=router_lookup or FakeRouterLookup(),
     )
     return service, provisioning_lookup
 

@@ -62,6 +62,7 @@ from app.domains.rbac.dependencies import (
 )
 
 from .constants import ConfigVariableScope
+from .customer_visibility import customer_visible_interface_counters
 from .dependencies import get_router_provisioning_service
 from .models import (
     ConfigProfile,
@@ -260,13 +261,21 @@ def _health_snapshot_response(
         uptime_seconds=snapshot.uptime_seconds,
         connected_clients_count=snapshot.connected_clients_count,
         metrics_source=snapshot.metrics_source,
-        # Passed through as-is: pydantic validates each dict into a
-        # RouterInterfaceTrafficCounter. The sweep is the only writer and
-        # SnmpPoller.get_interface_counters already guarantees every entry
-        # has a non-empty if_name and an int-parsable if_index (it skips
-        # the ones that don't), so there is no partially-shaped row to
-        # defend against here -- and None stays None, never [].
-        interface_traffic_counters=snapshot.interface_traffic_counters,
+        # The sweep is the only writer and SnmpPoller.get_interface_counters
+        # already guarantees every entry has a non-empty if_name and an
+        # int-parsable if_index (it skips the ones that don't), so there is
+        # no partially-shaped row to defend against here -- and None stays
+        # None, never [].
+        #
+        # What IS filtered is this platform's own management tunnel.
+        # `wg-cloudguard` was being served on `GET /health-history`, which is
+        # `router_provisioning.read` at ORGANIZATION scope -- a venue-owner
+        # payload -- complete with byte counters. See
+        # `customer_visibility` for why the field is stripped rather than
+        # left for the console to decline to draw.
+        interface_traffic_counters=customer_visible_interface_counters(
+            snapshot.interface_traffic_counters
+        ),
     )
 
 

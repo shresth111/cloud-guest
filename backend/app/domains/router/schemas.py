@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.domains.auth.schemas import MessageResponse
 
 from .enums import RouterStatus
+from .vendor_capabilities import SUPPORTED_ROUTER_VENDORS
 
 __all__ = [
     "MessageResponse",
@@ -53,6 +54,7 @@ __all__ = [
     "RouterListResponse",
     "RouterPlatformResponse",
     "RouterCreateRequest",
+    "RouterVendorChangeRequest",
     "RouterUpdateRequest",
     "RouterManagementAccessRequest",
     "ProvisioningTokenResponse",
@@ -479,16 +481,24 @@ class RouterUpdateRequest(BaseModel):
     serial_number: str | None = Field(default=None, min_length=1, max_length=100)
     mac_address: str | None = Field(default=None, min_length=17, max_length=17)
     model: str | None = Field(default=None, min_length=1, max_length=100)
-    vendor: str | None = Field(
-        default=None,
-        max_length=50,
-        description=(
-            "Device vendor -- same field/default RouterCreateRequest already "
-            "exposes at creation time (router/models.py:77). Added here so "
-            "an already-registered router's vendor can be corrected/set from "
-            "the Master console without re-creating the router."
-        ),
-    )
+    # `vendor` IS DELIBERATELY NOT A FIELD HERE ANY MORE.
+    #
+    # It used to be, with a docstring saying it existed so a vendor could be
+    # set "from the Master console". This route is not the Master console:
+    # `PUT /routers/{router_id}` is `routers.update` at ORGANIZATION scope,
+    # and `organization-owner` -- the role `LocationProvisioningService`
+    # assigns to every venue owner it provisions -- holds that permission in
+    # full. Any venue owner could relabel their own router's vendor, and
+    # under the pure-label predicates that switched off their own device's
+    # monitoring. The comment 60 lines down in `router.py` had already
+    # spelled out why that scope is customer-reachable; the field simply
+    # never got read against it.
+    #
+    # It now lives on `PUT /platform/routers/{id}/vendor`
+    # (`RouterVendorChangeRequest` below), GLOBAL-scoped, requiring a written
+    # reason and refusing when the device's own data contradicts the claim --
+    # exactly the move `api_username`/`api_secret` made onto
+    # `/platform/routers/{id}/management-access` for the identical reason.
     routeros_version: str | None = Field(default=None, max_length=50)
     management_ip_address: str | None = Field(default=None, max_length=45)
     public_ip_address: str | None = Field(default=None, max_length=45)
@@ -503,6 +513,64 @@ class RouterUpdateRequest(BaseModel):
     @classmethod
     def validate_host_address(cls, value: str | None) -> str | None:
         return _validate_host_address(value) if value is not None else value
+
+
+class RouterVendorChangeRequest(BaseModel):
+    """A deliberate, reasoned, GLOBAL-scoped change to ``routers.vendor``.
+
+    ``vendor`` is the single most consequential column on a fleet row and was
+    the least guarded: a free ``String(50)``, editable through an
+    organization-scoped ``PUT``, from a bare ``<select>`` whose ``onChange``
+    fired the request immediately. It decides whether the alert evaluator
+    judges the device, whether the ZTP dashboard shows it, whether the
+    readiness checklist runs, and whether seven device domains will talk to
+    it at all.
+
+    So this schema asks for three things the old one did not:
+
+    * a ``vendor`` from a closed vocabulary of types the platform actually
+      implements -- see :data:`SUPPORTED_ROUTER_VENDORS`;
+    * a ``reason``, stored in the audit entry, because the question anyone
+      asks about a vendor change afterwards is "why", and nothing recorded
+      it;
+    * an explicit ``override_contradicting_evidence`` when the device's own
+      data says otherwise, so overruling a heartbeat is a thing somebody
+      typed rather than a thing that happened.
+    """
+
+    vendor: str = Field(
+        min_length=1,
+        max_length=50,
+        description=(
+            "The device type to record. Must be one of "
+            + ", ".join(SUPPORTED_ROUTER_VENDORS)
+            + " -- the types this platform has working machinery for. A "
+            "vendor it does not implement is not 'unsupported' in this "
+            "column, it is silently treated as an agent-managed MikroTik."
+        ),
+    )
+    reason: str = Field(
+        min_length=8,
+        max_length=500,
+        description=(
+            "Why this device's type is being changed. Recorded verbatim in "
+            "the ROUTER_UPDATED audit entry alongside the old and new "
+            "values. Required: seven production rows were relabelled in "
+            "2026-09 and the audit trail could say neither what changed nor "
+            "why."
+        ),
+    )
+    override_contradicting_evidence: bool = Field(
+        default=False,
+        description=(
+            "Proceed even though this device has behaved like an "
+            "agent-managed device (it has heartbeated, reported a RouterOS "
+            "version, or has RouterOS API credentials on file) or carries a "
+            "MikroTik model string. Refused without this flag. Never "
+            "overrides the network-integration check, which is not evidence "
+            "about the device but a live row that depends on this value."
+        ),
+    )
 
 
 class RouterManagementAccessRequest(BaseModel):

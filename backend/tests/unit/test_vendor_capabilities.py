@@ -144,11 +144,18 @@ class TestReadinessChecklist:
     every AUTO item has no answer rather than a failing one."""
 
     async def _checklist(self, vendor: str):
-        from tests.unit.test_readiness import _build_service, _make_router
+        from tests.unit.test_readiness import (
+            _build_service,
+            _make_router,
+            make_controller_router,
+        )
 
         service, _repo, router_lookup, *_ = _build_service()
-        router = _make_router(status="pending_provisioning")
-        router.vendor = vendor
+        if vendor == _OMADA:
+            router = make_controller_router(status="pending_provisioning")
+        else:
+            router = _make_router(status="pending_provisioning")
+            router.vendor = vendor
         router_lookup.add(router)
         return await service.get_checklist(
             router.id, requesting_organization_id=None
@@ -225,11 +232,10 @@ class TestReadinessSummary:
     counts a readiness percentage is built from."""
 
     async def test_not_applicable_is_counted_separately(self) -> None:
-        from tests.unit.test_readiness import _build_service, _make_router
+        from tests.unit.test_readiness import _build_service, make_controller_router
 
         service, _repo, router_lookup, *_ = _build_service()
-        router = _make_router(status="pending_provisioning")
-        router.vendor = _OMADA
+        router = make_controller_router(status="pending_provisioning")
         router_lookup.add(router)
 
         rows = await service.get_checklist(

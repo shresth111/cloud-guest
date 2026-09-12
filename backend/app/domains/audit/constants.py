@@ -20,6 +20,11 @@ CSV_EXPORT_HEADERS = (
     "organization_id",
     "location_id",
     "description",
+    # Appended, never inserted. Every existing consumer of this export reads
+    # by position or by a header row it already knows; a new column at the
+    # end is additive for both, and one in the middle silently shifts every
+    # field after it.
+    "event_metadata",
 )
 
 __all__ = [

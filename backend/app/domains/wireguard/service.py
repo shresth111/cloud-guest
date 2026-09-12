@@ -1988,6 +1988,15 @@ class WireGuardService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # The one write path in this domain that was missing the eligibility
+        # check its three siblings (`create_tunnel`,
+        # `allocate_tunnel_via_hub`, `rotate_tunnel`) all make right here.
+        # A peer registered for a controller row is worse than a refused one:
+        # it permanently occupies a /24 address and reads, forever, as a
+        # device someone started setting up and never finished -- the exact
+        # indistinguishability `validate_router_eligible_for_wireguard`'s own
+        # docstring gives as the reason the vendor check runs first.
+        validate_router_eligible_for_wireguard(router)
         server = await self.get_active_server()
         existing = await self.repository.get_peer_by_router_id(router.id)
 

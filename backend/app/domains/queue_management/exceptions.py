@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
     "QueueManagementError",
@@ -169,11 +170,19 @@ class QueueDeviceOperationError(QueueManagementError):
 class UnsupportedQueueVendorError(QueueManagementError):
     """Raised by ``device_adapters.get_queue_adapter`` when no real
     ``BaseQueueAdapter`` implementation is registered for a router's own
-    ``vendor``."""
+    ``vendor``.
+
+    The message is chosen by
+    ``app.domains.router.device_domain_gate.unsupported_vendor_message``: a
+    controller-managed vendor gets the sentence a venue owner can act on, an
+    unrecognised vendor string keeps the engineer-facing wording. Both keep
+    this domain's own type and 400 -- the change is what the customer reads,
+    not what the caller catches.
+    """
 
     def __init__(self, vendor: str) -> None:
         super().__init__(
-            f"No queue adapter registered for vendor '{vendor}'",
+            unsupported_vendor_message(feature="Speed Limits", vendor=vendor),
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

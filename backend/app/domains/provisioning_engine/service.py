@@ -77,6 +77,7 @@ from app.core.config import get_settings
 from app.domains.policy.constants import PolicyType
 from app.domains.policy.service import ResolvedPolicy
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 from app.domains.router_provisioning.adapters import get_provisioning_adapter
 from app.domains.router_provisioning.constants import (
@@ -412,6 +413,13 @@ class ProvisioningEngineService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Refused here, before a row exists. The adapter registry below would
+        # decline this vendor eventually -- but only on a later `push`, after
+        # this method has returned 201 and the venue has been shown a saved
+        # setting that will never reach any device. See
+        # `app.domains.router.device_domain_gate` for why the message is
+        # written for the venue rather than for the registry.
+        ensure_not_controller_managed(router, feature="Device Setup")
         if provision_template_id is not None:
             template = await self.repository.get_template_by_id(provision_template_id)
             if template is None:
@@ -781,6 +789,9 @@ class ProvisioningEngineService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Before credentials, whose absence on a controller row would be
+        # reported as a gap to fill rather than as a device we never talk to.
+        ensure_not_controller_managed(router, feature="Device Discovery")
         credentials = self._resolve_device_credentials(router)
         adapter = self._get_device_adapter(router.vendor)
         result = await adapter.discover(credentials)
@@ -854,6 +865,13 @@ class ProvisioningEngineService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # The highest-consequence path in the product: raw RouterOS, executed
+        # immediately, with no undo and no safe-command allowlist. Refused
+        # before `_resolve_device_credentials` -- which for a controller row
+        # would raise `ProvisionMissingCredentialsError` ("missing device
+        # connection credentials"), telling the operator to go and add some
+        # for a device that will never accept a RouterOS command.
+        ensure_not_controller_managed(router, feature="Device Console")
         credentials = self._resolve_device_credentials(router)
         adapter = self._get_device_adapter(router.vendor)
         try:

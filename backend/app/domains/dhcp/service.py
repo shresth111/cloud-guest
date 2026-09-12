@@ -53,6 +53,7 @@ from app.domains.rbac.location_scope import (
     LocationScope,
     enforce_entity_location,
 )
+from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 
 from .constants import (
@@ -209,6 +210,13 @@ class DhcpService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Refused here, before a row exists. The adapter registry below would
+        # decline this vendor eventually -- but only on a later `push`, after
+        # this method has returned 201 and the venue has been shown a saved
+        # setting that will never reach any device. See
+        # `app.domains.router.device_domain_gate` for why the message is
+        # written for the venue rather than for the registry.
+        ensure_not_controller_managed(router, feature="IP Addresses")
         validate_address_range(address_range_start, address_range_end)
         validate_ip_address("gateway_ip_address", gateway_ip_address)
         validate_ip_address("dns_primary", dns_primary)
