@@ -47,6 +47,9 @@ __all__ = [
     "NextCampaignResponse",
     "CampaignRespondRequest",
     "CampaignImpressionRequest",
+    "CampaignTemplateQuestionResponse",
+    "CampaignTemplateResponse",
+    "CampaignTemplateListResponse",
 ]
 
 
@@ -137,11 +140,54 @@ class CampaignQuestionResponse(BaseModel):
     is_required: bool
 
 
+class CampaignTemplateQuestionResponse(BaseModel):
+    answer_type: str
+    # Empty when the venue supplies it -- a dish name, in the one template
+    # that has any. The dashboard renders an empty field, not a
+    # placeholder to be accepted as-is.
+    question_text: str
+    options: list[str]
+    is_required: bool
+    # The dashboard should offer "add another" for rows of this kind. A
+    # dish survey is a repeating list of identical questions with
+    # different names; a satisfaction survey is not.
+    repeatable: bool
+
+
+class CampaignTemplateResponse(BaseModel):
+    """A starter shape, not a resource. Applying one is the ordinary
+    `POST /campaigns` plus one `POST /campaigns/{id}/questions` per
+    question -- there is no "create from template" endpoint and no stored
+    link back to the template afterwards. See `templates.py` for why the
+    shapes live in the backend at all."""
+
+    key: str
+    name: str
+    description: str
+    campaign_type: str
+    display_rule: str
+    display_interval_days: int | None
+    questions: list[CampaignTemplateQuestionResponse]
+    # The ceiling the venue is authoring against, sent alongside the
+    # template so the dashboard can show "7 of 10" while they add dishes
+    # rather than discovering the limit as a 400 on the eleventh.
+    max_questions: int
+
+
+class CampaignTemplateListResponse(BaseModel):
+    items: list[CampaignTemplateResponse]
+
+
 class CampaignAssetCreateRequest(BaseModel):
     image_url: str | None = None
     click_url: str | None = None
     alt_text: str | None = None
     locale: str | None = None
+    # Banner & Discounts promo copy -- see models.CampaignAsset.
+    headline: str | None = None
+    subtext: str | None = None
+    coupon_code: str | None = None
+    coupon_expires_at: datetime | None = None
 
 
 class CampaignAssetUpdateRequest(BaseModel):
@@ -149,6 +195,10 @@ class CampaignAssetUpdateRequest(BaseModel):
     click_url: str | None = None
     alt_text: str | None = None
     locale: str | None = None
+    headline: str | None = None
+    subtext: str | None = None
+    coupon_code: str | None = None
+    coupon_expires_at: datetime | None = None
 
 
 class CampaignAssetResponse(BaseModel):
@@ -158,6 +208,10 @@ class CampaignAssetResponse(BaseModel):
     click_url: str | None
     alt_text: str | None
     locale: str | None
+    headline: str | None
+    subtext: str | None
+    coupon_code: str | None
+    coupon_expires_at: datetime | None
 
 
 class QuestionResultBreakdownResponse(BaseModel):
@@ -167,7 +221,16 @@ class QuestionResultBreakdownResponse(BaseModel):
     total_answers: int
     option_counts: dict[str, int] | None
     average_rating: float | None
-    rating_distribution: dict[int, int] | None
+    # `dict[str, int]`, not `dict[int, int]`, because JSON object keys are
+    # always strings: this field has always crossed the wire as
+    # `{"1": .., "5": ..}` no matter what the annotation claimed, so the
+    # declared type -- and the OpenAPI schema generated from it -- described
+    # something the transport cannot carry. A client trusting the schema and
+    # indexing by number read `undefined` for every star and rendered an
+    # all-zero distribution, which is indistinguishable from "nobody rated
+    # us". A wrong-looking chart with no error is exactly the failure mode
+    # this codebase keeps finding, so the annotation now matches the wire.
+    rating_distribution: dict[str, int] | None
     free_text_answers: list[str] | None
 
 
@@ -193,6 +256,12 @@ class NextCampaignAssetPayload(BaseModel):
     image_url: str | None
     click_url: str | None
     alt_text: str | None
+    # Banner & Discounts promo copy the captive portal renders as a coupon
+    # card -- see models.CampaignAsset. Null for a plain image/redirect banner.
+    headline: str | None = None
+    subtext: str | None = None
+    coupon_code: str | None = None
+    coupon_expires_at: datetime | None = None
 
 
 class NextCampaignResponse(BaseModel):

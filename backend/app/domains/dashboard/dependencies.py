@@ -7,7 +7,9 @@ a unified dashboard configuration — no new database tables or models.
 from __future__ import annotations
 
 from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.session import get_db_session
 from app.domains.analytics.dashboard_service import (
     DashboardService as AnalyticsDashboardService,
 )
@@ -23,7 +25,14 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_service
 from app.domains.rbac.service import RBACService
 
+from .repository import DashboardFleetRepository
 from .service import DashboardService
+
+
+def get_dashboard_fleet_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> DashboardFleetRepository:
+    return DashboardFleetRepository(session)
 
 
 def get_dashboard_service(
@@ -38,6 +47,9 @@ def get_dashboard_service(
     ),
     rbac_service: RBACService = Depends(get_rbac_service),
     organization_service: OrganizationService = Depends(get_organization_service),
+    fleet_repository: DashboardFleetRepository = Depends(
+        get_dashboard_fleet_repository
+    ),
 ) -> DashboardService:
     return DashboardService(
         analytics_dashboard=analytics_dashboard,
@@ -45,4 +57,5 @@ def get_dashboard_service(
         billing_dashboard=billing_dashboard,
         rbac_service=rbac_service,
         organization_service=organization_service,
+        fleet_repository=fleet_repository,
     )

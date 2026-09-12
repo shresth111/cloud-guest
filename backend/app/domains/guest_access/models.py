@@ -41,7 +41,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -86,6 +86,29 @@ class GuestAccessRule(BaseModel):
         DateTime(timezone=True), nullable=True
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # -- block enforcement -------------------------------------------------
+    #
+    # Blocking a guest is not a database fact. The customer dashboard's own
+    # copy promises that a block "takes effect immediately, ending any
+    # session these users currently have", and until these four columns
+    # existed nothing recorded whether that had happened, because nothing
+    # attempted it. They mirror ``Vlan.device_push_status``/
+    # ``device_push_error``/``device_pushed_at`` field for field, and for
+    # the same reason: an operator must be able to tell a block that
+    # reached the router from one that only reached Postgres.
+    #
+    # See ``constants.BlockEnforcementStatus`` for the four values and why
+    # "not applicable" and "unenforced" are deliberately not the same one.
+    enforcement_status: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )
+    enforcement_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enforced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # How many live sessions were confirmed ended -- confirmed against the
+    # router's own active table, never counted from what was attempted.
+    sessions_ended: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         Index("ix_guest_access_rules_organization_id", "organization_id"),

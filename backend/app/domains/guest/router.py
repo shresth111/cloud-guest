@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 
 import httpx
@@ -45,17 +46,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
+from app.domains.location.scoping import enforce_target_location
 from app.domains.rbac.dependencies import (
+    CurrentLocation,
     CurrentOrganization,
     CurrentUser,
     RequireOrganization,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
+from app.domains.wireguard.validators import hub_reserved_ip
 
 from .constants import (
     MAX_BULK_DEVICE_LOOKUP_IDS,
+    MAX_BULK_VOUCHER_LOOKUP_IDS,
     RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
     RADIUS_ACCT_STATUS_ACCOUNTING_ON,
     RADIUS_ACCT_STATUS_INTERIM_UPDATE,
@@ -86,6 +92,7 @@ from .schemas import (
     GuestDeviceListResponse,
     GuestDeviceResponse,
     GuestDisconnectRequest,
+    GuestLastEndedSessionResponse,
     GuestListResponse,
     GuestLoginHistoryListResponse,
     GuestLoginHistoryResponse,
@@ -94,6 +101,8 @@ from .schemas import (
     GuestPasswordLoginRequest,
     GuestPinLoginRequest,
     GuestResponse,
+    GuestReviewLinkOpenedRequest,
+    GuestReviewLinkOpenedResponse,
     GuestSessionListResponse,
     GuestSessionResponse,
     GuestSetPasswordRequest,
@@ -112,6 +121,7 @@ from .schemas import (
     RadiusNasListResponse,
     RadiusNasRegisterRequest,
     RadiusNasResponse,
+    RadiusNasSecretRotatedResponse,
     RadiusNasUpdateRequest,
     SessionDisconnectRequest,
     SessionExtendRequest,
@@ -122,6 +132,8 @@ from .schemas import (
     TopDevicesResponse,
     TopLocationItem,
     TopLocationsResponse,
+    VoucherRedemptionListResponse,
+    VoucherRedemptionResponse,
     VoucherUsageResponse,
 )
 from .service import (
@@ -130,12 +142,21 @@ from .service import (
     GuestService,
     RadiusService,
 )
+from .validators import guest_has_opened_review_link, guest_has_profile
 
 guest_router = APIRouter(prefix="/guest", tags=["Guest"])
 admin_router = APIRouter(tags=["Guest Admin"])
 radius_router = APIRouter(prefix="/radius", tags=["RADIUS"])
 nas_router = APIRouter(prefix="/radius/nas", tags=["RADIUS NAS Admin"])
 nas_cross_reference_router = APIRouter(tags=["RADIUS NAS Admin"])
+# Platform (Master console) NAS operations -- ScopeType.GLOBAL only.
+# Mounted under /platform/... rather than /radius/nas/... to match the
+# namespace `app.domains.router.router` already established for exactly
+# this separation; see the section header above
+# `regenerate_radius_nas_secret` for why the split exists.
+nas_platform_router = APIRouter(
+    prefix="/platform/radius/nas", tags=["RADIUS NAS Platform"]
+)
 analytics_router = APIRouter(prefix="/guest-analytics", tags=["Guest Analytics"])
 
 # The single-tenant FreeRADIUS bridge (ops/hub-agents/radius_agent.py,
@@ -292,11 +313,20 @@ def _device_response(device: GuestDevice) -> dict[str, object]:
     }
 
 
-def _session_response(session: GuestSession) -> GuestSessionResponse:
+def _session_response(
+    session: GuestSession, *, device_mac: str | None = None
+) -> GuestSessionResponse:
+    """``device_mac`` is passed in, never looked up here, because the only
+    correct way to resolve it for a *list* of sessions is one bulk query
+    for the whole page -- see ``_resolve_session_macs`` below. A helper
+    that fetched its own device would turn every list endpoint into an
+    N+1, which is the exact cost ``constants.MAX_BULK_DEVICE_LOOKUP_IDS``
+    was written to avoid."""
     return GuestSessionResponse(
         id=str(session.id),
         guest_id=str(session.guest_id),
         device_id=str(session.device_id) if session.device_id else None,
+        device_mac=device_mac,
         router_id=str(session.router_id),
         location_id=str(session.location_id),
         organization_id=str(session.organization_id),
@@ -312,6 +342,7 @@ def _session_response(session: GuestSession) -> GuestSessionResponse:
         data_limit_mb=session.data_limit_mb,
         session_timeout_minutes=session.session_timeout_minutes,
         disconnect_reason=session.disconnect_reason,
+        disconnect_enforced=session.disconnect_enforced,
         user_agent=session.user_agent,
         created_at=session.created_at,
     )
@@ -332,19 +363,138 @@ def _nas_response(nas_client: RadiusNasClient) -> RadiusNasResponse:
         ip_address=nas_client.ip_address,
         hub_client_synced_ip=nas_client.hub_client_synced_ip,
         hub_client_synced_at=nas_client.hub_client_synced_at,
+        device_push_status=nas_client.device_push_status,
+        device_push_error=nas_client.device_push_error,
+        device_pushed_at=nas_client.device_pushed_at,
         vendor=nas_client.vendor,
         created_at=nas_client.created_at,
         updated_at=nas_client.updated_at,
     )
 
 
-def _guest_response(guest: Guest) -> GuestResponse:
+async def _resolve_session_macs(
+    sessions: Sequence[GuestSession],
+    *,
+    service: GuestService,
+    requesting_organization_id: uuid.UUID | None,
+) -> dict[str, str]:
+    """Resolve one page of sessions' ``device_id``s to MAC addresses in a
+    single query, returning ``{device_id: mac_address}``.
+
+    This is the whole anti-N+1 story for ``GuestSessionResponse
+    .device_mac``: one extra query per page, never one per row. It is
+    also strictly cheaper than the alternative the ``GET /guest-devices``
+    endpoint was built for, which costs a second HTTP round trip per page
+    on top of the same query -- and which, as it turns out, no caller
+    ever actually made, which is why the Reports screen has been showing
+    a blank Device MAC column.
+
+    ``GET /guest-devices`` is deliberately left in place: it is a
+    published endpoint with its own bound and tests, and removing it is a
+    separate decision from fixing the screens.
+
+    De-duplicates ids before querying, so a page where many sessions
+    share one device costs one row in the ``IN (...)``, not one per
+    session -- which is the common case, since a guest reconnecting all
+    day produces many sessions on one device.
+
+    Chunked at ``MAX_BULK_DEVICE_LOOKUP_IDS`` rather than passed straight
+    through, because not every caller is page-bounded: ``GET
+    /guests/{id}`` resolves a guest's *entire* session history
+    (``get_guest_sessions`` takes ``limit=None``). Handing that to the
+    service unchunked would raise ``TooManyDeviceIdsError`` and turn a
+    working detail endpoint into a 400 for the platform's heaviest-using
+    guests. The bound is there to
+    stop an external caller sending an unbounded ``IN (...)``; it is not
+    a reason to fail on an id list this module derived itself, so this
+    respects the bound by splitting rather than by refusing."""
+    device_ids = list(
+        {session.device_id for session in sessions if session.device_id is not None}
+    )
+    if not device_ids:
+        return {}
+    macs: dict[str, str] = {}
+    for start in range(0, len(device_ids), MAX_BULK_DEVICE_LOOKUP_IDS):
+        chunk = device_ids[start : start + MAX_BULK_DEVICE_LOOKUP_IDS]
+        # Scoped through the SESSION's organization, not the device's
+        # current owner -- see GuestRepository.list_devices_for_session_ids
+        # for why that difference matters for a guest who visits two
+        # venues on different organizations.
+        devices = await service.list_devices_for_session_ids(
+            device_ids=chunk,
+            requesting_organization_id=requesting_organization_id,
+        )
+        macs.update({str(device.id): device.mac_address for device in devices})
+    return macs
+
+
+def _session_responses(
+    sessions: Sequence[GuestSession], macs: dict[str, str]
+) -> list[GuestSessionResponse]:
+    """Zip a page of sessions with an already-resolved MAC map. A session
+    whose device is absent from ``macs`` (no ``device_id``, or a device
+    outside the caller's organization scope) gets ``None`` -- an honest
+    "no device on record", never a fabricated or borrowed address."""
+    return [
+        _session_response(
+            s, device_mac=macs.get(str(s.device_id)) if s.device_id else None
+        )
+        for s in sessions
+    ]
+
+
+async def _session_response_resolved(
+    session: GuestSession,
+    *,
+    service: GuestService,
+    requesting_organization_id: uuid.UUID | None,
+) -> GuestSessionResponse:
+    """Single-session variant of ``_session_responses`` for the admin
+    session-mutation endpoints (disconnect/terminate/pause/resume/
+    extend/reconnect) and ``GET /guest-sessions/{id}``.
+
+    One session means one device, so there is no N+1 to avoid here --
+    it is one bounded lookup. These are wired up not because an action
+    acknowledgement needs a MAC, but because the frontend reuses one
+    session type across list and detail responses: leaving ``device_mac``
+    absent on exactly these seven routes would put a field on the type
+    that is silently null depending on which endpoint filled it, which is
+    the same "looks empty, is actually unresolved" trap the whole change
+    is closing."""
+    macs = await _resolve_session_macs(
+        [session],
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return _session_response(
+        session,
+        device_mac=macs.get(str(session.device_id)) if session.device_id else None,
+    )
+
+
+def _guest_response(
+    guest: Guest, *, devices: Sequence[GuestDevice] | None = None
+) -> GuestResponse:
+    """``devices`` is this guest's own device rows, newest-seen first, as
+    grouped by ``GuestService.list_devices_for_guest_ids`` -- passed in
+    from one bulk query per page for the same anti-N+1 reason
+    ``_session_response`` takes its MAC as an argument.
+
+    Passing ``None`` yields an empty ``mac_addresses`` and a
+    ``device_count`` of 0. That is correct only where the caller has
+    genuinely not resolved devices; every admin-facing route that returns
+    a ``GuestResponse`` does resolve them, precisely so no screen renders
+    a blank MAC cell that looks like missing data but is really a missing
+    join."""
+    device_list = list(devices or [])
     return GuestResponse(
         id=str(guest.id),
         organization_id=str(guest.organization_id),
         location_id=str(guest.location_id) if guest.location_id else None,
         identifier=guest.identifier,
         display_name=guest.display_name,
+        mac_addresses=[d.mac_address for d in device_list],
+        device_count=len(device_list),
         first_seen_at=guest.first_seen_at,
         last_seen_at=guest.last_seen_at,
         total_visit_count=guest.total_visit_count,
@@ -385,6 +535,8 @@ def _login_response(result: GuestLoginResult) -> GuestLoginResponse:
         is_new_guest=result.is_new_guest,
         has_password=bool(result.guest.hashed_password),
         has_pin=bool(result.guest.hashed_pin),
+        has_profile=guest_has_profile(result.guest),
+        has_opened_review_link=guest_has_opened_review_link(result.guest),
         session=_session_response(result.session),
         device=_device_response(result.device) if result.device else None,
     )
@@ -561,6 +713,71 @@ async def guest_active_session(
     )
 
 
+@guest_router.get(
+    "/session/last-ended",
+    response_model=ApiResponse[GuestLastEndedSessionResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_last_ended_session(
+    request: Request,
+    router_id: uuid.UUID = Query(...),
+    device_mac: str = Query(...),
+    service: GuestService = Depends(get_guest_service),
+):
+    """Guest-facing, unauthenticated (same posture as ``/login/*`` and
+    ``/session/active`` directly above): the sibling question to that
+    endpoint's. ``/session/active`` asks "is this device connected right
+    now"; this asks "did it just stop being connected, and may the guest
+    be told so". The portal calls this only once the first has answered
+    no, so a connected guest never reaches it.
+
+    It exists because a guest whose session ends while the portal tab is
+    closed -- which is every real guest, since sessions run for hours --
+    lost their internet and then got a sign-in page identical to a
+    first-time visit, with nothing anywhere saying the two events were
+    related. Read as "the WiFi is broken again".
+
+    ``data`` is ``null`` (not an error) for every kind of no: no such
+    device, nothing ended within
+    ``LAST_ENDED_SESSION_WINDOW_MINUTES``, or an ending a guest must not
+    be told about -- notably an operator's block, which ends sessions as
+    ``TERMINATED`` and must send the guest to an ordinary sign-in page
+    to be refused there properly rather than be told their session
+    "expired". The caller cannot tell those cases apart, which is
+    deliberate: a single ``null`` is what stops this endpoint answering
+    "is this MAC blocked here?" for anyone who asks.
+
+    A separate route rather than an extra field on ``/session/active``,
+    even though that would have been the smaller diff, because that
+    endpoint's response model is ``GuestLoginResponse`` -- which carries
+    the guest's unmasked ``identifier`` and a nested session object
+    holding ``disconnect_reason``. Both are defensible for a device the
+    NAS is currently authorising and neither is defensible keyed on a
+    bare, no-longer-authorised MAC. Keeping the two questions on two
+    routes keeps them on two response models, so the wider one cannot be
+    reached by the weaker credential. See
+    ``schemas.GuestLastEndedSessionResponse`` for the field-by-field
+    argument.
+    """
+    result = await service.get_last_ended_session_for_device(
+        router_id=router_id, device_mac=device_mac
+    )
+    return build_response(
+        success=True,
+        message="Last ended session found" if result else "No recent ended session",
+        data=(
+            GuestLastEndedSessionResponse(
+                reason=result.reason,
+                session_timeout_minutes=result.session_timeout_minutes,
+                idle_timeout_minutes=result.idle_timeout_minutes,
+            ).model_dump()
+            if result
+            else None
+        ),
+        request_id=_request_id(request),
+    )
+
+
 @guest_router.post(
     "/set-password",
     response_model=ApiResponse[GuestSetPasswordResponse],
@@ -624,6 +841,7 @@ async def guest_update_profile(
         session_id=payload.session_id,
         display_name=payload.display_name,
         email=payload.email,
+        declined=payload.declined,
     )
     return build_response(
         success=True,
@@ -632,6 +850,47 @@ async def guest_update_profile(
             guest_id=str(guest.id),
             display_name=guest.display_name,
             email=guest.email,
+            has_profile=guest_has_profile(guest),
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/review-link-opened",
+    response_model=ApiResponse[GuestReviewLinkOpenedResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_review_link_opened(
+    request: Request,
+    payload: GuestReviewLinkOpenedRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    """Guest-facing, unauthenticated (same posture as ``/profile`` and
+    ``/login/*``): the guest tapped the venue's Google review card and is
+    being sent to Google.
+
+    Called fire-and-forget by the portal as it navigates away, so this
+    must stay cheap and must not be something the caller has to await.
+    Its only job is to stop the card being shown to this guest again --
+    see ``GuestService.record_review_link_opened`` for why that record
+    cannot live in the browser, and for why "opened" is the most this can
+    ever honestly claim.
+
+    Post-connect only. Nothing here can change whether, how fast, or how
+    long the guest is connected, and under Google's Rating Manipulation
+    policy nothing may.
+    """
+    guest = await service.record_review_link_opened(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+    )
+    return build_response(
+        success=True,
+        message="Review link opened",
+        data=GuestReviewLinkOpenedResponse(
+            guest_id=str(guest.id),
+            has_opened_review_link=guest_has_opened_review_link(guest),
         ).model_dump(),
         request_id=_request_id(request),
     )
@@ -655,6 +914,10 @@ async def guest_disconnect_own_session(
     return build_response(
         success=True,
         message="Disconnected",
+        # Guest-facing: no CurrentOrganization to scope a device lookup
+        # by, and this is the guest's own disconnect acknowledgement --
+        # not an admin display surface. device_mac stays None here by
+        # design, not by omission.
         data=_session_response(session).model_dump(),
         request_id=_request_id(request),
     )
@@ -714,8 +977,14 @@ async def list_guests(
     is_blocked: bool | None = Query(default=None),
     search: str | None = Query(default=None, max_length=255),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestService = Depends(get_guest_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     guests, meta = await service.list_guests(
         requesting_organization_id=requesting_organization_id,
         location_id=location_id,
@@ -724,8 +993,14 @@ async def list_guests(
         page=page,
         page_size=page_size,
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[g.id for g in guests],
+        requesting_organization_id=requesting_organization_id,
+    )
     payload = GuestListResponse(
-        items=[_guest_response(g) for g in guests],
+        items=[
+            _guest_response(g, devices=devices_by_guest.get(g.id, [])) for g in guests
+        ],
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -759,9 +1034,19 @@ async def get_guest(
     sessions = await service.get_guest_sessions(
         guest_id, requesting_organization_id=requesting_organization_id
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[guest.id],
+        requesting_organization_id=requesting_organization_id,
+    )
+    macs = await _resolve_session_macs(
+        sessions,
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
+    guest_payload = _guest_response(guest, devices=devices_by_guest.get(guest.id, []))
     payload = GuestDetailResponse(
-        **_guest_response(guest).model_dump(),
-        sessions=[_session_response(s) for s in sessions],
+        **guest_payload.model_dump(),
+        sessions=_session_responses(sessions, macs),
     )
     return build_response(
         success=True,
@@ -791,10 +1076,16 @@ async def block_guest(
         requesting_organization_id=requesting_organization_id,
         reason=payload.reason,
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[guest.id],
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Guest blocked",
-        data=_guest_response(guest).model_dump(),
+        data=_guest_response(
+            guest, devices=devices_by_guest.get(guest.id, [])
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -817,10 +1108,16 @@ async def unblock_guest(
         guest_id=guest_id,
         requesting_organization_id=requesting_organization_id,
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[guest.id],
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Guest unblocked",
-        data=_guest_response(guest).model_dump(),
+        data=_guest_response(
+            guest, devices=devices_by_guest.get(guest.id, [])
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -855,8 +1152,14 @@ async def list_guest_sessions(
     ),
     end_date: datetime | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestService = Depends(get_guest_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     has_real_range = start_date is not None and end_date is not None
     if has_real_range and requesting_organization_id is not None:
         sessions, meta = await service.list_sessions_in_range(
@@ -877,8 +1180,13 @@ async def list_guest_sessions(
             page=page,
             page_size=page_size,
         )
+    macs = await _resolve_session_macs(
+        sessions,
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
     payload = GuestSessionListResponse(
-        items=[_session_response(s) for s in sessions],
+        items=_session_responses(sessions, macs),
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -934,6 +1242,73 @@ async def list_guest_devices(
 
 
 @admin_router.get(
+    "/voucher-redemptions",
+    response_model=ApiResponse[VoucherRedemptionListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def list_voucher_redemptions(
+    request: Request,
+    voucher_ids: list[uuid.UUID] = Query(
+        ...,
+        description=(
+            "Bulk-resolve up to "
+            f"{MAX_BULK_VOUCHER_LOOKUP_IDS} voucher IDs (e.g. a page of the "
+            "Vouchers screen) to the device and address each was actually "
+            "redeemed on, in one call. A voucher with no session -- never "
+            "redeemed, or redeemed outside the caller's own organization -- "
+            "is simply absent from the response rather than an error."
+        ),
+    ),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    """Resolve vouchers to their **observed** redemption facts.
+
+    Gated on ``guest_sessions.read``, not a voucher permission, and that
+    is deliberate: everything this returns is guest-session data (the
+    device, the address, when the session ran). A caller who may list
+    vouchers but not read guest sessions must not get session details
+    through a voucher-shaped door.
+
+    Lives on the guest router rather than the voucher router for the
+    reason ``app.domains.voucher.models.Voucher`` documents: the voucher
+    domain deliberately holds no FK to a guest, device or session, and
+    ``guest_sessions.voucher_id`` -- the only link -- is this domain's
+    column. The Vouchers screen batches a call here rather than the
+    voucher service reaching across the boundary.
+
+    Note what is *not* here: ``Voucher.redeemed_identifier``. That value
+    is self-reported by the guest at the portal; these are observed by
+    the platform. Keeping them in separate responses is what stops a UI
+    presenting them as equally trustworthy facts on one row."""
+    rows = await service.list_voucher_redemptions(
+        voucher_ids=voucher_ids,
+        requesting_organization_id=requesting_organization_id,
+    )
+    payload = VoucherRedemptionListResponse(
+        items=[
+            VoucherRedemptionResponse(
+                voucher_id=str(row.voucher_id),
+                session_count=row.session_count,
+                session_id=str(row.session_id),
+                guest_id=str(row.guest_id),
+                device_mac=row.device_mac,
+                ip_address=row.ip_address,
+                started_at=row.started_at,
+            )
+            for row in rows
+        ]
+    )
+    return build_response(
+        success=True,
+        message="Voucher redemptions retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
     "/guest-login-history",
     response_model=ApiResponse[GuestLoginHistoryListResponse],
     status_code=status.HTTP_200_OK,
@@ -959,8 +1334,14 @@ async def list_guest_login_history(
     ),
     end_date: datetime | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestService = Depends(get_guest_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     has_real_range = start_date is not None and end_date is not None
     if has_real_range and requesting_organization_id is not None:
         entries, meta = await service.list_login_history_in_range(
@@ -1014,9 +1395,43 @@ async def get_guest_session(
     return build_response(
         success=True,
         message="Guest session retrieved",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
+
+
+#: The operator-facing wording for a session-ending action.
+#:
+#: ``status`` going to DISCONNECTED/TERMINATED means this platform recorded
+#: the end of the session; it does NOT mean the guest's device was cut off.
+#: The RFC 5176 Disconnect-Request is sent after that transition has already
+#: committed and never raises, so until this function existed both outcomes
+#: produced the identical "Guest session terminated" and an operator had no
+#: way to tell which had happened. Measured on production 2026-09-11, the
+#: unenforced outcome was the only one occurring: the app server has no route
+#: to the tunnel range, so every Disconnect-Request was dropped.
+#:
+#: ``success`` on the envelope stays ``True`` deliberately -- the record
+#: update genuinely succeeded, and that is what the envelope describes. What
+#: changes is that the message stops claiming the device was disconnected
+#: when it was not, and ``disconnect_enforced`` on the payload carries the
+#: fact in a form a UI can act on.
+def _session_end_message(session, *, action: str) -> str:
+    if session.disconnect_enforced is False:
+        return (
+            f"Guest session {action} in records only -- the disconnect was "
+            "not acknowledged by the router, so the device may still be "
+            "online. Check the router's connectivity."
+        )
+    if session.disconnect_enforced is True:
+        return f"Guest session {action} and the device was disconnected"
+    return f"Guest session {action}"
 
 
 @admin_router.post(
@@ -1041,8 +1456,14 @@ async def disconnect_guest_session(
     )
     return build_response(
         success=True,
-        message="Guest session disconnected",
-        data=_session_response(session).model_dump(),
+        message=_session_end_message(session, action="disconnected"),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1069,8 +1490,14 @@ async def terminate_guest_session(
     )
     return build_response(
         success=True,
-        message="Guest session terminated",
-        data=_session_response(session).model_dump(),
+        message=_session_end_message(session, action="terminated"),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1098,7 +1525,13 @@ async def pause_guest_session(
     return build_response(
         success=True,
         message="Guest session paused",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1124,7 +1557,13 @@ async def resume_guest_session(
     return build_response(
         success=True,
         message="Guest session resumed",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1152,7 +1591,13 @@ async def extend_guest_session(
     return build_response(
         success=True,
         message="Guest session extended",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1181,7 +1626,13 @@ async def reconnect_guest_session(
     return build_response(
         success=True,
         message="Guest session reconnected",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1249,6 +1700,27 @@ def _bridge_error_detail(resp: httpx.Response) -> str:
     return str(body)[:600]
 
 
+def _external_nas_registration_response(
+    request: Request, nas_client: RadiusNasClient, shared_secret: str
+):
+    """``register_external_radius_nas``'s single success envelope.
+
+    Extracted only because that endpoint now has two returns -- the rotate
+    branch pushes through ``regenerate_secret``'s hook and finishes early,
+    the fresh-registration branch falls through -- and two hand-written
+    copies of the same envelope is how the two paths drift apart.
+    """
+    return build_response(
+        success=True,
+        message="RADIUS NAS client registered",
+        data=RadiusNasCreatedResponse(
+            **_nas_response(nas_client).model_dump(),
+            shared_secret=shared_secret,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @nas_router.post(
     "/register-external/{router_id}",
     response_model=ApiResponse[RadiusNasCreatedResponse],
@@ -1283,19 +1755,57 @@ async def register_external_radius_nas(
         page=1,
         page_size=1,
     )
+    # NOTE ON ORDERING (2026-09-02): the rotate branch used to be a bare
+    # `regenerate_secret()` followed by the shared push below, i.e. it
+    # carried the same database-ahead-of-hub defect as the standalone
+    # rotate endpoint -- a 502 from the push left this router's row holding
+    # a secret the hub had never seen, and the venue rejecting every guest
+    # login. `regenerate_secret` now requires the push and performs it
+    # before its own write, so the branch pushes through the hook and the
+    # block below is the *fresh registration* path only.
+    #
+    # `register_nas` keeps the write-then-push order, and that is deliberate
+    # rather than overlooked: it has no `nas_identifier` to push under until
+    # the row exists (the identifier is server-assigned), and the state a
+    # failed push leaves -- a `pending` row with `hub_client_synced_ip` NULL
+    # and no device configured yet -- is a venue that was not working
+    # before either, is visibly unsynced, and converges on the next call,
+    # which takes the rotate branch above.
     if existing:
-        result = await service.regenerate_secret(
-            nas_id=existing[0].id,
-            requesting_organization_id=requesting_organization_id,
-            actor_user_id=uuid.UUID(user.id),
+        nas_identifier = existing[0].nas_identifier
+
+        async def _push_rotated(secret: str) -> None:
+            await push_nas_client(
+                tunnel_ip=peer.tunnel_ip_address,
+                nas_identifier=nas_identifier,
+                secret=secret,
+            )
+
+        try:
+            result = await service.regenerate_secret(
+                nas_id=existing[0].id,
+                requesting_organization_id=requesting_organization_id,
+                actor_user_id=uuid.UUID(user.id),
+                push_secret=_push_rotated,
+            )
+        except RadiusBridgePushError as exc:
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        return _external_nas_registration_response(
+            request,
+            await service.record_hub_client_sync(
+                nas_id=result.nas_client.id,
+                tunnel_ip_address=peer.tunnel_ip_address,
+                requesting_organization_id=requesting_organization_id,
+            ),
+            result.shared_secret,
         )
-    else:
-        result = await service.register_nas(
-            actor_user_id=uuid.UUID(user.id),
-            router_id=router_id,
-            nas_identifier=f"cg-{str(router_id)[:8]}",
-            requesting_organization_id=requesting_organization_id,
-        )
+
+    result = await service.register_nas(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        nas_identifier=f"cg-{str(router_id)[:8]}",
+        requesting_organization_id=requesting_organization_id,
+    )
 
     # NOTE ON ERROR REPORTING (2026-08-27): this block used to collapse
     # every possible failure -- connect timeout, DNS, 401, 500 -- into the
@@ -1342,14 +1852,8 @@ async def register_external_radius_nas(
         requesting_organization_id=requesting_organization_id,
     )
 
-    return build_response(
-        success=True,
-        message="RADIUS NAS client registered",
-        data=RadiusNasCreatedResponse(
-            **_nas_response(nas_client).model_dump(),
-            shared_secret=result.shared_secret,
-        ).model_dump(),
-        request_id=_request_id(request),
+    return _external_nas_registration_response(
+        request, nas_client, result.shared_secret
     )
 
 
@@ -1368,8 +1872,14 @@ async def list_radius_nas(
     router_id: uuid.UUID | None = Query(default=None),
     status_filter: NasStatus | None = Query(default=None, alias="status"),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: RadiusService = Depends(get_radius_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     nas_clients, meta = await service.list_nas_clients(
         requesting_organization_id=requesting_organization_id,
         location_id=location_id,
@@ -1413,6 +1923,47 @@ async def get_radius_nas(
     return build_response(
         success=True,
         message="RADIUS NAS client retrieved",
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.post(
+    "/{nas_id}/push",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.update"))],
+)
+async def push_radius_nas_to_device(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+    wireguard: WireGuardService = Depends(get_wireguard_service),
+):
+    """Writes this NAS registration onto the router itself.
+
+    The counterpart to the hub-side sync. A failure here is a real 502 from
+    ``RadiusNasDeviceOperationError`` -- never a 200 carrying an error body,
+    which the frontend's interceptor cannot tell apart from success.
+
+    The RADIUS server address is the hub's own tunnel address, derived from
+    the active server's ``tunnel_network_cidr`` rather than its
+    ``endpoint_host``: RADIUS has to traverse the tunnel, because the hub
+    matches the ``client{}`` stanza on the router's tunnel source address.
+    See ``app.domains.wireguard.validators.hub_reserved_ip``.
+    """
+    server = await wireguard.get_active_server()
+    nas_client = await service.push_nas_client_to_device(
+        nas_id=nas_id,
+        radius_server_host=hub_reserved_ip(server.tunnel_network_cidr),
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client pushed to router",
         data=_nas_response(nas_client).model_dump(),
         request_id=_request_id(request),
     )
@@ -1491,85 +2042,255 @@ async def delete_radius_nas(
     )
 
 
-@nas_router.post(
+# ============================================================================
+# Platform-only NAS endpoints (Master console)
+# ============================================================================
+#
+# Everything on ``nas_platform_router`` is gated at ``ScopeType.GLOBAL``, the
+# same posture ``GET /platform/routers/{id}`` and
+# ``PUT /platform/routers/{id}/management-access`` already carry for the
+# identical bug class (2026-09-01), and the same one the WireGuard domain
+# uses wholesale.
+#
+# ``radius.execute`` is held at *organization* scope by
+# ``organization-owner`` -- the role ``LocationProvisioningService`` assigns
+# to every venue owner it provisions -- so ``nas_router`` above is
+# customer-reachable by construction. An explicit GLOBAL scope is the only
+# thing that separates the two audiences, since an organization-scoped grant
+# can never satisfy a GLOBAL check however the caller sets
+# ``X-Organization-Id`` (``ScopeResolver.satisfies``).
+#
+# THE RULE THIS SECTION NOW CARRIES (2026-09-02, widened): *no*
+# ``radius.execute`` route anywhere in this domain is organization-scoped.
+# ``radius.execute`` is the NAS *lifecycle* key -- activate/disable/rotate --
+# and every one of those three reaches into the live RADIUS auth path for a
+# venue rather than into its tenant data. #93 moved only the rotate route and
+# left ``activate``/``disable`` behind on ``nas_router``, which meant the
+# reason for the split was written down in one place while two routes with
+# the same key and the same blast radius stayed reachable by every venue
+# owner. ``TestNasSecretRotationIsPlatformOnly`` now asserts the rule for the
+# key rather than for the three routes that exist today, so a fourth
+# ``radius.execute`` route added to ``nas_router`` later fails by
+# construction instead of quietly reopening this.
+
+
+@nas_platform_router.post(
+    "/{nas_id}/regenerate-secret",
+    response_model=ApiResponse[RadiusNasSecretRotatedResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
+)
+async def regenerate_radius_nas_secret(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
+):
+    """Rotates this NAS's RADIUS shared secret, pushing it to the real
+    FreeRADIUS server as part of the same operation.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/regenerate-secret``
+    (2026-09-02), and both halves of that move are the fix.
+
+    *The push.* The old endpoint rotated the secret in the database and
+    told nobody. The result was three places disagreeing -- row, hub,
+    device -- and a venue whose every guest login Access-Rejected with
+    nothing in any log naming the cause. ``RadiusService.regenerate_secret``
+    now takes a mandatory ``push_secret`` and calls it before it writes, so
+    the state the old endpoint produced is not reachable from any caller;
+    see that method's docstring for the ordering argument in full.
+
+    *The scope.* The old endpoint was gated on bare ``radius.execute``,
+    which ``organization-owner`` holds, and the customer dashboard wired a
+    "Regenerate secret" button in the venue owner's own NAS detail page
+    straight to it. A rotation is irreversible for the device -- there is no
+    write path from this platform to a RouterOS RADIUS client, so the new
+    secret has to be pasted in over WinBox before the venue works again --
+    which makes it a site action wearing an API call's clothes, and not one
+    a venue owner can complete. It belongs where every other infrastructure
+    internal already lives.
+
+    Requires a WireGuard peer, for the same reason
+    ``register_external_radius_nas`` does: the hub keys the ``client{}``
+    stanza on the router's tunnel address, so with no peer there is nowhere
+    to push and therefore -- now -- no rotation. That is a 404 from
+    ``get_peer``, not a silent database-only rotate.
+
+    ``requesting_organization_id`` is deliberately ``None`` throughout: this
+    route is already GLOBAL-only, so the caller is a platform operator
+    acting on any tenant's device, the same shape
+    ``get_router_platform_view``/``decommission_router`` use.
+    """
+    nas_client = await service.get_nas_client(nas_id, requesting_organization_id=None)
+    peer = await wireguard_service.get_peer(
+        router_id=nas_client.router_id, requesting_organization_id=None
+    )
+
+    async def _push(secret: str) -> None:
+        await push_nas_client(
+            tunnel_ip=peer.tunnel_ip_address,
+            nas_identifier=nas_client.nas_identifier,
+            secret=secret,
+        )
+
+    try:
+        result = await service.regenerate_secret(
+            nas_id=nas_id,
+            requesting_organization_id=None,
+            actor_user_id=uuid.UUID(user.id),
+            push_secret=_push,
+        )
+    except RadiusBridgePushError as exc:
+        # 502, and the row is untouched: the hub, the device and the
+        # database all still hold the previous secret, so the venue is
+        # still working. This is the case that used to return 200 having
+        # broken it.
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+
+    # Same "record what the hub confirmed, not what we intended" rule as
+    # `register_external_radius_nas` -- only reachable after a 2xx, and it
+    # also re-converges `hub_client_synced_ip` if the peer had moved since
+    # the last push (`add_client` is idempotent on shortname).
+    synced = await service.record_hub_client_sync(
+        nas_id=result.nas_client.id,
+        tunnel_ip_address=peer.tunnel_ip_address,
+        requesting_organization_id=None,
+    )
+
+    return build_response(
+        success=True,
+        message=(
+            "RADIUS NAS client shared secret rotated and pushed to the "
+            "FreeRADIUS server -- the router still holds the old secret"
+        ),
+        data=RadiusNasSecretRotatedResponse(
+            **_nas_response(synced).model_dump(),
+            shared_secret=result.shared_secret,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.post(
     "/{nas_id}/activate",
     response_model=ApiResponse[RadiusNasResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
 )
 async def activate_radius_nas(
     request: Request,
     nas_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
+    """Returns a NAS to ``ACTIVE``, which is the only status
+    ``RadiusService.authenticate_nas`` accepts.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/activate`` (2026-09-02),
+    with ``disable`` alongside it. See the section header for the rule.
+
+    This is the *lifting* half of the pair, so it does not take a venue
+    down -- but it is not therefore harmless. ``NAS_STATUS_TRANSITIONS``
+    makes ``SUSPENDED -> ACTIVE`` a legal edge, and ``SUSPENDED`` is
+    documented (``constants.NasStatus``) as the stronger, platform-imposed
+    restriction -- "a security incident or billing hold". Left on
+    ``nas_router`` this was a venue owner clearing the platform's own hold
+    on their own venue from their own dashboard. No endpoint sets
+    ``SUSPENDED`` in this build, so that was latent rather than live; it
+    stops being latent the moment a suspend path is added, and the fix for
+    it is here, not in whoever adds one.
+
+    ``requesting_organization_id`` is deliberately ``None``: the route is
+    GLOBAL-only, so the caller is a platform operator acting on some
+    tenant's device -- the same shape ``regenerate_radius_nas_secret`` and
+    ``get_router_platform_view``/``decommission_router`` use.
+    """
     nas_client = await service.activate_nas(
         nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
+        requesting_organization_id=None,
         actor_user_id=uuid.UUID(user.id),
     )
     return build_response(
         success=True,
-        message="RADIUS NAS client activated",
+        message=(
+            "RADIUS NAS client activated -- guest authentication through "
+            "this NAS is accepted again"
+        ),
         data=_nas_response(nas_client).model_dump(),
         request_id=_request_id(request),
     )
 
 
-@nas_router.post(
+@nas_platform_router.post(
     "/{nas_id}/disable",
     response_model=ApiResponse[RadiusNasResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
 )
 async def disable_radius_nas(
     request: Request,
     nas_id: uuid.UUID,
     payload: RadiusNasDisableRequest,
     user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
+    """Takes a NAS out of ``ACTIVE``, which stops every guest login at that
+    venue from the moment it returns.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/disable`` (2026-09-02).
+
+    This is the sharp one of the pair. There is no hub call and no device
+    call: ``disable_nas`` writes ``status``/``is_active`` and returns, and
+    ``authenticate_nas`` rejects any NAS that is not ``ACTIVE``
+    (``service.py``), so the venue's guest WiFi stops on the next
+    Access-Request. Nothing the guest, the router or the hub can see names
+    the cause -- the same silent-failure shape as the rotation bug #93
+    fixed, arrived at through the success path rather than a bug.
+
+    It differs from a rotation in one way worth stating plainly, because it
+    weakens the case rather than strengthens it: a disable *is* reversible,
+    and by the very role that could perform it -- ``activate`` above was
+    sitting next to it on the same dashboard. So the argument for moving it
+    is not "the venue owner cannot undo it". It is that no product surface
+    ever asked for a venue-owner-operated kill switch: the buttons existed
+    because ``NasStatus``'s internal lifecycle graph had been mirrored into
+    the customer dashboard, and an internal lifecycle model is not a
+    feature. Guest-facing "pause the WiFi" belongs to captive-portal
+    scheduling (business hours / portal closed), which is where a venue
+    owner's own intent to stop serving guests is actually modeled.
+
+    ``reason`` is retained and still audited: it is now an operator's note
+    about someone else's venue, which is if anything more worth having.
+    """
     nas_client = await service.disable_nas(
         nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
+        requesting_organization_id=None,
         actor_user_id=uuid.UUID(user.id),
         reason=payload.reason,
     )
+    # The message states the consequence, not the operation. "RADIUS NAS
+    # client disabled" is true and tells an operator nothing about what
+    # just happened to the venue on the other end of it. Same reasoning as
+    # ``RadiusNasSecretRotatedResponse``'s ``device_action`` field, but a
+    # message rather than a field: a rotation obliges the caller to *do*
+    # something afterwards (drive to the router) and so needs a flag a
+    # client cannot miss, whereas a disable obliges nothing -- inventing a
+    # ``device_action_required: False`` field here would add API surface
+    # that describes no action.
     return build_response(
         success=True,
-        message="RADIUS NAS client disabled",
+        message=(
+            "RADIUS NAS client disabled -- every guest login at this venue "
+            "now fails until it is activated again"
+        ),
         data=_nas_response(nas_client).model_dump(),
-        request_id=_request_id(request),
-    )
-
-
-@nas_router.post(
-    "/{nas_id}/regenerate-secret",
-    response_model=ApiResponse[RadiusNasCreatedResponse],
-    status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
-)
-async def regenerate_radius_nas_secret(
-    request: Request,
-    nas_id: uuid.UUID,
-    user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    service: RadiusService = Depends(get_radius_service),
-):
-    result = await service.regenerate_secret(
-        nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
-        actor_user_id=uuid.UUID(user.id),
-    )
-    return build_response(
-        success=True,
-        message="RADIUS NAS client shared secret regenerated",
-        data=RadiusNasCreatedResponse(
-            **_nas_response(result.nas_client).model_dump(),
-            shared_secret=result.shared_secret,
-        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1586,8 +2307,14 @@ async def list_radius_nas_for_location(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: RadiusService = Depends(get_radius_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     nas_clients, meta = await service.list_nas_clients(
         requesting_organization_id=requesting_organization_id,
         location_id=location_id,
@@ -1693,6 +2420,25 @@ async def radius_authorize(
     if result.authorized:
         if result.session_timeout_seconds is not None:
             reply["Session-Timeout"] = result.session_timeout_seconds
+        # RFC 2865 s5.28, attribute 28. RouterOS reads this on a hotspot
+        # Access-Accept and applies it to that session in preference to the
+        # user profile's own ``idle-timeout`` -- which is the whole point of
+        # sending it, because until now the profile was the ONLY thing that
+        # decided, and the venue's own setting reached the device by no path
+        # at all. A router set up by Master console carries 30m there; one
+        # provisioned before that constant existed carries RouterOS's
+        # factory ``none``. Two venues with identical dashboard settings
+        # therefore behaved differently, and neither behaved as configured.
+        #
+        # Omitted, never sent as 0, when the session has no recorded idle
+        # timeout. RFC 2865 gives 0 no "unlimited" meaning for this
+        # attribute, so a 0 would be a guess about NAS behaviour -- and the
+        # plausible readings of it include "disconnect immediately", which
+        # would lock every guest out. Absence is the one encoding whose
+        # meaning is certain: the NAS falls back to its own profile, exactly
+        # as it did before this line existed.
+        if result.idle_timeout_seconds is not None:
+            reply["Idle-Timeout"] = result.idle_timeout_seconds
         if result.rate_limit is not None:
             reply["Mikrotik-Rate-Limit"] = result.rate_limit
         # Without this, RouterOS's hotspot profile (radius-interim-update
@@ -1793,8 +2539,14 @@ async def get_guest_analytics_summary(
     end_date: datetime = Query(...),
     location_id: uuid.UUID | None = Query(default=None),
     organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestAnalyticsService = Depends(get_guest_analytics_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
     summary = await service.get_summary(
         organization_id=organization_id,
         location_id=location_id,
@@ -1898,8 +2650,14 @@ async def get_otp_success_rate(
     end_date: datetime = Query(...),
     location_id: uuid.UUID | None = Query(default=None),
     organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestAnalyticsService = Depends(get_guest_analytics_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
     result = await service.get_otp_success_rate(
         organization_id=organization_id,
         location_id=location_id,
@@ -1930,8 +2688,14 @@ async def get_voucher_usage(
     end_date: datetime = Query(...),
     location_id: uuid.UUID | None = Query(default=None),
     organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestAnalyticsService = Depends(get_guest_analytics_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
     result = await service.get_voucher_usage(
         organization_id=organization_id,
         location_id=location_id,

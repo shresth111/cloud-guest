@@ -1,7 +1,7 @@
 """Enumerations and the fixed checklist-item registry for the Router
 Readiness Checklist domain.
 
-``CHECKLIST_ITEMS`` is the single source of truth for which 14 items exist,
+``CHECKLIST_ITEMS`` is the single source of truth for which 16 items exist,
 their display copy, and whether each is auto-detectable today. Adding a new
 item is additive (append here; no migration needed -- ``item_key`` is a
 plain string column, the same "no native enum type" posture
@@ -11,7 +11,15 @@ document).
 **Auto-detected today** (``DetectionMode.AUTO``, zero new device I/O --
 computed live in ``service.py``'s ``run_auto_detection`` from telemetry this
 platform already collects): ``HEARTBEAT``, ``SAAS_PROVISIONING``,
-``WAN_CONNECTIVITY``, ``WIREGUARD``, ``API_REACHABILITY``.
+``WAN_CONNECTIVITY``, ``WIREGUARD``, ``API_REACHABILITY``,
+``GUEST_DATA_PATH``, and ``ROGUE_DHCP_GUARD``.
+
+``ROGUE_DHCP_GUARD`` is the one AUTO item whose evidence originates on a
+device rather than in telemetry this platform already holds -- and it still
+costs this domain zero new device I/O, because it reads only the row
+``app.domains.dhcp.tasks``'s scheduled detector persisted hours earlier.
+That split (detector writes, surface reads) is what lets a real device fact
+appear on a checklist whose read path re-runs on every GET.
 
 **Manual-only for now** (``DetectionMode.MANUAL`` -- an operator ticks these
 after checking on-site or via another tab; ``service.py``'s
@@ -42,6 +50,20 @@ class ChecklistItemStatus(StrEnum):
     FAIL = "fail"
     MANUALLY_CONFIRMED = "manually_confirmed"
     MANUALLY_FAILED = "manually_failed"
+    # This check cannot apply to this device, and never will. Every item on
+    # this checklist asks a question about a MikroTik running a platform
+    # agent -- "did it heartbeat", "is its WireGuard peer up", "is the
+    # RouterOS API reachable". For a controller-managed device (a TP-Link
+    # Omada controller registered as a fleet row so its venue's guests can
+    # have a `guest_sessions.router_id` at all) every one of those has no
+    # answer rather than a failing one.
+    #
+    # Deliberately neither PASSING nor FAILING below. Counting it as
+    # passing would claim a check this platform never made; counting it as
+    # failing would report a healthy venue as broken, which is the precise
+    # outcome contract §11.5 says must not ship. It is a fifth bucket
+    # because it is a fifth state.
+    NOT_APPLICABLE = "not_applicable"
 
 
 # Statuses that read as "this item is in good shape" for the checklist's
@@ -51,6 +73,12 @@ PASSING_STATUSES: frozenset[ChecklistItemStatus] = frozenset(
 )
 FAILING_STATUSES: frozenset[ChecklistItemStatus] = frozenset(
     {ChecklistItemStatus.FAIL, ChecklistItemStatus.MANUALLY_FAILED}
+)
+# Statuses that read as "there is nothing to do here" -- excluded from both
+# counts above, and from the "outstanding work" a readiness percentage is
+# meant to represent.
+NOT_APPLICABLE_STATUSES: frozenset[ChecklistItemStatus] = frozenset(
+    {ChecklistItemStatus.NOT_APPLICABLE}
 )
 
 
@@ -70,6 +98,7 @@ class ChecklistItemKey(StrEnum):
     HEARTBEAT = "heartbeat"
     SAAS_PROVISIONING = "saas_provisioning"
     WAN_CONNECTIVITY = "wan_connectivity"
+    GUEST_DATA_PATH = "guest_data_path"
     WIREGUARD = "wireguard"
     API_REACHABILITY = "api_reachability"
     GUEST_SIGN_IN = "guest_sign_in"
@@ -79,8 +108,11 @@ class ChecklistItemKey(StrEnum):
     FIREWALL = "firewall"
     RADIUS_AUTH = "radius_auth"
     RADIUS_ACCOUNTING = "radius_accounting"
+    ROGUE_DHCP_GUARD = "rogue_dhcp_guard"
     DOH_DOT_BLOCKING = "doh_dot_blocking"
     REBOOT_PERSISTENCE = "reboot_persistence"
+    # Controller-managed devices only -- see CONTROLLER_MANAGED_ITEMS.
+    CONTROLLER_INTEGRATION = "controller_integration"
 
 
 class ChecklistCategory(StrEnum):
@@ -120,6 +152,34 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
         key=ChecklistItemKey.WAN_CONNECTIVITY,
         label="WAN connectivity",
         description="At least one enabled WAN link is passing its health check.",
+        detection_mode=DetectionMode.AUTO,
+        category=ChecklistCategory.CONNECTIVITY,
+    ),
+    # THE ITEM THAT WOULD HAVE CAUGHT 2026-08-27.
+    #
+    # Every other item here asks whether something the platform configured
+    # is currently working. This one asks whether the platform ever
+    # configured it at all -- a different and, as it turns out, more
+    # dangerous question. Venue "huda city center" passed heartbeat, SaaS
+    # provisioning, WireGuard and API reachability, and every guest who
+    # authenticated had no internet, because no NAT rule had ever been
+    # asserted for that router and nothing anywhere said so.
+    #
+    # Deliberately NOT folded into WAN_CONNECTIVITY above. That item
+    # returns NOT_CHECKED when a router has no enabled ISP link -- which is
+    # correct for a question about *link health* (there is no link to
+    # assess) and is exactly why it could not surface this: NOT_CHECKED is
+    # not in FAILING_STATUSES, so a router with no data path at all counted
+    # as nothing-wrong. Two different claims deserve two rows.
+    ChecklistItemDefinition(
+        key=ChecklistItemKey.GUEST_DATA_PATH,
+        label="Guest data path",
+        description=(
+            "The platform has asserted a route to the internet for this "
+            "router's guests -- an enabled WAN link, or an applied config "
+            "version. Without one, guests authenticate successfully and "
+            "then have nowhere to send a packet."
+        ),
         detection_mode=DetectionMode.AUTO,
         category=ChecklistCategory.CONNECTIVITY,
     ),
@@ -197,6 +257,33 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
         detection_mode=DetectionMode.MANUAL,
         category=ChecklistCategory.SECURITY,
     ),
+    # Reads a persisted row and nothing else. The device read that produced
+    # it happened hours earlier, off the request path, in
+    # ``app.domains.dhcp.tasks`` -- which is what lets an AUTO item exist
+    # here at all without breaking this domain's zero-new-device-I/O rule
+    # (``service.get_checklist`` re-runs every AUTO item on every GET, so
+    # anything it calls is on a hot path).
+    #
+    # DETECTION ONLY, and the copy must stay that way. RouterOS's
+    # ``/ip dhcp-server alert`` writes a log entry when it sees a DHCP
+    # server it does not trust. It does not drop the offer, block the port,
+    # or rate-limit anything. "Protected"/"blocked"/"guarded" would each
+    # describe a capability the feature does not have, and an operator who
+    # believed it would stop looking for the rogue server -- which is the
+    # actual harm. The item KEY says guard for continuity with
+    # ``app.domains.dhcp.constants.RogueDhcpAlertState``'s own vocabulary
+    # and the gateway contract's ``guarded`` property; the label and
+    # description, the only parts a human reads, say detection.
+    ChecklistItemDefinition(
+        key=ChecklistItemKey.ROGUE_DHCP_GUARD,
+        label="Rogue DHCP detection",
+        description=(
+            "This router is watching for another DHCP server on the guest "
+            "network. Detection only -- it logs, it does not block."
+        ),
+        detection_mode=DetectionMode.AUTO,
+        category=ChecklistCategory.SECURITY,
+    ),
     ChecklistItemDefinition(
         key=ChecklistItemKey.DOH_DOT_BLOCKING,
         label="DoH/DoT blocking",
@@ -222,14 +309,97 @@ CHECKLIST_ITEMS_BY_KEY: dict[ChecklistItemKey, ChecklistItemDefinition] = {
     item.key: item for item in CHECKLIST_ITEMS
 }
 
+
+# Items that exist ONLY for a controller-managed device, appended to the
+# sixteen above rather than mixed into them.
+#
+# ## Why appended and not a seventeenth entry in CHECKLIST_ITEMS
+#
+# `get_checklist` iterates whichever tuple it is given and writes a row per
+# definition. A seventeenth shared item would give every MikroTik in
+# production an extra NOT_CHECKED row and move `summarize`'s `total` from
+# 16 to 17 -- a change to every existing customer's readiness page, to
+# carry a question that has no meaning for their hardware. Kept separate,
+# an agent-managed router's checklist is byte-identical to what it was.
+#
+# ## Why a controller gets an extra item rather than a shorter list
+#
+# The nine MANUAL items still mean something at an Omada venue -- an
+# operator confirming "guest sign-in works here" is the same claim
+# whatever the hardware -- and the seven AUTO ones already report
+# NOT_APPLICABLE with a reason. What was missing was the one question that
+# IS answerable, and is the only thing that can actually be wrong: has
+# anyone finished pointing this controller at a site.
+#
+# ## Deliberately absent from CHECKLIST_ITEMS_BY_KEY
+#
+# `service.confirm_item` validates against that mapping, so this item
+# cannot be manually ticked -- which is the point. Every other item on
+# this checklist is a claim a human can reasonably make from the outside.
+# This one is computed from rows this platform owns, and letting an
+# operator mark a dead venue "confirmed" would reintroduce exactly the
+# green-badge-over-a-broken-venue failure it exists to end.
+CONTROLLER_MANAGED_ITEMS: tuple[ChecklistItemDefinition, ...] = (
+    ChecklistItemDefinition(
+        key=ChecklistItemKey.CONTROLLER_INTEGRATION,
+        label="Controller integration",
+        description=(
+            "This controller is linked to a network integration that is "
+            "finished -- credentials saved, mapped to a location, and a "
+            "controller site selected. Until all three are true it "
+            "authorizes nobody, and guests here complete sign-in with no "
+            "internet."
+        ),
+        detection_mode=DetectionMode.AUTO,
+        category=ChecklistCategory.CONNECTIVITY,
+    ),
+)
+
+
+# Every definition this domain can ever put on a checklist, keyed for
+# display. SEPARATE FROM `CHECKLIST_ITEMS_BY_KEY` above, and the split is
+# load-bearing in both directions:
+#
+#   * `router._item_response` renders a stored row by looking its
+#     definition up, so it must know about EVERY item or a controller's
+#     checklist 500s on the one row that matters. It uses this one.
+#   * `service.confirm_item` validates the key an operator asked to tick,
+#     so it must know only the CONFIRMABLE items. It uses the other one,
+#     and CONTROLLER_INTEGRATION's absence there is what refuses a manual
+#     override of a computed check.
+#
+# Two mappings because they answer two questions. Merging them would
+# either 500 the page or hand the operator back the green badge over the
+# dead venue.
+DEFINITIONS_BY_KEY: dict[ChecklistItemKey, ChecklistItemDefinition] = {
+    item.key: item for item in CHECKLIST_ITEMS + CONTROLLER_MANAGED_ITEMS
+}
+
+
+def checklist_items_for(*, agent_managed: bool) -> tuple[ChecklistItemDefinition, ...]:
+    """The checklist a given device actually has.
+
+    A function rather than two exported tuples so there is one place that
+    decides, and so the agent-managed answer is literally `CHECKLIST_ITEMS`
+    -- the same object, in the same order, as before any of this existed.
+    """
+    if agent_managed:
+        return CHECKLIST_ITEMS
+    return CHECKLIST_ITEMS + CONTROLLER_MANAGED_ITEMS
+
+
 __all__ = [
     "ChecklistItemStatus",
     "PASSING_STATUSES",
     "FAILING_STATUSES",
+    "NOT_APPLICABLE_STATUSES",
     "DetectionMode",
     "ChecklistItemKey",
     "ChecklistCategory",
     "ChecklistItemDefinition",
     "CHECKLIST_ITEMS",
     "CHECKLIST_ITEMS_BY_KEY",
+    "CONTROLLER_MANAGED_ITEMS",
+    "DEFINITIONS_BY_KEY",
+    "checklist_items_for",
 ]

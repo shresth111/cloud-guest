@@ -81,7 +81,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import HealthStatus, HealthStatusSource, IspConnectionMode, IspLinkType
+from .constants import (
+    HealthStatus,
+    HealthStatusSource,
+    IspConnectionMode,
+    IspFailoverPushStatus,
+    IspLinkType,
+)
 
 
 class IspLink(BaseModel):
@@ -258,6 +264,28 @@ class IspLink(BaseModel):
         Float, nullable=True
     )
     current_upload_mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # The DEVICE half of a failover, kept separate from `is_active_uplink`
+    # above on purpose. That column is what this platform intends; these
+    # three are what the router was actually told and whether it took it.
+    # Collapsing them was the defect: `trigger_failover` flipped the
+    # boolean, wrote an audit row and returned success without opening a
+    # socket, so the dashboard's "Active uplink" tile named the backup
+    # while the venue stayed dark. Written on whichever link traffic was
+    # moved ONTO -- by a failover and by a failback alike, since a
+    # failback is the same device operation aimed at the primary. See
+    # constants.IspFailoverPushStatus for the state vocabulary and
+    # service.IspService._push_preferred_uplink for what each write does.
+    failover_push_status: Mapped[str] = mapped_column(
+        String(20), default=IspFailoverPushStatus.PENDING.value, nullable=False
+    )
+    # The raw str(exc) of the last failed push, shown to the customer
+    # verbatim -- a RouterOS refusal ("no such item", a dynamic route that
+    # cannot be modified) is more useful unedited than summarized, and
+    # summarizing device errors is how the original silence started.
+    failover_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failover_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_isp_links_router_id", "router_id"),

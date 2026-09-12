@@ -23,6 +23,8 @@ __all__ = [
     "VlanUpdateRequest",
     "VlanResponse",
     "VlanListResponse",
+    "VlanDeviceInterfaceResponse",
+    "VlanDeviceInterfacesResponse",
 ]
 
 
@@ -35,8 +37,17 @@ class VlanCreateRequest(BaseModel):
     interface: str | None = None
     port_mode: Literal["trunk", "access"] = "trunk"
     enable_hotspot: bool = False
+    nat_enabled: bool = False
     description: str | None = None
     is_enabled: bool = True
+    # Acknowledges that an access-mode push may take this VLAN's port out
+    # of a bridge and cut off whatever is behind it. Defaults false: the
+    # whole point is that taking a bridge port has to be said out loud, and
+    # a default of true would make this field decorative.
+    #
+    # Stored on the row rather than consumed here, because the push that
+    # acts on it is a separate request -- see ``Vlan.confirm_takes_port``.
+    confirm_takes_port: bool = False
 
 
 class VlanUpdateRequest(BaseModel):
@@ -47,8 +58,13 @@ class VlanUpdateRequest(BaseModel):
     interface: str | None = None
     port_mode: Literal["trunk", "access"] | None = None
     enable_hotspot: bool | None = None
+    nat_enabled: bool | None = None
     description: str | None = None
     is_enabled: bool | None = None
+    # ``None`` means "not part of this edit", as every field here does --
+    # the router drops ``None``s before calling the service. ``False`` is a
+    # real value and survives that filter, so consent can be withdrawn.
+    confirm_takes_port: bool | None = None
 
 
 class VlanResponse(BaseModel):
@@ -63,8 +79,44 @@ class VlanResponse(BaseModel):
     interface: str | None
     port_mode: str
     enable_hotspot: bool
+    # Whether ANYTHING on this VLAN hands out addresses -- its own captive
+    # portal, or a DHCP pool an operator created for its interface.
+    #
+    # Exposed because "pushed successfully" and "usable" are different
+    # facts and the dashboard could not tell them apart. A VLAN with the
+    # portal off gets an interface and an address and nothing else: a
+    # client joins, never receives a lease, and the row reads "Applied".
+    # That state cost a real customer an evening. None means it was not
+    # computed for this response, not that there is no DHCP.
+    has_dhcp: bool | None = None
+    # Whether this VLAN's subnet is masqueraded onto the router's WAN --
+    # i.e. whether its guests actually reach the internet. Realized (or
+    # removed) by the device push, never by create/update alone.
+    nat_enabled: bool
     description: str | None
     is_enabled: bool
+    # Whether the operator has acknowledged that an access-mode push may
+    # take this VLAN's port out of a bridge. Returned so the dashboard's
+    # existing warning can show whether it has already been answered --
+    # otherwise the only way to find out is to push and read the 409.
+    confirm_takes_port: bool
+    # Whether this row has ever reached a real router, and what happened.
+    # Independent of is_enabled: a VLAN can be enabled for months and never
+    # have been on a device, which was true of every row before this domain
+    # had a push at all.
+    # PENDING / PROVISIONING / ACTIVE / FAILED. Never ACTIVE until the
+    # device has accepted every write.
+    device_push_status: str
+    # The spec's ``error_message``: the device's own words from the last
+    # failed push, verbatim, shown to the customer. There is no second
+    # column -- one fact, one place to look.
+    device_push_error: str | None
+    device_pushed_at: datetime | None
+    # What the router was actually told to call this interface --
+    # ``vlan<id>`` on a trunk, the physical port in access mode. NULL until
+    # the first successful push, because before one this platform has no
+    # claim about what any router carries.
+    mikrotik_interface_name: str | None
     created_at: datetime
 
 
@@ -76,3 +128,26 @@ class VlanListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class VlanDeviceInterfaceResponse(BaseModel):
+    """One interface as the router currently has it.
+
+    ``is_bridge_port`` is the field ``app.domains.router``'s own
+    ``DeviceInterfaceResponse`` does not carry, and the reason this shape
+    is not simply reused: an access-mode VLAN takes a port *out of* a
+    bridge, so a port in no bridge is not a candidate, and a picker should
+    not have to infer that from whether ``bridge`` happens to be null.
+    """
+
+    name: str
+    type: str | None
+    running: bool
+    disabled: bool
+    bridge: str | None
+    is_bridge_port: bool
+    has_ip_address: bool
+
+
+class VlanDeviceInterfacesResponse(BaseModel):
+    interfaces: list[VlanDeviceInterfaceResponse]

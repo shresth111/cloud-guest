@@ -40,8 +40,108 @@ jobs:
       - name: Ruff
         run: ruff check .
 
+      # `[tool.ruff] exclude` lists `vendor`, so the one ruff invocation above
+      # walks past the vendored gateway entirely -- which is where the Omada
+      # integration's code actually lives. That exclusion is right for style
+      # (it keeps its own style, and reformatting it is churn), but it
+      # also meant nothing checked the gateway for *breakage*.
+      #
+      # It cost us on 2026-09-11. Resolving the #206 conflict deleted an
+      # orphaned `deauthorize_client` from `omada/portal.py` and left its name
+      # in that module's `__all__`, so `from ... import *` raised
+      # AttributeError. `ruff check .` said "All checks passed", the 5,286-test
+      # suite was green, and a single `--select F` pass over the package found
+      # it in under a second.
+      #
+      # Deliberately only the pyflakes rules, and deliberately only the
+      # package (not its tests): F is the set that is about code being wrong
+      # rather than code being differently formatted, so this cannot drift
+      # into re-styling an upstream tree. `--isolated` because the repo config
+      # is what excludes this directory in the first place.
+      - name: Ruff (vendored gateway, pyflakes only)
+        run: |
+          ruff check --isolated --select F \
+            vendor/wyfy-device-gateway/wyfy_device_gateway/
+
+      # The gateway ships 544 tests of its own and this repo ran none of them:
+      # `[tool.pytest.ini_options] testpaths = ["tests"]` points at the
+      # backend's suite only. So `omada/deauth.py` and `omada/tls.py` -- both
+      # written on 2026-09-11, both the subject of merges resolved by hand
+      # that day -- landed with their tests executing nowhere. The standalone
+      # gateway repository is archived (2026-09-11) and this directory is the
+      # canonical copy, so this step is the only place these tests run.
+      #
+      # Run from the gateway's own directory rather than as another path
+      # argument to the backend's pytest: six MikroTik modules import
+      # `tests.fake_write_transport`, and from the backend root `tests` is the
+      # backend's own package, so collection fails on a name collision rather
+      # than on anything real.
+      - name: Pytest (vendored gateway)
+        working-directory: backend/vendor/wyfy-device-gateway
+        run: pytest tests -q
+
+      # Fails in seconds, before the ~20-minute suite, and says exactly what
+      # to do. There is already a pytest assertion for this
+      # (`test_the_revision_graph_has_exactly_one_head`) and it is not
+      # redundant with this one: the suite is where you learn *eventually*,
+      # this is where you learn *immediately*, and on the day it matters the
+      # difference is whether a branch sits unmergeable for twenty minutes or
+      # for one.
+      #
+      # Why it is worth a step of its own at all: the api image's CMD runs
+      # `alembic upgrade head` before uvicorn, so shipping the api IS running
+      # a migration. A branched history makes that command refuse outright --
+      # the container crash-loops, the deploy's health wait times out, and it
+      # rolls back, after the pre-deploy dump has already run.
+      #
+      # It has happened twice. The second time (0114 vs 0117, 2026-09-06) it
+      # took five consecutive backend deploys down over five hours while the
+      # frontend deployed normally, and nobody noticed, because every one of
+      # those PRs was green. Two PRs adding a migration in the same window is
+      # all it takes and neither looks wrong on its own.
+      #
+      # `ScriptDirectory` reads the versions directory only -- no database, no
+      # env.py -- so this cannot fail for an unrelated connection reason and
+      # cannot be mistaken for one.
+      - name: Assert Alembic has exactly one head
+        run: |
+          python - <<'EOF'
+          import sys
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
+          for h in heads:
+              print("head: " + h)
+          if len(heads) != 1:
+              print("::error::Alembic has %d heads; `alembic upgrade head` will "
+                    "refuse and any api deploy will crash-loop. Rebase the newer "
+                    "revision's down_revision onto the other head -- and check "
+                    "which revisions production has already applied before "
+                    "choosing the direction, or the unapplied ones are skipped "
+                    "silently." % len(heads))
+              sys.exit(1)
+          print("one head, as required")
+          EOF
+
+      # `-n auto`, and no coverage. Both halves are measured, not guessed:
+      #
+      #   serial + coverage (what this was)   25:15   <- the 2026-09-10 deploy
+      #   -n auto + coverage                1:15:40   31% CPU
+      #   -n auto, no coverage                 4:20   370% CPU
+      #
+      # Coverage under xdist is not merely slower than parallel, it is three
+      # times slower than SERIAL -- the workers contend on coverage data
+      # collection and the run drops to ~31% CPU. And nothing consumes the
+      # number: there is no threshold, no upload, no artifact, only a line in
+      # a log nobody reads. It was pure cost on the path that blocks deploys.
+      #
+      # `--junitxml` stays: the ratchet below parses it.
+      #
+      # If coverage is wanted again it belongs in its own scheduled job, where
+      # taking an hour costs nobody a deploy.
       - name: Pytest
-        run: pytest --cov=app --cov-report=term-missing --junitxml=junit.xml
+        run: pytest -n auto --junitxml=junit.xml
 
       # The suite has always gone green on every PR, which is exactly why
       # nobody noticed a branch drop from 2,924 collected tests to 2,868 --
@@ -53,7 +153,13 @@ jobs:
       # target -- a floor that drifts down with the suite protects nothing.
       - name: Assert the suite did not shrink
         env:
-          MIN_TESTS: "2900"
+          # Raised from 2900 on 2026-09-11. The suite had grown to 5,130
+          # while this floor stayed where it was set, so it would have
+          # passed a branch that silently lost 2,200 tests -- precisely the
+          # green-but-smaller failure described above, with the guard in
+          # place and asleep. Kept just below the real count so a
+          # legitimate small removal does not fail the build.
+          MIN_TESTS: "5100"
         run: |
           total=$(python - <<'EOF'
           import xml.etree.ElementTree as ET

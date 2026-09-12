@@ -77,18 +77,37 @@ class ConnectedDevice(BaseModel):
     connection_type: Mapped[str] = mapped_column(
         String(10), default=ConnectionType.UNKNOWN.value, nullable=False
     )
-    # The router's own interface/SSID this device was last seen on.
+    # The router's own interface this device was last seen on, e.g.
+    # "bridge" or "ether3". NOT an SSID: the routers this platform
+    # deploys have no radios and therefore no SSIDs at all -- the venue's
+    # Wi-Fi comes from separate access points. An earlier comment here
+    # read "interface/SSID", which is where a reader could reasonably get
+    # the idea that an SSID is available somewhere. It is not.
     interface: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    # Only ever populated for a WIRELESS device, from the same wireless
-    # registration-table query that determines connection_type -- real
-    # data when present (never fabricated for a wired device), NULL
-    # otherwise. The roadmap's own "(Future)" marker on Signal
-    # Information reflects that wired devices structurally can never
-    # have this value, not that this column is unused.
+    # ALWAYS NULL on every router this platform currently deploys, and
+    # not because nothing has measured it yet.
+    #
+    # Signal strength lives in the radio. Every deployed router is a
+    # wired hEX lite / RB750r2 with no radio and no wireless package;
+    # guest Wi-Fi is emitted by separate third-party access points
+    # (TP-Link / Omada) that this platform does not talk to. There is no
+    # RouterOS command on this hardware that can produce this value, so
+    # no future sweep will fill it in. It is unobtainable, not pending.
+    #
+    # The column is kept, not dropped, because it is genuinely
+    # populatable by a vendor adapter against wireless-capable hardware,
+    # and because dropping it would discard historical rows. But treat a
+    # NULL here as "this platform cannot know", and never render a
+    # placeholder, an estimate, or a bar chart in its place. A frontend
+    # inventing values to fill an always-absent field is exactly what
+    # happened to the sibling `ssid` field on live sessions.
+    #
+    # Populating this for real is an access-point integration (Omada /
+    # UniFi controller API), not a router change.
     signal_strength_dbm: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Whether this device was present in the most recent sync -- flipped
     # to False (never deleted) when a device drops off the router's own
-    # DHCP-lease/ARP/wireless tables, so history-adjacent context
+    # DHCP-lease/ARP tables, so history-adjacent context
     # ("this device used to be here") survives a disconnect.
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # First observed at the start of this device's *current* active

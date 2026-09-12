@@ -490,6 +490,53 @@ class TestDerivedStatus:
         assert item.status == HardwareStatus.DOWN
         assert item.last_seen_at == seen_at
 
+    async def test_status_is_down_when_sighting_is_stale_even_if_still_active(
+        self,
+    ) -> None:
+        """Regression: "AP Hall Lobby went down but the console still shows
+        UP". ``is_active`` is only as fresh as the sweep that last wrote it;
+        when the uplink router went unreachable (or the sweep stalled) the
+        flip that would have marked the device down never ran, and the
+        stale ``is_active=True`` row kept reporting UP. A sighting older
+        than the stale window must read as DOWN regardless of the flag."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:14")
+        stale_at = _now() - timedelta(hours=1)
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                mac_address=device.mac_address,
+                is_active=True,
+                last_seen_at=stale_at,
+            )
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.DOWN
+        assert item.connected_at is None, (
+            "a stale sighting must not surface connected_at as current uptime"
+        )
+
+    async def test_status_is_up_when_sighting_is_fresh(self) -> None:
+        """A genuinely current sighting -- inside the stale window -- keeps
+        reporting UP; the staleness guard must not invent outages for a
+        device the sweep is actively refreshing."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:15")
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                mac_address=device.mac_address,
+                is_active=True,
+                last_seen_at=_now() - timedelta(minutes=20),
+            )
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.UP
+
     async def test_status_lookup_is_scoped_to_the_devices_own_location(self) -> None:
         """A ConnectedDevice row for the same MAC at a *different* location
         must never leak into this device's status -- two venues sharing a

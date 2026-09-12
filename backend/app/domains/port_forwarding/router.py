@@ -79,6 +79,9 @@ def _rule_response(rule: PortForwardingRule) -> PortForwardingRuleResponse:
         internal_port=rule.internal_port,
         description=rule.description,
         is_enabled=rule.is_enabled,
+        device_push_status=rule.device_push_status,
+        device_push_error=rule.device_push_error,
+        device_pushed_at=rule.device_pushed_at,
         created_at=rule.created_at,
     )
 
@@ -223,6 +226,62 @@ async def delete_port_forwarding_rule(
         success=True,
         message="Port forwarding rule deleted",
         data=MessageResponse(message="Port forwarding rule deleted").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/rules/{rule_id}/push",
+    response_model=ApiResponse[PortForwardingRuleResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("firewall.execute"))],
+)
+async def push_port_forwarding_rule(
+    request: Request,
+    rule_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: PortForwardingService = Depends(get_port_forwarding_service),
+):
+    """Realizes this port-forwarding rule on its own router over the
+    RouterOS API.
+
+    Gated by ``firewall.execute``, not ``firewall.update``: editing a row
+    and reaching into a live router are different privileges. Unlike the
+    ``vlan.execute``/``dhcp.execute`` actions, this one is not new --
+    ``PermissionModule.FIREWALL`` has carried ``EXECUTE`` since before this
+    domain existed, so no re-seed is required on deploy. (That distinction
+    is worth stating: ``vlan.execute`` shipped without the seed being run,
+    and the Apply button 403'd against a working adapter until it was.)
+
+    ``firewall.execute`` is deliberately the gate rather than anything on
+    ``PermissionModule.ROUTERS``: ``expand_grant_level`` folds EXECUTE out
+    of both OPERATE and FULL, so an Organization Owner (FULL by default)
+    and an Organization Admin (OPERATE by default) both hold it, as do
+    Network Administrator and Network Engineer. A ``routers.manage`` gate
+    would only fold out of FULL and would 403 the Organization Admin who
+    owns this rule.
+
+    **There is no try/except in this handler, deliberately.** Every failure
+    path raises a ``PortForwardingError`` carrying its own status code (502
+    for a device connection or operation failure, 409/400/403/404 for the
+    rest), and the app-wide ``CloudGuestError`` handler turns it into a real
+    non-2xx.
+
+    Returning ``200 {"success": false}`` instead would be invisible: the
+    frontend's response interceptor unwraps ``response.data.data`` and never
+    reads ``success``, so such a response reaches the UI as a success. The
+    honesty has to live in the status code.
+    """
+    rule = await service.push_rule_to_device(
+        rule_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Port forwarding rule pushed to device",
+        data=_rule_response(rule).model_dump(),
         request_id=_request_id(request),
     )
 

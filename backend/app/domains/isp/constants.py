@@ -147,6 +147,41 @@ class HealthStatusSource(StrEnum):
     MANUAL = "manual"
 
 
+class IspFailoverPushStatus(StrEnum):
+    """Lifecycle of the *device* half of a failover/failback on the link
+    traffic was moved onto.
+
+    ``is_active_uplink`` is what this platform intends; this is what the
+    router was actually told and whether it accepted. Before these
+    existed, "Trigger failover" flipped ``is_active_uplink``, wrote an
+    audit row, and returned success without contacting the device at all
+    -- so during an outage the "Active uplink" tile named the backup while
+    every packet still went nowhere. The two facts must be separately
+    visible, because they genuinely differ.
+
+    Mirrors ``vlan.constants.VlanDevicePushStatus`` value-for-value so a
+    reader of either table sees the same vocabulary.
+
+    * ``PENDING`` -- no failover has ever been pushed for this link. Every
+      pre-existing row, truthfully.
+    * ``PROVISIONING`` -- a push is in flight. Written and committed
+      before the first socket, so a customer refreshing during a slow push
+      sees work in progress, and a process killed mid-push leaves a row
+      that says nobody confirmed this rather than a stale ``ACTIVE``.
+    * ``ACTIVE`` -- the router accepted every write: this link's route is
+      the preferred one and its egress is NATed. Only ever written after
+      the device has confirmed, never optimistically.
+    * ``FAILED`` -- the last attempt raised; ``failover_push_error`` holds
+      why, verbatim, and it is what the customer is shown instead of a
+      success toast.
+    """
+
+    PENDING = "pending"
+    PROVISIONING = "provisioning"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
 # ============================================================================
 # Health-check classification thresholds -- see
 # ``validators.classify_health_status``. Deliberately plain module
@@ -271,6 +306,29 @@ TASK_RUN_ISP_HEALTH_CHECK_SWEEP = "app.domains.isp.tasks.run_isp_health_check_sw
 # silently leaving it here forever.
 ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 30.0
 
+# Longest hole between two counter readings still worth expressing as a
+# rate. Beyond it the delta is a real *total* but a meaningless *rate*: a
+# saturated evening averaged over six hours reads as a calm one, and it
+# reads that way at a plausible-looking number, which is worse than an
+# admitted gap -- nothing on the card tells the operator that the point
+# they are reading spans a quarter of a day.
+#
+# Deliberately NOT derived from ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS
+# above. The question this answers is "how long can traffic hold still
+# enough for an average across it to mean anything", which is a property
+# of the traffic, not of how often we happen to sample it -- a multiple of
+# the cadence would have silently become a 200-minute ceiling the day
+# somebody raised the sweep back to 600s, which is exactly the drift this
+# is here to stop.
+#
+# 1800s is the same ceiling the per-interface chart already applies
+# client-side (`MAX_INTERVAL_MINUTES = 30` in
+# cloudguest-foundation/src/lib/device-health.ts). The two pipelines are
+# unrelated -- different table, writer and transport -- but they answer
+# the same question about the same physical link, so they must not
+# disagree about which intervals are plottable. Change one, change both.
+MAX_RATE_INTERVAL_SECONDS = 1800.0
+
 
 __all__ = [
     "IspLinkType",
@@ -278,6 +336,7 @@ __all__ = [
     "IspLinkRole",
     "HealthStatus",
     "HealthStatusSource",
+    "IspFailoverPushStatus",
     "DEFAULT_LATENCY_DEGRADED_THRESHOLD_MS",
     "DEFAULT_LATENCY_UNHEALTHY_THRESHOLD_MS",
     "DEFAULT_PACKET_LOSS_DEGRADED_THRESHOLD_PERCENT",
@@ -294,4 +353,5 @@ __all__ = [
     "UNHEALTHY_SINCE_LOOKBACK_LIMIT",
     "TASK_RUN_ISP_HEALTH_CHECK_SWEEP",
     "ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",
+    "MAX_RATE_INTERVAL_SECONDS",
 ]

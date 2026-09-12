@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,7 +48,11 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .cache import EntitlementCache
 from .constants import PaymentProvider, PlanFeatureKey
-from .exceptions import FeatureNotEntitledError, LicenseNotActiveError
+from .exceptions import (
+    FeatureNotEntitledError,
+    LicenseNotActiveError,
+    LicenseNotFoundError,
+)
 from .payment_gateways import RazorpayPaymentGateway, StripePaymentGateway
 from .renewal_service import PaymentGatewayProtocol, RenewalService
 from .repository import (
@@ -94,6 +98,10 @@ from .service import (
     UsageService,
 )
 from .webhooks import RedisWebhookEventDedup, WebhookEventDedupProtocol
+
+# GET/HEAD/OPTIONS never change state, so a lapsed licence must not block
+# them -- see ``RequireActiveLicenseForWrites``'s own docstring.
+_SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 def get_plan_repository(
@@ -171,6 +179,15 @@ def get_powered_by_reset_service(
     )
 
 
+# Defined here, ahead of the Subscription section it belongs to, because
+# ``get_license_service`` below consumes it and a ``Depends()`` default is
+# evaluated at import time -- a later definition would be a NameError.
+def get_subscription_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> SubscriptionRepositoryProtocol:
+    return SubscriptionRepository(db)
+
+
 def get_license_service(
     repository: LicenseRepositoryProtocol = Depends(get_license_repository),
     plan_repository: PlanRepositoryProtocol = Depends(get_plan_repository),
@@ -181,6 +198,9 @@ def get_license_service(
     powered_by_reset: PoweredByAttributionResetService = Depends(
         get_powered_by_reset_service
     ),
+    subscription_repository: SubscriptionRepositoryProtocol = Depends(
+        get_subscription_repository
+    ),
 ) -> LicenseService:
     return LicenseService(
         repository,
@@ -190,6 +210,7 @@ def get_license_service(
         audit_writer=audit_repository,
         entitlement_cache=entitlement_cache,
         white_label_reset=powered_by_reset,
+        subscription_repository=subscription_repository,
     )
 
 
@@ -217,6 +238,64 @@ def get_entitlement_checker(
 # license permanently unrecoverable via the API.
 
 
+def _organization_id_from_header(request: Request) -> uuid.UUID | None:
+    """The organization this request claims, read straight off the header.
+
+    Deliberately NOT ``Depends(CurrentOrganization)``. FastAPI resolves every
+    declared dependency *before* the endpoint runs, so declaring
+    ``CurrentOrganization`` here would drag ``CurrentUser`` in with it and
+    force authentication on every route of any router this gate is applied to
+    -- including the unauthenticated guest-facing ones
+    (``/captive-portal/resolve``, ``/vouchers/redeem``, the public branding
+    assets). The method check inside the function body would not save them,
+    because by then the 401 has already happened.
+
+    This gate is not an access check -- the endpoint's own
+    ``RequirePermission`` is -- so it does not need the membership validation
+    ``CurrentOrganization`` performs. It needs only "which organization's
+    billing state applies here", and a request with no organization context
+    passes through unchecked, exactly as ``RequireActiveLicense`` already
+    documents.
+    """
+    raw = request.headers.get("X-Organization-Id")
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _require_active_license(
+    organization_id: uuid.UUID | None,
+    checker: EntitlementChecker,
+) -> uuid.UUID | None:
+    """Shared body of ``RequireActiveLicense``/``RequireActiveLicenseForWrites``.
+
+    An organization with **no ``License`` row at all** is treated as not
+    licensed -- a clean 402, the same answer an expired license gets -- rather
+    than surfacing ``LicenseNotFoundError``'s 404. A gate whose job is to
+    answer "may this organization act?" should never answer "that thing does
+    not exist": a 404 from a write endpoint reads to a client as "wrong URL"
+    and to an operator as a bug, and it is a very different remediation from
+    "your plan lapsed". Organizations predating the billing domain have no
+    license row, so this is reachable in real data, not a theoretical branch.
+    """
+    if organization_id is None:
+        return None
+    try:
+        snapshot = await checker.get_snapshot(organization_id)
+    except LicenseNotFoundError as exc:
+        raise LicenseNotActiveError(
+            organization_id, "no license has been assigned"
+        ) from exc
+    if not snapshot.is_active:
+        raise LicenseNotActiveError(
+            organization_id, f"status is '{snapshot.license_status}'"
+        )
+    return organization_id
+
+
 def RequireActiveLicense() -> Callable[..., Awaitable[uuid.UUID | None]]:
     """402s (``LicenseNotActiveError``) unless the current organization's
     license is ``ACTIVE`` and unexpired. A request with no organization
@@ -226,14 +305,41 @@ def RequireActiveLicense() -> Callable[..., Awaitable[uuid.UUID | None]]:
         organization_id: uuid.UUID | None = Depends(CurrentOrganization),
         checker: EntitlementChecker = Depends(get_entitlement_checker),
     ) -> uuid.UUID | None:
-        if organization_id is None:
+        return await _require_active_license(organization_id, checker)
+
+    return _dependency
+
+
+def RequireActiveLicenseForWrites() -> Callable[..., Awaitable[uuid.UUID | None]]:
+    """``RequireActiveLicense``, but only for state-changing requests.
+
+    Applied at the ``include_router`` level in ``app.api.v1.router`` rather
+    than decorated onto endpoints one at a time, so which router families are
+    licence-gated is legible in one place instead of spread across a hundred
+    handlers -- and so a new endpoint on an already-gated router is covered by
+    construction rather than by remembering.
+
+    Reads deliberately stay open on a lapsed licence. A customer whose plan
+    expired must still be able to sign in, see their venues, read their guest
+    list and reach billing to pay; locking them out of the evidence of what
+    they are paying for is the wrong lever, and a read is not the thing a plan
+    sells.
+
+    Guest-facing paths are **never** gated -- see ``app.api.v1.router`` for the
+    exact list. Cutting a venue's guest WiFi over a billing state would punish
+    the guests standing in the lobby for the owner's lapsed card, and turn a
+    revenue problem into an outage.
+    """
+
+    async def _dependency(
+        request: Request,
+        checker: EntitlementChecker = Depends(get_entitlement_checker),
+    ) -> uuid.UUID | None:
+        if request.method in _SAFE_HTTP_METHODS:
             return None
-        snapshot = await checker.get_snapshot(organization_id)
-        if not snapshot.is_active:
-            raise LicenseNotActiveError(
-                organization_id, f"status is '{snapshot.license_status}'"
-            )
-        return organization_id
+        return await _require_active_license(
+            _organization_id_from_header(request), checker
+        )
 
     return _dependency
 
@@ -259,12 +365,6 @@ def RequireFeature(
         return organization_id
 
     return _dependency
-
-
-def get_subscription_repository(
-    db: AsyncSession = Depends(get_db_session),
-) -> SubscriptionRepositoryProtocol:
-    return SubscriptionRepository(db)
 
 
 def get_coupon_repository(
@@ -522,6 +622,7 @@ def get_invoice_service(
     note_repository: CreditDebitNoteRepositoryProtocol = Depends(
         get_credit_debit_note_repository
     ),
+    coupon_repository: CouponRepositoryProtocol = Depends(get_coupon_repository),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     settings: Settings = Depends(get_settings),
 ) -> InvoiceService:
@@ -535,6 +636,7 @@ def get_invoice_service(
         note_repository=note_repository,
         platform_gst_state=settings.platform_gst_state,
         platform_gst_country=settings.platform_gst_country,
+        coupon_repository=coupon_repository,
         invoice_due_days=settings.invoice_due_days,
         audit_writer=audit_repository,
     )

@@ -44,6 +44,7 @@ from httpx import ASGITransport, AsyncClient, Response
 
 from app.common.exceptions import register_exception_handlers
 from app.domains.guest.constants import (
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     RADIUS_NAS_IDENTIFIER_HEADER,
     RADIUS_SHARED_SECRET_HEADER,
@@ -112,13 +113,109 @@ class TestRadiusAuthorizeWireFormat:
 
         # rlm_rest's real attribute names MUST be present.
         assert body.get("control:Auth-Type") == "Accept"
-        assert body.get("Session-Timeout") == DEFAULT_SESSION_TIMEOUT_MINUTES * 60
+        # Not an exact equality. Since the Access-Accept began carrying the
+        # session's REMAINING allowance rather than the full one (#178 -- the
+        # change that made a venue's timeout actually expire, because the NAS
+        # re-authorizes periodically and the old full value reset the clock
+        # every time), this number is `full - elapsed`. Asserting equality
+        # made it a function of how long the test took to run: CI observed
+        # 14398 against an expected 14400 and failed a PR that had touched
+        # nothing near RADIUS.
+        #
+        # What this test is actually for is rlm_rest's ATTRIBUTE NAMES, not
+        # the arithmetic. That is owned by the test asserting the reply
+        # carries remaining time rather than the full allowance, over in
+        # tests/unit/test_guest_last_ended_session.py.
+        # So pin it tightly enough that a wrong attribute or a wrong unit
+        # (minutes-not-seconds, or some other timeout entirely) still fails,
+        # and loosely enough that the clock cannot.
+        full_seconds = DEFAULT_SESSION_TIMEOUT_MINUTES * 60
+        session_timeout = body.get("Session-Timeout")
+        assert isinstance(session_timeout, int)
+        assert full_seconds - 60 <= session_timeout <= full_seconds
         assert body.get("Acct-Interim-Interval") == 300
 
         # The OLD, silently-discarded-by-rlm_rest generic envelope must be
         # entirely gone -- this is the actual regression check.
         assert "authorized" not in body
         assert "session_timeout_seconds" not in body
+
+    async def test_the_accept_reply_carries_an_idle_timeout(self) -> None:
+        """The venue's idle timeout has to reach the device, and the only
+        channel it has is this reply.
+
+        Before this attribute existed here, nothing this platform sent
+        said anything about idleness at all, so what actually governed a
+        guest was RouterOS's ``default`` hotspot user profile -- 30
+        minutes on a router Master console set up, RouterOS's factory
+        ``none`` on one provisioned before that. The dashboard's Idle
+        Timeout field reached the device by no path whatsoever, which is
+        why it carried a "not enforced" note on its face.
+
+        Asserted in SECONDS, because RFC 2865 s5.28 is a seconds-valued
+        attribute and the dashboard's field is in minutes -- a unit slip
+        here is a silent factor-of-60 that would read on the device as
+        either "half a minute" or "a day"."""
+        fx = make_fixture()
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier=_NAS_IDENTIFIER,
+            shared_secret=_NAS_SECRET,
+        )
+        await fx.guest_service.login_via_otp(
+            identifier="+15550001111",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+        app = _build_app(fx.radius_service)
+        resp = await _authorize(app, username="+15550001111")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("Idle-Timeout") == DEFAULT_IDLE_TIMEOUT_MINUTES * 60
+
+    async def test_the_idle_timeout_is_the_full_value_on_every_reauthorization(
+        self,
+    ) -> None:
+        """An idle timeout is a rolling window the NAS resets on every
+        packet, so the full configured value is the right thing to send
+        every time.
+
+        Its neighbour ``Session-Timeout`` is the exact opposite: that one
+        must send what REMAINS, because sending the full allowance on each
+        re-authorization is what made a venue's session timeout
+        unreachable by construction. The two live one line apart in the
+        reply builder and it would be easy to "fix" this one the same way
+        -- which would shrink a guest's idle allowance every time anything
+        spoke to RADIUS, and eventually disconnect an actively-browsing
+        guest for being idle."""
+        fx = make_fixture()
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier=_NAS_IDENTIFIER,
+            shared_secret=_NAS_SECRET,
+        )
+        await fx.guest_service.login_via_otp(
+            identifier="+15550001111",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+        app = _build_app(fx.radius_service)
+        first = (await _authorize(app, username="+15550001111")).json()
+        second = (await _authorize(app, username="+15550001111")).json()
+
+        assert first["Idle-Timeout"] == DEFAULT_IDLE_TIMEOUT_MINUTES * 60
+        assert second["Idle-Timeout"] == first["Idle-Timeout"]
 
     async def test_reject_reply_uses_rlm_rest_attribute_name_convention(self) -> None:
         fx = make_fixture()

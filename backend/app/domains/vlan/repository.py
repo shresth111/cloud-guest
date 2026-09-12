@@ -49,6 +49,20 @@ class VlanRepositoryProtocol(Protocol):
 
     async def list_vlans_for_router(self, router_id: uuid.UUID) -> list[Vlan]: ...
 
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by ``VlanService.push_vlan_to_device`` and nothing else.
+        ``GenericRepository.update`` only ``flush()``es, and
+        ``get_db_session`` rolls the session back on any exception -- so a
+        failure record written just before a re-raise is discarded, and the
+        row still reads ``pending`` after a real device failure. That is a
+        live defect in ``qos``'s otherwise-identical push (its own docstring
+        claims the opposite). Committing the failure explicitly, before
+        raising, is what makes the record survive.
+        """
+        ...
+
 
 class VlanRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -76,6 +90,9 @@ class VlanRepository:
 
     async def update_vlan(self, vlan: Vlan, data: dict[str, object]) -> Vlan:
         return await self.vlans.update(vlan, data)
+
+    async def commit(self) -> None:
+        await self.session.commit()
 
     async def soft_delete_vlan(self, vlan: Vlan) -> Vlan:
         return await self.vlans.soft_delete(vlan)

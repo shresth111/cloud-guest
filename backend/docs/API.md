@@ -2047,16 +2047,48 @@ the terminal `deleted` status and sets the row's ordinary soft-delete
 fields -- it disappears from `GET /radius/nas` afterward, the same as
 every other domain's own soft-deleted rows.
 
-`POST /radius/nas/{nas_id}/activate` -- requires `radius.execute`.
+`POST /platform/radius/nas/{nas_id}/activate` -- requires `radius.execute`
+**at `ScopeType.GLOBAL`** (Master console only). Was
+`POST /radius/nas/{nas_id}/activate` until 2026-09-02.
 
-`POST /radius/nas/{nas_id}/disable` -- requires `radius.execute`. Body:
-optional `reason`. A disabled NAS fails `authenticate_nas` (RADIUS
+`POST /platform/radius/nas/{nas_id}/disable` -- requires `radius.execute`
+**at `ScopeType.GLOBAL`** (Master console only). Was
+`POST /radius/nas/{nas_id}/disable` until 2026-09-02. Body: optional
+`reason`. A disabled NAS fails `authenticate_nas` (RADIUS
 Authorize/Accounting calls from it are rejected) until reactivated.
 
-`POST /radius/nas/{nas_id}/regenerate-secret` -- requires `radius.execute`.
-Immediately invalidates the old secret. Response includes the new
-plaintext `shared_secret`, the same one-time-exposure contract as
-registration. Does not require or change the NAS's own status.
+Both moved for the same reason the rotate route did: `radius.execute` is
+held at *organization* scope by `organization-owner`, the role every venue
+owner is provisioned with, so on `/radius/nas/...` these were a one-click
+kill switch for a venue's own guest WiFi sitting on that venue's own
+dashboard. `disable` is a pure database write -- no hub call, no device
+call -- so it takes effect on the next Access-Request with nothing in any
+log naming the cause. `activate` is the reverse edge and also the only way
+out of `suspended`, the status reserved for platform-imposed holds. **This
+is a behaviour change**: an organization- or location-scoped grant that
+could call these before now gets `403`, whatever `X-Organization-Id` it
+sends.
+
+`POST /platform/radius/nas/{nas_id}/regenerate-secret` -- requires
+`radius.execute` **at `ScopeType.GLOBAL`** (Master console only; an
+organization-scoped grant can never satisfy it). Was
+`POST /radius/nas/{nas_id}/regenerate-secret` until 2026-09-02.
+
+Rotates the shared secret and pushes it to the real FreeRADIUS server in
+the same operation, hub first: if the push fails the route answers `502`
+with the bridge's own diagnostic and the NAS row is **unchanged**, so the
+row, the hub and the device all still hold the working secret. Requires the
+router to have a WireGuard peer (`404` otherwise), because the hub keys the
+`client{}` stanza on the tunnel address -- with nowhere to push there is no
+rotation.
+
+Response includes the new plaintext `shared_secret` (the same one-time-
+exposure contract as registration), the `hub_client_synced_ip`/`_at` the
+hub confirmed, and `device_action_required`/`device_action`. That last pair
+is not decoration: the platform has **no** write path to a RouterOS RADIUS
+client, so a `200` here means the venue's guest WiFi is down until somebody
+re-pastes the RADIUS chunk over WinBox. Does not require or change the
+NAS's own status.
 
 `GET /locations/{location_id}/nas` -- requires `radius.read`. Every NAS
 registered at that location, paginated.

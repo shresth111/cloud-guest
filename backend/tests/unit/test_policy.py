@@ -55,7 +55,7 @@ from app.domains.policy.exceptions import (
 )
 from app.domains.policy.models import Policy, PolicyAssignment, PolicyVersion
 from app.domains.policy.router import router as policy_router
-from app.domains.policy.service import PolicyService
+from app.domains.policy.service import PolicyResolver, PolicyService
 from app.domains.rbac.enums import ScopeType
 
 # ============================================================================
@@ -145,7 +145,13 @@ class FakeLocationLookup:
             raise CrossOrganizationLocationAccessError()
         return location
 
-    def add(self, *, organization_id: uuid.UUID) -> Location:
+    def add(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
+    ) -> Location:
+        extra = {"id": location_id} if location_id is not None else {}
         location = Location(
             **_base_fields(
                 organization_id=organization_id,
@@ -165,6 +171,7 @@ class FakeLocationLookup:
                 contact_phone=None,
                 contact_email=None,
                 settings={},
+                **extra,
             )
         )
         self.locations[location.id] = location
@@ -316,9 +323,7 @@ class FakePolicyRepository:
                 and assignment.target_id == user_id
             )
             is_role_match = (
-                target_type == "role"
-                and role_ids
-                and assignment.target_id in role_ids
+                target_type == "role" and role_ids and assignment.target_id in role_ids
             )
             is_guest_match = (
                 target_type == "guest"
@@ -397,9 +402,9 @@ class FakeRoleLookup:
         return object() if role_id in self.known_role_ids else None
 
 
-def _build_service_with_targeting() -> tuple[
-    PolicyService, FakePolicyRepository, FakeUserLookup, FakeRoleLookup
-]:
+def _build_service_with_targeting() -> (
+    tuple[PolicyService, FakePolicyRepository, FakeUserLookup, FakeRoleLookup]
+):
     repo = FakePolicyRepository()
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup()
@@ -590,7 +595,41 @@ class TestRulesValidation:
         assert version.rules["session_timeout_minutes"] == 60
         assert version.version_number == 1
 
-    async def test_missing_required_session_field_is_rejected(self) -> None:
+    async def test_a_partial_session_payload_is_accepted(self) -> None:
+        """Was ``test_missing_required_session_field_is_rejected``.
+
+        ``SessionPolicyRules``' four fields are now optional, so a venue can
+        change only its session length. Requiring all four made the type
+        unusable for its actual purpose: three of them have no reader an
+        operator would ever set deliberately, so the old contract forced them
+        to invent numbers for settings they were not editing. An omitted field
+        means "no opinion" and the reader falls back to its platform
+        constant."""
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.SESSION,
+            name="Session",
+            description=None,
+        )
+
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"session_timeout_minutes": 60},
+        )
+
+        assert version.rules["session_timeout_minutes"] == 60
+        assert version.rules["max_concurrent_sessions_per_guest"] is None
+
+    async def test_an_unknown_session_field_is_still_rejected(self) -> None:
+        """Optional is not the same as permissive -- ``extra="forbid"`` still
+        holds, so a typo'd or invented key is still a 422 rather than a
+        silently ignored setting."""
         service, _, org_lookup, _ = _build_service()
         org = org_lookup.add()
         policy = await service.create_policy(
@@ -606,7 +645,26 @@ class TestRulesValidation:
                 policy_id=policy.id,
                 requesting_organization_id=org.id,
                 actor_user_id=None,
-                rules={"session_timeout_minutes": 60},
+                rules={"session_timeout_minutes": 60, "sesion_timeout": 30},
+            )
+
+    async def test_an_out_of_range_session_value_is_still_rejected(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.SESSION,
+            name="Session",
+            description=None,
+        )
+        with pytest.raises(PolicyRulesValidationError):
+            await service.create_version(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                rules={"session_timeout_minutes": 0},
             )
 
     async def test_negative_value_is_rejected(self) -> None:
@@ -1195,6 +1253,11 @@ class TestResolution:
         service, repo, org_lookup, _ = _build_service()
         org = org_lookup.add()
         location_id = uuid.uuid4()
+        # Register the location under this org so resolution's tenant-isolation
+        # check (a resolved ``location_id`` must belong to the resolving org)
+        # passes -- the assignment below is written straight to the repo, but
+        # the location itself must still be a real, org-owned location.
+        service.location_lookup.add(organization_id=org.id, location_id=location_id)
 
         org_policy = await _create_published_session_policy(
             service, organization_id=org.id
@@ -1333,6 +1396,93 @@ class TestResolution:
             location_id=None,
         )
         assert resolved.source == "platform_default"
+
+
+class TestTiedAssignmentsResolveTheSameWayEveryTime:
+    """Two screens under Access & Policy -- Guest WiFi Limits
+    (``LocationPolicies.tsx``) and Access Tiers (``CreateGroup.tsx``) --
+    both write ``BANDWIDTH`` policies and both map them to a location with
+    ``scope_type="location"``, ``target_type="none"``, ``priority=0``. A
+    venue that has used both therefore has two candidates whose
+    WHO/WHERE/priority keys are identical.
+
+    ``list_candidate_assignments`` issues no ``ORDER BY`` and ``max``
+    returns the first maximal element, so before a total ordering existed
+    the winner was decided by row order -- the operator could edit the
+    policy they were looking at, see it save, and have a guest keep the
+    other one's rate. Bug report: "speed is only set to 20 and not
+    updating"."""
+
+    @staticmethod
+    def _assignment(*, created_at: datetime, policy_id: uuid.UUID) -> PolicyAssignment:
+        return PolicyAssignment(
+            **_base_fields(
+                created_at=created_at,
+                policy_id=policy_id,
+                scope_type=ScopeType.LOCATION.value,
+                scope_id=uuid.uuid4(),
+                priority=0,
+                target_type=PolicyAssignmentTargetType.NONE.value,
+                target_id=None,
+                is_active=True,
+                created_by_user_id=None,
+            )
+        )
+
+    def test_the_newest_assignment_wins_whatever_order_rows_arrive_in(self) -> None:
+        resolver = PolicyResolver()
+        older = self._assignment(
+            created_at=datetime(2026, 9, 1, tzinfo=UTC), policy_id=uuid.uuid4()
+        )
+        newer = self._assignment(
+            created_at=datetime(2026, 9, 6, tzinfo=UTC), policy_id=uuid.uuid4()
+        )
+
+        assert resolver.resolve(candidates=[older, newer]) is newer
+        assert resolver.resolve(candidates=[newer, older]) is newer
+
+    def test_assignments_written_together_still_resolve_identically(self) -> None:
+        """Two assignments created inside one transaction share a
+        ``created_at`` to the microsecond. Reproducible "most of the time"
+        is not reproducible."""
+        resolver = PolicyResolver()
+        same_moment = datetime(2026, 9, 6, 12, 0, 0, tzinfo=UTC)
+        a = self._assignment(created_at=same_moment, policy_id=uuid.uuid4())
+        b = self._assignment(created_at=same_moment, policy_id=uuid.uuid4())
+
+        forward = resolver.resolve(candidates=[a, b])
+        backward = resolver.resolve(candidates=[b, a])
+        assert forward is backward
+
+    def test_the_real_precedence_rules_still_outrank_recency(self) -> None:
+        """The tie-break is a tie-break. A newer assignment must not beat
+        an older one that is genuinely more specific, or a location's own
+        settings would start losing to whatever was mapped last at the
+        organization above it."""
+        resolver = PolicyResolver()
+        location_scoped = self._assignment(
+            created_at=datetime(2026, 1, 1, tzinfo=UTC), policy_id=uuid.uuid4()
+        )
+        org_scoped = self._assignment(
+            created_at=datetime(2026, 9, 6, tzinfo=UTC), policy_id=uuid.uuid4()
+        )
+        org_scoped.scope_type = ScopeType.ORGANIZATION.value
+
+        assert resolver.resolve(candidates=[location_scoped, org_scoped]) is (
+            location_scoped
+        )
+
+        higher_priority = self._assignment(
+            created_at=datetime(2026, 1, 1, tzinfo=UTC), policy_id=uuid.uuid4()
+        )
+        higher_priority.priority = 10
+        newer_but_lower = self._assignment(
+            created_at=datetime(2026, 9, 6, tzinfo=UTC), policy_id=uuid.uuid4()
+        )
+
+        assert resolver.resolve(candidates=[newer_but_lower, higher_priority]) is (
+            higher_priority
+        )
 
 
 # ============================================================================
@@ -1971,7 +2121,13 @@ class TestOneGuestOneGroupConstraint:
 
     async def test_get_guest_group_assignment_returns_none_when_unmapped(self) -> None:
         service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
-        assert await service.get_guest_group_assignment(guest_id=uuid.uuid4()) is None
+        assert (
+            await service.get_guest_group_assignment(
+                guest_id=uuid.uuid4(),
+                requesting_organization_id=None,
+            )
+            is None
+        )
 
     async def test_get_guest_group_assignment_returns_the_active_mapping(self) -> None:
         service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
@@ -1991,7 +2147,10 @@ class TestOneGuestOneGroupConstraint:
             target_id=guest_id,
         )
 
-        found = await service.get_guest_group_assignment(guest_id=guest_id)
+        found = await service.get_guest_group_assignment(
+            guest_id=guest_id,
+            requesting_organization_id=None,
+        )
         assert found is not None
         assert found.id == created.id
         assert found.policy_id == group.id
@@ -2056,10 +2215,68 @@ class TestTenantIsolation:
         assert len(policies) == 1
         assert policies[0].organization_id == org_a.id
 
+    async def test_resolve_rejects_location_from_another_organization(self) -> None:
+        """A caller scoped to org A resolving with org B's ``location_id`` must
+        be refused -- otherwise (``list_candidate_assignments`` matches a
+        LOCATION-scoped assignment by ``scope_id`` alone) org A could read org
+        B's location-scoped effective policy."""
+        service, _, org_lookup, _ = _build_service()
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        victim_location = service.location_lookup.add(organization_id=org_b.id)
+
+        with pytest.raises(CrossOrganizationLocationAccessError):
+            await service.resolve_effective_policy(
+                policy_type=PolicyType.SESSION,
+                organization_id=org_a.id,
+                location_id=victim_location.id,
+            )
+
+    async def test_resolve_allows_platform_caller_any_location(self) -> None:
+        """A platform/GLOBAL caller (``organization_id is None``, having passed
+        the GLOBAL-scope permission gate) may resolve for any location; the
+        location tenant-check is skipped."""
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        location = service.location_lookup.add(organization_id=org.id)
+
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=None,
+            location_id=location.id,
+        )
+        # No assignment exists -> platform default, but crucially no raise.
+        assert resolved.source == "platform_default"
+
 
 # ============================================================================
 # RBAC -- every route in this domain is admin-facing
 # ============================================================================
+
+
+class TestResolveRouteScoping:
+    def test_resolve_takes_organization_from_auth_scope_not_query_param(
+        self,
+    ) -> None:
+        """``GET /policies/resolve`` must resolve ``organization_id`` from
+        ``CurrentOrganization`` (the caller's validated auth scope), not a
+        client-supplied query param -- otherwise an org-scoped admin omitting
+        the header's org while passing ``?organization_id=<other org>`` would
+        read another tenant's effective policy."""
+        from app.domains.rbac.dependencies import CurrentOrganization
+
+        resolve_route = next(
+            route
+            for route in policy_router.routes
+            if getattr(route, "path", "") == "/policies/resolve"
+        )
+        dependant = resolve_route.dependant
+
+        query_names = {param.name for param in dependant.query_params}
+        assert "organization_id" not in query_names
+
+        dependency_calls = {dep.call for dep in dependant.dependencies}
+        assert CurrentOrganization in dependency_calls
 
 
 class TestEveryRouteRequiresPermission:
@@ -2075,3 +2292,87 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+class TestPlatformDefaultsMirrorTheirSourceConstants:
+    """``app.domains.policy`` is a dependency-free leaf, so
+    ``PLATFORM_DEFAULT_RULES`` duplicates several ``app.domains.guest``
+    constants as literals rather than importing them -- a documented
+    trade-off that keeps the module acyclic (see ``constants.py``'s own
+    module docstring).
+
+    The cost of that trade-off is drift, and it had already happened:
+    ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` was raised 3 -> 20 after a
+    real launch incident and the mirror stayed at 3. That is not a dormant
+    inconsistency -- ``resolve_effective_policy`` hands these defaults back as
+    a real ``rules`` dict whenever no policy is assigned, which is every venue
+    in production, so the stale copy is what a reader actually gets.
+
+    A test may import both sides freely; only the application module is bound
+    by the leaf rule. So the mirror is pinned here instead."""
+
+    def test_session_timeout_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import DEFAULT_SESSION_TIMEOUT_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION]["session_timeout_minutes"]
+            == DEFAULT_SESSION_TIMEOUT_MINUTES
+        )
+
+    def test_concurrent_session_limit_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import (
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+        )
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION][
+                "max_concurrent_sessions_per_guest"
+            ]
+            == DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
+        )
+
+    def test_idle_timeout_mirrors_the_guest_constant(self) -> None:
+        """And, transitively, the value the router setup script writes onto
+        the device (``HOTSPOT_IDLE_TIMEOUT``, 30m).
+
+        This one has a second reason to be pinned that the others do not.
+        Every Access-Accept now carries an ``Idle-Timeout`` built from this
+        mirror, for every venue, configured or not. As long as the number
+        equals what the device was already doing on its own, a venue that
+        never opened the settings screen sees no behaviour change. Let the
+        two drift and the platform starts silently overriding the device's
+        idle timeout fleet-wide with a number nobody chose -- which is the
+        exact failure this whole change set out to remove, reintroduced from
+        the other side."""
+        from app.domains.guest.constants import DEFAULT_IDLE_TIMEOUT_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION]["idle_timeout_minutes"]
+            == DEFAULT_IDLE_TIMEOUT_MINUTES
+        )
+
+    def test_reconnect_cooldown_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import TERMINATION_RECONNECT_COOLDOWN_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION][
+                "termination_reconnect_cooldown_minutes"
+            ]
+            == TERMINATION_RECONNECT_COOLDOWN_MINUTES
+        )
+
+    def test_reconnect_grace_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import RECONNECT_GRACE_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION]["reconnect_grace_minutes"]
+            == RECONNECT_GRACE_MINUTES
+        )
+
+    def test_device_limit_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import DEFAULT_MAX_DEVICES_PER_GUEST
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.DEVICE]["max_devices_per_guest"]
+            == DEFAULT_MAX_DEVICES_PER_GUEST
+        )

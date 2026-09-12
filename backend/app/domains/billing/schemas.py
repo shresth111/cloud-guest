@@ -781,6 +781,7 @@ class InvoiceResponse(BaseModel):
     issue_date: datetime
     due_date: datetime
     subtotal: Decimal
+    discount_amount: Decimal
     cgst_amount: Decimal
     sgst_amount: Decimal
     igst_amount: Decimal

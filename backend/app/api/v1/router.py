@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from app.api.v1.health.routes import router as health_router
 from app.domains.admin_logs.router import router as admin_logs_router
@@ -8,6 +8,7 @@ from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
 from app.domains.auth.router import router as auth_router
+from app.domains.billing.dependencies import RequireActiveLicenseForWrites
 from app.domains.billing.router import router as billing_router
 from app.domains.branding.router import router as branding_router
 from app.domains.campaigns.router import guest_router as campaigns_guest_router
@@ -32,6 +33,7 @@ from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
 from app.domains.guest.router import guest_router
 from app.domains.guest.router import nas_cross_reference_router as guest_nas_xref_router
+from app.domains.guest.router import nas_platform_router as guest_nas_platform_router
 from app.domains.guest.router import nas_router as guest_nas_router
 from app.domains.guest.router import radius_router as guest_radius_router
 from app.domains.guest_access.router import router as guest_access_router
@@ -49,6 +51,12 @@ from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
+from app.domains.network_integration.router import (
+    portal_router as network_integration_portal_router,
+)
+from app.domains.network_integration.router import (
+    router as network_integration_router,
+)
 from app.domains.notification.router import router as notification_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
@@ -65,11 +73,65 @@ from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
+from app.domains.system_settings.router import router as system_settings_router
 from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
 from app.domains.wireguard.router import router as wireguard_router
 from app.domains.workspace.router import router as workspace_router
+
+# ---------------------------------------------------------------------------
+# Licence gating
+# ---------------------------------------------------------------------------
+#
+# `RequireActiveLicenseForWrites` 402s a state-changing request from an
+# organization whose licence is expired, suspended, or absent entirely. It is
+# applied here, at the include, rather than decorated onto endpoints one at a
+# time: which router families are gated then reads as one list instead of a
+# hundred separate decisions, and a new endpoint added to an already-gated
+# router is covered by construction rather than by remembering.
+#
+# Reads are never gated. A customer whose plan lapsed must still sign in, see
+# their venues, read their guest list, and reach billing to pay -- locking
+# them out of the evidence of what they are paying for is the wrong lever.
+#
+# NOT gated, deliberately:
+#
+# * Every guest-facing path -- `guest_router`, `captive_portal`'s own
+#   unauthenticated resolve, `campaigns_guest_router`,
+#   `guest_teams_guest_router`, `otp_router`, and the RADIUS/NAS routers.
+#   Cutting a venue's guest WiFi over a billing state would punish the guests
+#   standing in its lobby for the owner's lapsed card, and turn a revenue
+#   problem into an outage. This is the single most important line here.
+# * `network_integration_portal_router` -- the single unauthenticated
+#   `POST /network-integrations/portal/authorize`, which is the network-
+#   enforcement step of a guest getting online (the Omada equivalent of the
+#   MikroTik `link-login-only` POST). Gating it would mean a venue whose card
+#   lapsed stops being able to put guests on its WiFi at all -- the same
+#   reasoning that keeps every other guest-facing path off this list, and the
+#   reason this domain ships two routers rather than one: the customer/platform
+#   CRUD half IS gated, immediately below.
+# * `voucher_router` -- it carries two *unauthenticated* POSTs,
+#   `/vouchers/validate` and `/vouchers/redeem`, which are how a guest with a
+#   front-desk code gets online. They sit on the same router as the admin
+#   batch CRUD, so the router cannot be gated without gating them, and a
+#   guest holding a valid voucher must not be turned away because the venue's
+#   card expired. Gating the admin half needs per-endpoint dependencies;
+#   left for a follow-up rather than risking the guest half here.
+# * `billing_router` -- gating payment behind "you must have paid" makes a
+#   lapsed account unrecoverable. Same reasoning the licence-lifecycle
+#   endpoints already document for themselves.
+# * `auth_router`, `user_router`, `rbac_router`, `organization_router`,
+#   `location_router` -- account and access management. An owner must be able
+#   to log in, fix a user, and reach the rest of the product.
+# * `support_tickets_router`, `demo_request_router`, `demo_booking_router`,
+#   `quotation_router` -- how a lapsed customer talks to us. Gating these
+#   would silence the exact conversation that gets them paying again.
+# * `router_*`, `provisioning_engine`, `wireguard`, `hub_reconciliation`,
+#   `device_sync`, `monitoring`, `readiness`, `system*`, `admin_logs`,
+#   `controller_logs`, `audit` -- platform-operator and device-fleet surfaces,
+#   several of which run as the platform with no organization context at all.
+_PAID_WRITES = [Depends(RequireActiveLicenseForWrites())]
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health_router, prefix="/health", tags=["Health"])
@@ -85,45 +147,53 @@ api_v1_router.include_router(wireguard_router)
 api_v1_router.include_router(hub_reconciliation_router)
 api_v1_router.include_router(otp_router)
 api_v1_router.include_router(voucher_router)
-api_v1_router.include_router(captive_portal_router)
+api_v1_router.include_router(captive_portal_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_router)
 api_v1_router.include_router(guest_admin_router)
 api_v1_router.include_router(guest_radius_router)
 api_v1_router.include_router(guest_nas_router)
 api_v1_router.include_router(guest_nas_xref_router)
+api_v1_router.include_router(guest_nas_platform_router)
 api_v1_router.include_router(guest_analytics_router)
-api_v1_router.include_router(guest_access_router)
+api_v1_router.include_router(guest_access_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_teams_guest_router)
-api_v1_router.include_router(guest_teams_admin_router)
+api_v1_router.include_router(guest_teams_admin_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(monitoring_router)
 api_v1_router.include_router(analytics_router)
 api_v1_router.include_router(billing_router)
-api_v1_router.include_router(policy_router)
+api_v1_router.include_router(policy_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(provisioning_engine_router)
-api_v1_router.include_router(queue_management_router)
-api_v1_router.include_router(isp_router)
-api_v1_router.include_router(isp_routing_router)
-api_v1_router.include_router(vlan_router)
-api_v1_router.include_router(dhcp_router)
-api_v1_router.include_router(dns_router)
-api_v1_router.include_router(firewall_router)
-api_v1_router.include_router(port_forwarding_router)
-api_v1_router.include_router(mac_authorization_router)
+api_v1_router.include_router(queue_management_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(isp_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(isp_routing_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(vlan_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(dhcp_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(dns_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(firewall_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(port_forwarding_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(mac_authorization_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(connected_devices_router)
 api_v1_router.include_router(device_sync_router)
 api_v1_router.include_router(controller_logs_router)
 api_v1_router.include_router(admin_logs_router)
-api_v1_router.include_router(network_config_router)
-api_v1_router.include_router(hotspot_router)
-api_v1_router.include_router(qos_router)
+api_v1_router.include_router(network_config_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(hotspot_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(qos_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(network_diagnostics_router)
-api_v1_router.include_router(network_device_router)
-api_v1_router.include_router(monitored_hardware_router)
-api_v1_router.include_router(content_filtering_router)
+api_v1_router.include_router(network_device_router, dependencies=_PAID_WRITES)
+# Two routers, one prefix. The customer/platform CRUD half is a paid
+# feature; the guest-facing portal authorize half must never be, for the
+# reason spelled out in the licence-gating note above.
+api_v1_router.include_router(
+    network_integration_router, dependencies=_PAID_WRITES
+)
+api_v1_router.include_router(network_integration_portal_router)
+api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(campaigns_guest_router)
-api_v1_router.include_router(campaigns_router)
-api_v1_router.include_router(notification_router)
-api_v1_router.include_router(api_keys_router)
+api_v1_router.include_router(campaigns_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(notification_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(api_keys_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(audit_router)
 api_v1_router.include_router(dashboard_router)
 api_v1_router.include_router(workspace_router)
@@ -132,7 +202,8 @@ api_v1_router.include_router(agent_permissions_router)
 api_v1_router.include_router(live_sessions_router)
 api_v1_router.include_router(customer_provisioning_router)
 api_v1_router.include_router(system_router)
-api_v1_router.include_router(branding_router)
+api_v1_router.include_router(system_settings_router)
+api_v1_router.include_router(branding_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)
 api_v1_router.include_router(demo_booking_router)

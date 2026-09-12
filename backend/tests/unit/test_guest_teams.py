@@ -378,6 +378,18 @@ class FakeGuestTeamRepository:
         existing = {t.team_code for t in self.teams.values()}
         return [c for c in codes if c in existing]
 
+    async def list_active_teams_for_portal(
+        self, organization_id: uuid.UUID, location_id: uuid.UUID | None
+    ) -> list[GuestTeam]:
+        return [
+            t
+            for t in self.teams.values()
+            if t.organization_id == organization_id
+            and t.status == "active"
+            and not t.is_deleted
+            and (t.location_id == location_id or t.location_id is None)
+        ]
+
     async def create_member(self, **fields: object) -> GuestTeamMember:
         member = GuestTeamMember(**_base_fields(**fields))
         self.members[member.id] = member
@@ -596,6 +608,117 @@ async def _create_active_team(
         expires_at=expires_at,
     )
     return team, organization.id
+
+
+# ============================================================================
+# Open-teams listing (the sign-in screen's "which group do you belong to?")
+# ============================================================================
+
+
+class TestOpenTeams:
+    async def test_open_lists_active_and_unlimited_teams(self) -> None:
+        service, _, _, _ = _build_service()
+        organization = service.organization_lookup.add()
+        await service.create_team(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            organization_id=organization.id,
+            location_id=None,
+            name="Unlimited",
+            max_members=None,
+            shared_data_limit_mb=None,
+            expires_at=None,
+        )
+        open_teams = await service.list_open_teams(
+            organization_id=organization.id, location_id=None
+        )
+        assert [t.name for t, _ in open_teams] == ["Unlimited"]
+
+    async def test_open_excludes_revoked_team(self) -> None:
+        service, team_repo, _, _ = _build_service()
+        organization = service.organization_lookup.add()
+        team = await service.create_team(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            organization_id=organization.id,
+            location_id=None,
+            name="Revoked",
+            max_members=None,
+            shared_data_limit_mb=None,
+            expires_at=None,
+        )
+        await team_repo.update_team(team, {"status": GuestTeamStatus.REVOKED.value})
+        open_teams = await service.list_open_teams(
+            organization_id=organization.id, location_id=None
+        )
+        assert open_teams == []
+
+    async def test_open_excludes_full_team_but_includes_open_one(self) -> None:
+        service, team_repo, _, _ = _build_service()
+        organization = service.organization_lookup.add()
+        full_team = await service.create_team(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            organization_id=organization.id,
+            location_id=None,
+            name="Full",
+            max_members=1,
+            shared_data_limit_mb=None,
+            expires_at=None,
+        )
+        guest_id = uuid.uuid4()
+        await team_repo.create_member(
+            team_id=full_team.id, guest_id=guest_id, is_active=True
+        )
+        await service.create_team(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            organization_id=organization.id,
+            location_id=None,
+            name="Open",
+            max_members=2,
+            shared_data_limit_mb=None,
+            expires_at=None,
+        )
+        open_teams = await service.list_open_teams(
+            organization_id=organization.id, location_id=None
+        )
+        assert [t.name for t, _ in open_teams] == ["Open"]
+
+    async def test_open_scopes_to_location_plus_org_wide(self) -> None:
+        service, _, _, _ = _build_service()
+        organization = service.organization_lookup.add()
+        location = service.location_lookup.add(organization_id=organization.id)
+        location_id = location.id
+        await service.create_team(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            organization_id=organization.id,
+            location_id=location_id,
+            name="Loc Team",
+            max_members=None,
+            shared_data_limit_mb=None,
+            expires_at=None,
+        )
+        await service.create_team(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            organization_id=organization.id,
+            location_id=None,
+            name="Org Wide",
+            max_members=None,
+            shared_data_limit_mb=None,
+            expires_at=None,
+        )
+        open_teams = await service.list_open_teams(
+            organization_id=organization.id, location_id=location_id
+        )
+        assert {t.name for t, _ in open_teams} == {"Loc Team", "Org Wide"}
+        # A different location sees only the org-wide team.
+        other_open = await service.list_open_teams(
+            organization_id=organization.id, location_id=uuid.uuid4()
+        )
+        assert [t.name for t, _ in other_open] == ["Org Wide"]
 
 
 # ============================================================================

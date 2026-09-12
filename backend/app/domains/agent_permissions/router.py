@@ -11,7 +11,12 @@ import uuid
 from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
-from app.domains.rbac.dependencies import RequirePermission
+from app.domains.auth.models import AuthUser
+from app.domains.rbac.dependencies import (
+    CurrentOrganization,
+    CurrentUser,
+    RequirePermission,
+)
 
 from .dependencies import get_agent_permission_service
 from .schemas import (
@@ -37,9 +42,12 @@ def _request_id(request: Request) -> str:
 )
 async def get_suggested_roles(
     request: Request,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AgentPermissionService = Depends(get_agent_permission_service),
 ):
-    payload = await service.get_suggested_roles()
+    payload = await service.get_suggested_roles(
+        requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Suggested roles retrieved",
@@ -77,9 +85,16 @@ async def assign_agent_permissions(
     request: Request,
     agent_id: uuid.UUID,
     body: AgentPermissionAssignRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AgentPermissionService = Depends(get_agent_permission_service),
 ):
-    payload = await service.assign_agent_permissions(agent_id, body)
+    payload = await service.assign_agent_permissions(
+        agent_id,
+        body,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message=payload.message,

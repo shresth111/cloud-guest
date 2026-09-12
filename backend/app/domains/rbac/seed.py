@@ -137,11 +137,24 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # Guest Access Control: CRUD plus IMPORT/EXPORT for the bulk load and
+    # round-trip of a property's Always Allowed list -- its own permission
+    # pair rather than riding on ``guest_access.create``, because one
+    # request here rewrites the guest-access table for a whole venue and,
+    # under whitelist-only mode, that table is the venue's door. Mirrors
+    # PermissionModule.MAC_AUTHORIZATION's own identical inclusion of both
+    # actions for the same "bulk-load/download a whitelist" shape. Both
+    # fall inside GrantLevel.OPERATE (see ``expand_grant_level``), so every
+    # role already holding GUEST_ACCESS: OPERATE gains them -- which is
+    # correct: those are the front-desk and site-manager roles that
+    # maintain the list today, one number at a time.
     PermissionModule.GUEST_ACCESS: (
         _A.CREATE,
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        _A.IMPORT,
+        _A.EXPORT,
         _A.MANAGE,
     ),
     PermissionModule.GUEST_TEAMS: (
@@ -192,10 +205,28 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        # EXECUTE now also gates POST /port-forwarding/rules/{id}/push --
+        # realizing a DSTNAT rule on a real router, which is a different
+        # privilege from editing the row. Same distinction as DHCP/VLAN
+        # below, but unlike theirs this action already existed on this
+        # module, so plugging the port-forwarding domain into a real device
+        # needs no re-seed on deploy. (Worth stating: vlan.execute shipped
+        # without the seed being run, and the Apply button 403'd against a
+        # working adapter until it was.)
         _A.EXECUTE,
         _A.MANAGE,
     ),
-    PermissionModule.DHCP: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
+    PermissionModule.DHCP: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        # EXECUTE gates POST /dhcp-pools/{id}/push -- realizing a pool on a
+        # real router, which is a different privilege from editing the row.
+        # Same distinction, and the same tuple shape, as VLAN below.
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
     PermissionModule.DNS: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
     PermissionModule.HOTSPOT: (
         _A.CREATE,
@@ -317,18 +348,29 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # VLAN Management: same CRUD+MANAGE shape as PermissionModule
     # .ISP_ROUTING -- a pure rules/inventory domain, no EXECUTE action in
     # this pass (see app.domains.vlan.service's own module docstring).
+    # VLAN gained EXECUTE when the domain gained a real device push
+    # (POST /vlans/{id}/push -- see app.domains.vlan.device_adapters).
+    # EXECUTE, not UPDATE: editing a row and reaching into a live router are
+    # different privileges, and the row edit must not require the second.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook. Shipping the push endpoint
+    # without re-running the seed gives every operator a 403 on it.
+    # expand_grant_level already folds EXECUTE into OPERATE and FULL, so no
+    # role table changes are needed.
     PermissionModule.VLAN: (
         _A.CREATE,
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        _A.EXECUTE,
         _A.MANAGE,
     ),
     # PermissionModule.DHCP's own action tuple already exists above
     # (seeded ahead of any real domain, like PermissionModule.BANDWIDTH
     # was for queue_management) -- this build reuses it as-is for
-    # app.domains.dhcp rather than minting a second key, and its shape
-    # already matches (CREATE/READ/UPDATE/DELETE/MANAGE, no EXECUTE).
+    # app.domains.dhcp rather than minting a second key. It now also
+    # carries EXECUTE, for the device push that domain gained.
     # MAC Authorization: CRUD plus IMPORT/EXPORT for its own bulk
     # operations -- mirrors PermissionModule.VOUCHER's own inclusion of
     # both actions for the identical "bulk-load/download a whitelist"
@@ -421,16 +463,28 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # roles, and GrantLevel.FULL resolve to (CREATE, READ, MANAGE) for
     # admin roles that triage/resolve tickets -- see expand_grant_level.
     PermissionModule.SUPPORT_TICKETS: (_A.CREATE, _A.READ, _A.MANAGE),
-    # Content Filtering: a plain CRUD rules/inventory domain -- no
-    # EXECUTE, since this domain has no device-facing action of its own
-    # (real device push is composed via app.domains.network_config's own
-    # EXECUTE-gated push endpoint instead), mirroring QOS/DHCP/VLAN's
-    # identical shape.
+    # Content Filtering: CRUD on the rules plus EXECUTE, the same
+    # CRUD+EXECUTE+MANAGE shape as PermissionModule.DHCP/VLAN above.
+    # EXECUTE gates POST /content-filter-rules/{id}/push -- realizing a
+    # blocked site on a real router, which is a different privilege from
+    # editing the row that describes it. This comment previously said the
+    # opposite ("no EXECUTE, since this domain has no device-facing action
+    # of its own ... real device push is composed via network_config's own
+    # EXECUTE-gated push endpoint instead"); that composition never
+    # existed, which is how a customer came to be shown a site as blocked
+    # that no router had ever been told about.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook. Shipping the push
+    # endpoint without re-running the seed gives every operator a 403 on
+    # it. expand_grant_level already folds EXECUTE into OPERATE and FULL,
+    # so no role table changes are needed.
     PermissionModule.CONTENT_FILTERING: (
         _A.CREATE,
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        _A.EXECUTE,
         _A.MANAGE,
     ),
     # Quotations: CREATE covers the one-shot "generate the PDF + email it"
@@ -455,6 +509,26 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # the future deactivate/reactivate action (see models.py's `status`
     # column comment -- no API surface for it yet).
     PermissionModule.CHANNEL_PARTNERS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # Network Integrations: plain CRUD on the integration row plus MANAGE
+    # (the platform-console enable/disable, a real admin action distinct
+    # from a field edit -- the same reasoning
+    # PermissionModule.NETWORK_DEVICE's own entry above documents for its
+    # compliance-assessment endpoint). Deliberately the identical 5-action
+    # shape as NETWORK_DEVICE, and deliberately *no* EXECUTE: every route
+    # this domain exposes is gated on .read/.create/.update/.delete (the
+    # test-connection/sync/credential-rotation endpoints are all .update,
+    # since each one changes stored state on the row it targets), so an
+    # EXECUTE here would be a permission key no route ever checks -- dead
+    # permission data that reads like a capability. If a genuinely
+    # device-facing action with no persisted effect ever lands here, it
+    # gets EXECUTE then, with a route to point at.
+    PermissionModule.NETWORK_INTEGRATIONS: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -516,6 +590,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.QUOTATIONS: "Quotations",
     PermissionModule.READINESS: "Router Readiness Checklist",
     PermissionModule.CHANNEL_PARTNERS: "Channel Partners",
+    PermissionModule.NETWORK_INTEGRATIONS: "Network Integrations",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -640,6 +715,38 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # identical ScopeType.GLOBAL reasoning as PermissionModule.QUOTATIONS'
     # own entry above.
     PermissionModule.CHANNEL_PARTNERS: ScopeType.GLOBAL,
+    # ScopeType.GLOBAL -- and this one is a *product* decision, not a
+    # property of the row, so it is worth stating plainly rather than
+    # reasoning from the model's nullable columns the way the entries
+    # above do.
+    #
+    # A third-party network controller (TP-Link Omada) is onboarded,
+    # credentialled, mapped, repaired and removed from the Master console
+    # only. Every new customer and every new venue is set up by platform
+    # staff, who hold the controller's address and its login; a venue
+    # admin never sees any of it. The routes enforce that directly --
+    # every authenticated route in
+    # ``app.domains.network_integration.router`` names
+    # ``scope=ScopeType.GLOBAL`` (see that module's docstring) -- and this
+    # entry is the seed-data half of the same statement: with GLOBAL as
+    # the narrowest allowed scope, ``allowed_scope_types_for_module``
+    # returns ``(GLOBAL,)``, no ORGANIZATION/LOCATION/ROUTER permission-
+    # scope row is ever created for these keys, and
+    # ``test_rbac``'s "every module a system role grants must be
+    # assignable at that role's scope" check *fails* for any
+    # organization- or location-scoped role that still carries them. That
+    # test is what makes this line load-bearing instead of decorative.
+    #
+    # This used to be ScopeType.LOCATION, on the reasoning that an
+    # integration's ``location_id`` is nullable so LOCATION is the
+    # narrowest *meaningful* scope. That reasoning was sound about the
+    # data and wrong about the audience.
+    #
+    # Identical GLOBAL-only shape to PermissionModule.DEMO_REQUESTS /
+    # QUOTATIONS / CHANNEL_PARTNERS above, which is why every
+    # non-GLOBAL system role below now carries the same explicit
+    # ``_L.NONE`` override those three do.
+    PermissionModule.NETWORK_INTEGRATIONS: ScopeType.GLOBAL,
 }
 
 
@@ -865,6 +972,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- identical reasoning,
+            # and the one on this list that is a product decision rather
+            # than a property of the row: a third-party network controller
+            # is onboarded and credentialled from the Master console only.
+            # See MODULE_NARROWEST_SCOPE's own entry.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -893,6 +1006,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
+            # identical override above.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -935,6 +1051,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
+            # identical override above.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -965,6 +1084,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
+            # identical override above.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1001,6 +1123,26 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
             _M.READINESS: _L.FULL,
             _M.NETWORK_DEVICE: _L.FULL,
+            # NETWORK_INTEGRATIONS is GLOBAL-only now (see
+            # MODULE_NARROWEST_SCOPE) -- a LOCATION-scoped role can never
+            # hold any of its permissions, the same shape as this file's
+            # DEMO_REQUESTS/QUOTATIONS/CHANNEL_PARTNERS overrides.
+            #
+            # This override used to read _L.FULL, and argued that
+            # connecting a venue's own Omada controller was "squarely this
+            # role's job". Under the product decision recorded on that
+            # MODULE_NARROWEST_SCOPE entry it is not: a controller is
+            # onboarded and credentialled from the Master console for
+            # every new customer and every new venue, and a venue-side
+            # role -- however technical -- must not reach the controller's
+            # address, its login, or the probe that opens an outbound
+            # connection to a host of the caller's choosing.
+            #
+            # Removing it from this definition is not, on its own, enough
+            # for a database that has already been seeded: the seeder is
+            # additive. See RETIRED_NON_GLOBAL_MODULES below, which is
+            # what actually revokes the rows this line used to create.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,
@@ -1042,6 +1184,11 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
             _M.READINESS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
+            # GLOBAL-only -- see Network Administrator's own identical
+            # override above and MODULE_NARROWEST_SCOPE. This used to be
+            # _L.OPERATE for the same "this location's own network
+            # controller" reason, retired for the same product decision.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
             # Day-to-day network operations plainly includes knowing
             # whether THIS location's own internet uplink is up (ISP) and
             # what hardware is registered on its network (MONITORED_
@@ -1186,6 +1333,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEMO_REQUESTS: _L.NONE,
             _M.QUOTATIONS: _L.NONE,
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only too -- and note what this
+            # line withholds: at _L.READ this role held
+            # network_integrations.read, which serves the controller's
+            # base_url, its Omada id and its site/SSID mapping to anyone
+            # with tenant-wide "read-only visibility".
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1200,6 +1353,14 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         overrides={
             _M.AUDIT_LOGS: _L.FULL,
             _M.SYSTEM_SETTINGS: _L.NONE,
+            # DEVICE_CONSOLE is ROUTER-scope (see its own MODULE_ACTIONS
+            # comment) -- an ORGANIZATION-scoped role can never hold it, and
+            # leaving it at default READ made the Auditor role unassignable:
+            # the escalation guard requires the assigner (an org owner) to
+            # already hold every permission the role grants, and owners never
+            # hold ROUTER-scope device-console access. Same override every
+            # other org-scope role carries.
+            _M.DEVICE_CONSOLE: _L.NONE,
             # DEMO_REQUESTS is GLOBAL-only -- see Read Only's own identical
             # override above.
             _M.DEMO_REQUESTS: _L.NONE,
@@ -1207,6 +1368,11 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
             _M.CHANNEL_PARTNERS: _L.NONE,
+            # NETWORK_INTEGRATIONS is GLOBAL-only -- see Read Only's own
+            # identical override above. An auditor's trail into this domain
+            # is the audit log (_L.FULL above), which records every
+            # controller action without exposing the controller.
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1235,6 +1401,51 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
 
 
 # ============================================================================
+# Grants this seed used to create and no longer does
+# ============================================================================
+
+# ``seed_rbac`` is otherwise purely additive -- every write is preceded by an
+# existence check and nothing is ever deleted -- which is the right default:
+# an operator may legitimately have attached an extra permission to a system
+# role through the roles UI, and a seeder that reconciled the whole grant set
+# every deploy would silently undo their work.
+#
+# The cost of that default is that *removing* a module from a
+# ``SystemRoleDefinition`` above has no effect on any database that has
+# already been seeded. Deleting ``_M.NETWORK_INTEGRATIONS: _L.FULL`` from
+# Network Administrator changes what a fresh database gets and leaves every
+# existing Network Administrator holding ``network_integrations.create``,
+# ``.read``, ``.update``, ``.delete`` and ``.manage`` forever. That is not a
+# theoretical gap: those rows are what an organization-scoped session
+# actually presents at the routes, and the routes are the thing being
+# closed.
+#
+# So the retirement is stated explicitly, as narrowly as it can be:
+#
+#   * only the modules named here,
+#   * only on roles this file owns (``is_system_role``, matched by slug from
+#     ``SYSTEM_ROLES``),
+#   * and only on roles whose ``scope_type`` is not GLOBAL -- Super Admin,
+#     Platform Admin and Platform Support keep every one of these keys,
+#     because the Master console is where the surface moved *to*.
+#
+# It is idempotent (a grant already absent is not an error and is not
+# counted) and it is a no-op on a fresh database, where the additive pass
+# never created the rows in the first place.
+#
+# A module belongs here only once it is GLOBAL-only in
+# MODULE_NARROWEST_SCOPE *and* removed from every non-GLOBAL role's grants
+# above; the two halves are checked against each other in
+# ``tests/unit/test_seed.py``.
+RETIRED_NON_GLOBAL_MODULES: tuple[PermissionModule, ...] = (
+    # Controller configuration and credentials are Master-console-only --
+    # see this module's MODULE_NARROWEST_SCOPE entry and
+    # ``app.domains.network_integration.router``'s docstring.
+    PermissionModule.NETWORK_INTEGRATIONS,
+)
+
+
+# ============================================================================
 # Seeding entrypoint
 # ============================================================================
 
@@ -1246,6 +1457,9 @@ class SeedSummary:
     permission_scopes_created: int = 0
     roles_created: int = 0
     role_permissions_created: int = 0
+    #: Grants deleted from an already-seeded system role because the module
+    #: is now GLOBAL-only. See RETIRED_NON_GLOBAL_MODULES.
+    role_permissions_revoked: int = 0
 
 
 async def seed_rbac(session: AsyncSession) -> SeedSummary:
@@ -1323,6 +1537,24 @@ async def seed_rbac(session: AsyncSession) -> SeedSummary:
                         role.id, permission.id, granted_by=None
                     )
                     summary.role_permissions_created += 1
+
+        # The one subtractive pass, and it runs after the additive one on
+        # purpose: if a module were ever both granted above and retired here,
+        # the retirement is the statement that wins rather than a race
+        # between two loops. Today that cannot happen -- the modules named
+        # in RETIRED_NON_GLOBAL_MODULES are absent from every non-GLOBAL
+        # role's `grants()` -- and the ordering keeps it true if it ever
+        # stops being.
+        if role_def.scope_type is not ScopeType.GLOBAL:
+            for module in RETIRED_NON_GLOBAL_MODULES:
+                for action in MODULE_ACTIONS[module]:
+                    permission = permission_by_key[permission_key(module, action)]
+                    if permission.id not in existing_permission_ids:
+                        continue
+                    if await repository.remove_role_permission(
+                        role.id, permission.id
+                    ):
+                        summary.role_permissions_revoked += 1
 
     logger.info("rbac_seed_completed", extra=vars(summary))
     return summary

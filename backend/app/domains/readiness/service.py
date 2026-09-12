@@ -35,14 +35,25 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from app.domains.network_integration.validators import (
+    describe_portal_readiness_gaps,
+    portal_readiness_gaps,
+)
+from app.domains.router.vendor_capabilities import (
+    NOT_APPLICABLE_REASON,
+    is_agent_managed,
+)
+
 from .constants import (
     CHECKLIST_ITEMS,
     CHECKLIST_ITEMS_BY_KEY,
     FAILING_STATUSES,
+    NOT_APPLICABLE_STATUSES,
     PASSING_STATUSES,
     ChecklistItemKey,
     ChecklistItemStatus,
     DetectionMode,
+    checklist_items_for,
 )
 from .exceptions import UnknownChecklistItemError
 from .models import RouterChecklistItem
@@ -79,6 +90,80 @@ class WireGuardLookupProtocol(Protocol):
     ) -> Any: ...
 
 
+class ConfigVersionLookupProtocol(Protocol):
+    """The one read this domain needs from ``router_provisioning``: has any
+    rendered configuration ever actually been applied to this router?
+
+    Narrow on purpose, and satisfied by the real
+    ``RouterProvisioningService.list_versions`` -- the same
+    "smallest interface the sibling already implements" convention every
+    other lookup in this module follows."""
+
+    async def list_versions(
+        self,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        page: int = ...,
+        page_size: int = ...,
+    ) -> tuple[list[Any], object]: ...
+
+
+class RogueDhcpStatusLookupProtocol(Protocol):
+    """The one read this domain needs from ``dhcp``: what did the last
+    rogue-DHCP detection pass see on this router's interfaces?
+
+    Satisfied by the real ``DhcpService.get_rogue_dhcp_statuses`` -- the
+    same "smallest interface the sibling already implements" convention
+    every other lookup in this module follows.
+
+    **This read touches the database only.** That is a requirement of this
+    Protocol, not an accident of its current implementation:
+    ``get_checklist`` re-runs every AUTO item on every GET, so any
+    collaborator here is on a hot request path. The device read that
+    produced these rows happens on a six-hour schedule in
+    ``app.domains.dhcp.tasks``, off the request path entirely. A future
+    implementation that reached for a router here would silently put a
+    RouterOS timeout behind a dashboard page load.
+
+    No ``requesting_organization_id`` parameter, deliberately.
+    ``get_checklist`` has already resolved the router through its own
+    org-scoped ``router_lookup.get_router`` before ``_run_auto_detection``
+    is reached, so authorization has happened. Passing an org id here that
+    the implementation then ignored in favour of the router id would be the
+    exact shape of the path-id scoping defect this codebase has found
+    across a number of handlers: the permission check reads one thing and
+    the query reads another.
+    """
+
+    async def get_rogue_dhcp_statuses(self, router_id: uuid.UUID) -> list[Any]: ...
+
+
+class NetworkIntegrationLookupProtocol(Protocol):
+    """The one read this domain needs from ``network_integration``: which
+    integration row, if any, this controller-managed fleet row belongs to.
+
+    **This read touches the database only**, and that is a requirement of
+    the Protocol rather than an accident -- exactly as it is for
+    ``RogueDhcpStatusLookupProtocol`` above, and for the same reason.
+    ``get_checklist`` re-runs every AUTO item on every GET, so an
+    implementation that asked the controller here would put a live HTTPS
+    round trip to a customer's Omada box behind a dashboard page load, and
+    a controller that is merely slow would look like a checklist that
+    hangs.
+
+    No ``requesting_organization_id`` parameter, for the same reason
+    ``RogueDhcpStatusLookupProtocol`` has none: ``get_checklist`` has
+    already resolved the router through its own org-scoped
+    ``router_lookup.get_router``, so authorization has happened. Passing an
+    org id that the implementation then ignored in favour of the router id
+    would be the shape of the path-id scoping defect this codebase has
+    found across a number of handlers.
+    """
+
+    async def find_integration_for_router(self, router_id: uuid.UUID) -> Any | None: ...
+
+
 class RouterAgentCredentialLookupProtocol(Protocol):
     async def get_credential_for_router(self, router_id: uuid.UUID) -> Any | None: ...
 
@@ -93,12 +178,30 @@ class ReadinessService:
         isp_lookup: IspLinkLookupProtocol,
         wireguard_lookup: WireGuardLookupProtocol,
         router_agent_lookup: RouterAgentCredentialLookupProtocol,
+        config_version_lookup: ConfigVersionLookupProtocol | None = None,
+        rogue_dhcp_lookup: RogueDhcpStatusLookupProtocol | None = None,
+        network_integration_lookup: NetworkIntegrationLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.isp_lookup = isp_lookup
         self.wireguard_lookup = wireguard_lookup
         self.router_agent_lookup = router_agent_lookup
+        # Optional so every existing construction of this service keeps
+        # working unchanged; when absent, the guest-data-path check falls
+        # back to the ISP-link evidence alone and says so rather than
+        # silently passing.
+        self.config_version_lookup = config_version_lookup
+        # Optional for the same reason ``config_version_lookup`` above is:
+        # every existing construction of this service keeps working
+        # unchanged. When absent, ROGUE_DHCP_GUARD reports NOT_CHECKED and
+        # says why, rather than silently passing a router nobody looked at.
+        self.rogue_dhcp_lookup = rogue_dhcp_lookup
+        # Optional for the same reason the two above are. When absent,
+        # CONTROLLER_INTEGRATION reports NOT_CHECKED and says the lookup
+        # is not wired -- never PASS. A missing collaborator must not be
+        # able to produce a green tick over a venue nobody has checked.
+        self.network_integration_lookup = network_integration_lookup
 
     # ========================================================================
     # Read path
@@ -122,7 +225,7 @@ class ReadinessService:
         }
 
         rows: list[RouterChecklistItem] = []
-        for definition in CHECKLIST_ITEMS:
+        for definition in checklist_items_for(agent_managed=is_agent_managed(router)):
             key = definition.key.value
             if key in auto_results:
                 status_value, detail, evidence = auto_results[key]
@@ -162,11 +265,19 @@ class ReadinessService:
         not_checked = sum(
             1 for r in rows if r.status == ChecklistItemStatus.NOT_CHECKED.value
         )
+        not_applicable = sum(
+            1 for r in rows if r.status in _values(NOT_APPLICABLE_STATUSES)
+        )
         return {
             "total": len(rows),
             "passing": passing,
             "failing": failing,
             "not_checked": not_checked,
+            # Additive fifth bucket -- `total` still counts every row, so a
+            # caller that only reads the original four sees no change in
+            # them. See ChecklistItemStatus.NOT_APPLICABLE for why this is
+            # not folded into either of the other two.
+            "not_applicable": not_applicable,
         }
 
     # ========================================================================
@@ -186,6 +297,11 @@ class ReadinessService:
         await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # CHECKLIST_ITEMS_BY_KEY, not DEFINITIONS_BY_KEY, and deliberately:
+        # this is the CONFIRMABLE set. CONTROLLER_INTEGRATION is absent
+        # from it, so an operator cannot tick "controller integration" by
+        # hand over a venue that authorizes nobody -- see that item's own
+        # note in `constants`.
         if item_key not in CHECKLIST_ITEMS_BY_KEY:
             raise UnknownChecklistItemError(item_key)
         return await self.repository.upsert_item(
@@ -209,6 +325,40 @@ class ReadinessService:
         self, router: Any, *, requesting_organization_id: uuid.UUID | None
     ) -> dict[str, tuple[ChecklistItemStatus, str, dict[str, Any]]]:
         results: dict[str, tuple[ChecklistItemStatus, str, dict[str, Any]]] = {}
+
+        if not is_agent_managed(router):
+            # Contract §11.5. Every auto check below asks a question about a
+            # MikroTik running a platform agent, and this device is not one
+            # -- a TP-Link Omada controller has no agent, no WireGuard peer
+            # and no RouterOS API. Running them would produce seven FAILs
+            # for a venue that is working perfectly, which is exactly the
+            # "reported as a broken MikroTik" failure the vendor gating
+            # exists to prevent.
+            #
+            # Marked NOT_APPLICABLE rather than skipped, so the checklist
+            # says why it is empty instead of looking like it has not run
+            # yet. Manual items are untouched: an operator confirming "guest
+            # sign-in works at this venue" by hand is just as meaningful for
+            # an Omada site as for a MikroTik one.
+            not_applicable = (
+                ChecklistItemStatus.NOT_APPLICABLE,
+                NOT_APPLICABLE_REASON,
+                {"vendor": getattr(router, "vendor", None)},
+            )
+            for definition in CHECKLIST_ITEMS:
+                if definition.detection_mode == DetectionMode.AUTO:
+                    results[definition.key.value] = not_applicable
+            # The one question that IS answerable here, and the only thing
+            # that can actually be wrong with an Omada venue. Written after
+            # the loop so it cannot be overwritten by the blanket
+            # NOT_APPLICABLE above -- a checklist of nothing but "does not
+            # apply" is honest and useless, and it is what an operator was
+            # shown while their venue authorized nobody.
+            results[ChecklistItemKey.CONTROLLER_INTEGRATION.value] = (
+                await self._check_controller_integration(router)
+            )
+            return results
+
         results[ChecklistItemKey.HEARTBEAT.value] = self._check_heartbeat(router)
         results[ChecklistItemKey.SAAS_PROVISIONING.value] = (
             await self._check_saas_provisioning(router)
@@ -218,13 +368,102 @@ class ReadinessService:
                 router, requesting_organization_id=requesting_organization_id
             )
         )
+        results[ChecklistItemKey.GUEST_DATA_PATH.value] = (
+            await self._check_guest_data_path(
+                router, requesting_organization_id=requesting_organization_id
+            )
+        )
         results[ChecklistItemKey.WIREGUARD.value] = await self._check_wireguard(
             router, requesting_organization_id=requesting_organization_id
         )
         results[ChecklistItemKey.API_REACHABILITY.value] = self._check_api_reachability(
             router
         )
+        results[ChecklistItemKey.ROGUE_DHCP_GUARD.value] = (
+            await self._check_rogue_dhcp_detection(router)
+        )
         return results
+
+    async def _check_controller_integration(
+        self, router: Any
+    ) -> tuple[ChecklistItemStatus, str, dict[str, Any]]:
+        """Has anyone finished pointing this controller at a site?
+
+        ## Why this is a readiness item and not only an alert
+
+        An operator can complete the Master onboarding wizard and stop --
+        the wizard itself says the site/SSID mapping happens elsewhere,
+        because listing sites needs an authenticated call which needs
+        stored credentials which need the row the wizard is only creating
+        at that moment. Everything then looks done. The integration exists,
+        the fleet row exists, and `authorize_portal_client` refuses every
+        guest at the venue.
+
+        Nothing pushes that fact anywhere, so it has to be waiting on the
+        surface an operator opens when they ask "is this venue ready" --
+        which is this checklist. An alert rule would be the other half, and
+        it is opt-in: a rule nobody created fires for nobody.
+
+        ## FAIL, not NOT_CHECKED
+
+        The three gaps are read out of rows this platform owns; there is no
+        uncertainty to be honest about. A device that cannot authorize a
+        single guest is failing, and `FAILING_STATUSES` is what makes the
+        summary count say so.
+        """
+        if self.network_integration_lookup is None:
+            # Never PASS. A collaborator that was not wired must not be
+            # able to produce a green tick over a venue nobody looked at --
+            # the same posture ROGUE_DHCP_GUARD takes when its lookup is
+            # absent.
+            return (
+                ChecklistItemStatus.NOT_CHECKED,
+                "The network-integration lookup is not wired into this "
+                "service, so this device's controller mapping has not been "
+                "checked.",
+                {"lookup_available": False},
+            )
+
+        integration = await self.network_integration_lookup.find_integration_for_router(
+            router.id
+        )
+        if integration is None:
+            return (
+                ChecklistItemStatus.FAIL,
+                "This controller has no network integration linked to it, so "
+                "nothing can authorize a guest at this venue.",
+                {"integration_linked": False},
+            )
+
+        gaps = portal_readiness_gaps(integration)
+        evidence: dict[str, Any] = {
+            "integration_linked": True,
+            "integration_id": str(getattr(integration, "id", "")) or None,
+            "integration_status": getattr(integration, "status", None),
+            "is_enabled": bool(getattr(integration, "is_enabled", False)),
+            "readiness_gaps": [gap.value for gap in gaps],
+        }
+        if gaps:
+            return (
+                ChecklistItemStatus.FAIL,
+                describe_portal_readiness_gaps(gaps),
+                evidence,
+            )
+        if not getattr(integration, "is_enabled", False):
+            # Reported separately from the gaps, because it is not an
+            # unfinished setup -- somebody switched it off. An operator
+            # sent to "finish the mapping" would find it already finished.
+            return (
+                ChecklistItemStatus.FAIL,
+                "This controller's integration is fully configured but "
+                "switched off, so it authorizes nobody.",
+                evidence,
+            )
+        return (
+            ChecklistItemStatus.PASS,
+            "This controller is linked to a finished, enabled integration.",
+            evidence,
+        )
 
     def _check_heartbeat(
         self, router: Any
@@ -319,6 +558,190 @@ class ReadinessService:
         return (
             ChecklistItemStatus.FAIL,
             "No enabled WAN link is currently passing its health check.",
+            evidence,
+        )
+
+    async def _check_guest_data_path(
+        self, router: Any, *, requesting_organization_id: uuid.UUID | None
+    ) -> tuple[ChecklistItemStatus, str, dict[str, Any]]:
+        """Has the platform ever asserted a route to the internet for this
+        router's guests?
+
+        FAIL, not NOT_CHECKED, when the answer is no. That distinction is
+        the entire point of this item. ``_check_wan_connectivity`` above
+        returns NOT_CHECKED for a router with no enabled ISP link, which is
+        right for a question about link health and is why nothing caught
+        the 2026-08-27 fault: NOT_CHECKED is absent from FAILING_STATUSES,
+        so "this router has no data path whatsoever" was summarised as
+        nothing being wrong. A venue that cannot serve a single guest is
+        not an unanswered question, it is a failure.
+
+        Two independent kinds of evidence, either of which is enough:
+
+        * an **enabled ISP link**, which is what makes
+          ``wan.assembler.render_basic_wan_config`` emit anything at all
+          (it short-circuits on ``if not ctx.links``), and with it the
+          discovered-uplink masquerade; or
+        * an **applied config version**, which means a rendered script --
+          now always carrying ``render_guest_data_path`` -- actually
+          reached the device.
+
+        Deliberately does NOT count a completed bootstrap as evidence, even
+        though the bootstrap script now asserts the data path itself. The
+        platform records that a router checked in, not which revision of
+        the script it ran, so treating enrollment as proof would be
+        inferring a fact from something that does not carry it -- the same
+        move that produced every other failure this week. If that becomes
+        the common case, the honest fix is for the device to report the
+        assertion, not for this check to assume it.
+        """
+        links, _meta = await self.isp_lookup.list_links(
+            requesting_organization_id=requesting_organization_id,
+            router_id=router.id,
+            page=1,
+            page_size=50,
+        )
+        enabled_links = [
+            link for link in links if getattr(link, "is_enabled", False)
+        ]
+        applied_versions: list[Any] = []
+        lookup_available = self.config_version_lookup is not None
+        if lookup_available:
+            versions, _vmeta = await self.config_version_lookup.list_versions(
+                router_id=router.id,
+                requesting_organization_id=requesting_organization_id,
+                page=1,
+                page_size=50,
+            )
+            applied_versions = [
+                version
+                for version in versions
+                if getattr(version, "status", None) == "applied"
+            ]
+        evidence = {
+            "enabled_link_count": len(enabled_links),
+            "applied_config_version_count": len(applied_versions),
+            "config_version_lookup_available": lookup_available,
+        }
+        if enabled_links or applied_versions:
+            return (
+                ChecklistItemStatus.PASS,
+                "A guest data path has been asserted for this router.",
+                evidence,
+            )
+        return (
+            ChecklistItemStatus.FAIL,
+            (
+                "No guest data path has ever been asserted for this router: "
+                "it has no enabled WAN link and no applied config version. "
+                "Guests will authenticate successfully and have no internet."
+            ),
+            evidence,
+        )
+
+    async def _check_rogue_dhcp_detection(
+        self, router: Any
+    ) -> tuple[ChecklistItemStatus, str, dict[str, Any]]:
+        """Is this router watching for a DHCP server on the guest network
+        that isn't ours?
+
+        Reads only the rows ``app.domains.dhcp.tasks``'s scheduled detector
+        persisted -- **no device I/O**, which is what allows an AUTO item
+        sourced from a real device fact to live on a read path that re-runs
+        on every GET. See ``RogueDhcpStatusLookupProtocol``.
+
+        ## Three outcomes, and why ``unknown`` is not one of the failures
+
+        * **FAIL** -- at least one interface where the device *answered*
+          and the answer was "nothing is watching this". That covers both
+          "no alert row at all" and "row present, ``enabled=False``" -- and
+          the second is the one RouterOS's own default produces, a row that
+          reads as configured in a ``/export`` and watches nothing.
+        * **NOT_CHECKED** -- no row yet (the detector has not reached this
+          router), or every row is ``unknown`` (it tried and could not get
+          an answer). ``ChecklistItemStatus.NOT_CHECKED`` is absent from
+          ``FAILING_STATUSES``, so this never counts against a venue.
+        * **PASS** -- every interface answered, and every one is watched.
+
+        A router the detector could not reach is **never** a FAIL. That is
+        not a nicety: an unreachable router is an unanswered question, and
+        answering it "unguarded" would raise a failure on every offline
+        router in the fleet that no operator could act on -- while telling
+        them nothing true about rogue DHCP. Same posture
+        ``app.domains.monitoring.constants.HealthStatus.UNKNOWN`` documents
+        for its own no-data-to-judge-from case; this codebase has been
+        bitten by collapsing the two more than once.
+
+        Note the ordering: a known-unguarded interface outranks an unknown
+        one. If one interface answered "nothing watching" and another timed
+        out, the failure is real and is reported -- it was established by a
+        device that answered, and the unknown beside it does not soften it.
+
+        ## Detection only
+
+        Every string this method produces says detection, never protection.
+        ``/ip dhcp-server alert`` logs and does nothing else -- see
+        ``constants.CHECKLIST_ITEMS``'s own note on this item.
+        """
+        if self.rogue_dhcp_lookup is None:
+            return (
+                ChecklistItemStatus.NOT_CHECKED,
+                "Rogue DHCP detection results are not available here.",
+                {"lookup_available": False},
+            )
+        rows = await self.rogue_dhcp_lookup.get_rogue_dhcp_statuses(router.id)
+        # Compared as plain strings rather than imported as an enum: this
+        # domain composes ``dhcp`` through a duck-typed Protocol and never
+        # imports its module, the same loose coupling every other lookup
+        # here keeps. The values are ``app.domains.dhcp.constants
+        # .RogueDhcpAlertState``.
+        unguarded = [r for r in rows if getattr(r, "alert_state", None) == "unguarded"]
+        unknown = [r for r in rows if getattr(r, "alert_state", None) == "unknown"]
+        guarded = [r for r in rows if getattr(r, "alert_state", None) == "guarded"]
+        last_checked = max(
+            (r.checked_at for r in rows if getattr(r, "checked_at", None)),
+            default=None,
+        )
+        evidence: dict[str, Any] = {
+            "lookup_available": True,
+            "interface_count": len(rows),
+            "guarded_count": len(guarded),
+            "unguarded_count": len(unguarded),
+            "unknown_count": len(unknown),
+            "unguarded_interfaces": [r.interface for r in unguarded],
+            "last_checked_at": last_checked.isoformat() if last_checked else None,
+        }
+        if not rows:
+            return (
+                ChecklistItemStatus.NOT_CHECKED,
+                "This router has not been checked for rogue DHCP detection yet.",
+                evidence,
+            )
+        if unguarded:
+            names = ", ".join(sorted(r.interface for r in unguarded))
+            return (
+                ChecklistItemStatus.FAIL,
+                (
+                    f"No rogue DHCP detection is active on: {names}. "
+                    "These interfaces hand out addresses, so another DHCP "
+                    "server on the segment would go unnoticed."
+                ),
+                evidence,
+            )
+        if unknown:
+            # Deliberately NOT a FAIL. We did not learn anything about this
+            # router; saying it is unwatched would be inventing a finding.
+            return (
+                ChecklistItemStatus.NOT_CHECKED,
+                (
+                    "The last check could not reach this router, so its "
+                    "rogue DHCP detection state is unknown."
+                ),
+                evidence,
+            )
+        return (
+            ChecklistItemStatus.PASS,
+            "Rogue DHCP detection is active on every interface serving DHCP.",
             evidence,
         )
 

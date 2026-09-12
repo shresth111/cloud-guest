@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -29,6 +30,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.captive_portal.constants import (
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
+)
+from app.domains.captive_portal.exceptions import CaptivePortalConfigNotFoundError
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest.constants import (
@@ -43,6 +48,7 @@ from app.domains.guest.constants import (
     RECONNECT_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
+    WHITELIST_ONLY_LOGIN_FAILURE_REASON,
     GuestAuthMethod,
     GuestSessionStatus,
     NasStatus,
@@ -87,6 +93,7 @@ from app.domains.guest.models import (
     GuestSession,
     RadiusNasClient,
 )
+from app.domains.guest.radius_bridge import RadiusBridgePushError
 from app.domains.guest.repository import (
     ActiveGuestOrgPair,
     AuthMethodOutcomeCounts,
@@ -114,12 +121,21 @@ from app.domains.guest.validators import (
     is_session_timed_out,
     validate_nas_status_transition,
 )
-from app.domains.guest_access.exceptions import GuestAccessDeniedError
+from app.domains.guest_access.constants import (
+    WHITELIST_ONLY_DENIAL_REASON,
+    AccessRuleType,
+)
+from app.domains.guest_access.exceptions import (
+    DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE,
+    GuestAccessDeniedError,
+    WhitelistOnlyAccessDeniedError,
+)
+from app.domains.guest_access.service import AccessDecision
 from app.domains.location.models import Location
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.exceptions import OtpCodeMismatchError
 from app.domains.queue_management.constants import QueueTargetType
-from app.domains.router.crypto import encrypt_secret
+from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
@@ -294,6 +310,14 @@ class FakeCaptivePortalService:
         voucher_enabled: bool = True,
         username_password_enabled: bool = False,
         pin_login_enabled: bool = False,
+        # The post-connect profile-capture flags. Default **on** here, and
+        # off in production -- see `make_fixture` for the reasoning; the
+        # divergence is deliberate and is the reason it is spelled out
+        # rather than inherited from the column default.
+        collect_guest_name: bool = True,
+        collect_guest_email: bool = True,
+        whitelist_only_enabled: bool = False,
+        whitelist_only_denied_message: str | None = None,
     ) -> CaptivePortalConfig:
         config = CaptivePortalConfig(
             **_base_fields(
@@ -326,6 +350,20 @@ class FakeCaptivePortalService:
                 pin_login_enabled=pin_login_enabled,
                 social_login_enabled=False,
                 social_login_providers=[],
+                collect_guest_name=collect_guest_name,
+                collect_guest_email=collect_guest_email,
+                review_card_enabled=False,
+                review_url=None,
+                guest_feedback_enabled=False,
+                feedback_dwell_minutes=DEFAULT_FEEDBACK_DWELL_MINUTES,
+                # Set explicitly, always. The column is NOT NULL with a
+                # server default of False, but a `CaptivePortalConfig`
+                # constructed in memory never sees the server default -- so
+                # leaving it out would make the attribute `None`, which is
+                # falsy and would let a broken gate "pass" for the wrong
+                # reason.
+                whitelist_only_enabled=whitelist_only_enabled,
+                whitelist_only_denied_message=whitelist_only_denied_message,
             )
         )
         self.configs_by_org[organization_id] = config
@@ -348,12 +386,33 @@ class FakeCaptivePortalService:
             resolved_via_location_override=False,
         )
 
+    async def get_config(
+        self,
+        config_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> CaptivePortalConfig:
+        for config in self.configs_by_org.values():
+            if config.id == config_id:
+                return config
+        raise CaptivePortalConfigNotFoundError(config_id)
+
 
 @dataclass
 class FakeRouterService:
     """Stand-in for ``RouterLookupProtocol``."""
 
     routers: dict[uuid.UUID, Router] = field(default_factory=dict)
+
+    def get_decrypted_api_secret(self, router: Router) -> str | None:
+        """The real ``RouterService`` decrypts ``api_credentials_encrypted``
+        with Fernet. These fakes never encrypt one, so a fixed plaintext
+        stands in -- what the device-push path needs is *a* secret and the
+        refusal behaviour when there is none, not a real key.
+        """
+        if getattr(router, "api_credentials_encrypted", None) is None:
+            return None
+        return "fake-api-secret"
 
     def add(
         self,
@@ -466,18 +525,41 @@ class FakeAccessControlHook:
     without constructing a real ``GuestAccessService``/repository. Denies
     any identifier/mac_address pair added via ``deny()``; allows everything
     else, mirroring the real ``AccessDecisionResolver``'s default-allow
-    posture."""
+    posture.
+
+    ``allow()`` registers a stand-in for an allow-shaped rule
+    (WHITELIST/VIP/TEMPORARY) -- only meaningful under
+    ``whitelist_only_enabled``, where "matched an allow rule" and "matched
+    nothing" stop being the same outcome.
+
+    Returns the **real** ``AccessDecision``, not a look-alike. The
+    whitelist-only refusal is discriminated by
+    ``AccessDecision.is_whitelist_only_denial``, which is derived from
+    ``rule_type``/``allowed``; a hand-rolled double would let this fake
+    invent a combination the real resolver cannot produce, which is exactly
+    how a gate test passes while the gate is broken.
+    """
 
     denied_identifiers: set[str] = field(default_factory=set)
     denied_macs: set[str] = field(default_factory=set)
+    allowed_identifiers: set[str] = field(default_factory=set)
+    allowed_macs: set[str] = field(default_factory=set)
     denial_reason: str | None = "blocked for testing"
     calls: list[dict[str, object]] = field(default_factory=list)
+    #: Set to raise from ``check_access`` -- the fail-open path.
+    raises: Exception | None = None
 
     def deny(self, *, identifier: str | None = None, mac_address: str | None = None):
         if identifier is not None:
             self.denied_identifiers.add(identifier)
         if mac_address is not None:
             self.denied_macs.add(mac_address.strip().upper())
+
+    def allow(self, *, identifier: str | None = None, mac_address: str | None = None):
+        if identifier is not None:
+            self.allowed_identifiers.add(identifier)
+        if mac_address is not None:
+            self.allowed_macs.add(mac_address.strip().upper())
 
     async def check_access(
         self,
@@ -487,6 +569,7 @@ class FakeAccessControlHook:
         location_id: uuid.UUID | None,
         identifier: str | None,
         mac_address: str | None,
+        whitelist_only_enabled: bool = False,
     ):
         self.calls.append(
             {
@@ -495,20 +578,41 @@ class FakeAccessControlHook:
                 "location_id": location_id,
                 "identifier": identifier,
                 "mac_address": mac_address,
+                "whitelist_only_enabled": whitelist_only_enabled,
             }
         )
+        if self.raises is not None:
+            raise self.raises
         normalized_mac = mac_address.strip().upper() if mac_address else None
         denied = (identifier in self.denied_identifiers) or (
             normalized_mac is not None and normalized_mac in self.denied_macs
         )
-
-        class _Decision:
-            def __init__(self, allowed: bool, reason: str | None) -> None:
-                self.allowed = allowed
-                self.reason = reason
-
-        return _Decision(
-            allowed=not denied, reason=self.denial_reason if denied else None
+        if denied:
+            return AccessDecision(
+                allowed=False,
+                rule_type=AccessRuleType.BLOCKLIST,
+                matched_rule_id=uuid.uuid4(),
+                reason=self.denial_reason,
+            )
+        allowed = (identifier in self.allowed_identifiers) or (
+            normalized_mac is not None and normalized_mac in self.allowed_macs
+        )
+        if allowed:
+            return AccessDecision(
+                allowed=True,
+                rule_type=AccessRuleType.WHITELIST,
+                matched_rule_id=uuid.uuid4(),
+                reason=None,
+            )
+        if whitelist_only_enabled:
+            return AccessDecision(
+                allowed=False,
+                rule_type=None,
+                matched_rule_id=None,
+                reason=WHITELIST_ONLY_DENIAL_REASON,
+            )
+        return AccessDecision(
+            allowed=True, rule_type=None, matched_rule_id=None, reason=None
         )
 
 
@@ -576,6 +680,47 @@ class FakeFupPolicyLookup:
 
 
 @dataclass
+class FakeLocationScopedFupPolicyLookup:
+    """A FUP policy assigned at LOCATION scope, which is the only scope the
+    dashboard's Guest WiFi Limits screen can produce.
+
+    Unlike ``FakeFupPolicyLookup`` above, this one actually looks at
+    ``location_id``, because that is the whole point: the real
+    ``PolicyRepository.list_candidate_assignments`` only adds its
+    LOCATION-scope predicate when a real ``location_id`` arrives, so a
+    caller that passes ``None`` resolves as if the assignment were not
+    there at all -- no error, no warning, just no limits. A fake that
+    ignored the argument would pass whether or not the caller supplied it,
+    and would have let the defect this models ship twice.
+
+    Records every ``location_id`` it is asked with so a test can assert on
+    what the caller actually passed, not merely on the outcome."""
+
+    fup_rules: dict[str, object] = field(default_factory=dict)
+    location_ids_seen: list[uuid.UUID | None] = field(default_factory=list)
+
+    async def resolve_effective_policy(
+        self,
+        *,
+        policy_type: object,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
+    ):
+        self.location_ids_seen.append(location_id)
+
+        class _Resolved:
+            def __init__(self, rules: dict[str, object]) -> None:
+                self.rules = rules
+
+        if location_id is None:
+            # An organization-scope resolution finds no location-scoped
+            # assignment. This is what the sweep used to get, every time.
+            return _Resolved({})
+        return _Resolved(dict(self.fup_rules))
+
+
+@dataclass
 class FakeQueueAssignmentHook:
     """Stand-in for ``QueueAssignmentProtocol`` -- lets speed-linked-voucher
     tests exercise ``GuestService._assign_voucher_queue``'s
@@ -629,10 +774,25 @@ class FakeMacAuthorizationHook:
     calls: list[dict[str, object]] = field(default_factory=list)
 
     async def is_mac_authorized(
-        self, mac_address: str, *, organization_id: uuid.UUID
+        self,
+        mac_address: str,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> bool:
+        # `location_id` is recorded, not filtered on. This double answers
+        # "is this MAC in the set", and the location predicate it stands in
+        # for is the real service's own -- reimplementing it here would mean
+        # the tests pass against a rule this fake invented rather than the
+        # one `MacAuthorizationService.is_mac_authorized` applies. What the
+        # tests need from the fake is that the caller PASSED a location at
+        # all, which `calls` now carries.
         self.calls.append(
-            {"mac_address": mac_address, "organization_id": organization_id}
+            {
+                "mac_address": mac_address,
+                "organization_id": organization_id,
+                "location_id": location_id,
+            }
         )
         return mac_address in self.whitelisted
 
@@ -644,6 +804,18 @@ class FakeGuestRepository:
     real repository's SQL aggregates compute (the same "test the arithmetic
     against a hand-rolled fake" convention ``test_voucher.py``'s
     ``FakeVoucherRepository.get_batch_status_counts`` already established)."""
+
+    async def commit(self) -> None:
+        """A no-op: this fake mutates objects in place, so there is no
+        transaction to commit.
+
+        Present because the RADIUS device-push path calls it deliberately --
+        the real repository only ``flush()``es and the session rolls back on
+        any exception, so a failure record has to be committed before the
+        re-raise. Its absence here would make that path untestable rather
+        than making the fake simpler.
+        """
+        return None
 
     guests: dict[uuid.UUID, Guest] = field(default_factory=dict)
     devices: dict[uuid.UUID, GuestDevice] = field(default_factory=dict)
@@ -658,6 +830,21 @@ class FakeGuestRepository:
     # (GuestService._enforce_device_limit's fetch reused via known_device,
     # not re-queried a second time by get_or_create_device).
     get_device_by_mac_call_count: int = 0
+    # Per-guest ``asyncio.Lock`` used by ``get_guest_for_update`` to
+    # emulate the real repository's ``SELECT ... FOR UPDATE`` row lock --
+    # see that method's own docstring. Internal bookkeeping, never fixture
+    # data, hence ``init=False``.
+    _guest_locks: dict[uuid.UUID, asyncio.Lock] = field(
+        default_factory=dict, init=False
+    )
+
+    def _release_guest_lock(self, guest_id: uuid.UUID) -> None:
+        """Releases this guest's emulated row lock if this fake currently
+        holds it -- called from ``create_session``/``update_session`` (see
+        ``get_guest_for_update`` for why those are the release points)."""
+        lock = self._guest_locks.get(guest_id)
+        if lock is not None and lock.locked():
+            lock.release()
 
     # -- guests ----------------------------------------------------------------
     async def create_guest(self, **fields: object) -> Guest:
@@ -669,6 +856,33 @@ class FakeGuestRepository:
         self, guest_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Guest | None:
         return self.guests.get(guest_id)
+
+    async def get_guest_for_update(self, guest_id: uuid.UUID) -> Guest | None:
+        """Emulates ``GuestRepository.get_guest_for_update`` (the real
+        ``SELECT ... FOR UPDATE`` row lock) with a per-guest
+        ``asyncio.Lock`` held until the holder's next mutating session
+        write for that guest (``create_session``/``update_session``) -- the
+        fake has no transaction, so that write is its closest analogue to
+        the real lock's release-at-commit. A concurrently-racing second
+        caller therefore blocks here until the first caller's session row
+        exists, exactly as it would block on the winner's open transaction
+        in Postgres, and its reuse read then finds that row. This is what
+        lets ``test_concurrent_double_submit_...`` race two genuinely
+        concurrent ``_reuse_or_create_session`` calls and observe the same
+        single-row outcome the database produces."""
+        lock = self._guest_locks.setdefault(guest_id, asyncio.Lock())
+        await lock.acquire()
+        # Yield once while holding the lock so a concurrently-started
+        # second caller is guaranteed to reach its own acquire (and block)
+        # before this caller finishes -- making the serialization the test
+        # is about actually observable rather than schedule-dependent.
+        await asyncio.sleep(0)
+        guest = self.guests.get(guest_id)
+        if guest is None:
+            # Nothing to hold the lock for -- release it so a later caller
+            # for the same (absent) guest does not deadlock.
+            lock.release()
+        return guest
 
     async def get_guest_by_identifier(
         self, organization_id: uuid.UUID, identifier: str
@@ -756,6 +970,89 @@ class FakeGuestRepository:
             ]
         return items
 
+    async def list_devices_for_session_ids(
+        self,
+        *,
+        device_ids,
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        """Mirrors the real query's tenancy question: a device is visible
+        if some session IN THIS ORGANIZATION used it -- deliberately not
+        ``list_devices_by_ids``'s "who owns the device row now", which a
+        device reassigned to another org's guest would fail."""
+        wanted = set(device_ids)
+        items = [
+            d for d in self.devices.values() if d.id in wanted and not d.is_deleted
+        ]
+        if organization_id is not None:
+            visible = {
+                s.device_id
+                for s in self.sessions.values()
+                if not s.is_deleted and s.organization_id == organization_id
+            }
+            items = [d for d in items if d.id in visible]
+        return items
+
+    async def list_devices_for_guest_ids(
+        self,
+        *,
+        guest_ids,
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        """Mirrors the real repository's ``last_seen_at DESC, id DESC``
+        ordering in Python -- that ordering is the contract
+        ``GuestResponse.mac_addresses[0] is the current device`` rests
+        on, so a fake that returned insertion order would let a broken
+        implementation pass."""
+        wanted = set(guest_ids)
+        items = [d for d in self.devices.values() if d.guest_id in wanted]
+        if organization_id is not None:
+            items = [
+                d
+                for d in items
+                if d.guest_id in self.guests
+                and self.guests[d.guest_id].organization_id == organization_id
+            ]
+        return sorted(items, key=lambda d: (d.last_seen_at, d.id), reverse=True)
+
+    async def list_voucher_redemptions(
+        self,
+        *,
+        voucher_ids,
+        organization_id: uuid.UUID | None,
+    ):
+        """Python mirror of the real ``row_number()``/``count()`` window
+        query: group this voucher's sessions, count them, and return the
+        most recent one with its device's MAC left-joined."""
+        from app.domains.guest.repository import VoucherRedemptionRow
+
+        wanted = set(voucher_ids)
+        by_voucher: dict[uuid.UUID, list[GuestSession]] = {}
+        for session in self.sessions.values():
+            if session.voucher_id not in wanted:
+                continue
+            if organization_id is not None and (
+                session.organization_id != organization_id
+            ):
+                continue
+            by_voucher.setdefault(session.voucher_id, []).append(session)
+        rows = []
+        for voucher_id, group in by_voucher.items():
+            newest = sorted(group, key=lambda s: (s.started_at, s.id), reverse=True)[0]
+            device = self.devices.get(newest.device_id) if newest.device_id else None
+            rows.append(
+                VoucherRedemptionRow(
+                    voucher_id=voucher_id,
+                    session_count=len(group),
+                    session_id=newest.id,
+                    guest_id=newest.guest_id,
+                    device_mac=device.mac_address if device else None,
+                    ip_address=newest.ip_address,
+                    started_at=newest.started_at,
+                )
+            )
+        return rows
+
     async def update_device(
         self, device: GuestDevice, data: dict[str, object]
     ) -> GuestDevice:
@@ -768,6 +1065,9 @@ class FakeGuestRepository:
     async def create_session(self, **fields: object) -> GuestSession:
         session = GuestSession(**_base_fields(**fields))
         self.sessions[session.id] = session
+        # The row now exists, which is what a concurrent caller blocked in
+        # get_guest_for_update is waiting to observe -- see that method.
+        self._release_guest_lock(session.guest_id)
         return session
 
     async def get_session_by_id(
@@ -781,6 +1081,9 @@ class FakeGuestRepository:
         for key, value in data.items():
             setattr(session, key, value)
         session.version += 1
+        # Reuse is the other way a session-creation critical section ends
+        # (no new row is inserted) -- see get_guest_for_update.
+        self._release_guest_lock(session.guest_id)
         return session
 
     async def list_sessions(
@@ -840,6 +1143,47 @@ class FakeGuestRepository:
             if s.guest_id == guest_id and s.status == GuestSessionStatus.ACTIVE.value
         )
 
+    async def count_active_devices_for_guest(
+        self, *, guest_id: uuid.UUID, exclude_device_id: uuid.UUID | None = None
+    ) -> int:
+        seen: set[uuid.UUID] = set()
+        for s in self.sessions.values():
+            if (
+                s.guest_id == guest_id
+                and s.status == GuestSessionStatus.ACTIVE.value
+                and s.device_id is not None
+                and (exclude_device_id is None or s.device_id != exclude_device_id)
+            ):
+                seen.add(s.device_id)
+        return len(seen)
+
+    async def get_latest_ended_session_for_device(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_id: uuid.UUID,
+        statuses: Sequence[str],
+        ended_after: datetime,
+    ) -> GuestSession | None:
+        """Mirrors the real statement in ``GuestRepository`` -- including
+        the ``ended_at >= ended_after`` bound, which is the privacy
+        window and so must be enforced by the fake too, or the tests
+        that assert an old session is not disclosed would pass against a
+        fake that never had the bound at all."""
+        if not statuses:
+            return None
+        items = [
+            s
+            for s in self.sessions.values()
+            if s.router_id == router_id
+            and s.device_id == device_id
+            and s.status in set(statuses)
+            and s.ended_at is not None
+            and s.ended_at >= ended_after
+        ]
+        items.sort(key=lambda s: s.ended_at, reverse=True)  # type: ignore[arg-type,return-value]
+        return items[0] if items else None
+
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
         return [
             s
@@ -868,18 +1212,24 @@ class FakeGuestRepository:
         ]
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
-        seen: set[tuple[uuid.UUID, uuid.UUID]] = set()
+        # DISTINCT over (guest, organization, LOCATION) -- mirrors the real
+        # repository's projection. The location is what lets the accrual
+        # sweep resolve a LOCATION-scoped FUP policy; leaving it out of the
+        # key here would hide exactly the defect the sweep tests exercise.
+        seen: set[tuple[uuid.UUID, uuid.UUID, uuid.UUID | None]] = set()
         pairs: list[ActiveGuestOrgPair] = []
         for s in self.sessions.values():
             if s.status != GuestSessionStatus.ACTIVE.value:
                 continue
-            key = (s.guest_id, s.organization_id)
+            key = (s.guest_id, s.organization_id, s.location_id)
             if key in seen:
                 continue
             seen.add(key)
             pairs.append(
                 ActiveGuestOrgPair(
-                    guest_id=s.guest_id, organization_id=s.organization_id
+                    guest_id=s.guest_id,
+                    organization_id=s.organization_id,
+                    location_id=s.location_id,
                 )
             )
         return pairs
@@ -1276,6 +1626,18 @@ def make_fixture(
     queue_assignment_hook: object | None = None,
     mac_authorization_hook: object | None = None,
     redis: FakeRedis | None = None,
+    # **On by default here, off by default in production.** The real
+    # column defaults false so that no venue starts collecting a guest's
+    # name or email because a migration decided for them -- the venue is
+    # the Data Fiduciary, not this platform. A test fixture is not a
+    # venue, and defaulting these off here would mean every test about the
+    # *authorisation* of a profile write would first have to opt in to the
+    # feature, burying the thing each test is actually about. Tests that
+    # care about the flags set them explicitly.
+    collect_guest_name: bool = True,
+    collect_guest_email: bool = True,
+    whitelist_only_enabled: bool = False,
+    whitelist_only_denied_message: str | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -1296,6 +1658,10 @@ def make_fixture(
         voucher_enabled=voucher_enabled,
         username_password_enabled=username_password_enabled,
         pin_login_enabled=pin_login_enabled,
+        collect_guest_name=collect_guest_name,
+        collect_guest_email=collect_guest_email,
+        whitelist_only_enabled=whitelist_only_enabled,
+        whitelist_only_denied_message=whitelist_only_denied_message,
     )
     captive_portal_service.add_location(location_id, organization_id)
     router = router_service.add(organization_id=organization_id, status=router_status)
@@ -1565,6 +1931,178 @@ class TestOtpLogin:
                 location_id=fx.location_id,
                 router_id=fx.router.id,
             )
+
+
+class TestConcurrentSessionCreationRace:
+    """Regression tests for the *concurrency* half of the duplicate-ACTIVE-
+    session defect documented on ``GuestService._reuse_or_create_session``
+    (the production incident left 18 rows for one guest across ~6.5 hours,
+    several only 7-13 minutes long): two near-simultaneous logins for the
+    same guest+router+device can both run the reuse read, both see "no
+    reusable ACTIVE session", and both insert a redundant ``ACTIVE`` row.
+    ``_reuse_or_create_session`` now takes a real row lock on the ``Guest``
+    row (``GuestRepository.get_guest_for_update``, ``SELECT ... FOR
+    UPDATE``) before that read, so concurrent calls serialize exactly like
+    sequential ones: exactly one session is ever created and the loser
+    reuses the winner's row. These tests race the method for real (the
+    fake repository's ``get_guest_for_update`` emulates the row lock) and
+    pin the lock's position relative to the reuse read."""
+
+    def _seed_guest_and_device(
+        self, fx: Fixture, *, mac: str = "AA:BB:CC:DD:EE:FF"
+    ) -> tuple[Guest, GuestDevice]:
+        now = _now()
+        guest = Guest(
+            **_base_fields(
+                organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                identifier="+15551234567",
+                first_seen_at=now,
+                last_seen_at=now,
+                total_visit_count=0,
+                is_blocked=False,
+                blocked_reason=None,
+            )
+        )
+        fx.repository.guests[guest.id] = guest
+        device = GuestDevice(
+            **_base_fields(
+                guest_id=guest.id,
+                mac_address=mac,
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        fx.repository.devices[device.id] = device
+        return guest, device
+
+    async def _reuse(
+        self,
+        fx: Fixture,
+        *,
+        guest: Guest,
+        device: GuestDevice | None,
+    ) -> tuple[GuestSession, bool]:
+        return await fx.guest_service._reuse_or_create_session(
+            guest=guest,
+            device=device,
+            router=fx.router,
+            location_id=fx.location_id,
+            auth_method=GuestAuthMethod.OTP_SMS,
+            voucher_id=None,
+            ip_address=None,
+            user_agent=None,
+            accept_language=None,
+            data_limit_mb=None,
+            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+        )
+
+    async def test_concurrent_double_submit_creates_one_session_not_two(
+        self,
+    ) -> None:
+        """The double-submit race itself: two ``_reuse_or_create_session``
+        calls for the same guest+router+device overlap in flight with no
+        session existing yet -- the exact window in which both callers
+        would otherwise see "no reusable ACTIVE session" and insert a
+        duplicate ``ACTIVE`` row. The guest-row lock (emulated by the fake
+        repository) serializes them, so exactly one ``ACTIVE`` session is
+        created and the loser reuses the winner's row: one caller gets
+        ``created=True``, the other ``created=False`` on the *same*
+        session id, and ``fx.repository.sessions`` holds one row, not
+        two."""
+        fx = make_fixture()
+        guest, device = self._seed_guest_and_device(fx)
+        real_read = fx.repository.list_active_sessions_for_guest
+
+        async def overlapping_read(
+            guest_id: uuid.UUID,
+        ) -> list[GuestSession]:
+            # Read first, then yield mid-call: this makes the racing
+            # second caller take its own reuse-read snapshot (also of the
+            # still-empty table) before either caller inserts -- the exact
+            # window in which the unguarded read-then-insert creates a
+            # duplicate row. With the guest-row lock in place the reads
+            # never overlap (the loser is still blocked on the lock),
+            # which is precisely what the assertion below verifies.
+            sessions = await real_read(guest_id)
+            await asyncio.sleep(0)
+            return sessions
+
+        fx.repository.list_active_sessions_for_guest = overlapping_read
+
+        first, second = await asyncio.gather(
+            self._reuse(fx, guest=guest, device=device),
+            self._reuse(fx, guest=guest, device=device),
+        )
+
+        assert {first[1], second[1]} == {True, False}, (
+            "exactly one of the two concurrent logins may create a session"
+        )
+        assert first[0].id == second[0].id
+        assert len(fx.repository.sessions) == 1
+        (only_session,) = fx.repository.sessions.values()
+        assert only_session.guest_id == guest.id
+        assert only_session.router_id == fx.router.id
+        assert only_session.device_id == device.id
+        assert only_session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_guest_row_lock_is_acquired_before_the_reuse_read(self) -> None:
+        """The guard's position is what makes it correct: the row lock must
+        be acquired *before* ``_find_reusable_active_session``'s read, or a
+        second caller could still slip its read in between the first
+        caller's read and insert. Asserts the call order directly, since
+        that ordering -- not the fake's emulation -- is what the real
+        database serialization depends on."""
+        fx = make_fixture()
+        guest, device = self._seed_guest_and_device(fx)
+        calls: list[str] = []
+        real_read = fx.repository.list_active_sessions_for_guest
+        real_lock = fx.repository.get_guest_for_update
+
+        async def recorded_read(guest_id: uuid.UUID) -> list[GuestSession]:
+            calls.append("reuse_read")
+            return await real_read(guest_id)
+
+        async def recorded_lock(guest_id: uuid.UUID) -> Guest | None:
+            calls.append("row_lock")
+            return await real_lock(guest_id)
+
+        fx.repository.list_active_sessions_for_guest = recorded_read
+        fx.repository.get_guest_for_update = recorded_lock
+
+        session, created = await self._reuse(fx, guest=guest, device=device)
+
+        assert created is True
+        assert calls == ["row_lock", "reuse_read"]
+
+    async def test_a_macless_login_never_takes_the_row_lock(self) -> None:
+        """A login that never presented a MAC cannot reuse anything (see
+        ``_find_reusable_active_session``'s "requires a real device_id"
+        write-up), so there is no read-then-insert race to serialize and no
+        row lock is taken -- preserving the existing MAC-less behavior
+        exactly."""
+        fx = make_fixture()
+        guest, _device = self._seed_guest_and_device(fx)
+        calls: list[str] = []
+        real_read = fx.repository.list_active_sessions_for_guest
+        real_lock = fx.repository.get_guest_for_update
+
+        async def recorded_read(guest_id: uuid.UUID) -> list[GuestSession]:
+            calls.append("reuse_read")
+            return await real_read(guest_id)
+
+        async def recorded_lock(guest_id: uuid.UUID) -> Guest | None:
+            calls.append("row_lock")
+            return await real_lock(guest_id)
+
+        fx.repository.list_active_sessions_for_guest = recorded_read
+        fx.repository.get_guest_for_update = recorded_lock
+
+        session, created = await self._reuse(fx, guest=guest, device=None)
+
+        assert created is True
+        assert session.device_id is None
+        assert calls == []
 
 
 # ============================================================================
@@ -2889,6 +3427,115 @@ class TestGuestQueueAssignmentIsOffTheRequestPath:
         assert recorded["target_type"] == QueueTargetType.SESSION
 
 
+class TestABandwidthChangeReachesAnAlreadyConnectedGuest:
+    """A venue's Guest WiFi Limits screen says, right above its Save
+    button, "Applies immediately -- including to guests already
+    connected." A guest's speed does not live on ``guest_sessions`` the
+    way their session/idle timeout does; it lives in a SESSION-targeted
+    ``QueueAssignment`` pointing at a ``QueueProfile``, and that
+    assignment is what ``RadiusService.authorize`` reads to compose the
+    ``Mikrotik-Rate-Limit`` reply attribute and what
+    ``QueueManagementService.apply_queue`` writes as a real RouterOS
+    ``/queue simple`` entry.
+
+    ``_reuse_or_create_session`` deliberately refreshes every *other*
+    entitlement onto a reused row -- ``session_timeout_minutes``,
+    ``idle_timeout_minutes``, ``data_limit_mb``, ``auth_method``,
+    ``voucher_id`` -- precisely so a returning guest gets what the venue
+    configured *now*, not what it had configured when their session was
+    first opened. Bandwidth was the one entitlement left behind, because
+    ``_assign_guest_queue`` sat inside every login method's ``if
+    created:`` block. A guest who never actually disconnects (each
+    re-login bumps ``last_activity_at``, so the session never ages out)
+    therefore kept the rate resolved at their very first login, for ever,
+    while the dashboard showed the new one. Bug report: "speed is only
+    set to 20 and not updating".
+
+    ``resolve_and_assign_queue`` is idempotent by construction -- an
+    unchanged rate returns the existing assignment without touching the
+    device, and a changed one goes through ``move_queue``, which applies
+    the new ``/queue simple`` *before* pulling the old one -- so running
+    it on a reused session is safe as well as necessary."""
+
+    @staticmethod
+    def _dispatcher(record: list[dict]):
+        async def _dispatch(**kwargs):
+            record.append(kwargs)
+
+        return _dispatch
+
+    async def _login(self, fx, ip: str = "10.0.0.5"):
+        return await fx.guest_service.login_via_otp(
+            identifier="regular@example.com",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:01",
+            ip_address=ip,
+        )
+
+    async def test_a_reused_session_re_resolves_its_bandwidth(self) -> None:
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        first = await self._login(fx)
+        second = await self._login(fx)
+
+        # The premise: this is the reuse path, not two separate sessions.
+        # If this ever stops holding, the test below stops meaning what
+        # it says, so it is asserted rather than assumed.
+        assert second.session.id == first.session.id
+
+        assert len(dispatched) == 2, (
+            "a returning guest's queue was never re-resolved, so a "
+            "bandwidth change made while they were connected never "
+            "reached them"
+        )
+        assert dispatched[1]["session_id"] == first.session.id
+        assert dispatched[1]["device_target"] == "10.0.0.5"
+
+    async def test_the_re_resolve_follows_a_new_dhcp_lease(self) -> None:
+        """The reuse path refreshes ``ip_address`` when the guest comes
+        back on a different lease. A ``/queue simple`` entry is bound to
+        one concrete IP, so the re-resolve has to carry the *new* address
+        or it would re-apply the rate to an address the guest no longer
+        holds."""
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        await self._login(fx, ip="10.0.0.5")
+        await self._login(fx, ip="10.0.0.77")
+
+        assert [d["device_target"] for d in dispatched] == ["10.0.0.5", "10.0.0.77"]
+
+    async def test_a_reused_session_still_skips_the_new_session_side_effects(
+        self,
+    ) -> None:
+        """Re-resolving the queue is the *only* thing that moves out of
+        ``if created:``. The visit counter and the real-time "a guest just
+        arrived" broadcast still describe an arrival that did not happen
+        on a reused row, and ``_assign_voucher_queue`` is not idempotent
+        (it creates a fresh assignment per call), so those stay put."""
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        first = await self._login(fx)
+        guest_id = first.session.guest_id
+        before = await fx.repository.get_guest_by_id(guest_id)
+        visits_after_first = before.total_visit_count
+
+        await self._login(fx)
+
+        assert (
+            await fx.repository.get_guest_by_id(guest_id)
+        ).total_visit_count == visits_after_first
+
+
 class TestFupQuotaReadsAreBatched:
     """Design spec §5 S9: the three-iteration quota loop issued one SELECT
     per period against the same table for the same guest."""
@@ -4068,8 +4715,9 @@ class TestConcurrentSessionLimit:
     async def test_login_raises_once_limit_reached(self) -> None:
         fx = make_fixture()
         identifier = "+15559990002"
+        last = None
         for _ in range(DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST):
-            await fx.guest_service.login_via_otp(
+            last = await fx.guest_service.login_via_otp(
                 identifier=identifier,
                 code="GOOD",
                 auth_method=GuestAuthMethod.OTP_SMS,
@@ -4091,6 +4739,18 @@ class TestConcurrentSessionLimit:
         assert exc_info.value.limit == DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
         # No new session row was created for the rejected attempt.
         assert len(fx.repository.sessions) == sessions_before
+        # The 409 text stays guest-safe: the captive portal renders this
+        # message verbatim on the guest's screen, so neither the internal
+        # Guest.id UUID nor the identifier may appear in it. The structured
+        # data keeps carrying the resolved limit untouched.
+        assert last is not None
+        assert str(last.guest.id) not in str(exc_info.value)
+        assert identifier not in str(exc_info.value)
+        assert "This account already has" in exc_info.value.message
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.data == {
+            "max_concurrent_sessions": DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
+        }
 
     async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
         """A guest already at the limit must never spend a real OTP
@@ -4193,7 +4853,12 @@ class TestDeviceLimit:
         assert is_device_limit_reached(device_count=3, limit=3) is True
         assert is_device_limit_reached(device_count=4, limit=3) is True
 
-    async def test_count_devices_for_guest_counts_distinct_macs(self) -> None:
+    async def test_count_active_devices_for_guest_counts_distinct_connected(
+        self,
+    ) -> None:
+        """The limit's basis: distinct devices holding ``ACTIVE`` sessions
+        right now -- a disconnected device (still registered) must not
+        count, and two ACTIVE sessions on the same device count once."""
         fx = make_fixture()
         identifier = "+15559990010"
         first = await fx.guest_service.login_via_otp(
@@ -4205,7 +4870,6 @@ class TestDeviceLimit:
             router_id=fx.router.id,
             device_mac="AA:BB:CC:DD:EE:01",
         )
-        await fx.guest_service.disconnect_session(session_id=first.session.id)
         await fx.guest_service.login_via_otp(
             identifier=identifier,
             code="GOOD",
@@ -4215,10 +4879,31 @@ class TestDeviceLimit:
             router_id=fx.router.id,
             device_mac="AA:BB:CC:DD:EE:02",
         )
-        count = await fx.repository.count_devices_for_guest(first.guest.id)
+        count = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id
+        )
         assert count == 2
+        # A reconnect of the first (still-active) device must not count
+        # against itself.
+        excluded = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id, exclude_device_id=first.device.id
+        )
+        assert excluded == 1
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        after_disconnect = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id
+        )
+        assert after_disconnect == 1
+        # The device row is still registered -- only the active count drops.
+        assert await fx.repository.count_devices_for_guest(first.guest.id) == 2
 
-    async def test_login_raises_once_device_limit_reached(self) -> None:
+    async def test_registered_but_idle_devices_never_block_a_new_connection(
+        self,
+    ) -> None:
+        """The QA report: a guest who has registered ``limit`` devices
+        over time (each now disconnected) must not be blocked on a new
+        connection -- the limit is on devices connected *at the same
+        time*, not devices ever registered."""
         fx = make_fixture()
         identifier = "+15559990011"
         for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
@@ -4231,34 +4916,31 @@ class TestDeviceLimit:
                 router_id=fx.router.id,
                 device_mac=f"AA:BB:CC:DD:EE:{index:02d}",
             )
-            # Disconnected between iterations so the (same-valued) concurrent
-            # session limit never trips before the device limit does -- see
-            # this class's own module-level discussion in the roadmap
-            # write-up. Disconnecting frees the session slot but leaves the
-            # GuestDevice row (and thus the device count) intact.
+            # Disconnect so the device is registered but NOT connected --
+            # under the old registered-device basis this was the setup that
+            # used to raise; under the connected basis it must not.
             await fx.guest_service.disconnect_session(session_id=result.session.id)
+        assert await fx.repository.count_devices_for_guest(result.guest.id) == (
+            DEFAULT_MAX_DEVICES_PER_GUEST
+        )
         devices_before = len(fx.repository.devices)
 
-        with pytest.raises(GuestDeviceLimitExceededError) as exc_info:
-            await fx.guest_service.login_via_otp(
-                identifier=identifier,
-                code="GOOD",
-                auth_method=GuestAuthMethod.OTP_SMS,
-                organization_id=None,
-                location_id=fx.location_id,
-                router_id=fx.router.id,
-                device_mac="AA:BB:CC:DD:EE:FF",
-            )
-        assert exc_info.value.limit == DEFAULT_MAX_DEVICES_PER_GUEST
-        # No new device row was created for the rejected attempt.
-        assert len(fx.repository.devices) == devices_before
+        new_result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:FF",
+        )
+        assert new_result.session.status == GuestSessionStatus.ACTIVE.value
+        # The new device registered (a 4th row is fine) and is online.
+        assert len(fx.repository.devices) == devices_before + 1
 
-    async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
-        """Mirrors ``TestConcurrentSessionLimit``'s identical-named test:
-        a guest already at the device limit must never spend a real OTP
-        verification attempt on a login that was always going to be
-        rejected -- see ``GuestService._enforce_device_limit``'s call-site
-        placement in ``login_via_otp``."""
+    async def test_login_raises_when_limit_devices_connected_at_once(self) -> None:
+        """The connected-basis block: with ``limit`` OTHER devices ACTIVE
+        right now, a new device's login raises ``GuestDeviceLimitExceededError``."""
         fx = make_fixture()
         identifier = "+15559990012"
         for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
@@ -4269,9 +4951,56 @@ class TestDeviceLimit:
                 organization_id=None,
                 location_id=fx.location_id,
                 router_id=fx.router.id,
+                device_mac=f"AB:BB:CC:DD:EE:{index:02d}",
+            )
+            assert result.session.status == GuestSessionStatus.ACTIVE.value
+        devices_before = len(fx.repository.devices)
+
+        with pytest.raises(GuestDeviceLimitExceededError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="AB:BB:CC:DD:EE:FF",
+            )
+        assert exc_info.value.limit == DEFAULT_MAX_DEVICES_PER_GUEST
+        # No new device row was created for the rejected attempt.
+        assert len(fx.repository.devices) == devices_before
+        # The 409 text stays guest-safe: the captive portal renders this
+        # message verbatim on the guest's screen, so neither the internal
+        # Guest.id UUID nor the identifier may appear in it. The structured
+        # data keeps carrying the resolved limit untouched.
+        assert str(result.guest.id) not in str(exc_info.value)
+        assert identifier not in str(exc_info.value)
+        assert "This account already has" in exc_info.value.message
+        assert "connected at the same time" in exc_info.value.message
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.data == {
+            "max_devices_per_guest": DEFAULT_MAX_DEVICES_PER_GUEST
+        }
+
+    async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
+        """Mirrors ``TestConcurrentSessionLimit``'s identical-named test:
+        a guest already at the connected-device limit must never spend a
+        real OTP verification attempt on a login that was always going to
+        be rejected -- see ``GuestService._enforce_device_limit``'s
+        call-site placement in ``login_via_otp``."""
+        fx = make_fixture()
+        identifier = "+15559990013"
+        for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
+            result = await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
                 device_mac=f"BB:CC:DD:EE:FF:{index:02d}",
             )
-            await fx.guest_service.disconnect_session(session_id=result.session.id)
+            assert result.session.status == GuestSessionStatus.ACTIVE.value
 
         with pytest.raises(GuestDeviceLimitExceededError):
             await fx.guest_service.login_via_otp(
@@ -4284,27 +5013,85 @@ class TestDeviceLimit:
                 device_mac="BB:CC:DD:EE:FF:FF",
             )
 
-    async def test_returning_device_never_counts_against_the_limit(self) -> None:
-        """The same MAC logging in repeatedly is a *returning* device, not
-        a new one -- ``_enforce_device_limit`` recognizes it via
-        ``get_device_by_mac`` + ``guest_id`` match and never raises,
-        regardless of how many times it reconnects."""
+    async def test_reconnect_of_an_already_online_device_never_counts_against_itself(
+        self,
+    ) -> None:
+        """At the limit, reconnecting a device that is ALREADY online (its
+        ``ACTIVE`` session is reused) is allowed: the device is excluded
+        from its own connected count, so a reconnect never looks like an
+        extra connection."""
         fx = make_fixture()
-        identifier = "+15559990013"
-        mac = "CC:DD:EE:FF:00:01"
-        for _ in range(DEFAULT_MAX_DEVICES_PER_GUEST + 2):
-            result = await fx.guest_service.login_via_otp(
+        identifier = "+15559990014"
+        results = []
+        for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
+            results.append(
+                await fx.guest_service.login_via_otp(
+                    identifier=identifier,
+                    code="GOOD",
+                    auth_method=GuestAuthMethod.OTP_SMS,
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                    device_mac=f"CC:DD:EE:FF:00:{index:02d}",
+                )
+            )
+        first = results[0]
+        again = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="CC:DD:EE:FF:00:00",
+        )
+        assert again.session.id == first.session.id  # reused, not a new row
+        connected = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id
+        )
+        assert connected == DEFAULT_MAX_DEVICES_PER_GUEST
+
+    async def test_returning_idle_device_is_blocked_when_limit_others_connected(
+        self,
+    ) -> None:
+        """The same guest's OWN device, back after its session ended while
+        ``limit`` OTHER devices are already connected, is a genuinely new
+        simultaneous connection -- and is blocked. Registered state alone
+        never grants a slot; only an ACTIVE session does."""
+        fx = make_fixture()
+        identifier = "+15559990015"
+        # Device A: registered, then disconnected (idle but still owned).
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="DD:EE:FF:00:11:00",
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        # Devices B/C/D: three ACTIVE connections (limit reached).
+        for index in range(1, DEFAULT_MAX_DEVICES_PER_GUEST + 1):
+            await fx.guest_service.login_via_otp(
                 identifier=identifier,
                 code="GOOD",
                 auth_method=GuestAuthMethod.OTP_SMS,
                 organization_id=None,
                 location_id=fx.location_id,
                 router_id=fx.router.id,
-                device_mac=mac,
+                device_mac=f"DD:EE:FF:00:11:{index:02d}",
             )
-            await fx.guest_service.disconnect_session(session_id=result.session.id)
-        count = await fx.repository.count_devices_for_guest(result.guest.id)
-        assert count == 1
+        with pytest.raises(GuestDeviceLimitExceededError):
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="DD:EE:FF:00:11:00",
+            )
 
     async def test_device_limit_check_is_skipped_when_no_device_mac(self) -> None:
         """A login with no ``device_mac`` at all registers no device, so it
@@ -4312,7 +5099,7 @@ class TestDeviceLimit:
         the guest is already sitting at the limit via other, MAC-bearing
         logins."""
         fx = make_fixture()
-        identifier = "+15559990014"
+        identifier = "+15559990016"
         for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
             result = await fx.guest_service.login_via_otp(
                 identifier=identifier,
@@ -4342,7 +5129,7 @@ class TestDeviceLimit:
         ``DEFAULT_MAX_DEVICES_PER_GUEST`` -- see
         ``GuestService._resolve_device_limit``."""
         fx = make_fixture(policy_lookup=FakeDevicePolicyLookup(max_devices_per_guest=1))
-        identifier = "+15559990015"
+        identifier = "+15559990017"
         first = await fx.guest_service.login_via_otp(
             identifier=identifier,
             code="GOOD",
@@ -4352,7 +5139,7 @@ class TestDeviceLimit:
             router_id=fx.router.id,
             device_mac="EE:FF:00:11:22:01",
         )
-        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        assert first.session.status == GuestSessionStatus.ACTIVE.value
 
         with pytest.raises(GuestDeviceLimitExceededError) as exc_info:
             await fx.guest_service.login_via_otp(
@@ -4620,6 +5407,20 @@ class TestEnforceFupQuotaLoginGate:
         assert exc_info.value.period_type == QuotaPeriodType.DAILY.value
         assert exc_info.value.metric == "data"
         assert exc_info.value.limit == 100
+        # The 409 text stays guest-safe: the captive portal renders this
+        # message verbatim on the guest's screen, so neither the internal
+        # Guest.id UUID nor the identifier may appear in it. The structured
+        # data keeps carrying the cap fields untouched.
+        assert str(first.guest.id) not in str(exc_info.value)
+        assert identifier not in str(exc_info.value)
+        assert "This account has used" in exc_info.value.message
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.data == {
+            "period_type": QuotaPeriodType.DAILY.value,
+            "metric": "data",
+            "limit": 100,
+            "used": 100,
+        }
 
     async def test_raises_once_a_configured_daily_time_cap_is_already_met(
         self,
@@ -4838,7 +5639,166 @@ class TestRecordUsageFupTracking:
         assert updated.status == GuestSessionStatus.ACTIVE.value
 
 
+# A fixed clock for this class, and it has to be fixed.
+#
+# Every test below establishes a quota window at `now` and then runs the
+# accrual at `now + N minutes`. With `now` taken from the real clock that is
+# a time bomb: `run_fup_time_accrual` calls `get_or_reset_quota_usage`, which
+# RESETS the window when the advanced `now` has crossed into the next period.
+# So a DAILY test that jumps 61 minutes fails for the whole hour before
+# midnight UTC -- `minutes_used` goes back to zero and nothing expires.
+#
+# That is not hypothetical: it failed a production deploy at 23:20 UTC on
+# 2026-09-10, and CI reported `assert 0 == 1` on a change that had nothing to
+# do with quotas. Four other tests here advance 10-15 minutes and carry the
+# same bug with a narrower window.
+#
+# Midday, mid-month, mid-week: leaves room before the next daily, weekly and
+# monthly boundary alike. The accrual reads only the quota row and the `now`
+# it is handed -- never a session's own timestamps -- so pinning this does not
+# desynchronize it from the sessions the fixtures create at the real clock.
+_FUP_NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
 class TestRunFupTimeAccrual:
+    async def test_the_sweep_resolves_with_the_guests_real_location(self) -> None:
+        """The sweep used to resolve with a hardcoded ``location_id=None``,
+        which made a LOCATION-scoped FUP assignment invisible to it.
+
+        That is the only scope the dashboard's Guest WiFi Limits screen can
+        produce, so this was not an edge case -- it was every venue that
+        ever set a daily time limit. And it was silent in the worst way,
+        because the two halves of the feature depend on each other: this
+        sweep is the only thing that ever WRITES ``minutes_used``, and the
+        login-time gate only READS it. With the sweep resolving no limits,
+        it skipped the guest, ``minutes_used`` stayed 0 for ever, and the
+        gate -- which by then resolved the location correctly -- had
+        nothing to fire on. The limit was set, stored, displayed, and
+        enforced by nothing.
+
+        Asserts on the argument, not just the outcome: a future change that
+        resolved the right rules by luck (an organization-scoped policy
+        that happened to match) would still leave location-scoped venues
+        broken, and this test would still catch it."""
+        fx = make_fixture()
+        await fx.guest_service.login_via_otp(
+            identifier="+15559990048",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 999_999}
+        )
+
+        await run_fup_time_accrual(fx.repository, policy_lookup, now=_FUP_NOW)
+
+        assert policy_lookup.location_ids_seen == [fx.location_id]
+        assert None not in policy_lookup.location_ids_seen
+
+    async def test_a_location_scoped_daily_limit_actually_accrues_and_expires(
+        self,
+    ) -> None:
+        """End to end for the setting as a venue actually creates it: a
+        daily time limit on a policy assigned to one location.
+
+        Fails outright before the location fix -- not by expiring late, but
+        by never accruing a single minute and never expiring anything, for
+        ever."""
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990049",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 60}
+        )
+        now = _FUP_NOW
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(usage, {"last_accrued_at": now})
+
+        summary = await run_fup_time_accrual(
+            fx.repository, policy_lookup, now=now + timedelta(minutes=61)
+        )
+
+        assert summary["expired_sessions"] == 1
+        after = await fx.repository.get_quota_usage(
+            result.guest.id, QuotaPeriodType.DAILY.value
+        )
+        assert after.minutes_used == 61
+        ended = fx.repository.sessions[result.session.id]
+        assert ended.status == GuestSessionStatus.EXPIRED.value
+        assert ended.disconnect_reason == "fup_time_quota_exceeded_daily"
+
+    async def test_a_guest_at_two_locations_accrues_their_minutes_once(self) -> None:
+        """Adding ``location_id`` to the sweep's DISTINCT means a guest
+        holding active sessions at two of an organization's locations now
+        appears as two rows.
+
+        Accruing per row would double their elapsed minutes and cut them
+        off at half their real allowance -- a regression introduced by the
+        fix above rather than by the original defect, which is exactly the
+        kind that ships unnoticed. Time is per guest, never summed across
+        concurrent sessions (see ``GuestQuotaUsage``'s own docstring); this
+        pins that the location grouping did not quietly change it."""
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990050",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        # A second active session for the same guest at a DIFFERENT
+        # location of the same organization.
+        second_location_id = uuid.uuid4()
+        await fx.repository.create_session(
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            location_id=second_location_id,
+            router_id=fx.router.id,
+            status=GuestSessionStatus.ACTIVE.value,
+            started_at=datetime.now(UTC),
+            last_activity_at=datetime.now(UTC),
+        )
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 999_999}
+        )
+        now = _FUP_NOW
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(usage, {"last_accrued_at": now})
+
+        await run_fup_time_accrual(
+            fx.repository, policy_lookup, now=now + timedelta(minutes=10)
+        )
+
+        after = await fx.repository.get_quota_usage(
+            result.guest.id, QuotaPeriodType.DAILY.value
+        )
+        # Ten minutes of connected time, not twenty.
+        assert after.minutes_used == 10
+        assert len(policy_lookup.location_ids_seen) == 2
+
     async def test_skips_guests_whose_org_has_no_time_limit_configured(self) -> None:
         fx = make_fixture()
         result = await fx.guest_service.login_via_otp(
@@ -4851,7 +5811,7 @@ class TestRunFupTimeAccrual:
         )
         policy_lookup = FakeFupPolicyLookup(fup_rules={})
         summary = await run_fup_time_accrual(
-            fx.repository, policy_lookup, now=datetime.now(UTC)
+            fx.repository, policy_lookup, now=_FUP_NOW
         )
         assert summary == {"accrued_rows": 0, "expired_sessions": 0}
         assert (
@@ -4874,7 +5834,7 @@ class TestRunFupTimeAccrual:
         policy_lookup = FakeFupPolicyLookup(
             fup_rules={"daily_time_limit_minutes": 999_999}
         )
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         # Pre-seed the row with a known last_accrued_at baseline (rather
         # than letting the first sweep tick accrue from period_start,
         # which -- at whatever real wall-clock time this test happens to
@@ -4912,7 +5872,7 @@ class TestRunFupTimeAccrual:
             device_mac="AA:11:22:33:44:01",
         )
         policy_lookup = FakeFupPolicyLookup(fup_rules={"daily_time_limit_minutes": 5})
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         summary = await run_fup_time_accrual(
             fx.repository, policy_lookup, now=now + timedelta(minutes=10)
         )
@@ -4950,7 +5910,7 @@ class TestRunFupTimeAccrual:
         policy_lookup = FakeFupPolicyLookup(
             fup_rules={"daily_time_limit_minutes": 999_999}
         )
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         # Pre-seed a known last_accrued_at baseline -- see the identical
         # note in test_accrues_elapsed_minutes_since_last_accrual.
         usage = await get_or_reset_quota_usage(
@@ -5150,6 +6110,557 @@ class TestAccessControlHookIntegration:
                 router_id=fx.router.id,
                 device_mac="aa:bb:cc:dd:ee:ff",
             )
+
+
+# ============================================================================
+# Per-property whitelist-only mode
+# ============================================================================
+
+
+class TestWhitelistOnlyLoginGate:
+    """The gate itself, at the service level: what happens to a guest who
+    matches nothing, at a property that admits only listed guests."""
+
+    async def test_off_by_default_an_unmatched_guest_still_gets_online(self) -> None:
+        """The state of every property on the platform. Stated first,
+        because it is the assertion that must never break."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559992001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        assert hook.calls[0]["whitelist_only_enabled"] is False
+
+    async def test_on_an_unmatched_guest_is_refused(self) -> None:
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert len(fx.repository.sessions) == 0
+        assert hook.calls[0]["whitelist_only_enabled"] is True
+
+    async def test_on_a_listed_guest_still_gets_online(self) -> None:
+        hook = FakeAccessControlHook()
+        hook.allow(identifier="+15559992003")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559992003",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_the_refusal_is_not_the_blocklist_error(self) -> None:
+        """"You are barred" and "this venue admits only listed guests" are
+        different facts and must not raise the same exception -- the portal
+        has to be able to say different things.
+
+        ``WhitelistOnlyAccessDeniedError`` deliberately does **not**
+        subclass ``GuestAccessDeniedError``, so this is a real
+        discrimination and not an inheritance accident.
+        """
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992004",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert not isinstance(exc_info.value, GuestAccessDeniedError)
+        assert exc_info.value.status_code == 403
+
+    async def test_a_blocklisted_guest_still_gets_the_blocklist_error(self) -> None:
+        """Turning whitelist-only on must not relabel existing blocks."""
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="+15559992005")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(GuestAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992005",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert not isinstance(exc_info.value, WhitelistOnlyAccessDeniedError)
+
+    async def test_the_operators_own_words_reach_the_guest(self) -> None:
+        hook = FakeAccessControlHook()
+        fx = make_fixture(
+            access_control_hook=hook,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message="Raise a ticket with IT to get access.",
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992006",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert "Raise a ticket with IT" in str(exc_info.value)
+
+    async def test_a_property_with_no_message_still_says_something_useful(
+        self,
+    ) -> None:
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992007",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert str(exc_info.value) == DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE
+
+    async def test_the_refusal_happens_before_the_otp_is_verified(self) -> None:
+        """A refused guest must not spend a real OTP attempt, exactly as a
+        blocklisted one does not."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992008",
+                code="WRONG",  # would raise OtpCodeMismatchError if reached
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    @pytest.mark.parametrize(
+        "method",
+        ["voucher", "password", "pin"],
+    )
+    async def test_every_login_method_is_gated(self, method: str) -> None:
+        """Not just OTP. A venue that closed its WiFi has closed it."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        identifier = f"+1555999{method[:2]}90"
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            if method == "voucher":
+                fx.voucher_service.register(
+                    "VWL", data_limit_mb=None, validity_minutes=60
+                )
+                await fx.guest_service.login_via_voucher(
+                    code="VWL",
+                    identifier=identifier,
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+            elif method == "password":
+                await fx.guest_service.login_via_password(
+                    identifier=identifier,
+                    password="whatever",
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+            else:
+                await fx.guest_service.login_via_pin(
+                    identifier=identifier,
+                    pin="123456",
+                    device_mac="aa:bb:cc:dd:ee:90",
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+
+
+class TestWhitelistOnlyReconcilesTrustedDevices:
+    """A trusted device's authorisation lives in ``mac_authorization_entries``
+    -- a table ``check_access`` does not query. Switching a property to
+    whitelist-only must not refuse every device an operator already
+    trusted, and must not make them keep the same MAC in two lists."""
+
+    async def test_a_trusted_device_is_admitted_without_a_second_list_entry(
+        self,
+    ) -> None:
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        access_hook = FakeAccessControlHook()  # no rule for this guest at all
+        fx = make_fixture(
+            access_control_hook=access_hook,
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559993001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="aa:bb:cc:dd:ee:f1",
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        # Scoped by location, not just organization -- a trust entry that
+        # names a location applies only there.
+        assert mac_hook.calls[-1]["location_id"] == fx.location_id
+
+    async def test_an_untrusted_device_is_still_refused(self) -> None:
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559993002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="aa:bb:cc:dd:ee:f2",
+            )
+
+    async def test_the_trusted_device_lookup_only_runs_on_the_denial_path(
+        self,
+    ) -> None:
+        """An ordinary property pays nothing for this reconciliation, and
+        neither does a listed guest at a whitelist-only one."""
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        access_hook = FakeAccessControlHook()
+        access_hook.allow(identifier="+15559993003")
+        fx = make_fixture(
+            access_control_hook=access_hook,
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        await fx.guest_service.login_via_otp(
+            identifier="+15559993003",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="aa:bb:cc:dd:ee:f1",
+        )
+        assert mac_hook.calls == []
+
+    async def test_mac_whitelist_login_is_not_refused_by_whitelist_only(self) -> None:
+        """``login_via_mac_whitelist`` is the path a trusted device takes at
+        RADIUS-authorize time. Before this reconciliation it would have been
+        refused by a gate that cannot see the table authorising it."""
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        result = await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        # One lookup, not two: that path already asked the same question
+        # for the same MAC before the gate ran.
+        assert len(mac_hook.calls) == 1
+
+    async def test_no_mac_hook_wired_still_refuses_rather_than_crashing(self) -> None:
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=None,
+            whitelist_only_enabled=True,
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559993004",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="aa:bb:cc:dd:ee:f3",
+            )
+
+
+class TestWhitelistOnlyRefusalsAreRecorded:
+    """Without a record, a venue has no way to discover their list is
+    wrong -- and every rule written before PR #160 was a bare national
+    number that could never match anyone."""
+
+    async def test_a_refusal_writes_a_login_history_row(self) -> None:
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559994001",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                ip_address="203.0.113.7",
+            )
+        assert len(fx.repository.login_history) == 1
+        row = fx.repository.login_history[0]
+        assert row.success is False
+        assert row.identifier == "+15559994001"
+        assert row.failure_reason == WHITELIST_ONLY_LOGIN_FAILURE_REASON
+        assert row.auth_method == GuestAuthMethod.OTP_SMS.value
+        assert row.location_id == fx.location_id
+        assert row.organization_id == fx.organization_id
+        assert row.ip_address == "203.0.113.7"
+
+    async def test_the_reason_distinguishes_it_from_every_other_failure(self) -> None:
+        """An operator's question is "who did we turn away for not being on
+        the list?", which they cannot answer if the refusal is spelled the
+        same as a wrong OTP or a block."""
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559994002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert (
+            fx.repository.login_history[0].failure_reason
+            != "GuestAccessDeniedError"
+        )
+        assert (
+            fx.repository.login_history[0].failure_reason
+            == WhitelistOnlyAccessDeniedError.__name__
+        )
+
+    async def test_an_admitted_guest_writes_no_refusal(self) -> None:
+        access_hook = FakeAccessControlHook()
+        access_hook.allow(identifier="+15559994003")
+        fx = make_fixture(
+            access_control_hook=access_hook, whitelist_only_enabled=True
+        )
+        await fx.guest_service.login_via_otp(
+            identifier="+15559994003",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert [r for r in fx.repository.login_history if not r.success] == []
+
+
+class TestWhitelistOnlyFailsOpen:
+    """The uncomfortable half, asserted rather than assumed."""
+
+    async def test_a_raising_rule_lookup_lets_the_guest_online(self) -> None:
+        """Failing closed at a whitelist-only property means *nobody* gets
+        online -- including the listed guests, the owner, and whoever is
+        trying to diagnose it -- and from the venue's side that is
+        indistinguishable from the feature working."""
+        hook = FakeAccessControlHook()
+        hook.raises = RuntimeError("connection pool exhausted")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559995001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_it_says_so_out_loud(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The one moment this platform knowingly does the opposite of what
+        a venue asked for. It must be visible in the log, or a fail-open is
+        indistinguishable from a list that was simply wide."""
+        import logging
+
+        hook = FakeAccessControlHook()
+        hook.raises = RuntimeError("connection pool exhausted")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with caplog.at_level(logging.WARNING, logger="app.domains.guest.service"):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559995002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        records = [
+            r for r in caplog.records if r.message == "whitelist_only_gate_failed_open"
+        ]
+        assert records, [r.message for r in caplog.records]
+        assert records[0].event_identifier == "+15559995002"
+
+    async def test_a_property_that_never_opted_in_keeps_raising(self) -> None:
+        """The swallow is scoped to the feature. A venue that never
+        switched whitelist-only on must not have its error behaviour
+        quietly changed by a feature it does not use."""
+        hook = FakeAccessControlHook()
+        hook.raises = RuntimeError("connection pool exhausted")
+        fx = make_fixture(access_control_hook=hook)  # whitelist-only off
+        with pytest.raises(RuntimeError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559995003",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_a_real_refusal_travelling_as_an_exception_is_not_swallowed(
+        self,
+    ) -> None:
+        """Fail-open must not become "any 403 from the gate means allow"."""
+        hook = FakeAccessControlHook()
+        hook.raises = GuestAccessDeniedError("abuse")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(GuestAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559995004",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+
+class TestCheckPortalAdmission:
+    """The gate on ``POST /otp/request`` -- refusing before the venue pays
+    for an SMS, at the service level. The routed version lives in
+    ``test_guest_login_composition.py``."""
+
+    async def test_an_unlisted_guest_is_refused_before_a_code_is_sent(self) -> None:
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.check_portal_admission(
+                identifier="+15559996001",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+            )
+
+    async def test_a_listed_guest_passes(self) -> None:
+        hook = FakeAccessControlHook()
+        hook.allow(identifier="+15559996002")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996002",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+        )
+
+    async def test_it_is_a_no_op_at_an_ordinary_property(self) -> None:
+        """Deliberately does **not** start enforcing blocklists at
+        OTP-request time: that is a behaviour change for every venue on the
+        platform and belongs to its own PR."""
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="+15559996003")
+        fx = make_fixture(access_control_hook=hook)  # whitelist-only off
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996003",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+        )
+        assert hook.calls == []
+
+    async def test_it_is_a_no_op_when_no_property_was_named(self) -> None:
+        """An account-level code carries no venue at all, and there is no
+        flag to read."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996004",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=None,
+        )
+        assert hook.calls == []
+
+    async def test_the_refusal_is_recorded(self) -> None:
+        """With the gate here, a refused OTP guest never reaches
+        ``/guest/login/otp`` at all -- so if this path did not record, a
+        whitelist-only venue's refusal list would be empty for the method
+        nearly all of them use."""
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.check_portal_admission(
+                identifier="+15559996005",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                ip_address="203.0.113.9",
+            )
+        assert len(fx.repository.login_history) == 1
+        row = fx.repository.login_history[0]
+        assert row.failure_reason == WHITELIST_ONLY_LOGIN_FAILURE_REASON
+        assert row.ip_address == "203.0.113.9"
+
+    async def test_a_trusted_device_passes_here_too(self) -> None:
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996006",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            device_mac="AA:BB:CC:DD:EE:F1",
+        )
+
+    async def test_a_failing_config_lookup_lets_the_guest_through(self) -> None:
+        """This path *does* add a lookup ``POST /otp/request`` never made
+        before. It fails in the same direction as the rest of the gate --
+        and the refusal still stands at login, which was always there."""
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996007",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=uuid.uuid4(),  # no config registered for this org
+            location_id=None,
+        )
 
 
 # ============================================================================
@@ -5583,6 +7094,208 @@ class TestPublicMacLoginEndpointRemoved:
 
 
 # ============================================================================
+# A login with no device_mac creates a session no consumer can see, until
+# the NAS asserts the MAC at Authorize time.
+# ============================================================================
+
+
+class TestMacLessSessionIsHealedByNasAssertion:
+    """``device_mac`` is optional on the OTP/voucher/password logins, so a
+    session with ``device_id IS NULL`` is a supported outcome. Three
+    consumers key on ``device_id`` and skip a NULL silently -- the captive
+    portal's own "already connected?" check among them -- so such a guest
+    is online, ACTIVE, and shown the sign-in form again.
+
+    Confirmed live: one iPhone, two OTP verifications 2m44s apart.
+
+    The contract these pin: such a session stays creatable (refusing it
+    would stop a guest on a link without RouterOS's ``$(mac)`` from
+    signing in at all), and becomes visible the moment a
+    shared-secret-authenticated NAS asserts its ``Calling-Station-Id``.
+    """
+
+    async def _register_and_authenticate_nas(
+        self, fx: Fixture, secret: str = "supersecret123"
+    ) -> RadiusNasClient:
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-1",
+            shared_secret=secret,
+        )
+        return await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret=secret
+        )
+
+    async def _login_without_mac(self, fx: Fixture, identifier: str) -> GuestSession:
+        result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.device is None
+        assert result.session.device_id is None
+        return result.session
+
+    async def test_a_macless_session_is_invisible_to_the_portals_own_check(
+        self,
+    ) -> None:
+        """The defect itself, pinned so it cannot be re-argued as
+        cosmetic: before any NAS speaks, the portal cannot find the
+        session it just created."""
+        fx = make_fixture()
+        await self._login_without_mac(fx, "+15551230001")
+
+        found = await fx.guest_service.get_active_session_for_device(
+            router_id=fx.router.id, device_mac="AA:BB:CC:DD:EE:01"
+        )
+
+        assert found is None
+
+    async def test_authorize_attaches_the_nas_asserted_device_to_the_session(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        session = await self._login_without_mac(fx, "+15551230002")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230002",
+            calling_station_id="AA:BB:CC:DD:EE:02",
+        )
+
+        assert authz.authorized is True
+        healed = await fx.repository.get_session_by_id(session.id)
+        assert healed is not None
+        assert healed.device_id is not None
+        device = await fx.repository.get_device_by_id(healed.device_id)
+        assert device is not None
+        assert device.mac_address == "AA:BB:CC:DD:EE:02"
+        assert device.guest_id == healed.guest_id
+
+    async def test_the_portal_can_find_the_session_once_the_nas_has_spoken(
+        self,
+    ) -> None:
+        """The guest-visible half: this is the lookup that returned
+        ``None`` and sent a real guest back through OTP a second time."""
+        fx = make_fixture()
+        await self._login_without_mac(fx, "+15551230003")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230003",
+            calling_station_id="AA:BB:CC:DD:EE:03",
+        )
+
+        found = await fx.guest_service.get_active_session_for_device(
+            router_id=fx.router.id, device_mac="AA:BB:CC:DD:EE:03"
+        )
+
+        assert found is not None
+        assert found.session.status == GuestSessionStatus.ACTIVE.value
+        assert found.device is not None
+        assert found.device.mac_address == "AA:BB:CC:DD:EE:03"
+
+    async def test_a_second_login_reuses_the_healed_session(self) -> None:
+        """``_find_reusable_active_session`` is the second consumer that
+        keys on ``device_id``. Once healed, the duplicate row that the
+        production incident produced is no longer created."""
+        fx = make_fixture()
+        session = await self._login_without_mac(fx, "+15551230004")
+        nas_client = await self._register_and_authenticate_nas(fx)
+        await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230004",
+            calling_station_id="AA:BB:CC:DD:EE:04",
+        )
+
+        second = await fx.guest_service.login_via_otp(
+            identifier="+15551230004",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:04",
+        )
+
+        assert second.session.id == session.id
+
+    async def test_adoption_is_idempotent_across_reauthentication(self) -> None:
+        """A real NAS re-sends Authorize on every periodic reauth. The
+        second one must not reassign, duplicate, or churn the row."""
+        fx = make_fixture()
+        session = await self._login_without_mac(fx, "+15551230005")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        for _ in range(3):
+            await fx.radius_service.authorize(
+                nas_client=nas_client,
+                username="+15551230005",
+                calling_station_id="AA:BB:CC:DD:EE:05",
+            )
+
+        healed = await fx.repository.get_session_by_id(session.id)
+        assert healed is not None
+        first_device_id = healed.device_id
+        assert first_device_id is not None
+        assert await fx.repository.count_devices_for_guest(healed.guest_id) == 1
+
+    async def test_a_session_that_already_has_a_device_is_left_alone(self) -> None:
+        """Adoption must never repoint a session that logged in with its
+        own MAC at a different one the NAS happens to assert."""
+        fx = make_fixture()
+        login = await fx.guest_service.login_via_otp(
+            identifier="+15551230006",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:06",
+        )
+        original_device_id = login.session.device_id
+        assert original_device_id is not None
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230006",
+            calling_station_id="99:99:99:99:99:99",
+        )
+
+        unchanged = await fx.repository.get_session_by_id(login.session.id)
+        assert unchanged is not None
+        assert unchanged.device_id == original_device_id
+
+    async def test_authorize_still_grants_when_adoption_fails(self) -> None:
+        """The repair must never change the verdict. A guest with a
+        verified OTP losing their internet because a device write failed
+        would be strictly worse than the defect being repaired."""
+        fx = make_fixture()
+        await self._login_without_mac(fx, "+15551230007")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        async def _boom(**_kwargs: object) -> GuestSession:
+            raise RuntimeError("device write failed")
+
+        fx.guest_service.adopt_nas_asserted_device = _boom  # type: ignore[method-assign]
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230007",
+            calling_station_id="AA:BB:CC:DD:EE:07",
+        )
+
+        assert authz.authorized is True
+
+
+# ============================================================================
 # RADIUS Accounting-On/Accounting-Off (RFC 2866 §5.13): NAS reboot/shutdown
 # closes every ACTIVE GuestSession tied to that NAS's router.
 # ============================================================================
@@ -5898,6 +7611,26 @@ class TestSharedSecretGeneration:
 
 
 class TestNasLifecycle:
+    @staticmethod
+    def _pusher() -> tuple[object, list[str]]:
+        """A stand-in for the real hub push, and the list of secrets it was
+        handed.
+
+        ``regenerate_secret`` takes this as a *required* argument, which is
+        the fix: before 2026-09-02 it wrote the new secret to the database
+        and told nobody, so a rotate left the row, the hub's ``client{}``
+        stanza and the router holding three different secrets and every
+        guest login at that venue Access-Rejecting silently. Deleting the
+        argument here is how you re-break it -- and a `TypeError` is what
+        you get, at every call site, rather than a green suite.
+        """
+        seen: list[str] = []
+
+        async def _push(secret: str) -> None:
+            seen.append(secret)
+
+        return _push, seen
+
     async def _register(self, fx: Fixture, **overrides: object):
         overrides.setdefault("nas_identifier", "nas-x")
         return await fx.radius_service.register_nas(
@@ -6058,12 +7791,16 @@ class TestNasLifecycle:
     async def test_regenerate_secret_invalidates_old_one(self) -> None:
         fx = make_fixture()
         result = await self._register(fx, shared_secret="original-secret")
+        push, pushed = self._pusher()
         regen = await fx.radius_service.regenerate_secret(
             nas_id=result.nas_client.id,
             requesting_organization_id=fx.organization_id,
             actor_user_id=uuid.uuid4(),
+            push_secret=push,
         )
         assert regen.shared_secret != "original-secret"
+        # The hub was handed exactly the secret the database now holds.
+        assert pushed == [regen.shared_secret]
         with pytest.raises(RadiusNasAuthenticationError):
             await fx.radius_service.authenticate_nas(
                 nas_identifier=result.nas_client.nas_identifier,
@@ -6087,8 +7824,117 @@ class TestNasLifecycle:
             nas_id=result.nas_client.id,
             requesting_organization_id=fx.organization_id,
             actor_user_id=uuid.uuid4(),
+            push_secret=self._pusher()[0],
         )
         assert regen.nas_client.status == NasStatus.DISABLED.value
+
+    # ========================================================================
+    # A rotate must never leave the database ahead of the hub
+    # ========================================================================
+    #
+    # The regression these exist for (2026-09-02):
+    # ``POST /radius/nas/{id}/regenerate-secret`` rotated the shared secret
+    # in the database and never pushed it to the FreeRADIUS hub. Three
+    # places then disagreed -- the row held the new secret, the hub's
+    # ``client{}`` stanza held the old one, the router held the old one --
+    # and FreeRADIUS answers an Access-Request authenticated with a secret
+    # that is not the one in ``clients.conf`` with a bare Access-Reject. So
+    # every guest login at the venue failed from that instant with nothing
+    # in any log naming the cause, and the 5-minute reconciliation sweep
+    # did not repair it: ``rebind_nas_for_router`` fires on *address* drift
+    # and deliberately re-pushes the stored secret, which a secret-only
+    # divergence never triggers.
+    #
+    # The endpoint was additionally wired to a button in the venue owner's
+    # own dashboard, where it reported success. See
+    # ``TestNasSecretRotationIsPlatformOnly`` for that half.
+
+    async def test_the_hub_is_told_before_the_row_is_written(self) -> None:
+        """The ordering *is* the fix. Asserted by having the push read the
+        stored secret at the moment it is called: if the row were written
+        first, the push would observe the new value."""
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="original-secret")
+        observed: list[str] = []
+
+        async def _push(secret: str) -> None:
+            stored = await fx.radius_service.get_nas_client(
+                result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+            )
+            observed.append(decrypt_secret(stored.shared_secret_encrypted))
+
+        await fx.radius_service.regenerate_secret(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            push_secret=_push,
+        )
+        assert observed == ["original-secret"]
+
+    async def test_a_refused_push_leaves_the_old_secret_working(self) -> None:
+        """A rotate that cannot reach the hub must fail loudly having
+        changed nothing -- the venue is still up on the old secret, which
+        the row, the hub and the device all still share.
+
+        This is the behaviour change operators may notice: rotation now
+        *fails* where it previously returned success having broken the
+        venue.
+        """
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="original-secret")
+
+        async def _boom(secret: str) -> None:
+            raise RadiusBridgePushError(
+                "config validation failed, reverted",
+                transport=False,
+                status_code=500,
+            )
+
+        with pytest.raises(RadiusBridgePushError):
+            await fx.radius_service.regenerate_secret(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+                actor_user_id=uuid.uuid4(),
+                push_secret=_boom,
+            )
+
+        authenticated = await fx.radius_service.authenticate_nas(
+            nas_identifier=result.nas_client.nas_identifier,
+            shared_secret="original-secret",
+        )
+        assert authenticated.id == result.nas_client.id
+
+    async def test_a_refused_push_writes_no_audit_row_either(self) -> None:
+        """Nothing happened, so nothing may claim it did. An audit entry for
+        a rotation that did not occur is the same lie in a slower medium.
+        """
+        fx = make_fixture()
+        result = await self._register(fx)
+        before = len(fx.audit_writer.entries)
+
+        async def _boom(secret: str) -> None:
+            raise RadiusBridgePushError("nope", transport=True, status_code=None)
+
+        with pytest.raises(RadiusBridgePushError):
+            await fx.radius_service.regenerate_secret(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+                actor_user_id=uuid.uuid4(),
+                push_secret=_boom,
+            )
+        assert len(fx.audit_writer.entries) == before
+
+    def test_regenerate_secret_cannot_be_called_without_a_push(self) -> None:
+        """The guarantee stated as a signature, so a future caller cannot
+        reintroduce the defect by simply not thinking about the hub."""
+        import inspect
+
+        param = inspect.signature(
+            RadiusService.regenerate_secret
+        ).parameters["push_secret"]
+        assert param.default is inspect.Parameter.empty
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
     async def test_delete_sets_terminal_status_and_soft_delete(self) -> None:
         fx = make_fixture()
@@ -6166,6 +8012,7 @@ class TestNasLifecycle:
             nas_id=result.nas_client.id,
             requesting_organization_id=fx.organization_id,
             actor_user_id=uuid.uuid4(),
+            push_secret=self._pusher()[0],
         )
         await fx.radius_service.update_nas_client(
             nas_id=result.nas_client.id,
@@ -6713,3 +8560,295 @@ def test_run_session_timeout_sweep_task_bridges_into_async(monkeypatch) -> None:
 
     result = tasks_module.run_session_timeout_sweep()
     assert result == {"expired_count": 3}
+
+
+# ============================================================================
+# Rotating a NAS shared secret is a platform operation, not a customer one
+# ============================================================================
+#
+# The other half of the 2026-09-02 defect. The rotate endpoint was gated on
+# bare ``radius.execute``, which ``organization-owner`` holds at
+# *organization* scope -- the role ``LocationProvisioningService`` assigns
+# to every venue owner it provisions -- and the customer dashboard wired a
+# "Regenerate secret" button in the venue owner's own NAS detail page
+# straight to it, with no confirmation at all.
+#
+# A rotation is irreversible for the device: nothing in this codebase can
+# write a RADIUS client onto RouterOS, so the new secret has to be pasted
+# in over WinBox before the venue works again. That makes it a site action
+# wearing an API call's clothes, and not one a venue owner can complete --
+# they got a success toast and a dead network. It now lives on
+# ``POST /platform/radius/nas/{id}/regenerate-secret`` at
+# ``ScopeType.GLOBAL``, the same posture ``GET /platform/routers/{id}`` and
+# the whole WireGuard domain already carry.
+
+
+class TestNasSecretRotationIsPlatformOnly:
+    """The NAS *lifecycle* routes are Master-console-only.
+
+    Named for the rotation because #93 got there first with one route.
+    Widened 2026-09-02 to the whole ``radius.execute`` key after
+    ``activate``/``disable`` were found still sitting on ``nas_router``,
+    reachable by every venue owner, with the same blast radius the rotate
+    route was moved for. The load-bearing assertion is now
+    ``test_no_radius_execute_route_is_org_scoped``, which is written against
+    the permission key rather than against today's three paths -- a fourth
+    ``radius.execute`` route added anywhere fails it by construction.
+    """
+
+    @staticmethod
+    def _routes_requiring(permission_key: str) -> list[object]:
+        """Every mounted route gated on ``permission_key``, found by reading
+        what ``RequirePermission`` actually closed over rather than by
+        guessing at paths -- a route can only hide from this by not using
+        the permission at all."""
+        from app.main import app
+
+        found = []
+        for route in app.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            for dep in dependant.dependencies:
+                if dep.call is None:
+                    continue
+                if (
+                    TestNasSecretRotationIsPlatformOnly._declared_permission(dep.call)
+                    == permission_key
+                ):
+                    found.append(route)
+                    break
+        return found
+
+    @staticmethod
+    def _rotate_routes() -> list[object]:
+        from app.main import app
+
+        return [
+            route
+            for route in app.routes
+            if str(getattr(route, "path", "")).endswith("/regenerate-secret")
+            and "nas" in str(getattr(route, "path", ""))
+        ]
+
+    @staticmethod
+    def _declared_permission(dependant_call) -> object:
+        """The ``permission_key`` ``RequirePermission`` was constructed with.
+
+        Same closure read as ``_declared_scope``, taking the ``str``.
+        ``RequireRole`` also closes over a ``str`` (a role slug), which is
+        harmless here: no role is slugged ``radius.execute``.
+        """
+        for cell in getattr(dependant_call, "__closure__", None) or ():
+            try:
+                contents = cell.cell_contents
+            except ValueError:  # pragma: no cover -- empty cell
+                continue
+            if isinstance(contents, str):
+                return contents
+        return None
+
+    @staticmethod
+    def _declared_scope(dependant_call) -> object:
+        """The ``scope=`` ``RequirePermission`` was constructed with.
+
+        It closes over the value rather than storing it on an attribute, so
+        this reads the closure. Unambiguous because the only other captured
+        free variable is the permission key, a ``str``.
+        """
+        from app.domains.rbac.enums import ScopeType
+
+        for cell in getattr(dependant_call, "__closure__", None) or ():
+            try:
+                contents = cell.cell_contents
+            except ValueError:  # pragma: no cover -- empty cell
+                continue
+            if isinstance(contents, ScopeType):
+                return contents
+        return None
+
+    def test_no_radius_execute_route_is_org_scoped(self) -> None:
+        """THE RULE, stated for the permission key rather than for the three
+        routes that hold it today.
+
+        ``radius.execute`` gates NAS lifecycle -- activate, disable, rotate
+        -- and every one of those reaches into the live RADIUS auth path for
+        a venue. It is held at *organization* scope by ``organization-owner``
+        (asserted separately below), so any route carrying it without an
+        explicit ``scope=ScopeType.GLOBAL`` is customer-reachable the moment
+        it is mounted.
+
+        Writing it this way is the point: #93 fixed the one route it was
+        looking at and two others with the identical defect stayed live for a
+        day. A fourth one added later fails here rather than in an incident.
+        """
+        from app.domains.rbac.enums import ScopeType
+
+        offenders = []
+        for route in self._routes_requiring("radius.execute"):
+            scopes = [
+                self._declared_scope(dep.call)
+                for dep in route.dependant.dependencies
+                if dep.call is not None
+                and self._declared_permission(dep.call) == "radius.execute"
+            ]
+            if ScopeType.GLOBAL not in scopes:
+                offenders.append((route.path, scopes))
+
+        assert offenders == [], (
+            "These radius.execute routes are reachable by any venue owner, "
+            "because organization-owner holds radius.execute at organization "
+            "scope. Mount them on nas_platform_router with "
+            "scope=ScopeType.GLOBAL: " + repr(offenders)
+        )
+
+    def test_the_radius_execute_routes_are_exactly_the_platform_three(
+        self,
+    ) -> None:
+        """A companion to the rule above, and the half that catches the
+        *other* direction: a route that keeps GLOBAL scope but is mounted
+        back under the customer ``/radius/nas`` namespace passes the scope
+        assertion while telling every reader the wrong thing about who the
+        endpoint is for."""
+        paths = sorted(r.path for r in self._routes_requiring("radius.execute"))
+        assert paths == [
+            "/api/v1/platform/radius/nas/{nas_id}/activate",
+            "/api/v1/platform/radius/nas/{nas_id}/disable",
+            "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret",
+        ]
+
+    def test_disable_is_a_database_write_with_no_hub_or_device_call(
+        self,
+    ) -> None:
+        """Why ``disable`` is immediate rather than eventually-consistent,
+        asserted as a signature so the claim in the route docstring cannot
+        rot.
+
+        ``regenerate_secret`` had to grow a mandatory ``push_secret``
+        because a rotation that does not reach the hub is a lie
+        (``test_regenerate_secret_cannot_be_called_without_a_push``).
+        ``disable_nas`` deliberately has no such argument: there is nothing
+        to push. It flips ``status``/``is_active`` and returns, and
+        ``authenticate_nas`` rejects anything that is not ``ACTIVE`` -- see
+        ``test_disabled_nas_cannot_authenticate`` -- so the venue stops
+        serving guests on the very next Access-Request, with no hub
+        round-trip to fail and no reconciliation sweep to undo it.
+        """
+        import inspect
+
+        params = set(inspect.signature(RadiusService.disable_nas).parameters)
+        assert "push_secret" not in params
+        assert params == {
+            "self",
+            "nas_id",
+            "requesting_organization_id",
+            "actor_user_id",
+            "reason",
+        }
+
+    def test_the_only_rotate_route_is_the_platform_one(self) -> None:
+        routes = self._rotate_routes()
+        assert [r.path for r in routes] == [
+            "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret"
+        ], (
+            "A NAS secret rotation reachable at any other path is reachable "
+            "by a venue owner, because radius.execute is an organization-"
+            "scoped grant. Put it on nas_platform_router."
+        )
+
+    def test_the_rotate_route_is_gated_at_global_scope(self) -> None:
+        from app.domains.rbac.enums import ScopeType
+
+        (route,) = self._rotate_routes()
+        scopes = [
+            self._declared_scope(dep.call)
+            for dep in route.dependant.dependencies
+            if dep.call is not None and getattr(dep.call, "__closure__", None)
+        ]
+        assert ScopeType.GLOBAL in scopes, (
+            "Mounting the route under /platform is cosmetic on its own -- "
+            "without scope=ScopeType.GLOBAL an organization-scoped grant "
+            "still satisfies it."
+        )
+
+    def test_organization_owner_really_does_hold_radius_execute(self) -> None:
+        """The premise the move exists for, asserted rather than assumed.
+
+        If a future seed change genuinely takes ``radius.execute`` away from
+        every organization-scoped role, this fails and whoever is reading
+        can decide the split is no longer load-bearing -- rather than the
+        split quietly outliving its reason.
+        """
+        from app.domains.rbac.enums import PermissionAction, PermissionModule, ScopeType
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        role = next(r for r in SYSTEM_ROLES if r.slug == "organization-owner")
+        assert role.scope_type == ScopeType.ORGANIZATION
+        assert PermissionAction.EXECUTE in role.grants()[PermissionModule.RADIUS]
+
+    def test_the_full_set_of_non_global_radius_execute_holders_is_known(
+        self,
+    ) -> None:
+        """The premise widened: ``organization-owner`` is not the only
+        non-platform role holding the key, so pinning only that one would
+        under-state how reachable these routes were.
+
+        Resolved by running the seed's own ``grants()`` rather than reading
+        its comments. If a future seed change adds or removes a holder this
+        fails, and whoever is reading gets to decide what it means for the
+        split -- which is the entire point of asserting a premise.
+        """
+        from app.domains.rbac.enums import PermissionAction, PermissionModule, ScopeType
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        holders = {
+            role.slug: role.scope_type
+            for role in SYSTEM_ROLES
+            if PermissionAction.EXECUTE
+            in role.grants().get(PermissionModule.RADIUS, ())
+        }
+        assert holders == {
+            "super-admin": ScopeType.GLOBAL,
+            "platform-admin": ScopeType.GLOBAL,
+            "msp-owner": ScopeType.ORGANIZATION,
+            "msp-admin": ScopeType.ORGANIZATION,
+            "organization-owner": ScopeType.ORGANIZATION,
+            "organization-admin": ScopeType.ORGANIZATION,
+            "network-administrator": ScopeType.LOCATION,
+        }
+        # Five of the seven are below GLOBAL, and every one of those five is
+        # excluded by the move -- a LOCATION grant cannot satisfy a GLOBAL
+        # check either (SCOPE_HIERARCHY_ORDER), so network-administrator, the
+        # role closest to a legitimate operator of these endpoints, loses
+        # them too. That is the behaviour change, named.
+        assert sum(1 for s in holders.values() if s != ScopeType.GLOBAL) == 5
+
+    def test_an_organization_scoped_grant_can_never_satisfy_a_global_check(
+        self,
+    ) -> None:
+        """The one property the move rests on: an organization-scoped role
+        is excluded whatever ``X-Organization-Id`` it sends -- while still
+        satisfying the org-scoped NAS *reads* the customer dashboard
+        legitimately needs."""
+        from app.domains.rbac.authorization import ScopeResolver
+        from app.domains.rbac.context import GrantScope, ScopeContext
+        from app.domains.rbac.enums import ScopeType
+
+        org_id = uuid.uuid4()
+        grant = GrantScope(scope_type=ScopeType.ORGANIZATION, organization_id=org_id)
+        context = ScopeContext(organization_id=org_id)
+        assert ScopeResolver.satisfies(grant, ScopeType.GLOBAL, context) is False
+        assert ScopeResolver.satisfies(grant, ScopeType.LOCATION, context) is True
+
+    def test_the_response_states_the_device_half_out_loud(self) -> None:
+        """A 200 here means the venue's guest WiFi is DOWN until somebody
+        re-pastes the RADIUS chunk. Carried as a field rather than left to
+        the message string because that is the only version of it a client
+        cannot fail to notice."""
+        from app.domains.guest.schemas import RadiusNasSecretRotatedResponse
+
+        fields = RadiusNasSecretRotatedResponse.model_fields
+        assert fields["device_action_required"].default is True
+        action = fields["device_action"].default
+        assert "DOWN" in action
+        assert "router" in action.lower()

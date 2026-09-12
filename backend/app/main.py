@@ -30,6 +30,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "application_started",
             extra={"service": app_settings.service_name},
         )
+        # Logged, not raised: an unset key must not crash-loop a deploy.
+        # Names only -- the value of a default key is public anyway, but a
+        # log line that prints key material is one edit away from printing
+        # a real one.
+        for env_var in app_settings.secrets_at_public_default():
+            logger.critical(
+                "secret_at_public_default",
+                extra={
+                    "env_var": env_var,
+                    "environment": app_settings.environment,
+                },
+            )
+        # WARNING, not CRITICAL: unlike a public default key this exposes
+        # nothing, it just means an alert copy nobody asked for out loud is
+        # not being sent. Logged for the same reason as the block above --
+        # a setting that is silently empty is indistinguishable from one
+        # that is working.
+        for env_var in app_settings.alerting_delivery_gaps():
+            logger.warning(
+                "alert_delivery_not_configured",
+                extra={
+                    "env_var": env_var,
+                    "environment": app_settings.environment,
+                },
+            )
         yield
         logger.info(
             "application_stopped",

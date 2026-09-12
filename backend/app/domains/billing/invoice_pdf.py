@@ -619,6 +619,22 @@ def render_invoice_pdf(
             Paragraph(_amount(invoice.subtotal), styles["totals_value"]),
         ]
     ]
+    # The coupon discount, shown between the gross subtotal and the tax
+    # lines because that is the order in which it is applied: tax is charged
+    # on ``subtotal - discount``, not on the gross (CGST Act s.15(3)(a) --
+    # see ``validators.compute_taxable_value``). Rendered only when non-zero,
+    # matching the CGST/SGST/IGST rows' own convention, so an undiscounted
+    # invoice looks exactly as it did before this row existed. Shown as a
+    # negative so the column reads as an arithmetic sequence down to Total.
+    if invoice.discount_amount > 0:
+        totals_rows.append(
+            [
+                Paragraph("Discount", styles["totals_label"]),
+                Paragraph(
+                    f"-{_amount(invoice.discount_amount)}", styles["totals_value"]
+                ),
+            ]
+        )
     if invoice.cgst_amount > 0:
         totals_rows.append(
             [

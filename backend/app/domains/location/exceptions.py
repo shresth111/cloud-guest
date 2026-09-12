@@ -70,6 +70,24 @@ class CrossOrganizationLocationAccessError(LocationError):
         super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
 
 
+class CrossLocationScopeAccessError(LocationError):
+    """A caller whose permission was checked at LOCATION scope for location A
+    attempted to act on location B.
+
+    Distinct from :class:`CrossOrganizationLocationAccessError`, which catches
+    the *cross-tenant* case (a location in someone else's organization). This
+    one catches the *within-tenant* case that an organization-level check
+    cannot see: a front-desk account scoped to one site reaching a sibling
+    site under the same organization. See ``location.scoping`` for why an
+    organization-level guard alone is not sufficient."""
+
+    def __init__(
+        self,
+        message: str = "Cannot access a location outside your own location scope",
+    ) -> None:
+        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+
+
 class NewOrganizationRequiredError(LocationError):
     """Smart Location Provisioning: the caller supplied neither an
     ``existing_organization_id`` (provision a new location for an existing
@@ -111,6 +129,29 @@ class DefaultConfigTemplateNotFoundError(LocationError):
         ),
     ) -> None:
         super().__init__(message, status_code=status.HTTP_409_CONFLICT)
+
+
+class RouterConfigTemplateWithoutRouterError(LocationError):
+    """Smart Location Provisioning: an explicit ``router_config_template_id``
+    was supplied but no ``router`` was.
+
+    Provisioning without a router is legitimate (a venue on an Omada
+    controller has no MikroTik to register -- see ``docs/location/FLOW.md``
+    §1b), and then there is nothing to apply a template to. Ignoring the
+    template quietly would turn a caller bug into a 201, so it is refused.
+    ``ProvisionLocationRequest`` already rejects this shape as a 422 at the
+    request boundary; this is the same rule for any caller that builds
+    ``ProvisionLocationInput`` itself, with the same status."""
+
+    def __init__(
+        self,
+        message: str = (
+            "router_config_template_id was supplied without a router -- a "
+            "config template can only be applied to a router. Either include "
+            "`router`, or omit router_config_template_id."
+        ),
+    ) -> None:
+        super().__init__(message, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
 
 class LocationOrganizationMismatchError(LocationError):

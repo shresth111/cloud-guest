@@ -33,6 +33,8 @@ class QosRepositoryProtocol(Protocol):
 
     async def soft_delete_rule(self, rule: QosTrafficRule) -> QosTrafficRule: ...
 
+    async def commit(self) -> None: ...
+
     async def list_rules(
         self,
         *,
@@ -72,6 +74,23 @@ class QosRepository:
 
     async def soft_delete_rule(self, rule: QosTrafficRule) -> QosTrafficRule:
         return await self.rules.soft_delete(rule)
+
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by ``QosService.push_rule_to_device`` and nothing else, for
+        the identical reason ``app.domains.dhcp.repository
+        .DhcpRepository.commit`` and ``app.domains.vlan.repository
+        .VlanRepository.commit`` exist: ``GenericRepository.update`` only
+        ``flush()``es, and ``get_db_session`` rolls the session back on any
+        exception -- so a failure record written just before a re-raise is
+        discarded, and the row still reads ``pending`` after a real device
+        failure with ``device_push_error`` NULL. This domain's own push
+        docstring claimed the opposite while doing exactly that. Committing
+        explicitly before raising is what makes the record survive to be
+        read.
+        """
+        await self.rules.commit()
 
     async def list_rules(
         self,

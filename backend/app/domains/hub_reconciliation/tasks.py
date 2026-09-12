@@ -59,6 +59,7 @@ from app.domains.rbac.repository import RBACRepository
 from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
 from app.domains.wireguard.dependencies import (
+    HubBridgeUnavailableError,
     hub_capabilities_from_settings,
     make_hub_peer_deregistrar,
     make_hub_peer_lister,
@@ -246,11 +247,25 @@ def run_hub_reconciliation_sweep(
     """
     try:
         result = run_celery_task(_run_hub_reconciliation_sweep_async(adopt=adopt))
-    except WireGuardError as exc:
+    except (WireGuardError, HubBridgeUnavailableError) as exc:
         # HubPeerListerNotConfiguredError / HubBridgeUnavailableError and
         # their siblings. ERROR, because a hub this task cannot read means
         # no reconciliation is happening at all -- the silent state it
         # exists to end.
+        #
+        # `HubBridgeUnavailableError` IS NAMED SEPARATELY ON PURPOSE, and it
+        # was missing until 2026-09-01. It lives in
+        # `wireguard/dependencies.py` and subclasses `CloudGuestError`, NOT
+        # `WireGuardError` -- so `except WireGuardError` never caught it,
+        # despite this comment having claimed it did since the day it was
+        # written. It is also the single most likely failure in this whole
+        # task: `make_hub_peer_lister` raises exactly this when the bridge
+        # is unreachable or answers >=400, and `get_fleet_status`
+        # deliberately propagates it rather than falling back to a DB-only
+        # guess. An unreachable hub -- the ordinary, expected state this
+        # `except` exists to report as one line -- was therefore escaping as
+        # an unhandled Celery exception with a traceback and a retry storm,
+        # which is precisely the burial this handler was written to prevent.
         result = {
             "skipped_locked": False,
             "hub_unreachable": True,

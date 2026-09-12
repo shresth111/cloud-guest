@@ -38,7 +38,12 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 
-from .constants import AnswerType, CampaignType, DisplayRule
+from .constants import (
+    MAX_QUESTIONS_PER_CAMPAIGN,
+    AnswerType,
+    CampaignType,
+    DisplayRule,
+)
 from .dependencies import get_campaigns_service
 from .models import Campaign, CampaignAsset, CampaignQuestion
 from .schemas import (
@@ -55,6 +60,9 @@ from .schemas import (
     CampaignRespondRequest,
     CampaignResponse,
     CampaignResultsResponse,
+    CampaignTemplateListResponse,
+    CampaignTemplateQuestionResponse,
+    CampaignTemplateResponse,
     CampaignUpdateRequest,
     MessageResponse,
     NextCampaignAssetPayload,
@@ -63,6 +71,7 @@ from .schemas import (
     QuestionResultBreakdownResponse,
 )
 from .service import CampaignResults, CampaignsService, NextCampaignResult
+from .templates import CAMPAIGN_TEMPLATES
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
 guest_router = APIRouter(prefix="/portal/campaigns", tags=["Campaigns Portal"])
@@ -121,6 +130,10 @@ def _asset_response(asset: CampaignAsset) -> CampaignAssetResponse:
         click_url=asset.click_url,
         alt_text=asset.alt_text,
         locale=asset.locale,
+        headline=asset.headline,
+        subtext=asset.subtext,
+        coupon_code=asset.coupon_code,
+        coupon_expires_at=asset.coupon_expires_at,
     )
 
 
@@ -168,6 +181,10 @@ def _next_campaign_response(result: NextCampaignResult) -> NextCampaignResponse:
                 image_url=result.asset.image_url,
                 click_url=result.asset.click_url,
                 alt_text=result.asset.alt_text,
+                headline=result.asset.headline,
+                subtext=result.asset.subtext,
+                coupon_code=result.asset.coupon_code,
+                coupon_expires_at=result.asset.coupon_expires_at,
             )
             if result.asset is not None
             else None
@@ -240,6 +257,59 @@ async def list_campaigns(
     return build_response(
         success=True,
         message="Campaigns retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/templates",
+    response_model=ApiResponse[CampaignTemplateListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("campaigns.read"))],
+)
+async def list_campaign_templates(request: Request):
+    """The starter shapes a venue can begin a campaign from.
+
+    Static -- constants, not rows, so there is no service call, no
+    organization scoping and nothing to page. It is behind
+    ``campaigns.read`` anyway, because a template list is only meaningful
+    to somebody who can go on to create a campaign, and an unauthenticated
+    endpoint here would be one more surface for no gain.
+
+    **Registered before ``GET /{campaign_id}``** -- Starlette matches
+    first-listed-first, so a literal path declared after the parameterised
+    one would be swallowed by it and ``templates`` would be parsed as a
+    campaign id. Same discipline the module docstring records for
+    ``GET /campaigns``.
+    """
+    payload = CampaignTemplateListResponse(
+        items=[
+            CampaignTemplateResponse(
+                key=template.key,
+                name=template.name,
+                description=template.description,
+                campaign_type=template.campaign_type.value,
+                display_rule=template.display_rule.value,
+                display_interval_days=template.display_interval_days,
+                questions=[
+                    CampaignTemplateQuestionResponse(
+                        answer_type=question.answer_type.value,
+                        question_text=question.question_text,
+                        options=list(question.options),
+                        is_required=question.is_required,
+                        repeatable=question.repeatable,
+                    )
+                    for question in template.questions
+                ],
+                max_questions=MAX_QUESTIONS_PER_CAMPAIGN,
+            )
+            for template in CAMPAIGN_TEMPLATES
+        ]
+    )
+    return build_response(
+        success=True,
+        message="Campaign templates retrieved",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )
@@ -605,6 +675,10 @@ async def add_campaign_asset(
         click_url=payload.click_url,
         alt_text=payload.alt_text,
         locale=payload.locale,
+        headline=payload.headline,
+        subtext=payload.subtext,
+        coupon_code=payload.coupon_code,
+        coupon_expires_at=payload.coupon_expires_at,
     )
     return build_response(
         success=True,

@@ -223,7 +223,9 @@ class FakeLicenseActivation:
     async def get_license_for_organization(self, organization_id: uuid.UUID):
         return self.license
 
-    async def activate_license(self, *, actor_user_id, license_id: uuid.UUID):
+    async def activate_license(
+        self, *, actor_user_id, license_id: uuid.UUID, requesting_organization_id
+    ):
         if self.raise_on_activate is not None:
             raise self.raise_on_activate
         self.activate_calls.append(license_id)

@@ -125,6 +125,7 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
+from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.core.email_layout import esc, heading, paragraph, render_email
 from app.core.storage import ObjectStorageProtocol
 from app.database.constants import MAX_BULK_CREATE_SIZE
@@ -135,6 +136,10 @@ from app.domains.notification.constants import (
 )
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 
 from .constants import (
     CODE_GENERATION_MAX_ROUNDS,
@@ -157,6 +162,8 @@ from .events import (
     VoucherRedemptionFailed,
 )
 from .exceptions import (
+    CrossLocationVoucherBatchAccessError,
+    CrossLocationVoucherSeriesAccessError,
     CrossOrganizationVoucherBatchAccessError,
     CrossOrganizationVoucherPlanAccessError,
     CrossOrganizationVoucherSeriesAccessError,
@@ -177,9 +184,11 @@ from .models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
 from .repository import VoucherRepositoryProtocol
 from .validators import (
     normalize_redeemed_identifier,
+    normalize_voucher_code,
     validate_batch_status_transition,
     validate_code_length,
     validate_quantity,
+    voucher_code_lookup_candidates,
 )
 from .voucher_pdf import render_voucher_batch_pdf
 
@@ -326,6 +335,7 @@ class VoucherService:
             DEFAULT_REDEMPTION_MAX_ATTEMPTS_PER_WINDOW
         ),
         redemption_window_minutes: int = DEFAULT_REDEMPTION_WINDOW_MINUTES,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.redis = redis
@@ -336,6 +346,8 @@ class VoucherService:
         self.notification_service = notification_service
         self.redemption_max_attempts_per_window = redemption_max_attempts_per_window
         self.redemption_window_minutes = redemption_window_minutes
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     # ========================================================================
     # Batch lifecycle
@@ -563,6 +575,11 @@ class VoucherService:
             and batch.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationVoucherBatchAccessError()
+        enforce_entity_location(
+            entity_location_id=getattr(batch, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationVoucherBatchAccessError(),
+        )
         return await self._refresh_batch_expiry(batch)
 
     async def list_batches(
@@ -765,6 +782,11 @@ class VoucherService:
             and series.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationVoucherSeriesAccessError()
+        enforce_entity_location(
+            entity_location_id=getattr(series, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationVoucherSeriesAccessError(),
+        )
         return series
 
     async def list_series(
@@ -822,7 +844,21 @@ class VoucherService:
     # ========================================================================
 
     async def _get_voucher_and_batch(self, code: str) -> tuple[Voucher, VoucherBatch]:
-        voucher = await self.repository.get_voucher_by_code(code)
+        """Resolves a guest-typed code, trying each spelling
+        ``voucher_code_lookup_candidates`` yields, in its order.
+
+        The as-typed (trimmed, upper-cased) spelling first, so a venue whose
+        pre-printed codes genuinely carry a hyphen matches exactly; the
+        separator-free spelling only on a miss, so a guest who typed a
+        generated code with the grouping a printed card invited still lands
+        on it. A second query only ever runs when the first found nothing,
+        so this costs a redemption that succeeds exactly what it cost
+        before."""
+        voucher = None
+        for candidate in voucher_code_lookup_candidates(code):
+            voucher = await self.repository.get_voucher_by_code(candidate)
+            if voucher is not None:
+                break
         if voucher is None:
             raise VoucherNotFoundError()
         batch = await self.repository.get_batch(voucher.batch_id)
@@ -903,7 +939,7 @@ class VoucherService:
         future captive portal to show "is this code still good" before
         committing to a redemption."""
         await self._enforce_redemption_rate_limit(source)
-        voucher, batch = await self._get_voucher_and_batch(code.strip())
+        voucher, batch = await self._get_voucher_and_batch(code)
         now = datetime.now(UTC)
         reason = self._redemption_failure_reason(voucher, batch, now=now)
         if reason is not None:
@@ -919,8 +955,41 @@ class VoucherService:
     async def redeem_voucher(
         self, *, code: str, identifier: str, source: str
     ) -> tuple[Voucher, VoucherBatch]:
+        """Redeems ``code`` exactly once, atomically.
+
+        The read/validate phase below and the write that follows it form a
+        check-then-act, and the write is deliberately **not** a blind
+        ``GenericRepository.update``: it goes through
+        ``VoucherRepository.redeem_voucher_conditionally``, a single
+        conditional ``UPDATE`` that only lands when the row still matches
+        the state this call validated (same ``status``/``use_count``,
+        batch still ``ACTIVE``).
+
+        Two concurrent ``POST /guest/login/voucher`` requests presenting the
+        same single-use code can therefore never both succeed: whichever
+        request's ``UPDATE`` commits first flips the row to ``EXHAUSTED``,
+        and the loser's ``UPDATE`` matches zero rows and is surfaced as the
+        same clean ``VoucherExhaustedError`` (409) the sequential
+        already-exhausted path raises -- never a 500 and never a silent
+        second success. ``use_count`` is incremented in SQL
+        (``use_count = use_count + 1``), not read-modify-write, so it stays
+        exact under any interleaving.
+
+        Transactional posture note: this method never commits -- it writes
+        through the caller's session, so the redemption becomes durable
+        only when the enclosing transaction commits. In the guest-login
+        wiring (``GuestService.login_via_voucher``) both domains share the
+        request-scoped session, so a session-creation failure *after* this
+        call rolls the redemption back together with the session it was
+        meant to create. That coupling is incidental to the shared session,
+        though -- this service does not hold anything open across the
+        caller's later work, so a caller that commits between redemption
+        and its own subsequent failure would burn the voucher regardless
+        (no such caller exists today -- the standalone endpoint
+        ``POST /vouchers/redeem`` also commits only at request end).
+        """
         await self._enforce_redemption_rate_limit(source)
-        voucher, batch = await self._get_voucher_and_batch(code.strip())
+        voucher, batch = await self._get_voucher_and_batch(code)
         now = datetime.now(UTC)
         reason = self._redemption_failure_reason(voucher, batch, now=now)
         if reason is not None:
@@ -928,23 +997,45 @@ class VoucherService:
             self._raise_for_reason(reason, batch_status=batch.status)
 
         is_first_use = voucher.status == VoucherStatus.UNUSED.value
-        new_use_count = voucher.use_count + 1
-        will_exhaust = new_use_count >= batch.max_uses_per_voucher
-        update_data: dict[str, object] = {
-            "use_count": new_use_count,
-            "last_used_at": now,
-            "status": (
-                VoucherStatus.EXHAUSTED if will_exhaust else VoucherStatus.ACTIVE
-            ).value,
-        }
+        first_use_fields: dict[str, object] | None = None
         if is_first_use:
-            update_data["redeemed_at"] = now
-            update_data["redeemed_identifier"] = normalize_redeemed_identifier(
-                identifier
-            )
-            update_data["expires_at"] = now + timedelta(minutes=batch.validity_minutes)
+            first_use_fields = {
+                "redeemed_at": now,
+                "redeemed_identifier": normalize_redeemed_identifier(identifier),
+                "expires_at": now + timedelta(minutes=batch.validity_minutes),
+            }
 
-        updated = await self.repository.update_voucher(voucher, update_data)
+        updated = await self.repository.redeem_voucher_conditionally(
+            voucher,
+            batch,
+            expected_status=voucher.status,
+            expected_use_count=voucher.use_count,
+            max_uses_per_voucher=batch.max_uses_per_voucher,
+            last_used_at=now,
+            first_use_fields=first_use_fields,
+        )
+        if updated is None:
+            # This call lost the race: between the read above and this
+            # write another request redeemed the voucher first (or it was
+            # revoked/expired / its batch deactivated), so the conditional
+            # UPDATE matched zero rows. ``redeem_voucher_conditionally``
+            # has already refreshed both rows to their now-committed
+            # state; re-run the same classifier so the loser surfaces the
+            # exact distinct error the sequential path would have raised.
+            race_reason = self._redemption_failure_reason(
+                voucher, batch, now=datetime.now(UTC)
+            )
+            if race_reason is None:
+                # The voucher is still redeemable on paper -- e.g. a
+                # multi-use voucher whose ``use_count`` a concurrent
+                # redeemer just advanced past this request's snapshot. The
+                # compare-and-swap still admits only one winner per
+                # snapshot, so surface the same clean 409 as the exhausted
+                # path; a fresh request simply reads the advanced count.
+                race_reason = "exhausted"
+            await self._record_redemption_failure(voucher, reason=race_reason)
+            self._raise_for_reason(race_reason, batch_status=batch.status)
+
         event = VoucherRedeemed(
             voucher_id=updated.id,
             batch_id=batch.id,
@@ -1035,8 +1126,11 @@ class VoucherService:
         writer = csv.writer(buffer)
         writer.writerow(CSV_EXPORT_HEADERS)
         for voucher in vouchers:
+            # `redeemed_identifier` is whatever the guest typed at the portal;
+            # `normalize_redeemed_identifier` strips whitespace and nothing
+            # else, by design.
             writer.writerow(
-                [
+                sanitize_spreadsheet_row([
                     voucher.code,
                     voucher.status,
                     voucher.use_count,
@@ -1045,7 +1139,7 @@ class VoucherService:
                     voucher.last_used_at.isoformat() if voucher.last_used_at else "",
                     voucher.expires_at.isoformat() if voucher.expires_at else "",
                     voucher.redeemed_identifier or "",
-                ]
+                ])
             )
         return buffer.getvalue()
 
@@ -1155,7 +1249,7 @@ class VoucherService:
         seen_in_request: set[str] = set()
         candidates: list[str] = []
         for raw_code in codes:
-            code = raw_code.strip().upper()
+            code = normalize_voucher_code(raw_code)
             if not code:
                 rejected.append((raw_code, "empty code"))
                 continue

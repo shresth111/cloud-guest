@@ -20,6 +20,12 @@ dependencies = [
     # why this was chosen over the alternatives. Pulls in only `pyasn1`
     # (also pure Python) transitively.
     "pysnmp==7.1.28",
+    # The Omada controller integration's HTTP transport
+    # (``wyfy_device_gateway/omada/``). Pinned to the exact version
+    # cloud-guest-repo/backend/requirements.txt pins, so that the backend
+    # installing this package as an editable path dependency cannot end up
+    # resolving two different httpx versions.
+    "httpx==0.27.2",
 ]
 
 [project.optional-dependencies]

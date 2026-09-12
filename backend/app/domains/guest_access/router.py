@@ -9,13 +9,21 @@ and resolves ``CurrentOrganization`` (``X-Organization-Id``), passed through
 to ``GuestAccessService`` as ``requesting_organization_id`` so tenant
 scoping is enforced the same way every other domain's router enforces it --
 mirrors ``app.domains.voucher.router``'s identical pattern.
+
+**Route ordering matters.** ``/rules/import`` and ``/rules/export`` are
+registered *before* ``/rules/{rule_id}`` so Starlette's first-match-wins
+routing resolves the literal paths first -- otherwise ``GET
+/rules/export`` would be swallowed by the ``{rule_id}`` path parameter and
+fail UUID parsing. Same discipline, same reason, as
+``app.domains.mac_authorization.router``'s own ``/entries/import``/
+``/entries/export`` placement.
 """
 
 from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
@@ -35,8 +43,11 @@ from .schemas import (
     DeviceAccessRuleListResponse,
     DeviceAccessRuleResponse,
     GuestAccessRuleCreate,
+    GuestAccessRuleImportRequest,
+    GuestAccessRuleImportResponse,
     GuestAccessRuleListResponse,
     GuestAccessRuleResponse,
+    RejectedGuestRuleImportRowResponse,
 )
 from .service import GuestAccessService
 
@@ -133,6 +144,94 @@ async def list_guest_rules(
     )
 
 
+@router.post(
+    "/rules/import",
+    response_model=ApiResponse[GuestAccessRuleImportResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("guest_access.import"))],
+)
+async def import_guest_rules(
+    request: Request,
+    payload: GuestAccessRuleImportRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestAccessService = Depends(get_guest_access_service),
+):
+    """Bulk-load a property's Always Allowed list, one bounded batch.
+
+    Always ``201`` with a per-row report, never all-or-nothing: a 200-row
+    list with three bad numbers imports 197 and returns the three with a
+    row number, a machine-readable code and a message. A 1001-row body is
+    a ``422`` from pydantic before anything is written -- see
+    ``schemas.GuestAccessRuleImportRequest``.
+
+    Its own ``guest_access.import`` permission rather than
+    ``guest_access.create``: one call here rewrites the guest-access table
+    for a whole venue, and with the per-property whitelist-only mode that
+    table is the venue's door. Mirrors ``mac_authorization.import``.
+    """
+    result = await service.import_guest_rules(
+        organization_id=payload.organization_id,
+        requesting_organization_id=requesting_organization_id,
+        default_location_id=payload.location_id,
+        default_rule_type=payload.rule_type,
+        default_expires_at=payload.expires_at,
+        rows=[row.model_dump() for row in payload.rules],
+        actor_user_id=uuid.UUID(user.id),
+    )
+    response_payload = GuestAccessRuleImportResponse(
+        imported_count=result.imported_count,
+        updated_count=result.updated_count,
+        imported_ids=result.imported_ids,
+        updated_ids=result.updated_ids,
+        rejected=[
+            RejectedGuestRuleImportRowResponse(
+                row_number=row.row_number,
+                identifier=row.identifier,
+                code=row.code,
+                reason=row.reason,
+            )
+            for row in result.rejected
+        ],
+    )
+    return build_response(
+        success=True,
+        message="Guest access rules imported",
+        data=response_payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/rules/export",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_access.export"))],
+)
+async def export_guest_rules(
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestAccessService = Depends(get_guest_access_service),
+) -> Response:
+    """The organization's guest rules as a CSV a venue can edit and post
+    straight back to ``/rules/import``.
+
+    Deliberately a raw CSV ``Response`` rather than the usual
+    ``ApiResponse`` envelope -- a file someone opens in a spreadsheet
+    cannot usefully be JSON-wrapped. Same exception, same reason, as
+    ``mac_authorization.router.export_mac_authorization_entries`` and
+    ``voucher.router.export_voucher_batch``.
+    """
+    csv_text = await service.export_guest_rules_csv(
+        requesting_organization_id=requesting_organization_id
+    )
+    return Response(
+        content=csv_text,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="guest_access_rules.csv"'
+        },
+    )
+
+
 @router.get(
     "/rules/{rule_id}",
     response_model=ApiResponse[GuestAccessRuleResponse],
@@ -151,6 +250,46 @@ async def get_guest_rule(
     return build_response(
         success=True,
         message="Guest access rule retrieved",
+        data=_guest_rule_response(rule).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/rules/{rule_id}/enforce",
+    response_model=ApiResponse[GuestAccessRuleResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_access.update"))],
+)
+async def enforce_guest_rule(
+    request: Request,
+    rule_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestAccessService = Depends(get_guest_access_service),
+):
+    """Re-runs device-side enforcement for a blocklist rule.
+
+    Exists because ``POST /rules`` can legitimately succeed at blocking a
+    guest from signing in again and fail at ending the session they are
+    already in -- an unreachable router, a tunnel down. Retrying through
+    this endpoint does the device half alone, so an operator never has to
+    re-submit the form and never ends up with a second, duplicate rule.
+    Mirrors ``POST /vlans/{id}/push``'s identical separation.
+
+    Every failure mode is a real non-2xx carrying a named error (see
+    ``exceptions.py``'s "Block enforcement" section), never a 200 with a
+    ``success: false`` body -- the frontend interceptor unwraps ``data``
+    and never reads ``success``, so the latter would read as success.
+    """
+    rule = await service.enforce_guest_rule(
+        rule_id=rule_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Guest access rule enforced",
         data=_guest_rule_response(rule).model_dump(),
         request_id=_request_id(request),
     )

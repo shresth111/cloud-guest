@@ -30,17 +30,26 @@ edited to make this work.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
+from app.domains.dhcp.models import RouterRogueDhcpStatus
 from app.domains.guest.models import GuestSession, RadiusNasClient
 from app.domains.isp.models import IspLink
+from app.domains.location.models import Location
+from app.domains.network_integration.constants import AuthorizationStatus
+from app.domains.network_integration.models import (
+    NetworkIntegration,
+    NetworkIntegrationAuthorization,
+)
+from app.domains.organization.models import Organization
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
 from app.domains.router_provisioning.constants import ProvisioningJobStatus
@@ -53,6 +62,7 @@ from app.domains.router_provisioning.models import (
 from app.domains.wireguard.models import WireGuardPeer
 
 from .constants import AlertStatus
+from .exceptions import UnscopedOrganizationListError
 from .models import (
     Alert,
     AlertRule,
@@ -68,6 +78,23 @@ from .models import (
     SlaReport,
     SlaTarget,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationOutcomeCounts:
+    """One integration's guest authorizations inside a time window -- the
+    read behind the ``ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE`` rule.
+
+    ``failed_guests`` counts distinct guest sessions, not rows: the portal
+    retries and guests tap twice, so one device can leave several failed
+    rows, and the rule's threshold is about how many *people* were
+    refused. See ``constants.NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS``.
+    """
+
+    integration_id: uuid.UUID
+    attempts: int
+    failed_attempts: int
+    failed_guests: int
 
 
 class MonitoringRepositoryProtocol(Protocol):
@@ -152,6 +179,7 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         is_active: bool | None,
         page: int,
         page_size: int,
@@ -182,9 +210,11 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         status: str | None,
         severity: str | None,
         router_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
     ) -> tuple[list[Alert], PaginationMeta]: ...
@@ -210,6 +240,24 @@ class MonitoringRepositoryProtocol(Protocol):
     async def list_isp_links(
         self, *, organization_id: uuid.UUID | None
     ) -> list[IspLink]: ...
+
+    async def list_rogue_dhcp_statuses_with_routers(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[tuple[Router, RouterRogueDhcpStatus]]: ...
+
+    async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]: ...
+
+    async def list_network_integrations(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[NetworkIntegration]: ...
+
+    async def count_authorization_outcomes_since(
+        self, *, since: datetime, organization_id: uuid.UUID | None
+    ) -> list[AuthorizationOutcomeCounts]: ...
+
+    async def get_organization_and_location_names(
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+    ) -> tuple[str | None, str | None]: ...
 
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
@@ -244,6 +292,7 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         channel_type: str | None,
         is_active: bool | None,
         page: int,
@@ -280,6 +329,7 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         status: str | None,
         severity: str | None,
         page: int,
@@ -302,7 +352,10 @@ class MonitoringRepositoryProtocol(Protocol):
     async def get_sla_target(self, target_id: uuid.UUID) -> SlaTarget | None: ...
 
     async def list_sla_targets(
-        self, *, organization_id: uuid.UUID | None
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
     ) -> list[SlaTarget]: ...
 
     async def create_sla_report(self, **fields: object) -> SlaReport: ...
@@ -619,10 +672,16 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[AlertRule], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.alert_rules.paginate(
             page=page,
             page_size=page_size,
@@ -680,12 +739,19 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         status: str | None = None,
         severity: str | None = None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[Alert], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.alerts.paginate(
             page=page,
             page_size=page_size,
@@ -694,6 +760,12 @@ class MonitoringRepository:
                 "status": status,
                 "severity": severity,
                 "router_id": router_id,
+                # Alert.location_id has always been populated by the
+                # router-health path; it simply was not filterable, so a
+                # caller wanting one venue's alerts had to over-fetch the
+                # organization and narrow client-side -- silently capped at
+                # one page.
+                "location_id": location_id,
             },
             sort_by="triggered_at",
             sort_order=SortOrder.DESC,
@@ -753,6 +825,23 @@ class MonitoringRepository:
     async def list_routers(
         self, *, organization_id: uuid.UUID | None = None
     ) -> list[Router]:
+        """Every non-deleted router in scope -- **including
+        controller-managed ones**, deliberately.
+
+        Two callers want different things from this one read.
+        ``AlertService.get_router_names_for_alerts`` needs every row, a
+        controller included, or an alert that references one renders a bare
+        UUID on the customer's Alerts page -- the exact defect that method
+        was written to fix. The rule evaluator needs only the rows an agent
+        reports for, and narrows this result itself through
+        ``AlertService._agent_managed_routers``.
+
+        So the vendor question is answered at the call site here rather
+        than in the WHERE clause, and which call sites those are is pinned
+        by ``tests/unit/test_router_read_vendor_coverage.py``. Contrast
+        ``ConnectedDeviceRepository.list_routers_for_sync``, where there is
+        no such second caller and the filter belongs in the query.
+        """
         statement = select(Router).where(Router.is_deleted.is_(False))
         if organization_id is not None:
             statement = statement.where(Router.organization_id == organization_id)
@@ -770,6 +859,189 @@ class MonitoringRepository:
         statement = select(IspLink).where(IspLink.is_deleted.is_(False))
         if organization_id is not None:
             statement = statement.where(IspLink.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_rogue_dhcp_statuses_with_routers(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[tuple[Router, RouterRogueDhcpStatus]]:
+        """Every rogue-DHCP detection row in scope, joined to the router it
+        belongs to -- the read behind
+        ``service.AlertService._evaluate_rogue_dhcp_guard_rule``.
+
+        Same "query another domain's model directly, read-only" precedent
+        ``list_routers``/``list_isp_links`` above already establish, and for
+        the same reason: ``DhcpService`` has no "every detection row across
+        an optional organization scope" method, only a per-router
+        ``get_rogue_dhcp_statuses`` the readiness checklist calls one router
+        at a time.
+
+        ## One query, not one per router
+
+        The join is the whole point. Looping the routers and calling a
+        per-router lookup would put a query per router inside every
+        evaluation pass, on a rule that exists to watch an entire fleet --
+        and ``evaluate_alert_rules`` already runs every active rule on a
+        Beat cadence. The router row comes back in the same trip because
+        the caller needs ``organization_id``/``location_id``/``name`` for
+        the alert's de-duplication key and message anyway.
+
+        An inner join, deliberately: a router with no detection rows at all
+        is a router the detector has not reached yet, which is an
+        unanswered question and must produce no finding. Absence stays
+        absence rather than becoming a row the evaluator has to remember to
+        skip. Soft-deleted rows on either side are excluded, matching every
+        other read here.
+        """
+        statement = (
+            select(Router, RouterRogueDhcpStatus)
+            .join(RouterRogueDhcpStatus, RouterRogueDhcpStatus.router_id == Router.id)
+            .where(
+                Router.is_deleted.is_(False),
+                RouterRogueDhcpStatus.is_deleted.is_(False),
+            )
+            .order_by(Router.id, RouterRogueDhcpStatus.interface)
+        )
+        if organization_id is not None:
+            statement = statement.where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return [(row[0], row[1]) for row in result.all()]
+
+    async def list_network_integrations(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[NetworkIntegration]:
+        """Every live network-controller integration in scope -- the read
+        behind the three ``ALERT_TARGET_NETWORK_CONTROLLER*`` rules.
+
+        Same "query another domain's model directly, read-only" precedent
+        as ``list_isp_links``, and for the same reason:
+        ``NetworkIntegrationService``'s own list is paginated, tenant-guarded
+        for a request, and would drag the provider registry (and with it
+        the vendored gateway) into this domain for a read that needs none
+        of it. Disabled rows are returned too -- the evaluator needs to see
+        them to close an alert an operator answered by switching the
+        integration off.
+        """
+        statement = select(NetworkIntegration).where(
+            NetworkIntegration.is_deleted.is_(False)
+        )
+        if organization_id is not None:
+            statement = statement.where(
+                NetworkIntegration.organization_id == organization_id
+            )
+        result = await self.session.execute(statement.order_by(NetworkIntegration.id))
+        return list(result.scalars().all())
+
+    async def count_authorization_outcomes_since(
+        self, *, since: datetime, organization_id: uuid.UUID | None = None
+    ) -> list[AuthorizationOutcomeCounts]:
+        """Per-integration guest-authorization counts since ``since``, in one
+        grouped query rather than one per integration.
+
+        Only integrations with at least one attempt in the window appear.
+        That is the honest shape rather than a gap: an integration nobody
+        tried to join through has no evidence either way, and the caller
+        treats "no row" as "no failures", which is exactly what it is.
+
+        Every row in ``network_integration_authorizations`` is an attempt
+        the controller actually answered (or failed to answer) -- refusals
+        this platform makes *before* calling the controller (an inactive
+        session, a mismatched site) are events, not rows -- so a failed row
+        here is the controller's verdict, not a guest's typo.
+        """
+        failed = NetworkIntegrationAuthorization.status == (
+            AuthorizationStatus.FAILED.value
+        )
+        statement = (
+            select(
+                NetworkIntegrationAuthorization.integration_id,
+                func.count().label("attempts"),
+                func.count().filter(failed).label("failed_attempts"),
+                func.count(distinct(NetworkIntegrationAuthorization.guest_session_id))
+                .filter(failed)
+                .label("failed_guests"),
+            )
+            .where(
+                NetworkIntegrationAuthorization.is_deleted.is_(False),
+                NetworkIntegrationAuthorization.created_at >= since,
+            )
+            .group_by(NetworkIntegrationAuthorization.integration_id)
+        )
+        if organization_id is not None:
+            statement = statement.where(
+                NetworkIntegrationAuthorization.organization_id == organization_id
+            )
+        result = await self.session.execute(statement)
+        return [
+            AuthorizationOutcomeCounts(
+                integration_id=row.integration_id,
+                attempts=int(row.attempts),
+                failed_attempts=int(row.failed_attempts),
+                failed_guests=int(row.failed_guests),
+            )
+            for row in result.all()
+        ]
+
+    async def get_organization_and_location_names(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> tuple[str | None, str | None]:
+        """Display names for an alert's organization and venue -- what the
+        platform team's copy of a cross-tenant alert has to carry to be
+        actionable (see ``AlertService._dispatch_platform_copies``).
+
+        Two primary-key reads. Soft-deleted rows still answer: an alert about
+        a venue that was deleted a minute ago should still say which venue
+        it was.
+        """
+        organization_name: str | None = None
+        location_name: str | None = None
+        if organization_id is not None:
+            organization_name = (
+                await self.session.execute(
+                    select(Organization.name).where(Organization.id == organization_id)
+                )
+            ).scalar_one_or_none()
+        if location_id is not None:
+            location_name = (
+                await self.session.execute(
+                    select(Location.name).where(Location.id == location_id)
+                )
+            ).scalar_one_or_none()
+        return organization_name, location_name
+
+    async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
+        """Every open (not ``RESOLVED``) ``Alert`` for one rule, newest
+        first -- the bulk form of ``find_active_alert`` above.
+
+        ``find_active_alert`` answers the de-duplication question for one
+        target with one query, which is right for a rule watching a single
+        platform component and merely tolerable for one watching a fleet.
+        ``ALERT_TARGET_ROGUE_DHCP_GUARD`` evaluates every router with
+        detection rows on every pass, so asking it that way would be a
+        query per router per pass. This returns the same rows in one trip
+        and the caller indexes them by the de-duplication key itself --
+        identical predicate (not deleted, not resolved, this rule),
+        identical newest-first ordering, so the two cannot disagree about
+        which alert is "the" open one for a target.
+
+        The sibling ``ALERT_TARGET_ROUTER``/``ALERT_TARGET_ISP_LINK``
+        branches still call ``find_active_alert`` per target. Switching
+        them over is a strictly mechanical follow-up and is deliberately
+        not done here: it would put a behaviour change to three shipped
+        evaluation paths inside a change that adds a fourth.
+        """
+        statement = (
+            select(Alert)
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.rule_id == rule_id,
+                Alert.status != AlertStatus.RESOLVED.value,
+            )
+            .order_by(Alert.triggered_at.desc())
+        )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 
@@ -834,11 +1106,17 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         channel_type: str | None = None,
         is_active: bool | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[NotificationChannel], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.notification_channels.paginate(
             page=page,
             page_size=page_size,
@@ -902,11 +1180,17 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         status: str | None = None,
         severity: str | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[Incident], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.incidents.paginate(
             page=page,
             page_size=page_size,
@@ -956,8 +1240,16 @@ class MonitoringRepository:
         return await self.sla_targets.get_by_id(target_id)
 
     async def list_sla_targets(
-        self, *, organization_id: uuid.UUID | None = None
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
     ) -> list[SlaTarget]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.sla_targets.get_all(
             filters={"organization_id": organization_id},
             sort_by="created_at",
@@ -1119,10 +1411,31 @@ class MonitoringRepository:
         self, *, organization_id: uuid.UUID | None = None
     ) -> list[tuple[str, int]]:
         """Real SQL ``GROUP BY`` -- the module brief's "Device Statistics:
-        router counts by RouterStatus" bullet."""
+        router counts by RouterStatus" bullet.
+
+        A router whose Location or Organization has been archived is
+        **excluded**. Archiving a location soft-deletes only the location
+        row (``LocationService.archive_location``); it does not cascade to
+        the routers underneath it, so those keep ``is_deleted = False`` and
+        used to be counted here. The fleet screen never showed them --
+        ``RouterService.list_routers`` resolves the location first and a
+        soft-deleted one 404s -- so the platform total read 11 while Router
+        Fleet listed 8, and neither number was wrong about what it was
+        actually counting. Counting a router nobody can reach or manage as
+        part of the fleet is the misleading half, so this joins.
+
+        The same join lives in the sibling with this name in the other
+        domain; both must move together.
+        """
         statement = (
             select(Router.status, func.count())
-            .where(Router.is_deleted.is_(False))
+            .join(Location, Location.id == Router.location_id)
+            .join(Organization, Organization.id == Router.organization_id)
+            .where(
+                Router.is_deleted.is_(False),
+                Location.is_deleted.is_(False),
+                Organization.is_deleted.is_(False),
+            )
             .group_by(Router.status)
         )
         if organization_id is not None:
@@ -1383,6 +1696,7 @@ class MonitoringRepository:
 
 
 __all__ = [
+    "AuthorizationOutcomeCounts",
     "MonitoringRepositoryProtocol",
     "MonitoringRepository",
 ]

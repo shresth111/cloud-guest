@@ -52,6 +52,14 @@ class ContentFilterRuleResponse(BaseModel):
     value: str
     comment: str | None
     is_enabled: bool
+    # Whether this rule has ever reached a real router, and what happened.
+    # Independent of is_enabled: a rule can be enabled for months and never
+    # have been on a device, which was true of every row before this domain
+    # had a push at all -- and is the difference between a site the
+    # dashboard says is blocked and a site that is.
+    device_push_status: str
+    device_push_error: str | None
+    device_pushed_at: datetime | None
     created_at: datetime
 
 

@@ -62,12 +62,24 @@ from app.domains.network_config.constants import BootstrapMode
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
+from .constants import (
+    ROUTER_REACHABILITY_FLEET_OUTAGE_MIN_ROUTERS,
+    ROUTER_REACHABILITY_FLEET_OUTAGE_RATIO,
+    ROUTER_REACHABILITY_HITS_TO_RESOLVE,
+    ROUTER_REACHABILITY_MISSES_TO_ALERT,
+    ROUTER_REACHABILITY_SILENCE_SECONDS,
+)
 from .crypto import decrypt_secret, encrypt_secret
 from .device_credential_rotator import (
     DeviceCredentialRotationError,
     DeviceCredentialRotatorProtocol,
 )
-from .enums import ROUTER_STATUS_TRANSITIONS, RouterHealthStatus, RouterStatus
+from .enums import (
+    ROUTER_STATUS_TRANSITIONS,
+    RouterHealthStatus,
+    RouterReachabilityState,
+    RouterStatus,
+)
 from .exceptions import (
     BootstrapLocationCodeMissingError,
     CrossOrganizationRouterAccessError,
@@ -83,9 +95,11 @@ from .exceptions import (
     RouterDecommissionedError,
     RouterLiveCredentialRotationFailedError,
     RouterNotFoundError,
+    RouterVendorNotProvisionableError,
 )
 from .models import Router, RouterProvisioningToken
 from .repository import RouterRepositoryProtocol
+from .vendor_capabilities import supports_zero_touch_provisioning
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +144,32 @@ class AuditLogWriter(Protocol):
     ``RBACRepositoryProtocol``."""
 
     async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
+class TunnelLivenessProbe(Protocol):
+    """The confirmation half of ``RouterService.sweep_router_reachability``:
+    "these routers have stopped calling us -- are their tunnels gone too?"
+
+    Returns one entry per router asked about:
+
+    * ``True``  -- the tunnel is demonstrably alive right now. Silence is
+      then OUR problem (a broken agent script, an expired scheduler), not
+      the venue's power, and no outage alert may be raised.
+    * ``False`` -- the tunnel is gone as well. Two independent signals now
+      agree the site is unreachable.
+    * ``None`` (or a missing key) -- we could not tell. The probe may only
+      ever WITHHOLD an alert, never manufacture one, so an unanswerable
+      probe falls back to absence alone, which is exactly the answer with
+      no probe wired at all.
+
+    Deliberately a narrow protocol rather than a dependency on
+    ``WireGuardService``: this domain has no business knowing what a peer
+    or a hub bridge is, and the sweep must stay fully testable without one.
+    """
+
+    async def __call__(
+        self, routers: list[Router]
+    ) -> dict[uuid.UUID, bool | None]: ...
 
 
 def _hash_token(plaintext: str) -> str:
@@ -599,6 +639,15 @@ class RouterService:
         router = await self.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Checked before the status ladder below, because "wrong status" is
+        # a temporary answer and this one is permanent -- a controller-managed
+        # device is never going to be in a status where a token is useful.
+        # `app.domains.router_provisioning.adapters.get_provisioning_adapter`
+        # would refuse this vendor a few steps later anyway; refusing here
+        # means the operator is told before a single-use token is minted and
+        # handed to them, rather than after.
+        if not supports_zero_touch_provisioning(router):
+            raise RouterVendorNotProvisionableError(router_id, router.vendor)
         if router.status not in (
             RouterStatus.PENDING_PROVISIONING.value,
             RouterStatus.PROVISIONING.value,
@@ -754,7 +803,17 @@ class RouterService:
         if router.status != RouterStatus.PENDING_PROVISIONING.value:
             raise ProvisioningTokenRouterStateError(router.id, router.status)
 
-        await self.repository.mark_provisioning_token_used(token, used_at=now)
+        consumed = await self.repository.mark_provisioning_token_used(
+            token, used_at=now
+        )
+        if not consumed:
+            # Lost the race: another concurrent check-in for this same
+            # token committed its atomic compare-and-set first. Treat it
+            # exactly like the upfront ``token.is_used()`` check above --
+            # the TOCTOU window between that read and this write is
+            # precisely what the compare-and-set in
+            # ``mark_provisioning_token_used`` closes.
+            raise ProvisioningTokenAlreadyUsedError()
         updated = await self.repository.update_router(
             router,
             {"status": RouterStatus.PROVISIONING.value, "last_seen_at": now},
@@ -909,6 +968,286 @@ class RouterService:
                     extra={"router_id": str(router.id), "error": str(exc)},
                 )
         return {"considered": len(stale), "marked_offline": marked, "failed": failed}
+
+    async def sweep_router_reachability(
+        self,
+        *,
+        now: datetime | None = None,
+        previous_sweep_at: datetime | None = None,
+        tunnel_probe: TunnelLivenessProbe | None = None,
+    ) -> dict[str, int]:
+        """Beat-scheduled sweep (every
+        ``ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS`` = 30s): the fast,
+        alert-only answer to "is this site talking to us right now?".
+
+        ## Why this exists next to ``sweep_stale_heartbeats`` rather than
+        ## inside it
+
+        The founder asked for an email within two minutes of a site going
+        down. ``sweep_stale_heartbeats`` cannot deliver that and must not be
+        made to: its 15-minute ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` is
+        shared, on purpose, with ``compute_lifecycle_stage``,
+        ``compute_internet_availability`` and the frontend's
+        ``location-liveness`` module, and its own docstring says that a
+        second, slightly different definition of "offline" is how two
+        screens start disagreeing about one router. So nothing here touches
+        ``status``, ``last_seen_at``, ``health_status`` or that constant.
+        This sweep writes one new column that nothing else reads, answering
+        a narrower question with its own name.
+
+        ## The signal, and why it is already fast enough
+
+        Absence of agent contact -- ``router_agent_credentials.last_used_at``,
+        which ``CurrentAgent`` stamps on every device-authenticated request.
+        The agent scheduler polls ``GET /agent/authorized-macs`` every 60
+        seconds against the heartbeat's 5 minutes, so this column is five
+        times fresher than ``last_seen_at`` and it has been ticking on the
+        real fleet the whole time. No new device-side scheduler, no new
+        per-router network round trip, nothing to re-provision on 800
+        routers.
+
+        ## What absence does NOT prove, and the three guards for it
+
+        "We stopped hearing from you" is ambiguous: the venue lost power,
+        the uplink died, our API was redeploying, the broker hiccuped, or
+        the WireGuard hub went away. All five look identical from here.
+        Three guards keep that ambiguity from becoming a 3am false alarm:
+
+        1. **The awake-window guard.** If the previous run of this sweep was
+           longer ago than the silence window, we were not awake to hear
+           from anyone, so nobody's silence means anything -- the pass is
+           skipped without touching a counter. This is what stops our own
+           deploys from paging the founder: on 2026-09-07 the api container
+           restarted at 03:49:19, and a sweep that reasoned over that gap
+           would have declared the whole fleet down.
+        2. **The fleet-outage guard.** If at least
+           ``ROUTER_REACHABILITY_FLEET_OUTAGE_RATIO`` of the routers we
+           actually evaluated look silent in the same 30-second window (and
+           there are at least
+           ``ROUTER_REACHABILITY_FLEET_OUTAGE_MIN_ROUTERS`` of them for
+           "most" to mean anything), the likelier explanation is us, not all
+           of them. Counters are frozen, one log line is emitted, nobody is
+           emailed.
+        3. **The tunnel confirmation.** ``tunnel_probe`` -- when the caller
+           supplies one -- reports each router's live WireGuard state from
+           the hub's own ``wg show wg0 dump``. A router that has stopped
+           calling us but whose tunnel is demonstrably still passing traffic
+           is not a venue outage; it is a broken agent script, and it is
+           logged as one instead of being alerted on. A probe that cannot
+           answer (hub unreachable, peer unknown) returns ``None`` and this
+           falls back to absence alone -- the guard can only ever prevent an
+           alert, never manufacture one.
+
+        ## Debounce, and the flapping night this is sized against
+
+        ``ROUTER_REACHABILITY_MISSES_TO_ALERT`` consecutive misses are
+        required to declare UNREACHABLE, and
+        ``ROUTER_REACHABILITY_HITS_TO_RESOLVE`` consecutive hits -- ten
+        minutes' worth -- to call it recovered. The asymmetry is the flap
+        guard. On 2026-09-07 one router went down at 03:50, returned at
+        04:12, and went down again at 04:16. Resolving on first contact
+        would have produced four emails in 35 minutes; requiring sustained
+        recovery collapses it to one "down" and one "back up", with no
+        separate cooldown table, because the alert simply never closes in
+        between and the Alert Engine's own de-duplication key refuses to
+        open a second one while the first is open.
+
+        ## Per-router isolation
+
+        Same discipline as ``sweep_stale_heartbeats`` above: one router's
+        update failing is logged and skipped, never aborting the sweep for
+        the rest.
+        """
+        moment = now or datetime.now(UTC)
+        candidates = await self.repository.list_reachability_candidates(now=moment)
+        result = {
+            "considered": len(candidates),
+            "silent": 0,
+            "marked_unreachable": 0,
+            "marked_reachable": 0,
+            "tunnel_alive_despite_silence": 0,
+            "skipped_platform_gap": 0,
+            "skipped_fleet_outage": 0,
+            "failed": 0,
+        }
+        if not candidates:
+            return result
+
+        # Guard 1: were we even awake for the window we are about to judge?
+        awake_for = timedelta(seconds=ROUTER_REACHABILITY_SILENCE_SECONDS)
+        if previous_sweep_at is None or moment - previous_sweep_at > awake_for:
+            result["skipped_platform_gap"] = len(candidates)
+            logger.warning(
+                "router_reachability_sweep_skipped_platform_gap",
+                extra={
+                    "considered": len(candidates),
+                    "previous_sweep_at": (
+                        previous_sweep_at.isoformat() if previous_sweep_at else None
+                    ),
+                },
+            )
+            return result
+
+        silence_cutoff = moment - awake_for
+        silent = [
+            (router, contact)
+            for router, contact in candidates
+            if contact is None or contact < silence_cutoff
+        ]
+        result["silent"] = len(silent)
+
+        # Guard 2: most of the fleet cannot go dark at once. That is us.
+        if (
+            len(candidates) >= ROUTER_REACHABILITY_FLEET_OUTAGE_MIN_ROUTERS
+            and len(silent) / len(candidates)
+            >= ROUTER_REACHABILITY_FLEET_OUTAGE_RATIO
+        ):
+            result["skipped_fleet_outage"] = len(silent)
+            logger.error(
+                "router_reachability_sweep_skipped_fleet_outage",
+                extra={"considered": len(candidates), "silent": len(silent)},
+            )
+            return result
+
+        # Guard 3: ask the tunnel whether they are really gone.
+        tunnel_alive: dict[uuid.UUID, bool | None] = {}
+        if silent and tunnel_probe is not None:
+            try:
+                tunnel_alive = await tunnel_probe([router for router, _ in silent])
+            except Exception as exc:  # noqa: BLE001 -- confirmation is optional
+                # A probe that cannot answer must never block the alert; it
+                # exists only to withhold one. Falling back to absence alone
+                # is the same answer we would give with no probe wired at
+                # all.
+                logger.warning(
+                    "router_reachability_tunnel_probe_failed",
+                    extra={"silent": len(silent), "error": str(exc)},
+                )
+
+        silent_ids = set()
+        abstain_ids = set()
+        for router, _contact in silent:
+            if tunnel_alive.get(router.id) is True:
+                # Silent to us, but its tunnel is demonstrably still up.
+                # That is our agent script, not their power.
+                #
+                # Neither a miss nor a hit, and the distinction matters in
+                # both directions. Counting it as a miss would alert a
+                # venue whose Wi-Fi is fine. Counting it as a hit would let
+                # an already-open outage alert resolve itself -- mailing
+                # "back online and has stayed up" about a router we have
+                # not actually heard a word from. We have no evidence
+                # either way about the agent, so the router's state and
+                # counters are left exactly as they are and the fact is
+                # logged for us to fix, which is whose problem it is.
+                result["tunnel_alive_despite_silence"] += 1
+                abstain_ids.add(router.id)
+                logger.warning(
+                    "router_reachability_agent_silent_but_tunnel_alive",
+                    extra={"router_id": str(router.id), "router_name": router.name},
+                )
+                continue
+            silent_ids.add(router.id)
+
+        for router, _contact in candidates:
+            if router.id in abstain_ids:
+                continue
+            try:
+                if router.id in silent_ids:
+                    result[
+                        "marked_unreachable"
+                    ] += await self._record_reachability_miss(router, moment)
+                else:
+                    result["marked_reachable"] += await self._record_reachability_hit(
+                        router, moment
+                    )
+            except Exception as exc:  # noqa: BLE001 -- per-router isolation, see docstring
+                result["failed"] += 1
+                logger.warning(
+                    "router_reachability_sweep_router_failed",
+                    extra={"router_id": str(router.id), "error": str(exc)},
+                )
+        return result
+
+    async def _record_reachability_miss(self, router: Router, moment: datetime) -> int:
+        """One observation of silence. Returns 1 if this observation is the
+        one that flipped the router to UNREACHABLE, else 0."""
+        misses = (router.reachability_consecutive_misses or 0) + 1
+        update: dict[str, object] = {
+            "reachability_consecutive_misses": misses,
+            "reachability_consecutive_hits": 0,
+        }
+        flipped = 0
+        if (
+            misses >= ROUTER_REACHABILITY_MISSES_TO_ALERT
+            and router.reachability_state != RouterReachabilityState.UNREACHABLE.value
+        ):
+            update["reachability_state"] = RouterReachabilityState.UNREACHABLE.value
+            update["reachability_state_changed_at"] = moment
+            flipped = 1
+            logger.warning(
+                "router_reachability_marked_unreachable",
+                extra={
+                    "router_id": str(router.id),
+                    "router_name": router.name,
+                    "organization_id": str(router.organization_id),
+                    "consecutive_misses": misses,
+                },
+            )
+        await self.repository.update_router(router, update)
+        return flipped
+
+    async def _record_reachability_hit(self, router: Router, moment: datetime) -> int:
+        """One observation of contact. Returns 1 if this observation is the
+        one that flipped the router back to REACHABLE, else 0.
+
+        Writes nothing at all in the overwhelmingly common case -- an
+        already-``reachable`` router with clean counters -- so a healthy
+        fleet costs this sweep one SELECT every 30 seconds and no UPDATEs.
+        """
+        state = router.reachability_state
+        if state == RouterReachabilityState.UNREACHABLE.value:
+            hits = (router.reachability_consecutive_hits or 0) + 1
+            update: dict[str, object] = {
+                "reachability_consecutive_hits": hits,
+                "reachability_consecutive_misses": 0,
+            }
+            if hits < ROUTER_REACHABILITY_HITS_TO_RESOLVE:
+                # Back in touch, but not yet trusted to stay. This is the
+                # flap guard: the alert stays open and no "it's back" email
+                # goes out until the site has held on for the full window.
+                await self.repository.update_router(router, update)
+                return 0
+            update["reachability_state"] = RouterReachabilityState.REACHABLE.value
+            update["reachability_state_changed_at"] = moment
+            await self.repository.update_router(router, update)
+            logger.info(
+                "router_reachability_marked_reachable",
+                extra={
+                    "router_id": str(router.id),
+                    "router_name": router.name,
+                    "consecutive_hits": hits,
+                },
+            )
+            return 1
+
+        if (
+            state == RouterReachabilityState.REACHABLE.value
+            and not router.reachability_consecutive_misses
+            and not router.reachability_consecutive_hits
+        ):
+            return 0
+
+        first_time = state != RouterReachabilityState.REACHABLE.value
+        update = {
+            "reachability_state": RouterReachabilityState.REACHABLE.value,
+            "reachability_consecutive_misses": 0,
+            "reachability_consecutive_hits": 0,
+        }
+        if first_time:
+            update["reachability_state_changed_at"] = moment
+        await self.repository.update_router(router, update)
+        return 0
 
     # -- credential access ---------------------------------------------------------
 

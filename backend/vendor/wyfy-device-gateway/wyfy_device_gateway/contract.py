@@ -12,6 +12,7 @@ so no compatibility shim is needed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -66,6 +67,69 @@ class InterfaceInfo:
     disabled: bool
     bridge: str | None
     has_ip_address: bool
+    # Whether this interface is a *member port* of some bridge, as opposed
+    # to being a bridge itself. ``bridge`` already carries which bridge, so
+    # this is derivable -- but only for a caller that knows the convention,
+    # and a VLAN access port picker needs the fact directly: an access port
+    # has to be a bridge port to be pulled out of one. Defaulted so the
+    # several existing constructors of this shape keep working unchanged.
+    is_bridge_port: bool = False
+    # The interface's own hardware address, as the device reports it.
+    #
+    # Carried because a caller configuring `/ip dhcp-server alert` has to
+    # name the DHCP server it trusts, and the only trustworthy source for
+    # that is the router's own MAC on the segment being watched. A wrong
+    # value there is worse than no alert: every legitimate lease reply looks
+    # rogue and the log fills with false alarms, which is how a real one
+    # gets missed. Resolved from the same read the caller already does
+    # rather than typed in or defaulted.
+    #
+    # `None` for interfaces that have no hardware address of their own.
+    mac_address: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IpAddressInfo:
+    """One row of the device's own ``/ip address`` table.
+
+    Read, never written, by the callers of :class:`NetworkSnapshot`. The
+    subnet a VLAN is about to claim has to be checked against what the
+    router already carries -- other VLAN *rows* in this platform's database
+    are not the same set, and are not the set RouterOS will reject against.
+    """
+
+    address: str  # "192.168.10.1/24" -- an address with a prefix, not a network
+    interface: str | None
+    disabled: bool
+    # RouterOS marks a row invalid when the interface it names no longer
+    # exists -- an address left behind by a deleted interface. Such a row
+    # occupies no subnet: nothing routes to it and nothing answers on it.
+    #
+    # Carried because a caller that cannot see it treats a dead address as a
+    # live one. A lab router held `10.0.0.1/24 invalid=True` on a vanished
+    # interface `*C`, and the VLAN subnet-overlap preflight refused every
+    # 10.0.0.0/24 VLAN on the strength of it -- a permanent, unexplainable
+    # rejection with nothing on the device actually using the range.
+    #
+    # Defaulted so the several existing constructors of this shape keep
+    # working unchanged.
+    invalid: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkSnapshot:
+    """Everything a VLAN preflight needs, read in one connection.
+
+    Deliberately one shape rather than two calls. "Is the router
+    reachable", "does the parent interface exist", and "does this subnet
+    collide with something already on the device" are three questions with
+    one answer source, and asking them over three separate RouterOS
+    sessions triples the time an operator waits for a validation failure --
+    and makes it possible for the three answers to disagree.
+    """
+
+    interfaces: list[InterfaceInfo]
+    ip_addresses: list[IpAddressInfo]
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,20 +151,123 @@ class WanHealth:
 
 @dataclass(frozen=True, slots=True)
 class ConnectedDevice:
+    """One device the router can currently see, merged by MAC across the
+    menus that vendor's adapter consults.
+
+    ``is_wireless`` is deliberately three-state, and the third state is
+    the common one on this fleet:
+
+    * ``True``  -- the device is associated to a radio this router owns.
+    * ``False`` -- this router can report wireless association, and this
+      device is not wireless.
+    * ``None``  -- **this router cannot report wireless association at
+      all**, so the question is unanswerable rather than answered "no".
+
+    ``None`` is not "we haven't looked yet". It means the capability does
+    not exist on the device, and no future poll will change that. Every
+    MikroTik router this platform currently deploys is a hEX lite /
+    RB750r2 (RouterOS 7.23.3, mipsbe): a five-port wired router with no
+    radio, no ``wireless`` package, and therefore no
+    ``/interface/wireless/registration-table`` menu at all. Guest Wi-Fi at
+    the venue comes from separate third-party access points (TP-Link /
+    Omada in the field today) that this platform does not talk to.
+
+    Collapsing that into ``False`` is what this three-state exists to
+    prevent: it turns "we cannot know" into the positive claim "this
+    guest's phone is on a cable", which is wrong for every Wi-Fi guest on
+    the fleet. A caller that needs a two-state answer must decide what to
+    do with ``None`` explicitly rather than inheriting a default.
+
+    ``signal_strength_dbm`` follows the same rule and has the same cause:
+    it is ``None`` whenever ``is_wireless`` is ``None``, permanently and
+    by construction, because the value lives in the access point and not
+    in this router. Do not render it as a pending measurement, and do not
+    substitute a placeholder for it downstream.
+    """
+
     mac_address: str
     ip_address: str | None
     hostname: str | None
     interface: str | None
-    is_wireless: bool
+    is_wireless: bool | None
     signal_strength_dbm: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class VlanConfig:
+    """One VLAN to realize on a device.
+
+    ``port_mode`` mirrors ``app.domains.vlan.models.Vlan.port_mode`` and
+    changes what is created, not merely how it looks:
+
+    * ``"trunk"`` -- ``interface`` is the parent trunk carrying tagged
+      traffic; a ``/interface vlan`` sub-interface named ``vlan<id>`` is
+      created on it and the address goes there.
+    * ``"access"`` -- ``interface`` is a dedicated *physical* port. It is
+      pulled out of the shared bridge and given this VLAN's subnet
+      directly, untagged. No ``/interface vlan`` entry is created at all.
+
+    Getting this wrong is not cosmetic: a row the operator saved as
+    "access" but realized as trunk leaves that physical port on the wrong
+    network. See ``network_config.renderers.render_vlan``, which this
+    mirrors.
+    """
+
     vlan_id: int
     name: str
     interface: str
     ip_cidr: str | None
+    port_mode: str = "trunk"
+    # The bridge this port belonged to before an access-mode VLAN took it,
+    # so deleting the VLAN can put it back. Set by the caller from the
+    # device snapshot taken before the push; ``None`` means the port was in
+    # no bridge, and the delete leaves it that way.
+    #
+    # This exists because the alternative was unrecoverable. ``delete_vlan``
+    # used to leave the port out of every bridge on the grounds that "which
+    # bridge it belonged to was never recorded" -- which is true, and the
+    # consequence was a venue whose access point sat on an unbridged port
+    # until somebody restored it by hand. Recording it is what makes the
+    # operation reversible by the product rather than by an engineer.
+    previous_bridge: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VlanHotspotConfig:
+    """One VLAN's own standalone captive portal.
+
+    Mirrors ``network_config.renderers._render_vlan_hotspot`` command for
+    command: an ``/ip pool``, an ``/ip dhcp-server`` and its network row,
+    an ``/ip hotspot profile``, an ``/ip dns static`` record for that
+    profile's ``dns-name``, and the ``/ip hotspot`` server itself -- all
+    bound to ``interface`` and named after ``vlan_id``, so one VLAN's
+    portal cannot touch another's or the router's own default ``hotspot1``.
+
+    ``interface`` is the *bind* interface, which is not always
+    ``vlan<id>``: in access mode the VLAN is realized as a physical port
+    with no ``/interface vlan`` entry at all, and the portal belongs on
+    that port. The caller resolves it; this shape does not guess.
+
+    ``gateway`` is required, not optional as it is on ``VlanConfig``. A
+    portal has to hand out addresses and answer DNS on a real address of
+    its own, and ``_render_vlan_hotspot`` skips with an explanatory comment
+    rather than inventing one -- the direct-push equivalent is the caller
+    refusing before it connects.
+    """
+
+    vlan_id: int
+    interface: str
+    cidr: str
+    gateway: str
+    # The ``dns-name`` RouterOS puts in the portal redirect URL, and the
+    # ``/ip dns static`` name that makes it resolve. Passed in rather than
+    # built here: the platform-wide base name lives in
+    # ``network_config.renderers.HOTSPOT_DNS_NAME`` and this package cannot
+    # import ``app.domains`` (see the module docstring).
+    dns_name: str
+    # RouterOS's ``html-directory`` -- which uploaded portal page set this
+    # profile serves. Same reasoning as ``dns_name``.
+    html_directory: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,19 +281,501 @@ class DhcpPoolConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RogueDhcpAlertConfig:
+    """One interface's watch for a DHCP server that is not ours --
+    RouterOS's ``/ip dhcp-server alert``.
+
+    ## What it does, and what it does NOT
+
+    It **logs**. That is the whole of it. It drops nothing, blocks
+    nothing, disconnects nobody, and cannot take a working guest network
+    down. A rogue DHCP server it detects keeps answering exactly as it
+    did before; the only thing that changes is that the router now says
+    so, in its own log, instead of the whole event being invisible. A
+    raised alert is evidence for a person, not a containment action, and
+    any caller that treats one as "handled" is wrong.
+
+    That ceiling is deliberate, not a gap to be closed later. The
+    alternative shapes -- dropping DHCP replies from unknown servers,
+    kicking the offending MAC -- are guards that can themselves black out
+    a venue if the trusted list is wrong by one character, and this
+    platform pushes to a fleet it cannot watch. A detector that is always
+    safe to have on beats a blocker nobody dares enable.
+
+    ## Why it is worth having anyway
+
+    A consumer router in factory configuration appeared briefly on the lab
+    guest bridge announcing ``192.168.1.1`` -- the WAN gateway's own
+    address -- with an Atheros MAC, and was gone before it could be
+    traced. The address it claimed was the small half of the danger: a box
+    in that state usually serves DHCP as well, and a rogue DHCP server
+    wins whenever it answers first. Guests take an address and a default
+    gateway that go nowhere, the router they are actually associated with
+    reports nothing wrong, and support gets "the wifi is broken" with no
+    evidence attached to it at all.
+
+    ## ``valid_servers`` is the caller's value, never the adapter's
+
+    The MAC addresses of the DHCP servers that are *supposed* to answer on
+    this interface -- in practice the router's own MAC on it, read off the
+    device by whatever resolves this config. It is required, and the
+    adapter refuses to invent one: a wrong entry makes every legitimate
+    reply look rogue and buries a real alert under a log full of false
+    ones, and an empty list means the same thing in a form that looks like
+    configuration rather than a mistake.
+
+    ``alert_timeout`` is how long RouterOS waits before reporting the same
+    unknown server again. ``None`` means "leave whatever the device has",
+    never "set it to a default we made up" -- the same posture
+    ``mikrotik_adapter._ensure_dhcp_server`` takes on ``lease_time``.
+    """
+
+    interface: str
+    valid_servers: tuple[str, ...]
+    alert_timeout: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RogueDhcpAlertStatus:
+    """Whether one interface is actually being watched for a rogue DHCP
+    server, as the device reports it right now.
+
+    The reader produces one of these for every interface running an
+    enabled DHCP server *and* for every alert row present, so an
+    unguarded interface is a row in the answer rather than a silence a
+    caller has to notice. An interface that hands out addresses with
+    nothing watching it is the state worth reporting, and it has no alert
+    row of its own to be listed by.
+
+    ``enabled`` is the field this type exists for. **RouterOS creates an
+    alert row disabled by default**: a first, careful attempt at
+    configuring this by hand on the lab router left three alerts present
+    and switched off -- guarding nothing, while reading in the
+    configuration exactly like a router that was guarded. A check that
+    tests only for presence certifies that router as safe. So presence
+    (``alert_present``) and liveness (``enabled``) are reported as two
+    separate facts, and :attr:`guarded` is the answer to the question
+    anyone actually has.
+
+    ``serves_dhcp`` is read from ``/ip dhcp-server`` in the same pass,
+    because an alert is only meaningful where this router is itself a DHCP
+    server -- an interface with no server of ours has no baseline to
+    compare an offer against.
+
+    ``managed`` says the row carries this platform's own comment marker. A
+    row without it was written by a person or an older tool; it is
+    reported, and adopted rather than duplicated on the next push, but the
+    distinction is worth seeing.
+
+    ``valid_servers`` is what the device says it trusts (canonical
+    uppercase where the entry is a real MAC, verbatim where it is not);
+    ``unknown_server`` is whatever RouterOS last saw answering that it did
+    not trust -- the only field here that is evidence rather than
+    configuration.
+    """
+
+    interface: str
+    serves_dhcp: bool
+    alert_present: bool
+    enabled: bool
+    valid_servers: tuple[str, ...]
+    alert_timeout: str | None
+    managed: bool
+    unknown_server: str | None
+
+    @property
+    def guarded(self) -> bool:
+        """Is this interface's DHCP being watched *right now*.
+
+        False for a missing row and, just as importantly, for one that is
+        present and disabled -- the state that looks configured and
+        watches nothing.
+        """
+        return self.alert_present and self.enabled
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionConfig:
+    """One custom DHCP option this platform owns on a router, plus where it
+    is attached.
+
+    ## Why this type exists at all
+
+    Until it did, **nothing in this platform could write a DHCP option.**
+    ``network_config/renderers.py`` renders ``/ip pool``, ``/ip
+    dhcp-server`` and ``/ip dhcp-server network`` and has never rendered an
+    ``option`` line; a fleet-wide ``grep`` for ``dhcp-server option``
+    returned nothing. The only writer of one was a **human pasting the
+    Master Console setup script**, which means the only remover of one was
+    a human too -- and that is how a wrong option survives on a live venue
+    router until somebody notices the symptom.
+
+    The concrete option that forced this: code **114** (RFC 8910 captive
+    portal URI), pointing at a cloud ``rfc8908`` endpoint whose ``captive``
+    member is a hardcoded ``true``. An RFC 8908 client re-polls that URI to
+    learn whether it is *still* captive and is always told yes, so a guest
+    who has signed in successfully keeps the portal sheet open forever. OS
+    probe interception -- what happens with no option 114 at all -- gets
+    both halves right: intercepted before login (sheet opens), succeeds
+    after (sheet dismisses). The endpoint cannot be made truthful, because
+    every guest reaches the cloud from behind the venue's NAT as one source
+    IP, so it has no way to tell one guest's state from another's. The fix
+    is therefore to stop advertising the option, and that is a *removal*
+    the platform has to be able to perform on its own.
+
+    ## Identity is ``name``, never ``code``
+
+    ``name`` is the row's own identity and the only thing this contract
+    matches on. Matching on ``code`` instead would let a sweep delete an
+    option **somebody else added** -- a venue with its own PXE or TFTP
+    option on the same code is a real configuration, not a mistake, and it
+    is not ours to remove. ``code``/``value``/``force`` are the desired
+    contents of *our* row and are written, not matched.
+
+    ``force`` mirrors RouterOS's own flag: send the option to every client
+    rather than only to clients that ask for it by code. It is set on the
+    real fleet router today, which is exactly why the symptom went from
+    occasional to universal.
+
+    ``option_set_name`` is the ``/ip dhcp-server option sets`` row that
+    carries this option, and ``network_addresses`` are the ``/ip
+    dhcp-server network`` rows the set is bound to. Both are optional: a
+    removal only needs ``name``, because the sets and bindings that
+    reference it are discovered from the device rather than assumed.
+    """
+
+    name: str
+    code: int | None = None
+    value: str | None = None
+    force: bool = False
+    option_set_name: str | None = None
+    network_addresses: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionInfo:
+    """One row of the router's own ``/ip dhcp-server option`` table."""
+
+    name: str
+    code: int | None
+    value: str | None
+    force: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionSetInfo:
+    """One row of ``/ip dhcp-server option sets``.
+
+    ``option_names`` is RouterOS's comma-separated ``options`` field split
+    out. It is a *list*, which is the whole reason a teardown cannot just
+    delete the set: a set that also carries somebody else's option must
+    lose our entry and keep theirs.
+    """
+
+    name: str
+    option_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionBinding:
+    """One place an option or option-set is actually handed to clients.
+
+    ``menu`` is the RouterOS path as a slash-joined string (``ip/dhcp-server
+    /network`` or ``ip/dhcp-server/lease``) and ``identity`` is the row's
+    human-recognisable key -- the subnet for a network row, the address for
+    a lease -- so a caller can say *where* something was attached without
+    holding a RouterOS ``.id`` that is meaningless the moment the
+    connection closes.
+
+    Both binding fields are carried, never merged: ``option_names`` is the
+    row's ``dhcp-option`` list and ``option_set_name`` its
+    ``dhcp-option-set``. They are different fields with different removal
+    rules -- one is a list to be edited down, the other a single value to
+    be unset -- and a shape that flattened them would lose that.
+    """
+
+    menu: str
+    identity: str
+    option_names: tuple[str, ...]
+    option_set_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionSnapshot:
+    """Everything the device currently says about its custom DHCP options.
+
+    ``supported`` is ``False`` on a router whose RouterOS has no ``/ip
+    dhcp-server option`` menu at all. That is not the same fact as "has no
+    options", and collapsing the two would report a router we could not ask
+    as a router that answered "none" -- the same conflation
+    :class:`RogueDhcpAlertStatus` exists to prevent one menu over.
+    """
+
+    supported: bool
+    options: tuple[DhcpOptionInfo, ...]
+    option_sets: tuple[DhcpOptionSetInfo, ...]
+    bindings: tuple[DhcpOptionBinding, ...]
+
+    def option(self, name: str) -> DhcpOptionInfo | None:
+        return next((o for o in self.options if o.name == name), None)
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionRemoval:
+    """What a removal actually changed on the device, as opposed to what it
+    was asked to change.
+
+    A removal is idempotent, so "it succeeded" says nothing on its own --
+    running it against a router that was cleaned last week succeeds too.
+    These four fields are the difference between the two runs, which is the
+    only thing worth logging and the only thing an operator asking "did
+    this venue still have it?" is actually asking.
+
+    ``option_sets_rewritten`` is separate from ``option_sets_removed``
+    deliberately: a set we emptied and deleted and a set we edited our
+    entry out of are different outcomes, and the second one means somebody
+    else's configuration is still live in that set.
+    """
+
+    option_removed: bool = False
+    option_sets_removed: tuple[str, ...] = ()
+    option_sets_rewritten: tuple[str, ...] = ()
+    bindings_detached: tuple[str, ...] = ()
+
+    @property
+    def changed(self) -> bool:
+        return bool(
+            self.option_removed
+            or self.option_sets_removed
+            or self.option_sets_rewritten
+            or self.bindings_detached
+        )
+
+@dataclass(frozen=True, slots=True)
 class PortForwardConfig:
-    protocol: str          # "tcp" | "udp"
+    """One inbound port-forwarding (DSTNAT) rule to realize on a device.
+
+    Sibling of :class:`NatRuleConfig` -- both land in ``/ip firewall nat``,
+    but on opposite chains and in opposite directions
+    (``dstnat``/``dst-nat`` inbound here, ``srcnat``/``masquerade``
+    outbound there) -- and it carries its identity for the same reason.
+
+    ``rule_id`` is the caller's own stable handle for this rule (the
+    ``port_forwarding_rules`` row id), carried for identity and written to
+    no RouterOS field except the comment. Every *other* field here is one a
+    customer edits in the dashboard: the external port they publish, the
+    host behind it, its port, the protocol. Keying the rule on any of them
+    means the next push finds no match, adds a second rule, and leaves the
+    first one still forwarding the same public port to a host that may no
+    longer be there -- silent, cumulative, and invisible in this platform's
+    own UI. See ``mikrotik_adapter.configure_port_forward``.
+
+    ``protocol`` accepts ``"both"`` in addition to ``"tcp"``/``"udp"``,
+    because that is what the domain's own rules can say. RouterOS cannot
+    express it on a single rule (``dst-port`` is only valid alongside a
+    tcp/udp ``protocol``), so the vendor adapter realizes it as one device
+    rule per transport -- see that method's docstring.
+
+    ``dst_address``/``src_address`` are ``None`` for "any", matching the
+    nullable columns they come from. ``src_address`` in particular is a
+    restriction: dropping it on the way to the device would publish a port
+    the operator meant to expose to one network to the whole internet.
+    """
+
+    rule_id: str
+    protocol: str  # "tcp" | "udp" | "both"
     external_port: int
     internal_ip: str
     internal_port: int
+    dst_address: str | None = None
+    src_address: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QosPacketMarkConfig:
+    """One QoS traffic-classification rule's ``/ip firewall mangle``
+    packet mark -- the half of RouterOS QoS that actually selects packets.
+
+    RouterOS realizes QoS as two independent objects: a mangle rule that
+    *sets* a packet mark, and a ``/queue tree`` entry that *references* it.
+    A queue referencing a mark nothing sets is inert, and that was exactly
+    the shipped state: ``create_queue_tree`` had a caller, this had no
+    equivalent at all, so the live push wrote the queue half and nothing
+    else.
+
+    The mangle line was not missing from the codebase -- ``network_config``
+    renders it (``renderers.render_qos_traffic_rule``) into the combined
+    config script, and ``POST /network-config/routers/{id}/push`` is
+    customer-reachable. It does not rescue QoS, because that script is
+    delivered over SSH, and a port sweep run from the platform against a
+    fleet router reached **only** ``8728``: ``22`` times out, along with
+    every other port tried including one nothing listens on, so the
+    filtering sits upstream of the router rather than on it. Both halves
+    therefore failed at once -- the half this class fixes was never called,
+    and the half that existed could not be delivered. The dashboard said
+    "Applied to your router" over the top of that.
+
+    ``rule_id`` is carried for identity, not for any RouterOS field, for
+    the same reason it is on :class:`ContentFilterRuleConfig` and
+    :class:`PortForwardConfig`: ``protocol``/``port_range_*``/``dscp_value``
+    are precisely what a customer edits, and ``label`` is the name they
+    typed. Keyed on any of them, the push after an edit would find no
+    match, add a second mangle rule, and leave the first one still marking
+    traffic for a classification nobody asked for.
+
+    ``packet_mark`` is the caller's own identifier and must be the exact
+    string the paired ``/queue tree`` entry references -- the two are
+    derived from one source of truth on the caller's side
+    (``app.domains.qos.identifiers.qos_packet_mark_identifier``), because
+    two independently-derived strings that drift apart fail silently: both
+    objects exist, neither does anything.
+
+    The match is either a protocol/port-range pair or a DSCP value, never
+    both and never neither -- the caller's own validator enforces that
+    (``app.domains.qos.validators.validate_traffic_match``), and a rule
+    that switched from one to the other is torn down and rewritten rather
+    than updated in place, because the fields the old match used have to
+    stop matching.
+    """
+
+    rule_id: str  # this rule's own stable id, and its device-side identity
+    packet_mark: str  # the mark this rule sets, and the queue tree reads
+    label: str  # human-readable label, carried in the device's own comment
+    priority: int  # carried in the comment only -- the queue tree sets it
+    protocol: str | None = None  # "tcp"/"udp", with a port range
+    port_range_start: int | None = None
+    port_range_end: int | None = None
+    dscp_value: int | None = None  # the alternative match, 0-63
+
+
+@dataclass(frozen=True, slots=True)
+class NatRuleConfig:
+    """One VLAN's source-NAT (masquerade) rule -- what turns a routed but
+    isolated VLAN subnet into one whose guests actually reach the
+    internet.
+
+    Sibling of :class:`PortForwardConfig`: both land in ``/ip firewall
+    nat``, but on opposite chains and in opposite directions
+    (``dstnat``/``dst-nat`` inbound there, ``srcnat``/``masquerade``
+    outbound here).
+
+    ``vlan_id`` is carried for identity, not for any RouterOS field: the
+    rule is found again on a later push by the comment derived from it
+    (``"WyfyGuest VLAN <id>"``), because ``src_address`` is precisely the
+    field an operator edits and so cannot be the handle -- see
+    ``mikrotik_adapter.configure_nat_masquerade``'s own docstring.
+
+    ``out_interface`` is ``None`` by default and that is the normal case:
+    it means "whichever interface this router's own live default route
+    leaves by". The caller (cloud-guest-repo) has no honest way to know a
+    given router's WAN port -- it is not stored anywhere, differs per
+    site, and a hardcoded ``"WAN"``/``"ether1"`` would masquerade out of
+    the wrong interface or silently match nothing. Pass a real name only
+    to override that resolution deliberately.
+    """
+
+    vlan_id: int
+    src_address: str  # the VLAN's own subnet as a CIDR, e.g. "10.100.0.0/24"
+    out_interface: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RadiusClientConfig:
+    """One router's registration as a RADIUS/hotspot NAS client.
+
+    ``src_address`` is the router's own address on the management tunnel,
+    and it is the field this whole shape turns on: the hub's FreeRADIUS
+    matches an incoming request to a ``client{}`` stanza **by source
+    address**, so a ``/radius`` row without it sends from whatever address
+    the routing table picks and the hub answers nothing. It is optional
+    only because a vendor with no tunnel has nothing to put here;
+    ``network_config.renderers.render_radius_client`` calls it "this
+    function's single most important parameter", and the caller that omits
+    it on MikroTik is registering a client that cannot authenticate.
+
+    ``coa_port`` is the RFC 5176 Change-of-Authorization listener port,
+    router-global rather than per-client (RouterOS has exactly one
+    ``/radius incoming`` object). RouterOS's own default is ``1700``; this
+    platform uses ``3799``, the RFC-assigned port, which is why finding
+    ``3799`` on a device is evidence this platform wrote it.
+    """
+
     radius_server_host: str
     radius_secret: str
     auth_port: int = 1812
     acct_port: int = 1813
+    src_address: str | None = None
+    coa_port: int = 3799
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotActiveSession:
+    """One row of the router's live ``/ip hotspot active`` table.
+
+    This is the table that decides whether a guest's packets are
+    forwarded. A ``GuestSession`` row in this platform's own database is a
+    *record* of a login; this is the router's own notion of who is
+    currently logged in, and the two can disagree -- which is the entire
+    reason this type exists. ``routeros_id`` is carried so a removal can
+    be issued per-row by ``.id`` rather than as a broad ``remove [find]``.
+    """
+
+    routeros_id: str
+    user: str | None
+    mac_address: str | None
+    address: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotSessionControl:
+    """What this router can currently be asked to do about a live hotspot
+    session, read from the device rather than assumed.
+
+    ``coa_accept`` is ``/radius incoming``'s own ``accept`` value, read
+    back through :func:`mikrotik_adapter._is_truthy` -- never a string
+    compare, because RouterOS answers a read with a real ``bool`` while
+    accepting ``"no"``/``"false"`` on write.
+
+    The distinction matters because this fleet is currently *in* the
+    disagreement it guards against: the lab router holds
+    ``/radius incoming accept=false port=3799``, and port 3799 is not
+    RouterOS's default (1700) -- it is exactly what
+    :meth:`MikroTikAdapter.set_radius_client_config` writes, in the same
+    statement that sets ``accept=yes``. One half of that write survives on
+    the device and the other does not, and nothing in this platform knows
+    why. So CoA availability is a per-router runtime fact that must be
+    read, and may never be inferred from "we configured it".
+    """
+
+    hotspot_servers: int
+    coa_accept: bool
+    coa_port: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotDisconnectResult:
+    """The honest outcome of asking a router to end one guest's live
+    hotspot session.
+
+    ``still_active`` is the field that carries the truth: it is a *second*
+    read of ``/ip hotspot active``, taken after the removals, listing rows
+    that still match. A non-empty ``still_active`` means the removal was
+    issued, raised nothing, and the router is still tracking the guest as
+    logged in -- which a caller must report as a failure rather than as a
+    green toast.
+
+    A re-read is deliberately not claimed to be proof about the *data
+    plane*. It distinguishes "the row is gone" from "the remove returned
+    quietly and the row is still there"; whether an already-established
+    flow keeps forwarding after the row disappears is a question only real
+    hardware and a real transfer can answer (see
+    ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §7, test T7).
+    """
+
+    control: HotspotSessionControl
+    matched: tuple[HotspotActiveSession, ...]
+    removed_ids: tuple[str, ...]
+    still_active: tuple[HotspotActiveSession, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,11 +788,22 @@ class ContentFilterRuleConfig:
     that docstring's own "Honest scope" section). Ported from
     ``cloud-guest-repo/backend/app/domains/content_filtering`` (see that
     domain's own module docstring for the full customer-facing scope
-    write-up this vendor-agnostic shape mirrors)."""
+    write-up this vendor-agnostic shape mirrors).
 
+    ``rule_id`` is carried for identity, not for any RouterOS field: the
+    objects this rule becomes are found again on a later push by the
+    comment marker derived from it, because ``value`` -- the blocked
+    domain or address -- is precisely what a customer edits and so cannot
+    be the handle. Keyed on ``value``, the push after an edit finds
+    nothing, adds a second sinkhole, and leaves the first one blocking a
+    site nobody asked to block any more. Same reasoning and the same
+    shape as :class:`NatRuleConfig`'s own ``vlan_id`` -- see
+    ``mikrotik_adapter.configure_content_filter_rule``'s own docstring."""
+
+    rule_id: str  # this rule's own stable id, and its device-side identity
     value_type: str  # "domain" | "ip_cidr"
     value: str  # a bare domain name ("facebook.com") or an IP/CIDR
-    label: str  # human-readable label, rendered into the device's own comment
+    label: str  # human-readable label, carried in the device's own comment
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,15 +884,57 @@ class DeviceDiscoveryResult:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceInterfaceCounters:
+    """One interface's real, current byte counters as the *device API*
+    reports them -- a single snapshot, never a rate, exactly like
+    ``snmp_poller.SnmpInterfaceCounters``. Turning two successive
+    snapshots into Mbps is the caller's own job.
+
+    Field-for-field identical to the SNMP shape on purpose: both are
+    persisted into the same
+    ``router_health_snapshots.interface_traffic_counters`` column and read
+    back by one chart, so a reading's transport must change its
+    *provenance tag*, never its structure.
+
+    ``if_index`` is the one field where the two transports are not
+    interchangeable, and it is worth being exact about. SNMP reports a
+    genuine IF-MIB ``ifIndex``. RouterOS's API has no such field -- the
+    only per-row handle it returns is its own internal ``.id`` (``*1``,
+    ``*2``, ...), which is what the MikroTik adapter parses into this
+    field. The two numbering schemes are commonly equal on RouterOS, but
+    this package does not assert that, because nothing here has verified
+    it against hardware. What follows from that: **``if_index`` is a
+    stable identity only within one transport.** Anything that must match
+    an interface across transports keys on ``if_name``, which both report
+    identically -- see the dashboard's own series key, which does exactly
+    that for this reason.
+    """
+
+    if_index: int
+    if_name: str
+    if_oper_status_up: bool | None
+    in_octets: int | None
+    out_octets: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceHealthResult:
     """Ported from
-    ``app.domains.provisioning_engine.device_adapters.DeviceHealthResult``."""
+    ``app.domains.provisioning_engine.device_adapters.DeviceHealthResult``.
+
+    ``interfaces`` is additive and defaults to ``None``, which means "this
+    adapter took no per-interface reading" -- never "this device has no
+    interfaces". An adapter that cannot read them leaves it ``None`` and
+    the caller persists ``None``, keeping "not measured" distinguishable
+    from "measured, and empty".
+    """
 
     healthy: bool
     cpu_load_percent: float | None
     free_memory_bytes: int | None
     uptime_seconds: int | None
     detail: str | None = None
+    interfaces: tuple[DeviceInterfaceCounters, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +955,137 @@ class SpeedTestResult:
     downloaded_bytes: int
     duration_seconds: float
     test_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotCertificatePush:
+    """One router's worth of "replace the TLS certificate the captive
+    portal serves", expressed as things the *device* can reach and names
+    the device already uses.
+
+    The two URLs are the whole point of this shape. The mechanism this
+    replaces pushed the PEMs with ``scp`` and drove the re-import over
+    ``ssh``; measured against the live fleet on 2026-09-06, ports
+    21/22/23/80/443/8291 all time out on the only reachable router --
+    filtered, a firewall drop, not "refused" -- and only 8728/8729 answer.
+    So nothing can be pushed *to* a router at all. Inverting the direction
+    (the router pulls, via ``/tool fetch``, which is an ordinary API
+    command on 8728) is the only transport that survives that firewall.
+
+    Because the direction is inverted, ``privkey_url`` is briefly a
+    credential living outside the API's own authentication: anyone who can
+    reach that URL gets the fleet private key. Minting it is therefore the
+    caller's responsibility and carries real obligations -- single use,
+    a short TTL, bound to the requesting router's own address, and served
+    only on an interface the public internet cannot route to. See
+    ``app.domains.router.ephemeral_pem_server`` in cloud-guest-repo for
+    the implementation those obligations are actually enforced by; this
+    package deliberately holds no opinion about *how* a URL is minted,
+    exactly as ``run_speed_test`` holds none about which host serves its
+    test file.
+
+    ``login_by`` is not a policy decision made here. It is ported verbatim
+    from ``ops/letsencrypt-hotspot/renew-hotspot-certs.sh``, which sets it
+    in the *same* ``set`` call as ``ssl-certificate`` because splitting the
+    two across separate calls silently no-op'd during the 2026-08-18
+    incident. It travels with the rebind so the rebind stays atomic, not so
+    that callers can retune the portal's authentication.
+
+    ``expected_dns_names`` is the certificate's own SAN list, when the
+    caller knows it. Given, the adapter refuses to rebind a profile whose
+    ``dns-name`` those SANs do not cover -- pushing a certificate that
+    does not match the address in the guest's URL bar produces exactly the
+    full-screen browser warning this whole effort exists to remove, while
+    looking like a success in every log.
+    """
+
+    cert_name: str
+    hotspot_profile: str
+    fullchain_url: str
+    privkey_url: str
+    login_by: str = "https,http-pap"
+    expected_dns_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotCertificatePushResult:
+    """What the device says is true *after* a certificate push -- read back
+    off the router, never inferred from the fact that the commands did not
+    raise.
+
+    Every field here exists because an import that silently no-ops is worse
+    than one that errors, and whether RouterOS's ``/certificate import``
+    reports its own result over the API has never been confirmed against
+    this fleet's firmware. ``certificates_imported``/
+    ``private_keys_imported`` carry that reply's counters when it sends
+    them and ``None`` when it sends nothing -- so a caller can tell "the
+    router said it imported 2 certificates" apart from "the router said
+    nothing and we checked ourselves". The read-back fields below are what
+    the adapter actually gates success on, precisely because the counters
+    may not be there.
+
+    ``chain_issuer_present`` is the 2026-08-18 incident, encoded as a
+    boolean. An earlier version of the shell push deleted the Let's Encrypt
+    intermediate immediately after importing it, and the router then served
+    the leaf alone: genuinely LE-issued, verifiable offline, incomplete on
+    the wire -- which strict/embedded TLS clients reject outright and
+    desktop browsers paper over, so it looked fine to whoever checked. The
+    tell on the device was an orphaned ``akid``: the leaf named an issuer
+    that no certificate object in the store claimed by ``skid``. That is
+    the check, not "did we import three objects".
+    """
+
+    cert_name: str
+    hotspot_profile: str
+    profile_dns_name: str | None
+    certificates_imported: int | None
+    private_keys_imported: int | None
+    bound_ssl_certificate: str | None
+    bound_login_by: str | None
+    leaf_has_private_key: bool
+    leaf_invalid_after: str | None
+    chain_issuer_present: bool
+    chain_cert_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DefaultRoute:
+    """One ``0.0.0.0/0`` route in the router's own ``main`` routing table,
+    as RouterOS reports it right now.
+
+    This is the shape WAN failover is decided on, and every field in it is
+    read off the device rather than assumed:
+
+    * ``route_id`` -- RouterOS's own ``.id`` for the row, the only handle
+      a write can address it by. Valid for the life of one connection;
+      never persisted anywhere.
+    * ``interface`` -- the egress interface this route actually leaves by,
+      resolved by :func:`mikrotik_adapter._route_interface`, which is the
+      *same* four-tier rule
+      :meth:`MikroTikAdapter.resolve_wan_interface` documents and uses.
+      ``None`` when no tier can name a real interface on this device: the
+      route exists, but nothing here can honestly say where it goes.
+    * ``distance`` -- RouterOS's own administrative distance. ``None``
+      when the row does not carry one (it always does in practice; the
+      Optional is so a malformed reply degrades to "cannot decide" rather
+      than to a fabricated 1).
+    * ``active`` -- RouterOS's live "this is the route currently
+      forwarding matching traffic" flag. It goes false the instant a
+      ``check-gateway`` probe fails, which is what makes it, and not mere
+      presence, the signal a failover target is usable.
+    * ``dynamic`` -- a route RouterOS created itself (a dhcp-client's own
+      auto-route). ``/ip route set`` is refused on these, so a failover
+      that would have to modify one has to say so rather than try.
+    """
+
+    route_id: str
+    gateway: str | None
+    interface: str | None
+    distance: int | None
+    active: bool
+    disabled: bool
+    dynamic: bool
+    comment: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +1119,23 @@ class DeviceGatewayAdapter(Protocol):
 
     # -- discovery / telemetry (read-only) -----------------------------
     async def get_interface_list(self, creds: DeviceCredentials) -> list[InterfaceInfo]: ...
+
+    async def read_network_snapshot(self, creds: DeviceCredentials) -> NetworkSnapshot:
+        """Every interface and every ``/ip address`` on the device, read in
+        one connection and filtered by nothing.
+
+        Distinct from :meth:`get_interface_list`, which exists to back a
+        *DHCP* picker and therefore drops every interface already carrying
+        an ``/ip dhcp-server`` -- on a real router that removes ``bridge``,
+        which is exactly the interface a VLAN trunk hangs off. A picker
+        that cannot offer the trunk parent is not a VLAN picker.
+
+        Read-only, and the single read a VLAN push preflight makes: whether
+        the router answers at all, whether the named parent/port exists,
+        and whether the subnet collides with one the device already carries
+        are one question asked once, not three sessions that can disagree.
+        """
+        ...
     async def get_wan_health(self, creds: DeviceCredentials, *, target_ip: str) -> WanHealth: ...
     async def list_connected_devices(self, creds: DeviceCredentials) -> list[ConnectedDevice]: ...
 
@@ -304,10 +1154,252 @@ class DeviceGatewayAdapter(Protocol):
 
     # -- network config push ---------------------------------------------
     async def configure_vlan(self, creds: DeviceCredentials, *, vlan: VlanConfig) -> None: ...
+
+    async def configure_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Puts a captive portal on one VLAN's own interface.
+
+        The six objects ``network_config.renderers._render_vlan_hotspot``
+        renders, issued as real API operations: pool, DHCP server, DHCP
+        network, hotspot profile, the static DNS record that makes the
+        profile's ``dns-name`` resolve, and the hotspot server. Scoped to
+        this VLAN's interface and named after its id, so it never disturbs
+        the router's default ``hotspot1`` or another VLAN's portal.
+
+        Idempotent, and *updating* where a field an operator can edit
+        changed -- a re-push after re-subnetting a VLAN has to move the
+        pool, not silently leave the old one.
+
+        Callers must not point this and :meth:`configure_dhcp_pool` at the
+        same interface: a portal brings its own ``/ip dhcp-server``, and
+        RouterOS refuses a second one on an interface that already has
+        one.
+        """
+        ...
     async def configure_dhcp_pool(self, creds: DeviceCredentials, *, pool: DhcpPoolConfig) -> None: ...
+
+    # -- custom DHCP options ------------------------------------------------
+    # The three operations that let this platform own an ``/ip dhcp-server
+    # option`` row instead of leaving it to whoever last pasted the setup
+    # script. See :class:`DhcpOptionConfig` for why that mattered.
+
+    async def read_dhcp_options(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        """Read the device's custom DHCP options, option sets, and every
+        row those are bound to. Reads only; writes nothing.
+
+        A router whose RouterOS has no option menu answers
+        ``supported=False`` rather than an empty list -- see
+        :class:`DhcpOptionSnapshot`.
+        """
+        ...
+
+    async def configure_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> None:
+        """Realize one custom DHCP option, its option set, and the network
+        rows the set is bound to.
+
+        Idempotent, and *updating* rather than skipping when the value or
+        the ``force`` flag drifted -- an option whose value is a stale URL
+        is worse than an absent one, because it reads as configured.
+        """
+        ...
+
+    async def delete_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        """Take one custom DHCP option, and only that option, back off the
+        device -- detaching it everywhere first, because RouterOS refuses
+        to remove anything still referenced.
+
+        Idempotent: safe against a router that never had the option and
+        against one already cleaned. The return value says which of those
+        it was.
+        """
+        ...
+
+    # -- rogue DHCP detection ----------------------------------------------
+    # A detector, deliberately never an enforcer: see
+    # :class:`RogueDhcpAlertConfig` for what a DHCP alert does and, more
+    # importantly, what it does not.
+
+    async def configure_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials, *, alerts: Sequence[RogueDhcpAlertConfig]
+    ) -> None:
+        """Make the device watch the named interfaces for a DHCP server
+        other than the ones the caller vouches for, and *log* when one
+        answers. It blocks nothing; a rogue server keeps working exactly
+        as before, it just stops being invisible.
+
+        An interface that runs no enabled DHCP server of ours is skipped
+        rather than alerted on: there is no baseline there to call a
+        reply rogue against.
+
+        Idempotent, and idempotent on the state that matters rather than
+        on presence -- a second push of an unchanged set writes nothing,
+        and a row somebody left disabled is switched back on, because
+        RouterOS creates these disabled by default and a present-but-off
+        alert reads as guarded while watching nothing.
+        """
+        ...
+
+    async def read_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials
+    ) -> list[RogueDhcpAlertStatus]:
+        """Whether this device is actually guarded against a rogue DHCP
+        server, interface by interface -- read-only.
+
+        Covers every interface serving DHCP as well as every alert row
+        present, so "this interface hands out addresses and nothing is
+        watching it" is something the caller is told rather than something
+        it has to infer from an absence.
+        """
+        ...
+
+    async def configure_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Gives one VLAN's subnet real internet access, by realizing a
+        source-NAT masquerade rule for it on the device's own WAN-facing
+        interface.
+
+        A VLAN with an address and a DHCP pool is a working *local*
+        network and nothing more: without this, its guests get a lease, a
+        gateway, and no route off the router. This is the toggle that
+        makes the difference.
+
+        Idempotent, and idempotent on *identity* rather than on content:
+        the rule is found again by a marker derived from ``rule.vlan_id``,
+        so editing the VLAN's subnet updates the existing rule instead of
+        leaving an orphan behind and adding a second one that masquerades
+        a subnet nothing uses any more.
+        """
+        ...
+
+    # -- WAN failover ------------------------------------------------------
+    # Until these existed, this platform's "Trigger failover" button moved
+    # no traffic: it flipped a boolean in a database and wrote an audit
+    # row. The venue stayed offline and the dashboard's "Active uplink"
+    # tile named the backup -- the one screen a customer looks at during an
+    # outage, made actively wrong. See ``read_default_routes`` and
+    # ``set_default_route_distances`` for what failover means on the device.
+
+    async def read_default_routes(
+        self, creds: DeviceCredentials
+    ) -> list[DefaultRoute]:
+        """Every ``0.0.0.0/0`` route in the device's own ``main`` routing
+        table, each resolved to the interface it actually leaves by.
+
+        Read-only, and the single read a failover decision is made from:
+        which uplinks the router believes it has, which one it currently
+        prefers, which are live, and which can be modified at all. A
+        caller that cannot see all of that before it writes is guessing.
+        """
+        ...
+
+    async def set_default_route_distances(
+        self, creds: DeviceCredentials, *, distances: Mapping[str, int]
+    ) -> None:
+        """Set the administrative distance of the default route leaving by
+        each named interface -- the write that actually moves traffic.
+
+        Keyed by interface name rather than by route id, because an id is
+        meaningless outside the connection that read it and the caller's
+        own decision is about links, not rows.
+
+        Every named interface is validated against the device (exactly one
+        modifiable main-table default route each) *before the first write*.
+        A half-applied distance change is worse than none: it can leave two
+        default routes tied at the same distance, which is RouterOS load
+        sharing across an uplink that is down.
+
+        Idempotent: an interface whose route already carries the requested
+        distance is skipped, so re-triggering an already-applied failover
+        issues no write at all.
+        """
+        ...
+
+    async def ensure_wan_egress(
+        self, creds: DeviceCredentials, *, interface: str
+    ) -> None:
+        """Make sure traffic that leaves by ``interface`` is actually
+        NATed and treated as WAN-facing -- additively, never by editing a
+        rule that is already working.
+
+        Moving the default route alone is not failover. A masquerade rule
+        bound to ``out-interface=ether1`` stops matching the moment traffic
+        leaves ``ether2``, so the route moves and every guest loses
+        internet anyway -- from behind an un-NATed private source address,
+        which looks exactly like the outage the failover was supposed to
+        end.
+        """
+        ...
+
+    # -- network config teardown ------------------------------------------
+    # Deleting a row never removed anything from the device: the platform
+    # could create a VLAN or a pool on a router and then had no way to take
+    # it back off, so a "deleted" object went on serving traffic forever.
+    # Both are idempotent -- removing what is already absent is a no-op, not
+    # an error, so a retry after a partial failure completes cleanly.
+    async def delete_vlan(
+        self, creds: DeviceCredentials, *, vlan: VlanConfig
+    ) -> None: ...
+
+    async def delete_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Takes one VLAN's captive portal back off the device.
+
+        Removes the six objects in the reverse of the order they were
+        created, because RouterOS enforces the references between them: the
+        hotspot server holds the profile and the pool, and the DHCP server
+        holds the pool. Idempotent.
+        """
+        ...
+
+    async def delete_dhcp_pool(
+        self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
+    ) -> None: ...
+
+    async def delete_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Takes one VLAN's internet access back off the device.
+
+        The same call serves two different intents -- the operator turned
+        the NAT toggle off, or deleted the VLAN outright -- because both
+        mean the same thing on the device: this VLAN's masquerade rule
+        must not be there. Only ``rule.vlan_id`` is consulted; a rule left
+        over from an older subnet is still this VLAN's rule and is removed
+        too.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error.
+        """
+        ...
+
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig
     ) -> None: ...
+
+    async def delete_port_forward(
+        self, creds: DeviceCredentials, *, rule: PortForwardConfig
+    ) -> None:
+        """Takes one port-forwarding rule back off the device.
+
+        Only ``rule.rule_id`` is consulted, by the same comment identity
+        :meth:`configure_port_forward` writes under -- so a rule left from
+        an earlier external port or internal host is still this row's rule
+        and is removed too. Matching on the current field values is exactly
+        how one would be orphaned instead: still forwarding a public port,
+        with nothing in this platform left pointing at it.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error.
+        """
+        ...
+
     async def set_radius_client_config(
         self, creds: DeviceCredentials, *, config: RadiusClientConfig
     ) -> None: ...
@@ -321,13 +1413,95 @@ class DeviceGatewayAdapter(Protocol):
         (``rule.value_type == "ip_cidr"``). See the MikroTik
         implementation's own docstring for the full, honest scope this
         deliberately does and does not cover (no Layer7, no web-proxy, no
-        TLS interception -- ever)."""
+        TLS interception -- ever).
+
+        Idempotent on ``rule.rule_id``: re-realizing an unchanged rule adds
+        nothing and raises nothing, and editing the blocked value updates
+        the objects already carrying this rule's marker rather than adding
+        a second set beside them."""
+        ...
+
+    async def configure_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule: QosPacketMarkConfig
+    ) -> None:
+        """Realizes the ``/ip firewall mangle`` packet mark half of one QoS
+        rule -- the half that decides which packets the paired
+        ``/queue tree`` entry ever sees. Without it the queue is inert and
+        the platform is claiming a prioritisation that is not happening.
+
+        Idempotent on ``rule.rule_id``: re-realizing an unchanged rule
+        writes nothing and raises nothing, and editing the match updates
+        the rule already carrying this rule's marker rather than adding a
+        second one beside it."""
+        ...
+
+    async def delete_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule_id: str
+    ) -> None:
+        """Takes one QoS rule's mangle mark back off the device, by the
+        same ``rule_id`` identity the write path stamps it with -- so a
+        rule whose match was edited since the last push is still found and
+        removed rather than left marking traffic for a rule the customer
+        deleted.
+
+        Idempotent: removing what is already absent is a no-op."""
+        ...
+
+    async def delete_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Takes one content-filtering rule back off the device, by the
+        same ``rule.rule_id`` identity the write path stamps it with -- so
+        a rule whose blocked value was edited since the last push is still
+        found and removed rather than orphaned.
+
+        Idempotent: removing what is already absent is a no-op, so a retry
+        after a partial failure completes cleanly."""
         ...
 
     # -- disconnect / kick -------------------------------------------------
     async def disconnect_device(
         self, creds: DeviceCredentials, *, mac_address: str, interface: str | None
     ) -> None: ...
+
+    async def read_hotspot_session_control(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        """Reads whether this router runs a hotspot at all, and whether it
+        currently accepts an RFC 5176 Disconnect-Request.
+
+        Read-only. Exists so a caller can *report* CoA availability per
+        router instead of inferring it from this platform's own
+        configuration history -- see :class:`HotspotSessionControl`.
+        """
+        ...
+
+    async def end_hotspot_sessions(
+        self,
+        creds: DeviceCredentials,
+        *,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
+        """Ends every live ``/ip hotspot active`` session belonging to one
+        guest, identified by MAC address and/or hotspot ``user``.
+
+        This is the operation that actually cuts a guest off. Removing a
+        row from ``/ip hotspot active`` is the device-local equivalent of
+        the Disconnect-Request a RADIUS server would send, and unlike CoA
+        it needs no inbound UDP reachability and no ``/radius incoming
+        accept=yes`` -- it rides the same port-8728 API every other write
+        in this gateway uses.
+
+        Idempotent: a guest with no live session matches nothing, removes
+        nothing, and raises nothing.
+
+        Never widens the match. A ``None`` ``mac_address`` and a ``None``
+        ``username`` match *nothing* rather than everything -- a
+        block whose subject could not be identified must end zero sessions,
+        not every session on the router.
+        """
+        ...
 
     # -- diagnostics (network_diagnostics + isp call sites share `ping`) --
     async def ping(
@@ -407,6 +1581,35 @@ class DeviceGatewayAdapter(Protocol):
         is a slow, on-demand, multi-second-or-more real action, not a
         quick health-check read) -- see the MikroTik implementation's own
         docstring for real, measured timings against real hardware."""
+        ...
+
+    # -- hotspot TLS certificate ------------------------------------------
+    async def push_hotspot_certificate(
+        self, creds: DeviceCredentials, *, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """Replace the certificate the captive portal serves, over the API
+        alone -- no SSH, no SFTP, no port but the one the fleet's firewall
+        actually leaves open.
+
+        The device pulls both PEMs itself from the caller-minted URLs in
+        ``push`` (``/tool fetch``), imports them, and the profile is
+        rebound to the new leaf. See :class:`HotspotCertificatePush` for
+        why the direction is inverted and what minting those URLs obliges
+        the caller to.
+
+        Fails closed in the direction that matters: everything destructive
+        (removing the old leaf, rebinding the profile) happens only after
+        the new leaf has been read back off the device by name, so an
+        import that silently does nothing leaves the router on its current,
+        working certificate rather than on none. Success is likewise a
+        read-back, never an absence of errors -- see
+        :class:`HotspotCertificatePushResult`.
+
+        Not idempotent in the "re-push writes nothing" sense the config
+        methods are: a certificate push is a replacement, and re-running it
+        genuinely re-imports and re-binds. It is safe to re-run, which is
+        the property that actually matters after a partial failure.
+        """
         ...
 
     # -- queue management (QoS/bandwidth shaping) --------------------------
@@ -582,13 +1785,31 @@ __all__ = [
     "UnsupportedVendorError",
     "DeviceCredentials",
     "InterfaceInfo",
+    "IpAddressInfo",
+    "NetworkSnapshot",
     "WanHealth",
     "ConnectedDevice",
     "VlanConfig",
+    "VlanHotspotConfig",
     "DhcpPoolConfig",
+    "RogueDhcpAlertConfig",
+    "RogueDhcpAlertStatus",
+    "DhcpOptionConfig",
+    "DhcpOptionInfo",
+    "DhcpOptionSetInfo",
+    "DhcpOptionBinding",
+    "DhcpOptionSnapshot",
+    "DhcpOptionRemoval",
+    "NatRuleConfig",
     "PortForwardConfig",
     "RadiusClientConfig",
     "ContentFilterRuleConfig",
+    "QosPacketMarkConfig",
+    "HotspotActiveSession",
+    "HotspotSessionControl",
+    "HotspotDisconnectResult",
+    "HotspotCertificatePush",
+    "HotspotCertificatePushResult",
     "ProvisionResult",
     "SpeedTestResult",
     "PingResult",
@@ -597,6 +1818,7 @@ __all__ = [
     "QueueDeviceStatus",
     "DeviceDiscoveryResult",
     "DeviceHealthResult",
+    "DeviceInterfaceCounters",
     "RawCommandResult",
     "DeviceGatewayAdapter",
 ]

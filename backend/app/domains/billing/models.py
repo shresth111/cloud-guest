@@ -1065,6 +1065,22 @@ class Invoice(BaseModel):
     )
     due_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    #: The coupon discount actually granted on this invoice -- gross
+    #: ``subtotal`` minus this is the taxable value handed to
+    #: ``validators.compute_tax_breakdown``, and
+    #: ``subtotal - discount_amount + tax_amount == total_amount``. Kept as
+    #: its own column rather than netted into ``subtotal`` because CGST Act
+    #: s.15(3)(a) excludes a discount from taxable value only where the
+    #: invoice *records* it, and because a customer (or an auditor) reading
+    #: a subtotal already reduced by an invisible amount cannot tell a
+    #: coupon from a mispriced plan. Sourced from the ``CouponUsage`` row
+    #: ``CouponService.apply_coupon`` froze at signup -- never recomputed
+    #: here, so a later edit to the coupon's ``discount_value`` cannot
+    #: retroactively change what an issued invoice granted (the same "copy,
+    #: not reference" rule ``billing_snapshot`` follows).
+    discount_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
     cgst_amount: Mapped[Decimal] = mapped_column(
         Numeric(12, 2), default=Decimal("0"), nullable=False
     )

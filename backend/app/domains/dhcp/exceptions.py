@@ -21,6 +21,15 @@ __all__ = [
     "InvalidIpAddressError",
     "InvalidAddressRangeError",
     "DhcpPoolRangeConflictError",
+    "DhcpPoolNotEnabledError",
+    "DhcpPoolMissingInterfaceError",
+    "DhcpPoolMissingGatewayError",
+    "DhcpPoolHotspotConflictError",
+    "DhcpMissingCredentialsError",
+    "UnsupportedDhcpVendorError",
+    "DhcpDeviceConnectionError",
+    "DhcpDeviceOperationError",
+    "DhcpOptionValueRequiredError",
 ]
 
 
@@ -37,6 +46,26 @@ class DhcpPoolNotFoundError(DhcpError):
     def __init__(self, pool_id: uuid.UUID | str) -> None:
         super().__init__(
             f"DHCP pool not found: {pool_id}", status_code=status.HTTP_404_NOT_FOUND
+        )
+
+
+class CrossLocationDhcpPoolAccessError(DhcpError):
+    """A caller confined to particular sites reached a DHCP pool
+    at another site.
+
+    Distinct from ``CrossOrganizationDhcpPoolAccessError``:
+    both sites belong to the *same* organization, so the organization
+    comparison sees nothing wrong. The row is reached by its own id,
+    so ``RequirePermission`` had nothing to pin the check to -- see
+    ``app.domains.rbac.location_scope`` for why the confinement comes
+    from the caller's grants rather than from ``X-Location-Id``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a DHCP pool at a location outside "
+            "your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
         )
 
 
@@ -87,4 +116,171 @@ class DhcpPoolRangeConflictError(DhcpError):
             f"Address range overlaps existing DHCP pool "
             f"'{conflicting_pool_id}' on router '{router_id}'",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+# ============================================================================
+# Device push -- preconditions checked before a socket is opened, so a
+# misconfigured row fails as a 4xx naming the problem rather than as a
+# device timeout. All subclass ``CloudGuestError``, so the app-wide handler
+# turns them into a real non-2xx: the frontend interceptor unwraps ``data``
+# and never reads ``success``, so a 200 carrying ``success: false`` would be
+# indistinguishable from a successful push to every caller in the app.
+# ============================================================================
+
+
+class DhcpPoolNotEnabledError(DhcpError):
+    """A disabled pool is intent to *not* serve addresses. Pushing one
+    would create a live ``/ip dhcp-server`` for a row the operator has
+    switched off."""
+
+    def __init__(self, pool_id: uuid.UUID) -> None:
+        super().__init__(
+            f"DHCP pool '{pool_id}' is disabled and cannot be pushed to a device",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class DhcpPoolMissingInterfaceError(DhcpError):
+    """``interface`` is nullable on this model, and the adapter derives
+    both RouterOS identifiers (``<iface>-pool``, ``<iface>-dhcp``) and the
+    server's own ``interface=`` from it. Pushing without one would either
+    fail obscurely inside the gateway or bind the server to nothing.
+
+    ``render_dhcp_pool`` handles the same case by emitting a comment and
+    skipping -- fine for a script, but on a direct push that silence would
+    report success for a device that received nothing.
+    """
+
+    def __init__(self, pool_id: uuid.UUID) -> None:
+        super().__init__(
+            f"DHCP pool '{pool_id}' has no interface configured -- set the "
+            "interface (e.g. the VLAN it serves, such as vlan300) before "
+            "pushing it",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class DhcpPoolMissingGatewayError(DhcpError):
+    """A DHCP server that hands out addresses with no gateway gives guests
+    an IP and no route off the subnet -- working-looking and useless.
+
+    Raised rather than defaulted: guessing ``.1`` would be a fabricated
+    network fact, and the operator is the only one who knows which address
+    the router actually holds on that interface.
+    """
+
+    def __init__(self, pool_id: uuid.UUID) -> None:
+        super().__init__(
+            f"DHCP pool '{pool_id}' has no gateway IP address -- guests would "
+            "receive an address with no route off the subnet",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class DhcpMissingCredentialsError(DhcpError):
+    """The target router has no reachable host, API username, or decryptable
+    API secret -- raise rather than guess, mirroring ``vlan``/``qos``."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' has no usable API credentials for a DHCP push",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class UnsupportedDhcpVendorError(DhcpError):
+    """``Router.vendor`` is a free ``String(50)``, so a row carrying
+    ``"MikroTik"`` or ``"mikrotik_routeros"`` lands here and gets this
+    domain's typed 400 rather than an opaque error from inside the
+    gateway."""
+
+    def __init__(self, vendor: str) -> None:
+        super().__init__(
+            f"No DHCP device adapter is registered for vendor '{vendor}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class DhcpDeviceConnectionError(DhcpError):
+    """Could not reach the router at all -- a 502, not a 500: the failure is
+    upstream of this service, not inside it."""
+
+    def __init__(self, host: str, detail: str) -> None:
+        super().__init__(
+            f"Could not connect to router at {host}: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class DhcpDeviceOperationError(DhcpError):
+    """The router was reached and refused, or failed, the operation. Carries
+    the device's own words verbatim."""
+
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"Router rejected {operation}: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class DhcpPoolHotspotConflictError(DhcpError):
+    """This pool's interface already belongs to a VLAN's captive portal.
+
+    The mirror image of ``app.domains.vlan.exceptions
+    .VlanHotspotDhcpPoolConflictError``, and it exists for the same single
+    rule: **a VLAN's captive portal owns DHCP on that VLAN's own
+    interface.** A portal must create its own ``/ip pool`` and ``/ip
+    dhcp-server`` on the interface it challenges, RouterOS permits one
+    DHCP server per interface, and this domain's push creates a second.
+
+    Guarding only the VLAN side would have made the rule half-true: the
+    collision is reachable from either direction, and the direction that
+    stayed open is the one where a customer configures a portal first --
+    the normal order -- and then adds a pool.
+
+    Refused rather than resolved by deleting the portal's objects. Both
+    are things an operator deliberately created and can still see in the
+    dashboard; silently removing one would report a successful push while
+    a captive portal that is supposed to be intercepting guests simply
+    stops.
+
+    The message names the VLAN so the fix is actionable, and the fix is
+    the operator's to choose: point this pool at another interface, or
+    turn that VLAN's portal off.
+    """
+
+    def __init__(self, pool_id: uuid.UUID, interface: str, vlan_tag: int) -> None:
+        super().__init__(
+            f"DHCP pool '{pool_id}' serves interface '{interface}', which "
+            f"already carries the captive portal of VLAN {vlan_tag} -- a "
+            "portal brings its own DHCP server and RouterOS allows only one "
+            "per interface. Re-point this pool, or turn that VLAN's portal "
+            "off",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class DhcpOptionValueRequiredError(DhcpError):
+    """A caller asked for the captive-portal DHCP option to be *present*
+    without saying what value it should carry.
+
+    Refused rather than defaulted, and the refusal is the point. This
+    database has never stored a per-router option-114 value -- the only
+    thing that ever wrote one was a human pasting the Master Console setup
+    script -- so any fallback this code invented would be a fabricated URI
+    handed to every client device on a guest network. An operator who has
+    to supply the value gets an error they can fix; an operator handed a
+    guessed one gets a venue whose captive portal points somewhere wrong
+    and no indication that it does.
+
+    The removal direction needs no value at all, which is why this can only
+    ever be raised by ``present=True``.
+    """
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            "A DHCP option value is required to write the captive-portal "
+            f"option to router {router_id}",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )

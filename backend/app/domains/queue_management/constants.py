@@ -210,6 +210,15 @@ TASK_SWEEP_SCHEDULE_TRANSITIONS = (
     "app.domains.queue_management.tasks.sweep_schedule_transitions"
 )
 
+# Fired by the Policy router after a bandwidth-policy version publish --
+# re-resolves every live (ACTIVE) session queue assignment in each location
+# the published policy is mapped to, so a venue that just raised a speed
+# sees it reach guests who are already connected (see
+# ``QueueManagementService.reapply_active_sessions_for_location``).
+TASK_REAPPLY_POLICY_ASSIGNMENTS = (
+    "app.domains.queue_management.tasks.reapply_policy_assignments"
+)
+
 # Every 5 minutes -- a schedule window boundary (e.g. "Night Mode" starting
 # at 22:00) should flip within a few minutes of the real clock time, not
 # be discovered only on the next admin action. Shorter than
@@ -236,5 +245,6 @@ __all__ = [
     "QueueScheduleType",
     "QueueTemplatePersona",
     "TASK_SWEEP_SCHEDULE_TRANSITIONS",
+    "TASK_REAPPLY_POLICY_ASSIGNMENTS",
     "SCHEDULE_SWEEP_INTERVAL_SECONDS",
 ]

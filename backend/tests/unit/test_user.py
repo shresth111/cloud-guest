@@ -198,6 +198,9 @@ class FakeOrganizationLookup:
 
     organizations: dict[uuid.UUID, Organization] = field(default_factory=dict)
     member_rows: list[OrganizationMember] = field(default_factory=list)
+    invite_requesting_organization_ids: list[uuid.UUID | None] = field(
+        default_factory=list
+    )
 
     async def get_organization(
         self, organization_id: uuid.UUID, *, include_deleted: bool = False
@@ -236,8 +239,15 @@ class FakeOrganizationLookup:
         actor_user_id: uuid.UUID,
         organization_id: uuid.UUID,
         user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         is_primary_contact: bool = False,
     ) -> OrganizationMember:
+        # Recorded rather than ignored: this fake matching the real
+        # signature is the whole reason these tests are worth running.
+        # While it did not, every test here passed against a Protocol that
+        # no longer described OrganizationService, and
+        # /locations/provision returned 500 in production.
+        self.invite_requesting_organization_ids.append(requesting_organization_id)
         member = OrganizationMember(
             **_base_fields(
                 organization_id=organization_id,
@@ -457,6 +467,28 @@ class TestUserCreation:
         assert len(memberships) == 1
         assert memberships[0].status == MembershipStatus.ACTIVE.value
         assert memberships[0].joined_at is not None
+
+    async def test_create_user_passes_its_tenant_scope_into_invite_member(self) -> None:
+        """`invite_member` performs its own tenant check and takes
+        `requesting_organization_id` with no default precisely so a
+        forgotten call site fails loudly. It was forgotten here, and
+        `POST /locations/provision` returned 500 in production until it was
+        passed. Asserting the value *arrives* rather than only that the
+        signature accepts it: a call site that passed `None` to silence the
+        TypeError would satisfy the signature and reopen the cross-tenant
+        write the argument exists to prevent.
+        """
+        service, _identity, org_lookup, _assigner, _resolver, _audit = make_service()
+        organization = org_lookup.add_organization()
+
+        await service.create_user(
+            **_create_kwargs(
+                organization_id=organization.id,
+                requesting_organization_id=organization.id,
+            )
+        )
+
+        assert org_lookup.invite_requesting_organization_ids == [organization.id]
 
     async def test_create_user_with_org_and_initial_role_assigns_role(self) -> None:
         service, _identity, org_lookup, role_assigner, _resolver, _audit = (

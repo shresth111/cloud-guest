@@ -39,6 +39,7 @@ from app.domains.qos.exceptions import (
     InvalidPriorityError,
     NoTrafficMatchError,
     QosDeviceConnectionError,
+    QosDeviceOperationError,
     QosMissingCredentialsError,
     QosTrafficRuleNotEnabledError,
     QosTrafficRuleNotFoundError,
@@ -147,6 +148,18 @@ class FakeQosRepository:
         rule.deleted_at = _now()
         return rule
 
+    #: Counts the explicit commit ``push_rule_to_device`` issues before it
+    #: re-raises a device failure. This fake has no transaction of its own,
+    #: so the *count* is the only thing that can prove the commit happened
+    #: -- and it is the whole difference between a failure record that
+    #: survives ``get_db_session``'s rollback and one that does not. See
+    #: ``QosRepository.commit``'s own docstring, and the identical counter
+    #: in ``test_dhcp.py``/``test_vlan.py``/``test_content_filtering.py``.
+    commits: int = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
+
     async def list_rules(
         self,
         *,
@@ -232,15 +245,58 @@ class FakeQosDeviceAdapter:
     created: list[dict[str, object]] = field(default_factory=list)
     priority_updates: list[dict[str, object]] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    packet_marks: list[dict[str, object]] = field(default_factory=list)
+    removed_marks: list[str] = field(default_factory=list)
+    #: Every device call in the order it was made, so a test can assert the
+    #: mark is written *before* the queue that references it rather than
+    #: only that both happened.
+    calls: list[str] = field(default_factory=list)
     fail_create: Exception | None = None
     fail_set_priority: Exception | None = None
+    fail_packet_mark: Exception | None = None
     _id_counter: int = 0
+
+    async def apply_packet_mark(
+        self,
+        credentials: QosCredentials,
+        *,
+        rule_id: str,
+        packet_mark: str,
+        label: str,
+        priority: int,
+        protocol: str | None,
+        port_range_start: int | None,
+        port_range_end: int | None,
+        dscp_value: int | None,
+    ) -> None:
+        if self.fail_packet_mark is not None:
+            raise self.fail_packet_mark
+        self.calls.append("apply_packet_mark")
+        self.packet_marks.append(
+            {
+                "rule_id": rule_id,
+                "packet_mark": packet_mark,
+                "label": label,
+                "priority": priority,
+                "protocol": protocol,
+                "port_range_start": port_range_start,
+                "port_range_end": port_range_end,
+                "dscp_value": dscp_value,
+            }
+        )
+
+    async def remove_packet_mark(
+        self, credentials: QosCredentials, *, rule_id: str
+    ) -> None:
+        self.calls.append("remove_packet_mark")
+        self.removed_marks.append(rule_id)
 
     async def create_priority_queue(
         self, credentials: QosCredentials, *, name: str, packet_mark: str, priority: int
     ) -> str:
         if self.fail_create is not None:
             raise self.fail_create
+        self.calls.append("create_priority_queue")
         self._id_counter += 1
         device_id = f"*{self._id_counter}"
         self.created.append(
@@ -254,6 +310,7 @@ class FakeQosDeviceAdapter:
     ) -> None:
         if self.fail_set_priority is not None:
             raise self.fail_set_priority
+        self.calls.append("set_priority")
         self.priority_updates.append(
             {"device_queue_id": device_queue_id, "priority": priority}
         )
@@ -261,6 +318,7 @@ class FakeQosDeviceAdapter:
     async def remove_priority_queue(
         self, credentials: QosCredentials, *, device_queue_id: str
     ) -> None:
+        self.calls.append("remove_priority_queue")
         self.removed.append(device_queue_id)
 
 
@@ -751,6 +809,104 @@ class TestPushRuleToDevice:
         assert failed.device_queue_id is None
 
 
+    async def test_the_push_writes_the_packet_mark_before_the_queue(self) -> None:
+        """RouterOS QoS is two objects and the queue is the one that
+        references the mark. Writing the queue first would leave the router
+        holding a queue matching nothing for as long as the mangle write
+        takes -- or forever, if it fails -- which is precisely the state
+        this domain used to ship permanently."""
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+        rule = await _create_rule(h, router, priority=2)
+
+        await h.service.push_rule_to_device(
+            rule.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert h.device_adapter.calls == ["apply_packet_mark", "create_priority_queue"]
+        mark = h.device_adapter.packet_marks[0]
+        assert mark["rule_id"] == str(rule.id)
+        # The same identifier the queue tree references -- one source of
+        # truth, so the two objects can never point at different strings.
+        assert mark["packet_mark"] == qos_packet_mark_identifier(rule)
+        assert mark["packet_mark"] == h.device_adapter.created[0]["packet_mark"]
+        assert mark["protocol"] == "udp"
+        assert (mark["port_range_start"], mark["port_range_end"]) == (5060, 5061)
+        assert mark["priority"] == 2
+
+    async def test_a_failed_packet_mark_never_creates_the_queue(self) -> None:
+        """Half a mechanism reported as success is the defect. If the mark
+        does not land, no queue is created and the row does not go
+        ``active``."""
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+        rule = await _create_rule(h, router)
+        h.device_adapter.fail_packet_mark = QosDeviceConnectionError(
+            "10.0.0.1", "connection refused"
+        )
+
+        with pytest.raises(QosDeviceConnectionError):
+            await h.service.push_rule_to_device(
+                rule.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert h.device_adapter.created == []
+        failed = await h.service.get_rule(rule.id)
+        assert failed.device_push_status == QosDevicePushStatus.FAILED.value
+
+    async def test_a_device_failure_is_recorded_committed_and_re_raised(self) -> None:
+        """The commit is the point. ``GenericRepository.update`` only
+        ``flush()``es and ``get_db_session`` rolls back on any exception, so
+        without an explicit commit the failure record is discarded: the row
+        still reads ``pending`` with ``device_push_error`` NULL after a real
+        device failure, and the dashboard's failure tooltip can never fire.
+        ``dhcp`` and ``vlan`` had this right; this domain did not."""
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+        rule = await _create_rule(h, router)
+        h.device_adapter.fail_create = QosDeviceOperationError(
+            "create_priority_queue", "already have such item"
+        )
+
+        with pytest.raises(QosDeviceOperationError):
+            await h.service.push_rule_to_device(
+                rule.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        failed = await h.service.get_rule(rule.id)
+        assert failed.device_push_status == QosDevicePushStatus.FAILED.value
+        assert "already have such item" in (failed.device_push_error or "")
+        # Exactly one commit, issued before the re-raise -- this is what
+        # makes the two assertions above survive the session rollback.
+        assert h.repository.commits == 1
+
+    async def test_a_successful_push_issues_no_commit_of_its_own(self) -> None:
+        """The commit exists only to save a record that would otherwise be
+        rolled back. A successful push leaves the request's own transaction
+        boundary alone, exactly as ``dhcp``/``vlan`` do."""
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+        rule = await _create_rule(h, router)
+
+        await h.service.push_rule_to_device(
+            rule.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert h.repository.commits == 0
+
+
 # ============================================================================
 # delete_rule -- real device cleanup for an already-pushed rule
 # ============================================================================
@@ -770,6 +926,7 @@ class TestDeleteRuleDeviceCleanup:
         )
 
         assert h.device_adapter.removed == []
+        assert h.device_adapter.removed_marks == []
 
     async def test_delete_removes_the_live_device_queue_when_pushed(self) -> None:
         h = make_harness()
@@ -794,6 +951,14 @@ class TestDeleteRuleDeviceCleanup:
         )
 
         assert h.device_adapter.removed == [pushed_device_queue_id]
+        # Both halves, in the reverse of the order the push put them on.
+        # Removing only the queue left the router marking packets for a
+        # rule the customer had deleted.
+        assert h.device_adapter.removed_marks == [str(rule.id)]
+        assert h.device_adapter.calls[-2:] == [
+            "remove_priority_queue",
+            "remove_packet_mark",
+        ]
         assert deleted.is_deleted is True
         assert deleted.device_queue_id is None
 
@@ -825,6 +990,139 @@ class TestDeleteRuleDeviceCleanup:
 
         still_there = await h.service.get_rule(pushed.id)
         assert still_there.is_deleted is False
+
+
+# ============================================================================
+# Editing a pushed rule stops it claiming the router has the new values
+# ============================================================================
+
+
+class TestEditDemotesAnAppliedRule:
+    """``active`` renders as "Applied to your router" in the customer
+    dashboard. An edit to anything the router actually carries makes that
+    sentence false the moment it is saved, and nothing used to say so."""
+
+    async def _pushed(self, h: Harness, router: Router) -> QosTrafficRule:
+        rule = await _create_rule(h, router, priority=4)
+        return await h.service.push_rule_to_device(
+            rule.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+    async def test_changing_the_priority_demotes_the_row(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pushed = await self._pushed(h, router)
+        assert pushed.device_push_status == QosDevicePushStatus.ACTIVE.value
+
+        updated = await h.service.update_rule(
+            pushed.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            priority=1,
+        )
+
+        assert updated.device_push_status == QosDevicePushStatus.PENDING.value
+
+    async def test_changing_the_match_demotes_the_row(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pushed = await self._pushed(h, router)
+
+        updated = await h.service.update_rule(
+            pushed.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            port_range_start=5070,
+            port_range_end=5071,
+        )
+
+        assert updated.device_push_status == QosDevicePushStatus.PENDING.value
+
+    async def test_a_rename_demotes_because_the_name_is_the_packet_mark(self) -> None:
+        """The one domain where a display name is real device
+        configuration: ``qos_packet_mark_identifier`` derives the RouterOS
+        ``new-packet-mark`` from ``name`` + the row id, so after a rename
+        the router is setting and matching a mark this row no longer
+        describes."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pushed = await self._pushed(h, router)
+
+        updated = await h.service.update_rule(
+            pushed.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="SIP Signaling (Lobby)",
+        )
+
+        assert updated.device_push_status == QosDevicePushStatus.PENDING.value
+        assert qos_packet_mark_identifier(updated) != updated.device_packet_mark
+
+    async def test_toggling_is_enabled_does_not_demote(self) -> None:
+        """``is_enabled`` is intent, not configuration -- no push writes it.
+        (What it *does* leave behind is a separate, untouched gap: the
+        device objects of a disabled rule stay on the router.)"""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pushed = await self._pushed(h, router)
+
+        updated = await h.service.update_rule(
+            pushed.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            is_enabled=False,
+        )
+
+        assert updated.device_push_status == QosDevicePushStatus.ACTIVE.value
+
+    async def test_resubmitting_the_same_values_does_not_demote(self) -> None:
+        """A PATCH that re-sends what the row already has must not nag the
+        operator into a re-push: the router really is holding those
+        values."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pushed = await self._pushed(h, router)
+
+        updated = await h.service.update_rule(
+            pushed.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name=pushed.name,
+            priority=pushed.priority,
+            port_range_start=pushed.port_range_start,
+            port_range_end=pushed.port_range_end,
+        )
+
+        assert updated.device_push_status == QosDevicePushStatus.ACTIVE.value
+
+    async def test_a_failed_row_keeps_its_error(self) -> None:
+        """``failed`` claims no device state -- it is the operator's only
+        record of why the last attempt did not work. Rewriting it to
+        ``pending`` on an edit would erase that."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        rule = await _create_rule(h, router)
+        h.device_adapter.fail_packet_mark = QosDeviceConnectionError(
+            "10.0.0.1", "unreachable"
+        )
+        with pytest.raises(QosDeviceConnectionError):
+            await h.service.push_rule_to_device(
+                rule.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        updated = await h.service.update_rule(
+            rule.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            priority=7,
+        )
+
+        assert updated.device_push_status == QosDevicePushStatus.FAILED.value
+        assert updated.device_push_error is not None
 
 
 # ============================================================================

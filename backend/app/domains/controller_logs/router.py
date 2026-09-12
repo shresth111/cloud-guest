@@ -31,6 +31,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.common.responses import ApiResponse, build_response
+from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import LoginAttempt
 from app.domains.guest.models import GuestLoginHistory
@@ -38,6 +39,7 @@ from app.domains.monitoring.constants import HealthComponent
 from app.domains.monitoring.models import HealthCheck
 from app.domains.provisioning_engine.models import ProvisionLog
 from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
+from app.domains.rbac.enums import ScopeType
 from app.domains.router_provisioning.models import ConfigVersion, RouterEvent
 
 from .constants import MAX_EXPORT_ROWS
@@ -81,8 +83,8 @@ def _csv_response(
 ) -> Response:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(header)
-    writer.writerows(rows)
+    writer.writerow(sanitize_spreadsheet_row(list(header)))
+    writer.writerows(sanitize_spreadsheet_row(list(r)) for r in rows)
     return Response(
         content=buffer.getvalue(),
         media_type="text/csv",
@@ -377,11 +379,30 @@ async def export_router_logs(
 # ============================================================================
 
 
+# GLOBAL scope, deliberately. ``LoginAttempt`` has no ``organization_id``
+# column at all -- a login attempt is recorded by email and IP, not scoped to
+# a tenant -- so this listing is genuinely platform-wide and cannot be
+# filtered down by any organization context.
+#
+# Without the explicit scope it gated on a bare ``audit_logs.read``, which an
+# Organization Owner holds at ORGANIZATION scope (``rbac/seed.py``,
+# ``default_level=FULL``). The check therefore passed for any venue owner and
+# returned every dashboard login attempt on the platform: emails, IP
+# addresses, user agents and failure reasons for every other customer and for
+# staff accounts.
+#
+# The tenant-scoped equivalent already exists and is correctly built:
+# ``GET /admin-logs/dashboard-logins`` (RequireOrganization + RequireRole
+# "organization-owner"), which narrows by the caller's own member user ids
+# through the ``user_ids`` seam on ``AuthRepository.list_login_attempts``.
+# Customer surfaces belong there.
 @router.get(
     "/authentication/admin",
     response_model=ApiResponse[LoginAttemptLogListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.read"))],
+    dependencies=[
+        Depends(RequirePermission("audit_logs.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def list_admin_authentication_logs(
     request: Request,
@@ -405,10 +426,23 @@ async def list_admin_authentication_logs(
     )
 
 
+# GLOBAL scope, for the same reason as the listing endpoint above -- and this
+# one is the more dangerous of the pair.
+#
+# It was missed when that fix landed: the listing 40 lines up was gated and its
+# CSV sibling was not, so the exact data the gate exists to protect stayed
+# available in bulk, as a file. ``LoginAttempt`` has no ``organization_id``, so
+# this returns every platform admin's and every other tenant's login emails, IP
+# addresses and failure reasons -- and ``audit_logs.export`` is held by
+# Organization Owners at ORGANIZATION scope, so any customer could call it.
+#
+# The tenant-scoped equivalent is ``GET /admin-logs/dashboard-logins``.
 @router.get(
     "/authentication/admin/export",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.export"))],
+    dependencies=[
+        Depends(RequirePermission("audit_logs.export", scope=ScopeType.GLOBAL))
+    ],
 )
 async def export_admin_authentication_logs(
     service: ControllerLogsService = Depends(get_controller_logs_service),

@@ -33,15 +33,29 @@ class HealthComponent(StrEnum):
     ``RouterEvent`` (BE-008/BE-009). See ``models.py``'s module docstring for
     the full "why no ``DeviceHealth`` table" write-up.
 
-    ``CELERY``/``WEBSOCKET`` are real, first-class enum members even though
-    neither piece of infrastructure exists in this codebase yet (no Celery
-    worker/broker anywhere, no WebSocket support anywhere) -- per this
-    module's honesty mandate, a health-check *type* is defined and wired
-    into every dashboard/history endpoint now, so no migration is needed
-    once a real deployment exists; ``service.py``'s
-    ``check_celery_health``/``check_websocket_health`` return an honest
-    ``HealthStatus.UNKNOWN`` with a documented reason, never a fabricated
-    ``HEALTHY``.
+    ``CELERY``/``WEBSOCKET`` were once placeholders here, defined ahead of
+    the infrastructure so that no migration would be needed once it
+    existed, and returning an honest ``HealthStatus.UNKNOWN`` in the
+    meantime. **Both are real checks now**, and this paragraph used to say
+    otherwise: it claimed "neither piece of infrastructure exists in this
+    codebase yet (no Celery worker/broker anywhere, no WebSocket support
+    anywhere)" long after ``app.core.celery_app`` shipped a genuine Celery
+    deployment with a nineteen-entry ``beat_schedule``,
+    ``deploy/docker-compose.prod.yml`` began running ``celery-worker`` and
+    ``celery-beat`` services, and BE-011 Part 3 added real WebSocket
+    endpoints.
+
+    That is not a harmless stale line. It was read as current on
+    2026-09-04 and taken as evidence that this platform has no recurring
+    scheduler at all -- which is exactly why nobody noticed the Health
+    Engine itself had no Beat entry and the System Health page was showing
+    two-day-old rows. A comment that describes infrastructure the reader
+    cannot see is load-bearing, and this one pointed the wrong way.
+
+    See ``service.py``'s ``check_celery_health`` (a real
+    ``control.inspect().ping()`` against the configured broker, with three
+    distinct real outcomes) and ``check_websocket_health`` for what each
+    actually does today.
     """
 
     DATABASE = "database"
@@ -89,6 +103,13 @@ STORAGE_UNHEALTHY_USED_PERCENT = 95.0
 # signal, not a live daemon ping. Deliberately generous (an hour) since
 # guest WiFi traffic is naturally bursty (e.g. overnight at a hotel), unlike
 # WireGuard's much tighter keepalive-driven staleness window.
+#
+# Crossing it reports UNKNOWN, not DEGRADED, and that distinction matters
+# more than the number does. This is not "how long before RADIUS is broken"
+# -- nothing here can see the daemon. It is "how long before silence stops
+# being informative", after which the honest answer is that this check no
+# longer knows. Moving it changes when the page stops claiming to know; it
+# never turns a quiet venue into a faulty one.
 FREERADIUS_ACTIVITY_STALE_MINUTES = 60
 
 # ============================================================================
@@ -115,13 +136,17 @@ class HeartbeatComponentType(StrEnum):
       more devices). A future BE-011 part may add this the same way.
     * ``SERVICE`` -- ``component_id`` is any platform-service's own stable
       identifier (not a foreign key into any existing table -- e.g. a
-      worker/daemon process that self-registers). Reserved for a future
-      platform self-heartbeat source (a Celery worker, once one exists, or
-      a scheduled sweep process) -- nothing in this codebase emits one yet
-      (there is no background task runner at all, see the Celery honesty
-      note above), so this value currently has no live writer either, the
-      same honest "defined, not fabricated" posture as ``HealthComponent
-      .CELERY``.
+      worker/daemon process that self-registers). Still has no live writer,
+      which remains the honest "defined, not fabricated" posture.
+
+      The *reason* has changed, though, and the old wording no longer holds:
+      it said "there is no background task runner at all". There is --
+      ``app.core.celery_app`` carries a twenty-entry ``beat_schedule`` and
+      ``deploy/docker-compose.prod.yml`` runs ``celery-worker`` and
+      ``celery-beat``. So a Celery worker emitting its own heartbeat here is
+      no longer waiting on infrastructure; it is simply unbuilt. Corrected
+      alongside ``HealthComponent``'s own stale Celery paragraph, which had
+      drifted the same way and was read as current on 2026-09-04.
     """
 
     ROUTER = "router"
@@ -201,8 +226,11 @@ class AlertTriggerType(StrEnum):
       it), the sentinel :data:`ALERT_TARGET_ROUTER` (watches every in-scope
       ``app.domains.router.models.Router.health_status`` directly), or the
       sentinel :data:`ALERT_TARGET_ISP_LINK` (watches every in-scope
-      ``app.domains.isp.models.IspLink.health_status`` directly) -- all
-      three read-only, the same "read another domain's table directly"
+      ``app.domains.isp.models.IspLink.health_status`` directly), or the
+      sentinel :data:`ALERT_TARGET_ROGUE_DHCP_GUARD` (watches every
+      in-scope router's persisted
+      ``app.domains.dhcp.models.RouterRogueDhcpStatus.alert_state``) -- all
+      read-only, the same "read another domain's table directly"
       precedent ``repository.py`` already establishes for
       ``RadiusNasClient``/``WireGuardPeer``/``RouterEvent``.
       ``condition_config`` shape: ``{"expected_status": <str>}``.
@@ -288,6 +316,221 @@ ALERT_TARGET_ISP_LINK = "isp_link"
 # "never observed yet" is an honest gap in data, not a real outage, the same
 # distinction that domain's own module docstring already draws.
 ALERT_TARGET_MONITORED_HARDWARE = "monitored_hardware"
+
+# Sentinel ``AlertRule.target_component`` value for the FAST outage rule:
+# a ``HEALTH_STATUS_CHANGE`` rule watching every in-scope
+# ``app.domains.router.models.Router.reachability_state``.
+#
+# ## Why this is not ``ALERT_TARGET_ROUTER``
+#
+# ``ALERT_TARGET_ROUTER`` watches ``Router.health_status``, which moves with
+# ``Router.status`` and is therefore written on the 15-minute
+# ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` clock that
+# ``compute_lifecycle_stage``, ``compute_internet_availability`` and the
+# frontend's ``location-liveness`` module all share. That is the right
+# number for "what does the platform believe about this router" and the
+# wrong number for "email the venue owner now": with a 5-minute heartbeat
+# on top of it, the floor is about twenty minutes. Lowering it would
+# silently re-time every one of those readers -- the exact drift
+# ``RouterService.sweep_stale_heartbeats``'s docstring warns about.
+#
+# So this is a second target, not a second threshold on the first one.
+# ``Router.reachability_state`` is written only by
+# ``RouterService.sweep_router_reachability`` (every 30s, off the 60-second
+# agent poll, debounced over two misses, confirmed against the hub's live
+# WireGuard state) and read only here. ``ALERT_TARGET_ROUTER`` keeps
+# meaning exactly what it meant, and a venue can sensibly have both rules:
+# this one pages in two minutes, that one is the slower, fleet-wide
+# statement of record.
+#
+# ``expected_status`` must be ``"unreachable"``. ``"unknown"``/NULL means
+# the sweep has never been able to judge this router -- a freshly enrolled
+# device, one whose agent credential expired, one mid-provisioning -- and
+# alerting on an unanswered question is precisely what
+# ``ALERT_TARGET_ROGUE_DHCP_GUARD``'s own validator refuses to do.
+ALERT_TARGET_ROUTER_REACHABILITY = "router_reachability"
+
+# Sentinel ``AlertRule.target_component`` value for a ``HEALTH_STATUS_CHANGE``
+# rule that watches, per router, whether that router is still *watching* for
+# a DHCP server on the guest network that isn't ours -- the rolled-up
+# ``app.domains.dhcp.models.RouterRogueDhcpStatus.alert_state`` that
+# ``app.domains.dhcp.tasks``'s scheduled detector persists every six hours.
+#
+# ## Why this target exists at all
+#
+# cloud-guest#139 built the detector and a ``ROGUE_DHCP_GUARD`` readiness
+# checklist item that reads its rows. That surface is pull-only: an
+# unguarded router shows up if -- and only if -- somebody opens that
+# router's checklist. Nobody does. This target is the push half, and it is
+# the same "already-tracked signal another domain persists" composition
+# ``ALERT_TARGET_ROUTER``/``ALERT_TARGET_ISP_LINK`` above already establish.
+#
+# ## No per-device I/O, and none needed
+#
+# ``app.domains.monitoring.tasks``'s module docstring commits this engine to
+# reading already-persisted state only. That promise is what forced #139's
+# detector-writes/surface-reads split in the first place, so honouring it
+# here costs nothing: ``RouterRogueDhcpStatus`` *is* already-persisted
+# state, written hours earlier off the request path. See
+# ``service.AlertService._evaluate_rogue_dhcp_guard_rule``, which reads it
+# through ``repository.list_rogue_dhcp_statuses_with_routers`` -- one
+# query for the whole rule, not one per router.
+#
+# ## Only ``unguarded`` is alertable, and only per router
+#
+# ``expected_status`` is ``"unguarded"`` -- the sole value with a finding
+# behind it. ``app.domains.dhcp.constants.RogueDhcpAlertState`` is
+# deliberately tri-state, and ``unknown`` ("the detector could not reach
+# this router") never triggers and never resolves: a router we could not
+# reach is not a router we know is unwatched, and it is not a router we
+# know has been fixed either. Same posture ``ALERT_TARGET_MONITORED_HARDWARE``
+# above documents for ``HardwareStatus.UNKNOWN``, same posture
+# ``HealthStatus.UNKNOWN`` documents for its own no-data case, and the same
+# distinction the readiness item's own NOT_CHECKED-not-FAIL branch draws.
+# This codebase has collapsed that distinction twice and paid for it both
+# times (a missing SMS provider rendered as "delivery failed"; locations
+# silently dropped from a fleet list).
+#
+# The detector persists one row per ``(router_id, interface)``, but the
+# alert de-duplication key (see ``AlertService``'s own docstring) has no
+# interface dimension -- so this target evaluates one *router* at a time,
+# with the affected interface names in the alert message. Two unguarded
+# interfaces on one router are one alert, not two.
+#
+# ## Detection only
+#
+# ``/ip dhcp-server alert`` logs. It does not block, drop, or rate-limit
+# anything. No copy derived from this target may imply otherwise -- see
+# ``RogueDhcpAlertState``'s own note on this and
+# ``service._rogue_dhcp_guard_message``/``_rogue_dhcp_guard_resolved_message``,
+# which carry the same "detection only -- it logs, it does not block"
+# sentence the readiness item already shows.
+ALERT_TARGET_ROGUE_DHCP_GUARD = "rogue_dhcp_guard"
+
+# The one ``expected_status`` an ``ALERT_TARGET_ROGUE_DHCP_GUARD`` rule may
+# carry, and the ``alert_state`` string the evaluator matches it against.
+# Held here as a plain string rather than importing
+# ``app.domains.dhcp.constants.RogueDhcpAlertState`` so this module keeps
+# the zero-imports-from-other-domains shape every other constant here has;
+# ``dhcp``'s enum stores plain strings for exactly this reason, and
+# ``tests/unit/test_monitoring_alerts.py`` pins the two to each other so
+# they cannot drift apart silently.
+ROGUE_DHCP_STATE_UNGUARDED = "unguarded"
+ROGUE_DHCP_STATE_GUARDED = "guarded"
+ROGUE_DHCP_STATE_UNKNOWN = "unknown"
+
+# ----------------------------------------------------------------------------
+# Network-controller integrations (TP-Link Omada today)
+# ----------------------------------------------------------------------------
+#
+# ## The gap these close
+#
+# An Omada venue has no MikroTik in the path, so none of the router targets
+# above can see it: ``AlertService._agent_managed_routers`` deliberately
+# drops the controller's synthetic fleet row, because it runs no agent and
+# its health columns are NULL by construction. Until these targets existed,
+# a controller the platform could no longer reach -- which means no new
+# guest at that venue can be let onto the WiFi, because
+# ``authorize_portal_client`` calls the controller from this backend --
+# surfaced only as a red badge on an integration page nobody was looking
+# at.
+#
+# Three targets rather than one target with three ``expected_status``
+# values, because ``default_alerting`` matches an organization's existing
+# rules by ``(organization_id, target_component)``. One shared target would
+# let only the first of the three defaults ever be created.
+#
+# ## Persisted state only
+#
+# Same promise ``app.domains.monitoring.tasks`` makes for the whole engine:
+# no controller I/O here. ``network_integrations`` is already written by
+# that domain's own 60-second sync sweep (status, consecutive-failure
+# counter, readiness gaps), and ``network_integration_authorizations``
+# already records every guest authorization the controller accepted or
+# refused. These targets read those rows and nothing else.
+#
+# ## De-duplication
+#
+# The alert key is ``(rule_id, organization_id, location_id, router_id)``
+# and there is no integration column on ``alerts``. An integration's
+# ``router_id`` is its own fleet row whenever it can serve guests at all
+# (``PortalReadinessGap.FLEET_DEVICE_MISSING`` otherwise), so in practice
+# the key is one integration. Where two integrations *do* share a key --
+# two self-service rows with no fleet device in the same venue -- they are
+# grouped into one alert naming both, the way
+# ``_evaluate_rogue_dhcp_guard_rule`` groups interfaces per router, rather
+# than one of them silently losing its alert to the other.
+
+# The controller this platform talks to for a venue is failing: it cannot
+# be reached, its credentials are rejected, or reads from it keep failing.
+ALERT_TARGET_NETWORK_CONTROLLER = "network_controller"
+NETWORK_CONTROLLER_STATE_FAILING = "failing"
+
+# Guests are completing sign-in and the controller is refusing to let them
+# online.
+ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE = "network_controller_authorize"
+NETWORK_CONTROLLER_STATE_REFUSING_GUESTS = "refusing_guests"
+
+# An integration was added and left unable to authorize a single guest.
+ALERT_TARGET_NETWORK_CONTROLLER_SETUP = "network_controller_setup"
+NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE = "setup_incomplete"
+
+# The one ``expected_status`` each of the three targets accepts -- the only
+# value with a finding behind it, the same discipline the rogue-DHCP and
+# reachability targets apply in ``validators``.
+NETWORK_CONTROLLER_TARGET_STATES: dict[str, str] = {
+    ALERT_TARGET_NETWORK_CONTROLLER: NETWORK_CONTROLLER_STATE_FAILING,
+    ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE: NETWORK_CONTROLLER_STATE_REFUSING_GUESTS,
+    ALERT_TARGET_NETWORK_CONTROLLER_SETUP: NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE,
+}
+
+# How many consecutive failed syncs before "failing" fires.
+#
+# Three, because the sync backs off: the interval doubles per failure
+# (``network_integration.constants.SYNC_BACKOFF_CAP_MULTIPLIER``). At the
+# 300-second default, failures land at roughly 0, 10 and 30 minutes, so this
+# fires about half an hour after the controller first stopped answering. One
+# failure is a blip -- a controller reboot, a firmware update, a cloud
+# controller's own maintenance -- and paging a venue for each of those is
+# how an alert gets filtered to a folder nobody reads. Two would be ten
+# minutes, which is inside a routine controller upgrade.
+#
+# Resolution needs no threshold: the counter is reset to zero only by a
+# successful sync, so "below three" after having been at three means the
+# controller answered.
+NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES = 3
+
+# How long an integration may sit unable to authorize anybody before
+# "setup incomplete" fires, measured from when it was created.
+#
+# A day, because the onboarding flow is genuinely multi-step and
+# multi-person (credentials from the venue, site selection, location
+# mapping, a pre-auth entry on the controller) and an operator part-way
+# through it is not a fault. An integration still not ready a full day
+# later has been abandoned, and a venue that believes it is live is the
+# case this exists for.
+NETWORK_CONTROLLER_SETUP_GRACE_HOURS = 24
+
+# The "refusing guests" window, and the two conditions that must BOTH hold
+# inside it to fire:
+#
+# * at least ``MIN_FAILED_GUESTS`` distinct guest sessions were refused.
+#   Counted per session, not per attempt: the portal retries and a guest
+#   taps again, so one unlucky device can produce several failed rows, and
+#   one device is not a venue-wide problem.
+# * failures are at least ``MIN_FAILURE_RATIO`` of all attempts. A busy
+#   venue with a handful of odd devices among hundreds of successful joins
+#   is not "the controller is refusing guests".
+#
+# Resolution is deliberately stricter than the trigger: the alert closes
+# only once the window holds no failed attempt at all. Resolving on "back
+# under the trigger" would open and close the alert every time a sustained
+# problem drifted across the line, mailing the venue each time -- the
+# hysteresis the reachability sweep's two-miss debounce exists for on the
+# router side.
+NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES = 15
+NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS = 3
+NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO = 0.5
 
 
 class ThresholdMetric(StrEnum):
@@ -387,6 +630,26 @@ ALERT_EVENT_LOOKBACK_MINUTES = 15
 # "within about one cycle of the faster underlying sweep," typically
 # under a minute end-to-end (health check catches the change, next
 # evaluation pass alerts + emails on it), never truly immediate.
+# How often the Health Engine actually runs.
+#
+# It did not run at all. `GET /monitoring/health` only *reads* the stored
+# `service_health` rows; the sole writer is `POST /monitoring/health/run`,
+# which is the Master console's own "Run health checks now" button. There
+# was no Beat entry and nothing else called `run_all_health_checks`, so on
+# 2026-09-04 that page showed component timestamps two days old while
+# calling itself live -- and FreeRADIUS sat on "Degraded, 5 consecutive
+# failures" from a check nobody had re-run since.
+#
+# Five minutes, matching the hub-reconciliation sweep rather than the
+# 30-second alert sweep: these checks touch the database, Redis, disk and
+# the hub's own agents, so they are an order of magnitude more expensive
+# than reading already-persisted state, and nothing here changes on a
+# 30-second timescale. Health that is five minutes old is honest; health
+# that is two days old is a lie with a timestamp on it.
+HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 300.0
+
+TASK_RUN_HEALTH_CHECK_SWEEP = "app.domains.monitoring.tasks.run_health_check_sweep"
+
 ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS = 30.0
 
 TASK_RUN_ALERT_RULE_EVALUATION_SWEEP = (
@@ -583,6 +846,23 @@ __all__ = [
     "ALERT_TARGET_ROUTER",
     "ALERT_TARGET_ISP_LINK",
     "ALERT_TARGET_MONITORED_HARDWARE",
+    "ALERT_TARGET_ROUTER_REACHABILITY",
+    "ALERT_TARGET_ROGUE_DHCP_GUARD",
+    "ROGUE_DHCP_STATE_UNGUARDED",
+    "ROGUE_DHCP_STATE_GUARDED",
+    "ROGUE_DHCP_STATE_UNKNOWN",
+    "ALERT_TARGET_NETWORK_CONTROLLER",
+    "ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE",
+    "ALERT_TARGET_NETWORK_CONTROLLER_SETUP",
+    "NETWORK_CONTROLLER_STATE_FAILING",
+    "NETWORK_CONTROLLER_STATE_REFUSING_GUESTS",
+    "NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE",
+    "NETWORK_CONTROLLER_TARGET_STATES",
+    "NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES",
+    "NETWORK_CONTROLLER_SETUP_GRACE_HOURS",
+    "NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES",
+    "NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILED_GUESTS",
+    "NETWORK_CONTROLLER_AUTHORIZE_MIN_FAILURE_RATIO",
     "ThresholdMetric",
     "ThresholdOperator",
     "AlertSeverity",
@@ -590,7 +870,9 @@ __all__ = [
     "ALERT_STATUS_TRANSITIONS",
     "ALERT_EVENT_LOOKBACK_MINUTES",
     "ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS",
+    "HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_ALERT_RULE_EVALUATION_SWEEP",
+    "TASK_RUN_HEALTH_CHECK_SWEEP",
     "NotificationChannelType",
     "NotificationStatus",
     "HTTP_NOTIFICATION_TIMEOUT_SECONDS",

@@ -11,24 +11,40 @@ pretending any of these vendors work today -- see PRD section 4.2.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from .contract import (
     ConnectedDevice,
     ContentFilterRuleConfig,
+    DefaultRoute,
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
     DeviceVendor,
+    DhcpOptionConfig,
+    DhcpOptionRemoval,
+    DhcpOptionSnapshot,
     DhcpPoolConfig,
+    HotspotCertificatePush,
+    HotspotCertificatePushResult,
+    HotspotDisconnectResult,
+    HotspotSessionControl,
     InterfaceInfo,
+    NatRuleConfig,
+    NetworkSnapshot,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
+    QosPacketMarkConfig,
     QueueDeviceStatus,
     RadiusClientConfig,
     RawCommandResult,
+    RogueDhcpAlertConfig,
+    RogueDhcpAlertStatus,
     SpeedTestResult,
     TracerouteResult,
     VlanConfig,
+    VlanHotspotConfig,
     WanHealth,
 )
 
@@ -96,6 +112,20 @@ class _StubAdapter:
     ) -> None:
         raise self._not_implemented()
 
+    async def read_hotspot_session_control(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        raise self._not_implemented()
+
+    async def end_hotspot_sessions(
+        self,
+        creds: DeviceCredentials,
+        *,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
+        raise self._not_implemented()
+
     async def ping(
         self, creds: DeviceCredentials, *, target: str, count: int, timeout_seconds: int
     ) -> PingResult:
@@ -127,6 +157,11 @@ class _StubAdapter:
     async def run_speed_test(
         self, creds: DeviceCredentials, *, download_url: str
     ) -> SpeedTestResult:
+        raise self._not_implemented()
+
+    async def push_hotspot_certificate(
+        self, creds: DeviceCredentials, *, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
         raise self._not_implemented()
 
     async def create_simple_queue(
@@ -251,6 +286,96 @@ class _StubAdapter:
     ) -> RawCommandResult:
         raise self._not_implemented()
 
+    # --- Protocol methods added to the contract after the stubs were written.
+    # Without these, ``isinstance(stub, DeviceGatewayAdapter)`` was False and
+    # a caller reaching a non-MikroTik vendor got an AttributeError instead of
+    # the honest NotImplementedError every other method gives.
+
+    async def delete_vlan(self, creds: DeviceCredentials, *, vlan: VlanConfig) -> None:
+        raise self._not_implemented()
+
+    async def configure_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def delete_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def delete_dhcp_pool(
+        self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def configure_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def delete_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        raise self._not_implemented()
+
+    async def read_dhcp_options(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        raise self._not_implemented()
+
+    async def configure_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials, *, alerts: Sequence[RogueDhcpAlertConfig]
+    ) -> None:
+        raise self._not_implemented()
+
+    async def read_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials
+    ) -> list[RogueDhcpAlertStatus]:
+        raise self._not_implemented()
+
+    async def delete_port_forward(
+        self, creds: DeviceCredentials, *, rule: PortForwardConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def configure_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def delete_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def configure_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule: QosPacketMarkConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def delete_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule_id: str
+    ) -> None:
+        raise self._not_implemented()
+
+    async def delete_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def ensure_wan_egress(self, creds: DeviceCredentials, *, interface: str) -> None:
+        raise self._not_implemented()
+
+    async def read_default_routes(self, creds: DeviceCredentials) -> list[DefaultRoute]:
+        raise self._not_implemented()
+
+    async def set_default_route_distances(
+        self, creds: DeviceCredentials, *, distances: Mapping[str, int]
+    ) -> None:
+        raise self._not_implemented()
+
+    async def read_network_snapshot(self, creds: DeviceCredentials) -> NetworkSnapshot:
+        raise self._not_implemented()
+
     def capabilities(self) -> dict[str, bool]:
         return {
             "get_interface_list": False,
@@ -270,6 +395,7 @@ class _StubAdapter:
             "get_pppoe_interface_status": False,
             "get_interface_traffic_counters": False,
             "run_speed_test": False,
+            "push_hotspot_certificate": False,
             "create_simple_queue": False,
             "update_simple_queue": False,
             "delete_simple_queue": False,
@@ -287,6 +413,25 @@ class _StubAdapter:
             "restore": False,
             "upload_file": False,
             "execute_raw_command": False,
+            "delete_vlan": False,
+            "configure_vlan_hotspot": False,
+            "delete_vlan_hotspot": False,
+            "delete_dhcp_pool": False,
+            "configure_dhcp_option": False,
+            "delete_dhcp_option": False,
+            "read_dhcp_options": False,
+            "configure_rogue_dhcp_alerts": False,
+            "read_rogue_dhcp_alerts": False,
+            "delete_port_forward": False,
+            "configure_nat_masquerade": False,
+            "delete_nat_masquerade": False,
+            "configure_qos_packet_mark": False,
+            "delete_qos_packet_mark": False,
+            "delete_content_filter_rule": False,
+            "ensure_wan_egress": False,
+            "read_default_routes": False,
+            "set_default_route_distances": False,
+            "read_network_snapshot": False,
         }
 
 

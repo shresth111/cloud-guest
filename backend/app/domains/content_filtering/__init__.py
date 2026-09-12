@@ -62,10 +62,19 @@ through the router (blocking outbound port 53 to anything else) already
 has the general-purpose tool to do that -- ``app.domains.firewall`` -- and
 this domain deliberately does not duplicate that capability itself.
 
-No live device push in this pass -- see ``service.py``'s own module
-docstring. Real RouterOS provisioning happens through ``app.domains
-.network_config``'s existing push pipeline
-(``renderers.render_content_filter_rule``).
+## Live device push
+
+``POST /content-filter-rules/{id}/push`` realizes one rule on its own
+router over the RouterOS API, per rule -- see ``service.py``'s own module
+docstring for why per-rule and not per-router, and
+``wyfy_device_gateway.mikrotik_adapter.configure_content_filter_rule``
+for the exact objects each mechanism above becomes. This section
+previously said the opposite ("no live device push in this pass ... real
+RouterOS provisioning happens through ``app.domains.network_config``'s
+existing push pipeline"), and that pipeline had no caller for these rules
+at all. The result was a feature that reported a security property it did
+not have: a customer blocked a site, the dashboard said blocked, and
+every guest on that router kept reaching it.
 """
 
 from __future__ import annotations

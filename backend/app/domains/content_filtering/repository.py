@@ -35,6 +35,19 @@ class ContentFilterRepositoryProtocol(Protocol):
         self, rule: ContentFilterRule, data: dict[str, object]
     ) -> ContentFilterRule: ...
 
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by ``ContentFilterService.push_rule_to_device`` and nothing
+        else. ``GenericRepository.update`` only ``flush()``es, and
+        ``get_db_session`` rolls the session back on any exception -- so a
+        failure record written just before a re-raise is discarded, and the
+        row still reads ``pending`` with a NULL error after a real device
+        failure. Committing the failure explicitly, before raising, is what
+        makes the record survive to be read.
+        """
+        ...
+
     async def soft_delete_rule(self, rule: ContentFilterRule) -> ContentFilterRule: ...
 
     async def list_rules(
@@ -80,6 +93,9 @@ class ContentFilterRepository:
         self, rule: ContentFilterRule, data: dict[str, object]
     ) -> ContentFilterRule:
         return await self.rules.update(rule, data)
+
+    async def commit(self) -> None:
+        await self.session.commit()
 
     async def soft_delete_rule(self, rule: ContentFilterRule) -> ContentFilterRule:
         return await self.rules.soft_delete(rule)

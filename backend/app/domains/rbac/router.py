@@ -15,6 +15,8 @@ from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.user.dependencies import get_user_service
+from app.domains.user.service import UserService
 
 from .dependencies import (
     CurrentOrganization,
@@ -452,8 +454,15 @@ async def list_permission_groups(
 async def list_user_role_assignments(
     request: Request,
     user_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    user_service: UserService = Depends(get_user_service),
     rbac_service: RBACService = Depends(get_rbac_service),
 ):
+    # The permission check above scopes off the X-Organization-Id header
+    # while this reads by path id, so without an explicit tenant check any
+    # organization user could enumerate any platform user's role
+    # assignments. The sibling *write* routes already thread this.
+    await user_service.assert_user_accessible(user_id, requesting_organization_id)
     assignments = await rbac_service.repository.get_active_user_roles(user_id)
     payload = UserRoleListResponse(items=[_user_role_response(a) for a in assignments])
     return build_response(
@@ -537,8 +546,13 @@ async def revoke_role_from_user(
 async def get_user_permissions(
     request: Request,
     user_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    user_service: UserService = Depends(get_user_service),
     rbac_service: RBACService = Depends(get_rbac_service),
 ):
+    # Same unguarded-path-id read as the role listing above -- this one
+    # returns the user's effective permission set.
+    await user_service.assert_user_accessible(user_id, requesting_organization_id)
     permissions = await rbac_service.get_user_permissions(user_id)
     return build_response(
         success=True,

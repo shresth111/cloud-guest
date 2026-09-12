@@ -217,6 +217,10 @@ from app.domains.guest.service import GuestService
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 
 from .constants import (
     TEAM_CODE_ALPHABET,
@@ -231,6 +235,7 @@ from .events import (
     GuestTeamRevoked,
 )
 from .exceptions import (
+    CrossLocationGuestTeamAccessError,
     CrossOrganizationGuestTeamAccessError,
     GuestTeamCodeGenerationExhaustedError,
     GuestTeamMemberCapExceededError,
@@ -359,12 +364,15 @@ class GuestTeamService:
         guest_service: GuestService,
         *,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
         self.location_lookup = location_lookup
         self.guest_service = guest_service
         self.audit_writer = audit_writer
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     # ========================================================================
     # Team lifecycle
@@ -435,6 +443,15 @@ class GuestTeamService:
         if team is None:
             raise GuestTeamNotFoundError(team_id)
         self._enforce_tenant_scope(team.organization_id, requesting_organization_id)
+        # A team is reached by its own id, so the permission check had nothing
+        # to pin to. `join_team` deliberately does NOT come through here -- it
+        # resolves by team *code* off the repository -- so the guest join path
+        # is untouched by this.
+        enforce_entity_location(
+            entity_location_id=getattr(team, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationGuestTeamAccessError(),
+        )
         return await self._refresh_team_expiry(team)
 
     async def list_teams(
@@ -458,6 +475,30 @@ class GuestTeamService:
         )
         refreshed = [await self._refresh_team_expiry(team) for team in teams]
         return refreshed, meta
+
+    async def list_open_teams(
+        self, organization_id: uuid.UUID, location_id: uuid.UUID | None
+    ) -> list[tuple[GuestTeam, int]]:
+        """Every team this portal's login screen may offer in its "which
+        group do you belong to?" dropdown -- teams a guest at this location
+        could actually join right now: active (including a lazy expiry
+        refresh, same as every other read), scoped to the location or
+        org-wide, and NOT full (``max_members`` unlimited, or a live active-
+        member count under the cap). Returns ``(team, member_count)`` pairs
+        -- the count is the "not full" evidence AND what the dropdown's
+        "N of M seats filled" line renders."""
+        teams = await self.repository.list_active_teams_for_portal(
+            organization_id=organization_id, location_id=location_id
+        )
+        open_teams: list[tuple[GuestTeam, int]] = []
+        for team in teams:
+            refreshed = await self._refresh_team_expiry(team)
+            if GuestTeamStatus(refreshed.status) != GuestTeamStatus.ACTIVE:
+                continue
+            member_count = await self.repository.count_active_members(refreshed.id)
+            if refreshed.max_members is None or member_count < refreshed.max_members:
+                open_teams.append((refreshed, member_count))
+        return open_teams
 
     async def revoke_team(
         self,

@@ -14,12 +14,22 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
+from app.domains.dhcp.dependencies import get_dhcp_service
+from app.domains.dhcp.service import DhcpService
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
+from app.domains.network_integration.dependencies import (
+    get_network_integration_service,
+)
+from app.domains.network_integration.service import NetworkIntegrationService
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
+from app.domains.router_provisioning.dependencies import (
+    get_router_provisioning_service,
+)
+from app.domains.router_provisioning.service import RouterProvisioningService
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
@@ -39,6 +49,13 @@ def get_readiness_service(
     isp_service: IspService = Depends(get_isp_service),
     wireguard_service: WireGuardService = Depends(get_wireguard_service),
     router_agent_service: RouterAgentService = Depends(get_router_agent_service),
+    router_provisioning_service: RouterProvisioningService = Depends(
+        get_router_provisioning_service
+    ),
+    dhcp_service: DhcpService = Depends(get_dhcp_service),
+    network_integration_service: NetworkIntegrationService = Depends(
+        get_network_integration_service
+    ),
 ) -> ReadinessService:
     return ReadinessService(
         repository,
@@ -46,6 +63,26 @@ def get_readiness_service(
         isp_service,
         wireguard_service,
         router_agent_service,
+        # Supplies the second kind of evidence GUEST_DATA_PATH accepts: a
+        # config version that actually reached the device. Without it that
+        # check can only see ISP links, and would fail a router that was
+        # genuinely configured by a push.
+        router_provisioning_service,
+        # Supplies ROGUE_DHCP_GUARD's evidence, and supplies it from the
+        # database only. ``DhcpService.get_rogue_dhcp_statuses`` reads the
+        # rows ``app.domains.dhcp.tasks``'s six-hourly detector persisted;
+        # the RouterOS round trip happened there, off this request path.
+        # Wiring anything here that talks to a device would put a device
+        # timeout behind every checklist GET -- see that method's own
+        # docstring and ``service.RogueDhcpStatusLookupProtocol``'s.
+        dhcp_service,
+        # Supplies CONTROLLER_INTEGRATION's evidence -- the item that only
+        # exists for a controller-managed device, and the only thing on
+        # its checklist that can actually be wrong. Database-only, like
+        # ``dhcp_service`` above: `find_integration_for_router` reads one
+        # row and never talks to the controller, which matters because
+        # every AUTO item re-runs on every checklist GET.
+        network_integration_service,
     )
 
 

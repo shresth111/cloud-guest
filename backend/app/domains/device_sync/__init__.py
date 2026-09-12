@@ -8,7 +8,7 @@ This domain triggers/reports exactly three real, already-existing
 mechanisms, never re-implementing any of them:
 
 * ``app.domains.connected_devices.service.ConnectedDeviceService
-  .sync_router`` -- real DHCP-lease/ARP/wireless-registration-table sync.
+  .sync_router`` -- real DHCP-lease/ARP sync.
 * ``app.domains.queue_management.service.QueueManagementService
   .reapply_assignments_for_router`` -- a new bulk method added to that
   domain specifically for this orchestrator, itself composing that

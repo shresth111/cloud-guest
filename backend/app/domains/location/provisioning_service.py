@@ -41,14 +41,65 @@ graph, which resolves ``Depends(get_db_session)`` exactly once per request
 and hands that *same* ``AsyncSession`` instance to every dependant that
 (transitively) needs one -- so every composed repository in this call tree
 shares one connection/transaction. ``provision_location`` itself never
-catches and swallows an exception from any composed step (no
-``try``/``except`` anywhere in this method) -- so a failure at, say, step
-(g) propagates all the way up through the FastAPI route handler to
-``get_db_session``'s own ``except Exception: await session.rollback(); raise``,
-which genuinely rolls back every flushed-but-uncommitted change from steps
-(a)-(f) too. See ``tests/unit/test_location_provisioning.py``'s
+catches and swallows an exception from any composed step -- so a failure
+at, say, step (g) propagates all the way up through the FastAPI route
+handler to ``get_db_session``'s own
+``except Exception: await session.rollback(); raise``, which genuinely
+rolls back every flushed-but-uncommitted change from steps (a)-(f) too.
+See ``tests/unit/test_location_provisioning.py``'s
 ``TestTransactionalRollback`` for a real, forced-failure proof of this using
 a shared fake session double.
+
+There is exactly ONE ``try``/``except`` in ``provision_location``, around
+the WireGuard hub allocation, and it **re-raises** (as
+``RouterTunnelProvisioningFailedError``) rather than swallowing -- so the
+rollback above still happens, unchanged. It exists only to add the one
+fact the underlying hub errors cannot carry and the operator will act on:
+that nothing was saved. See that class's docstring.
+
+## The one step this transaction cannot undo
+
+``POST /wg/peer`` on the hub agent is an HTTP call to another machine, and
+that agent has no removal verb -- a ``DELETE`` answers ``501``. A peer it
+mints is therefore permanent whatever this transaction subsequently does.
+That is why the tunnel allocation, numbered step (e) by the spec, is
+executed **last** among the write steps (as ``e'``, after step (j)):
+running it first meant every later failure rolled back the database while
+stranding a peer and a tunnel address on the hub forever. See the comments
+at both positions in ``provision_location``.
+
+## Provisioning without a router
+
+``ProvisionLocationInput.router`` may be ``None``. That is not a shortcut
+around a missing field; it is the only way to create a customer whose venue
+runs a TP-Link Omada controller, because that venue has no MikroTik and
+``RouterInput`` is MikroTik-shaped (serial, MAC, model) with nothing honest
+to put in it. The controller is onboarded separately, by the Master
+console, right after this call returns -- through
+``POST /network-integrations/platform/onboard``, which creates the
+integration *and* its own fleet ``Router`` row (vendor ``tplink_omada``)
+using the organization_id/location_id this call produced.
+
+Without a router exactly three steps are skipped, and each one is
+router-shaped by definition: (d) register the router, (f) apply a config
+template to it, and (e') allocate its WireGuard peer. Every other step --
+organization, location, owner, subscription, feature overrides, default
+settings, captive portal config, audit entry, welcome email, activation --
+runs identically, because none of them reads the router. Nor is a
+router-less location a new state for the rest of the platform: the plain
+``POST /organizations/{id}/locations`` endpoint has always created
+locations with no router. RADIUS NAS registration is not part of this
+flow in either case -- ``RouterService.create_router`` does not register
+one.
+
+Two consequences worth stating:
+
+* No hub call at all. Skipping (e') is what matters most here: a peer
+  minted for nothing is a hub address burned permanently (see "The one step
+  this transaction cannot undo" above).
+* ``router_config_template_id`` without a router is rejected, not ignored
+  (``RouterConfigTemplateWithoutRouterError``, 422) -- an explicit choice
+  the operator made should never be silently discarded behind a 201.
 
 ## Billing feature-flag/plan-limit override design decision
 
@@ -210,10 +261,16 @@ from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.models import Role
 from app.domains.router.models import Router
 from app.domains.router_provisioning.models import ConfigTemplate
-from app.domains.wireguard.service import TunnelDeliveryInfo
+from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+from app.domains.wireguard.exceptions import WireGuardError
+from app.domains.wireguard.service import HubTunnelAllocation
 
 from .enums import PropertyType
-from .exceptions import DefaultConfigTemplateNotFoundError, NewOrganizationRequiredError
+from .exceptions import (
+    DefaultConfigTemplateNotFoundError,
+    NewOrganizationRequiredError,
+    RouterConfigTemplateWithoutRouterError,
+)
 from .models import Location
 from .service import LocationService
 
@@ -258,6 +315,53 @@ class OwnerRoleNotSeededError(CloudGuestError):
             "The 'organization-owner' system role is not seeded -- run "
             "app.domains.rbac.seed.seed_rbac first",
             status_code=500,
+        )
+
+
+class RouterTunnelProvisioningFailedError(CloudGuestError):
+    """The hub bridge could not give the new router a WireGuard identity, so
+    the whole customer was rolled back.
+
+    ## Why this exists rather than letting the underlying error through
+
+    The underlying errors are written for someone holding a router_id --
+    ``HubBridgeUnavailableError`` ("Could not reach the WireGuard hub
+    bridge"), ``HubPeerAllocatorNotConfiguredError``,
+    ``TunnelIPAllocationConflictError``. An operator who has just filled in
+    a five-page new-customer wizard needs one more fact none of those
+    carry, and it is the fact they will act on: **whether the customer they
+    just tried to create exists.** Without it the honest options are both
+    wrong -- retry and risk a duplicate organization, or go hunting for a
+    half-built account that is not there.
+
+    It is not there. ``provision_location`` runs inside the single
+    request-scoped ``AsyncSession`` (see module docstring), so raising here
+    rolls back the organization, the owner user, the location and the
+    router along with everything else. This error says so in the message.
+
+    ``status_code`` is inherited from the cause rather than flattened to
+    500, so a caller can still tell "the hub is down, retry" (502) from
+    "this deployment has no hub configured" (503) from an allocation
+    conflict (409) -- the same distinction
+    ``HubBridgeUnavailableError``'s own docstring had to fight for.
+
+    ## The one thing rollback does NOT undo
+
+    If the hub bridge already minted a peer and a *later* step failed, that
+    peer stays on the hub forever: ``ops/hub-agents/wg_agent.py`` as
+    deployed has no ``do_DELETE`` (a DELETE answers ``501``). That is why
+    the allocation is deliberately the LAST write step in
+    ``provision_location`` -- see the comment at its call site."""
+
+    def __init__(self, *, router_name: str, cause: CloudGuestError) -> None:
+        super().__init__(
+            f"Could not allocate a WireGuard tunnel for router "
+            f"'{router_name}' through the hub bridge, so this customer was "
+            f"NOT provisioned: {cause.message}. Nothing was saved -- the "
+            "organization, owner account, location and router from this "
+            "attempt have all been rolled back. Once the hub bridge is "
+            "reachable again, submit the form again.",
+            status_code=cause.status_code,
         )
 
 
@@ -401,13 +505,28 @@ class ConfigTemplateAssignmentProtocol(Protocol):
 
 
 class WireGuardProvisioningProtocol(Protocol):
-    async def create_tunnel(
+    """DELIBERATELY NOT ``create_tunnel``.
+
+    ``WireGuardService.create_tunnel`` generates the keypair on the
+    platform, and ``ops/hub-agents/wg_agent.py`` has no verb that accepts a
+    public key it did not generate itself -- so the tunnel it describes can
+    never establish, and the service refuses outright with
+    ``HubCannotLearnPlatformKeyError``. Provisioning called it anyway until
+    2026-09-01, which is why creating a customer failed every time, at
+    step (e), after the organization/owner/router rows had already been
+    written. ``allocate_tunnel_via_hub`` is the path that produces a key
+    both sides hold; see its own docstring for the reuse/adopt/allocate
+    decision it makes."""
+
+    async def allocate_tunnel_via_hub(
         self,
         *,
         actor_user_id: uuid.UUID | None,
         router_id: uuid.UUID,
         requesting_organization_id: uuid.UUID | None,
-    ) -> TunnelDeliveryInfo: ...
+        rotate: bool = False,
+        force: bool = False,
+    ) -> HubTunnelAllocation: ...
 
 
 class PlanProvisioningProtocol(Protocol):
@@ -506,6 +625,51 @@ class _NoopNotificationSender:
         )
 
 
+class DefaultAlertingProtocol(Protocol):
+    """Give a newly created organization the alert rules, email channel and
+    link between them that it would otherwise never have.
+
+    Satisfied structurally by
+    ``app.domains.monitoring.default_alerting.ensure_default_alerting``
+    partially applied over its two services -- see
+    ``provisioning_dependencies.py``. A narrow duck-typed protocol rather
+    than a hard import, for the reason that module's own docstring gives:
+    ``app.domains.location`` has no business knowing what an alert is, and
+    ``monitoring`` is the domain that owns both services.
+
+    ## Why this seam exists at all
+
+    ``POST /organizations`` has called ``ensure_default_alerting`` since it
+    was written. This wizard creates organizations too -- it is the path a
+    master operator actually uses -- and did not. So a customer onboarded
+    here had **no alert rules of any kind**: the 30s evaluation sweep found
+    nothing to evaluate for them, and their venue could go dark without a
+    single email. For an Omada venue that also means the three
+    ``network_controller*`` rules never exist, so the controller-health
+    alerting shipped in #223 was inert for exactly the customers it was
+    built for.
+    """
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> object: ...
+
+
+class _NoopDefaultAlerting:
+    """Honest fallback when no real ``DefaultAlertingProtocol`` is wired --
+    logs rather than silently leaving an organization unalerted, the same
+    posture as ``_NoopNotificationSender`` above. Never wired in
+    production; see ``provisioning_dependencies.py``."""
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> None:
+        logger.info(
+            "default_alerting_not_wired",
+            extra={"organization_id": str(organization_id)},
+        )
+
+
 # ============================================================================
 # Plain input/output value objects (dataclasses, not pydantic -- mirrors
 # ``app.domains.auth.service.DeviceInfo``'s own "service layer stays
@@ -583,9 +747,13 @@ class FeatureOverride:
 
 @dataclass(frozen=True, slots=True)
 class ProvisionLocationInput:
+    """``router`` is ``None`` for a venue with no MikroTik -- see module
+    docstring's "Provisioning without a router" section for exactly which
+    steps that skips and why none of the others need it."""
+
     location: LocationInput
     owner: OwnerInput
-    router: RouterInput
+    router: RouterInput | None
     plan_id: uuid.UUID
     existing_organization_id: uuid.UUID | None = None
     new_organization: NewOrganizationInput | None = None
@@ -605,8 +773,9 @@ class ProvisionLocationResult:
     plan_id: uuid.UUID
     plan_name: str
     feature_summary: dict[str, object]
-    router_id: uuid.UUID
-    router_name: str
+    # All three ``None`` when provisioned without a router.
+    router_id: uuid.UUID | None
+    router_name: str | None
     tunnel_ip_address: str | None
     owner_user_id: uuid.UUID
     owner_name: str
@@ -642,6 +811,11 @@ class ProvisionLocationPreview:
     in the request -- the MikroTik device *is* "the controller" in this
     architecture (see this dataclass's own docstring section in
     ``preview_provision_location``), not a separately generated value.
+    ``controller_id`` and ``router_name`` are ``None`` when the request
+    carries no router. ``nas_id`` is not: it is derived from the
+    location's code alone (the name the location's first RADIUS client
+    would get, whenever one is registered), and it is the same value
+    either way.
 
     This preview validates everything checkable without writing (Plan
     exists, Organization archived-state or new-slug availability, the
@@ -658,20 +832,30 @@ class ProvisionLocationPreview:
     customer_id: str
     site_id: str
     nas_id: str
-    controller_id: str
+    controller_id: str | None
     plan_id: uuid.UUID
     plan_name: str
     feature_summary: dict[str, object]
     owner_name: str
     owner_email: str
     owner_username_preview: str
-    router_name: str
+    router_name: str | None
 
 
 # ============================================================================
 # Generation helpers -- see module docstring's "Username / temporary-
 # password generation" section.
 # ============================================================================
+
+
+def _reject_template_without_router(data: ProvisionLocationInput) -> None:
+    """``ProvisionLocationRequest`` refuses this shape at the request
+    boundary; this is the same rule for a caller that builds the input
+    dataclass directly, so the service cannot be talked into silently
+    dropping a template either. See
+    ``RouterConfigTemplateWithoutRouterError``."""
+    if data.router is None and data.router_config_template_id is not None:
+        raise RouterConfigTemplateWithoutRouterError()
 
 
 def _generate_username(email: str) -> str:
@@ -715,7 +899,16 @@ class _LoginMethods:
     otp_email_enabled: bool
     voucher_enabled: bool
     social_login_enabled: bool
-    username_password_enabled: bool = True
+    # Defaults OFF as of 2026-09-07 -- password sign-in is being retired
+    # from the guest portal. Must stay equal to
+    # app.domains.captive_portal.models.CaptivePortalConfig
+    # .username_password_enabled's own column default: this dataclass and
+    # that column are two independent defaults for the same
+    # setting, and if they disagree a location's offered methods depend on
+    # which path created its config, which presents as a race rather than
+    # as a wrong default. See that column's module docstring ("Retiring
+    # password sign-in") for the rollout and the guest-facing cost.
+    username_password_enabled: bool = False
     # Third real OTP channel -- see CaptivePortalConfig.otp_whatsapp_enabled's
     # own docstring. No PlanFeatureKey exists for it (same gap as
     # otp_email_enabled had before it defaulted on), but unlike email,
@@ -734,8 +927,13 @@ def _resolve_login_methods(feature_summary: dict[str, object]) -> _LoginMethods:
     ``CaptivePortalConfig`` field to map onto today -- a real, documented
     gap (not fabricated), left for a future Captive Portal addition.
     ``username_password_enabled`` has no corresponding ``PlanFeatureKey`` in
-    the spec's list either, so it defaults to always-on (the standard,
-    baseline login method).
+    the spec's list either. It used to default to always-on (the standard,
+    baseline login method); as of 2026-09-07 it defaults OFF, because
+    password sign-in is being retired from the guest portal -- see
+    ``_LoginMethods``'s own field comment and
+    ``app.domains.captive_portal.models``'s module docstring. The cost,
+    stated plainly: a returning guest at a newly provisioned location does
+    an OTP on every visit.
 
     ``otp_email_enabled`` previously reused ``mobile_otp_enabled`` as its
     source -- there is no dedicated ``PlanFeatureKey`` for email OTP either
@@ -747,9 +945,14 @@ def _resolve_login_methods(feature_summary: dict[str, object]) -> _LoginMethods:
     guest hitting the disabled otp_email path fell through to the
     password-login form, which always fails for a first-time guest with no
     saved password (``GuestPasswordLoginFailedError``). Email OTP has no
-    comparable per-send cost, so -- like ``username_password_enabled`` --
-    it now defaults to always-on rather than piggybacking on an unrelated
-    feature flag."""
+    comparable per-send cost, so it now defaults to always-on rather than
+    piggybacking on an unrelated feature flag. (This used to read "like
+    ``username_password_enabled``, it now defaults to always-on". That
+    comparison no longer holds -- password login defaults OFF as of
+    2026-09-07 -- and the incident above is a reason it should: falling
+    through to a password form that can never succeed for a first-time
+    guest is exactly what made a broken email path look like a working
+    one.)"""
     mobile_otp_enabled = bool(
         feature_summary.get(PlanFeatureKey.MOBILE_OTP.value, False)
     )
@@ -796,6 +999,7 @@ class LocationProvisioningService:
         *,
         login_url_base: str = _DEFAULT_LOGIN_URL_BASE,
         notification_service: NotificationSenderProtocol | None = None,
+        default_alerting: DefaultAlertingProtocol | None = None,
     ) -> None:
         self.location_service = location_service
         self.organization_service = organization_service
@@ -814,6 +1018,9 @@ class LocationProvisioningService:
         self.notification_service: NotificationSenderProtocol = (
             notification_service or _NoopNotificationSender()
         )
+        self.default_alerting: DefaultAlertingProtocol = (
+            default_alerting or _NoopDefaultAlerting()
+        )
 
     # -- preview (read-only dry run) ----------------------------------------
 
@@ -825,6 +1032,7 @@ class LocationProvisioningService:
         and is not validated, and the honest boundary on what it does not
         guarantee. Never calls a single ``create_*``/``update_*`` method
         on any composed service."""
+        _reject_template_without_router(data)
         organization_id: uuid.UUID | None
         if data.existing_organization_id is not None:
             organization = await self.organization_service.get_organization(
@@ -852,7 +1060,10 @@ class LocationProvisioningService:
         if owner_role is None:
             raise OwnerRoleNotSeededError()
 
-        if data.router_config_template_id is None:
+        # Only a router gets a template, so only a router needs a default
+        # to resolve -- previewing without one must not fail on a missing
+        # system template the real write path will never look up.
+        if data.router is not None and data.router_config_template_id is None:
             await self._resolve_default_template_id()
 
         base_plan = await self.plan_service.get_plan(data.plan_id)
@@ -871,14 +1082,16 @@ class LocationProvisioningService:
             customer_id=customer_id,
             site_id=site_id,
             nas_id=nas_id,
-            controller_id=data.router.serial_number,
+            controller_id=(
+                data.router.serial_number if data.router is not None else None
+            ),
             plan_id=base_plan.id,
             plan_name=base_plan.name,
             feature_summary=feature_summary,
             owner_name=f"{data.owner.first_name} {data.owner.last_name}".strip(),
             owner_email=data.owner.email,
             owner_username_preview=owner_username_preview,
-            router_name=data.router.name,
+            router_name=data.router.name if data.router is not None else None,
         )
 
     # -- main orchestration ------------------------------------------------
@@ -889,8 +1102,13 @@ class LocationProvisioningService:
         """Executes every Smart Location Provisioning step, in order. No
         ``try``/``except`` anywhere in this method -- see module docstring's
         transactional-guarantee section for why that is exactly what makes
-        the single-transaction rollback real."""
+        the single-transaction rollback real.
+
+        ``data.router is None`` skips steps (d), (f) and (e') -- and only
+        those. See module docstring's "Provisioning without a router"."""
         now = datetime.now(UTC)
+        # Before the first write, so a rejected request writes nothing.
+        _reject_template_without_router(data)
 
         # -- a. Create Organization (if new) / reuse existing ----------------
         organization = await self._resolve_organization(actor_user_id, data)
@@ -950,39 +1168,66 @@ class LocationProvisioningService:
             owner, must_change_password=True
         )
 
-        # -- d. Register Router ------------------------------------------------
-        router = await self.router_service.create_router(
-            actor_user_id=actor_user_id,
-            location_id=location.id,
-            requesting_organization_id=None,
-            name=data.router.name,
-            serial_number=data.router.serial_number,
-            mac_address=data.router.mac_address,
-            model=data.router.model,
-            management_ip_address=data.router.management_ip_address,
-            public_ip_address=data.router.public_ip_address,
-            api_username=data.router.api_username,
-            api_secret=data.router.api_secret,
-            settings=dict(data.router.settings),
-        )
+        # -- d. Register Router (skipped without one -- see docstring) ----------
+        router: Router | None = None
+        if data.router is not None:
+            router = await self.router_service.create_router(
+                actor_user_id=actor_user_id,
+                location_id=location.id,
+                requesting_organization_id=None,
+                name=data.router.name,
+                serial_number=data.router.serial_number,
+                mac_address=data.router.mac_address,
+                model=data.router.model,
+                management_ip_address=data.router.management_ip_address,
+                public_ip_address=data.router.public_ip_address,
+                api_username=data.router.api_username,
+                api_secret=data.router.api_secret,
+                settings=dict(data.router.settings),
+            )
 
-        # -- e. Generate WireGuard Peer -----------------------------------------
-        tunnel = await self.wireguard_service.create_tunnel(
-            actor_user_id=actor_user_id,
-            router_id=router.id,
-            requesting_organization_id=None,
-        )
+        # -- e. Generate WireGuard Peer -- DEFERRED, see step (e') below --------
+        #
+        # The spec numbers the tunnel as step (e), between Register Router
+        # and Apply default router configuration, and it used to run here.
+        # It has been moved to the end of the write sequence, and the move
+        # is the point rather than a tidy-up:
+        #
+        # The hub allocation is the ONE step in this whole flow that the
+        # request's transaction cannot undo. Every other step is a
+        # `session.flush()` on the single request-scoped AsyncSession, so a
+        # failure anywhere rolls all of them back (see module docstring).
+        # `POST /wg/peer` on `ops/hub-agents/wg_agent.py` is an HTTP call to
+        # another machine that mints a keypair and consumes the next free
+        # address out of the hub's /24 -- and that agent has no `do_DELETE`
+        # (a DELETE answers `501 Unsupported method`), so nothing, here or
+        # anywhere, can give the address back.
+        #
+        # With the allocation at (e), every later failure -- an incompatible
+        # config template at (f), a plan/subscription problem at (g), a
+        # captive-portal validation error at (j) -- rolled back the database
+        # and left a peer stranded on the hub forever. `next_free_ip()`
+        # scans live kernel state, so each one permanently narrows the fleet
+        # ceiling. Running it last shrinks that window to the three steps
+        # after it, none of which touch another machine.
+        #
+        # Nothing between here and there depends on the tunnel:
+        # `assign_profile` renders its template from
+        # `RouterProvisioningService.resolve_variables`, which reads the
+        # Router row and ConfigVariable scopes only -- no WireGuard field is
+        # in scope for a template today.
 
-        # -- f. Apply default router configuration ------------------------------
-        template_id = data.router_config_template_id
-        if template_id is None:
-            template_id = await self._resolve_default_template_id()
-        await self.router_provisioning_service.assign_profile(
-            actor_user_id=actor_user_id,
-            router_id=router.id,
-            template_id=template_id,
-            requesting_organization_id=None,
-        )
+        # -- f. Apply default router configuration (router only) -----------------
+        if router is not None:
+            template_id = data.router_config_template_id
+            if template_id is None:
+                template_id = await self._resolve_default_template_id()
+            await self.router_provisioning_service.assign_profile(
+                actor_user_id=actor_user_id,
+                router_id=router.id,
+                template_id=template_id,
+                requesting_organization_id=None,
+            )
 
         # -- g. Apply Subscription Plan (License is created/activated by
         # SubscriptionService.create_subscription itself -- see module
@@ -1078,6 +1323,51 @@ class LocationProvisioningService:
             social_login_providers=[],
         )
 
+        # -- e'. Generate WireGuard Peer (spec step (e), run last -- see the
+        # comment at its original position for why) ---------------------------
+        #
+        # THROUGH THE HUB BRIDGE, NEVER `create_tunnel`. `create_tunnel`
+        # generates the keypair here, on the platform, and the hub agent has
+        # no verb to be told a public key it did not generate itself -- so
+        # it refuses with `HubCannotLearnPlatformKeyError` rather than
+        # writing a row describing a tunnel that could never establish.
+        # That refusal is correct and is not suppressed here; provisioning
+        # simply asks for the allocation the right way instead.
+        #
+        # A brand-new router has no peer and no issuance history, so
+        # `allocate_tunnel_via_hub`'s reuse and adopt branches cannot match
+        # and this always reaches the bridge -- one `POST /wg/peer` per
+        # successfully provisioned customer, which is the minimum possible.
+        #
+        # No router, no call: a peer is a router's tunnel identity, and
+        # minting one for nothing would permanently burn a hub address (see
+        # above -- the agent cannot give it back).
+        tunnel_ip_address: str | None = None
+        if router is not None:
+            try:
+                tunnel = await self.wireguard_service.allocate_tunnel_via_hub(
+                    actor_user_id=actor_user_id,
+                    router_id=router.id,
+                    requesting_organization_id=None,
+                )
+            except (HubBridgeUnavailableError, WireGuardError) as exc:
+                # BOTH types are named on purpose. `HubBridgeUnavailableError`
+                # subclasses `CloudGuestError`, NOT `WireGuardError` -- it is
+                # also the most likely failure here (the hub is another
+                # machine on the far end of an HTTP call), so an `except
+                # WireGuardError` alone would miss exactly the case this
+                # handler exists for. See that class's own docstring, trap 1.
+                #
+                # Re-raised, never swallowed: the re-raise is what makes the
+                # rollback happen, and a half-provisioned customer reported as
+                # a success is strictly worse than a clean failure. All this
+                # adds is the fact the operator needs and none of the
+                # underlying errors carry -- that nothing was saved.
+                raise RouterTunnelProvisioningFailedError(
+                    router_name=router.name, cause=exc
+                ) from exc
+            tunnel_ip_address = tunnel.peer.tunnel_ip_address
+
         # -- k. Audit logging (one additional Location-domain entry for the
         # overall event -- every composed step above already wrote its own,
         # see module docstring) --------------------------------------------
@@ -1089,7 +1379,10 @@ class LocationProvisioningService:
             description=f"Location '{location.name}' fully provisioned",
             event_metadata={
                 "organization_id": str(organization.id),
-                "router_id": str(router.id),
+                # A real null, not the string "None", when there is no
+                # router -- anything reading the audit trail back must be
+                # able to tell "no router" from a router id.
+                "router_id": str(router.id) if router is not None else None,
                 "plan_id": str(effective_plan_id),
                 "owner_user_id": str(owner.id),
             },
@@ -1135,9 +1428,9 @@ class LocationProvisioningService:
             plan_id=effective_plan_id,
             plan_name=resolved_plan.name,
             feature_summary=feature_summary,
-            router_id=router.id,
-            router_name=router.name,
-            tunnel_ip_address=tunnel.peer.tunnel_ip_address,
+            router_id=router.id if router is not None else None,
+            router_name=router.name if router is not None else None,
+            tunnel_ip_address=tunnel_ip_address,
             owner_user_id=owner.id,
             owner_name=f"{owner.first_name} {owner.last_name}".strip(),
             owner_username=owner.username,
@@ -1206,7 +1499,7 @@ class LocationProvisioningService:
         if data.new_organization is None:
             raise NewOrganizationRequiredError()
 
-        return await self.organization_service.create_organization(
+        organization = await self.organization_service.create_organization(
             actor_user_id=actor_user_id,
             name=data.new_organization.name,
             slug=data.new_organization.slug,
@@ -1220,6 +1513,40 @@ class LocationProvisioningService:
                 "onboarding_completed": True,
             },
         )
+        await self._ensure_default_alerting(organization)
+        return organization
+
+    async def _ensure_default_alerting(self, organization: Organization) -> None:
+        """Give the organization the default alert rules and channel.
+
+        Only on the branch that *creates* an organization. Provisioning a
+        second location into an existing tenant does not re-ask: that
+        tenant was given its defaults when it was created, and an operator
+        who has since retuned or deleted a rule meant to.
+
+        ## Failures are swallowed, deliberately
+
+        ``ensure_default_alerting`` is documented as never raising, and this
+        guard is for the layer between here and it. ``provision_location``
+        runs inside one request-scoped ``AsyncSession``, so an exception
+        escaping here would roll back the organization, the owner account,
+        the location and the router -- the whole customer -- because their
+        alert rules could not be created. That trade is the wrong way
+        round. The customer existing matters more than the default rule
+        existing, which is the same judgement
+        ``default_alerting``'s own module made when it chose per-rule
+        failure over per-call failure.
+        """
+        try:
+            await self.default_alerting(
+                organization_id=organization.id,
+                contact_email=organization.contact_email,
+            )
+        except Exception:
+            logger.exception(
+                "default_alerting_failed_during_provisioning",
+                extra={"organization_id": str(organization.id)},
+            )
 
     async def _resolve_default_template_id(self) -> uuid.UUID:
         templates, _meta = await self.router_provisioning_service.list_templates(
@@ -1355,4 +1682,5 @@ __all__ = [
     "FeatureOverride",
     "OwnerRoleNotSeededError",
     "OwnerNotProvisionedError",
+    "RouterTunnelProvisioningFailedError",
 ]

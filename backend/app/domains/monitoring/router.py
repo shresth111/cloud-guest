@@ -129,6 +129,7 @@ from app.domains.guest.dependencies import get_guest_analytics_service
 from app.domains.guest.service import GuestAnalyticsService
 from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import (
+    CurrentOrganization,
     CurrentUser,
     RequirePermission,
     get_access_validator,
@@ -315,11 +316,35 @@ def _timeline_entry_response(entry: TimelineEntry) -> TimelineEntryResponse:
 # ============================================================================
 
 
+# The three Health Engine endpoints below are gated at ``ScopeType.GLOBAL``,
+# deliberately.
+#
+# ``HealthCheck`` and ``ServiceHealth`` have no ``organization_id`` column at
+# all -- one row per *platform component* (database, redis, celery,
+# freeradius), shared by every tenant. There is nothing to scope them by, so
+# unlike the by-id resources fixed alongside these cannot be filtered down;
+# they can only be withheld.
+#
+# Without the explicit scope they gated on a bare ``monitoring.read`` /
+# ``monitoring.manage``, which several org-side roles hold
+# (``location-manager``, ``helpdesk``, ``network-engineer`` at READ;
+# ``network-administrator`` at FULL -- see ``rbac/seed.py``). That exposed the
+# platform's own infrastructure state to a venue's staff, and in the case of
+# ``/health/run`` let them trigger live probes against every platform
+# dependency on demand.
+#
+# A venue's own health signals are not here: they are on
+# ``/monitoring/dashboard``, which resolves ``CurrentOrganization`` and scopes
+# its statistics to the caller's organization.
+
+
 @router.get(
     "/monitoring/health",
     response_model=ApiResponse[DashboardSummaryResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("monitoring.read"))],
+    dependencies=[
+        Depends(RequirePermission("monitoring.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_health_dashboard(
     request: Request,
@@ -342,7 +367,9 @@ async def get_health_dashboard(
     "/monitoring/health/{component}",
     response_model=ApiResponse[HealthHistoryResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("monitoring.read"))],
+    dependencies=[
+        Depends(RequirePermission("monitoring.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_health_history(
     request: Request,
@@ -375,7 +402,9 @@ async def get_health_history(
     "/monitoring/health/run",
     response_model=ApiResponse[HealthCheckRunResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("monitoring.manage"))],
+    dependencies=[
+        Depends(RequirePermission("monitoring.manage", scope=ScopeType.GLOBAL))
+    ],
 )
 async def run_health_checks(
     request: Request,
@@ -407,7 +436,7 @@ async def run_health_checks(
 )
 async def get_event_timeline(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     category: list[EventCategory] | None = Query(default=None),
     severity: list[EventSeverity] | None = Query(default=None),
     start_date: datetime | None = Query(default=None),
@@ -417,6 +446,16 @@ async def get_event_timeline(
     ),
     service: MonitoringService = Depends(get_monitoring_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param.
+    # ``monitoring.read`` is grantable at ORGANIZATION scope (see rbac.seed's
+    # MODULE_NARROWEST_SCOPE ``MONITORING: ScopeType.ROUTER``), so an org-scoped
+    # admin who sent ``X-Organization-Id`` (passing the org-scoped permission
+    # check) but omitted ``?organization_id=`` had the org filter silently
+    # dropped and read every organization's event timeline. A caller reaching
+    # this handler with ``organization_id is None`` sent no org header and thus
+    # passed the GLOBAL-scope permission gate, so may legitimately read across
+    # organizations.
     entries = await service.get_event_timeline(
         organization_id=organization_id,
         categories=category,
@@ -535,14 +574,22 @@ async def create_alert_rule(
 )
 async def list_alert_rules(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     is_active: bool | None = Query(default=None),
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: AlertService = Depends(get_alert_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching audit/controller_logs/analytics/dashboard. A non-GLOBAL
+    # caller can only ever resolve to an org they are an active member of (the
+    # membership check inside ``CurrentOrganization``), so ``organization_id``
+    # here is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     items, meta = await service.list_alert_rules(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         is_active=is_active,
         page=page,
         page_size=page_size,
@@ -573,9 +620,12 @@ async def list_alert_rules(
 async def get_alert_rule(
     request: Request,
     rule_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    rule = await service.get_alert_rule(rule_id)
+    rule = await service.get_alert_rule(
+        rule_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert rule retrieved",
@@ -594,6 +644,7 @@ async def update_alert_rule(
     request: Request,
     rule_id: uuid.UUID,
     payload: AlertRuleUpdateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
     data = payload.model_dump(exclude_unset=True, exclude={"notification_channel_ids"})
@@ -602,7 +653,10 @@ async def update_alert_rule(
     if "severity" in data and payload.severity is not None:
         data["severity"] = payload.severity.value
     rule = await service.update_alert_rule(
-        rule_id, data=data, notification_channel_ids=payload.notification_channel_ids
+        rule_id,
+        data=data,
+        notification_channel_ids=payload.notification_channel_ids,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -621,9 +675,12 @@ async def update_alert_rule(
 async def delete_alert_rule(
     request: Request,
     rule_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    await service.delete_alert_rule(rule_id)
+    await service.delete_alert_rule(
+        rule_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert rule deleted",
@@ -640,7 +697,7 @@ async def delete_alert_rule(
 )
 async def list_alerts(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     router_id: uuid.UUID | None = Query(default=None),
     alert_status: AlertStatus | None = Query(default=None, alias="status"),
     severity: str | None = Query(default=None),
@@ -648,8 +705,15 @@ async def list_alerts(
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: AlertService = Depends(get_alert_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching audit/controller_logs/analytics/dashboard. A non-GLOBAL
+    # caller can only ever resolve to an org they are an active member of, so
+    # ``organization_id`` is either that own org or ``None`` for a
+    # platform/GLOBAL caller who legitimately reads across organizations.
     items, meta = await service.list_alerts(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         status=alert_status.value if alert_status is not None else None,
         severity=severity,
         router_id=router_id,
@@ -685,9 +749,12 @@ async def list_alerts(
 async def get_alert(
     request: Request,
     alert_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    alert = await service.get_alert(alert_id)
+    alert = await service.get_alert(
+        alert_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert retrieved",
@@ -706,9 +773,14 @@ async def acknowledge_alert(
     request: Request,
     alert_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    alert = await service.acknowledge_alert(alert_id, user_id=uuid.UUID(user.id))
+    alert = await service.acknowledge_alert(
+        alert_id,
+        user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Alert acknowledged",
@@ -726,9 +798,12 @@ async def acknowledge_alert(
 async def resolve_alert(
     request: Request,
     alert_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    alert = await service.resolve_alert(alert_id)
+    alert = await service.resolve_alert(
+        alert_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert resolved",
@@ -803,14 +878,21 @@ async def create_notification_channel(
 )
 async def list_notification_channels(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     is_active: bool | None = Query(default=None),
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: NotificationService = Depends(get_notification_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching list_alerts/list_alert_rules. A non-GLOBAL caller can only
+    # ever resolve to an org they are an active member of, so ``organization_id``
+    # is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     items, meta = await service.list_channels(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         is_active=is_active,
         page=page,
         page_size=page_size,
@@ -841,9 +923,12 @@ async def list_notification_channels(
 async def get_notification_channel(
     request: Request,
     channel_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NotificationService = Depends(get_notification_service),
 ):
-    channel = await service.get_channel(channel_id)
+    channel = await service.get_channel(
+        channel_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Notification channel retrieved",
@@ -862,10 +947,16 @@ async def update_notification_channel(
     request: Request,
     channel_id: uuid.UUID,
     payload: NotificationChannelUpdateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NotificationService = Depends(get_notification_service),
 ):
     data = payload.model_dump(exclude_unset=True, exclude={"config"})
-    channel = await service.update_channel(channel_id, data=data, config=payload.config)
+    channel = await service.update_channel(
+        channel_id,
+        data=data,
+        config=payload.config,
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Notification channel updated",
@@ -883,9 +974,12 @@ async def update_notification_channel(
 async def delete_notification_channel(
     request: Request,
     channel_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NotificationService = Depends(get_notification_service),
 ):
-    await service.delete_channel(channel_id)
+    await service.delete_channel(
+        channel_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Notification channel deleted",
@@ -979,15 +1073,22 @@ async def create_incident(
 )
 async def list_incidents(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     incident_status: IncidentStatus | None = Query(default=None, alias="status"),
     severity: str | None = Query(default=None),
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: IncidentService = Depends(get_incident_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching list_alerts/list_alert_rules. A non-GLOBAL caller can only
+    # ever resolve to an org they are an active member of, so ``organization_id``
+    # is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     items, meta = await service.list_incidents(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         status=incident_status.value if incident_status is not None else None,
         severity=severity,
         page=page,
@@ -1019,9 +1120,12 @@ async def list_incidents(
 async def get_incident(
     request: Request,
     incident_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
-    incident = await service.get_incident(incident_id)
+    incident = await service.get_incident(
+        incident_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Incident retrieved",
@@ -1040,10 +1144,12 @@ async def update_incident(
     request: Request,
     incident_id: uuid.UUID,
     payload: IncidentUpdateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
     incident = await service.update_incident(
         incident_id,
+        requesting_organization_id=requesting_organization_id,
         status=payload.status,
         title=payload.title,
         description=payload.description,
@@ -1068,9 +1174,14 @@ async def attach_alert_to_incident(
     request: Request,
     incident_id: uuid.UUID,
     payload: IncidentAlertAttachRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
-    incident = await service.attach_alert(incident_id, payload.alert_id)
+    incident = await service.attach_alert(
+        incident_id,
+        payload.alert_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Alert attached to incident",
@@ -1088,9 +1199,12 @@ async def attach_alert_to_incident(
 async def list_incident_alerts(
     request: Request,
     incident_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
-    alerts = await service.list_alerts_for_incident(incident_id)
+    alerts = await service.list_alerts_for_incident(
+        incident_id, requesting_organization_id=requesting_organization_id
+    )
     payload = IncidentAlertsResponse(items=[_alert_response(a) for a in alerts])
     return build_response(
         success=True,
@@ -1119,11 +1233,18 @@ async def list_incident_alerts(
 )
 async def list_sla_targets(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SlaService = Depends(get_sla_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching list_alerts/list_alert_rules. A non-GLOBAL caller can only
+    # ever resolve to an org they are an active member of, so ``organization_id``
+    # is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     pairs = await service.list_targets_with_latest_report(
-        organization_id=organization_id
+        organization_id=organization_id,
+        include_all_organizations=organization_id is None,
     )
     payload = SlaTargetListResponse(
         items=[
@@ -1180,9 +1301,15 @@ async def list_sla_reports(
     target_id: uuid.UUID,
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SlaService = Depends(get_sla_service),
 ):
-    items, meta = await service.list_reports(target_id, page=page, page_size=page_size)
+    items, meta = await service.list_reports(
+        target_id,
+        page=page,
+        page_size=page_size,
+        requesting_organization_id=requesting_organization_id,
+    )
     payload = SlaReportListResponse(
         items=[_sla_report_response(item) for item in items],
         page=meta.page,
@@ -1210,9 +1337,14 @@ async def generate_sla_report(
     request: Request,
     target_id: uuid.UUID,
     payload: SlaReportGenerateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SlaService = Depends(get_sla_service),
 ):
-    report = await service.generate_report(target_id, period_days=payload.period_days)
+    report = await service.generate_report(
+        target_id,
+        requesting_organization_id=requesting_organization_id,
+        period_days=payload.period_days,
+    )
     return build_response(
         success=True,
         message="SLA report generated",
@@ -1478,7 +1610,7 @@ def _ztp_analytics_response(result: ZtpAnalyticsResult) -> ZtpAnalyticsResponse:
 )
 async def get_platform_dashboard(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     start_date: datetime | None = Query(default=None),
     end_date: datetime | None = Query(default=None),
     service: PlatformDashboardService = Depends(get_platform_dashboard_service),
@@ -1496,6 +1628,11 @@ async def get_platform_dashboard(
     """
     end = end_date or datetime.now(UTC)
     start = start_date or (end - timedelta(hours=24))
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above for the full rationale. Omitting the org
+    # filter here aggregated every organization's health/alert/device/visitor
+    # statistics into one cross-tenant dashboard payload.
     result = await service.get_dashboard_statistics(
         organization_id=organization_id,
         start=start,
@@ -1533,7 +1670,7 @@ async def get_platform_dashboard(
 )
 async def get_device_statistics(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     page: int = Query(default=DEFAULT_ZTP_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_ZTP_PAGE_SIZE, ge=1, le=100),
     service: ZtpMonitoringService = Depends(get_ztp_monitoring_service),
@@ -1544,6 +1681,10 @@ async def get_device_statistics(
     monitoring dashboard's device tab) -- deliberately not a second
     implementation, per this module's "compose, don't duplicate" discipline.
     """
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above. Omitting the org filter listed every
+    # organization's routers/lifecycle stages cross-tenant.
     result = await service.get_dashboard(
         organization_id=organization_id, page=page, page_size=page_size
     )
@@ -1563,7 +1704,7 @@ async def get_device_statistics(
 )
 async def get_ztp_dashboard(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     page: int = Query(default=DEFAULT_ZTP_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_ZTP_PAGE_SIZE, ge=1, le=100),
     service: ZtpMonitoringService = Depends(get_ztp_monitoring_service),
@@ -1572,6 +1713,10 @@ async def get_ztp_dashboard(
     router currently sit" view (read-only aggregation over
     ``app.domains.router_provisioning``'s own existing data -- see
     ``service.ZtpMonitoringService``'s own docstring)."""
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above. Omitting the org filter listed every
+    # organization's routers/lifecycle stages cross-tenant.
     result = await service.get_dashboard(
         organization_id=organization_id, page=page, page_size=page_size
     )
@@ -1591,7 +1736,7 @@ async def get_ztp_dashboard(
 )
 async def get_ztp_analytics(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     start_date: datetime | None = Query(default=None),
     end_date: datetime | None = Query(default=None),
     retry_page: int = Query(default=DEFAULT_ZTP_PAGE, ge=1),
@@ -1607,6 +1752,11 @@ async def get_ztp_analytics(
     identical default window)."""
     end = end_date or datetime.now(UTC)
     start = start_date or (end - timedelta(days=30))
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above (``analytics.read`` is likewise grantable at
+    # ORGANIZATION scope). Omitting the org filter aggregated every
+    # organization's provisioning success/failure/retry analytics cross-tenant.
     result = await service.get_analytics(
         organization_id=organization_id,
         start=start,

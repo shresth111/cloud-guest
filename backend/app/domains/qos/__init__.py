@@ -11,15 +11,14 @@ device push); this domain fills the one genuinely missing piece --
 traffic classification -- and reuses ``queue_management``'s own priority
 bounds for validation rather than redeclaring them.
 
-Real RouterOS ``/ip firewall mangle`` packet-marking is composed via
-``app.domains.network_config`` in the same pass this domain was built
-(rather than deferred to a future domain, mirroring ``app.domains
-.hotspot``'s own identical "compose immediately, don't defer" precedent
-now that Network Configuration Management already exists) -- see
-``docs/qos/FLOW.md`` for the full design write-up, including why pairing
-the resulting packet-mark with an actual ``/queue tree`` entry is a
-real, separate, currently-manual device-side step, not automated in this
-pass.
+Both RouterOS objects a QoS rule becomes -- the ``/ip firewall mangle``
+packet mark and the ``/queue tree`` entry that references it -- are pushed
+by this domain's own ``device_adapters.py`` through
+``POST /qos-rules/{rule_id}/push``. ``app.domains.network_config`` also
+renders the mangle half into its config script, and that remains true, but
+it is not what a customer's Apply button reaches; see
+``service.py``'s own module docstring for why relying on it meant shipping
+half a mechanism under a badge claiming the whole one.
 """
 
 from __future__ import annotations

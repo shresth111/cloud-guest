@@ -65,9 +65,77 @@ def normalize_redeemed_identifier(identifier: str) -> str:
     return identifier.strip()
 
 
+#: Separators a person inserts to make a code readable. Deleting these is
+#: the *fallback* spelling, never the stored one -- see
+#: :func:`voucher_code_lookup_candidates` for why that distinction is the
+#: whole design here.
+_CODE_SEPARATORS = str.maketrans("", "", " \t-‐‑‒–—_")
+
+
+def normalize_voucher_code(code: str) -> str:
+    """The one spelling a code is stored and compared as: trimmed and
+    upper-cased.
+
+    ## The defect this closes
+
+    Generated codes come from :data:`VOUCHER_CODE_ALPHABET`, which is
+    uppercase letters and digits and nothing else. The bulk-import path
+    normalised with ``.strip().upper()``; redemption and validation did
+    ``.strip()`` only, and the lookup is exact. So a guest typing their own
+    code in lower case got "voucher not found" for a code sitting valid and
+    unredeemed in the row beside it -- and whether they succeeded depended
+    on which path had created the row. The two disagreeing is the bug; this
+    function exists so there is one answer and every caller uses it.
+
+    Upper-casing cannot turn one valid code into a different valid one:
+    lower case appears in no code, generated or imported, so ``kfa7`` can
+    only ever have meant ``KFA7``.
+
+    It stops short of confusable-character folding, deliberately. The
+    alphabet already excludes ``I``, ``O``, ``0`` and ``1`` so that no two
+    symbols look alike -- see its own comment. A guest who types ``0`` has
+    not mistyped ``O`` for it, because ``O`` is in no code either; they are
+    simply wrong, and saying so is more use than guessing which excluded
+    character they meant.
+    """
+    return code.strip().upper()
+
+
+def voucher_code_lookup_candidates(code: str) -> tuple[str, ...]:
+    """The spellings to try, in order, when looking a guest-typed code up.
+
+    Always at least :func:`normalize_voucher_code`. A second candidate with
+    separators removed is appended when it differs -- so ``KFA7-X2M9-QDT``
+    finds the generated code ``KFA7X2M9QDT`` that a printed card invited the
+    guest to group that way.
+
+    ## Why separators are a fallback and not part of the stored form
+
+    Because imported codes are not generated codes. ``import_codes`` exists
+    for vouchers a venue had **pre-printed elsewhere**, and those carry
+    whatever the printer put on them -- ``PRINT-001`` is a real shape in
+    this module's own tests. Stripping separators before storing would
+    silently rewrite a venue's own code, and stripping them before every
+    lookup would then make that stored code unreachable. This was not
+    reasoned out in advance: the first version of this fix did strip them
+    everywhere, and those tests failed.
+
+    Order matters for the same reason. The as-typed spelling is tried
+    first, so a venue whose codes genuinely contain a hyphen matches
+    exactly, and the separator-free attempt only ever runs on a miss. It can
+    therefore introduce no ambiguity -- it cannot shadow a code, only reach
+    one that was otherwise unreachable.
+    """
+    exact = normalize_voucher_code(code)
+    stripped = exact.translate(_CODE_SEPARATORS)
+    return (exact,) if stripped == exact else (exact, stripped)
+
+
 __all__ = [
     "validate_code_length",
     "validate_quantity",
     "validate_batch_status_transition",
     "normalize_redeemed_identifier",
+    "normalize_voucher_code",
+    "voucher_code_lookup_candidates",
 ]

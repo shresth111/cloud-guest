@@ -7,8 +7,8 @@ platform-wide device-sync sweep.
 acquires a Redis overlap-prevention lock, lists every router due a sync via
 ``ConnectedDeviceRepository.list_routers_for_sync``, and dispatches one real
 Celery task (``sync_single_router_devices``) per router -- never itself
-performing the real per-router RouterOS DHCP-lease/ARP/wireless-
-registration-table discovery call. Each dispatched leaf task then does the
+performing the real per-router RouterOS DHCP-lease/ARP discovery
+call. Each dispatched leaf task then does the
 identical fresh-``AsyncSession``-per-invocation bridge every other Celery
 task in this codebase uses (see ``app.domains.isp.tasks
 .run_isp_health_check_sweep`` for the original single-process precedent
@@ -58,12 +58,22 @@ from app.domains.router.service import RouterService
 from .constants import (
     CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY,
     CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS,
+    MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY,
+    MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS,
     TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
+    TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
     TASK_SYNC_SINGLE_ROUTER_DEVICES,
 )
 from .device_adapters import get_connected_device_adapter
 from .repository import ConnectedDeviceRepository
-from .service import DeviceSyncSweepSummary, run_device_sync_sweep
+from .service import (
+    DeviceSyncSweepSummary,
+    MonitoredHardwareLivenessSummary,
+    run_device_sync_sweep,
+)
+from .service import (
+    run_monitored_hardware_liveness_sweep as run_monitored_hardware_liveness_sweep_core,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +178,19 @@ async def _sync_single_router_devices_async(
             repository = ConnectedDeviceRepository(session)
             router_service = _build_router_service(session)
             guest_access_service = GuestAccessService(
-                GuestAccessRepository(session), audit_writer=RBACRepository(session)
+                GuestAccessRepository(session),
+                # No block enforcer, written down rather than defaulted.
+                # This sweep only ever reaches ``create_device_rule``/
+                # ``list_device_rules``/``deactivate_device_rule`` (see
+                # ``GuestAccessProtocol`` in ``connected_devices.service``),
+                # and device (MAC-keyed) rules have no session-termination
+                # path yet -- so there is nothing here for an enforcer to
+                # do. If this sweep ever starts creating identifier-keyed
+                # blocklist rules, this ``None`` is what will make that
+                # visible: those rows record ``UNENFORCED`` rather than
+                # silently ending no sessions.
+                block_enforcer=None,
+                audit_writer=RBACRepository(session),
             )
             guest_repository = GuestRepository(session)
             try:
@@ -197,6 +219,84 @@ async def _sync_single_router_devices_async(
             raise
 
 
+@celery_app.task(name=TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP)
+def run_monitored_hardware_liveness_sweep() -> dict[str, int]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS`` = 30s):
+    pings every registered monitored device through its own uplink router
+    and writes the verdict to its ``ConnectedDevice`` row, so a venue AP
+    that physically dies flips to DOWN within one tick instead of waiting
+    out its RouterOS DHCP lease. See
+    ``service.run_monitored_hardware_liveness_sweep``'s docstring for the
+    full write-up.
+
+    Unlike ``run_connected_device_sync_sweep`` this needs no per-router
+    fan-out: its work list is every monitored device that has ever been
+    observed (handfuls per venue, not every DHCP/ARP client platform-wide),
+    and ``service.run_monitored_hardware_liveness_sweep`` already groups
+    targets by router with per-router failure isolation. The Redis lock
+    below guards only against two overlapping runs (a 30s cadence with
+    real RouterOS socket timeouts can overrun itself) -- identical
+    SETNX shape and crash-safety semantics to the discovery sweep's own
+    coordinator lock."""
+    result = run_celery_task(_run_monitored_hardware_liveness_sweep_async())
+    logger.info(
+        "connected_device_task_run_monitored_hardware_liveness_sweep_completed",
+        extra=result,
+    )
+    return result
+
+
+async def _run_monitored_hardware_liveness_sweep_async() -> dict[str, int]:
+    redis = create_redis_client()
+    try:
+        acquired = await redis.set(
+            MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY,
+            "1",
+            nx=True,
+            ex=MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS,
+        )
+        if not acquired:
+            logger.warning(
+                "connected_device_task_monitored_hardware_liveness_skipped_locked",
+                extra={"lock_key": MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY},
+            )
+            return {
+                "routers_probed": 0,
+                "routers_failed": 0,
+                "devices_up": 0,
+                "devices_down": 0,
+                "skipped": 0,
+                "skipped_locked": True,
+            }
+        try:
+            async with SessionLocal() as session:
+                repository = ConnectedDeviceRepository(session)
+                router_service = _build_router_service(session)
+                summary: MonitoredHardwareLivenessSummary = (
+                    await run_monitored_hardware_liveness_sweep_core(
+                        repository,
+                        router_service,
+                        device_adapter_resolver=get_connected_device_adapter,
+                    )
+                )
+                await session.commit()
+                return {
+                    "routers_probed": summary.routers_probed,
+                    "routers_failed": summary.routers_failed,
+                    "devices_up": summary.devices_up,
+                    "devices_down": summary.devices_down,
+                    "skipped": summary.skipped,
+                    "skipped_locked": False,
+                }
+        except Exception:
+            await session.rollback()
+            raise
+    finally:
+        await redis.aclose()
+
+
 @celery_app.task(name=TASK_SYNC_SINGLE_ROUTER_DEVICES)
 def sync_single_router_devices(router_id: str) -> dict[str, int]:
     """The real fan-out leaf task ``run_connected_device_sync_sweep`` (the
@@ -206,7 +306,7 @@ def sync_single_router_devices(router_id: str) -> dict[str, int]:
     independent, real Celery tasks each worker slot picks up and runs
     concurrently (up to worker pool capacity), rather than one task
     blocking on N sequential, potentially-expensive real RouterOS
-    DHCP-lease/ARP/wireless-registration-table discovery calls. One
+    DHCP-lease/ARP discovery calls. One
     router's own connection failure/timeout only ever fails/delays this
     one task -- it can never block or slow down any other router's own
     sync."""
@@ -225,4 +325,8 @@ def sync_single_router_devices(router_id: str) -> dict[str, int]:
     return result
 
 
-__all__ = ["run_connected_device_sync_sweep", "sync_single_router_devices"]
+__all__ = [
+    "run_connected_device_sync_sweep",
+    "sync_single_router_devices",
+    "run_monitored_hardware_liveness_sweep",
+]

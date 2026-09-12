@@ -239,9 +239,58 @@ and tunnel network CIDR are ever included in a device-facing response --
 see `tests/unit/test_wireguard.py::TestDeviceFacingConfigPull
 ::test_pull_config_never_leaks_hub_private_key`.
 
+## 9a. `allocate_tunnel_via_hub` -- the only path to a usable tunnel
+
+`create_tunnel`/`rotate_tunnel` generate the keypair here, on the
+platform. `ops/hub-agents/wg_agent.py` exposes exactly two verbs -- `POST
+/wg/peer`, which mints its own keypair and returns both halves, and `GET
+/wg/peers` -- so there is no way to tell that agent about a public key it
+did not generate. Those two methods therefore refuse with
+`HubCannotLearnPlatformKeyError` instead of writing a row for a tunnel
+that could never establish.
+
+`WireGuardService.allocate_tunnel_via_hub` is the path that works. It is
+what `POST /routers/{router_id}/wireguard-peer/allocate-external` calls,
+and (since 2026-09-01) what
+`LocationProvisioningService.provision_location` calls -- provisioning
+used `create_tunnel` until then and consequently failed on every attempt
+to add a customer. The route handler is now a thin adapter; the decision
+sequence lives on the service because two callers need it.
+
+Its order is deliberate, and each branch exists because of a measured
+incident:
+
+1. **Validate the router first** (eligibility + tenant scope), before
+   anything irreversible happens.
+2. **Never allocate over a live device** unless `force=true`. The hub is
+   asked whether this router is handshaking right now, on the recorded key
+   or any key the issuance ledger attributes to it. Measured 2026-08-28:
+   four `?rotate=true` allocations for router 21e13913 in 24h, the last
+   handing out `10.20.0.9` while the device sat handshaking on
+   `10.20.0.6`. A guard the caller can switch off is not a guard, which is
+   why this one does not consult `rotate`.
+3. **Adopt rather than refuse.** If the live identity differs from what
+   the table records, the row is corrected onto it -- clicking Generate on
+   a diverged router repairs the divergence instead of deepening it.
+4. **Reuse before allocating**, unless `rotate=true`.
+5. Only then `POST /wg/peer`.
+
+Steps 2-4 exist because allocation is permanent: the agent has no
+`do_DELETE` (a `DELETE` answers `501`), and `next_free_ip()` scans live
+kernel state, so every unnecessary allocation permanently consumes an
+address out of the hub's /24.
+
+The bridge callable is injected (`dependencies.make_hub_peer_allocator`),
+alongside the deregistrar and the lister -- one bridge, three verbs -- so
+the in-memory test suite drives the whole decision without HTTP. A
+service built without it raises `HubPeerAllocatorNotConfiguredError`
+(503) rather than falling back to `create_tunnel`; the only available
+"fallback" is precisely the unusable path.
+
 ## 10. Router eligibility and soft-deleted (decommissioned) routers
 
-`create_tunnel`/`rotate_tunnel` both look up the router with
+`create_tunnel`/`rotate_tunnel`/`allocate_tunnel_via_hub` all look up the
+router with
 `include_deleted=True` before checking
 `validators.validate_router_eligible_for_wireguard` -- the identical
 reasoning `app.domains.router_agent.dependencies.CurrentAgent` already

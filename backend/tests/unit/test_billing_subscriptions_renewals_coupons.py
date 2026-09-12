@@ -49,6 +49,7 @@ from app.domains.billing.exceptions import (
     InvalidSubscriptionStatusForRenewalError,
     InvalidSubscriptionStatusTransitionError,
     PaymentGatewayNotConfiguredError,
+    SubscriptionNotFoundError,
     SubscriptionReactivationNotAllowedError,
 )
 from app.domains.billing.models import Coupon, License, Plan, Subscription
@@ -293,6 +294,26 @@ class FakeSubscriptionRepository:
             and s.current_period_end <= now
         ]
 
+    async def list_lapsed_non_renewing(self, *, now: datetime) -> list[Subscription]:
+        # The exact complement of list_due_for_renewal's auto_renew
+        # predicate, otherwise the identical filter -- mirrors
+        # SubscriptionRepository.list_lapsed_non_renewing.
+        cyclic = {BillingCycle.MONTHLY.value, BillingCycle.YEARLY.value}
+        # ACTIVE/TRIALING only -- PAST_DUE belongs to the grace-period
+        # phase, not this one.
+        renewable = {
+            SubscriptionStatus.TRIALING.value,
+            SubscriptionStatus.ACTIVE.value,
+        }
+        return [
+            s
+            for s in self.subscriptions.values()
+            if not s.auto_renew
+            and s.billing_cycle in cyclic
+            and s.status in renewable
+            and s.current_period_end <= now
+        ]
+
 
 @dataclass
 class FakeCouponRepository:
@@ -333,13 +354,20 @@ class FakeCouponRepository:
         page: int,
         page_size: int,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
     ) -> tuple[list[Coupon], PaginationMeta]:
-        items = list(self.coupons.values())
-        if organization_id is not None:
-            items = [c for c in items if c.organization_id == organization_id]
+        items = [c for c in self.coupons.values() if not c.is_deleted]
         if is_active is not None:
             items = [c for c in items if c.is_active == is_active]
+        if not include_all_organizations:
+            # Org-scoped caller: own org's coupons plus GLOBAL ones
+            # (``organization_id IS NULL``); never another org's.
+            items = [
+                c
+                for c in items
+                if c.organization_id == organization_id or c.organization_id is None
+            ]
         params = PageParams(page=page, page_size=page_size)
         return items, PaginationMeta.from_total(params, len(items))
 
@@ -523,7 +551,9 @@ async def _assign_and_activate_license(
         actor_user_id=None, organization_id=organization_id, plan_id=plan_id
     )
     return await fixture.service.activate_license(
-        actor_user_id=None, license_id=license_.id
+        actor_user_id=None,
+        license_id=license_.id,
+        requesting_organization_id=None,
     )
 
 
@@ -808,7 +838,10 @@ class TestSubscriptionCancellation:
         )
 
         cancelled = await fx.service.cancel_subscription(
-            actor_user_id=None, subscription_id=subscription.id, immediate=True
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            immediate=True,
+            requesting_organization_id=None,
         )
         assert cancelled.status == SubscriptionStatus.CANCELLED.value
         assert cancelled.auto_renew is False
@@ -819,6 +852,64 @@ class TestSubscriptionCancellation:
         )
         assert license_.status == LicenseStatus.SUSPENDED.value
 
+    async def test_a_tenant_cannot_cancel_another_tenants_subscription(self) -> None:
+        """`cancel`/`reactivate`/`pause`/`resume` all took the subscription
+        from the path while `RequirePermission("subscriptions.update")`
+        checked the header organization -- so a tenant holding it at its own
+        org could cancel any other tenant's plan by id. The sibling
+        `PATCH .../renewal-settings` already threaded the organization
+        correctly, which is what makes this an oversight rather than a
+        design."""
+        fx = make_subscription_service()
+        plan = await _make_plan(fx.license_fixture.plan_repository)
+        subscription = await fx.service.create_subscription(
+            actor_user_id=None, organization_id=uuid.uuid4(), plan_id=plan.id
+        )
+
+        with pytest.raises(SubscriptionNotFoundError):
+            await fx.service.cancel_subscription(
+                actor_user_id=None,
+                subscription_id=subscription.id,
+                immediate=True,
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+        assert subscription.status == SubscriptionStatus.ACTIVE.value
+
+    async def test_a_tenant_cannot_pause_another_tenants_subscription(self) -> None:
+        fx = make_subscription_service()
+        plan = await _make_plan(fx.license_fixture.plan_repository)
+        subscription = await fx.service.create_subscription(
+            actor_user_id=None, organization_id=uuid.uuid4(), plan_id=plan.id
+        )
+
+        with pytest.raises(SubscriptionNotFoundError):
+            await fx.service.pause_subscription(
+                actor_user_id=None,
+                subscription_id=subscription.id,
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+        assert subscription.status == SubscriptionStatus.ACTIVE.value
+
+    async def test_the_owning_tenant_can_still_cancel(self) -> None:
+        """The guard must refuse the neighbour without refusing the owner."""
+        fx = make_subscription_service()
+        plan = await _make_plan(fx.license_fixture.plan_repository)
+        org_id = uuid.uuid4()
+        subscription = await fx.service.create_subscription(
+            actor_user_id=None, organization_id=org_id, plan_id=plan.id
+        )
+
+        cancelled = await fx.service.cancel_subscription(
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            immediate=True,
+            requesting_organization_id=org_id,
+        )
+
+        assert cancelled.status == SubscriptionStatus.CANCELLED.value
+
     async def test_cancel_at_period_end_does_not_change_status_yet(self) -> None:
         fx = make_subscription_service()
         plan = await _make_plan(fx.license_fixture.plan_repository)
@@ -828,7 +919,10 @@ class TestSubscriptionCancellation:
         )
 
         scheduled = await fx.service.cancel_subscription(
-            actor_user_id=None, subscription_id=subscription.id, immediate=False
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            immediate=False,
+            requesting_organization_id=None,
         )
         assert scheduled.status == SubscriptionStatus.ACTIVE.value
         assert scheduled.cancel_at_period_end is True
@@ -849,7 +943,9 @@ class TestSubscriptionPauseResumeReactivate:
         )
 
         paused = await fx.service.pause_subscription(
-            actor_user_id=None, subscription_id=subscription.id
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            requesting_organization_id=None,
         )
         assert paused.status == SubscriptionStatus.PAUSED.value
         license_ = await fx.license_fixture.license_repository.get_by_id(
@@ -858,7 +954,9 @@ class TestSubscriptionPauseResumeReactivate:
         assert license_.status == LicenseStatus.ACTIVE.value  # untouched by pause
 
         resumed = await fx.service.resume_subscription(
-            actor_user_id=None, subscription_id=subscription.id
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            requesting_organization_id=None,
         )
         assert resumed.status == SubscriptionStatus.ACTIVE.value
 
@@ -870,11 +968,16 @@ class TestSubscriptionPauseResumeReactivate:
             actor_user_id=None, organization_id=org_id, plan_id=plan.id
         )
         await fx.service.cancel_subscription(
-            actor_user_id=None, subscription_id=subscription.id, immediate=True
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            immediate=True,
+            requesting_organization_id=None,
         )
 
         reactivated = await fx.service.reactivate_subscription(
-            actor_user_id=None, subscription_id=subscription.id
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            requesting_organization_id=None,
         )
         assert reactivated.status == SubscriptionStatus.ACTIVE.value
 
@@ -891,7 +994,10 @@ class TestSubscriptionPauseResumeReactivate:
             actor_user_id=None, organization_id=org_id, plan_id=plan.id
         )
         await fx.service.cancel_subscription(
-            actor_user_id=None, subscription_id=subscription.id, immediate=True
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            immediate=True,
+            requesting_organization_id=None,
         )
         # Simulate the grace-period sweep having already hard-expired the
         # license (see RenewalService.expire_lapsed_subscriptions).
@@ -902,7 +1008,9 @@ class TestSubscriptionPauseResumeReactivate:
 
         with pytest.raises(SubscriptionReactivationNotAllowedError):
             await fx.service.reactivate_subscription(
-                actor_user_id=None, subscription_id=subscription.id
+                actor_user_id=None,
+                subscription_id=subscription.id,
+                requesting_organization_id=None,
             )
 
     async def test_pause_from_paused_is_illegal(self) -> None:
@@ -913,11 +1021,15 @@ class TestSubscriptionPauseResumeReactivate:
             actor_user_id=None, organization_id=org_id, plan_id=plan.id
         )
         await fx.service.pause_subscription(
-            actor_user_id=None, subscription_id=subscription.id
+            actor_user_id=None,
+            subscription_id=subscription.id,
+            requesting_organization_id=None,
         )
         with pytest.raises(InvalidSubscriptionStatusTransitionError):
             await fx.service.pause_subscription(
-                actor_user_id=None, subscription_id=subscription.id
+                actor_user_id=None,
+                subscription_id=subscription.id,
+                requesting_organization_id=None,
             )
 
 
@@ -1219,6 +1331,132 @@ class TestRenewalSweep:
 
 
 class TestGracePeriodExpiry:
+    async def _non_renewing(
+        self,
+        fx: RenewalFixture,
+        *,
+        status: str = SubscriptionStatus.ACTIVE.value,
+        auto_renew: bool = False,
+        days_past_period_end: int = 5,
+    ):
+        plan = await _make_plan(fx.plan_repository)
+        org_id = uuid.uuid4()
+        license_ = await _assign_and_activate_license(
+            fx.license_fixture, organization_id=org_id, plan_id=plan.id
+        )
+        now = _now()
+        subscription = await fx.subscription_repository.create_subscription(
+            organization_id=org_id,
+            license_id=license_.id,
+            plan_id=plan.id,
+            status=status,
+            billing_cycle=plan.billing_cycle,
+            current_period_start=now - timedelta(days=30 + days_past_period_end),
+            current_period_end=now - timedelta(days=days_past_period_end),
+            trial_end=None,
+            auto_renew=auto_renew,
+            cancel_at_period_end=False,
+            started_at=now - timedelta(days=30 + days_past_period_end),
+        )
+        return subscription, license_
+
+    async def test_auto_renew_off_past_period_end_ends_the_subscription(self) -> None:
+        """The bug: turning auto-renewal off made a subscription immortal.
+
+        ``list_due_for_renewal`` requires ``auto_renew=True``, so the row
+        never entered the sweep; never charged, it never became
+        ``PAST_DUE``, so the grace-period phase never saw it either. It sat
+        ``ACTIVE`` past its paid period with a valid license, for free.
+        """
+        fx = make_renewal_service()
+        subscription, license_ = await self._non_renewing(fx)
+
+        lapsed_ids = await fx.service.lapse_non_renewing_subscriptions()
+        assert lapsed_ids == [subscription.id]
+
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.CANCELLED.value
+        assert after.cancelled_at is not None
+        # The real, unmodified LicenseService.suspend_license ran -- checked
+        # by its own state transition, not a reimplementation of it here.
+        license_after = await fx.license_fixture.license_repository.get_by_id(
+            license_.id
+        )
+        assert license_after.status == LicenseStatus.SUSPENDED.value
+
+    async def test_still_inside_the_paid_period_is_left_alone(self) -> None:
+        """Auto-renewal off does not end the subscription early -- the
+        customer paid for this period and it runs to its end."""
+        fx = make_renewal_service()
+        subscription, _license = await self._non_renewing(
+            fx,
+            days_past_period_end=-5,  # period ends 5 days from now
+        )
+
+        assert await fx.service.lapse_non_renewing_subscriptions() == []
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.ACTIVE.value
+
+    async def test_auto_renew_on_is_never_lapsed_here(self) -> None:
+        """A renewing subscription belongs to ``process_due_renewals``.
+        These two phases must never both claim one row."""
+        fx = make_renewal_service()
+        subscription, _license = await self._non_renewing(fx, auto_renew=True)
+
+        assert await fx.service.lapse_non_renewing_subscriptions() == []
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.ACTIVE.value
+
+    async def test_past_due_is_left_to_the_grace_period_phase(self) -> None:
+        """Turning auto-renewal off while past due must not cut the
+        customer off before the grace days they still had."""
+        fx = make_renewal_service(grace_period_days=7)
+        subscription, _license = await self._non_renewing(
+            fx, status=SubscriptionStatus.PAST_DUE.value
+        )
+
+        assert await fx.service.lapse_non_renewing_subscriptions() == []
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.PAST_DUE.value
+
+    async def test_a_lapse_failure_does_not_strand_its_siblings(self) -> None:
+        """Per-subscription isolation, same as every other sweep phase."""
+        fx = make_renewal_service()
+        doomed, _l1 = await self._non_renewing(fx)
+        healthy, _l2 = await self._non_renewing(fx)
+
+        real_suspend = fx.license_fixture.service.suspend_license
+
+        async def _explode_for_doomed(
+            *, actor_user_id, license_id, reason, requesting_organization_id
+        ):
+            if license_id == doomed.license_id:
+                raise RuntimeError("suspension blew up")
+            return await real_suspend(
+                actor_user_id=actor_user_id,
+                license_id=license_id,
+                reason=reason,
+                requesting_organization_id=requesting_organization_id,
+            )
+
+        fx.license_fixture.service.suspend_license = _explode_for_doomed  # type: ignore[method-assign]
+
+        lapsed_ids = await fx.service.lapse_non_renewing_subscriptions()
+
+        assert lapsed_ids == [healthy.id]
+
+    async def test_the_sweep_reports_lapsed_separately_from_expired(self) -> None:
+        """``lapsed_subscription_ids`` is its own field: "the customer chose
+        to stop paying" and "a charge failed and grace ran out" are
+        different outcomes and are reported as such."""
+        fx = make_renewal_service()
+        subscription, _license = await self._non_renewing(fx)
+
+        report = await fx.service.run_renewal_sweep()
+
+        assert report.lapsed_subscription_ids == [subscription.id]
+        assert report.expired_subscription_ids == []
+
     async def test_expire_lapsed_subscriptions_calls_real_expire_license(self) -> None:
         fx = make_renewal_service(grace_period_days=7)
         plan = await _make_plan(fx.plan_repository)
@@ -1416,3 +1654,83 @@ class TestReminders:
         assert report.expired_subscription_ids == []
         assert isinstance(report.renewal_reminders_sent, int)
         assert isinstance(report.expiry_reminders_sent, int)
+
+
+# ============================================================================
+# Tenant scoping of the coupon catalog listing (GET /coupons)
+# ----------------------------------------------------------------------------
+# A ``Coupon`` is either GLOBAL (``organization_id IS NULL``, usable by any
+# org) or organization-specific. ``billing.read`` is an ORGANIZATION-scoped
+# permission held by org-scoped customer roles, so ``GET /coupons`` is
+# reachable by a customer. Previously ``organization_id`` came from a query
+# param and, when omitted, dropped the filter entirely -- an org-scoped caller
+# who omitted it read every other tenant's private coupon codes. The effective
+# org must instead be resolved from the caller's auth scope, and an org-scoped
+# caller must see only their own org's coupons plus the GLOBAL ones.
+# ============================================================================
+
+
+async def _seed_coupon(fx: CouponFixture, *, code: str, organization_id):
+    return await fx.repository.create_coupon(
+        code=code,
+        discount_type="percentage",
+        discount_value=Decimal("10"),
+        currency=None,
+        organization_id=organization_id,
+        max_uses=None,
+        current_uses=0,
+        valid_from=_now(),
+        valid_until=None,
+        is_active=True,
+    )
+
+
+async def test_list_coupons_scoped_caller_sees_own_org_and_global_only():
+    fx = make_coupon_service()
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    await _seed_coupon(fx, code="AONLY", organization_id=org_a)
+    await _seed_coupon(fx, code="BONLY", organization_id=org_b)
+    await _seed_coupon(fx, code="GLOBAL", organization_id=None)
+
+    items, meta = await fx.service.list_coupons(
+        organization_id=org_a, include_all_organizations=False
+    )
+    codes = {c.code for c in items}
+    # Own org's coupon + the GLOBAL coupon, but never org_b's private coupon.
+    assert codes == {"AONLY", "GLOBAL"}
+    assert meta.total_items == 2
+
+
+async def test_list_coupons_platform_caller_sees_every_org():
+    fx = make_coupon_service()
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    await _seed_coupon(fx, code="AONLY", organization_id=org_a)
+    await _seed_coupon(fx, code="BONLY", organization_id=org_b)
+    await _seed_coupon(fx, code="GLOBAL", organization_id=None)
+
+    items, _meta = await fx.service.list_coupons(
+        organization_id=None, include_all_organizations=True
+    )
+    assert {c.code for c in items} == {"AONLY", "BONLY", "GLOBAL"}
+
+
+def test_coupon_listing_resolves_org_from_auth_scope_not_query_param():
+    from app.domains.rbac.dependencies import CurrentOrganization
+    from app.main import create_app
+
+    app = create_app()
+    route = next(
+        r
+        for r in app.routes
+        if getattr(r, "path", None) == "/api/v1/coupons"
+        and "GET" in (getattr(r, "methods", None) or set())
+    )
+    dependant = route.dependant
+
+    # organization_id is no longer a request query parameter ...
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    # ... it is resolved via the CurrentOrganization dependency instead.
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls

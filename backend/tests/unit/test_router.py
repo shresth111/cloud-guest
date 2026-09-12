@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.location.exceptions import (
@@ -35,8 +36,18 @@ from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.constants import (
+    ROUTER_REACHABILITY_HITS_TO_RESOLVE,
+    ROUTER_REACHABILITY_MISSES_TO_ALERT,
+    ROUTER_REACHABILITY_SILENCE_SECONDS,
+    ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
+)
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
-from app.domains.router.enums import RouterStatus
+from app.domains.router.enums import (
+    RouterHealthStatus,
+    RouterReachabilityState,
+    RouterStatus,
+)
 from app.domains.router.exceptions import (
     CrossOrganizationRouterAccessError,
     DuplicateMacAddressError,
@@ -54,6 +65,12 @@ from app.domains.router.exceptions import (
 )
 from app.domains.router.models import Router, RouterProvisioningToken
 from app.domains.router.repository import stale_heartbeat_statement
+from app.domains.router.schemas import (
+    HeartbeatRequest,
+    RouterCreateRequest,
+    RouterManagementAccessRequest,
+    RouterUpdateRequest,
+)
 from app.domains.router.service import RouterService
 
 # ============================================================================
@@ -199,6 +216,11 @@ class FakeRouterRepository:
 
     routers: dict[uuid.UUID, Router] = field(default_factory=dict)
     tokens: dict[uuid.UUID, RouterProvisioningToken] = field(default_factory=dict)
+    # router_id -> last moment an agent credential for it was used. Stands
+    # in for the real join onto ``router_agent_credentials.last_used_at``;
+    # a router missing from this dict has no usable credential and the real
+    # query excludes it. See ``list_reachability_candidates`` below.
+    agent_contact: dict[uuid.UUID, datetime] = field(default_factory=dict)
 
     async def get_by_id(
         self, router_id: uuid.UUID, *, include_deleted: bool = False
@@ -302,9 +324,13 @@ class FakeRouterRepository:
 
     async def mark_provisioning_token_used(
         self, token: RouterProvisioningToken, *, used_at: object
-    ) -> RouterProvisioningToken:
+    ) -> bool:
+        """Mirrors the real repository's compare-and-set semantics: a
+        no-op (returning ``False``) if the token was already used."""
+        if token.used_at is not None:
+            return False
         token.used_at = used_at
-        return token
+        return True
 
     async def list_expired_unused_provisioning_tokens(
         self, *, now: object
@@ -321,6 +347,30 @@ class FakeRouterRepository:
         token.is_deleted = True
         token.deleted_at = _now()
         return token
+
+    async def list_reachability_candidates(
+        self, *, now: object
+    ) -> list[tuple[Router, object]]:
+        """Mirrors ``reachability_candidate_statement`` on the two axes
+        that decide who gets judged: only ONLINE/OFFLINE routers, and only
+        those with a usable (unrevoked, unexpired) agent credential to read
+        a ``last_used_at`` from.
+
+        ``agent_contact`` here stands in for the real join onto
+        ``router_agent_credentials.last_used_at``; a router absent from the
+        dict is one with no usable credential and is excluded exactly as
+        the real query excludes it -- which is the behaviour
+        ``test_a_router_with_no_usable_agent_credential_is_never_judged``
+        below pins down.
+        """
+        return [
+            (r, self.agent_contact[r.id])
+            for r in self.routers.values()
+            if not r.is_deleted
+            and r.status
+            in (RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value)
+            and r.id in self.agent_contact
+        ]
 
     async def list_online_routers_with_stale_heartbeat(
         self, *, cutoff: object
@@ -846,7 +896,28 @@ class TestRouterProvisioning:
         # Raised 30 -> 36 on 2026-08-27 alongside the identical cap in
         # tests/unit/test_network_config.py, for the clock/NTP block the
         # bootstrap renderer now emits. See that file for the reasoning.
-        assert len(lines) <= 36
+        # Raised 36 -> 38 on 2026-08-29, again in lockstep with that file,
+        # for the captive-portal walled garden (2 lines, one per platform
+        # host). These two caps are deliberately kept identical -- they
+        # guard the same script, and letting them drift would mean one of
+        # them silently stops guarding anything.
+        #
+        # Raised 38 -> 39 on 2026-08-29: the walled garden emits a third
+        # line. `_render_vlan_hotspot` redirects to a per-VLAN
+        # `{tag}.HOTSPOT_DNS_NAME`, and RouterOS `dst-host` does not treat a
+        # bare name as covering its subdomains, so the wildcard form has to
+        # be allowed too or the one hostname guests are actually sent to is
+        # the one hostname walled off. Keeps the one line of slack this cap
+        # has carried since the 30 -> 36 raise.
+        #
+        # Raised 39 -> 42 on 2026-09-07, again in lockstep, for the three
+        # lines that make the HTTPS portal reachable pre-auth at all: a
+        # fourth host-based row for `GUEST_PORTAL_HOST` (the host the guest
+        # is actually sent to, which this section had never allowed), one
+        # joined line of address-based `/ip hotspot walled-garden ip`
+        # writes, and one verification line. See test_network_config.py for
+        # why the address-based row is the only one that can pass TLS.
+        assert len(lines) <= 42
         assert '/system identity set name="HQ-001"' in script
         assert "provisioning/check-in" in script
         # Step 1 ends at a verified tunnel + success line; the full config
@@ -1049,6 +1120,50 @@ class TestRouterProvisioning:
 
         with pytest.raises(ProvisioningTokenRouterStateError):
             await service.check_in(plaintext_token=plaintext)
+
+    async def test_check_in_treats_lost_compare_and_set_race_as_already_used(
+        self,
+    ) -> None:
+        """Regression test for a TOCTOU race: two concurrent ``check_in``
+        calls for the same token can both pass the earlier in-memory
+        ``token.is_used()`` guard before either one's write lands. This
+        simulates the *loser* of that race -- ``mark_provisioning_token_used``
+        reports "0 rows affected" (``False``) even though the token this
+        call already fetched still looks unused -- and asserts ``check_in``
+        surfaces the same ``ProvisioningTokenAlreadyUsedError`` a normal
+        already-used token would, and never transitions the router."""
+
+        class LostRaceRepository(FakeRouterRepository):
+            async def mark_provisioning_token_used(
+                self, token: RouterProvisioningToken, *, used_at: object
+            ) -> bool:
+                # Simulate someone else's concurrent, already-committed
+                # compare-and-set claiming this token first -- the atomic
+                # UPDATE ... WHERE used_at IS NULL affected zero rows.
+                return False
+
+        repo = LostRaceRepository()
+        service, repo, location_lookup, org_lookup, _audit = make_service(repo=repo)
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        router_device = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+        _token, plaintext = await service.generate_provisioning_token(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+        )
+
+        with pytest.raises(ProvisioningTokenAlreadyUsedError):
+            await service.check_in(plaintext_token=plaintext)
+
+        refreshed = await repo.get_by_id(router_device.id)
+        assert refreshed is not None
+        assert refreshed.status == RouterStatus.PENDING_PROVISIONING.value
 
     async def test_generate_token_rejected_outside_pending_provisioning(self) -> None:
         service, repo, _location_lookup, org_lookup, _audit = make_service()
@@ -1843,3 +1958,1152 @@ class TestBootstrapSingleLineCopy:
         for var in ("enroll", "wgcfg", "tunaddr"):
             assert f":local {var}" in joined
             assert f"${var}" in joined
+
+
+# ============================================================================
+# Customer-reachable router endpoints must not carry platform credentials
+# ============================================================================
+#
+# The regression these exist for (2026-09-01): ``RouterResponse`` emitted
+# ``snmp_enabled``/``has_snmp_community``/``snmp_version``/``snmp_port``, and
+# ``RouterCreateRequest``/``RouterUpdateRequest`` accepted plaintext
+# ``snmp_community`` and ``api_secret``. All four routes carrying those
+# schemas are gated on ``routers.read``/``create``/``update`` at
+# *organization* scope -- which ``organization-owner`` holds in full (see
+# ``TestRouterPermissionsAreHeldByCustomerScopedRoles`` below), and which
+# ``LocationProvisioningService`` assigns to every venue owner it
+# provisions. The customer dashboard really does call
+# ``GET /locations/{id}/routers`` for venue liveness, so that payload
+# reached venue-owner browsers, and a venue owner could set the router's
+# SNMP community string and the platform's own RouterOS API secret.
+
+
+class TestRouterPermissionsAreHeldByCustomerScopedRoles:
+    """The premise the split below exists for, asserted rather than assumed.
+
+    If a future seed change genuinely takes ``routers.*`` away from every
+    organization-scoped role, these fail and whoever is reading can decide
+    the split is no longer load-bearing -- rather than the split quietly
+    outliving its reason.
+    """
+
+    @staticmethod
+    def _grants(slug: str):
+        from app.domains.rbac.enums import PermissionModule
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        role = next(r for r in SYSTEM_ROLES if r.slug == slug)
+        return role, role.grants().get(PermissionModule.ROUTERS, ())
+
+    def test_organization_owner_holds_routers_read_and_update(self) -> None:
+        from app.domains.rbac.enums import PermissionAction, ScopeType
+
+        role, actions = self._grants("organization-owner")
+        assert role.scope_type == ScopeType.ORGANIZATION
+        assert PermissionAction.READ in actions
+        assert PermissionAction.UPDATE in actions
+        assert PermissionAction.CREATE in actions
+
+    def test_other_customer_scoped_roles_hold_them_too(self) -> None:
+        from app.domains.rbac.enums import PermissionAction, ScopeType
+
+        for slug in ("organization-admin", "msp-owner", "msp-admin"):
+            role, actions = self._grants(slug)
+            assert role.scope_type == ScopeType.ORGANIZATION, slug
+            assert PermissionAction.UPDATE in actions, slug
+
+    def test_an_organization_scoped_grant_can_never_satisfy_a_global_check(
+        self,
+    ) -> None:
+        """The one property the whole fix rests on: pointing the sensitive
+        fields at a ``ScopeType.GLOBAL`` route really does exclude an
+        organization-scoped role, whatever ``X-Organization-Id`` it sends."""
+        from app.domains.rbac.authorization import ScopeResolver
+        from app.domains.rbac.context import GrantScope, ScopeContext
+        from app.domains.rbac.enums import ScopeType
+
+        org_id = uuid.uuid4()
+        grant = GrantScope(scope_type=ScopeType.ORGANIZATION, organization_id=org_id)
+        assert (
+            ScopeResolver.satisfies(
+                grant, ScopeType.GLOBAL, ScopeContext(organization_id=org_id)
+            )
+            is False
+        )
+        # ...while still satisfying the organization-scoped liveness read
+        # the customer dashboard legitimately needs.
+        assert (
+            ScopeResolver.satisfies(
+                grant, ScopeType.LOCATION, ScopeContext(organization_id=org_id)
+            )
+            is True
+        )
+
+
+class TestCustomerReachableRouterSchemasCarryNoCredentials:
+    def test_router_response_has_no_credential_or_snmp_config_field(self) -> None:
+        from app.domains.router.schemas import (
+            CUSTOMER_FORBIDDEN_ROUTER_FIELDS,
+            RouterResponse,
+        )
+
+        leaked = set(RouterResponse.model_fields) & CUSTOMER_FORBIDDEN_ROUTER_FIELDS
+        assert leaked == set(), (
+            f"RouterResponse is returned by organization-scoped routes that a "
+            f"venue owner reaches; it must not carry {sorted(leaked)}. Put the "
+            f"field on RouterPlatformResponse instead."
+        )
+
+    def test_create_and_update_requests_cannot_set_a_secret(self) -> None:
+        from app.domains.router.schemas import (
+            CUSTOMER_FORBIDDEN_ROUTER_FIELDS,
+            RouterCreateRequest,
+            RouterUpdateRequest,
+        )
+
+        for schema in (RouterCreateRequest, RouterUpdateRequest):
+            leaked = set(schema.model_fields) & CUSTOMER_FORBIDDEN_ROUTER_FIELDS
+            assert leaked == set(), (
+                f"{schema.__name__} is accepted by an organization-scoped "
+                f"route; it must not accept {sorted(leaked)}."
+            )
+
+    def test_a_customer_write_carrying_a_secret_never_reaches_the_service(
+        self,
+    ) -> None:
+        """The end the service actually sees. ``update_router`` takes a plain
+        dict, so what matters is that the route's ``model_dump`` of a hostile
+        payload contains no credential key at all -- not merely that the
+        field is undeclared."""
+        from app.domains.router.schemas import (
+            CUSTOMER_FORBIDDEN_ROUTER_FIELDS,
+            RouterCreateRequest,
+            RouterUpdateRequest,
+        )
+
+        hostile = {
+            "api_username": "attacker",
+            "api_secret": "pwned",
+            "snmp_enabled": True,
+            "snmp_community": "public",
+            "snmp_version": "2c",
+            "snmp_port": 1610,
+        }
+        update = RouterUpdateRequest.model_validate({"name": "Front Desk", **hostile})
+        assert set(update.model_dump(exclude_unset=True)) == {"name"}
+
+        create = RouterCreateRequest.model_validate(
+            {
+                "name": "Front Desk",
+                "serial_number": "HB31090ABCD",
+                "mac_address": "AA:BB:CC:DD:EE:FF",
+                "model": "hAP ac2",
+                **hostile,
+            }
+        )
+        assert not set(create.model_dump()) & CUSTOMER_FORBIDDEN_ROUTER_FIELDS
+
+    def test_the_platform_response_still_carries_them(self) -> None:
+        """The Master console must not lose the fields -- only the audience
+        changes."""
+        from app.domains.router.schemas import RouterPlatformResponse
+
+        assert {
+            "snmp_enabled",
+            "has_snmp_community",
+            "snmp_version",
+            "snmp_port",
+        } <= set(RouterPlatformResponse.model_fields)
+
+    def test_the_platform_write_schema_still_carries_them(self) -> None:
+        from app.domains.router.schemas import RouterManagementAccessRequest
+
+        assert {
+            "api_username",
+            "api_secret",
+            "snmp_enabled",
+            "snmp_community",
+            "snmp_version",
+            "snmp_port",
+        } == set(RouterManagementAccessRequest.model_fields)
+
+    def test_the_platform_response_never_echoes_a_plaintext_secret(self) -> None:
+        from app.domains.router.schemas import RouterPlatformResponse
+
+        assert not {
+            "api_secret",
+            "snmp_community",
+            "api_credentials_encrypted",
+            "snmp_community_encrypted",
+        } & set(RouterPlatformResponse.model_fields)
+
+
+class TestPlatformRouterRoutesAreGlobalScopeOnly:
+    """Asserts the route dependencies directly, the same convention
+    ``test_wireguard.py``'s ``TestFleetStatusRouteRequiresPermission`` and
+    ``test_user.py``'s impersonate tests already establish."""
+
+    @staticmethod
+    def _route(path: str, method: str):
+        from app.domains.router.router import router as router_module
+
+        return next(
+            route
+            for route in router_module.routes
+            if route.path == path and method in route.methods  # type: ignore[attr-defined]
+        )
+
+    @staticmethod
+    def _dependency_nonlocals(route):
+        import inspect
+
+        return [
+            inspect.getclosurevars(dependency.dependency).nonlocals
+            for dependency in route.dependencies
+        ]
+
+    def test_platform_read_route_is_routers_read_at_global_scope(self) -> None:
+        from app.domains.rbac.enums import ScopeType
+
+        (nonlocals,) = self._dependency_nonlocals(
+            self._route("/platform/routers/{router_id}", "GET")
+        )
+        assert nonlocals["permission_key"] == "routers.read"
+        assert nonlocals["scope"] == ScopeType.GLOBAL
+
+    def test_management_access_route_is_routers_update_at_global_scope(self) -> None:
+        from app.domains.rbac.enums import ScopeType
+
+        (nonlocals,) = self._dependency_nonlocals(
+            self._route(
+                "/platform/routers/{router_id}/management-access",
+                "PUT",
+            )
+        )
+        assert nonlocals["permission_key"] == "routers.update"
+        assert nonlocals["scope"] == ScopeType.GLOBAL
+
+    def test_the_organization_scoped_routes_serialize_the_customer_safe_shape(
+        self,
+    ) -> None:
+        """The other half: the routes a venue owner reaches must be declared
+        with ``RouterResponse``/``RouterListResponse``, never the platform
+        one. A future edit that swaps the response_model back fails here."""
+        from app.domains.router.schemas import (
+            RouterListResponse,
+            RouterPlatformResponse,
+            RouterResponse,
+        )
+
+        for path, method, expected in (
+            ("/locations/{location_id}/routers", "GET", RouterListResponse),
+            ("/locations/{location_id}/routers", "POST", RouterResponse),
+            ("/routers/{router_id}", "GET", RouterResponse),
+            ("/routers/{router_id}", "PUT", RouterResponse),
+        ):
+            route = self._route(path, method)
+            (inner,) = route.response_model.__pydantic_generic_metadata__["args"]
+            assert inner is expected, (method, path)
+            assert inner is not RouterPlatformResponse
+
+    def test_the_organization_scoped_routes_are_not_global_scoped(self) -> None:
+        """Guards the other direction: these four must stay reachable by the
+        customer dashboard's liveness read and the venue's own network pages.
+        Tightening them to GLOBAL would break both."""
+        from app.domains.rbac.enums import ScopeType
+
+        for path, method in (
+            ("/locations/{location_id}/routers", "GET"),
+            ("/locations/{location_id}/routers", "POST"),
+            ("/routers/{router_id}", "GET"),
+            ("/routers/{router_id}", "PUT"),
+        ):
+            for nonlocals in self._dependency_nonlocals(self._route(path, method)):
+                assert nonlocals["scope"] != ScopeType.GLOBAL, (method, path)
+
+
+class TestLivenessFieldsSurviveOnTheCustomerShape:
+    """``src/lib/location-liveness.ts`` and ``customer.service.ts`` read
+    exactly ``id``/``name``/``status``/``last_seen_at`` off
+    ``GET /locations/{id}/routers``; ``src/services/router.service.ts``'s
+    ``toRouter()`` (which the venue's own DHCP/DNS/VLAN/QoS/hotspot/ISP
+    pages reach through ``listForLocation``) reads the rest. Removing any of
+    them would break the customer dashboard, so they are pinned here."""
+
+    def test_customer_consumed_fields_are_present(self) -> None:
+        from app.domains.router.schemas import RouterResponse
+
+        assert {
+            "id",
+            "location_id",
+            "organization_id",
+            "name",
+            "serial_number",
+            "mac_address",
+            "model",
+            "vendor",
+            "routeros_version",
+            "management_ip_address",
+            "public_ip_address",
+            "status",
+            "last_seen_at",
+            "last_health_check_at",
+            "health_status",
+            "has_api_credentials",
+            "settings",
+            "created_at",
+            "updated_at",
+        } <= set(RouterResponse.model_fields)
+# api_secret/api_username: RouterOS script injection hardening
+#
+# GatewayDeviceCredentialRotator.rotate_password interpolates these values
+# into a RouterOS console script (`/user set [find name="{username}"]
+# password="{new_password}"`) executed over SSH. Two independent layers
+# guard against a malicious value breaking out of that script:
+#   1. A strict charset allowlist at the schema layer
+#      (RouterManagementAccessRequest, the master-console route that
+#      sets these) -- tested below.
+#   2. Proper `"`/`\`/`$` escaping in device_credential_rotator itself,
+#      regardless of what the schema layer permits -- tested further below.
+# ============================================================================
+
+
+class TestApiCredentialCharsetValidation:
+    """The allowlist lives on ``RouterManagementAccessRequest``, the
+    master-console route that actually sets these credentials.
+
+    It was written against ``RouterCreateRequest``/``RouterUpdateRequest``,
+    which carried ``api_secret`` at the time. #91 has since removed
+    credentials and SNMP config from both of those customer-reachable
+    schemas -- see ``TestCustomerReachableRouterSchemasCarryNoCredentials``
+    above, which asserts exactly that. Re-pointing these here keeps the
+    hardening on the one schema where the field still exists; asserting it
+    on the customer schemas would only re-prove that the field is absent.
+    """
+
+    def test_rejects_double_quote_in_api_secret(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(
+                api_secret='p"; :put [/system identity print]; #',
+            )
+
+    def test_rejects_semicolon_in_api_secret(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_secret="password;reboot")
+
+    def test_rejects_bad_charset_in_api_username(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_username='admin"]')
+
+    def test_rejects_backslash_and_dollar(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_secret="pa\\ssword")
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_secret="$RandomVar")
+
+    def test_accepts_generated_url_safe_secret(self) -> None:
+        # secrets.token_urlsafe()'s alphabet (A-Za-z0-9-_) is exactly the
+        # shape RouterService actually generates -- must keep working.
+        request = RouterManagementAccessRequest(
+            api_secret="AbC123-_xyZ", api_username="cloudguest-api"
+        )
+        assert request.api_secret == "AbC123-_xyZ"
+
+    def test_accepts_none(self) -> None:
+        # Unset stays unset -- the validator must not choke on the common
+        # "not touching this field" case.
+        request = RouterManagementAccessRequest(api_secret=None)
+        assert request.api_secret is None
+
+
+class TestRouterOsScriptEscaping:
+    """``GatewayDeviceCredentialRotator.rotate_password`` builds a RouterOS
+    console script by interpolating ``username``/``new_password`` into
+    double-quoted string literals. These tests prove a value containing
+    ``"`` and ``;`` cannot break out of the intended single command, i.e.
+    that the escaping layer holds even if it were ever reached with a
+    value the schema-level charset allowlist should have already
+    rejected (defense in depth)."""
+
+    @staticmethod
+    def _parse_quoted_routeros_string(script: str, *, after: str) -> tuple[str, str]:
+        """Finds ``after`` (e.g. ``password="``) in ``script``, then walks
+        forward RouterOS-escaping-aware (``\\\\`` and ``\\"`` are literal
+        escapes) to find the *true* closing ``"``. Returns
+        ``(recovered_value, remainder_after_closing_quote)`` -- a naive
+        "find the next literal double-quote" parse would be fooled by an
+        improperly-escaped value exactly the way this test guards
+        against."""
+        start = script.index(after) + len(after)
+        i = start
+        recovered: list[str] = []
+        while i < len(script):
+            ch = script[i]
+            if ch == "\\" and i + 1 < len(script):
+                recovered.append(script[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                return "".join(recovered), script[i + 1 :]
+            recovered.append(ch)
+            i += 1
+        raise AssertionError("unterminated RouterOS string literal in script")
+
+    async def test_double_quote_and_semicolon_cannot_break_out_of_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.router import device_credential_rotator as rotator_module
+        from app.domains.router.device_adapters import RawCommandResult
+
+        malicious_password = 'x"; /user remove [find]; :put "pwned'
+        captured: dict[str, object] = {}
+
+        async def fake_execute_live_command(
+            *, host: str, username: str, password: str, command: str
+        ):
+            captured["host"] = host
+            captured["username"] = username
+            captured["password"] = password
+            captured["command"] = command
+            return RawCommandResult(
+                command=command, stdout="", stderr="", exit_status=0
+            )
+
+        monkeypatch.setattr(
+            rotator_module, "execute_live_command", fake_execute_live_command
+        )
+        rotator = rotator_module.GatewayDeviceCredentialRotator()
+        await rotator.rotate_password(
+            host="10.0.0.1",
+            username="cloudguest-api",
+            old_password="old-secret",
+            new_password=malicious_password,
+        )
+
+        script = captured["command"]
+        assert isinstance(script, str)
+        # Exactly one RouterOS statement -- a real semicolon-separated
+        # second command would show up as more than one top-level `/`
+        # command in the script.
+        assert script.count("/user set") == 1
+
+        recovered_password, remainder = self._parse_quoted_routeros_string(
+            script, after='password="'
+        )
+        assert recovered_password == malicious_password
+        # Nothing but the trailing newline may follow the closing quote --
+        # if the malicious `"` had closed the literal early, `remainder`
+        # would instead start with `; /user remove [find]; :put "pwned"`.
+        assert remainder.strip() == ""
+
+    async def test_double_quote_in_username_cannot_break_out_of_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.router import device_credential_rotator as rotator_module
+        from app.domains.router.device_adapters import RawCommandResult
+
+        malicious_username = 'admin"] ; /user remove [find'
+        captured: dict[str, object] = {}
+
+        async def fake_execute_live_command(
+            *, host: str, username: str, password: str, command: str
+        ):
+            captured["command"] = command
+            return RawCommandResult(
+                command=command, stdout="", stderr="", exit_status=0
+            )
+
+        monkeypatch.setattr(
+            rotator_module, "execute_live_command", fake_execute_live_command
+        )
+        rotator = rotator_module.GatewayDeviceCredentialRotator()
+        await rotator.rotate_password(
+            host="10.0.0.1",
+            username=malicious_username,
+            old_password="old-secret",
+            new_password="NewSecret123",
+        )
+
+        script = captured["command"]
+        assert isinstance(script, str)
+        assert script.count("/user set") == 1
+        recovered_username, _ = self._parse_quoted_routeros_string(
+            script, after='find name="'
+        )
+        assert recovered_username == malicious_username
+
+    def test_escape_helper_handles_backslash_quote_and_dollar(self) -> None:
+        from app.domains.router.device_credential_rotator import (
+            _escape_routeros_string,
+        )
+
+        assert _escape_routeros_string('a"b') == 'a\\"b'
+        assert _escape_routeros_string("a\\b") == "a\\\\b"
+        assert _escape_routeros_string("$var") == "\\$var"
+        assert _escape_routeros_string('mix\\ed"$val;ue') == 'mix\\\\ed\\"\\$val;ue'
+
+
+# ============================================================================
+# management_ip_address/public_ip_address: format validation
+#
+# These values are later used as a literal `host` in an outbound request
+# (router.py's WebFig proxy: `f"http://{host}/{path}"`), so an unvalidated
+# value is a request-forgery-shaped risk, not just a data-quality one.
+# ============================================================================
+
+
+class TestHostAddressValidation:
+    def test_create_request_rejects_garbage_management_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterCreateRequest(
+                **_create_kwargs(), management_ip_address="not an ip; rm -rf /"
+            )
+
+    def test_create_request_rejects_url_shaped_public_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterCreateRequest(
+                **_create_kwargs(),
+                public_ip_address="10.0.0.1:8080@evil.example.com",
+            )
+
+    def test_create_request_accepts_valid_ipv4(self) -> None:
+        request = RouterCreateRequest(
+            **_create_kwargs(), management_ip_address="10.0.0.1"
+        )
+        assert request.management_ip_address == "10.0.0.1"
+
+    def test_create_request_accepts_valid_ipv6(self) -> None:
+        request = RouterCreateRequest(
+            **_create_kwargs(), public_ip_address="2001:db8::1"
+        )
+        assert request.public_ip_address == "2001:db8::1"
+
+    def test_create_request_accepts_valid_hostname(self) -> None:
+        request = RouterCreateRequest(
+            **_create_kwargs(), management_ip_address="router-01.local"
+        )
+        assert request.management_ip_address == "router-01.local"
+
+    def test_update_request_rejects_garbage_management_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterUpdateRequest(management_ip_address="../../etc/passwd")
+
+    def test_update_request_accepts_none(self) -> None:
+        request = RouterUpdateRequest(
+            management_ip_address=None, public_ip_address=None
+        )
+        assert request.management_ip_address is None
+        assert request.public_ip_address is None
+
+    def test_heartbeat_request_rejects_garbage_management_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            HeartbeatRequest(management_ip_address="not-valid!!")
+
+    def test_heartbeat_request_accepts_valid_ipv4(self) -> None:
+        request = HeartbeatRequest(management_ip_address="192.168.1.1")
+        assert request.management_ip_address == "192.168.1.1"
+
+
+class TestSweepRouterReachability:
+    """The FAST outage path, and the guards that keep a two-minute
+    threshold from crying wolf.
+
+    Context these tests are written against, from production on
+    2026-09-07: a real router at a real venue went down twice inside 35
+    minutes (03:50-04:12 and again from 04:16). Five minutes into the first
+    outage the dashboard still said ``online``, because ``Router.status``
+    only moves at the shared 15-minute
+    ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES``. Nobody was emailed at all.
+    Meanwhile the ``/agent/authorized-macs`` poll -- every 60 seconds --
+    had stopped within a minute of the site going away, both times. This
+    sweep reads that signal.
+    """
+
+    async def _router(
+        self,
+        service,
+        location_lookup,
+        org_lookup,
+        repo,
+        *,
+        agent_contact,
+        status: str = RouterStatus.ONLINE.value,
+        reachability_state: str | None = None,
+        misses: int = 0,
+        hits: int = 0,
+    ) -> Router:
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        router = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(
+                serial_number=f"SN-{uuid.uuid4()}",
+                mac_address=_unique_mac(),
+            ),
+        )
+        router.status = status
+        router.reachability_state = reachability_state
+        router.reachability_consecutive_misses = misses
+        router.reachability_consecutive_hits = hits
+        if agent_contact is not None:
+            repo.agent_contact[router.id] = agent_contact
+        return router
+
+    @staticmethod
+    def _awake(now: datetime) -> datetime:
+        """A ``previous_sweep_at`` that satisfies the awake-window guard --
+        i.e. the platform was demonstrably running one interval ago."""
+        return now - timedelta(seconds=ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS)
+
+    async def test_a_silent_router_is_declared_unreachable_within_two_minutes(
+        self,
+    ) -> None:
+        """THE HEADLINE REQUIREMENT, expressed as a clock.
+
+        Two consecutive misses at a 30-second cadence, against a 90-second
+        silence window, puts the UNREACHABLE verdict on the board no later
+        than ~120s after the site went quiet. The alert evaluation sweep
+        (also 30s) then has it as an ``Alert`` and an email inside the
+        founder's two minutes.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=100)
+        )
+
+        first = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+        assert first["marked_unreachable"] == 0, "one miss must not be enough"
+        assert repo.routers[router.id].reachability_state is None
+
+        later = now + timedelta(seconds=ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS)
+        second = await service.sweep_router_reachability(
+            now=later, previous_sweep_at=self._awake(later)
+        )
+
+        assert second["marked_unreachable"] == 1
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_single_missed_poll_never_alerts(self) -> None:
+        """A dropped packet, a 502 during a release, a worker running a
+        second late -- one miss is noise, and the debounce exists so noise
+        does not reach a venue owner's inbox."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=100)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["silent"] == 1
+        assert result["marked_unreachable"] == 0
+        assert repo.routers[router.id].reachability_consecutive_misses == 1
+
+    async def test_a_router_still_polling_us_is_reachable(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=20)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["silent"] == 0
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.REACHABLE.value
+        )
+
+    async def test_our_own_downtime_does_not_declare_the_fleet_unreachable(
+        self,
+    ) -> None:
+        """THE DEPLOY GUARD.
+
+        On 2026-09-07 the api container restarted at 03:49:19. Any sweep
+        that reasoned across that gap would have seen every router in the
+        fleet as silent -- because nothing was listening -- and paged every
+        venue we have. Absence may only be judged over a window we can
+        prove we were awake for.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(minutes=10)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=now - timedelta(minutes=9)
+        )
+
+        assert result["skipped_platform_gap"] == 1
+        assert result["marked_unreachable"] == 0
+        assert repo.routers[router.id].reachability_state is None
+        assert repo.routers[router.id].reachability_consecutive_misses == 0, (
+            "a window we slept through must not even count as a miss"
+        )
+
+    async def test_a_first_ever_run_judges_nobody(self) -> None:
+        """No recorded previous sweep means a cold worker. Failing safe
+        costs one 30-second cycle; failing open costs an email to every
+        venue on the platform."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(minutes=10)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=None
+        )
+
+        assert result["skipped_platform_gap"] == 1
+        assert result["marked_unreachable"] == 0
+
+    async def test_most_of_the_fleet_going_quiet_at_once_is_read_as_our_fault(
+        self,
+    ) -> None:
+        """Four venues do not lose power in the same 30-second window. Our
+        broker, our hub, or our network does."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        for _ in range(4):
+            await self._router(
+                service, loc, org, repo, agent_contact=now - timedelta(seconds=200)
+            )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["silent"] == 4
+        assert result["skipped_fleet_outage"] == 4
+        assert result["marked_unreachable"] == 0
+
+    async def test_the_fleet_guard_does_not_silence_a_small_deployment(self) -> None:
+        """With two routers deployed, "half the fleet is silent" is just
+        "one real venue is down" -- which is precisely the alert this
+        feature exists to send. The guard must not swallow it."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        down = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+        await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=10)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["skipped_fleet_outage"] == 0
+        assert result["marked_unreachable"] == 1
+        assert (
+            repo.routers[down.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_live_tunnel_withholds_the_alert(self) -> None:
+        """Silent to us but the tunnel is still handshaking = our agent
+        script is broken, not their power. Alerting here would send a venue
+        owner to check a plug that is already in the wall."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        async def probe(routers):
+            return {r.id: True for r in routers}
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["tunnel_alive_despite_silence"] == 1
+        assert result["marked_unreachable"] == 0
+        assert repo.routers[router.id].reachability_state != (
+            RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_dead_tunnel_confirms_the_alert(self) -> None:
+        """Both signals agree. This is the 2026-09-07 shape exactly: agent
+        polls stopped, and port 8728 went from 24ms to an 8-second
+        timeout."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        async def probe(routers):
+            return {r.id: False for r in routers}
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["marked_unreachable"] == 1
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_probe_that_raises_never_blocks_the_alert(self) -> None:
+        """The confirmation is allowed to withhold an alert, never to
+        prevent one by failing. A hub bridge that is down must degrade to
+        absence-alone, which is the no-probe behaviour."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        async def probe(routers):
+            raise RuntimeError("hub bridge unreachable")
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["marked_unreachable"] == 1
+
+    async def test_a_flapping_router_does_not_resolve_on_first_contact(self) -> None:
+        """THE FLAP GUARD, against the real night.
+
+        The router came back at 04:12 and went down again at 04:16.
+        Resolving on the first successful poll would have emailed "it's
+        back" at 04:13 and "it's down" again at 04:18 -- four emails for
+        one bad night. The alert must stay open until the site has held on.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=5),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["marked_reachable"] == 0
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        ), "still unreachable, so the open alert stays open and sends nothing"
+        assert repo.routers[router.id].reachability_consecutive_hits == 1
+
+    async def test_a_router_that_stays_up_eventually_resolves(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=5),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+            hits=ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1,
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["marked_reachable"] == 1
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.REACHABLE.value
+        )
+
+    async def test_going_down_again_resets_the_recovery_counter(self) -> None:
+        """The half of the flap guard that makes it a guard rather than a
+        delay: partial recovery earns no credit toward being called back."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+            hits=ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1,
+        )
+
+        await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert repo.routers[router.id].reachability_consecutive_hits == 0
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_router_with_no_usable_agent_credential_is_never_judged(
+        self,
+    ) -> None:
+        """An expired or revoked credential makes ``CurrentAgent`` raise
+        before it stamps anything, so such a router looks permanently
+        silent. Alerting on it would blame a venue's power for our own
+        credential lifecycle -- and it would never stop."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(service, loc, org, repo, agent_contact=None)
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["considered"] == 0
+        assert repo.routers[router.id].reachability_state is None
+
+    async def test_administrative_states_are_never_judged(self) -> None:
+        """A venue we suspended or decommissioned on purpose must not email
+        anybody at 3am about being off. Same reasoning
+        ``stale_heartbeat_statement`` gives for leaving PROVISIONING
+        alone."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        for status in (
+            RouterStatus.SUSPENDED.value,
+            RouterStatus.DECOMMISSIONED.value,
+            RouterStatus.PENDING_PROVISIONING.value,
+        ):
+            await self._router(
+                service,
+                loc,
+                org,
+                repo,
+                agent_contact=now - timedelta(hours=5),
+                status=status,
+            )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["considered"] == 0
+
+    async def test_one_router_failing_never_aborts_the_sweep(self) -> None:
+        """The same per-router isolation contract
+        ``sweep_stale_heartbeats`` documents, in the sweep that now sits on
+        the critical path for every outage email."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        broken = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+        healthy = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        original_update = repo.update_router
+
+        async def exploding_update(router, data):
+            if router.id == broken.id:
+                raise RuntimeError("row is wedged")
+            return await original_update(router, data)
+
+        repo.update_router = exploding_update
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["failed"] == 1
+        assert result["marked_unreachable"] == 1
+        assert (
+            repo.routers[healthy.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_the_shared_offline_definition_is_left_completely_alone(
+        self,
+    ) -> None:
+        """THE CONSTRAINT THAT SHAPED THIS WHOLE DESIGN.
+
+        ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` is read by
+        ``compute_lifecycle_stage``, ``compute_internet_availability`` and
+        the frontend's ``location-liveness`` module, and
+        ``sweep_stale_heartbeats``'s docstring says a second, slightly
+        different definition of "offline" is how two screens start
+        disagreeing about one router. So the fast path had to be a new
+        column with a new name, not a faster threshold on the old one --
+        and this test fails the moment somebody "simplifies" it back.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=200)
+        )
+        router.last_seen_at = now - timedelta(seconds=200)
+        router.health_status = RouterHealthStatus.HEALTHY.value
+
+        for tick in range(ROUTER_REACHABILITY_MISSES_TO_ALERT):
+            moment = now + timedelta(
+                seconds=ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS * tick
+            )
+            await service.sweep_router_reachability(
+                now=moment, previous_sweep_at=self._awake(moment)
+            )
+
+        stored = repo.routers[router.id]
+        assert (
+            stored.reachability_state == RouterReachabilityState.UNREACHABLE.value
+        ), "the fast verdict is in"
+        assert stored.status == RouterStatus.ONLINE.value, (
+            "but Router.status is untouched -- it belongs to the 15-minute sweep"
+        )
+        assert stored.health_status == RouterHealthStatus.HEALTHY.value
+        assert stored.last_seen_at == now - timedelta(seconds=200)
+
+    async def test_a_live_tunnel_also_never_resolves_an_open_outage(self) -> None:
+        """The other direction of the same abstention.
+
+        A router already declared UNREACHABLE, still not talking to us, but
+        whose tunnel has come back must not accumulate recovery credit.
+        Letting it would eventually mail "back online and has stayed up"
+        about a site we have not heard a word from -- a sentence we would
+        have no evidence for.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+            hits=ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1,
+        )
+
+        async def probe(routers):
+            return {r.id: True for r in routers}
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["tunnel_alive_despite_silence"] == 1
+        assert result["marked_reachable"] == 0
+        stored = repo.routers[router.id]
+        assert stored.reachability_state == RouterReachabilityState.UNREACHABLE.value
+        assert stored.reachability_consecutive_hits == (
+            ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1
+        ), "untouched -- we abstained, we did not vote"
+
+
+class TestReachabilitySweepIsActuallyScheduled:
+    """A sweep that is registered but absent from ``beat_schedule``, or
+    scheduled under a task name nothing registered, never runs -- and it
+    fails exactly as silently as a fleet that is entirely healthy.
+
+    That is not hypothetical here. The whole reason this feature was needed
+    is that ``AlertService.evaluate_alert_rules`` sat fully built and
+    dormant for a long time, and that ``sweep_stale_heartbeats`` -- the only
+    writer of ONLINE -> OFFLINE -- did not exist at all while every screen
+    happily reported ``online``. Both halves are asserted, and that they
+    name the same task.
+    """
+
+    def test_the_sweep_is_registered_and_scheduled_under_the_same_name(self) -> None:
+        import app.domains.router.tasks  # noqa: F401 -- registers the task
+        from app.core.celery_app import celery_app
+        from app.domains.router.constants import (
+            TASK_RUN_ROUTER_REACHABILITY_SWEEP,
+        )
+
+        entry = celery_app.conf.beat_schedule.get("router-reachability-sweep")
+        assert entry is not None, "the fast outage path has no Beat entry"
+        assert entry["task"] == TASK_RUN_ROUTER_REACHABILITY_SWEEP
+        assert entry["schedule"] == ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS
+        assert TASK_RUN_ROUTER_REACHABILITY_SWEEP in celery_app.tasks, (
+            "scheduled under a task name nothing registered"
+        )
+
+    def test_the_two_minute_budget_still_adds_up(self) -> None:
+        """The founder's number, as arithmetic rather than as a comment.
+
+        Detection is (misses required) x (sweep interval), plus up to one
+        more interval of silence before the first miss is even observed;
+        the alert evaluation sweep then adds its own interval before the
+        email goes out. If somebody widens any of these three constants,
+        this fails rather than quietly turning two minutes into six.
+        """
+        from app.domains.monitoring.constants import (
+            ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
+        )
+
+        worst_case_seconds = (
+            ROUTER_REACHABILITY_SILENCE_SECONDS
+            + ROUTER_REACHABILITY_MISSES_TO_ALERT
+            * ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS
+            + ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS
+        )
+        assert worst_case_seconds <= 180, (
+            f"detection-to-email worst case is now {worst_case_seconds}s; the "
+            "founder asked for two minutes and this budget no longer fits it"
+        )
+
+    def test_the_recovery_window_is_long_enough_to_absorb_a_flap(self) -> None:
+        """The 2026-09-07 router was back for four minutes before it went
+        down again. The recovery window has to be comfortably longer than
+        that, or the flap guard is decorative."""
+        recovery_seconds = (
+            ROUTER_REACHABILITY_HITS_TO_RESOLVE
+            * ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS
+        )
+        assert recovery_seconds >= 300, (
+            f"recovery needs only {recovery_seconds}s of uptime; the real "
+            "outage came back for ~4 minutes before dropping again"
+        )

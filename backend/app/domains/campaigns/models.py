@@ -184,14 +184,24 @@ class CampaignResponse(BaseModel):
 
 
 class CampaignAsset(BaseModel):
-    """The visual/redirect content for a ``BANNER``/``REDIRECT``
-    campaign. ``image_url``/``click_url`` are both nullable since the
-    two campaign types share this one table (see
-    ``constants.CampaignType``'s own module docstring): a ``BANNER``
-    typically sets both; a pure ``REDIRECT`` sets only ``click_url``.
-    Validated at the service layer that at least one of the two is set
-    (``validators.validate_asset_urls``) -- a row with neither would be
-    inert."""
+    """The visual/redirect/promo content for a ``BANNER``/``REDIRECT``
+    campaign. Every content column is nullable since the two campaign
+    types share this one table (see ``constants.CampaignType``'s own
+    module docstring) and a banner may be authored either as a picture
+    or as text-and-coupon copy: a ``BANNER`` typically sets an image
+    *or* a ``headline``/``coupon_code`` (or both); a pure ``REDIRECT``
+    sets only ``click_url``. Validated at the service layer that the row
+    carries at least one renderable thing -- an ``image_url``,
+    ``click_url``, ``headline`` or ``coupon_code``
+    (``validators.validate_asset_urls``) -- a row with none of those
+    would be inert.
+
+    ``headline``/``subtext``/``coupon_code``/``coupon_expires_at`` back
+    the product's own "Banner & Discounts" campaign type: a rendered
+    promo banner with a redeemable coupon (e.g. "Flat 20% off this
+    weekend" / "Show this coupon at checkout" / ``SAVE20`` / valid until
+    a date), shown to a guest by the frontend ``CampaignOverlay`` as a
+    real copyable coupon card rather than only a tappable image."""
 
     __tablename__ = "campaign_assets"
 
@@ -204,6 +214,18 @@ class CampaignAsset(BaseModel):
     click_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     alt_text: Mapped[str | None] = mapped_column(String(300), nullable=True)
     locale: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # -- Banner & Discounts promo copy (see class docstring) -----------------
+    # All nullable: an image/redirect banner uses none of these, and a
+    # text/coupon banner may set only the ones it needs. `coupon_expires_at`
+    # is an optional display validity the frontend renders as "Valid until
+    # ..." -- distinct from the Campaign's own starts_at/ends_at scheduling
+    # window (which governs whether the campaign is served at all).
+    headline: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    subtext: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    coupon_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    coupon_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (Index("ix_campaign_assets_campaign_id", "campaign_id"),)
 

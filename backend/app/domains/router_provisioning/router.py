@@ -259,6 +259,14 @@ def _health_snapshot_response(
         memory_usage_percent=snapshot.memory_usage_percent,
         uptime_seconds=snapshot.uptime_seconds,
         connected_clients_count=snapshot.connected_clients_count,
+        metrics_source=snapshot.metrics_source,
+        # Passed through as-is: pydantic validates each dict into a
+        # RouterInterfaceTrafficCounter. The sweep is the only writer and
+        # SnmpPoller.get_interface_counters already guarantees every entry
+        # has a non-empty if_name and an int-parsable if_index (it skips
+        # the ones that don't), so there is no partially-shaped row to
+        # defend against here -- and None stays None, never [].
+        interface_traffic_counters=snapshot.interface_traffic_counters,
     )
 
 
@@ -380,10 +388,14 @@ async def list_variables(
     scope_type: ConfigVariableScope | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RouterProvisioningService = Depends(get_router_provisioning_service),
 ):
     variables, meta = await service.list_variables(
-        scope_type=scope_type, page=page, page_size=page_size
+        scope_type=scope_type,
+        requesting_organization_id=requesting_organization_id,
+        page=page,
+        page_size=page_size,
     )
     payload = ConfigVariableListResponse(
         items=[_variable_response(v) for v in variables], **_pagination_fields(meta)
@@ -535,11 +547,13 @@ async def update_variable(
     variable_id: uuid.UUID,
     payload: ConfigVariableUpdateRequest,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RouterProvisioningService = Depends(get_router_provisioning_service),
 ):
     updated = await service.update_variable(
         actor_user_id=uuid.UUID(user.id),
         variable_id=variable_id,
+        requesting_organization_id=requesting_organization_id,
         value=payload.value,
         is_secret=payload.is_secret,
     )
@@ -561,10 +575,13 @@ async def delete_variable(
     request: Request,
     variable_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RouterProvisioningService = Depends(get_router_provisioning_service),
 ):
     await service.delete_variable(
-        actor_user_id=uuid.UUID(user.id), variable_id=variable_id
+        actor_user_id=uuid.UUID(user.id),
+        variable_id=variable_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -847,8 +864,6 @@ async def approve_enrollment(
         name=payload.name,
         management_ip_address=payload.management_ip_address,
         public_ip_address=payload.public_ip_address,
-        api_username=payload.api_username,
-        api_secret=payload.api_secret,
     )
     result = RouterEnrollmentApproveResponse(
         enrollment=_enrollment_response(enrollment), router_id=str(router_device.id)

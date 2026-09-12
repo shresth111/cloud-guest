@@ -1,8 +1,30 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, PostgresDsn, RedisDsn
+from email_validator import EmailNotValidError, validate_email
+from pydantic import Field, PostgresDsn, RedisDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The default for every Fernet key below. It is base64 of the ASCII string
+# "insecure-local-dev-fernet-key32!", committed to a public repository, so it
+# is not a secret: anything encrypted under it outside a developer machine
+# is readable by anyone holding the ciphertext.
+INSECURE_LOCAL_DEV_FERNET_KEY = "aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE="
+
+# The only `environment` values in which the committed secret defaults are
+# expected. Everything else -- production sets "production" -- is treated as
+# a real deployment. An allowlist rather than a denylist, so a typo'd or new
+# environment name errs towards "real".
+LOCAL_ENVIRONMENTS = frozenset({"local", "test"})
+
+# Settings fields whose committed default is public. Compared against each
+# field's own declared default, so this list never has to repeat a value.
+PUBLIC_DEFAULT_SECRET_FIELDS = (
+    "jwt_secret_key",
+    "router_encryption_key",
+    "network_integration_encryption_key",
+    "mfa_encryption_key",
+)
 
 
 class Settings(BaseSettings):
@@ -24,6 +46,24 @@ class Settings(BaseSettings):
             "https://www.wyfyguest.com",
             "https://app.wyfyguest.com",
             "https://portal.wyfyguest.com",
+            # The name the captive portal is actually reached by -- see
+            # `network_config.renderers.HOTSPOT_DNS_NAME`. Today the portal
+            # calls the API same-origin (nginx proxies /api/ from the same
+            # server block), so CORS is not on that path at all; this entry
+            # is here so it stays working if that ever stops being true,
+            # not because anything currently depends on it.
+            "https://wifi.wyfyguest.com",
+            # The origin the guest portal SPA is ACTUALLY served from --
+            # `network_config.renderers.GUEST_PORTAL_HOST`, and the host in
+            # the `location.replace()` the router's own login.html performs.
+            # The entry above covers the hop the browser passes over on the
+            # way here; this covers where it lands and stays. Same "here so
+            # it keeps working if same-origin ever stops being true"
+            # reasoning, but with a sharper edge: production serves the SPA
+            # on auth.wyfyguest.com and the Master API on
+            # master.wyfyguest.com, which is cross-origin the moment nginx
+            # stops proxying /api/ from the portal's own server block.
+            "https://auth.wyfyguest.com",
         ]
     )
 
@@ -183,7 +223,7 @@ class Settings(BaseSettings):
     )
 
     router_encryption_key: str = Field(
-        default="aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE=",
+        default=INSECURE_LOCAL_DEV_FERNET_KEY,
         min_length=32,
         description=(
             "App-level symmetric key (Fernet, urlsafe-base64) used by "
@@ -1191,6 +1231,55 @@ class Settings(BaseSettings):
         ),
     )
 
+    platform_alert_emails: str = Field(
+        default="",
+        description=(
+            "Comma-separated inbox(es) of the WyFy platform team that also "
+            "receive every WiFi-controller (TP-Link Omada) alert, for every "
+            "organization -- in addition to that organization's own alert "
+            "channels, never instead of them. See "
+            "app.domains.monitoring.service.AlertService"
+            "._dispatch_platform_copies. Scoped to the three "
+            "network_controller* alert targets only. Empty (the default) "
+            "sends no extra copy. A plain comma-separated string rather "
+            "than list[str] for the reason the demo-booking block below "
+            "gives (pydantic-settings would parse a list as JSON); "
+            "normalized and validated at startup, so a malformed address "
+            "stops the process from starting instead of silently mailing "
+            "nobody."
+        ),
+    )
+
+    @field_validator("platform_alert_emails")
+    @classmethod
+    def _normalize_platform_alert_emails(cls, value: str) -> str:
+        """Lower-cased, de-duplicated, order-preserving, and every entry a
+        real address -- naming the offending token, so the startup error
+        points at the typo rather than at the setting."""
+        addresses: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            try:
+                normalized = validate_email(
+                    candidate, check_deliverability=False
+                ).normalized.lower()
+            except EmailNotValidError as exc:
+                raise ValueError(
+                    f"platform_alert_emails: {candidate!r} is not a valid "
+                    f"email address ({exc})"
+                ) from exc
+            if normalized not in addresses:
+                addresses.append(normalized)
+        return ",".join(addresses)
+
+    @property
+    def platform_alert_email_list(self) -> tuple[str, ...]:
+        return tuple(
+            address for address in self.platform_alert_emails.split(",") if address
+        )
+
     # ======================================================================
     # Demo booking calendar (app.domains.demo_booking)
     # ======================================================================
@@ -1349,7 +1438,20 @@ class Settings(BaseSettings):
         description=(
             "Which concrete SmsProviderProtocol implementation "
             "app.domains.otp.service.get_configured_sms_provider selects: "
-            "'logging' (default, no real send), 'twilio', or 'exotel'."
+            "'logging' (default, no real send), 'twilio', 'exotel', or "
+            "'ping4sms'."
+        ),
+    )
+    otp_sms_message_template: str = Field(
+        default="",
+        description=(
+            "Optional DLT-approved SMS body template for the guest-login "
+            "OTP, with the code as a `{#num#}` placeholder -- e.g. \"{#num#} "
+            "is your verification code for Wi-Fi.\". When set, OtpService "
+            "sends SMS bodies composed from this template (placeholder "
+            "replaced with the code) so the text matches the registered "
+            "template exactly; TRAI DLT carriers silently drop a body that "
+            "doesn't. Empty (default) keeps the built-in message."
         ),
     )
     twilio_account_sid: str = Field(default="")
@@ -1374,6 +1476,40 @@ class Settings(BaseSettings):
             "TRAI DLT-registered template id -- the OTP message body sent "
             "must match this template's approved text exactly, or Indian "
             "carriers silently drop the message."
+        ),
+    )
+    ping4sms_api_key: str = Field(
+        default="",
+        description=(
+            "Ping4SMS account API key (the 'key' query parameter of "
+            "https://site.ping4sms.com/api/smsapi). Secret -- set via "
+            "environment, never committed."
+        ),
+    )
+    ping4sms_route: str = Field(
+        default="",
+        description=(
+            "Ping4SMS route selector (the 'route' query parameter): "
+            "1=Promotional, 2=Transactional, 3=Optin, 4=Trans OTP, "
+            "5=Promo DND, 6=Whatsapp, 7=International. Use '4' for OTP "
+            "sends (Transactional/Trans OTP routes are the DLT-compliant "
+            "ones for a login code)."
+        ),
+    )
+    ping4sms_sender_id: str = Field(
+        default="",
+        description=(
+            "DLT-approved sender ID Ping4SMS sends SMS as (the 'sender' "
+            "query parameter)."
+        ),
+    )
+    ping4sms_dlt_template_id: str = Field(
+        default="",
+        description=(
+            "TRAI DLT-registered template id (the 'templateid' query "
+            "parameter) -- the OTP message body sent must match this "
+            "template's approved text exactly, or Indian carriers "
+            "silently drop the message."
         ),
     )
 
@@ -1471,11 +1607,153 @@ class Settings(BaseSettings):
     )
 
     # ========================================================================
+    # Network integrations (TP-Link Omada)
+    # ========================================================================
+    # A "network integration" is a *customer-owned* third-party network
+    # controller that this platform is pointed at -- not hardware this
+    # platform provisioned. Everything below exists because the far end of
+    # that connection belongs to someone else: the URL is user-supplied,
+    # the credentials are the venue's own, and every request leaves this
+    # server. See app.domains.network_integration for the domain itself.
+    #
+    # Per-tenant controller credentials live in the database
+    # (network_integrations.credentials_encrypted), encrypted with the key
+    # below. They are never configured through env -- there is one row per
+    # venue per controller, and env is not a multi-tenant store.
+
+    network_integration_encryption_key: str = Field(
+        default=INSECURE_LOCAL_DEV_FERNET_KEY,
+        min_length=32,
+        description=(
+            "App-level symmetric key (Fernet, urlsafe-base64) used by "
+            "app.domains.network_integration.crypto to encrypt/decrypt a "
+            "tenant's third-party network-controller credentials "
+            "(Omada client_id/client_secret or operator name/password) at "
+            "rest. Deliberately a separate key from router_encryption_key "
+            "rather than a reuse, for three reasons that are not "
+            "interchangeable. Blast radius: this key protects credentials "
+            "to controllers *customers own and operate*, so a compromise "
+            "reaches other people's networks, while "
+            "router_encryption_key protects devices this platform "
+            "provisioned and can reprovision. Rotation cost: rotating "
+            "this key means asking every venue owner to re-mint an API "
+            "client in their own controller UI -- a request to a human "
+            "outside this company -- whereas rotating the router key is a "
+            "table this platform can re-encrypt on its own. Lifecycle: "
+            "the two secret classes are created, revoked and expired by "
+            "different parties on different schedules, so tying them to "
+            "one key would mean the cheaper rotation could never happen "
+            "without paying for the expensive one. Same interim-design "
+            "posture as router_encryption_key/mfa_encryption_key pending "
+            "a real secrets-manager/KMS integration: must be overridden "
+            "with a real Fernet key (Fernet.generate_key()) in every "
+            "non-local environment. app.domains.network_integration"
+            ".crypto's own module docstring carries the full write-up, "
+            "including why the credential set is one ciphertext column "
+            "rather than four encrypted fields."
+        ),
+    )
+    omada_api_timeout_seconds: float = Field(
+        default=15.0,
+        ge=1,
+        le=120,
+        description=(
+            "Connect+read timeout for a single HTTP round trip to a "
+            "customer's Omada controller, passed through to the gateway "
+            "adapter as ControllerCredentials.timeout_seconds. Fifteen "
+            "seconds because the far end is very often a small hardware "
+            "controller on a hotel's own uplink rather than a datacentre "
+            "service -- a login on a loaded OC200 is measured in seconds, "
+            "not milliseconds -- while still being well inside the "
+            "Celery task time limit so a sweep of several integrations "
+            "cannot be killed mid-run by one unreachable box. There is no "
+            "'no timeout' option here by design: these calls happen "
+            "inside a request/response cycle on the portal authorize path, "
+            "where an unbounded wait is a guest staring at a spinner."
+        ),
+    )
+    omada_sync_interval_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=86400,
+        description=(
+            "Default polling interval for a new integration -- the value "
+            "network_integrations.sync_interval_seconds starts at; each "
+            "row can then carry its own. Five minutes is a compromise: "
+            "device/client counts on a dashboard are stale-tolerant, and "
+            "every tick is a real HTTPS round trip to somebody else's "
+            "hardware. The 60-second floor is not cosmetic -- it matches "
+            "app.domains.network_integration.constants"
+            ".MIN_SYNC_INTERVAL_SECONDS, and without it a tenant could "
+            "point this platform at their own controller as a load "
+            "generator. Note this is the *per-integration* period, not "
+            "the Beat cadence: Celery Beat wakes the sweep every "
+            "NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS and the "
+            "sweep then polls only the rows whose own interval has "
+            "elapsed."
+        ),
+    )
+    omada_allow_private_controller_urls: bool = Field(
+        default=False,
+        description=(
+            "Local/development escape hatch only. When True, "
+            "app.domains.network_integration.validators stops refusing "
+            "controller hosts that resolve to a private or otherwise "
+            "non-public address -- RFC1918, CGNAT, IPv6 ULA, loopback, "
+            "link-local -- which is what makes it possible to develop "
+            "against a controller on the same LAN or in a docker network. "
+            "It must stay False in every shared environment: the "
+            "controller URL is user-supplied and the request is made by "
+            "this server, so relaxing it turns the field into an SSRF "
+            "primitive against whatever the API host can route to. It "
+            "does NOT relax the cloud-metadata refusal (169.254.169.254, "
+            "fd00:ec2::254) -- that refusal is unconditional, because "
+            "there is no development scenario that needs this platform to "
+            "fetch its own instance credentials, and the one caller who "
+            "would ask for it is an attacker."
+        ),
+    )
+    omada_require_https: bool = Field(
+        default=True,
+        description=(
+            "When True (the default, and the only correct value outside a "
+            "developer's own machine), a controller base_url must be "
+            "https. Plain http would put the tenant's own controller "
+            "credentials -- an Omada operator password, or a "
+            "client_id/client_secret that can reconfigure their entire "
+            "network -- on the wire in the clear on every login and every "
+            "token refresh, on a path that crosses at least the venue's "
+            "LAN and usually the public internet. Setting this False is "
+            "only defensible against a controller on localhost."
+        ),
+    )
+    omada_extra_allowed_controller_ports: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Per-deployment additions to the built-in controller port "
+            "allowlist (app.domains.network_integration.constants"
+            ".DEFAULT_CONTROLLER_PORTS -- 443 for OC-series hardware "
+            "controllers, 8043 for the software controller's HTTPS, plus "
+            "8088/8843 which appear in TP-Link's own documentation for "
+            "older and alternate layouts). The allowlist exists because "
+            "the controller URL is user-supplied and reaches a "
+            "server-side HTTP client: with no port restriction, that "
+            "field becomes a port scanner against everything the API host "
+            "can route to, and the response timing alone reports back "
+            "which internal ports are open. Kept as a short, explicit "
+            "extension list rather than a replacement so a deployment "
+            "that genuinely fronts its controllers on a non-standard port "
+            "can say so without anyone being able to widen it to "
+            "'any port'."
+        ),
+    )
+
+    # ========================================================================
     # Security surface: API keys, MFA/TOTP, rate limiting
     # ========================================================================
 
     mfa_encryption_key: str = Field(
-        default="aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE=",
+        default=INSECURE_LOCAL_DEV_FERNET_KEY,
         min_length=32,
         description=(
             "App-level symmetric key (Fernet, urlsafe-base64) used by "
@@ -1545,6 +1823,72 @@ class Settings(BaseSettings):
     @property
     def log_path(self) -> Path:
         return self.log_dir / self.log_file
+
+    @property
+    def is_local_environment(self) -> bool:
+        return self.environment.strip().lower() in LOCAL_ENVIRONMENTS
+
+    def secrets_at_public_default(self) -> list[str]:
+        """Env var names of every secret still at its committed default,
+        in a non-local environment. Empty on a developer machine.
+
+        Returns names only, never values, so a caller can log the result
+        as-is. Deliberately does not raise: the api container runs its
+        migrations and then boots through this class, so a refusal here
+        would crash-loop a deployment whose .env nobody has checked yet.
+        What to do about each key is the caller's decision.
+        """
+        if self.is_local_environment:
+            return []
+        fields = type(self).model_fields
+        return [
+            f"CLOUDGUEST_{name.upper()}"
+            for name in PUBLIC_DEFAULT_SECRET_FIELDS
+            if getattr(self, name) == fields[name].default
+        ]
+
+    def alerting_delivery_gaps(self) -> list[str]:
+        """Env var names of alerting settings whose *unset* value silently
+        delivers nothing, in a non-local environment. Empty on a developer
+        machine.
+
+        ## Why an unset value needs saying out loud
+
+        ``platform_alert_emails`` already fails loudly when it is
+        **malformed** -- ``_normalize_platform_alert_emails`` raises and the
+        process does not start. The gap is the other direction. Empty is a
+        legal value and the default, and
+        ``AlertService._dispatch_platform_copies`` returns immediately on
+        it, so an operator who believes the platform team is being copied on
+        every WiFi-controller alert gets no email, no error and no log line
+        saying why. "Configured wrong" is caught; "never configured" was
+        not.
+
+        Names only, never values, and returned rather than logged so the
+        caller decides -- the same shape and the same reasoning as
+        :meth:`secrets_at_public_default` directly above, including that
+        this must never raise: a deployment whose team inbox nobody has set
+        yet should start and say so, not crash-loop.
+
+        This is not a claim that the setting is required. Sending no
+        platform copy is a legitimate choice; it just has to be a visible
+        one.
+        """
+        if self.is_local_environment:
+            return []
+        gaps: list[str] = []
+        if not self.platform_alert_email_list:
+            gaps.append("CLOUDGUEST_PLATFORM_ALERT_EMAILS")
+        return gaps
+
+    def uses_public_network_integration_key(self) -> bool:
+        """True when controller credentials would be encrypted under the
+        public default key outside a developer machine."""
+        return (
+            not self.is_local_environment
+            and self.network_integration_encryption_key
+            == INSECURE_LOCAL_DEV_FERNET_KEY
+        )
 
 
 @lru_cache

@@ -102,6 +102,9 @@ def _make_router(
 class FakeConnectedDeviceRepository:
     devices: dict[uuid.UUID, ConnectedDevice] = field(default_factory=dict)
     routers: list[Router] = field(default_factory=list)
+    #: Monitored MACs the sync must NOT write liveness fields for -- see
+    #: ``ConnectedDeviceService.sync_router``'s monitored-exemption logic.
+    monitored_macs: set[str] = field(default_factory=set)
 
     async def create_device(self, **fields: object) -> ConnectedDevice:
         device = ConnectedDevice(**_base_fields(**fields))
@@ -180,6 +183,15 @@ class FakeConnectedDeviceRepository:
         if organization_id is not None:
             return [r for r in self.routers if r.organization_id == organization_id]
         return list(self.routers)
+
+    async def list_monitored_macs_for_router(self, router_id: uuid.UUID) -> set[str]:
+        return set(self.monitored_macs)
+
+    async def list_monitored_targets(self) -> list:
+        return []
+
+    async def list_routers_with_monitored_hardware(self) -> list[Router]:
+        return []
 
 
 @dataclass
@@ -408,6 +420,94 @@ class TestSyncRouter:
         assert wireless_device.signal_strength_dbm == -55
         assert wireless_device.vendor is None
 
+    async def test_unknowable_wireless_state_is_recorded_as_unknown_not_wired(
+        self,
+    ) -> None:
+        """The MikroTik adapter reports ``is_wireless=None`` for every
+        device, because every router this platform deploys is a wired hEX
+        lite with no radio -- the venue's Wi-Fi comes from separate access
+        points we do not talk to, so the router genuinely cannot tell a
+        guest's phone from a laptop on a cable.
+
+        This used to fall through a two-branch expression to ``WIRED``,
+        which turned "we cannot know" into the positive, wrong claim "this
+        guest is on a cable" for every Wi-Fi guest on the fleet, and made
+        it indistinguishable in the API from a real wired device.
+        ``UNKNOWN`` already existed for exactly this and was unreachable.
+        """
+        adapter = FakeConnectedDeviceAdapter(
+            discovered=[
+                DiscoveredDevice(
+                    mac_address="AA:BB:CC:DD:EE:07",
+                    ip_address="10.5.50.20",
+                    hostname="pixel-7",
+                    interface="bridge",
+                    is_wireless=None,
+                    signal_strength_dbm=None,
+                ),
+            ]
+        )
+        h = make_harness(adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await h.service.sync_router(router.id)
+
+        devices, _ = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        device = next(d for d in devices if d.mac_address == "AA:BB:CC:DD:EE:07")
+        assert device.connection_type == ConnectionType.UNKNOWN.value
+        assert device.connection_type != ConnectionType.WIRED.value
+        # Permanently unobtainable on this hardware, never a placeholder.
+        assert device.signal_strength_dbm is None
+
+    async def test_unknown_connection_type_self_heals_on_the_next_sweep(
+        self,
+    ) -> None:
+        """No data migration is needed for rows already written as
+        ``wired``: the sweep writes ``connection_type`` unconditionally on
+        every tick, so an active device's row corrects itself within one
+        sweep interval. This asserts that update actually happens rather
+        than only being claimed in a comment."""
+        stale = FakeConnectedDeviceAdapter(
+            discovered=[
+                DiscoveredDevice(
+                    mac_address="AA:BB:CC:DD:EE:08",
+                    ip_address="10.5.50.21",
+                    hostname="phone",
+                    interface="bridge",
+                    is_wireless=False,  # what the old adapter reported
+                    signal_strength_dbm=None,
+                ),
+            ]
+        )
+        h = make_harness(adapter=stale)
+        router = h.router_lookup.add(_make_router())
+        await h.service.sync_router(router.id)
+
+        devices, _ = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        assert devices[0].connection_type == ConnectionType.WIRED.value
+
+        # Same device, same MAC, now reported honestly by the fixed adapter.
+        stale.discovered = [
+            DiscoveredDevice(
+                mac_address="AA:BB:CC:DD:EE:08",
+                ip_address="10.5.50.21",
+                hostname="phone",
+                interface="bridge",
+                is_wireless=None,
+                signal_strength_dbm=None,
+            ),
+        ]
+        await h.service.sync_router(router.id)
+
+        devices, meta = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        assert meta.total_items == 1, "still one device, not a second row"
+        assert devices[0].connection_type == ConnectionType.UNKNOWN.value
+
     async def test_second_sync_updates_existing_and_marks_dropped_device_inactive(
         self,
     ) -> None:
@@ -458,6 +558,68 @@ class TestSyncRouter:
         assert phone.is_active is True
         laptop = next(d for d in devices if d.mac_address == "AA:BB:CC:DD:EE:02")
         assert laptop.is_active is False
+
+    async def test_sync_does_not_override_liveness_for_monitored_hardware(
+        self,
+    ) -> None:
+        """A monitored device's ``is_active``/``connected_at``/
+        ``last_seen_at`` are owned by the ping liveness sweep, NOT by the
+        DHCP discovery sync: a lease-bound row must not resurrect a dead
+        monitored AP between liveness ticks. The discovery sync still
+        updates its metadata (here: the IP changed), but must leave the
+        three liveness columns exactly as the ping sweep wrote them."""
+        adapter = FakeConnectedDeviceAdapter(
+            discovered=[
+                DiscoveredDevice(
+                    mac_address="B8:27:EB:00:00:AA",
+                    ip_address="192.168.1.50",
+                    hostname="hall-lobby-ap",
+                    interface="ether2",
+                    is_wireless=None,
+                    signal_strength_dbm=None,
+                ),
+            ]
+        )
+        h = make_harness(adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await h.service.sync_router(router.id)
+
+        # The device is now registered as monitored hardware. The ping
+        # sweep marked it DOWN (its real state) -- and its row predates
+        # this sync.
+        h.repository.monitored_macs.add("B8:27:EB:00:00:AA")
+        devices, _ = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        monitored = devices[0]
+        original_connected_at = monitored.connected_at
+        original_last_seen_at = monitored.last_seen_at
+        await h.repository.update_device(monitored, {"is_active": False})
+
+        # Next discovery tick: lease still bound (RouterOS keeps it), IP
+        # changed. Metadata updates; the DOWN verdict must survive.
+        adapter.discovered = [
+            DiscoveredDevice(
+                mac_address="B8:27:EB:00:00:AA",
+                ip_address="192.168.1.60",
+                hostname="hall-lobby-ap",
+                interface="ether2",
+                is_wireless=None,
+                signal_strength_dbm=None,
+            ),
+        ]
+        summary = await h.service.sync_router(router.id)
+        assert summary.updated == 1
+        assert summary.disconnected == 0
+
+        devices, _ = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        ap = next(d for d in devices if d.mac_address == "B8:27:EB:00:00:AA")
+        assert ap.ip_address == "192.168.1.60"  # metadata did update
+        assert ap.is_active is False  # liveness verdict survived
+        assert ap.connected_at == original_connected_at
+        assert ap.last_seen_at == original_last_seen_at
 
     async def test_missing_credentials_raises(self) -> None:
         h = make_harness()

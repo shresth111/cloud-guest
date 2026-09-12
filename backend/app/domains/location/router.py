@@ -572,16 +572,23 @@ def _provision_input(payload: ProvisionLocationRequest) -> ProvisionLocationInpu
             language=payload.owner.language,
             send_welcome_sms=payload.owner.send_welcome_sms,
         ),
-        router=RouterInput(
-            name=payload.router.name,
-            serial_number=payload.router.serial_number,
-            mac_address=payload.router.mac_address,
-            model=payload.router.model,
-            management_ip_address=payload.router.management_ip_address,
-            public_ip_address=payload.router.public_ip_address,
-            api_username=payload.router.api_username,
-            api_secret=payload.router.api_secret,
-            settings=payload.router.settings,
+        # None for a venue with no MikroTik (e.g. an Omada controller,
+        # onboarded afterwards) -- see provisioning_service's "Provisioning
+        # without a router".
+        router=(
+            RouterInput(
+                name=payload.router.name,
+                serial_number=payload.router.serial_number,
+                mac_address=payload.router.mac_address,
+                model=payload.router.model,
+                management_ip_address=payload.router.management_ip_address,
+                public_ip_address=payload.router.public_ip_address,
+                api_username=payload.router.api_username,
+                api_secret=payload.router.api_secret,
+                settings=payload.router.settings,
+            )
+            if payload.router is not None
+            else None
         ),
         plan_id=uuid.UUID(payload.plan_id),
         existing_organization_id=(
@@ -679,7 +686,7 @@ async def provision_location(
         plan_id=str(result.plan_id),
         plan_name=result.plan_name,
         feature_summary=result.feature_summary,
-        router_id=str(result.router_id),
+        router_id=str(result.router_id) if result.router_id is not None else None,
         router_name=result.router_name,
         tunnel_ip_address=result.tunnel_ip_address,
         owner_user_id=str(result.owner_user_id),

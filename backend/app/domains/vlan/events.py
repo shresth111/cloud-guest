@@ -39,4 +39,19 @@ class VlanDeleted:
     occurred_at: datetime = field(default_factory=_now)
 
 
-__all__ = ["VlanCreated", "VlanUpdated", "VlanDeleted"]
+@dataclass(frozen=True, slots=True)
+class VlanPushed:
+    """A VLAN was realized on a real device.
+
+    Unlike the three events above, this one records something that happened
+    *outside* this database -- so it is the only one whose absence is
+    detectable by looking at a router.
+    """
+
+    id: uuid.UUID
+    router_id: uuid.UUID
+    port_mode: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+__all__ = ["VlanCreated", "VlanUpdated", "VlanDeleted", "VlanPushed"]

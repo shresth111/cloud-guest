@@ -17,9 +17,12 @@ from app.common.exceptions import CloudGuestError
 from .constants import (
     MAX_BACKGROUND_FOCAL,
     MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MAX_FEEDBACK_DWELL_MINUTES,
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_FEEDBACK_DWELL_MINUTES,
     GuestFontChoice,
+    PortalContentMode,
 )
 
 __all__ = [
@@ -34,10 +37,16 @@ __all__ = [
     "CaptivePortalConfigImmutableFieldError",
     "InvalidBusinessHoursScheduleError",
     "InvalidGuestFontChoiceError",
+    "InvalidPortalContentModeError",
     "InvalidBackgroundOverlayStrengthError",
     "InvalidBackgroundFocalPointError",
     "SplashTextTooLongError",
+    "PostLoginHtmlTooLargeError",
     "PoweredByAttributionNotEntitledError",
+    "InvalidUserPortalUrlError",
+    "WhitelistOnlyRequiresLocationError",
+    "InvalidReviewUrlError",
+    "InvalidFeedbackDwellMinutesError",
 ]
 
 
@@ -55,6 +64,23 @@ class CaptivePortalConfigNotFoundError(CaptivePortalError):
         super().__init__(
             f"Captive portal config not found: {config_id}",
             status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class CrossLocationCaptivePortalConfigAccessError(CaptivePortalError):
+    """A caller confined to particular sites reached a portal config for
+    another site.
+
+    Distinct from ``CrossOrganizationCaptivePortalConfigAccessError``:
+    both sites belong to the *same* organization. A config is reached by its
+    own id -- see ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a captive portal config for a location outside "
+            "your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
         )
 
 
@@ -94,6 +120,52 @@ class InvalidPortalContentSourceError(CaptivePortalError):
         )
 
 
+class InvalidReviewUrlError(CaptivePortalError):
+    """``review_url`` was not an ``https`` URL on a Google host -- see
+    ``validators.validate_review_url``.
+
+    Rejected at write time rather than at render time, because the failure
+    this prevents is silent: a venue pastes something that is not their
+    review link, the card renders, guests tap it, and nobody finds out
+    until someone asks why the review count never moved. A 400 in the
+    dashboard, in front of the person who did the pasting, is the only
+    moment the mistake is cheap.
+
+    Deliberately *not* a shape check on the path. This platform does not
+    know what a valid Google review path looks like from one quarter to the
+    next (see ``constants.REVIEW_URL_MAX_LENGTH``'s own comment), and a
+    validator that guessed would reject working links. Scheme and host are
+    the two things that have stayed true."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"That doesn't look like a Google review link: {reason}. Copy it "
+            "from your Google Business Profile -> Read reviews -> Get more "
+            "reviews.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidFeedbackDwellMinutesError(CaptivePortalError):
+    """``feedback_dwell_minutes`` was outside
+    ``[MIN_FEEDBACK_DWELL_MINUTES, MAX_FEEDBACK_DWELL_MINUTES]`` or was not
+    a whole number of minutes.
+
+    The message names the unit, because the field's whole failure mode is
+    a venue -- or a second client -- reading it as seconds. 1500 seconds
+    is a plausible dwell; 1500 minutes is a card no guest will ever be
+    connected long enough to see, and it fails silently rather than
+    loudly."""
+
+    def __init__(self, value: object) -> None:
+        super().__init__(
+            f"Feedback dwell must be a whole number of *minutes* between "
+            f"{MIN_FEEDBACK_DWELL_MINUTES} and {MAX_FEEDBACK_DWELL_MINUTES} "
+            f"-- got {value!r}.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class InvalidDefaultConfigScopeError(CaptivePortalError):
     """``is_default=True`` was requested alongside a non-null
     ``location_id`` -- ``is_default`` only has meaning for an
@@ -104,6 +176,32 @@ class InvalidDefaultConfigScopeError(CaptivePortalError):
         super().__init__(
             "is_default can only be set on an organization-level config "
             "(location_id must be null)",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class WhitelistOnlyRequiresLocationError(CaptivePortalError):
+    """``whitelist_only_enabled=True`` was requested on an organization's
+    default config (``location_id IS NULL``).
+
+    An org default is inherited by every location that has no override of
+    its own, so setting the flag there would silently put *every* property
+    in the organization into whitelist-only mode at once -- every guest
+    without an Always Allowed entry refused, everywhere, from one toggle.
+    There is no legitimate use for that: the feature was asked for, and is
+    only ever operated, per property. Refused here rather than guarded in
+    the UI, because the UI is not the only caller.
+
+    Turning it **off** on an org default is always allowed -- ``False`` is
+    the column's own default and the value every existing row already
+    carries, so writing it can never widen anything.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "whitelist_only_enabled can only be set on a location-specific "
+            "config (location_id must not be null) -- enabling it on the "
+            "organization default would switch on every property at once",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -171,6 +269,22 @@ class InvalidGuestFontChoiceError(CaptivePortalError):
         allowed = ", ".join(sorted(c.value for c in GuestFontChoice))
         super().__init__(
             f"guest_font_choice must be one of [{allowed}], got '{value}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidPortalContentModeError(CaptivePortalError):
+    """``content_mode`` was set to something outside
+    ``constants.PortalContentMode`` -- see
+    ``validators.validate_content_mode``. Like ``guest_font_choice`` this is
+    a closed enum stored as a plain string, never free text: an unknown mode
+    would have no renderer on the frontend and would silently fall back to
+    the sign-in card, so it is rejected at the write boundary instead."""
+
+    def __init__(self, value: str) -> None:
+        allowed = ", ".join(m.value for m in PortalContentMode)
+        super().__init__(
+            f"content_mode must be one of [{allowed}], got '{value}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -244,6 +358,41 @@ class SplashTextTooLongError(CaptivePortalError):
         )
 
 
+class PostLoginHtmlTooLargeError(CaptivePortalError):
+    """``post_login_html`` -- the page a venue authors for what a guest
+    sees after signing in -- exceeded ``constants.POST_LOGIN_HTML_MAX_BYTES``.
+
+    Carries ``max_bytes``/``actual_bytes`` in ``data`` for the same reason
+    ``SplashTextTooLongError`` above carries lengths: the dashboard's editor
+    has to be able to say "68 KB of a 64 KB limit" next to the field. A bare
+    Pydantic "string too long" would name neither number, and the venue
+    would be left guessing how much to cut.
+
+    Both figures are **UTF-8 bytes of the submitted value**, counted before
+    sanitizing -- see ``html_sanitizer.sanitize_post_login_html`` for why
+    the pre-sanitize input is the honest thing to measure.
+
+    400, not 413 or 422: this is the same domain-validation class as every
+    other error in this module, raised from the service layer rather than
+    from Pydantic or from a transport-level body limit.
+    """
+
+    def __init__(self, actual_bytes: int, max_bytes: int) -> None:
+        self.field_name = "post_login_html"
+        self.actual_bytes = actual_bytes
+        self.max_bytes = max_bytes
+        super().__init__(
+            f"post_login_html must be at most {max_bytes} bytes "
+            f"({max_bytes // 1024} KB), got {actual_bytes} bytes",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={
+                "field": "post_login_html",
+                "max_bytes": max_bytes,
+                "actual_bytes": actual_bytes,
+            },
+        )
+
+
 class PoweredByAttributionNotEntitledError(CaptivePortalError):
     """An organization without the ``white_label`` plan feature tried to
     turn ``powered_by_enabled`` **off** -- v7 design spec §Part 3 (P4).
@@ -275,3 +424,48 @@ class PoweredByAttributionNotEntitledError(CaptivePortalError):
                 "required_feature": feature_key,
             },
         )
+
+
+class InvalidUserPortalUrlError(CaptivePortalError):
+    """The ``portal_url`` query parameter of the RFC 8908 endpoint was not
+    a URL on this platform's own hotspot name.
+
+    **This is a security boundary, not input hygiene.** That parameter is
+    reflected into the ``user-portal-url`` member of an
+    ``application/captive+json`` document, and a conforming operating
+    system *opens that URL by itself* -- no link, no click, no user
+    decision anywhere in the chain. An ordinary open redirect needs a
+    victim to follow it; this one needs a victim to plug in a network
+    cable. So the check is an allowlist of names this platform owns, and
+    anything else is refused rather than sanitised.
+
+    400 rather than 422: FastAPI's own 422 means "the request did not
+    match the declared schema", and this one did -- ``portal_url`` is a
+    string and a string arrived. What failed is a domain rule about
+    *which* strings are acceptable, which is the same category as every
+    other 400 in this module.
+    """
+
+    def __init__(self, portal_url: str) -> None:
+        # The offending value is deliberately NOT interpolated into the
+        # message. This endpoint is unauthenticated and reachable by any
+        # guest device, so the message is the one thing an attacker can
+        # reliably get the platform to emit; echoing their string back
+        # into it would hand back a smaller version of the same
+        # reflection this class exists to close.
+        super().__init__(
+            "portal_url must be an http:// URL on this platform's own "
+            "hotspot name",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidContentImageError(CaptivePortalError):
+    """The uploaded pre-login content image was not a png/jpeg/webp/gif
+    or exceeded the 5 MiB ceiling -- same constraints as the branding
+    logo/background uploads. 400, and the message names the real problem
+    (unsupported type vs too large) so the dashboard's upload control can
+    surface it verbatim."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)

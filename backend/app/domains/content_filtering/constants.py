@@ -82,9 +82,72 @@ class ContentFilterCategory(StrEnum):
     CUSTOM = "custom"
 
 
+class ContentFilterDevicePushStatus(StrEnum):
+    """Lifecycle of a :class:`~.models.ContentFilterRule`'s own device push.
+
+    Distinct from ``is_enabled``, which is intent ("this site should be
+    blocked"), and independent of ``network_config``'s ``ConfigVersion``
+    status -- that pipeline renders a script and ships it over SSH on port
+    22, which is filtered on the fleet; this is a direct RouterOS-API push
+    on 8728. A rule can be enabled, rendered into a config version, and
+    still never have reached a device -- which was the state of every row
+    in this table before this domain had a push at all, and is exactly why
+    a customer could block a site, be shown that it was blocked, and reach
+    it from the guest network unchanged.
+
+    * ``PENDING`` -- created, never pushed. The state every pre-existing
+      row is backfilled to, truthfully: until now no code path could push
+      one.
+    * ``ACTIVE`` -- the real ``/ip dns static`` entries (a domain rule) or
+      ``/ip firewall address-list`` membership (an IP/CIDR rule) for this
+      row exist on the router. Stated exactly that narrowly on purpose:
+      it is a claim about objects this platform wrote and can read back,
+      not a claim that a packet was observed being dropped. Two known
+      limits sit behind it, both documented where they live rather than
+      hidden here -- a guest device that sets its own DNS resolver
+      bypasses a domain rule's sinkhole entirely (see this package's
+      ``__init__`` docstring), and an IP/CIDR rule's shared
+      ``/ip firewall filter`` DROP rule sits above the first ``accept`` in
+      ``forward`` but takes no view on whether a marked packet reaches that
+      chain at all on an arbitrary router (see
+      ``wyfy_device_gateway.mikrotik_adapter
+      ._ensure_content_filter_enforcement_rule``). Its position used to be
+      unmanaged entirely, which meant any accept ahead of it silently ended
+      blocking; that is fixed, and the position is now re-checked on every
+      push rather than only at creation.
+    * ``FAILED`` -- the last push attempt raised; ``device_push_error``
+      holds the device's own words.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
 __all__ = [
     "CONTENT_FILTER_SINKHOLE_ADDRESS",
     "CONTENT_FILTER_ADDRESS_LIST_NAME",
     "ContentFilterValueType",
     "ContentFilterCategory",
+    "ContentFilterDevicePushStatus",
+    "DEVICE_CARRIED_FIELDS",
 ]
+
+
+# The two columns ``ContentFilterService.push_rule_to_device`` actually
+# puts on the router: ``value`` is the blocked domain or address itself,
+# and ``value_type`` decides which mechanism realizes it (a DNS sinkhole
+# or an address-list entry plus the shared DROP rule) -- a re-typed rule
+# tears down the mechanism it stopped using. Changing either makes an
+# ``ACTIVE`` row claim a site is blocked that is not. See
+# ``app.common.device_push``.
+#
+# ``name`` is deliberately absent even though it *does* reach the device:
+# it is carried as ``label``, the mutable tail of the RouterOS comment
+# whose identity marker is the rule id (see
+# ``mikrotik_adapter.configure_content_filter_rule``'s own "the comment is
+# the rule's identity" section). A stale label on a comment blocks exactly
+# what the customer asked for; demoting a live block to "not yet applied"
+# over a rename would be the more misleading of the two. ``category``/
+# ``comment`` never leave the database, and ``is_enabled`` is intent.
+DEVICE_CARRIED_FIELDS = frozenset({"value", "value_type"})

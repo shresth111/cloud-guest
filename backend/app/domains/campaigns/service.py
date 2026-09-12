@@ -25,15 +25,21 @@ from typing import Protocol
 from pydantic import BaseModel as PydanticModel
 
 from app.common.masking import MaskedIdentifier, MaskedName
+from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.database.utils.pagination import PaginationMeta
 from app.domains.guest.constants import GuestSessionStatus
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import (
     DEFAULT_DISPLAY_INTERVAL_DAYS,
+    MAX_QUESTIONS_PER_CAMPAIGN,
     AnswerType,
     CampaignStatus,
     CampaignType,
@@ -53,11 +59,13 @@ from .exceptions import (
     CampaignNotFoundError,
     CampaignNotSchedulableError,
     CampaignQuestionNotFoundError,
+    CrossLocationCampaignAccessError,
     CrossOrganizationCampaignAccessError,
     DuplicateFirstLoginResponseError,
     GuestSessionNotActiveError,
     GuestSessionNotFoundError,
     OrganizationRequiredError,
+    TooManyCampaignQuestionsError,
     WrongCampaignTypeError,
 )
 from .models import (
@@ -157,7 +165,7 @@ class QuestionResultBreakdown:
     total_answers: int
     option_counts: dict[str, int] | None
     average_rating: float | None
-    rating_distribution: dict[int, int] | None
+    rating_distribution: dict[str, int] | None
     free_text_answers: list[str] | None
 
 
@@ -207,6 +215,8 @@ class CampaignsService:
         router_lookup: RouterLookupProtocol,
         guest_session_lookup: GuestSessionLookupProtocol,
         audit_writer: AuditLogWriter | None = None,
+        *,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
@@ -214,6 +224,15 @@ class CampaignsService:
         self.router_lookup = router_lookup
         self.guest_session_lookup = guest_session_lookup
         self.audit_writer = audit_writer
+        # Constructor-injected while `requesting_organization_id` stays
+        # per-method: an organization id is an *argument* (which tenant
+        # this call is about, and a Celery task legitimately varies it
+        # per call), whereas a location confinement is a *property of
+        # the caller*, fixed for the request, and a security control.
+        # Threading a security control through every method means every
+        # method can forget it, silently. See
+        # `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     # ========================================================================
     # Campaign CRUD
@@ -289,6 +308,14 @@ class CampaignsService:
             and campaign.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationCampaignAccessError()
+        # Not enough on its own: this row is reached by its own id, so the
+        # permission check had nothing to pin to and a LOCATION grant on
+        # the caller's own site satisfied it.
+        enforce_entity_location(
+            entity_location_id=getattr(campaign, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationCampaignAccessError(),
+        )
         return campaign
 
     async def list_campaigns(
@@ -570,6 +597,19 @@ class CampaignsService:
                 CampaignType.SURVEY.value, campaign.campaign_type
             )
         validate_question_options(answer_type, options)
+        # The cap, checked on the authoring path only. See
+        # `constants.MAX_QUESTIONS_PER_CAMPAIGN` for where 10 comes from and
+        # why `clone_campaign` is deliberately not gated the same way.
+        #
+        # Counted from live rows -- `list_questions_for_campaign` already
+        # filters `is_deleted` -- so deleting a question really does free a
+        # slot, which is the remedy the error message tells the venue to
+        # use.
+        existing = await self.repository.list_questions_for_campaign(campaign.id)
+        if len(existing) >= MAX_QUESTIONS_PER_CAMPAIGN:
+            raise TooManyCampaignQuestionsError(
+                MAX_QUESTIONS_PER_CAMPAIGN, len(existing)
+            )
         return await self.repository.create_question(
             campaign_id=campaign.id,
             order_index=order_index,
@@ -649,6 +689,10 @@ class CampaignsService:
         click_url: str | None,
         alt_text: str | None,
         locale: str | None,
+        headline: str | None = None,
+        subtext: str | None = None,
+        coupon_code: str | None = None,
+        coupon_expires_at: datetime | None = None,
     ) -> CampaignAsset:
         campaign = await self.get_campaign(
             campaign_id, requesting_organization_id=requesting_organization_id
@@ -661,13 +705,19 @@ class CampaignsService:
                 f"{CampaignType.BANNER.value}/{CampaignType.REDIRECT.value}",
                 campaign.campaign_type,
             )
-        validate_asset_urls(image_url, click_url)
+        validate_asset_urls(
+            image_url, click_url, headline=headline, coupon_code=coupon_code
+        )
         return await self.repository.create_asset(
             campaign_id=campaign.id,
             image_url=image_url,
             click_url=click_url,
             alt_text=alt_text,
             locale=locale,
+            headline=headline,
+            subtext=subtext,
+            coupon_code=coupon_code,
+            coupon_expires_at=coupon_expires_at,
             created_by=actor_user_id,
         )
 
@@ -697,7 +747,14 @@ class CampaignsService:
         )
         image_url = fields.get("image_url", asset.image_url)
         click_url = fields.get("click_url", asset.click_url)
-        validate_asset_urls(image_url, click_url)  # type: ignore[arg-type]
+        headline = fields.get("headline", asset.headline)
+        coupon_code = fields.get("coupon_code", asset.coupon_code)
+        validate_asset_urls(
+            image_url,  # type: ignore[arg-type]
+            click_url,  # type: ignore[arg-type]
+            headline=headline,  # type: ignore[arg-type]
+            coupon_code=coupon_code,  # type: ignore[arg-type]
+        )
         data = {key: value for key, value in fields.items() if value is not None}
         return await self.repository.update_asset(asset, data)
 
@@ -918,6 +975,9 @@ class CampaignsService:
         buffer = io.StringIO()
         writer = csv.writer(buffer)
         writer.writerow(["guest_identifier", "guest_name", "submitted_at", "answers"])
+        # Survey answers are guest free text and the identifier is
+        # guest-chosen -- the two most directly attacker-controlled strings
+        # in the product, landing in a file a venue owner opens in Excel.
         for response in responses:
             guest = await self.guest_session_lookup.get_guest_by_id(response.guest_id)
             identifier = getattr(guest, "identifier", None)
@@ -927,12 +987,14 @@ class CampaignsService:
             )
             dumped = row.model_dump()
             writer.writerow(
-                [
-                    dumped["guest_identifier"] or "",
-                    dumped["guest_name"] or "",
-                    response.submitted_at.isoformat(),
-                    response.answers,
-                ]
+                sanitize_spreadsheet_row(
+                    [
+                        dumped["guest_identifier"] or "",
+                        dumped["guest_name"] or "",
+                        response.submitted_at.isoformat(),
+                        response.answers,
+                    ]
+                )
             )
         return buffer.getvalue()
 
@@ -967,7 +1029,7 @@ def _build_question_breakdown(
     answer_type = AnswerType(question.answer_type)
     option_counts: dict[str, int] | None = None
     average_rating: float | None = None
-    rating_distribution: dict[int, int] | None = None
+    rating_distribution: dict[str, int] | None = None
     free_text_answers: list[str] | None = None
 
     if answer_type == AnswerType.SINGLE_CHOICE:
@@ -980,7 +1042,12 @@ def _build_question_breakdown(
         option_counts = dict(counter)
     elif answer_type == AnswerType.RATING_5:
         ratings = [int(a) for a in raw_answers if isinstance(a, int | float)]
-        rating_distribution = dict(Counter(ratings))
+        # Keyed by `str` deliberately -- see
+        # `QuestionResultBreakdownResponse.rating_distribution`. Building it
+        # as `str` here rather than letting Pydantic coerce on serialization
+        # means the in-process value and the JSON a client receives are the
+        # same shape, so a test asserting on one is asserting on the other.
+        rating_distribution = {str(k): v for k, v in Counter(ratings).items()}
         average_rating = sum(ratings) / len(ratings) if ratings else None
     else:
         free_text_answers = [str(a) for a in raw_answers if a]

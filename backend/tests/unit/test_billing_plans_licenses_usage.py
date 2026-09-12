@@ -54,6 +54,7 @@ from app.domains.billing.models import (
     LicenseChangeLog,
     Plan,
     PlanFeature,
+    Subscription,
     UsageMetric,
 )
 from app.domains.billing.service import (
@@ -463,6 +464,45 @@ def make_usage_service(
 
 
 @dataclass
+class FakeSubscriptionRepository:
+    """The slice of ``SubscriptionRepositoryProtocol``
+    ``LicenseService._sync_subscription_plan`` uses."""
+
+    subscriptions: dict[uuid.UUID, Subscription] = field(default_factory=dict)
+
+    async def add(self, **fields: object) -> Subscription:
+        subscription = Subscription(
+            id=uuid.uuid4(),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            deleted_at=None,
+            is_deleted=False,
+            created_by=None,
+            updated_by=None,
+            version=1,
+            **fields,
+        )
+        self.subscriptions[subscription.id] = subscription
+        return subscription
+
+    async def get_by_organization_id(
+        self, organization_id: uuid.UUID
+    ) -> Subscription | None:
+        for subscription in self.subscriptions.values():
+            if subscription.organization_id == organization_id:
+                return subscription
+        return None
+
+    async def update_subscription(
+        self, subscription: Subscription, data: dict[str, object]
+    ) -> Subscription:
+        for key, value in data.items():
+            setattr(subscription, key, value)
+        subscription.version += 1
+        return subscription
+
+
+@dataclass
 class LicenseFixture:
     license_repository: FakeLicenseRepository
     plan_repository: FakePlanRepository
@@ -472,6 +512,7 @@ class LicenseFixture:
     usage_fixture: UsageFixture
     service: LicenseService
     white_label_reset: FakeWhiteLabelReset | None = None
+    subscription_repository: FakeSubscriptionRepository | None = None
 
 
 def make_license_service(
@@ -495,6 +536,7 @@ def make_license_service(
         active_session_lookup=active_session_lookup,
     )
 
+    subscription_repository = FakeSubscriptionRepository()
     service = LicenseService(
         license_repository,
         plan_repository,
@@ -502,6 +544,7 @@ def make_license_service(
         usage_validator=usage_fixture.service,
         audit_writer=audit_writer,
         white_label_reset=white_label_reset,
+        subscription_repository=subscription_repository,
     )
     return LicenseFixture(
         license_repository,
@@ -512,6 +555,7 @@ def make_license_service(
         usage_fixture,
         service,
         white_label_reset,
+        subscription_repository,
     )
 
 
@@ -521,6 +565,7 @@ async def _create_plan(
     slug: str = "starter",
     plan_type: str = PlanType.STARTER.value,
     is_active: bool = True,
+    billing_cycle: str = BillingCycle.MONTHLY.value,
     features: list[dict[str, object]] | None = None,
 ) -> Plan:
     plan_service = PlanService(plan_repository)
@@ -530,7 +575,7 @@ async def _create_plan(
         slug=slug,
         plan_type=plan_type,
         description=None,
-        billing_cycle=BillingCycle.MONTHLY.value,
+        billing_cycle=billing_cycle,
         base_price=Decimal("49.99"),
         currency="USD",
         is_active=is_active,
@@ -804,25 +849,35 @@ class TestLicenseLifecycle:
         assert fx.organization_composer.sync_calls == [(org_id, plan.slug)]
 
         activated = await fx.service.activate_license(
-            actor_user_id=None, license_id=license_.id
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
         )
         assert activated.status == LicenseStatus.ACTIVE.value
         assert activated.activated_at is not None
 
         suspended = await fx.service.suspend_license(
-            actor_user_id=None, license_id=license_.id, reason="payment failed"
+            actor_user_id=None,
+            license_id=license_.id,
+            reason="payment failed",
+            requesting_organization_id=None,
         )
         assert suspended.status == LicenseStatus.SUSPENDED.value
         assert suspended.suspended_reason == "payment failed"
 
         reactivated = await fx.service.activate_license(
-            actor_user_id=None, license_id=license_.id
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
         )
         assert reactivated.status == LicenseStatus.ACTIVE.value
         assert reactivated.suspended_at is None
         assert reactivated.suspended_reason is None
 
-        history = await fx.service.list_change_history(license_.id)
+        history = await fx.service.list_change_history(
+            license_.id,
+            requesting_organization_id=None,
+        )
         assert len(history) == 1  # the initial ASSIGNED row
         assert history[0].change_type == "assigned"
 
@@ -856,7 +911,10 @@ class TestLicenseLifecycle:
         # PENDING_ACTIVATION -> SUSPENDED is not a legal transition.
         with pytest.raises(InvalidLicenseStatusTransitionError):
             await fx.service.suspend_license(
-                actor_user_id=None, license_id=license_.id, reason="x"
+                actor_user_id=None,
+                license_id=license_.id,
+                reason="x",
+                requesting_organization_id=None,
             )
 
     async def test_cancel_is_terminal(self) -> None:
@@ -866,10 +924,16 @@ class TestLicenseLifecycle:
         license_ = await fx.service.assign_license(
             actor_user_id=None, organization_id=org_id, plan_id=plan.id
         )
-        await fx.service.cancel_license(actor_user_id=None, license_id=license_.id)
+        await fx.service.cancel_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
         with pytest.raises(InvalidLicenseStatusTransitionError):
             await fx.service.activate_license(
-                actor_user_id=None, license_id=license_.id
+                actor_user_id=None,
+                license_id=license_.id,
+                requesting_organization_id=None,
             )
 
     async def test_expire_license(self) -> None:
@@ -879,12 +943,18 @@ class TestLicenseLifecycle:
         license_ = await fx.service.assign_license(
             actor_user_id=None, organization_id=org_id, plan_id=plan.id
         )
-        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
         expired = await fx.service.expire_license(license_id=license_.id)
         assert expired.status == LicenseStatus.EXPIRED.value
         with pytest.raises(InvalidLicenseStatusTransitionError):
             await fx.service.activate_license(
-                actor_user_id=None, license_id=license_.id
+                actor_user_id=None,
+                license_id=license_.id,
+                requesting_organization_id=None,
             )
 
     async def test_validate_license_active_and_not_expired(self) -> None:
@@ -897,7 +967,11 @@ class TestLicenseLifecycle:
         with pytest.raises(LicenseNotActiveError):
             await fx.service.validate_license(org_id)
 
-        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
         validated = await fx.service.validate_license(org_id)
         assert validated.id == license_.id
 
@@ -914,6 +988,182 @@ class TestLicenseLifecycle:
             await fx.service.get_license_for_organization(uuid.uuid4())
 
 
+class TestPlanChangeSyncsTheSubscription:
+    """A plan change used to update ``License.plan_id`` and the
+    organization's denormalized tier label, and stop there -- while the
+    renewal engine resolves what to charge from
+    ``subscription.plan_id``. The subscription kept pointing at the old
+    plan forever, so an upgraded customer went on being billed the old
+    price, renewal after renewal."""
+
+    async def _setup(
+        self, *, new_cycle: str = BillingCycle.MONTHLY.value
+    ) -> tuple[LicenseFixture, Plan, Plan, uuid.UUID, Subscription]:
+        org_id = uuid.uuid4()
+        # The downgrade path runs the usage validator, which resolves the
+        # real organization -- so it has to exist in the composer fake.
+        fx = make_license_service(
+            organization_composer=FakeOrganizationComposer(
+                organizations={org_id: _FakeOrganization(id=org_id, msp=False)}
+            )
+        )
+        starter = await _create_plan(fx.plan_repository, slug="starter-sync")
+        pro = await _create_plan(
+            fx.plan_repository,
+            slug="pro-sync",
+            plan_type=PlanType.PROFESSIONAL.value,
+            billing_cycle=new_cycle,
+        )
+        license_ = await fx.service.assign_license(
+            actor_user_id=None, organization_id=org_id, plan_id=starter.id
+        )
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
+        assert fx.subscription_repository is not None
+        now = datetime.now(UTC)
+        subscription = await fx.subscription_repository.add(
+            organization_id=org_id,
+            license_id=license_.id,
+            plan_id=starter.id,
+            status="active",
+            billing_cycle=starter.billing_cycle,
+            current_period_start=now,
+            current_period_end=now + timedelta(days=30),
+            trial_end=None,
+            auto_renew=True,
+            cancel_at_period_end=False,
+            started_at=now,
+        )
+        return fx, starter, pro, license_.id, subscription
+
+    async def test_upgrade_repoints_the_subscription_at_the_new_plan(self) -> None:
+        fx, _starter, pro, license_id, subscription = await self._setup()
+
+        await fx.service.upgrade_license(
+            actor_user_id=None,
+            license_id=license_id,
+            new_plan_id=pro.id,
+            requesting_organization_id=None,
+        )
+
+        # renewal_service resolves its charge amount from THIS field.
+        assert subscription.plan_id == pro.id
+
+    async def test_downgrade_repoints_the_subscription_too(self) -> None:
+        fx, starter, pro, license_id, subscription = await self._setup()
+        await fx.service.upgrade_license(
+            actor_user_id=None,
+            license_id=license_id,
+            new_plan_id=pro.id,
+            requesting_organization_id=None,
+        )
+
+        await fx.service.downgrade_license(
+            actor_user_id=None,
+            license_id=license_id,
+            new_plan_id=starter.id,
+            requesting_organization_id=None,
+        )
+
+        assert subscription.plan_id == starter.id
+
+    async def test_billing_cycle_moves_with_the_plan(self) -> None:
+        """``_mark_renewed`` extends the period by the *subscription's*
+        cycle, and ``list_due_for_renewal`` filters on it. Repointing
+        ``plan_id`` alone would charge a yearly plan every month."""
+        fx, _starter, pro, license_id, subscription = await self._setup(
+            new_cycle=BillingCycle.YEARLY.value
+        )
+        assert subscription.billing_cycle == BillingCycle.MONTHLY.value
+
+        await fx.service.upgrade_license(
+            actor_user_id=None,
+            license_id=license_id,
+            new_plan_id=pro.id,
+            requesting_organization_id=None,
+        )
+
+        assert subscription.billing_cycle == BillingCycle.YEARLY.value
+
+    async def test_the_paid_period_is_left_alone(self) -> None:
+        """The customer paid for the current period; it runs to its end.
+        The new price takes effect at the next renewal."""
+        fx, _starter, pro, license_id, subscription = await self._setup()
+        period_start = subscription.current_period_start
+        period_end = subscription.current_period_end
+
+        await fx.service.upgrade_license(
+            actor_user_id=None,
+            license_id=license_id,
+            new_plan_id=pro.id,
+            requesting_organization_id=None,
+        )
+
+        assert subscription.current_period_start == period_start
+        assert subscription.current_period_end == period_end
+
+    async def test_a_license_with_no_subscription_is_not_an_error(self) -> None:
+        """A manually assigned license that never went through checkout is
+        a legitimate state, not something to raise on."""
+        fx = make_license_service()
+        starter = await _create_plan(fx.plan_repository, slug="starter-nosub")
+        pro = await _create_plan(
+            fx.plan_repository,
+            slug="pro-nosub",
+            plan_type=PlanType.PROFESSIONAL.value,
+        )
+        org_id = uuid.uuid4()
+        license_ = await fx.service.assign_license(
+            actor_user_id=None, organization_id=org_id, plan_id=starter.id
+        )
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
+
+        upgraded = await fx.service.upgrade_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            new_plan_id=pro.id,
+            requesting_organization_id=None,
+        )
+
+        assert upgraded.plan_id == pro.id
+
+    async def test_another_organizations_subscription_is_untouched(self) -> None:
+        fx, starter, pro, license_id, _subscription = await self._setup()
+        assert fx.subscription_repository is not None
+        other_org = uuid.uuid4()
+        now = datetime.now(UTC)
+        other = await fx.subscription_repository.add(
+            organization_id=other_org,
+            license_id=uuid.uuid4(),
+            plan_id=starter.id,
+            status="active",
+            billing_cycle=BillingCycle.MONTHLY.value,
+            current_period_start=now,
+            current_period_end=now + timedelta(days=30),
+            trial_end=None,
+            auto_renew=True,
+            cancel_at_period_end=False,
+            started_at=now,
+        )
+        untouched_plan_id = other.plan_id
+
+        await fx.service.upgrade_license(
+            actor_user_id=None,
+            license_id=license_id,
+            new_plan_id=pro.id,
+            requesting_organization_id=None,
+        )
+
+        assert other.plan_id == untouched_plan_id
+
+
 class TestLicenseUpgradeDowngrade:
     async def test_upgrade_records_history_and_syncs_subscription_tier(self) -> None:
         fx = make_license_service()
@@ -923,18 +1173,26 @@ class TestLicenseUpgradeDowngrade:
         license_ = await fx.service.assign_license(
             actor_user_id=None, organization_id=org_id, plan_id=starter.id
         )
-        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
 
         upgraded = await fx.service.upgrade_license(
             actor_user_id=None,
             license_id=license_.id,
             new_plan_id=professional.id,
             reason="customer requested more locations",
+            requesting_organization_id=None,
         )
         assert upgraded.plan_id == professional.id
         assert fx.organization_composer.sync_calls[-1] == (org_id, professional.slug)
 
-        history = await fx.service.list_change_history(license_.id)
+        history = await fx.service.list_change_history(
+            license_.id,
+            requesting_organization_id=None,
+        )
         assert [entry.change_type for entry in history] == ["upgraded", "assigned"]
         assert history[0].from_plan_id == starter.id
         assert history[0].to_plan_id == professional.id
@@ -946,10 +1204,17 @@ class TestLicenseUpgradeDowngrade:
         license_ = await fx.service.assign_license(
             actor_user_id=None, organization_id=org_id, plan_id=plan.id
         )
-        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
         with pytest.raises(SamePlanError):
             await fx.service.downgrade_license(
-                actor_user_id=None, license_id=license_.id, new_plan_id=plan.id
+                actor_user_id=None,
+                license_id=license_.id,
+                new_plan_id=plan.id,
+                requesting_organization_id=None,
             )
 
     async def test_downgrade_blocked_when_usage_exceeds_target_limits(self) -> None:
@@ -996,11 +1261,18 @@ class TestLicenseUpgradeDowngrade:
         license_ = await fx.service.assign_license(
             actor_user_id=None, organization_id=org_id, plan_id=big_plan.id
         )
-        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
 
         with pytest.raises(DowngradeBelowUsageError) as exc_info:
             await fx.service.downgrade_license(
-                actor_user_id=None, license_id=license_.id, new_plan_id=small_plan.id
+                actor_user_id=None,
+                license_id=license_.id,
+                new_plan_id=small_plan.id,
+                requesting_organization_id=None,
             )
         assert "guests" in exc_info.value.exceeded_metric_keys
 
@@ -1048,10 +1320,17 @@ class TestLicenseUpgradeDowngrade:
         license_ = await fx.service.assign_license(
             actor_user_id=None, organization_id=org_id, plan_id=big_plan.id
         )
-        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+        await fx.service.activate_license(
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
+        )
 
         downgraded = await fx.service.downgrade_license(
-            actor_user_id=None, license_id=license_.id, new_plan_id=small_plan.id
+            actor_user_id=None,
+            license_id=license_.id,
+            new_plan_id=small_plan.id,
+            requesting_organization_id=None,
         )
         assert downgraded.plan_id == small_plan.id
 
@@ -1294,7 +1573,9 @@ class TestWhiteLabelResetOnDowngrade:
             actor_user_id=None, organization_id=org_id, plan_id=plan_id
         )
         return await fx.service.activate_license(
-            actor_user_id=None, license_id=license_.id
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
         )
 
     def _fixture_with_org(
@@ -1320,7 +1601,10 @@ class TestWhiteLabelResetOnDowngrade:
         license_ = await self._active_license(fx, org_id, pro.id)
 
         await fx.service.downgrade_license(
-            actor_user_id=actor, license_id=license_.id, new_plan_id=starter.id
+            actor_user_id=actor,
+            license_id=license_.id,
+            new_plan_id=starter.id,
+            requesting_organization_id=None,
         )
 
         assert reset.calls == [(org_id, actor)]
@@ -1338,7 +1622,10 @@ class TestWhiteLabelResetOnDowngrade:
         license_ = await self._active_license(fx, org_id, enterprise.id)
 
         await fx.service.downgrade_license(
-            actor_user_id=None, license_id=license_.id, new_plan_id=business.id
+            actor_user_id=None,
+            license_id=license_.id,
+            new_plan_id=business.id,
+            requesting_organization_id=None,
         )
 
         assert reset.calls == []
@@ -1366,7 +1653,10 @@ class TestWhiteLabelResetOnDowngrade:
         license_ = await self._active_license(fx, org_id, pro.id)
 
         await fx.service.downgrade_license(
-            actor_user_id=None, license_id=license_.id, new_plan_id=crippled.id
+            actor_user_id=None,
+            license_id=license_.id,
+            new_plan_id=crippled.id,
+            requesting_organization_id=None,
         )
 
         assert reset.calls == [(org_id, None)]
@@ -1380,7 +1670,10 @@ class TestWhiteLabelResetOnDowngrade:
         license_ = await self._active_license(fx, org_id, starter.id)
 
         await fx.service.upgrade_license(
-            actor_user_id=None, license_id=license_.id, new_plan_id=pro.id
+            actor_user_id=None,
+            license_id=license_.id,
+            new_plan_id=pro.id,
+            requesting_organization_id=None,
         )
 
         assert reset.calls == []
@@ -1401,6 +1694,9 @@ class TestWhiteLabelResetOnDowngrade:
         license_ = await self._active_license(fx, org_id, pro.id)
 
         downgraded = await fx.service.downgrade_license(
-            actor_user_id=None, license_id=license_.id, new_plan_id=starter.id
+            actor_user_id=None,
+            license_id=license_.id,
+            new_plan_id=starter.id,
+            requesting_organization_id=None,
         )
         assert downgraded.plan_id == starter.id

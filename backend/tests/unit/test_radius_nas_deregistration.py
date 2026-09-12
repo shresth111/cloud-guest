@@ -168,6 +168,10 @@ async def _register_nas(fx: Any) -> Any:
     #  A fake-fidelity gap, not a production one -- filled in here rather
     #  than changing the shared fake out from under every other suite.
     result.nas_client.vendor = "MikroTik"
+    #  Same fake-fidelity gap, same reason: ``device_push_status`` carries a
+    #  column default ("pending") applied at INSERT, which a repository that
+    #  never flushes does not apply.
+    result.nas_client.device_push_status = "pending"
     return result
 
 

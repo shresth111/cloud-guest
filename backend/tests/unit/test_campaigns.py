@@ -699,6 +699,18 @@ class TestValidateAssetUrls:
     def test_accepts_image_url_only(self) -> None:
         validate_asset_urls("https://example.com/a.png", None)
 
+    def test_accepts_coupon_code_only(self) -> None:
+        # A text-and-coupon "Banner & Discounts" banner is renderable with
+        # no image or link at all -- see validators.validate_asset_urls.
+        validate_asset_urls(None, None, coupon_code="SAVE20")
+
+    def test_accepts_headline_only(self) -> None:
+        validate_asset_urls(None, None, headline="Flat 20% off this weekend")
+
+    def test_still_rejects_when_all_sources_empty(self) -> None:
+        with pytest.raises(InvalidAssetUrlsError):
+            validate_asset_urls(None, None, headline=None, coupon_code=None)
+
 
 class TestValidateDisplayRuleFields:
     def test_once_per_n_days_requires_positive_interval(self) -> None:
@@ -1183,7 +1195,13 @@ class TestResultsAggregation:
         by_id = {b.question_id: b for b in results.question_breakdowns}
         assert by_id[q1.id].option_counts == {"yes": 1, "no": 1}
         assert by_id[q2.id].average_rating == 4.0
-        assert by_id[q2.id].rating_distribution == {5: 1, 3: 1}
+        # String keys, matching what JSON actually carries. This asserted
+        # `{5: 1, 3: 1}` while the API served `{"5": 1, "3": 1}`, so the test
+        # passed on a shape no client ever received -- which is how a
+        # consumer indexing by number came to read `undefined` for every star
+        # and render an all-zero chart that looked like real "nobody rated
+        # us" data.
+        assert by_id[q2.id].rating_distribution == {"5": 1, "3": 1}
 
 
 # ============================================================================

@@ -88,6 +88,7 @@ from app.domains.router_provisioning.models import (
     RouterEvent,
     RouterHealthSnapshot,
 )
+from app.domains.router_provisioning.router import _health_snapshot_response
 from app.domains.router_provisioning.service import (
     RouterProvisioningService,
     render_template,
@@ -301,9 +302,13 @@ class FakeRouterRepository:
             (t for t in self.tokens.values() if t.token_hash == token_hash), None
         )
 
-    async def mark_provisioning_token_used(self, token, *, used_at: object):
+    async def mark_provisioning_token_used(self, token, *, used_at: object) -> bool:
+        """Mirrors the real repository's compare-and-set semantics: a
+        no-op (returning ``False``) if the token was already used."""
+        if token.used_at is not None:
+            return False
         token.used_at = used_at
-        return token
+        return True
 
 
 # ============================================================================
@@ -443,10 +448,12 @@ class FakeRouterProvisioningRepository:
             and v.router_id == router_id
         ]
 
-    async def list_variables(self, *, scope_type, page, page_size):
+    async def list_variables(self, *, scope_type, organization_id, page, page_size):
         values = [v for v in self.variables.values() if not v.is_deleted]
         if scope_type:
             values = [v for v in values if v.scope_type == scope_type]
+        if organization_id is not None:
+            values = [v for v in values if v.organization_id == organization_id]
         values.sort(key=lambda v: v.created_at, reverse=True)
         params = PageParams(page=page, page_size=page_size)
         paged = values[params.offset : params.offset + params.page_size]
@@ -1039,7 +1046,10 @@ class TestConfigVariables:
             requesting_organization_id=None,
         )
         updated = await service.update_variable(
-            actor_user_id=uuid.uuid4(), variable_id=variable.id, value="Second"
+            actor_user_id=uuid.uuid4(),
+            variable_id=variable.id,
+            requesting_organization_id=None,
+            value="Second",
         )
         assert decrypt_secret(updated.value) == "Second"
 
@@ -1053,7 +1063,9 @@ class TestConfigVariables:
             requesting_organization_id=None,
         )
         deleted = await service.delete_variable(
-            actor_user_id=uuid.uuid4(), variable_id=variable.id
+            actor_user_id=uuid.uuid4(),
+            variable_id=variable.id,
+            requesting_organization_id=None,
         )
         assert deleted.is_deleted is True
 
@@ -2339,6 +2351,154 @@ class TestTenantIsolation:
         with pytest.raises(ProvisioningJobRouterMismatchError):
             validate_job_belongs_to_router(job, router_b.id)
 
+    async def test_a_tenant_does_not_see_another_tenants_variables(self) -> None:
+        """`GET /router-templates/variables` returned every organization's
+        rows -- including, for anything not marked secret, the plaintext
+        value -- and the ids needed to address them one at a time. That is
+        what turned the two unscoped writers below from "needs a guessed
+        UUID" into "pick one off the list"."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        for organization, key in ((org_a, "a_key"), (org_b, "b_key")):
+            await service.create_variable(
+                actor_user_id=uuid.uuid4(),
+                scope_type=ConfigVariableScope.ORGANIZATION,
+                key=key,
+                value="v",
+                organization_id=organization.id,
+                requesting_organization_id=organization.id,
+            )
+
+        mine, _meta = await service.list_variables(requesting_organization_id=org_a.id)
+
+        assert [v.key for v in mine] == ["a_key"]
+
+    async def test_platform_caller_still_sees_every_tenants_variables(self) -> None:
+        """The Master console has no organization context and must keep the
+        unnarrowed view -- the fix must scope tenants, not blind the
+        platform."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        for organization, key in ((org_a, "a_key"), (org_b, "b_key")):
+            await service.create_variable(
+                actor_user_id=uuid.uuid4(),
+                scope_type=ConfigVariableScope.ORGANIZATION,
+                key=key,
+                value="v",
+                organization_id=organization.id,
+                requesting_organization_id=organization.id,
+            )
+
+        everything, _meta = await service.list_variables(
+            requesting_organization_id=None
+        )
+
+        assert {v.key for v in everything} == {"a_key", "b_key"}
+
+    async def test_a_tenant_cannot_overwrite_another_tenants_variable(self) -> None:
+        """These feed `resolve_variables`, which is what renders a router's
+        RouterOS config -- so this was a write into another tenant's device
+        configuration, not only into their data."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        theirs = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            organization_id=org_b.id,
+            requesting_organization_id=org_b.id,
+        )
+
+        with pytest.raises(CrossOrganizationVariableAccessError):
+            await service.update_variable(
+                actor_user_id=uuid.uuid4(),
+                variable_id=theirs.id,
+                requesting_organization_id=org_a.id,
+                value="attacker.pool.ntp.org",
+            )
+
+    async def test_a_tenant_cannot_delete_another_tenants_variable(self) -> None:
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        theirs = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            organization_id=org_b.id,
+            requesting_organization_id=org_b.id,
+        )
+
+        with pytest.raises(CrossOrganizationVariableAccessError):
+            await service.delete_variable(
+                actor_user_id=uuid.uuid4(),
+                variable_id=theirs.id,
+                requesting_organization_id=org_a.id,
+            )
+
+    async def test_a_tenant_cannot_overwrite_a_global_default(self) -> None:
+        """A global default (`organization_id IS NULL`) applies to every
+        tenant's routers. An organization-scoped caller cannot create one
+        -- `_resolve_variable_scope_fks` already refuses that -- so it must
+        not be able to overwrite one either, or the write path would be
+        strictly more permissive than the create path."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        platform_default = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            requesting_organization_id=None,
+        )
+
+        with pytest.raises(CrossOrganizationVariableAccessError):
+            await service.update_variable(
+                actor_user_id=uuid.uuid4(),
+                variable_id=platform_default.id,
+                requesting_organization_id=org_a.id,
+                value="attacker.pool.ntp.org",
+            )
+
+    async def test_a_tenant_can_still_manage_its_own_variable(self) -> None:
+        """The guard must refuse the neighbour without refusing the owner."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        organization = org_lookup.add()
+        mine = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            organization_id=organization.id,
+            requesting_organization_id=organization.id,
+        )
+
+        updated = await service.update_variable(
+            actor_user_id=uuid.uuid4(),
+            variable_id=mine.id,
+            requesting_organization_id=organization.id,
+            value="in.pool.ntp.org",
+        )
+
+        assert updated.value == "in.pool.ntp.org"
+
 
 # ============================================================================
 # Provisioning Engine extension: vendor adapters
@@ -2635,3 +2795,172 @@ class TestRecordFailedHealthCheck:
             await service.record_failed_health_check(
                 router_id=uuid.uuid4(), requesting_organization_id=None
             )
+
+
+class TestHealthSnapshotResponseCarriesSnmpFields:
+    """``metrics_source``/``interface_traffic_counters`` were added to
+    ``router_health_snapshots`` by migration
+    ``0079_add_snmp_device_metrics_monitoring`` and written from that day on
+    (``run_router_snmp_metrics_poll_sweep`` tags every reading it takes),
+    but ``_health_snapshot_response`` never read them -- so
+    ``GET /routers/{id}/health-history`` served SNMP-sourced and
+    RouterOS-API-sourced readings as byte-identical JSON, and the
+    per-interface traffic history was invisible over the API despite being
+    in the database.
+
+    These assert the serialiser, because the serialiser is where the drop
+    was: the service/repository layers below it return full ORM rows, and
+    no test asserted this response's field set."""
+
+    @staticmethod
+    def _snapshot(**overrides: object) -> RouterHealthSnapshot:
+        fields: dict[str, object] = {
+            "router_id": uuid.uuid4(),
+            "recorded_at": datetime.now(UTC),
+            "health_status": RouterHealthStatus.HEALTHY.value,
+            "cpu_usage_percent": 12.5,
+            "memory_usage_percent": 41.0,
+            "uptime_seconds": 7200,
+            "connected_clients_count": None,
+            "metrics_source": None,
+            "interface_traffic_counters": None,
+        }
+        fields.update(overrides)
+        return RouterHealthSnapshot(**_base_fields(**fields))
+
+    def test_snmp_reading_serialises_source_and_per_interface_counters(self) -> None:
+        # Exactly the dict run_router_snmp_metrics_poll_sweep persists --
+        # see app.domains.provisioning_engine.service.
+        snapshot = self._snapshot(
+            metrics_source="snmp",
+            interface_traffic_counters=[
+                {
+                    "if_index": 1,
+                    "if_name": "ether1",
+                    "up": True,
+                    "in_octets": 123456,
+                    "out_octets": 654321,
+                }
+            ],
+        )
+
+        response = _health_snapshot_response(snapshot)
+
+        assert response.metrics_source == "snmp"
+        assert response.interface_traffic_counters is not None
+        assert len(response.interface_traffic_counters) == 1
+        counter = response.interface_traffic_counters[0]
+        assert counter.if_index == 1
+        assert counter.if_name == "ether1"
+        assert counter.up is True
+        # Cumulative counters, passed through untouched -- never converted
+        # to a rate here (see RouterInterfaceTrafficCounter's docstring).
+        assert counter.in_octets == 123456
+        assert counter.out_octets == 654321
+
+    def test_routeros_api_reading_reports_null_counters_not_an_empty_list(
+        self,
+    ) -> None:
+        """The RouterOS-API path has no per-interface breakdown, and the
+        SNMP sweep persists ``None`` (never ``[]``) when a poll returns no
+        interfaces. ``[]`` would read as "we looked and there are zero
+        interfaces"; ``None`` is the honest "no per-interface reading was
+        taken"."""
+        snapshot = self._snapshot(
+            metrics_source="routeros_api", connected_clients_count=3
+        )
+
+        response = _health_snapshot_response(snapshot)
+
+        assert response.metrics_source == "routeros_api"
+        assert response.interface_traffic_counters is None
+
+    def test_pre_migration_reading_keeps_a_null_source_rather_than_guessing(
+        self,
+    ) -> None:
+        """Rows written before 0079 have ``metrics_source IS NULL``. Their
+        real transport is unrecorded, so the API must report ``None`` --
+        defaulting them to "routeros_api" would fabricate a provenance
+        claim the database never made."""
+        response = _health_snapshot_response(self._snapshot())
+
+        assert response.metrics_source is None
+        assert response.interface_traffic_counters is None
+
+    def test_partial_snmp_counters_stay_null_rather_than_zero(self) -> None:
+        """An SNMP agent that does not answer a given OID yields ``None``,
+        never ``0`` (see ``SnmpDeviceMetrics``' own docstring). A ``0``
+        here would render as "this interface moved no traffic", which is a
+        measurement nobody took."""
+        snapshot = self._snapshot(
+            metrics_source="snmp",
+            interface_traffic_counters=[
+                {
+                    "if_index": 2,
+                    "if_name": "ether2",
+                    "up": None,
+                    "in_octets": None,
+                    "out_octets": None,
+                }
+            ],
+        )
+
+        response = _health_snapshot_response(snapshot)
+
+        assert response.interface_traffic_counters is not None
+        counter = response.interface_traffic_counters[0]
+        assert counter.up is None
+        assert counter.in_octets is None
+        assert counter.out_octets is None
+
+
+class TestEnrollmentApprovalCannotSetPlatformCredentials:
+    """The second door onto the same secret, found while fixing the first.
+
+    ``POST /router-enrollment/{id}/approve`` is gated on
+    ``router_provisioning.approve``, which -- like ``routers.update`` --
+    ``organization-owner``/``organization-admin``/``msp-*`` hold at
+    ORGANIZATION scope. Its request schema used to carry
+    ``api_username``/``api_secret``, so closing only
+    ``RouterCreateRequest``/``RouterUpdateRequest`` would have left an
+    identical way in. Approval registers the device; the credential is set
+    afterwards via ``PUT /platform/routers/{id}/management-access``
+    (GLOBAL-only).
+    """
+
+    def test_approve_schema_carries_no_credential_field(self) -> None:
+        from app.domains.router_provisioning.schemas import (
+            RouterEnrollmentApproveRequest,
+        )
+
+        assert not {"api_username", "api_secret"} & set(
+            RouterEnrollmentApproveRequest.model_fields
+        )
+
+    def test_a_hostile_approve_payload_drops_the_credential(self) -> None:
+        from app.domains.router_provisioning.schemas import (
+            RouterEnrollmentApproveRequest,
+        )
+
+        parsed = RouterEnrollmentApproveRequest.model_validate(
+            {
+                "location_id": str(uuid.uuid4()),
+                "name": "Front Desk AP",
+                "api_username": "attacker",
+                "api_secret": "pwned",
+            }
+        )
+        assert not {"api_username", "api_secret"} & set(parsed.model_dump())
+
+    def test_the_permission_really_is_held_at_organization_scope(self) -> None:
+        """The premise, asserted rather than assumed -- same shape as
+        ``test_router.py``'s own version."""
+        from app.domains.rbac.enums import PermissionAction, PermissionModule, ScopeType
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        role = next(r for r in SYSTEM_ROLES if r.slug == "organization-owner")
+        assert role.scope_type == ScopeType.ORGANIZATION
+        assert (
+            PermissionAction.APPROVE
+            in role.grants()[PermissionModule.ROUTER_PROVISIONING]
+        )

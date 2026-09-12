@@ -86,6 +86,24 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Static platform feature catalog, not customer-specific -- same "
         "public-catalog category as GET /branding/default."
     ),
+    ("POST", "/api/v1/network-integrations/portal/authorize"): (
+        "Captive-portal network enforcement. A guest joining WiFi has no "
+        "platform login and no RBAC grants, so there is no permission to "
+        "check -- same category as GET /captive-portal/resolve and POST "
+        "/vouchers/redeem above. It authenticates nobody: by the time it is "
+        "called, app.domains.guest has already decided the guest may go "
+        "online and issued a GuestSession, and this is the step that tells "
+        "the venue's network controller to let them through (the Omada "
+        "equivalent of the MikroTik link-login-only POST). What stands in "
+        "for a permission check is proof of a genuine session, enforced in "
+        "NetworkIntegrationService.authorize_portal_client: the GuestSession "
+        "must be ACTIVE and its own organization_id AND location_id must "
+        "match the request body, and the integration is resolved from the "
+        "SESSION's venue rather than the body's, so a consistently-lying "
+        "body still cannot reach a foreign controller. Rate limited twice -- "
+        "per client IP in app.middleware.rate_limit, per guest session in "
+        "that service."
+    ),
     # -- Auth: pre-identity flows by definition --------------------------
     ("POST", "/api/v1/auth/register"): "Self-registration -- no account exists yet.",
     ("POST", "/api/v1/auth/login"): "Login -- no session exists yet.",
@@ -119,6 +137,15 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("PUT", "/api/v1/me"): "Self-service -- own profile.",
     ("GET", "/api/v1/me/organizations"): "Self-service -- own memberships.",
     ("GET", "/api/v1/me/permissions"): "Self-service -- own effective permissions.",
+    # Same category, and ungated for a specific reason: the dashboard reads
+    # entitlements to decide which features to lock, and must do that for
+    # every signed-in user. The only entitlement read was
+    # GET /customers/{id}/features, gated on `billing.read` -- which an
+    # Organization Owner holds and a front-desk staff member does not -- so
+    # the locked-feature UI worked for owners and silently failed open for
+    # staff. This one always answers for the caller's own organization,
+    # never one they name.
+    ("GET", "/api/v1/me/entitlements"): "Self-service -- own org's entitlements.",
     # -- Workspace: self-service among orgs the caller already belongs
     # to -- CurrentUser establishes identity, WorkspaceService itself
     # filters/validates membership; there is no meaningful org-scoped
@@ -144,6 +171,14 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     # -- Guest-facing: no platform user identity exists at all ---------
     ("POST", "/api/v1/guest-teams/join"): (
         "Unauthenticated guest presenting a team join code."
+    ),
+    ("GET", "/api/v1/guest-teams/open"): (
+        "Unauthenticated guest reading which teams at this portal are "
+        "joinable, for the sign-in dropdown."
+    ),
+    ("GET", "/api/v1/captive-portal-configs/{config_id}/content-image/public"): (
+        "Unauthenticated guest-portal <img> fetch of the venue's uploaded "
+        "pre-login content image -- mirrors the branding public proxies."
     ),
     # -- Device/NAS/webhook: a different, non-RBAC identity mechanism --
     ("GET", "/api/v1/agent/actions"): "Router agent -- CurrentAgent device credential.",
@@ -222,13 +257,6 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Router agent -- CurrentAgent device credential. Reports the MACs "
         "of this router's own currently-ACTIVE guest sessions for the "
         "hotspot ip-binding sync; same class as the /agent/* entries above."
-    ),
-    # -- Guest device OS, pre-identity ---------------------------------
-    ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "RFC 8908 Captive Portal API discovery document, fetched by an "
-        "unauthenticated guest device's OS via the RFC 8910 DHCP Option "
-        "114 URI -- same pre-identity guest category as GET "
-        "/captive-portal/resolve, which is allowlisted by prefix above."
     ),
     # -- Self-service data-masking step-up: CurrentUser establishes
     # identity and the OTP is always sent to the caller's *own* phone/

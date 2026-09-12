@@ -48,6 +48,26 @@ class QosTrafficRuleNotFoundError(QosError):
         )
 
 
+class CrossLocationQosTrafficRuleAccessError(QosError):
+    """A caller confined to particular sites reached a QoS rule
+    at another site.
+
+    Distinct from ``CrossOrganizationQosTrafficRuleAccessError``:
+    both sites belong to the *same* organization, so the organization
+    comparison sees nothing wrong. The row is reached by its own id,
+    so ``RequirePermission`` had nothing to pin the check to -- see
+    ``app.domains.rbac.location_scope`` for why the confinement comes
+    from the caller's grants rather than from ``X-Location-Id``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a QoS rule at a location outside "
+            "your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationQosTrafficRuleAccessError(QosError):
     """A caller acting within organization A attempted to read/mutate a
     QoS traffic rule belonging to organization B -- mirrors
@@ -120,12 +140,18 @@ class NoTrafficMatchError(QosError):
 
 class QosTrafficRuleNotEnabledError(QosError):
     """Raised by ``push_rule_to_device`` when asked to push a rule whose
-    ``is_enabled`` is ``False`` -- there is nothing correct to push: the
-    mangle mark this rule's identifier would reference is never rendered
-    by ``network_config`` for a disabled rule (see
-    ``NetworkConfigService._gather_enabled_rows``'s own ``is_enabled``
-    filter), so pushing a paired ``/queue tree`` entry anyway would create
-    a queue that references a mark nothing on the device ever sets."""
+    ``is_enabled`` is ``False``. A disabled rule is the customer saying
+    this traffic should not be prioritised; realizing its mangle mark and
+    queue tree anyway would prioritise it and report success for having
+    done so. ``network_config`` takes the same view from the other side --
+    ``NetworkConfigService._gather_enabled_rows`` filters disabled rules
+    out of the rendered script.
+
+    Note what this does *not* do: disabling an already-pushed rule leaves
+    both device objects in place. The row goes on reading ``active``, which
+    is true -- they are applied -- but nothing tears them down. That is a
+    real, separate gap, shared with every other domain here whose push
+    refuses on ``is_enabled``."""
 
     def __init__(self, rule_id: uuid.UUID) -> None:
         super().__init__(

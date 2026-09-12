@@ -24,10 +24,12 @@ __all__ = [
     "WireGuardPrivateKeyUnavailableError",
     "InvalidPeerStatusTransitionError",
     "WireGuardRouterNotEligibleError",
+    "WireGuardVendorNotSupportedError",
     "TunnelIPPoolExhaustedError",
     "TunnelIPAllocationConflictError",
     "InvalidWireGuardCidrError",
     "HubPeerListerNotConfiguredError",
+    "HubPeerAllocatorNotConfiguredError",
     "HubCannotLearnPlatformKeyError",
     "HubPeerRemovalUnsupportedError",
     "HubPeerNotOnHubError",
@@ -78,6 +80,25 @@ class HubPeerListerNotConfiguredError(WireGuardError):
         super().__init__(
             "The WireGuard hub bridge is not configured -- cannot read live "
             "fleet status",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+class HubPeerAllocatorNotConfiguredError(WireGuardError):
+    """``allocate_tunnel_via_hub`` has no ``hub_peer_allocator`` injected.
+
+    Same reasoning as ``HubPeerListerNotConfiguredError``, and for the same
+    reason it must never degrade to a local fallback: the only "local
+    fallback" available is ``create_tunnel``'s platform-generated keypair,
+    which is precisely the unusable tunnel ``HubCannotLearnPlatformKeyError``
+    exists to refuse. Failing loudly is the whole point -- a caller that
+    cannot reach the hub cannot produce a working tunnel by any other
+    means."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The WireGuard hub bridge is not configured -- cannot allocate a "
+            "tunnel the hub would actually hold",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
@@ -161,6 +182,41 @@ class WireGuardRouterNotEligibleError(WireGuardError):
             f"Router {router_id} in status '{current_status}' cannot have a "
             "WireGuard tunnel",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class WireGuardVendorNotSupportedError(WireGuardError):
+    """A WireGuard tunnel was requested for a device that does not run
+    WireGuard and never will.
+
+    Not a status problem, which is what ``WireGuardRouterNotEligibleError``
+    above reports -- that device could become eligible when someone
+    reinstates it. This one never can: a TP-Link Omada controller is
+    registered as a ``Router`` row so its venue's guests can be issued a
+    session at all (network_integration contract 11.3), and this platform
+    reaches it through its vendor's controller API, not through a tunnel.
+
+    ## Why this is a refusal and not a no-op
+
+    Because the allocation it prevents is **irreversible**. The hub agent
+    exposes ``POST /wg/peer`` and ``GET /wg/peers`` and no delete verb, so
+    every peer minted is permanent; ``next_free_ip()`` scans live kernel
+    state, so the address it consumes is gone from the hub's /24 for good.
+    Allocating one for a controller would leak both, forever, for a device
+    that cannot use either -- and nothing downstream would ever report it,
+    because a peer that never handshakes looks exactly like a device that
+    has not been configured yet.
+
+    422 rather than 409: a conflict invites a retry, and there is no later
+    moment at which this one succeeds.
+    """
+
+    def __init__(self, router_id: uuid.UUID, vendor: str) -> None:
+        super().__init__(
+            f"Router {router_id} is a '{vendor}' device, which this platform "
+            "reaches through its own controller rather than over a WireGuard "
+            "tunnel. No tunnel can be allocated for it.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
 

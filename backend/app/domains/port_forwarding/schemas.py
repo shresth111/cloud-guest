@@ -64,6 +64,12 @@ class PortForwardingRuleResponse(BaseModel):
     internal_port: int
     description: str | None
     is_enabled: bool
+    # Whether this rule actually exists on the router right now, and why not
+    # if it doesn't. Separate from is_enabled, which is only intent -- a rule
+    # can be enabled and never have reached a device.
+    device_push_status: str
+    device_push_error: str | None
+    device_pushed_at: datetime | None
     created_at: datetime
 
 

@@ -31,14 +31,22 @@ device.
 
 ## Two ports, not one -- why ``creds.extra["ssh_port"]`` exists
 
-Every read/write operation below except ``provision_device`` uses
-MikroTik's structured RouterOS API (``librouteros``, default TCP port
-8728, taken from ``creds.port``). ``provision_device`` is the one
-operation ported from ``provisioning_engine.device_adapters`` that
-genuinely needs SSH + SFTP instead (RouterOS's API protocol has no
-file-transfer primitive; ``/import`` is a file-system-level operation --
-see that module's own docstring for the full "why both librouteros AND
-asyncssh" reasoning, mirrored here unchanged). Since
+Almost every operation below uses MikroTik's structured RouterOS API
+(``librouteros``, default TCP port 8728, taken from ``creds.port``). The
+exceptions are the ones that genuinely move *files*: ``provision_device``,
+``push_config``/``verify_config``, ``backup``/``restore`` and
+``upload_file`` need SSH + SFTP, because RouterOS's API protocol has no
+file-transfer primitive and ``/import`` is a file-system-level operation
+(see ``provisioning_engine.device_adapters``'s own docstring for the full
+"why both librouteros AND asyncssh" reasoning, mirrored here unchanged).
+
+``execute_raw_command`` used to be in that SSH list and is not any more:
+port 22 is filtered on this fleet, so the Master Console device console
+timed out on commands the API answers in milliseconds. It now runs over
+the API whenever the command can be translated faithfully, and falls back
+to SSH only for the shapes the API cannot express -- see that method's own
+docstring for the incident and :func:`_console_command_to_api_sentence`
+for what "faithfully" means. Since
 ``DeviceCredentials`` (the vendor-agnostic contract type) has only one
 ``port`` field, the SSH port is read from ``creds.extra["ssh_port"]``
 (defaulting to 22 if absent/unparsable) -- exactly the escape hatch the
@@ -65,7 +73,10 @@ import hashlib
 import ipaddress
 import logging
 import re
+import shlex
+import time
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 
 import asyncssh
 import librouteros
@@ -74,22 +85,42 @@ from librouteros.exceptions import LibRouterosError
 from .contract import (
     ConnectedDevice,
     ContentFilterRuleConfig,
+    DefaultRoute,
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
+    DeviceInterfaceCounters,
     DeviceVendor,
+    DhcpOptionBinding,
+    DhcpOptionConfig,
+    DhcpOptionInfo,
+    DhcpOptionRemoval,
+    DhcpOptionSetInfo,
+    DhcpOptionSnapshot,
     DhcpPoolConfig,
+    HotspotActiveSession,
+    HotspotCertificatePush,
+    HotspotCertificatePushResult,
+    HotspotDisconnectResult,
+    HotspotSessionControl,
     InterfaceInfo,
+    IpAddressInfo,
+    NatRuleConfig,
+    NetworkSnapshot,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
+    QosPacketMarkConfig,
     QueueDeviceStatus,
     RadiusClientConfig,
     RawCommandResult,
+    RogueDhcpAlertConfig,
+    RogueDhcpAlertStatus,
     SpeedTestResult,
     TracerouteHop,
     TracerouteResult,
     VlanConfig,
+    VlanHotspotConfig,
     WanHealth,
 )
 
@@ -97,6 +128,21 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_PORT = 8728
 _DEFAULT_SSH_PORT = 22
+
+# The RouterOS menus that make up a custom DHCP option. Written out as
+# module constants because the removal path has to walk all four in a
+# fixed order and getting one of them wrong is a silent no-op.
+_DHCP_OPTION_PATH = ("ip", "dhcp-server", "option")
+_DHCP_OPTION_SET_PATH = ("ip", "dhcp-server", "option", "sets")
+_DHCP_NETWORK_PATH = ("ip", "dhcp-server", "network")
+# Every menu whose rows can hand a DHCP option to clients, paired with the
+# field that identifies a row to a human. ``/ip dhcp-server`` itself is
+# deliberately absent: it carries no ``dhcp-option``/``dhcp-option-set``
+# field, and probing it would only add a round trip that can never match.
+_DHCP_OPTION_BINDING_PATHS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (_DHCP_NETWORK_PATH, "address"),
+    (("ip", "dhcp-server", "lease"), "address"),
+)
 # ported from provisioning_engine/device_adapters.py's own module-level
 # filename constants -- push_config/verify_config and backup/restore each
 # round-trip through the *same* filename, so they must stay in sync with
@@ -114,10 +160,290 @@ _PROVISIONING_ENGINE_BACKUP_FILENAME = "cloudguest-backup.backup"
 # *values* identical across both copies is what keeps them describing the
 # same real device-side objects.
 _CONTENT_FILTER_SINKHOLE_ADDRESS = "127.0.0.1"
+# Stamped on the ``/radius`` NAS row this platform manages. Not used as
+# the lookup key -- see ``set_radius_client_config`` for why the natural
+# key (service + server address) is, and why an existing hand-written row
+# is adopted rather than duplicated.
+_RADIUS_CLIENT_COMMENT = "WyfyGuest RADIUS NAS client"
 _CONTENT_FILTER_ADDRESS_LIST_NAME = "wyfyguest-content-filter-blocked"
+# Rogue DHCP detection: the marker stamped on every ``/ip dhcp-server
+# alert`` row this platform manages.
+#
+# Deliberately the SAME literal the hand-run probe
+# (``cloud-guest-repo/backend/ops/probes/setup_dhcp_alert.py``) already
+# wrote onto the lab router. RouterOS holds one alert per interface, so a
+# different marker here would not add a second row -- it would make the
+# writer fail to recognize its own predecessor's work and leave the
+# operator's carefully-checked rows unmanaged. The marker is not the lookup
+# key (the interface is -- see ``configure_rogue_dhcp_alerts``); it is what
+# tells an operator reading ``/ip dhcp-server alert`` on the device, and
+# the reader's ``managed`` flag, where a row came from.
+_ROGUE_DHCP_ALERT_COMMENT = "cloudguest-rogue-dhcp-watch"
 _CONTENT_FILTER_ENFORCEMENT_COMMENT = (
     "Wyfy Guest content filtering: block listed addresses"
 )
+# The marker that makes one content-filtering rule's own objects findable
+# again on the next push, exactly as ``_NAT_RULE_COMMENT_PREFIX`` does for a
+# VLAN's masquerade rule. It is deliberately built from the rule's id rather
+# than from anything RouterOS matches on: ``name``/``regexp``/``address``
+# are the blocked target -- the one field a customer edits -- and ``label``
+# is the name they gave it, so keying on either leaves the previous objects
+# behind still blocking a site the customer already unblocked. See
+# ``configure_content_filter_rule``'s own docstring.
+_CONTENT_FILTER_RULE_COMMENT_PREFIX = "WyfyGuest content filter "
+# Appended to the marker of the second, subdomain-matching DNS entry, so the
+# two entries one domain rule creates stay individually addressable.
+_CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX = " (subdomains)"
+# NAT / internet access: the marker that makes one VLAN's masquerade rule
+# findable again on the next push. It is deliberately the rule's *identity*
+# rather than any of its RouterOS fields -- ``src-address`` is exactly what
+# an operator edits, so keying on it would leave the old rule behind and add
+# a second one. See ``configure_nat_masquerade``'s own docstring.
+_NAT_RULE_COMMENT_PREFIX = "WyfyGuest VLAN "
+# QoS: the same marker trick again, for the ``/ip firewall mangle`` rule
+# that sets one QoS rule's packet mark. Every RouterOS field on that rule --
+# ``protocol``, ``dst-port``, ``dscp``, even ``new-packet-mark`` itself,
+# which is derived from the customer's own rule name -- is something an
+# edit changes, so the row id is the only stable handle. See
+# ``configure_qos_packet_mark``'s own docstring.
+_QOS_MANGLE_COMMENT_PREFIX = "WyfyGuest qos "
+# The mangle fields that carry a QoS rule's *match*. Listed so a rule
+# re-typed between a port-range match and a DSCP one can be detected: the
+# fields the old match used are still on the device row and are not in the
+# new desired set, and RouterOS's update has no way to unset them.
+_QOS_MANGLE_MATCH_FIELDS = ("protocol", "dst-port", "dscp")
+# WAN failover: the markers on the two objects ``ensure_wan_egress`` may add
+# so that traffic leaving a newly-preferred uplink is masqueraded and treated
+# as WAN-facing.
+#
+# INTERFACE-DERIVED, AND ONE PER INTERFACE ON PURPOSE. The alternative --
+# a single "the failover masquerade" rule whose ``out-interface`` is
+# rewritten on every failover -- is a *mutation of a live router-wide NAT
+# rule*, which is the class of change that took a guest network down on
+# 2026-08-18. Keyed per interface, every push this makes is an ADD of an
+# object that did not exist, and an add cannot break what already works: a
+# masquerade rule matches only traffic that actually leaves its own
+# ``out-interface``, so the rule for a backup uplink is inert for as long as
+# nothing is routed that way.
+_UPLINK_NAT_COMMENT_PREFIX = "cloudguest-nat-uplink-"
+_UPLINK_WAN_LIST_COMMENT_PREFIX = "cloudguest-wanlist-uplink-"
+# Fields that narrow a masquerade rule to less than "everything leaving this
+# interface". A rule carrying any of them may be someone else's deliberately
+# scoped NAT (one VLAN's own ``WyfyGuest VLAN <id>`` rule is exactly this
+# shape, with ``src-address`` set) and is therefore NOT evidence that guest
+# traffic in general is masqueraded out of that interface.
+_NAT_NARROWING_FIELDS = (
+    "src-address",
+    "src-address-list",
+    "dst-address",
+    "dst-address-list",
+    "in-interface",
+    "in-interface-list",
+    "protocol",
+    "src-port",
+    "dst-port",
+    "port",
+)
+
+
+def _uplink_nat_comment(interface: str) -> str:
+    return f"{_UPLINK_NAT_COMMENT_PREFIX}{interface}"
+
+
+def _uplink_wan_list_comment(interface: str) -> str:
+    return f"{_UPLINK_WAN_LIST_COMMENT_PREFIX}{interface}"
+
+
+def _nat_rule_comment(vlan_id: int) -> str:
+    return f"{_NAT_RULE_COMMENT_PREFIX}{vlan_id}"
+
+
+# Port forwarding: the same marker trick, for the same reason. The handle
+# is the caller's own row id, because every RouterOS field on a DSTNAT rule
+# -- dst-port, to-addresses, to-ports, protocol -- is one a customer edits.
+# ``<prefix><rule_id> <protocol>``: one device rule per transport, because a
+# "both" rule cannot be expressed as one (see ``configure_port_forward``),
+# and the trailing token keeps the two apart without giving up the row's
+# single identity.
+_PORT_FORWARD_COMMENT_PREFIX = "WyfyGuest PF "
+# The transports a "both" rule really means on a device.
+_PORT_FORWARD_BOTH_PROTOCOLS = ("tcp", "udp")
+
+
+def _port_forward_comment(rule_id: str, protocol: str) -> str:
+    return f"{_PORT_FORWARD_COMMENT_PREFIX}{rule_id} {protocol}"
+
+
+def _port_forward_protocols(protocol: str) -> tuple[str, ...]:
+    """Which transports one stored rule occupies on the device.
+
+    ``both`` is a value this platform's own port-forwarding domain stores
+    and defaults to, not a RouterOS one: ``dst-port`` is only accepted
+    alongside a tcp or udp ``protocol``, so a single rule cannot say it.
+    ``render_port_forwarding_rule`` handles the same case by omitting
+    ``protocol=`` entirely, which a real router rejects.
+    """
+    if protocol.strip().lower() == "both":
+        return _PORT_FORWARD_BOTH_PROTOCOLS
+    return (protocol,)
+
+
+def _owns_port_forward_comment(comment: object, rule_id: str) -> bool:
+    """Whether a ``/ip firewall nat`` row belongs to this stored rule.
+
+    Prefix-matched on the id and then on a separator, never on the bare
+    prefix: matching ``"WyfyGuest PF <id>"`` alone would also claim a row
+    belonging to a rule whose id merely starts with these characters.
+    """
+    if not isinstance(comment, str):
+        return False
+    owner = f"{_PORT_FORWARD_COMMENT_PREFIX}{rule_id}"
+    return comment == owner or comment.startswith(f"{owner} ")
+def _qos_marker(rule_id: str) -> str:
+    """The identity half of a QoS mangle rule's comment.
+
+    Ends in ``": "`` for the reason :func:`_content_filter_marker` does:
+    the customer's own label follows in the same field, and the marker of
+    one rule must never be a prefix of another's.
+    """
+    return f"{_QOS_MANGLE_COMMENT_PREFIX}{rule_id}: "
+
+
+def _qos_comment(rule_id: str, label: str, priority: int) -> str:
+    """The whole comment: identity first, then what an operator reading
+    ``/ip firewall mangle`` on the router needs to recognize the rule --
+    the customer's name for it and the priority the paired queue applies.
+
+    The priority is *not* configuration here; the ``/queue tree`` entry is
+    what actually sets it. It rides along in the comment because a mangle
+    rule read in isolation otherwise says nothing about what the mark is
+    worth, and ``network_config.renderers.render_qos_traffic_rule``'s own
+    rendered comment already carried it.
+    """
+    return f"{_qos_marker(rule_id)}{label} (priority={priority})"
+
+
+def _qos_mangle_fields(rule: QosPacketMarkConfig) -> dict[str, str]:
+    """The desired ``/ip firewall mangle`` row for one QoS rule.
+
+    Deliberately the same command shape
+    ``network_config.renderers.render_qos_traffic_rule`` already emits --
+    ``chain=prerouting``, the port-range or DSCP match, ``mark-packet``,
+    ``passthrough=no`` -- so a router that has had a config script pushed
+    and a router pushed directly through this method end up carrying the
+    same rule, not two competing ideas of one.
+    """
+    fields: dict[str, str] = {"chain": "prerouting"}
+    if rule.port_range_start is not None and rule.port_range_end is not None:
+        if rule.protocol:
+            fields["protocol"] = rule.protocol
+        fields["dst-port"] = f"{rule.port_range_start}-{rule.port_range_end}"
+    else:
+        fields["dscp"] = str(rule.dscp_value)
+    fields["action"] = "mark-packet"
+    fields["new-packet-mark"] = rule.packet_mark
+    fields["passthrough"] = "no"
+    fields["comment"] = _qos_comment(rule.rule_id, rule.label, rule.priority)
+    return fields
+
+
+def _content_filter_marker(rule_id: str, *, subdomains: bool = False) -> str:
+    """The identity half of a content-filtering object's comment.
+
+    Ends in ``": "`` so the customer's own label can follow it in the same
+    field without the marker ever being a prefix of another rule's -- and
+    so the non-subdomain marker is not a prefix of the subdomain one, which
+    branches at ``" ("`` before the colon is reached.
+    """
+    suffix = _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX if subdomains else ""
+    return f"{_CONTENT_FILTER_RULE_COMMENT_PREFIX}{rule_id}{suffix}: "
+
+
+def _content_filter_comment(
+    rule_id: str, label: str, *, subdomains: bool = False
+) -> str:
+    """The whole comment: identity first, then the customer's label.
+
+    The label is carried onto the device rather than dropped because it is
+    the only thing that tells an operator reading ``/ip dns static`` on the
+    router what a sinkholed name is for. It is mutable, and treated as
+    such: a renamed rule updates this field in place, found by the marker
+    the rename cannot touch.
+    """
+    return f"{_content_filter_marker(rule_id, subdomains=subdomains)}{label}"
+
+
+class _HotspotNames:
+    """The six RouterOS object names one VLAN's captive portal occupies.
+
+    Derived from ``vlan_id`` alone, exactly as
+    ``network_config.renderers._render_vlan_hotspot`` derives them, so a
+    portal this adapter pushes and the same portal rendered into a config
+    script are the same objects rather than two competing sets. ``vlan_id``
+    is the real, per-router-unique identity; the VLAN's display name is
+    not unique and never appears in an object name.
+    """
+
+    __slots__ = ("tag", "pool", "dhcp_server", "profile", "server")
+
+    def __init__(self, vlan_id: int) -> None:
+        self.tag = f"vlan{vlan_id}"
+        self.pool = f"{self.tag}-hs-pool"
+        self.dhcp_server = f"{self.tag}-hs-dhcp"
+        self.profile = f"{self.tag}-hsprof"
+        self.server = f"{self.tag}-hotspot"
+
+    @property
+    def dns_comment(self) -> str:
+        return f"{self.tag}-hotspot-dns-name"
+
+    @property
+    def network_owner(self) -> str:
+        """Marker stamped on this portal's ``/ip dhcp-server network`` row.
+
+        A DHCP pool on the same subnet writes a row keyed identically --
+        RouterOS identifies that row by subnet alone -- so without a marker
+        one feature's teardown silently removes the other's.
+        """
+        return f"WyfyGuest portal {self.tag}"
+
+
+def _hotspot_pool_range(cidr: str, gateway: str) -> str | None:
+    """The address range a VLAN's captive portal hands out: the largest
+    run of hosts in ``cidr`` that does not contain ``gateway``.
+
+    ``_render_vlan_hotspot`` computes this as "every host except the
+    gateway", then emits ``first-last`` -- which is the same answer
+    whenever the gateway sits at either end of the subnet (``.1`` in a
+    ``/24``, the shape every VLAN this platform creates actually has), and
+    a real defect when it does not: with a gateway at ``.100`` the emitted
+    ``.1-.254`` spans it, and the DHCP server can lease the router's own
+    address to a guest. Taking the largest gateway-free run instead is
+    identical in the common case and correct in the uncommon one.
+
+    ``None`` when the subnet has no host left to hand out -- a ``/32``,
+    a ``/31``, or a gateway that is the only host. The caller refuses
+    rather than pushing a pool with an empty range.
+    """
+    network = ipaddress.ip_network(cidr, strict=False)
+    gateway_ip = ipaddress.ip_address(gateway)
+    runs: list[list[object]] = []
+    current: list[object] = []
+    for host in network.hosts():
+        if host == gateway_ip:
+            if current:
+                runs.append(current)
+                current = []
+            continue
+        current.append(host)
+    if current:
+        runs.append(current)
+    if not runs:
+        return None
+    widest = max(runs, key=len)
+    return f"{widest[0]}-{widest[-1]}"
+
+
 _MAC_ADDRESS_PATTERN = re.compile(
     r"^([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})"
     r"[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})$"
@@ -171,6 +497,61 @@ class MikroTikConnectionError(MikroTikDeviceError):
     caught there at all and propagates as a real exception). Callers that
     need to preserve that distinction should catch this subclass first,
     then the base class."""
+
+
+class MikroTikWanInterfaceError(MikroTikDeviceError):
+    """Raised when the router's own WAN-facing interface cannot honestly
+    be determined from its live state -- see
+    :meth:`MikroTikAdapter.resolve_wan_interface`.
+
+    A distinct type because the caller genuinely wants to distinguish it:
+    every other failure here means "the device rejected an operation", but
+    this one means "the device is not currently telling us where the
+    internet is", which is a real, operator-fixable condition (no usable
+    default route, or a default route whose gateway sits on no known
+    interface) and reads as nonsense when reported as a NAT push failure.
+
+    Deliberately raised instead of falling back to a guess. Masquerading
+    out of the wrong interface does not fail loudly -- it silently NATs
+    guest traffic onto an internal segment, or matches nothing at all and
+    leaves a VLAN with no internet while the push reports success."""
+
+
+class MikroTikRouteNotFoundError(MikroTikDeviceError):
+    """A caller named an interface that has no ``0.0.0.0/0`` route in the
+    device's own ``main`` table.
+
+    Distinct from :class:`MikroTikWanInterfaceError`, which is "the device
+    will not say where the internet is at all". This one is narrower and
+    more alarming: the platform believes an uplink terminates on this
+    interface and the router has no default route there, so the two
+    disagree about the site's topology. Failing over onto it would produce
+    a dashboard that names an uplink no traffic can use."""
+
+
+class MikroTikAmbiguousRouteError(MikroTikDeviceError):
+    """More than one default route resolves to the same interface, or more
+    than one shares the lowest distance on the device.
+
+    Both are states where "which route is the preferred one" has no single
+    answer, and both are states a distance change would make worse rather
+    than better -- two routes tied at the lowest distance is RouterOS load
+    sharing, and lowering a third to join them adds a third share.
+    Refused rather than resolved by picking the first row, because row
+    order in a RouterOS reply is not a decision anyone made."""
+
+
+class MikroTikImmutableRouteError(MikroTikDeviceError):
+    """The route that would have to be modified is ``dynamic`` -- RouterOS
+    created it itself (a dhcp-client's own auto-route) and refuses
+    ``/ip route set`` on it.
+
+    Checked before the write rather than discovered from the device's
+    refusal, so the error names the interface and says what an operator can
+    do about it (this platform's own Setup Script generator provisions a
+    *static* default route per WAN precisely so this case does not arise --
+    a router showing this one was not provisioned by it, or has had its
+    routes replaced since)."""
 
 
 def normalize_mac_address(value: object) -> str | None:
@@ -253,6 +634,183 @@ def _describe_exception(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+# ============================================================================
+# Raw-console command translation: RouterOS CLI text -> a RouterOS API
+# sentence. See ``MikroTikAdapter.execute_raw_command``'s own docstring for
+# why the console runs over the API (8728) rather than SSH (22).
+# ============================================================================
+
+# A bare (non ``key=value``) console token is only ever a menu segment or a
+# command word. Anything outside this shape -- ``[find ...]``, ``:put``,
+# ``$var``, a ``;``-chained second command, a redirect -- has no API-sentence
+# equivalent, and *guessing* one would run something other than what the
+# operator typed. Those commands are handed to the SSH fallback instead.
+_CONSOLE_BARE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_CONSOLE_ARG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# RouterOS CLI keywords that read as bare words but are *not* menu segments.
+# ``/interface print where running=yes`` naively concatenates to the
+# nonexistent path ``/interface/print/where``; the API expresses that filter
+# as a query word instead, which this translator deliberately does not try to
+# construct. Presence of any of these means "not translatable".
+_CONSOLE_CLI_ONLY_KEYWORDS = frozenset(
+    {
+        "where",
+        "from",
+        "do",
+        "as-value",
+        "follow",
+        "follow-only",
+        "without-paging",
+        "detail",
+        "brief",
+        "terse",
+        "count-only",
+        "file",
+        "append",
+        "value-list",
+    }
+)
+
+# RouterOS command words -- the verb that terminates a menu path. A
+# translatable command's LAST bare token must be one of these, and no
+# earlier token may be.
+#
+# This is what keeps *positional* CLI syntax out. ``/user set admin
+# password=x`` is a real command an operator might type, and naive
+# concatenation turns it into the nonexistent path ``/user/set/admin``
+# (the API expresses that target as a ``.id``/``numbers`` word, not a path
+# segment). Requiring the verb to come last rejects it, and the SSH
+# fallback then reports honestly instead of the platform issuing a sentence
+# nobody asked for.
+#
+# The list is deliberately conservative and incomplete. A command whose
+# verb is not here is not translated -- it is not mangled -- so growing
+# this set is a safe, additive change, while a wrong entry is not.
+_ROUTEROS_ACTION_WORDS = frozenset(
+    {
+        "add",
+        "backup",
+        "blink",
+        "cancel",
+        "check-for-updates",
+        "clear",
+        "comment",
+        "disable",
+        "discover",
+        "download",
+        "enable",
+        "export",
+        "find",
+        "flush",
+        "get",
+        "install",
+        "load",
+        "monitor",
+        "move",
+        "ping",
+        "print",
+        "reboot",
+        "refresh",
+        "register",
+        "release",
+        "remove",
+        "renew",
+        "reset",
+        "reset-configuration",
+        "reset-counters",
+        "resolve",
+        "restart",
+        "restore",
+        "run",
+        "save",
+        "scan",
+        "send",
+        "set",
+        "shutdown",
+        "sign",
+        "start",
+        "stop",
+        "unset",
+        "upgrade",
+    }
+)
+
+
+def _console_command_to_api_sentence(
+    command: str,
+) -> tuple[str, dict[str, str]] | None:
+    """Translates one RouterOS console line into ``(sentence, arguments)``
+    for ``librouteros``' raw calling form (``api("/interface/print")``), or
+    returns ``None`` when the line cannot be translated *faithfully*.
+
+    ``None`` is not a failure -- it means "this command's meaning is not
+    expressible as a single API sentence", and the caller falls back to the
+    SSH transport rather than running an approximation of what the operator
+    asked for. Translating conservatively and refusing loudly is the whole
+    point: a console that silently runs a *different* command than the one
+    typed is worse than one that cannot run it at all.
+    """
+    try:
+        tokens = shlex.split(command.strip())
+    except ValueError:  # unbalanced quotes -- let SSH's own parser judge it
+        return None
+    if not tokens or not tokens[0].startswith("/"):
+        return None
+
+    segments: list[str] = []
+    arguments: dict[str, str] = {}
+    seen_argument = False
+    for index, token in enumerate(tokens):
+        name, separator, value = token.partition("=")
+        if separator and not token.startswith("/"):
+            if not _CONSOLE_ARG_NAME_RE.match(name):
+                return None
+            arguments[name] = value
+            seen_argument = True
+            continue
+        # A bare word after arguments have started is a second command or a
+        # CLI construct, never a menu segment.
+        if seen_argument:
+            return None
+        bare = token.lstrip("/") if index == 0 else token
+        if index > 0 and bare in _CONSOLE_CLI_ONLY_KEYWORDS:
+            return None
+        if not _CONSOLE_BARE_TOKEN_RE.match(bare):
+            return None
+        segments.extend(part for part in bare.split("/") if part)
+
+    # A menu path alone (``/interface``) only opens a submenu on the CLI; it
+    # is not a command the API can execute. Needs at least menu + verb.
+    if len(segments) < 2:
+        return None
+    # The verb terminates the path, and appears exactly once. Anything else
+    # means a positional argument or a second command is in play -- see
+    # ``_ROUTEROS_ACTION_WORDS``.
+    if segments[-1] not in _ROUTEROS_ACTION_WORDS:
+        return None
+    if any(segment in _ROUTEROS_ACTION_WORDS for segment in segments[:-1]):
+        return None
+    return "/" + "/".join(segments), arguments
+
+
+def _format_console_rows(rows: Sequence[Mapping[str, object]]) -> str:
+    """Renders RouterOS API reply rows as console-style text.
+
+    The API answers with structured rows where the CLI answers with a text
+    table, so this is the one place the two transports genuinely differ in
+    what an operator sees. ``key=value`` per row (``.id`` first, since that
+    is what a follow-up command needs) is chosen over imitating the CLI's
+    column layout because it is unambiguous: no truncated columns, and no
+    value silently reformatted to fit a width."""
+    lines: list[str] = []
+    for index, row in enumerate(rows):
+        ordered = sorted(row.items(), key=lambda item: (item[0] != ".id", item[0]))
+        rendered = " ".join(f"{key}={value}" for key, value in ordered)
+        lines.append(f"{index:>3} {rendered}".rstrip())
+    return "\n".join(lines)
+
+
 def _domain_subdomain_regex(domain: str) -> str:
     """Ported verbatim from
     ``network_config/renderers.py::_domain_subdomain_regex`` -- the real
@@ -262,6 +820,295 @@ def _domain_subdomain_regex(domain: str) -> str:
     ``configure_content_filter_rule``'s own docstring)."""
     escaped = domain.replace(".", r"\.")
     return f"^.*\\.{escaped}$"
+
+
+def _routeros_seconds(value: object) -> int | None:
+    """A RouterOS duration in seconds, or ``None`` if it is not one.
+
+    RouterOS accepts ``600s`` on write and answers the read with ``10m``.
+    Comparing the two as strings can never match, so a write guarded by
+    ``row.get(key) != value`` re-issues its ``set`` on **every** push,
+    forever -- the exact defect this file already documents fixing for
+    ``disabled``, in a field nobody re-checked. Observed on real hardware:
+    a DHCP server push issued ``set lease-time=600s`` on every call.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    total, number = 0, ""
+    for char in text:
+        if char.isdigit():
+            number += char
+        elif char in units and number:
+            total += int(number) * units[char]
+            number = ""
+        else:
+            return None
+    if number:  # a bare count of seconds, e.g. "600"
+        total += int(number)
+    return total
+
+
+def _same_routeros_duration(current: object, wanted: object) -> bool:
+    """Whether two RouterOS durations mean the same span of time."""
+    a, b = _routeros_seconds(current), _routeros_seconds(wanted)
+    return a is not None and a == b
+
+
+def _same_routeros_path(current: object, wanted: object) -> bool:
+    """Whether two RouterOS file paths name the same directory.
+
+    ``html-directory=cloudguest-hotspot`` is stored and read back as
+    ``flash/cloudguest-hotspot`` on a device with flash storage -- observed
+    on real hardware. Same consequence as the duration case: a pointless
+    ``set`` on every push. Compared on the trailing segment, which is the
+    part this platform chooses; the prefix is the device's own storage
+    layout.
+    """
+    if current is None or wanted is None:
+        return False
+    return (
+        str(current).strip("/").split("/")[-1]
+        == str(wanted).strip("/").split("/")[-1]
+    )
+
+
+def _routeros_row_index(raw_id: object) -> int | None:
+    """RouterOS's own ``.id`` for a row (``"*1"``, ``"*A"``, ...) as an int.
+
+    The leading ``*`` is a sigil, and what follows it is **hexadecimal**
+    -- ``"*A"`` is 10. Reading it as decimal raises on exactly the rows
+    past the ninth, which is why this is a named function with a test
+    rather than an inline ``int(...)``.
+
+    Returns ``None`` for anything that is not that shape, so a caller can
+    skip the row instead of inventing an index for it.
+    """
+    text = str(raw_id).strip()
+    if not text.startswith("*"):
+        return None
+    try:
+        return int(text[1:], 16)
+    except ValueError:
+        return None
+
+
+def _interface_counters_from_rows(
+    rows: list[dict[str, object]],
+) -> tuple[DeviceInterfaceCounters, ...] | None:
+    """RouterOS ``/interface`` rows -> the shape the health snapshot stores.
+
+    Returns ``None`` -- never ``()`` -- for an empty read, because the
+    column this ends up in treats "nothing" as "no per-interface reading
+    was taken" and an empty list as "we looked and there were none". A
+    router that answered a poll always has interfaces, so an empty list
+    here could only ever be a lie about a failed read.
+
+    ``lo`` is dropped, matching ``_read_network_snapshot_sync``: it is
+    RouterOS's loopback, it carries no traffic anyone charts, and letting
+    it through would put a permanently flat series in front of the
+    operator on every device.
+
+    Counters are read with ``default=None``, not ``0``. An absent
+    ``rx-byte`` means the field was not reported; charting it as zero
+    invents an idle interface, and makes the *next* poll's delta enormous
+    when the real counter reappears.
+    """
+    counters: list[DeviceInterfaceCounters] = []
+    for row in rows:
+        raw_name = row.get("name")
+        if not raw_name:
+            continue
+        name = str(raw_name)
+        if name == "lo":
+            continue
+        if_index = _routeros_row_index(row.get(".id"))
+        if if_index is None:
+            # No usable identity for the series this row would join.
+            continue
+        counters.append(
+            DeviceInterfaceCounters(
+                if_index=if_index,
+                if_name=name,
+                if_oper_status_up=_is_truthy(row.get("running", False)),
+                in_octets=_safe_int(row.get("rx-byte"), default=None),
+                out_octets=_safe_int(row.get("tx-byte"), default=None),
+            )
+        )
+    return tuple(counters) or None
+
+
+# How long a hotspot-certificate push waits for the device to agree that a
+# write landed before treating it as not having landed. Six reads half a
+# second apart, i.e. up to ~2.5s -- generously more than the ``:delay 1s``
+# each of these replaces in ``renew-hotspot-certs.sh``, and still short
+# enough that a genuinely silent no-op is reported inside one push.
+_SETTLE_ATTEMPTS = 6
+_SETTLE_DELAY_SECONDS = 0.5
+
+
+def _dns_name_covered(dns_name: str | None, san_names: Sequence[str]) -> bool:
+    """Whether a certificate carrying ``san_names`` is actually valid for
+    the hostname a hotspot profile redirects guests to.
+
+    Wildcard-aware in the one way X.509 defines and no further:
+    ``*.portal.wyfyguest.com`` covers ``site42.portal.wyfyguest.com`` and
+    does **not** cover ``portal.wyfyguest.com`` or
+    ``a.b.portal.wyfyguest.com``. Getting this wrong in the permissive
+    direction would wave through a push whose only visible effect is a
+    full-screen certificate warning on every guest device -- so an empty or
+    unreadable ``dns-name`` is treated as not covered, never as "probably
+    fine".
+    """
+    if not dns_name:
+        return False
+    host = dns_name.strip().lower().rstrip(".")
+    if not host:
+        return False
+    for raw in san_names:
+        san = str(raw).strip().lower().rstrip(".")
+        if not san:
+            continue
+        if san == host:
+            return True
+        if san.startswith("*."):
+            suffix = san[1:]  # ".portal.wyfyguest.com"
+            if host.endswith(suffix) and "." not in host[: -len(suffix)]:
+                return True
+    return False
+
+
+def _login_by_tokens(value: str | None) -> frozenset[str]:
+    """A RouterOS ``login-by`` list as a set of methods.
+
+    Compared as a set, never as a string: the API accepts
+    ``"https,http-pap"`` on write and is free to answer the read in its own
+    order, so a string comparison would report every correctly-rebound
+    profile as a failed rebind.
+    """
+    if not value:
+        return frozenset()
+    return frozenset(
+        token.strip().lower() for token in str(value).split(",") if token.strip()
+    )
+
+
+def _is_truthy(value: object) -> bool:
+    """RouterOS booleans, read back honestly.
+
+    The API answers a read with a real ``bool``, but accepts ``"no"``/
+    ``"yes"``/``"true"``/``"false"`` on write, and a fake or an older
+    firmware may hand back either shape. Comparing the raw value against a
+    string is how an idempotent write turns into an update issued on every
+    single push.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "yes"}
+
+
+def _split_routeros_list(value: object) -> tuple[str, ...]:
+    """Split one of RouterOS's comma-separated list fields (``options`` on
+    an option set, ``dhcp-option`` on a network/lease row) into its
+    entries, dropping the empties an absent field and a trailing comma both
+    produce.
+
+    Kept apart from :func:`_split_valid_servers`, which canonicalises MAC
+    addresses on the way through. These entries are *names*, and
+    upper-casing them would stop them matching the option they refer to.
+    """
+    if value is None:
+        return ()
+    return tuple(part.strip() for part in str(value).split(",") if part.strip())
+
+
+def _split_valid_servers(value: object) -> tuple[str, ...]:
+    """A RouterOS ``valid-server`` list, split and canonicalized.
+
+    Entries that are real MAC addresses come back in
+    :func:`normalize_mac_address`'s canonical uppercase form. Anything
+    else is kept **verbatim rather than dropped**: a reader that silently
+    discards what it cannot parse reports a shorter trusted list than the
+    device actually has, which on this field means telling an operator a
+    server is untrusted while the router happily accepts it.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, list | tuple):
+        parts = [str(item) for item in value]
+    else:
+        parts = str(value).split(",")
+    servers: list[str] = []
+    for part in parts:
+        text = part.strip()
+        if not text:
+            continue
+        servers.append(normalize_mac_address(text) or text)
+    return tuple(servers)
+
+
+def _same_valid_servers(current: object, wanted: tuple[str, ...]) -> bool:
+    """Whether the device already trusts exactly these DHCP servers.
+
+    Compared as a *set of canonicalized entries*, never as the raw string.
+    RouterOS answers with its own uppercase form and in its own order, so
+    a caller that supplied a lowercase MAC -- or the same two servers the
+    other way round -- would differ on every single read and this writer
+    would re-issue the identical ``set`` forever. That is the string-
+    compare trap :func:`_is_truthy` exists for on ``disabled`` and
+    :func:`_routeros_seconds` on durations, in a third field with a third
+    shape.
+    """
+    return set(_split_valid_servers(current)) == set(wanted)
+
+
+_RATE_SUFFIX_MULTIPLIERS = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
+
+
+def _rate_to_bps(value: object) -> int | None:
+    """RouterOS rate fields, read back honestly -- :func:`_is_truthy`'s
+    sibling for numbers.
+
+    ``max-limit=0k`` is what goes out on the wire and ``0`` is what comes
+    back; ``1000k`` goes out and ``1000000`` comes back. Comparing the raw
+    values as strings is how an idempotent write turns into an update
+    issued on every single push. Returns ``None`` for anything that is not
+    a rate, so a caller can fall back to comparing it some other way rather
+    than silently treating two unparseable values as equal.
+    """
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    multiplier = 1
+    if text[-1] in _RATE_SUFFIX_MULTIPLIERS:
+        multiplier = _RATE_SUFFIX_MULTIPLIERS[text[-1]]
+        text = text[:-1]
+    try:
+        return int(float(text) * multiplier)
+    except ValueError:
+        return None
+
+
+def _queue_tree_field_differs(field: str, current: object, desired: str) -> bool:
+    """Whether a ``/queue tree`` row's field really differs from what is
+    wanted, comparing each field in the shape RouterOS answers reads in
+    rather than as raw text. See :meth:`MikroTikAdapter.create_queue_tree`.
+    """
+    if field == "max-limit":
+        current_bps, desired_bps = _rate_to_bps(current), _rate_to_bps(desired)
+        if current_bps is not None and desired_bps is not None:
+            return current_bps != desired_bps
+    if field == "priority":
+        # RouterOS answers an integer field with an int on some firmware and
+        # a string on others; the write is always a string.
+        try:
+            return int(str(current)) != int(desired)
+        except (TypeError, ValueError):
+            pass
+    return str(current if current is not None else "") != desired
 
 
 def _smallest_enclosing_network(
@@ -303,6 +1150,19 @@ class MikroTikAdapter:
             )
         except (LibRouterosError, OSError) as exc:
             raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
+
+    @staticmethod
+    def _safe_close(api) -> None:  # noqa: ANN001
+        """Best-effort ``api.close()`` for ``finally`` blocks whose command
+        may have died with the socket. ``close()`` on an already-broken
+        connection can itself raise, which would mask the real error the
+        command raised -- or turn a clean result into a spurious failure.
+        (From wyfy-device-gateway#1, folded in when this copy became the
+        canonical one.)"""
+        try:
+            api.close()
+        except (LibRouterosError, OSError, EOFError):
+            pass
 
     def _ssh_port(self, creds: DeviceCredentials) -> int:
         return _safe_int(creds.extra.get("ssh_port"), default=_DEFAULT_SSH_PORT) or (
@@ -411,9 +1271,94 @@ class MikroTikAdapter:
                     disabled=bool(row.get("disabled", False)),
                     bridge=bridge_of.get(name),
                     has_ip_address=name in has_ip,
+                    is_bridge_port=name in bridge_of,
+                    mac_address=(
+                        str(row.get("mac-address"))
+                        if row.get("mac-address")
+                        else None
+                    ),
                 )
             )
         return result
+
+    async def read_network_snapshot(self, creds: DeviceCredentials) -> NetworkSnapshot:
+        """Every interface and every ``/ip address`` on the device, in one
+        connection, filtered by nothing but ``lo``.
+
+        Not a variant of :meth:`get_interface_list` and not replaceable by
+        it. That method exists to back a DHCP picker, so it drops every
+        interface already bound to an ``/ip dhcp-server`` -- and on a real
+        router (verified on the lab hEX) that drops ``bridge``, which is
+        precisely the interface a VLAN trunk hangs off. Reusing it for a
+        VLAN form hides the one answer the form needs.
+
+        The ``/ip address`` half is here rather than in a second method
+        because it is read for the same reason at the same moment: a VLAN
+        push has to know whether the subnet it is about to claim already
+        exists on this device before it writes anything, and "reachable",
+        "interface exists" and "subnet free" are one round trip, not three
+        that can disagree with each other.
+        """
+        return await asyncio.to_thread(self._read_network_snapshot_sync, creds)
+
+    def _read_network_snapshot_sync(self, creds: DeviceCredentials) -> NetworkSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                interfaces = list(api.path("interface"))
+                bridge_ports = list(api.path("interface", "bridge", "port"))
+                addresses = list(api.path("ip", "address"))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, _describe_exception(exc)) from exc
+        finally:
+            api.close()
+
+        bridge_of: dict[str, str] = {
+            str(p.get("interface")): str(p.get("bridge"))
+            for p in bridge_ports
+            if p.get("interface") and p.get("bridge")
+        }
+        has_ip: set[str] = {
+            str(a.get("interface")) for a in addresses if a.get("interface")
+        }
+
+        listed: list[InterfaceInfo] = []
+        for row in interfaces:
+            raw_name = row.get("name")
+            if not raw_name:
+                continue
+            name = str(raw_name)
+            if name == "lo":
+                continue
+            listed.append(
+                InterfaceInfo(
+                    name=name,
+                    type=str(row.get("type")) if row.get("type") else None,
+                    running=_is_truthy(row.get("running", False)),
+                    disabled=_is_truthy(row.get("disabled", False)),
+                    bridge=bridge_of.get(name),
+                    has_ip_address=name in has_ip,
+                    is_bridge_port=name in bridge_of,
+                    mac_address=(
+                        str(row.get("mac-address"))
+                        if row.get("mac-address")
+                        else None
+                    ),
+                )
+            )
+        return NetworkSnapshot(
+            interfaces=listed,
+            ip_addresses=[
+                IpAddressInfo(
+                    address=str(row["address"]),
+                    interface=str(row["interface"]) if row.get("interface") else None,
+                    disabled=_is_truthy(row.get("disabled", False)),
+                    invalid=_is_truthy(row.get("invalid", False)),
+                )
+                for row in addresses
+                if row.get("address")
+            ],
+        )
 
     async def get_wan_health(self, creds: DeviceCredentials, *, target_ip: str) -> WanHealth:
         """Composes three real, independently-audited read operations from
@@ -527,18 +1472,60 @@ class MikroTikAdapter:
         )
 
     async def list_connected_devices(self, creds: DeviceCredentials) -> list[ConnectedDevice]:
-        """Ported from
-        ``connected_devices/device_adapters.py::_discover_sync`` /
-        ``_merge_discovered_devices`` -- merges DHCP-lease/ARP/wireless-
-        registration-table replies into one row per MAC. Each menu is
-        queried independently (``_safe_query``): a wired-only router with
-        no wireless package at all has no
-        ``interface wireless registration-table`` menu, and that alone
-        must never abort discovery of the wired devices the other two
-        menus already carry fine (see that module's own docstring)."""
+        """Merges the router's ``/ip/dhcp-server/lease`` and ``/ip/arp``
+        replies into one :class:`ConnectedDevice` per MAC address.
+
+        ## Why the wireless registration table is no longer queried
+
+        This method used to issue a third read,
+        ``/interface/wireless/registration-table``, and merge its rows in
+        for signal strength and a wireless/wired verdict. That read was
+        removed because it cannot succeed on any router this platform
+        owns, and never could.
+
+        Every deployed router is a hEX lite / RB750r2 (RouterOS 7.23.3,
+        mipsbe) -- a five-port wired router with **no radio and no
+        ``wireless`` package**, so the menu does not exist. The query did
+        not return an empty table; it raised ``no such command or
+        directory (wireless)``, which ``_safe_query`` swallowed into
+        ``[]``. The cost of keeping it was a wasted RouterOS API round
+        trip plus a ``mikrotik_connected_devices_menu_unavailable`` log
+        line **per router, every five minutes, fleet-wide** (the
+        ``connected_devices`` sync sweep), for a reply that was
+        structurally guaranteed to be empty.
+
+        Guest Wi-Fi at these venues is emitted by separate third-party
+        access points (TP-Link / Omada in the field) plugged into
+        ``ether2..ether5``. Signal strength, data rate and association
+        state live in those APs. No RouterOS command on this hardware can
+        reach them, so this is not a gap a different query would close --
+        it is an access-point integration, tracked separately.
+
+        ## What that means for the caller
+
+        ``is_wireless`` is therefore ``None`` on every row this adapter
+        returns, and ``signal_strength_dbm`` is ``None`` with it -- the
+        documented "this router cannot answer that question" state, not
+        "no" and not "not measured yet". See :class:`ConnectedDevice`.
+
+        Re-adding a wireless read for genuinely wireless MikroTik hardware
+        is a real future change, but it must **gate on the device's own
+        ``/system/resource`` architecture and ``/system/package`` list**
+        rather than on a model-name string, and it must pick the right
+        menu for the RouterOS version: ``/interface/wireless`` (legacy
+        package), ``/interface/wifiwave2`` (7.1-7.12) or
+        ``/interface/wifi`` (7.13+, qcom drivers). Assuming any one of
+        those unconditionally is what this removal is undoing.
+        """
         return await asyncio.to_thread(self._list_connected_devices_sync, creds)
 
     def _safe_query(self, api, *path: str) -> list[dict[str, object]]:  # noqa: ANN001
+        """Reads one menu, degrading a missing/unsupported menu to ``[]``
+        rather than failing the whole discovery.
+
+        Retained after the wireless-menu removal above because it still
+        earns its place: ``/ip/dhcp-server/lease`` is absent on a router
+        running no DHCP server, and that must not cost us the ARP half."""
         try:
             return list(api.path(*path))
         except LibRouterosError as exc:
@@ -555,12 +1542,9 @@ class MikroTikAdapter:
         try:
             leases = self._safe_query(api, "ip", "dhcp-server", "lease")
             arp_entries = self._safe_query(api, "ip", "arp")
-            wireless_entries = self._safe_query(
-                api, "interface", "wireless", "registration-table"
-            )
         finally:
             api.close()
-        return _merge_connected_devices(leases, arp_entries, wireless_entries)
+        return _merge_connected_devices(leases, arp_entries)
 
     async def disconnect_device(
         self, creds: DeviceCredentials, *, mac_address: str, interface: str | None
@@ -616,6 +1600,220 @@ class MikroTikAdapter:
             api.close()
 
     # ------------------------------------------------------------------
+    # hotspot session control (guest_access blocklist enforcement)
+    # ------------------------------------------------------------------
+
+    async def read_hotspot_session_control(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        """Reads, from the device, whether it runs a hotspot at all and
+        whether it currently accepts an RFC 5176 Disconnect-Request.
+
+        **Why this is a read and never an assumption.** Both places this
+        codebase writes ``/radius incoming`` -- this adapter's own
+        :meth:`set_radius_client_config` and
+        ``network_config/renderers.py``'s ``render_radius_client`` -- set
+        ``accept=yes`` and ``port=3799`` in the *same* statement. The lab
+        router nonetheless holds ``accept=false port=3799``: the port is
+        the value this platform wrote (RouterOS's own default is 1700), so
+        the write did land, and ``accept`` was reset afterwards by
+        something nobody has identified. A platform that infers "we
+        configured CoA, therefore CoA works" from its own history is
+        wrong about that router today.
+
+        ``accept`` is resolved through :func:`_is_truthy`, never a string
+        compare: the API answers a read with a real ``bool`` and accepts
+        ``"no"``/``"false"`` on write, so ``row.get("accept") == "yes"``
+        would read a live ``True`` as disabled.
+
+        Read-only -- this method never writes to ``/radius incoming``. See
+        :meth:`end_hotspot_sessions` for why repairing it is deliberately
+        not part of the enforcement path.
+        """
+        return await asyncio.to_thread(self._read_hotspot_session_control_sync, creds)
+
+    def _hotspot_session_control(self, api, host: str) -> HotspotSessionControl:  # noqa: ANN001
+        try:
+            hotspot_servers = len(list(api.path("ip", "hotspot")))
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                host, f"read_hotspot_session_control: {exc}"
+            ) from exc
+        coa_accept = False
+        coa_port: int | None = None
+        try:
+            for row in api.path("radius", "incoming"):
+                coa_accept = _is_truthy(row.get("accept"))
+                coa_port = _safe_int(row.get("port"))
+                break
+        except LibRouterosError as exc:
+            # A router with no ``/radius incoming`` menu at all cannot
+            # accept a Disconnect either. Reported as "no", logged, never
+            # raised -- the caller's real mechanism does not depend on it.
+            logger.info(
+                "mikrotik_radius_incoming_unreadable",
+                extra={"host": host, "detail": str(exc)},
+            )
+        return HotspotSessionControl(
+            hotspot_servers=hotspot_servers,
+            coa_accept=coa_accept,
+            coa_port=coa_port,
+        )
+
+    def _read_hotspot_session_control_sync(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        api = self._connect_api(creds)
+        try:
+            return self._hotspot_session_control(api, creds.host)
+        finally:
+            api.close()
+
+    async def end_hotspot_sessions(
+        self,
+        creds: DeviceCredentials,
+        *,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
+        """Ends every live ``/ip hotspot active`` session belonging to one
+        guest -- the operation that actually cuts them off.
+
+        **Why device-local removal and not a RADIUS Disconnect-Request.**
+        Both end a hotspot session; RouterOS's own response to a
+        Disconnect-Request is to remove the host from this same table. The
+        difference is what each one needs to work:
+
+        * A Disconnect needs ``/radius incoming accept=yes`` (false on the
+          lab router), needs the right shared secret and the right session
+          identifiers or it is dropped with no NAK, and needs an *inbound*
+          UDP path from this platform to the NAS. That path does not exist
+          today -- see ``RadiusNasClient.ip_address``'s own comment in
+          ``app/domains/guest/models.py``: the API container has no route
+          into the hub's tunnel subnet, so ``issue_live_disconnect`` has
+          been reporting "no response" fleet-wide rather than "never
+          sent".
+        * This needs port 8728, which is the transport every other write
+          in this gateway already uses and the only one confirmed to reach
+          fleet routers.
+
+        So a Disconnect is the weaker mechanism *on this fleet*, and it
+        fails silently where this one raises. CoA availability is still
+        read and reported (:meth:`read_hotspot_session_control`), because
+        an operator deserves to know that the RFC-sanctioned path is shut
+        -- but the block does not depend on it.
+
+        **``/radius incoming`` is deliberately not repaired here.** This
+        method has every ingredient to issue
+        ``api.path("radius", "incoming").update(accept="yes")`` and fix the
+        contradiction it reads. It does not, for two reasons. Repairing it
+        would not help the operation at hand -- the session is already
+        being ended by the mechanism above -- so it would be an unrelated
+        write to a live router's RADIUS configuration performed as a side
+        effect of a customer clicking "Block". And a change to exactly
+        this subsystem took the guest network down earlier today. A write
+        that fixes nothing for the caller and can break everything for the
+        venue does not belong on a customer-triggered path. The honest
+        move is to surface ``coa_accept=False`` so an operator repairs it
+        deliberately, through :meth:`set_radius_client_config`, which is
+        the method that owns that setting.
+
+        **Matching.** A row matches when its normalized ``mac-address``
+        equals ``mac_address``, or its ``user`` equals ``username``
+        exactly. Either identifier alone is enough, because either alone
+        identifies the guest: the MAC is what the device knows them by,
+        the ``user`` is what RADIUS authenticated. Both ``None`` matches
+        **nothing** -- a block whose subject could not be identified must
+        end zero sessions rather than every session on the router.
+
+        **Removal is per-row by ``.id``**, never a bare ``remove [find]``:
+        a predicate that evaluates to nothing must produce zero removals,
+        and enumerating in Python is the only way to guarantee that.
+
+        Idempotent: a guest with no live session matches nothing and
+        raises nothing, so a retry after a partial failure -- or a second
+        block of an already-blocked guest -- completes cleanly.
+        """
+        return await asyncio.to_thread(
+            self._end_hotspot_sessions_sync, creds, mac_address, username
+        )
+
+    @staticmethod
+    def _match_active_rows(
+        rows: list[dict[str, object]],
+        mac_address: str | None,
+        username: str | None,
+    ) -> tuple[HotspotActiveSession, ...]:
+        if mac_address is None and username is None:
+            return ()
+        matched: list[HotspotActiveSession] = []
+        for row in rows:
+            row_mac = normalize_mac_address(row.get("mac-address"))
+            row_user = _safe_str(row.get("user"))
+            if (mac_address is not None and row_mac == mac_address) or (
+                username is not None and row_user == username
+            ):
+                row_id = _safe_str(row.get(".id"))
+                if row_id is None:
+                    # A row with no ``.id`` cannot be removed per-row, and
+                    # this method does not fall back to a broad remove.
+                    continue
+                matched.append(
+                    HotspotActiveSession(
+                        routeros_id=row_id,
+                        user=row_user,
+                        mac_address=row_mac,
+                        address=_safe_str(row.get("address")),
+                    )
+                )
+        return tuple(matched)
+
+    def _end_hotspot_sessions_sync(
+        self,
+        creds: DeviceCredentials,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
+        normalized_mac = (
+            normalize_mac_address(mac_address) if mac_address is not None else None
+        )
+        api = self._connect_api(creds)
+        try:
+            control = self._hotspot_session_control(api, creds.host)
+            try:
+                menu = api.path("ip", "hotspot", "active")
+                matched = self._match_active_rows(
+                    list(menu), normalized_mac, username
+                )
+                for row in matched:
+                    menu.remove(row.routeros_id)
+                # A SECOND read, not a re-use of the first. Without it this
+                # method could only report "the removes did not raise",
+                # which is precisely the claim this platform has been
+                # burned by twice.
+                still_active = self._match_active_rows(
+                    list(api.path("ip", "hotspot", "active")),
+                    normalized_mac,
+                    username,
+                )
+            except LibRouterosError as exc:
+                # Unlike ``disconnect_device``'s optional wireless menu, an
+                # unreadable ``/ip hotspot active`` is fatal here: without
+                # it this method cannot tell whether the guest is still
+                # online, and reporting success would be a guess.
+                raise MikroTikDeviceError(
+                    creds.host, f"end_hotspot_sessions: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return HotspotDisconnectResult(
+            control=control,
+            matched=matched,
+            removed_ids=tuple(row.routeros_id for row in matched),
+            still_active=still_active,
+        )
+
+    # ------------------------------------------------------------------
     # diagnostics (shared by network_diagnostics + isp call sites)
     # ------------------------------------------------------------------
 
@@ -627,10 +1825,13 @@ class MikroTikAdapter:
         the identical real RouterOS command
         (``api("/tool/ping", address=target, count=str(count))``) and parse
         the reply identically. ``timeout_seconds`` is accepted for Protocol
-        parity with both originals but, exactly like both originals, is not
-        itself used inside the ping command -- only ``creds.timeout_seconds``
-        (used when opening the connection) matters, an existing, if slightly
-        odd, real behavior preserved verbatim rather than "fixed" here."""
+        parity with both originals and is still not used inside the ping
+        command itself -- RouterOS's ``/tool/ping`` has no matching
+        parameter. What bounds one call is ``creds.timeout_seconds`` (the
+        socket timeout, below) and, for callers that impose one, their own
+        deadline: ``app.domains.network_diagnostics.service`` now wraps
+        this call in ``asyncio.wait_for`` so the parameter its API accepts
+        is a real bound rather than a discarded one."""
         return await asyncio.to_thread(self._ping_sync, creds, target, count)
 
     def _ping_sync(self, creds: DeviceCredentials, target: str, count: int) -> PingResult:
@@ -638,8 +1839,25 @@ class MikroTikAdapter:
         try:
             try:
                 rows = list(api("/tool/ping", address=target, count=str(count)))
-            except LibRouterosError as exc:
-                raise MikroTikDeviceError(creds.host, f"ping failed: {exc}") from exc
+            except (LibRouterosError, OSError) as exc:
+                # OSError matters as much as LibRouterosError here, and it
+                # used to be missing. librouteros passes creds.timeout_seconds
+                # to socket.create_connection, which makes it the timeout on
+                # every subsequent recv as well as on the connect; its own
+                # SocketTransport.read calls sock.recv with NO exception
+                # translation. So a router that accepts the connection and
+                # then goes quiet -- a flaky tunnel, a saturated uplink --
+                # raises a bare socket TimeoutError, which is an OSError and
+                # is NOT a LibRouterosError. It therefore missed this clause,
+                # missed the domain adapter's own except clauses, missed the
+                # service's, and surfaced as an HTTP 500 with no DiagnosticRun
+                # row recorded at all: the single failure the diagnostics page
+                # most needs to report honestly was the one failure that left
+                # no trace. _describe_exception because a bare TimeoutError's
+                # str() is empty.
+                raise MikroTikDeviceError(
+                    creds.host, f"ping failed: {_describe_exception(exc)}"
+                ) from exc
         finally:
             api.close()
         sent, received, packet_loss, avg_rtt_ms = _parse_ping_rows(
@@ -685,8 +1903,15 @@ class MikroTikAdapter:
                         **{"max-hops": str(max_hops)},
                     )
                 )
-            except LibRouterosError as exc:
-                raise MikroTikDeviceError(creds.host, f"traceroute failed: {exc}") from exc
+            except (LibRouterosError, OSError) as exc:
+                # See _ping_sync's own comment: a socket read timeout is an
+                # OSError, not a LibRouterosError, and without this it
+                # escaped every layer above as a bare 500. A traceroute is
+                # the more likely of the two to stall, since an unresponsive
+                # hop is a normal thing for it to encounter.
+                raise MikroTikDeviceError(
+                    creds.host, f"traceroute failed: {_describe_exception(exc)}"
+                ) from exc
         finally:
             api.close()
         return TracerouteResult(hops=_parse_traceroute_rows(rows))
@@ -721,8 +1946,18 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"read_active_default_route: {exc}"
                 ) from exc
+            # A router that goes quiet *mid-read* raises a bare socket error
+            # (OSError -- a recv TimeoutError included -- or EOFError), not a
+            # LibRouterosError: librouteros does no translation on read. It
+            # is a connectivity failure, so it maps to the connection error
+            # IspService already turns into IspDeviceConnectionError, rather
+            # than escaping as an unhandled exception.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"read_active_default_route: {_describe_exception(exc)}"
+                ) from exc
         finally:
-            api.close()
+            self._safe_close(api)
         return _select_default_gateway(rows)
 
     async def get_pppoe_interface_status(
@@ -752,8 +1987,13 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"read_pppoe_interface_status: {exc}"
                 ) from exc
+            # See _get_active_default_gateway_sync.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"read_pppoe_interface_status: {_describe_exception(exc)}"
+                ) from exc
         finally:
-            api.close()
+            self._safe_close(api)
         row = next((r for r in rows if r.get("name") == interface_name), None)
         if row is None and len(rows) == 1:
             logger.warning(
@@ -797,8 +2037,14 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"read_interface_traffic_counters: {exc}"
                 ) from exc
+            # See _get_active_default_gateway_sync.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host,
+                    f"read_interface_traffic_counters: {_describe_exception(exc)}",
+                ) from exc
         finally:
-            api.close()
+            self._safe_close(api)
         row = next((r for r in rows if r.get("name") == interface_name), None)
         if row is None:
             return None
@@ -891,22 +2137,35 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"run_speed_test: {exc}"
                 ) from exc
+            # A router losing connectivity mid-download. See
+            # _get_active_default_gateway_sync.
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"run_speed_test: {_describe_exception(exc)}"
+                ) from exc
             finally:
                 # Real cleanup regardless of outcome -- see docstring's
-                # "Real cleanup, not a real disk leak" section.
+                # "Real cleanup, not a real disk leak" section. If the socket
+                # just died, this cleanup fails the same way; that must be
+                # logged, never raised over the real fetch failure above.
                 try:
                     file_menu = api.path("file")
                     for row in file_menu:
                         if row.get("name") == filename:
                             file_menu.remove(row.get(".id"))
                             break
-                except LibRouterosError:
+                except (LibRouterosError, OSError, EOFError):
+                    # Not ``filename``: that is a reserved LogRecord
+                    # attribute, and logging raises KeyError on an ``extra``
+                    # that tries to overwrite it -- which turned every failed
+                    # cleanup into a KeyError that replaced both the real
+                    # fetch error and a successful result.
                     logger.warning(
                         "mikrotik_speed_test_cleanup_failed",
-                        extra={"host": creds.host, "filename": filename},
+                        extra={"host": creds.host, "speed_test_file": filename},
                     )
         finally:
-            api.close()
+            self._safe_close(api)
 
         if not rows:
             raise MikroTikDeviceError(
@@ -942,6 +2201,660 @@ class MikroTikAdapter:
             duration_seconds=duration_seconds,
             test_url=download_url,
         )
+
+    # ------------------------------------------------------------------
+    # hotspot TLS certificate
+    # ------------------------------------------------------------------
+
+    async def push_hotspot_certificate(
+        self, creds: DeviceCredentials, *, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """See :meth:`DeviceGatewayAdapter.push_hotspot_certificate`, and
+        :meth:`_push_hotspot_certificate_sync` for the ordering -- every
+        line of which is ported from
+        ``ops/letsencrypt-hotspot/renew-hotspot-certs.sh``'s
+        ``REMOTE_SCRIPT`` rather than re-derived.
+
+        ``creds.timeout_seconds`` covers two real HTTP downloads by the
+        device plus two imports; size it like a ``run_speed_test`` call,
+        not like a health-check read.
+        """
+        return await asyncio.to_thread(
+            self._push_hotspot_certificate_sync, creds, push
+        )
+
+    def _push_hotspot_certificate_sync(
+        self, creds: DeviceCredentials, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """The whole push, in one API session, in the order the 2026-08-18
+        incident settled.
+
+        ## Why this exists at all
+
+        The mechanism this replaces (``renew-hotspot-certs.sh``) moves the
+        PEMs with ``scp`` and drives the re-import over ``ssh``. Measured
+        against the live fleet on 2026-09-06: on the only reachable router,
+        ports 21/22/23/80/443/8291 all *time out* -- filtered by a firewall
+        drop, not refused -- and only 8728/8729 answer. The push could not
+        work on any router in the fleet, and the hotspot certificate
+        expires 2026-11-16. A bound-but-expired certificate is not a
+        cosmetic problem: with ``login-by=https,http-pap`` it is the
+        confirmed three-symptom failure (no login page on Windows/macOS,
+        the captive window never closing, an Android certificate warning)
+        that PR #153 exists to prevent.
+
+        ``/tool fetch`` inverts the direction -- the router pulls -- and is
+        an ordinary API command on 8728. ``_run_speed_test_sync`` in this
+        same module already drives it against real hardware today,
+        including ``dst-path`` writing to flash and a real ``/file remove``
+        cleanup; that is the proof the transport works, and this method is
+        modelled on it.
+
+        ## Ordering (ported, not re-derived)
+
+        1. **Read the profile first.** Nothing is written until the profile
+           named in ``push`` has been found and, if the caller supplied the
+           certificate's SANs, its ``dns-name`` confirmed covered. A
+           certificate that does not match the address in the guest's URL
+           bar produces the same full-screen warning the certificate effort
+           exists to remove, while looking like a success in every log.
+        2. **Fetch both PEMs before touching the certificate store.** The
+           shell script uploads first too, and the reason matters: step 3
+           removes the currently-serving intermediate, so every failure
+           mode that can be moved *before* that removal must be.
+        3. **Remove the ephemeral and stable chain artifacts of the last
+           round** (``<name>.fullchain.pem*`` and ``<name>-chain-*``).
+           RouterOS dedupes an import against an identical object already
+           in the store, so leaving last round's intermediate in place
+           makes this round's import produce no intermediate object to
+           rename -- which is why this sweep must run before the import and
+           not after it. It is also the *only* place that broad sweep runs;
+           see step 8.
+
+           Known cost, stated rather than hidden: between here and step 8
+           the router is serving its *current* leaf with no intermediate
+           beside it, i.e. the incomplete chain of the incident, for the
+           few seconds the import and rebind take. That is accepted
+           deliberately -- the alternative is a push that reliably ends
+           with no intermediate at all, which is the same failure
+           permanently -- but it does mean a push should not be run
+           against a venue mid-event for fun.
+        3b. **Wait for the device to agree, at each gate.** Steps 5 and 6b
+           poll rather than assume, replacing the two ``:delay 1s`` lines
+           in the shell script. See :meth:`_settle`.
+        4. **Import fullchain, then privkey**, and read the reply's
+           counters if RouterOS sends any. Whether it does over the API on
+           this firmware has never been confirmed against this fleet, so
+           the counters are recorded but never gated on -- step 5 is.
+        5. **Find the new leaf by name and stop here if it is absent.**
+           ``<name>.fullchain.pem_0`` is what an import of a file called
+           ``<name>.fullchain.pem`` produces for the first certificate in
+           it. If it is not there, the import silently did nothing, and the
+           router is still on its previous, working certificate: raise, and
+           leave it that way. This is the single reason nothing destructive
+           happens earlier.
+        6. **Rename + trust the new leaf under a temporary name**, so the
+           live certificate is never deleted while still referenced, then
+           **rebind the profile** -- ``ssl-certificate`` and ``login-by``
+           in ONE ``set``. Splitting them across two calls is what silently
+           no-op'd during the incident.
+        6b. **Read the profile back and stop if the rebind did not take.**
+           The shell script delays a second here and then deletes the old
+           leaf regardless. On the silent-no-op path that destroys the
+           certificate the router is still serving. Nothing is removed
+           until the device itself reports the new binding.
+        7. **Only now remove the old leaf** (nothing references it any
+           more), rename the new one onto the stable name, and re-issue the
+           bind against that stable name -- see the inline comment at step
+           7b for why the rename alone is not enough to rely on.
+        8. **Rename every remaining ``<name>.fullchain.pem*`` object onto a
+           stable ``<name>-chain-N`` name and mark it trusted.** These are
+           the intermediate(s) -- however many Let's Encrypt's current
+           chain has; do not assume exactly one. This step is the fix for
+           the incident: an earlier version deleted them via the SAME broad
+           sweep now used only in step 3, run a second time at the end,
+           which by then matched only the still-ephemerally-named
+           intermediates (the leaf had been renamed away in step 6) and
+           deleted them right after importing them. RouterOS's hotspot TLS
+           server builds the served chain from whatever trusted certificate
+           objects are present and issuer-linked (skid/akid) to the bound
+           leaf -- it needs no explicit ``ca=`` field, but it very much
+           needs the intermediate object to still exist. Losing it left the
+           router serving the leaf alone: genuinely LE-issued, verifiable
+           offline, incomplete on the wire -- which strict/embedded TLS
+           clients reject outright and desktop browsers paper over.
+        9. **Final sweep of the ephemeral pattern** -- by now everything
+           wanted has been renamed off it in steps 6 and 8, so this is a
+           true no-op safety net, not a deletion mechanism.
+        10. **``/file remove`` the two uploads**, always -- the private key
+            must not sit on the router's flash after the push. Same
+            unconditional cleanup ``_run_speed_test_sync`` does.
+        11. **Verify by reading the device back**, and raise if it does not
+            agree. See :meth:`_verify_hotspot_certificate`.
+        """
+        upload_fullchain = f"{push.cert_name}.fullchain.pem"
+        upload_privkey = f"{push.cert_name}.privkey.pem"
+        temp_leaf_name = f"{push.cert_name}-new"
+        ephemeral_prefix = f"{upload_fullchain}_"
+        chain_prefix = f"{push.cert_name}-chain-"
+        profile_dns_name: str | None = None
+        chain_names: tuple[str, ...] = ()
+        certificates_imported: int | None = None
+        private_keys_imported: int | None = None
+
+        api = self._connect_api(creds)
+        try:
+            try:
+                # 1. profile preflight -- read-only, before any write.
+                profile = self._find_hotspot_profile(api, push.hotspot_profile)
+                if profile is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: no /ip hotspot profile "
+                        f"named {push.hotspot_profile!r} on this device -- "
+                        "nothing to rebind",
+                    )
+                profile_dns_name = _safe_str(profile.get("dns-name"))
+                if push.expected_dns_names and not _dns_name_covered(
+                    profile_dns_name, push.expected_dns_names
+                ):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: this router's portal "
+                        f"redirects to {profile_dns_name!r}, which the "
+                        "certificate being pushed does not cover "
+                        f"(SANs: {', '.join(push.expected_dns_names)}) -- "
+                        "installing it would show every guest the exact "
+                        "browser warning this push exists to remove",
+                    )
+
+                # 2. both PEMs onto flash, before anything is removed.
+                self._fetch_to_flash(
+                    api, creds, url=push.fullchain_url, dst_path=upload_fullchain
+                )
+                self._fetch_to_flash(
+                    api, creds, url=push.privkey_url, dst_path=upload_privkey
+                )
+
+                cert_menu = api.path("certificate")
+
+                # 3. last round's artifacts. See docstring for why before.
+                self._remove_certificates(
+                    cert_menu,
+                    lambda name: name.startswith(ephemeral_prefix)
+                    or name in (upload_fullchain, upload_privkey)
+                    or name.startswith(chain_prefix),
+                )
+
+                # 4. import both. Counters recorded, never gated on.
+                certificates_imported, _ = self._import_certificate(
+                    api, creds, file_name=upload_fullchain
+                )
+                _, private_keys_imported = self._import_certificate(
+                    api, creds, file_name=upload_privkey
+                )
+
+                # 5. the fail-closed gate.
+                leaf = self._settle(
+                    lambda: self._find_certificate(
+                        cert_menu, f"{upload_fullchain}_0"
+                    )
+                )
+                if leaf is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: /certificate import "
+                        f"produced no {upload_fullchain}_0 object within "
+                        f"{_SETTLE_ATTEMPTS * _SETTLE_DELAY_SECONDS:.0f}s -- "
+                        "the import did nothing, and this router is still on "
+                        "its previous certificate (which is the safe "
+                        "outcome; nothing was removed or rebound)",
+                    )
+
+                # 6. temp name + trust, then the atomic rebind.
+                cert_menu.update(
+                    **{".id": leaf[".id"], "name": temp_leaf_name, "trusted": "yes"}
+                )
+                self._rebind_hotspot_profile(
+                    api, profile[".id"], certificate=temp_leaf_name, push=push
+                )
+
+                # 6b. The SECOND fail-closed gate, and the reason step 7 is
+                # allowed to delete anything at all.
+                #
+                # The shell script this is ported from puts a `:delay 1s`
+                # here and then deletes the old leaf unconditionally. That is
+                # a gap, not a subtlety to preserve: a `set` on
+                # /ip hotspot profile that returns cleanly and changes
+                # nothing is the exact 2026-08-18 failure, and on that path
+                # the script destroys the certificate the router is at that
+                # moment still serving. Reading the profile back instead
+                # turns "old certificate gone, portal unbound, loud error"
+                # into "nothing touched, loud error".
+                if self._settle(
+                    lambda: self._profile_bound_to(
+                        api, push.hotspot_profile, temp_leaf_name
+                    )
+                ) is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: the rebind of "
+                        f"{push.hotspot_profile!r} onto {temp_leaf_name!r} "
+                        "returned cleanly and did not take -- the profile "
+                        "still reports a different ssl-certificate. This is "
+                        "the 2026-08-18 silent-no-op shape; nothing has been "
+                        "removed, so this router is still serving the "
+                        "certificate it was serving before",
+                    )
+
+                # 7. old leaf out, new leaf onto the stable name.
+                old_leaf = self._find_certificate(cert_menu, push.cert_name)
+                if old_leaf is not None:
+                    cert_menu.remove(old_leaf[".id"])
+                new_leaf = self._find_certificate(cert_menu, temp_leaf_name)
+                if new_leaf is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: the renamed leaf "
+                        f"{temp_leaf_name!r} vanished between the rebind and "
+                        "the rename -- the profile is bound to a name that "
+                        "no longer exists, needs a human",
+                    )
+                cert_menu.update(**{".id": new_leaf[".id"], "name": push.cert_name})
+
+                # 7b. Re-issue the bind against the STABLE name. The shell
+                # script this is ported from stops after the rename, which
+                # is correct only if RouterOS rewrites a profile's
+                # ssl-certificate reference when the certificate it names is
+                # renamed out from under it. It may well do exactly that --
+                # but nobody has confirmed it on this firmware, and the
+                # failure mode if it does not is a profile pointing at a
+                # name that no longer exists, i.e. a portal serving no
+                # certificate at all. Re-issuing the same atomic
+                # ssl-certificate+login-by set costs one API call and is
+                # correct under either behavior.
+                self._rebind_hotspot_profile(
+                    api, profile[".id"], certificate=push.cert_name, push=push
+                )
+
+                # 8. THE INCIDENT FIX: preserve the intermediate(s).
+                chain_names = self._preserve_chain_certificates(
+                    cert_menu,
+                    ephemeral_prefix=ephemeral_prefix,
+                    chain_prefix=chain_prefix,
+                )
+
+                # 9. no-op safety net, deliberately after step 8.
+                self._remove_certificates(
+                    cert_menu, lambda name: name.startswith(ephemeral_prefix)
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"push_hotspot_certificate: {exc}"
+                ) from exc
+            finally:
+                # 10. The private key must not be left on flash whatever
+                # happened above -- same unconditional cleanup
+                # _run_speed_test_sync does for its own temp file.
+                self._remove_files(api, creds, (upload_fullchain, upload_privkey))
+
+            # 11. Success is a read-back, not an absence of errors.
+            #
+            # Outside the try above on purpose: the cleanup in its `finally`
+            # must have run before anything reads the device back, so that a
+            # verification failure is never also a report of a private key
+            # still sitting on the router's flash.
+            try:
+                return self._verify_hotspot_certificate(
+                    api,
+                    creds,
+                    push=push,
+                    profile_dns_name=profile_dns_name,
+                    chain_cert_names=chain_names,
+                    certificates_imported=certificates_imported,
+                    private_keys_imported=private_keys_imported,
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "push_hotspot_certificate: the push ran but the device "
+                    f"could not be read back to confirm it: {exc}",
+                ) from exc
+        finally:
+            api.close()
+
+    # -- push_hotspot_certificate helpers -------------------------------
+
+    def _rebind_hotspot_profile(
+        self,
+        api,  # noqa: ANN001
+        profile_id: str,
+        *,
+        certificate: str,
+        push: HotspotCertificatePush,
+    ) -> None:
+        """One ``set`` carrying BOTH ``ssl-certificate`` and ``login-by``.
+
+        Never split these into two calls. Doing so is what silently no-op'd
+        during the 2026-08-18 incident: the commands returned cleanly, the
+        profile did not change, and the logs said the push had worked.
+        """
+        api.path("ip", "hotspot", "profile").update(
+            **{
+                ".id": profile_id,
+                "ssl-certificate": certificate,
+                "login-by": push.login_by,
+            }
+        )
+
+    def _find_hotspot_profile(self, api, name: str) -> dict | None:  # noqa: ANN001
+        for row in api.path("ip", "hotspot", "profile"):
+            if row.get("name") == name:
+                return dict(row)
+        return None
+
+    def _profile_bound_to(
+        self, api, profile_name: str, certificate: str  # noqa: ANN001
+    ) -> dict | None:
+        """The profile row, but only once it actually reports ``certificate``
+        as its ``ssl-certificate``. ``None`` while it does not."""
+        profile = self._find_hotspot_profile(api, profile_name)
+        if profile is None:
+            return None
+        if _safe_str(profile.get("ssl-certificate")) != certificate:
+            return None
+        return profile
+
+    def _settle(self, read):  # noqa: ANN001, ANN201
+        """Poll ``read`` until it returns something truthy, or give up.
+
+        This is the port of the two ``:delay 1s`` lines in
+        ``renew-hotspot-certs.sh``'s ``REMOTE_SCRIPT``. They are there because
+        neither ``/certificate import`` nor a profile ``set`` is guaranteed to
+        be visible to the very next command, and dropping them would have made
+        the first hardware run fail spuriously -- which, on a path whose whole
+        purpose is to find out whether ``/certificate import`` works over the
+        API at all, would have produced exactly the wrong answer to the one
+        question the run exists to settle.
+
+        A poll rather than a blind sleep: it returns the instant the device
+        agrees, so the fast path costs nothing, and it still fails closed
+        because a caller that gets ``None`` has read the device and found it
+        unchanged rather than merely not waited long enough.
+        """
+        for attempt in range(_SETTLE_ATTEMPTS):
+            found = read()
+            if found:
+                return found
+            if attempt + 1 < _SETTLE_ATTEMPTS:
+                time.sleep(_SETTLE_DELAY_SECONDS)
+        return None
+
+    def _find_certificate(self, cert_menu, name: str) -> dict | None:  # noqa: ANN001
+        for row in cert_menu:
+            if row.get("name") == name:
+                return dict(row)
+        return None
+
+    def _fetch_to_flash(
+        self, api, creds: DeviceCredentials, *, url: str, dst_path: str  # noqa: ANN001
+    ) -> None:
+        """Make the device pull ``url`` onto its own flash as ``dst_path``.
+
+        Same command, same reply-shape checks as
+        ``_run_speed_test_sync``'s ``/tool/fetch`` -- which is the one
+        ``/tool fetch`` call in this codebase already exercised against
+        real hardware, so its handling of ``status``/``downloaded`` is
+        copied rather than reinvented.
+
+        ``check-certificate`` is set to ``yes`` for an ``https`` URL and
+        omitted otherwise. The speed test passes ``no`` because it is
+        downloading a throwaway blob from a public host and only the byte
+        count matters; here the response *is* the fleet private key, so an
+        unverified peer is not an acceptable place to get it from. The
+        intended deployment does not need it: the URL is served on the
+        WireGuard tunnel, over plain HTTP, on an address the public
+        internet cannot route to -- the tunnel is the encryption and the
+        authentication. ``https`` remains available for a deployment that
+        can present a certificate the router will actually verify.
+        """
+        mode = "https" if url.lower().startswith("https") else "http"
+        params: dict[str, str] = {"dst-path": dst_path}
+        if mode == "https":
+            params["check-certificate"] = "yes"
+        rows = list(api("/tool/fetch", url=url, mode=mode, **params))
+        if not rows:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: no reply from /tool/fetch for "
+                f"{dst_path} -- the router could not be told to pull it",
+            )
+        status = str(rows[-1].get("status", ""))
+        if status != "finished":
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: the router could not fetch "
+                f"{dst_path} (status={status!r}). This is the step that has "
+                "never been exercised in this direction: every use of the "
+                "tunnel so far has been app-server-to-router, and this is "
+                "the router reaching back. Check that the URL's address is "
+                "one the router routes over the tunnel and that something "
+                "is listening on it.",
+            )
+
+    def _import_certificate(
+        self, api, creds: DeviceCredentials, *, file_name: str  # noqa: ANN001
+    ) -> tuple[int | None, int | None]:
+        """Run ``/certificate import`` for one uploaded file and return its
+        ``(certificates-imported, private-keys-imported)`` counters --
+        ``(None, None)`` if it reports nothing at all.
+
+        Two of RouterOS's reply counters are genuine hard failures and are
+        raised on: a ``decryption-failure`` means the PEM was encrypted and
+        the empty passphrase did not open it, and
+        ``keys-with-no-certificate`` means a private key landed with
+        nothing to pair it to. Both are silent otherwise -- the command
+        returns normally.
+
+        The *absence* of counters is deliberately NOT a failure. Whether
+        this firmware reports import results over the API (as opposed to on
+        the console) is one of the three things this work could not settle
+        without a device, so the counters are treated as a bonus and the
+        real gate is the read-back in
+        :meth:`_verify_hotspot_certificate`.
+        """
+        rows = list(
+            api("/certificate/import", **{"file-name": file_name, "passphrase": ""})
+        )
+        if not rows:
+            return None, None
+        last = rows[-1]
+        failures = _safe_int(last.get("decryption-failures"), default=0) or 0
+        if failures:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: /certificate import {file_name} "
+                f"reported {failures} decryption failure(s) -- the PEM is "
+                "encrypted and this push imports with an empty passphrase",
+            )
+        orphan_keys = _safe_int(last.get("keys-with-no-certificate"), default=0) or 0
+        if orphan_keys:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: /certificate import {file_name} "
+                f"reported {orphan_keys} key(s) with no matching certificate "
+                "-- the private key does not belong to the certificate that "
+                "was imported alongside it",
+            )
+        return (
+            _safe_int(last.get("certificates-imported"), default=None),
+            _safe_int(last.get("private-keys-imported"), default=None),
+        )
+
+    def _remove_certificates(self, cert_menu, matches) -> None:  # noqa: ANN001
+        """Remove every ``/certificate`` row whose ``name`` ``matches``.
+
+        The rows are collected before the first removal rather than removed
+        while iterating: a RouterOS menu iteration is a live ``print``, and
+        deleting out from under it is how a sweep silently skips half its
+        matches.
+        """
+        doomed = [
+            row[".id"]
+            for row in cert_menu
+            if row.get(".id") and matches(str(row.get("name") or ""))
+        ]
+        for cert_id in doomed:
+            cert_menu.remove(cert_id)
+
+    def _preserve_chain_certificates(
+        self, cert_menu, *, ephemeral_prefix: str, chain_prefix: str  # noqa: ANN001
+    ) -> tuple[str, ...]:
+        """Rename every surviving ``<name>.fullchain.pem_N`` object onto a
+        stable ``<name>-chain-N`` name and mark it trusted.
+
+        This is the 2026-08-18 fix. Read
+        :meth:`_push_hotspot_certificate_sync`'s docstring, step 8, before
+        changing anything here -- the ordering relative to the leaf rename
+        is the entire point, and it is not re-derivable from the code
+        alone.
+        """
+        survivors = [
+            dict(row)
+            for row in cert_menu
+            if str(row.get("name") or "").startswith(ephemeral_prefix)
+        ]
+        names: list[str] = []
+        for index, row in enumerate(survivors, start=1):
+            stable = f"{chain_prefix}{index}"
+            cert_menu.update(**{".id": row[".id"], "name": stable, "trusted": "yes"})
+            names.append(stable)
+        return tuple(names)
+
+    def _remove_files(
+        self, api, creds: DeviceCredentials, filenames: Sequence[str]  # noqa: ANN001
+    ) -> None:
+        wanted = set(filenames)
+        try:
+            file_menu = api.path("file")
+            doomed = [
+                row[".id"]
+                for row in file_menu
+                if row.get(".id") and row.get("name") in wanted
+            ]
+            for file_id in doomed:
+                file_menu.remove(file_id)
+        except LibRouterosError:
+            # Worth a loud warning rather than an exception: the push
+            # itself may well have succeeded, and failing it here would
+            # send an operator to re-run a rebind that already worked. But
+            # one of these files is the fleet private key sitting on a
+            # router's flash, so this must never pass silently.
+            logger.warning(
+                "mikrotik_hotspot_cert_upload_cleanup_failed",
+                extra={"host": creds.host, "filenames": sorted(wanted)},
+            )
+
+    def _verify_hotspot_certificate(
+        self,
+        api,  # noqa: ANN001
+        creds: DeviceCredentials,
+        *,
+        push: HotspotCertificatePush,
+        profile_dns_name: str | None,
+        chain_cert_names: tuple[str, ...],
+        certificates_imported: int | None,
+        private_keys_imported: int | None,
+    ) -> HotspotCertificatePushResult:
+        """Read the device back and refuse to call this a success unless it
+        agrees.
+
+        Three things are checked, and each of them is a failure this
+        codebase has actually seen:
+
+        * **the profile is bound to the stable name** -- the rebind
+          silently no-op'd once already, when ``ssl-certificate`` and
+          ``login-by`` were set in separate calls;
+        * **the leaf has its private key** -- a certificate imported
+          without one binds fine and then serves nothing, because RouterOS
+          cannot complete a handshake with it;
+        * **the leaf's issuer is present in the store** -- its ``akid``
+          matched by some other certificate's ``skid``. This is the
+          2026-08-18 incident stated as a check. It is deliberately *not*
+          "did we rename N chain objects": RouterOS dedupes an import
+          against an identical object already present, so counting objects
+          this push happened to create would fail on a router that already
+          had the intermediate under some other name, while the thing that
+          actually matters -- can the router build a complete chain -- is
+          true. An orphaned ``akid`` is what a real incomplete chain looks
+          like on the device.
+        """
+        profile = self._find_hotspot_profile(api, push.hotspot_profile)
+        bound = _safe_str((profile or {}).get("ssl-certificate"))
+        bound_login_by = _safe_str((profile or {}).get("login-by"))
+
+        certificates = [dict(row) for row in api.path("certificate")]
+        leaf = next(
+            (row for row in certificates if row.get("name") == push.cert_name), None
+        )
+        has_key = leaf is not None and _is_truthy(leaf.get("private-key"))
+        akid = _safe_str((leaf or {}).get("akid"))
+        issuer_present = bool(akid) and any(
+            _safe_str(row.get("skid")) == akid
+            for row in certificates
+            if row.get("name") != push.cert_name
+        )
+
+        result = HotspotCertificatePushResult(
+            cert_name=push.cert_name,
+            hotspot_profile=push.hotspot_profile,
+            profile_dns_name=profile_dns_name,
+            certificates_imported=certificates_imported,
+            private_keys_imported=private_keys_imported,
+            bound_ssl_certificate=bound,
+            bound_login_by=bound_login_by,
+            leaf_has_private_key=has_key,
+            leaf_invalid_after=_safe_str((leaf or {}).get("invalid-after")),
+            chain_issuer_present=issuer_present,
+            chain_cert_names=chain_cert_names,
+        )
+
+        problems: list[str] = []
+        if leaf is None:
+            problems.append(
+                f"no /certificate named {push.cert_name!r} exists after the push"
+            )
+        if bound != push.cert_name:
+            problems.append(
+                f"profile {push.hotspot_profile!r} is bound to "
+                f"{bound!r}, not {push.cert_name!r}"
+            )
+        if leaf is not None and not has_key:
+            problems.append(
+                f"{push.cert_name!r} has no private key -- it will bind and "
+                "then fail every TLS handshake"
+            )
+        if _login_by_tokens(bound_login_by) != _login_by_tokens(push.login_by):
+            problems.append(
+                f"profile {push.hotspot_profile!r} reports "
+                f"login-by={bound_login_by!r}, not {push.login_by!r} -- the "
+                "rebind did not take, and this half of it is what decides "
+                "whether the portal is served over TLS at all"
+            )
+        if leaf is not None and not issuer_present:
+            problems.append(
+                f"{push.cert_name!r} has an orphaned akid: no certificate in "
+                "the store claims to be its issuer, so the router will serve "
+                "the leaf alone. This is the 2026-08-18 incomplete-chain "
+                "failure -- strict TLS clients reject it and browsers hide it"
+            )
+        if problems:
+            raise MikroTikDeviceError(
+                creds.host,
+                "push_hotspot_certificate: the device does not agree the "
+                "push worked -- " + "; ".join(problems),
+            )
+        return result
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -1055,24 +2968,518 @@ class MikroTikAdapter:
         await asyncio.to_thread(self._configure_vlan_sync, creds, vlan)
 
     def _configure_vlan_sync(self, creds: DeviceCredentials, vlan: VlanConfig) -> None:
-        vlan_interface = f"vlan{vlan.vlan_id}"
         api = self._connect_api(creds)
         try:
-            try:
+            if vlan.port_mode == "access":
+                self._configure_vlan_access(api, creds, vlan)
+            else:
+                self._configure_vlan_trunk(api, creds, vlan)
+        finally:
+            api.close()
+
+    def _configure_vlan_trunk(
+        self, api, creds: DeviceCredentials, vlan: VlanConfig
+    ) -> None:
+        """Tagged sub-interface on a parent trunk -- ``render_vlan``'s
+        default branch."""
+        vlan_interface = f"vlan{vlan.vlan_id}"
+        try:
+            if not self._interface_vlan_exists(api, vlan_interface):
                 api.path("interface", "vlan").add(
                     name=vlan_interface,
                     **{"vlan-id": str(vlan.vlan_id)},
                     interface=vlan.interface,
                     comment=vlan.name,
                 )
-                if vlan.ip_cidr:
-                    api.path("ip", "address").add(
-                        address=vlan.ip_cidr, interface=vlan_interface
-                    )
+            self._ensure_ip_address(api, vlan.ip_cidr, vlan_interface)
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(creds.host, f"configure_vlan: {exc}") from exc
+
+    def _configure_vlan_access(
+        self, api, creds: DeviceCredentials, vlan: VlanConfig
+    ) -> None:
+        """Dedicated untagged port -- ``render_vlan``'s "access" branch.
+
+        The physical port is pulled out of the shared bridge and given the
+        subnet directly. No ``/interface vlan`` entry is created: in this
+        mode the VLAN is realized as a separate port, deliberately, so that
+        enabling it can never disturb the shared production bridge's
+        already-live traffic (see ``Vlan.port_mode``'s own docstring).
+        """
+        physical = vlan.interface
+        try:
+            for port in list(api.path("interface", "bridge", "port")):
+                if port.get("interface") == physical:
+                    api.path("interface", "bridge", "port").remove(port[".id"])
+            self._ensure_ip_address(api, vlan.ip_cidr, physical)
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(creds.host, f"configure_vlan: {exc}") from exc
+
+    def _interface_vlan_exists(self, api, name: str) -> bool:
+        return any(row.get("name") == name for row in api.path("interface", "vlan"))
+
+    def _ensure_ip_address(self, api, ip_cidr: str | None, interface: str) -> None:
+        """Adds the address only when that exact address is not already on
+        that interface.
+
+        Re-pushing is an ordinary operation -- an operator edits a name and
+        saves again -- and RouterOS answers a duplicate ``add`` with
+        "already have such item". Without this check the second push of an
+        unchanged row surfaces as a device error, which teaches people to
+        ignore push failures.
+
+        Matches on address *and* interface: the same subnet existing
+        somewhere else on the router is not this VLAN's address.
+        """
+        if not ip_cidr:
+            return
+        for row in api.path("ip", "address"):
+            if row.get("address") == ip_cidr and row.get("interface") == interface:
+                return
+        api.path("ip", "address").add(address=ip_cidr, interface=interface)
+
+    async def delete_vlan(
+        self, creds: DeviceCredentials, *, vlan: VlanConfig
+    ) -> None:
+        """Removes what :meth:`configure_vlan` created, for the same
+        ``port_mode``.
+
+        Deleting a VLAN row never touched the device, and the gateway had
+        no teardown method to call even if it had wanted to -- so a VLAN
+        the platform created went on carrying traffic after the operator
+        deleted it, with nothing in the UI to say so.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error. A delete retried after a partial failure completes cleanly,
+        and deleting a row that was never pushed does nothing.
+        """
+        await asyncio.to_thread(self._delete_vlan_sync, creds, vlan)
+
+    def _delete_vlan_sync(self, creds: DeviceCredentials, vlan: VlanConfig) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if vlan.port_mode == "access":
+                    self._delete_vlan_access(api, vlan)
+                else:
+                    self._delete_vlan_trunk(api, vlan)
             except LibRouterosError as exc:
-                raise MikroTikDeviceError(creds.host, f"configure_vlan: {exc}") from exc
+                raise MikroTikDeviceError(creds.host, f"delete_vlan: {exc}") from exc
         finally:
             api.close()
+
+    def _delete_vlan_trunk(self, api, vlan: VlanConfig) -> None:
+        vlan_interface = f"vlan{vlan.vlan_id}"
+        # Address first, then the interface carrying it. RouterOS would
+        # cascade, but removing the address explicitly keeps the teardown
+        # symmetric with the two writes configure_vlan made and leaves
+        # nothing behind if the interface row is already gone.
+        self._remove_ip_address(api, vlan.ip_cidr, vlan_interface)
+        for row in list(api.path("interface", "vlan")):
+            if row.get("name") == vlan_interface:
+                api.path("interface", "vlan").remove(row[".id"])
+
+    def _delete_vlan_access(self, api, vlan: VlanConfig) -> None:
+        """Access mode gave a physical port the subnet directly, after
+        pulling it out of the shared bridge.
+
+        The address is removed, and the port is put back into
+        ``vlan.previous_bridge`` when the caller recorded one.
+
+        This used to deliberately leave the port unbridged, reasoning that
+        which bridge it came from "was never recorded" and that rejoining a
+        guessed one would be worse. Both halves of that were right; the
+        conclusion was not. A venue's access point sat on an unbridged port
+        with the guest network down, and the product had no way to undo what
+        it had done -- an engineer restored it by hand. The fix was to record
+        the bridge (see :class:`VlanConfig.previous_bridge`), not to keep
+        declining to.
+
+        Still no guessing: with ``previous_bridge`` unset the port is left
+        out of every bridge exactly as before, because "in no bridge" is
+        then the truthful previous state rather than an unknown one.
+
+        ``pvid`` is copied from a sibling port of that same bridge rather
+        than defaulted to 1 -- on a VLAN-filtering bridge the siblings'
+        value is the one that makes untagged ingress land where the rest of
+        that segment lands, and 1 would be a guess dressed as a default.
+        """
+        self._remove_ip_address(api, vlan.ip_cidr, vlan.interface)
+        if not vlan.previous_bridge:
+            return
+        ports = list(api.path("interface", "bridge", "port"))
+        if any(row.get("interface") == vlan.interface for row in ports):
+            return  # already bridged -- somebody restored it first
+        siblings = [
+            row for row in ports if row.get("bridge") == vlan.previous_bridge
+        ]
+        pvid = str(siblings[0].get("pvid")) if siblings else "1"
+        api.path("interface", "bridge", "port").add(
+            interface=vlan.interface, bridge=vlan.previous_bridge, pvid=pvid
+        )
+
+    def _remove_ip_address(self, api, ip_cidr: str | None, interface: str) -> None:
+        """Removes that exact address from that exact interface.
+
+        Matches on address *and* interface, the same pair
+        ``_ensure_ip_address`` adds on: the same subnet existing elsewhere
+        on the router is not this VLAN's address and must not be removed.
+        """
+        if not ip_cidr:
+            return
+        for row in list(api.path("ip", "address")):
+            if row.get("address") == ip_cidr and row.get("interface") == interface:
+                api.path("ip", "address").remove(row[".id"])
+
+    async def configure_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Puts a captive portal on one VLAN's own interface.
+
+        Ported command-for-command from
+        ``network_config/renderers.py::_render_vlan_hotspot`` -- the same
+        six real RouterOS objects, in the same order, issued over the
+        structured API instead of as script text:
+
+        1. ``/ip pool`` -- the addresses the portal hands out.
+        2. ``/ip dhcp-server`` on this VLAN's interface, drawing from it.
+        3. ``/ip dhcp-server network`` -- gateway and DNS for the subnet,
+           both the VLAN's own gateway address so guests resolve through
+           the router that is about to intercept them.
+        4. ``/ip hotspot profile`` -- ``hotspot-address``, the uploaded
+           page set, and the ``dns-name`` RouterOS puts in its redirect.
+        5. ``/ip dns static`` -- what makes that ``dns-name`` resolve.
+           MikroTik's own documentation is explicit that ``dns-name``
+           changes the redirect URL and does not by itself create a
+           record; without this line guests are redirected to a hostname
+           that answers NXDOMAIN.
+        6. ``/ip hotspot`` -- the server, referencing 1 and 4.
+
+        The order is the reference order and is not cosmetic: the hotspot
+        server names the pool and the profile, and the DHCP server names
+        the pool, so each must exist before the object that points at it.
+
+        **Every write is existence-checked, and updates rather than skips
+        when a mutable field changed.** Re-pushing is ordinary -- an
+        operator edits a subnet and saves again -- and a portal whose pool
+        still hands out the old subnet after a re-push is a portal that
+        reports success and does not work.
+
+        Nothing here touches the router's own default ``hotspot1`` or any
+        other VLAN's portal: every object is named from ``vlan_id`` and
+        bound to ``hotspot.interface``.
+        """
+        await asyncio.to_thread(self._configure_vlan_hotspot_sync, creds, hotspot)
+
+    def _configure_vlan_hotspot_sync(
+        self, creds: DeviceCredentials, hotspot: VlanHotspotConfig
+    ) -> None:
+        ranges = _hotspot_pool_range(hotspot.cidr, hotspot.gateway)
+        if ranges is None:
+            # Refused before the connection, not half-applied: a portal
+            # with an empty pool accepts guests and hands out nothing.
+            raise MikroTikDeviceError(
+                creds.host,
+                f"configure_vlan_hotspot: {hotspot.cidr} has no address left to "
+                f"hand out once {hotspot.gateway} is reserved for the router",
+            )
+        names = _HotspotNames(hotspot.vlan_id)
+        network = str(ipaddress.ip_network(hotspot.cidr, strict=False))
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._ensure_ip_pool(api, names.pool, ranges)
+                # No lease-time: _render_vlan_hotspot does not set one
+                # either, and inventing one would change how long every
+                # portal guest holds an address.
+                self._ensure_dhcp_server(
+                    api,
+                    names.dhcp_server,
+                    interface=hotspot.interface,
+                    address_pool=names.pool,
+                )
+                self._ensure_dhcp_network(
+                    api,
+                    network,
+                    {
+                        "address": network,
+                        "gateway": hotspot.gateway,
+                        "dns-server": hotspot.gateway,
+                    },
+                    owner=names.network_owner,
+                )
+                self._ensure_hotspot_profile(
+                    api,
+                    names.profile,
+                    hotspot_address=hotspot.gateway,
+                    html_directory=hotspot.html_directory,
+                    dns_name=hotspot.dns_name,
+                )
+                self._ensure_dns_static(
+                    api,
+                    hotspot.dns_name,
+                    address=hotspot.gateway,
+                    comment=names.dns_comment,
+                )
+                self._ensure_hotspot_server(
+                    api,
+                    names.server,
+                    interface=hotspot.interface,
+                    address_pool=names.pool,
+                    profile=names.profile,
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_vlan_hotspot: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_hotspot_profile(
+        self,
+        api,
+        name: str,
+        *,
+        hotspot_address: str,
+        html_directory: str,
+        dns_name: str,
+    ) -> None:
+        """Creates this VLAN's hotspot profile, or brings the existing one
+        of that name into line.
+
+        All three fields are things an operator can change -- re-address
+        the VLAN, upload a new page set, rename the portal host -- so a
+        found profile is updated, never skipped. Skipping is how a portal
+        keeps redirecting to a gateway the VLAN no longer has.
+        """
+        desired = {
+            "hotspot-address": hotspot_address,
+            "html-directory": html_directory,
+            "dns-name": dns_name,
+            # Without these two the portal is decorative. RouterOS defaults
+            # a new profile to `use-radius=no login-by=cookie,http-chap`,
+            # so a per-VLAN portal came up unable to check a credential
+            # against this platform at all: the page appeared, and no OTP,
+            # voucher or password could ever succeed on it. Observed on the
+            # lab router as `vlan95-hsprof use-radius=False`.
+            #
+            # The values mirror `hsprof1`, the router's own working guest
+            # profile (`use-radius=True login-by=http-pap`) -- `http-pap`
+            # because the portal posts the credential, which CHAP's
+            # challenge flow does not carry. `radius-accounting` is left
+            # alone: RouterOS turns it on by default once `use-radius=yes`.
+            "use-radius": "yes",
+            "login-by": "http-pap",
+        }
+        menu = api.path("ip", "hotspot", "profile")
+        for row in menu:
+            if row.get("name") != name:
+                continue
+            changed = {
+                key: value
+                for key, value in desired.items()
+                # html-directory compared as a path: RouterOS stores
+                # "cloudguest-hotspot" and reads back
+                # "flash/cloudguest-hotspot".
+                if not (
+                    key == "html-directory"
+                    and _same_routeros_path(row.get(key), value)
+                )
+                # use-radius answers a read as a real bool while accepting
+                # "yes"/"no" on write, so a string compare never matches and
+                # every push re-issues the same set. Same normalization trap
+                # already documented on _ensure_dhcp_server's lease-time and
+                # on `disabled`.
+                and not (
+                    key == "use-radius"
+                    and _is_truthy(row.get(key)) is (value == "yes")
+                )
+                and row.get(key) != value
+            }
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(name=name, **desired)
+
+    def _ensure_dns_static(
+        self, api, name: str, *, address: str, comment: str
+    ) -> None:
+        """Creates the ``/ip dns static`` record that makes the profile's
+        ``dns-name`` resolve, keyed on the name -- which is what RouterOS
+        itself treats as this row's identity, and what a second ``add``
+        collides on.
+
+        ``disabled`` is normalized through :func:`_is_truthy`, never by
+        string comparison: a disabled record answers nothing, so a
+        re-push -- the operator asking for the portal again -- has to
+        re-enable it, and comparing the raw value against ``"no"`` would
+        instead issue a pointless update on every single push.
+        """
+        desired = {"address": address, "comment": comment}
+        menu = api.path("ip", "dns", "static")
+        for row in menu:
+            if row.get("name") != name:
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(name=name, **desired, disabled="no")
+
+    def _ensure_hotspot_server(
+        self,
+        api,
+        name: str,
+        *,
+        interface: str,
+        address_pool: str,
+        profile: str,
+    ) -> None:
+        """Creates the ``/ip hotspot`` server itself, or corrects the one
+        already carrying this VLAN's name.
+
+        ``interface`` is part of the desired state rather than only of the
+        ``add``: a server found by this VLAN's name but bound to another
+        interface is this VLAN's portal challenging the wrong network,
+        which is worth fixing where adding a second server beside it would
+        not be.
+        """
+        desired = {
+            "interface": interface,
+            "address-pool": address_pool,
+            "profile": profile,
+        }
+        menu = api.path("ip", "hotspot")
+        for row in menu:
+            if row.get("name") != name:
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(name=name, **desired, disabled="no")
+
+    async def delete_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Takes one VLAN's captive portal back off the device.
+
+        The exact reverse of :meth:`configure_vlan_hotspot`'s order, and
+        that is a RouterOS requirement rather than a tidiness preference:
+        the hotspot server holds the profile and the pool, and the DHCP
+        server holds the pool, so RouterOS refuses to remove any of them
+        while something still points at it.
+
+        Idempotent, so it serves both intents that reach it -- the
+        operator turned the portal off, or deleted the VLAN outright -- and
+        a re-run after a partial failure completes cleanly.
+        """
+        await asyncio.to_thread(self._delete_vlan_hotspot_sync, creds, hotspot)
+
+    def _delete_vlan_hotspot_sync(
+        self, creds: DeviceCredentials, hotspot: VlanHotspotConfig
+    ) -> None:
+        names = _HotspotNames(hotspot.vlan_id)
+        network = str(ipaddress.ip_network(hotspot.cidr, strict=False))
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where(api, ("ip", "hotspot"), "name", names.server)
+                self._remove_where(
+                    api, ("ip", "dns", "static"), "name", hotspot.dns_name
+                )
+                self._remove_where(
+                    api, ("ip", "hotspot", "profile"), "name", names.profile
+                )
+                # Only this portal's own row -- a DHCP pool on the same
+                # subnet writes one keyed identically. See
+                # _remove_dhcp_network.
+                self._remove_dhcp_network(
+                    api, network, owner=names.network_owner
+                )
+                self._remove_where(
+                    api, ("ip", "dhcp-server"), "name", names.dhcp_server
+                )
+                self._remove_where(api, ("ip", "pool"), "name", names.pool)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_vlan_hotspot: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    async def delete_dhcp_pool(
+        self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
+    ) -> None:
+        """Removes the three objects :meth:`configure_dhcp_pool` created.
+
+        Order matters and is not cosmetic: the DHCP server holds a
+        reference to the address pool, so the server goes first or RouterOS
+        refuses to remove a pool still in use.
+
+        Idempotent, for the same reasons as :meth:`delete_vlan`.
+        """
+        await asyncio.to_thread(self._delete_dhcp_pool_sync, creds, pool)
+
+    def _delete_dhcp_pool_sync(
+        self, creds: DeviceCredentials, pool: DhcpPoolConfig
+    ) -> None:
+        identifier = re.sub(r"[^A-Za-z0-9_-]", "-", pool.interface)
+        pool_name = f"{identifier}-pool"
+        server_name = f"{identifier}-dhcp"
+        network = str(
+            _smallest_enclosing_network(pool.range_start, pool.range_end)
+        )
+        api = self._connect_api(creds)
+        try:
+            try:
+                # Only our own row -- the per-VLAN portal writes a network
+                # row for the same subnet, keyed identically by RouterOS.
+                # Observed on hardware: this delete removed a live portal's
+                # row, taking its gateway and DNS with it.
+                self._remove_dhcp_network(
+                    api, network, owner=f"WyfyGuest DHCP {identifier}"
+                )
+                # Server before pool: the server references the pool, and
+                # RouterOS refuses to remove a pool that is still in use.
+                self._remove_where(api, ("ip", "dhcp-server"), "name", server_name)
+                self._remove_where(api, ("ip", "pool"), "name", pool_name)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_dhcp_pool: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _remove_where(
+        self, api, path_segments: tuple[str, ...], field: str, value: str
+    ) -> None:
+        menu = api.path(*path_segments)
+        for row in list(menu):
+            if row.get(field) == value:
+                menu.remove(row[".id"])
+
+    def _remove_where_prefixed(
+        self, api, path_segments: tuple[str, ...], field: str, prefix: str
+    ) -> None:
+        """:meth:`_remove_where`'s sibling for a field that carries an
+        identity marker *and* a mutable tail -- a content-filtering
+        comment, which is ``"<marker>: <the customer's label>"``. Matching
+        the whole value would miss every rule renamed since its last push,
+        which is precisely the rule this has to find.
+        """
+        menu = api.path(*path_segments)
+        for row in list(menu):
+            if str(row.get(field, "")).startswith(prefix):
+                menu.remove(row[".id"])
 
     async def configure_dhcp_pool(
         self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
@@ -1097,29 +3504,58 @@ class MikroTikAdapter:
         self, creds: DeviceCredentials, pool: DhcpPoolConfig
     ) -> None:
         identifier = re.sub(r"[^A-Za-z0-9_-]", "-", pool.interface)
+        pool_name = f"{identifier}-pool"
+        server_name = f"{identifier}-dhcp"
         network = _smallest_enclosing_network(pool.range_start, pool.range_end)
         api = self._connect_api(creds)
         try:
             try:
-                api.path("ip", "pool").add(
-                    name=f"{identifier}-pool",
-                    ranges=f"{pool.range_start}-{pool.range_end}",
+                # Each of the three writes is guarded on its own existence
+                # check. All three were unconditional ``add`` calls, so the
+                # second push of an unchanged pool died on RouterOS's
+                # "already have such item" -- and re-pushing is an ordinary
+                # operation (an operator widens a range and saves again).
+                # Same fix, same reasoning as ``_ensure_ip_address`` above.
+                # Checked before anything is created, not discovered
+                # halfway through. RouterOS permits one dhcp-server per
+                # interface; observed on hardware, the pool add succeeded,
+                # the server add failed with "server or relay with such
+                # interface already exists", and the pool was left orphaned
+                # on the device with nothing referencing it while the
+                # caller recorded a failed push.
+                for existing in api.path("ip", "dhcp-server"):
+                    if (
+                        existing.get("interface") == pool.interface
+                        and existing.get("name") != server_name
+                    ):
+                        raise MikroTikDeviceError(
+                            creds.host,
+                            f"configure_dhcp_pool: interface {pool.interface!r} "
+                            f"already serves DHCP through "
+                            f"{existing.get('name')!r}; RouterOS permits one "
+                            "server per interface",
+                        )
+                self._ensure_ip_pool(
+                    api, pool_name, f"{pool.range_start}-{pool.range_end}"
                 )
-                api.path("ip", "dhcp-server").add(
-                    name=f"{identifier}-dhcp",
+                self._ensure_dhcp_server(
+                    api,
+                    server_name,
                     interface=pool.interface,
-                    **{
-                        "address-pool": f"{identifier}-pool",
-                        "lease-time": f"{pool.lease_time_seconds}s",
-                    },
-                    disabled="no",
+                    address_pool=pool_name,
+                    lease_time=f"{pool.lease_time_seconds}s",
                 )
                 network_fields: dict[str, str] = {"address": str(network)}
                 if pool.gateway:
                     network_fields["gateway"] = pool.gateway
                 if pool.dns_servers:
                     network_fields["dns-server"] = ",".join(pool.dns_servers)
-                api.path("ip", "dhcp-server", "network").add(**network_fields)
+                self._ensure_dhcp_network(
+                    api,
+                    str(network),
+                    network_fields,
+                    owner=f"WyfyGuest DHCP {identifier}",
+                )
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_dhcp_pool: {exc}"
@@ -1127,13 +3563,987 @@ class MikroTikAdapter:
         finally:
             api.close()
 
+    def _ensure_ip_pool(self, api, name: str, ranges: str) -> None:
+        """Creates the address pool, or updates its ranges if a pool of that
+        name is already there.
+
+        Updating rather than skipping matters here in a way it does not for
+        an IP address: the range *is* the thing an operator edits, so a
+        re-push after widening a pool has to actually widen it on the
+        device. Skipping would report success and leave the old range.
+        """
+        for row in api.path("ip", "pool"):
+            if row.get("name") == name:
+                if row.get("ranges") != ranges:
+                    api.path("ip", "pool").update(**{".id": row[".id"], "ranges": ranges})
+                return
+        api.path("ip", "pool").add(name=name, ranges=ranges)
+
+    def _ensure_dhcp_server(
+        self,
+        api,
+        name: str,
+        *,
+        interface: str,
+        address_pool: str,
+        lease_time: str | None = None,
+    ) -> None:
+        """Creates the DHCP server, or brings an existing one of that name
+        into line with the requested interface/pool/lease-time.
+
+        ``lease_time`` is optional because one caller genuinely has none to
+        state: ``_render_vlan_hotspot``'s own ``/ip dhcp-server add`` omits
+        it and lets RouterOS apply its default, and passing a fabricated
+        one here would change the lease behaviour of every captive portal
+        this platform pushes. Omitted means "leave whatever the device
+        has", not "set it to a default".
+        """
+        desired = {"interface": interface, "address-pool": address_pool}
+        if lease_time is not None:
+            desired["lease-time"] = lease_time
+        for row in api.path("ip", "dhcp-server"):
+            if row.get("name") == name:
+                changed = {
+                    key: value
+                    for key, value in desired.items()
+                    # lease-time compared as a duration, not a string:
+                    # RouterOS stores "600s" and reads it back as "10m".
+                    if not (
+                        key == "lease-time"
+                        and _same_routeros_duration(row.get(key), value)
+                    )
+                    and row.get(key) != value
+                }
+                # ``disabled`` is compared as a boolean, not a string.
+                # RouterOS accepts "no"/"false" on write and answers reads
+                # with a real bool, so a string comparison reports a
+                # difference on every single push and issues a pointless
+                # update forever.
+                if _is_truthy(row.get("disabled")):
+                    changed["disabled"] = "no"
+                if changed:
+                    api.path("ip", "dhcp-server").update(
+                        **{".id": row[".id"], **changed}
+                    )
+                return
+        api.path("ip", "dhcp-server").add(name=name, **desired, disabled="no")
+
+    def _ensure_dhcp_network(
+        self, api, address: str, fields: dict[str, str], *, owner: str
+    ) -> None:
+        """Creates the ``/ip dhcp-server network`` row for this subnet, or
+        updates the existing row for that exact address.
+
+        Matched on ``address`` because that is what RouterOS itself treats
+        as the row's identity -- a second row for the same subnet is what
+        produces "already have such item".
+
+        ``owner`` is stamped into the row's ``comment`` and exists for the
+        *delete* path, not this one. Two different features create a
+        network row for the same subnet -- a DHCP pool and a per-VLAN
+        captive portal both do -- and until this marker existed, deleting
+        either one removed whichever row was there, because the delete
+        matched on the subnet alone. Observed on real hardware: tearing
+        down a DHCP pool silently removed a live portal's network row,
+        taking its gateway and DNS with it. No error, no warning; the
+        portal then hands out addresses with no way off the subnet.
+        """
+        stamped = {**fields, "comment": owner}
+        for row in api.path("ip", "dhcp-server", "network"):
+            if row.get("address") == address:
+                changed = {
+                    key: value
+                    for key, value in stamped.items()
+                    if row.get(key) != value
+                }
+                if changed:
+                    api.path("ip", "dhcp-server", "network").update(
+                        **{".id": row[".id"], **changed}
+                    )
+                return
+        api.path("ip", "dhcp-server", "network").add(**stamped)
+
+    def _remove_dhcp_network(self, api, address: str, *, owner: str) -> None:
+        """Removes this subnet's network row **only if we wrote it**.
+
+        A row for the same subnet that carries someone else's marker -- or
+        no marker at all, meaning a human or an older build of this
+        platform created it -- is left exactly where it is. Deleting one
+        feature's configuration while tearing down another's is worse than
+        leaving a stale row behind: the stale row is visible and
+        correctable, the deletion is silent and breaks a running service.
+        """
+        menu = api.path("ip", "dhcp-server", "network")
+        for row in list(menu):
+            if row.get("address") == address and row.get("comment") == owner:
+                menu.remove(row[".id"])
+
+    # ------------------------------------------------------------------
+    # custom DHCP options (/ip dhcp-server option [+ sets])
+    # ------------------------------------------------------------------
+    #
+    # Read the whole of this before changing anything below it. Three of
+    # the four facts here were established by trying them on a live venue
+    # router, and none of them are inferable from the RouterOS
+    # documentation.
+    #
+    # 1. **Removal order is forced.** RouterOS refuses to remove an option
+    #    that an option-set still lists, and refuses to remove an
+    #    option-set that a ``/ip dhcp-server network`` row still names. So
+    #    the only order that works is detach -> shrink/remove the set ->
+    #    remove the option. Any other order fails partway and leaves the
+    #    device in a state where the option is still being handed out.
+    #
+    # 2. **``dhcp-option-set`` is a name-reference property, and clearing it
+    #    takes the ``!`` prefix.** Two other shapes were shipped first and
+    #    both failed on the venue router, with two different errors:
+    #    ``set dhcp-option-set=""`` gives ``ambiguous value of
+    #    dhcp-option-set, more than one possible value matches input``
+    #    (RouterOS prefix-matches name-typed values, and "" prefixes every
+    #    candidate), and ``unset value-name=dhcp-option-set`` gives ``input
+    #    does not match any value of value-name`` (``unset`` is
+    #    undocumented, per-menu optional, and does not list this field on
+    #    this menu). The *documented* clear, ``set !dhcp-option-set``, is
+    #    accepted by 7.23.3 and SILENTLY DOES NOTHING. What actually
+    #    clears the field is ``set dhcp-option-set=none``, confirming the
+    #    ``name | none`` typing. All three observations are from the venue
+    #    router. :meth:`_clear_field` tries them in that order and *proves*
+    #    the result by re-reading the row -- three shapes have now been
+    #    wrong on this one menu, so do not "simplify" it to a single
+    #    command, and do not drop the read-back.
+    #
+    # 3. **Match the option by its own name, never by ``code=114``.** A
+    #    code-scoped sweep can only ever hit a row somebody else added. A
+    #    venue running its own PXE/TFTP option on a code we also use is a
+    #    real configuration, and deleting it is a worse outage than the one
+    #    being fixed.
+    #
+    # 4. **``force=yes`` changes the blast radius.** With it, every client
+    #    receives the option whether or not it asked for that code. It is
+    #    set on the fleet today, which is why an option-114 defect went
+    #    from affecting the clients that ask to affecting all of them.
+
+    async def read_dhcp_options(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        """Reads ``/ip dhcp-server option``, ``/ip dhcp-server option
+        sets``, and every row that binds one of them to clients.
+
+        Read-only. This is the call that answers "does this venue still
+        advertise the captive-portal URI" without writing anything, and it
+        is deliberately separate from the removal so a fleet audit can run
+        against production without being a fleet change.
+        """
+        return await asyncio.to_thread(self._read_dhcp_options_sync, creds)
+
+    def _read_dhcp_options_sync(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # ``supported`` distinguishes "this RouterOS has no option
+                # menu" from "this router has no options" -- see
+                # DhcpOptionSnapshot. _safe_query flattens both to [], so
+                # the menu is probed once, on its own, first.
+                supported = True
+                try:
+                    option_rows = list(api.path(*_DHCP_OPTION_PATH))
+                except LibRouterosError as exc:
+                    logger.info(
+                        "mikrotik_dhcp_option_menu_unavailable",
+                        extra={"host": creds.host, "detail": str(exc)},
+                    )
+                    supported = False
+                    option_rows = []
+                # The sets menu is a separate probe: RouterOS 6 has the
+                # option menu without ``option sets``, so a missing sets
+                # menu must not be read as a router with no options at all.
+                set_rows = (
+                    self._safe_query(api, *_DHCP_OPTION_SET_PATH) if supported else []
+                )
+                bindings: list[DhcpOptionBinding] = []
+                if supported:
+                    for path, identity_field in _DHCP_OPTION_BINDING_PATHS:
+                        for row in self._safe_query(api, *path):
+                            option_names = _split_routeros_list(row.get("dhcp-option"))
+                            option_set = _safe_str(row.get("dhcp-option-set"))
+                            if not option_names and not option_set:
+                                continue
+                            bindings.append(
+                                DhcpOptionBinding(
+                                    menu="/".join(path),
+                                    identity=_safe_str(row.get(identity_field))
+                                    or _safe_str(row.get(".id"))
+                                    or "",
+                                    option_names=option_names,
+                                    option_set_name=option_set,
+                                )
+                            )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dhcp_options: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return DhcpOptionSnapshot(
+            supported=supported,
+            options=tuple(
+                DhcpOptionInfo(
+                    name=_safe_str(row.get("name")) or "",
+                    code=_safe_int(row.get("code")),
+                    value=_safe_str(row.get("value")),
+                    force=_is_truthy(row.get("force")),
+                )
+                for row in option_rows
+                if row.get("name")
+            ),
+            option_sets=tuple(
+                DhcpOptionSetInfo(
+                    name=_safe_str(row.get("name")) or "",
+                    option_names=_split_routeros_list(row.get("options")),
+                )
+                for row in set_rows
+                if row.get("name")
+            ),
+            bindings=tuple(bindings),
+        )
+
+    async def configure_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> None:
+        """Writes the option, the set that carries it, and the bindings that
+        hand it to clients -- the state a human previously produced only by
+        pasting a setup script.
+
+        ``code`` and ``value`` are required here even though they are
+        optional on the config: a removal is identified by name alone, but
+        an option cannot be *created* without the two fields that give it
+        meaning, and inventing either would put a fabricated URI in front
+        of every guest device on the network.
+        """
+        if option.code is None or not option.value:
+            raise MikroTikDeviceError(
+                creds.host,
+                "configure_dhcp_option: code and value are both required to "
+                f"create option {option.name!r}",
+            )
+        await asyncio.to_thread(self._configure_dhcp_option_sync, creds, option)
+
+    def _configure_dhcp_option_sync(
+        self, creds: DeviceCredentials, option: DhcpOptionConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                desired = {
+                    "code": str(option.code),
+                    "value": option.value or "",
+                    "force": "yes" if option.force else "no",
+                }
+                self._ensure_named_row(api, _DHCP_OPTION_PATH, option.name, desired)
+                if option.option_set_name:
+                    self._ensure_option_set_contains(
+                        api, option.option_set_name, option.name
+                    )
+                for address in option.network_addresses:
+                    self._attach_option_to_network(api, address, option)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_dhcp_option: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_named_row(
+        self, api, path: tuple[str, ...], name: str, desired: dict[str, str]
+    ) -> None:  # noqa: ANN001
+        """Create the row of this name, or bring an existing one into line.
+
+        Updating rather than skipping is the point: an option whose
+        ``value`` drifted still reads as configured on the dashboard and
+        hands every client the old URI. Same reasoning as
+        :meth:`_ensure_ip_pool`.
+        """
+        menu = api.path(*path)
+        for row in menu:
+            if row.get("name") == name:
+                changed = {
+                    key: value
+                    for key, value in desired.items()
+                    # ``force`` comes back from RouterOS as a real bool,
+                    # so comparing it as a string reports a difference on
+                    # every push and writes forever. Same trap
+                    # _ensure_dhcp_server documents for ``disabled``.
+                    if not (
+                        key == "force"
+                        and _is_truthy(row.get(key)) == (value == "yes")
+                    )
+                    and str(row.get(key, "")) != value
+                }
+                if changed:
+                    menu.update(**{".id": row[".id"], **changed})
+                return
+        menu.add(name=name, **desired)
+
+    def _ensure_option_set_contains(
+        self, api, set_name: str, option_name: str
+    ) -> None:  # noqa: ANN001
+        """Make ``set_name`` list ``option_name``, keeping whatever else it
+        already lists.
+
+        Appending rather than overwriting: ``options`` is a list field, and
+        a push that replaced it would silently drop another feature's
+        option out of a shared set.
+        """
+        menu = api.path(*_DHCP_OPTION_SET_PATH)
+        for row in menu:
+            if row.get("name") == set_name:
+                current = _split_routeros_list(row.get("options"))
+                if option_name in current:
+                    return
+                menu.update(
+                    **{
+                        ".id": row[".id"],
+                        "options": ",".join((*current, option_name)),
+                    }
+                )
+                return
+        menu.add(name=set_name, options=option_name)
+
+    def _attach_option_to_network(
+        self, api, address: str, option: DhcpOptionConfig
+    ) -> None:  # noqa: ANN001
+        """Bind this option (via its set where there is one, directly
+        otherwise) to the ``/ip dhcp-server network`` row for ``address``.
+
+        A subnet with no network row is skipped rather than created. This
+        method's job is to attach an option, and fabricating a network row
+        here would invent a gateway and DNS for a subnet nobody asked this
+        code about -- exactly the silent cross-feature damage
+        :meth:`_remove_dhcp_network`'s marker exists to prevent.
+        """
+        menu = api.path(*_DHCP_NETWORK_PATH)
+        for row in menu:
+            if row.get("address") != address:
+                continue
+            if option.option_set_name:
+                if _safe_str(row.get("dhcp-option-set")) == option.option_set_name:
+                    return
+                menu.update(
+                    **{
+                        ".id": row[".id"],
+                        "dhcp-option-set": option.option_set_name,
+                    }
+                )
+                return
+            current = _split_routeros_list(row.get("dhcp-option"))
+            if option.name in current:
+                return
+            menu.update(
+                **{
+                    ".id": row[".id"],
+                    "dhcp-option": ",".join((*current, option.name)),
+                }
+            )
+            return
+        logger.info(
+            "mikrotik_dhcp_option_network_row_absent",
+            extra={"address": address, "option": option.name},
+        )
+
+    async def delete_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        """Removes one named option and every reference to it, in the only
+        order RouterOS accepts.
+
+        Takes the same :class:`DhcpOptionConfig` as the writer, but reads
+        only ``name`` (and ``option_set_name`` as a hint): what the option
+        is attached to is discovered from the device, never assumed from
+        the caller's idea of it. That is what makes this safe to run
+        against a router configured by a pasted script this platform never
+        saw -- which is every router in the fleet today.
+
+        Idempotent in the strong sense: against a router that never had
+        the option, against one already cleaned, and against one cleaned
+        halfway by a previous run that failed mid-sequence.
+        """
+        return await asyncio.to_thread(self._delete_dhcp_option_sync, creds, option)
+
+    def _delete_dhcp_option_sync(
+        self, creds: DeviceCredentials, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # --- plan, from the device's own state -------------------
+                # Only sets that actually list our option are touched, and
+                # only ours is taken out of them. A set that carries
+                # somebody else's option too is shrunk, not deleted.
+                sets_to_remove: list[str] = []
+                sets_to_rewrite: dict[str, tuple[str, ...]] = {}
+                for row in self._safe_query(api, *_DHCP_OPTION_SET_PATH):
+                    listed = _split_routeros_list(row.get("options"))
+                    if option.name not in listed:
+                        continue
+                    name = _safe_str(row.get("name")) or ""
+                    remaining = tuple(n for n in listed if n != option.name)
+                    if remaining:
+                        sets_to_rewrite[name] = remaining
+                    else:
+                        sets_to_remove.append(name)
+
+                # --- step 1: detach ------------------------------------
+                # Must come first. RouterOS refuses to remove an
+                # option-set a network row still names, and refuses to
+                # remove an option a set still lists.
+                detached = self._detach_dhcp_option(
+                    api,
+                    host=creds.host,
+                    option_name=option.name,
+                    set_names=frozenset(sets_to_remove),
+                )
+
+                # --- step 2: shrink or remove the sets -----------------
+                set_menu = api.path(*_DHCP_OPTION_SET_PATH)
+                rewritten: list[str] = []
+                removed_sets: list[str] = []
+                for row in list(self._safe_query(api, *_DHCP_OPTION_SET_PATH)):
+                    name = _safe_str(row.get("name")) or ""
+                    if name in sets_to_rewrite:
+                        set_menu.update(
+                            **{
+                                ".id": row[".id"],
+                                "options": ",".join(sets_to_rewrite[name]),
+                            }
+                        )
+                        rewritten.append(name)
+                    elif name in sets_to_remove:
+                        set_menu.remove(row[".id"])
+                        removed_sets.append(name)
+
+                # --- step 3: the option itself -------------------------
+                option_removed = False
+                option_menu = api.path(*_DHCP_OPTION_PATH)
+                for row in list(self._safe_query(api, *_DHCP_OPTION_PATH)):
+                    # By name. Never by code -- see the block comment at
+                    # the top of this section.
+                    if row.get("name") == option.name:
+                        option_menu.remove(row[".id"])
+                        option_removed = True
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_dhcp_option: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return DhcpOptionRemoval(
+            option_removed=option_removed,
+            option_sets_removed=tuple(removed_sets),
+            option_sets_rewritten=tuple(rewritten),
+            bindings_detached=tuple(detached),
+        )
+
+    def _detach_dhcp_option(
+        self, api, *, host: str, option_name: str, set_names: frozenset[str]
+    ) -> list[str]:  # noqa: ANN001
+        """Take the option, and the sets that exist only to carry it, off
+        every row that hands them to clients. Returns what it detached
+        from, for the caller's report.
+
+        Two fields, two different removals:
+
+        * ``dhcp-option-set`` is a single name-reference value, so clearing
+          it goes through :meth:`_clear_field` -- ``set
+          dhcp-option-set=""`` does not work and is not a shortcut, and
+          neither does ``unset``. See that method for the two errors the
+          venue router gives and why the documented shape is ``!``.
+        * ``dhcp-option`` is a *list*, so ours is edited out of it and the
+          rest written back. Only when nothing else is left is the whole
+          field cleared. A blanket clear here would drop another feature's
+          option on the way past.
+
+        Raises :class:`MikroTikDeviceError` if a field will not clear,
+        leaving the device exactly as it was found. Detaching is the step
+        everything after it depends on, so a half-detach must not be
+        allowed to look like progress.
+        """
+        detached: list[str] = []
+        for path, identity_field in _DHCP_OPTION_BINDING_PATHS:
+            rows = self._safe_query(api, *path)
+            if not rows:
+                continue
+            menu = api.path(*path)
+            for row in list(rows):
+                row_id = row.get(".id")
+                if row_id is None:
+                    continue
+                identity = (
+                    _safe_str(row.get(identity_field)) or _safe_str(row_id) or ""
+                )
+                touched = False
+                if _safe_str(row.get("dhcp-option-set")) in set_names:
+                    self._clear_field_or_fail(
+                        api, host, path, row_id, "dhcp-option-set", identity
+                    )
+                    touched = True
+                listed = _split_routeros_list(row.get("dhcp-option"))
+                if option_name in listed:
+                    remaining = tuple(n for n in listed if n != option_name)
+                    if remaining:
+                        menu.update(
+                            **{".id": row_id, "dhcp-option": ",".join(remaining)}
+                        )
+                    else:
+                        self._clear_field_or_fail(
+                            api, host, path, row_id, "dhcp-option", identity
+                        )
+                    touched = True
+                if touched:
+                    detached.append(f"{'/'.join(path)}:{identity}")
+        return detached
+
+    def _clear_field_or_fail(
+        self,
+        api,  # noqa: ANN001
+        host: str,
+        path: tuple[str, ...],
+        row_id: object,
+        field: str,
+        identity: str,
+    ) -> None:
+        """:meth:`_clear_field`, but refusing to continue when the device
+        will not let go of the field.
+
+        This is the fail-closed hinge of the whole removal. If the binding
+        is still attached, the option is still being handed to clients, and
+        removing the set and the option underneath it would either be
+        refused by RouterOS or leave a dangling reference. Raising here
+        stops the sequence with the device in its original, working state
+        and lets the caller report ``changed: False`` honestly -- which is
+        the one thing the shipped version got right.
+        """
+        if self._clear_field(api, path, row_id, field):
+            return
+        raise MikroTikDeviceError(
+            host,
+            f"could not clear {field} on /{'/'.join(path)} row {identity!r}: "
+            "the router refused every supported clear shape "
+            f"(set !{field}, set {field}=none, unset value-name={field}). "
+            "Nothing further was written; the option is still attached.",
+        )
+
+    def _field_is_clear(
+        self, api, path: tuple[str, ...], row_id: object, field: str
+    ) -> bool:  # noqa: ANN001
+        """Re-reads one row and answers whether ``field`` is now empty.
+
+        ``none`` counts as empty: it is the literal RouterOS stores for a
+        ``name | none`` property that points at nothing, and a row that
+        reads back ``none`` is a row that hands out no option set.
+
+        A row that has vanished is *not* reported as clear -- that is a
+        different and much worse event than a cleared field, and the
+        caller must not mistake one for the other.
+        """
+        for row in self._safe_query(api, *path):
+            if row.get(".id") != row_id:
+                continue
+            return _safe_str(row.get(field)) in (None, "none")
+        return False
+
+    def _clear_field(
+        self, api, path: tuple[str, ...], row_id: object, field: str
+    ) -> bool:  # noqa: ANN001
+        """Clear one field on one row, and *prove* it was cleared.
+
+        Returns ``True`` only when a re-read of the row says the field is
+        empty. Never infers success from the absence of an exception: a
+        RouterOS ``set`` that returns cleanly and changes nothing is a real
+        failure mode on this fleet (2026-08-18, hotspot profile rebind).
+
+        ## Why this is a ladder and not one command
+
+        Two shapes were shipped before this one and *both* failed on the
+        venue router (RouterOS 7.23.3, hEX lite), with two different
+        errors, which is what makes this worth writing down:
+
+        * ``update(**{".id": id, "dhcp-option-set": ""})`` fails with
+          ``ambiguous value of dhcp-option-set, more than one possible
+          value matches input``. ``dhcp-option-set`` is a *name-reference*
+          property, and RouterOS resolves name-typed values by **prefix**.
+          The empty string is a prefix of every candidate name, so with
+          ``none`` plus at least one defined option set it matches more
+          than one. (Same error, same cause, reproduced by other people on
+          ``/ip firewall nat`` ``in-interface``.)
+        * ``("unset", value-name="dhcp-option-set")`` fails with ``input
+          does not match any value of value-name``. ``unset`` is
+          undocumented and per-menu optional -- it is absent from the
+          Console page's list of general commands -- and its ``value-name``
+          argument is an enum. A property that always has a value (default
+          ``none``) is not a member of that enum on this menu, so the
+          sentence is rejected before it does anything.
+
+        The shape that *is* documented is the ``!`` prefix on ``set``:
+        RouterOS Scripting docs, ``set`` -- "The parameter can be unset by
+        specifying '!' before the parameter." Over the binary API that is
+        the attribute word ``=!dhcp-option-set=``, and ``librouteros``
+        composes exactly that from a ``"!"``-prefixed key:
+
+            /ip/dhcp-server/network/set  =.id=*1  =!dhcp-option-set=
+
+        **...and on 7.23.3 the documented shape is a silent no-op.** Run
+        against the venue router on 2026-09-07, ``set !dhcp-option-set``
+        was accepted -- no ``!trap``, no error -- and the read-back showed
+        ``dhcp-option-set`` still set to ``cloudguest-opts``. The shape
+        that actually cleared it was ``set dhcp-option-set=none``, which
+        also confirms the ``name | none`` typing that explains the
+        "ambiguous" error above.
+
+        That is the whole argument for this method's design in one
+        observation: the *documented* command returned success and changed
+        nothing. Any version of this that trusted a clean return would have
+        reported a removal that did not happen. Only the read-back caught
+        it, and only the next rung fixed it.
+
+        Rung order is therefore hardware-first, not documentation-first:
+        the shape observed to work on this fleet's firmware leads, and the
+        documented one is kept behind it for the menus and firmwares where
+        it does work.
+        """
+        rungs: tuple[tuple[str, Callable[[], object]], ...] = (
+            # 1. The `name | none` clear literal -- OBSERVED to work on
+            #    7.23.3 (hEX lite) for dhcp-option-set. Unambiguous where
+            #    "" is not, because it matches exactly one candidate. Only
+            #    meaningful for a name-reference field: on an ordinary list
+            #    field like `dhcp-option` there is no option called "none",
+            #    so RouterOS rejects it and the next rung runs.
+            (
+                f"set {field}=none",
+                lambda: api.path(*path).update(**{".id": row_id, field: "none"}),
+            ),
+            # 2. The DOCUMENTED clear ("The parameter can be unset by
+            #    specifying '!' before the parameter"), wire word
+            #    `=!<field>=`. Kept, but demoted: on 7.23.3 this is
+            #    accepted and does nothing for dhcp-option-set. It is here
+            #    for the menus and firmwares where it does work, and it is
+            #    harmless where it does not -- the read-back is what
+            #    decides, never the clean return.
+            (
+                f"set !{field}",
+                lambda: api.path(*path).update(**{".id": row_id, f"!{field}": ""}),
+            ),
+            # 3. RouterOS's own `unset`, for the menus that do list this
+            #    field in the value-name enum. ``Path.__call__`` is a
+            #    *generator*, so the sentence is only written when it is
+            #    consumed -- hence ``tuple(...)``. A bare call sends nothing.
+            (
+                f"unset value-name={field}",
+                lambda: tuple(
+                    api.path(*path)(
+                        "unset", **{".id": row_id, "value-name": field}
+                    )
+                ),
+            ),
+        )
+        for label, attempt in rungs:
+            try:
+                attempt()
+            except LibRouterosError as exc:
+                logger.info(
+                    "mikrotik_clear_field_rung_rejected",
+                    extra={
+                        "menu": "/".join(path),
+                        "field": field,
+                        "shape": label,
+                        "detail": str(exc),
+                    },
+                )
+            # Read back even after a rejection: a RouterOS error does not
+            # always mean nothing changed, and the device's own answer is
+            # the only thing this method is willing to believe.
+            if self._field_is_clear(api, path, row_id, field):
+                logger.info(
+                    "mikrotik_clear_field_succeeded",
+                    extra={
+                        "menu": "/".join(path),
+                        "field": field,
+                        "shape": label,
+                    },
+                )
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # rogue DHCP detection (/ip dhcp-server alert)
+    # ------------------------------------------------------------------
+
+    async def configure_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials, *, alerts: Sequence[RogueDhcpAlertConfig]
+    ) -> None:
+        """Converge ``/ip dhcp-server alert`` -- the device's own watch for
+        a DHCP server on a guest segment that is not ours.
+
+        ## A detector, and only ever a detector
+
+        The alert **logs**; it drops nothing and blocks nothing. See
+        :class:`RogueDhcpAlertConfig` for the full statement of that
+        limit, and for the lab observation this exists because of. Nothing
+        this method writes can interrupt a working guest network, which is
+        the property that makes it safe to push to a fleet unattended.
+
+        ## The interface is the row's identity
+
+        Unlike the QoS/NAT/port-forward writers, this one is *not* keyed on
+        a comment marker. RouterOS holds one alert per interface, and the
+        interface is not a field a customer edits -- it is the segment
+        being watched, which is the row's whole meaning. Keying on our own
+        marker instead would mean an alert a human (or the hand-run probe
+        that preceded this method) already placed on that interface is not
+        recognized, and RouterOS would reject or duplicate around it. So an
+        unmarked row on a watched interface is **adopted and stamped**,
+        never duplicated -- ``_ensure_dhcp_network``'s reasoning, with the
+        marker serving provenance rather than lookup.
+
+        ## disabled=no is written explicitly, every time
+
+        RouterOS creates an alert row **disabled by default**. Adding one
+        without saying otherwise leaves a guard that is present in the
+        configuration and watching nothing -- worse than no guard at all,
+        because it reads as one. This was not theory: the first by-hand
+        attempt on the lab router left exactly three such rows. So the
+        ``add`` carries ``disabled="no"``, and an existing row found
+        switched off is switched back on.
+
+        ``disabled`` is compared through :func:`_is_truthy`, ``valid-server``
+        through :func:`_same_valid_servers` and ``alert-timeout`` through
+        :func:`_same_routeros_duration` -- three fields, three different
+        ways the naive string compare would re-issue the same ``set`` on
+        every push forever. See ``_ensure_dhcp_server`` for the first of
+        those and why it matters.
+
+        ## What is skipped, and what is refused
+
+        An interface running no *enabled* ``/ip dhcp-server`` of ours is
+        skipped: with no server of our own on that segment there is no
+        baseline for calling a reply rogue, and an alert there would
+        report our own legitimate neighbours.
+
+        A config whose ``valid_servers`` is empty, or contains something
+        that is not a MAC address, is refused **before the connection is
+        opened** -- never filled in with a plausible guess. A wrong
+        trusted-server list is not a partial guard; it is an alert on
+        every legitimate lease, which is how a real one gets ignored.
+
+        Idempotent: a second push of an unchanged set writes nothing.
+        """
+        desired = self._rogue_dhcp_alert_desired_rows(creds, alerts)
+        await asyncio.to_thread(
+            self._configure_rogue_dhcp_alerts_sync, creds, desired
+        )
+
+    @staticmethod
+    def _rogue_dhcp_alert_desired_rows(
+        creds: DeviceCredentials, alerts: Sequence[RogueDhcpAlertConfig]
+    ) -> dict[str, dict[str, str]]:
+        """Validate the whole request and render it into desired rows,
+        before anything is connected to or written.
+
+        Validated as a set rather than one at a time so a bad entry cannot
+        leave half a fleet's worth of interfaces watched and the rest not
+        -- the same "check before the first write" posture
+        ``set_default_route_distances`` and ``configure_dhcp_pool`` take.
+        """
+        desired: dict[str, dict[str, str]] = {}
+        for alert in alerts:
+            interface = _safe_str(alert.interface)
+            if interface is None:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "configure_rogue_dhcp_alerts: an alert with no interface",
+                )
+            if interface in desired:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "configure_rogue_dhcp_alerts: two alerts requested for "
+                    f"interface {interface!r}; RouterOS holds one per "
+                    "interface, so one would silently overwrite the other",
+                )
+            if not alert.valid_servers:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    f"configure_rogue_dhcp_alerts: interface {interface!r} has "
+                    "no valid_servers; an alert that trusts nobody reports "
+                    "every legitimate lease, and this adapter will not invent "
+                    "a trusted server",
+                )
+            servers: list[str] = []
+            for value in alert.valid_servers:
+                mac = normalize_mac_address(value)
+                if mac is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"configure_rogue_dhcp_alerts: interface {interface!r} "
+                        f"has valid_server {value!r}, which is not a MAC "
+                        "address",
+                    )
+                servers.append(mac)
+            row = {
+                "interface": interface,
+                "valid-server": ",".join(servers),
+                "comment": _ROGUE_DHCP_ALERT_COMMENT,
+            }
+            timeout = _safe_str(alert.alert_timeout)
+            if timeout is not None:
+                # Omitted means "leave whatever the device has", never a
+                # fabricated default -- ``_ensure_dhcp_server``'s reasoning
+                # about ``lease_time``, unchanged.
+                row["alert-timeout"] = timeout
+            desired[interface] = row
+        return desired
+
+    def _configure_rogue_dhcp_alerts_sync(
+        self, creds: DeviceCredentials, desired: dict[str, dict[str, str]]
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                serving = self._dhcp_serving_interfaces(api)
+                menu = api.path("ip", "dhcp-server", "alert")
+                rows = list(menu)
+                for interface, fields in desired.items():
+                    if interface not in serving:
+                        logger.info(
+                            "mikrotik_rogue_dhcp_alert_skipped_no_dhcp_server",
+                            extra={"host": creds.host, "interface": interface},
+                        )
+                        continue
+                    row = next(
+                        (
+                            candidate
+                            for candidate in rows
+                            if _safe_str(candidate.get("interface")) == interface
+                        ),
+                        None,
+                    )
+                    if row is None:
+                        menu.add(**fields, disabled="no")
+                        continue
+                    changed = {
+                        key: value
+                        for key, value in fields.items()
+                        if not self._same_rogue_dhcp_alert_field(
+                            key, row.get(key), value
+                        )
+                    }
+                    if _is_truthy(row.get("disabled")):
+                        # Present and switched off: the state that looks
+                        # guarded in the configuration and watches nothing.
+                        changed["disabled"] = "no"
+                    if changed:
+                        menu.update(**{".id": row[".id"], **changed})
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_rogue_dhcp_alerts: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    @staticmethod
+    def _same_rogue_dhcp_alert_field(key: str, current: object, wanted: str) -> bool:
+        """Whether the device's value for one alert field already means
+        what we want it to -- per field, because two of the three do not
+        survive a string comparison. See :func:`_same_valid_servers`."""
+        if key == "valid-server":
+            return _same_valid_servers(current, _split_valid_servers(wanted))
+        if key == "alert-timeout":
+            return _same_routeros_duration(current, wanted)
+        return _safe_str(current) == wanted
+
+    @staticmethod
+    def _dhcp_serving_interfaces(api) -> set[str]:  # noqa: ANN001
+        """The interfaces this router actually runs a DHCP server on.
+
+        Disabled servers are excluded, through :func:`_is_truthy` rather
+        than a string compare: a switched-off server hands out nothing, so
+        an alert on that interface would have no offers of our own to
+        compare an unknown one against.
+        """
+        serving: set[str] = set()
+        for row in api.path("ip", "dhcp-server"):
+            if _is_truthy(row.get("disabled")):
+                continue
+            interface = _safe_str(row.get("interface"))
+            if interface is not None:
+                serving.add(interface)
+        return serving
+
+    async def read_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials
+    ) -> list[RogueDhcpAlertStatus]:
+        """Whether this device is guarded against a rogue DHCP server,
+        interface by interface. Reads only.
+
+        Every interface serving DHCP appears in the answer, whether or not
+        it has an alert row, because "hands out addresses, nothing watching
+        it" is the finding worth having and it has no row of its own to be
+        reported by. Every alert row appears too, including one on an
+        interface that serves no DHCP -- reported rather than hidden, since
+        it means the configuration and the device disagree.
+
+        Presence and liveness are two separate fields
+        (:class:`RogueDhcpAlertStatus`): RouterOS creates these rows
+        disabled, so a check that looks only for presence certifies a
+        router that is watching nothing.
+        """
+        return await asyncio.to_thread(self._read_rogue_dhcp_alerts_sync, creds)
+
+    def _read_rogue_dhcp_alerts_sync(
+        self, creds: DeviceCredentials
+    ) -> list[RogueDhcpAlertStatus]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                serving = self._dhcp_serving_interfaces(api)
+                rows = list(api.path("ip", "dhcp-server", "alert"))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_rogue_dhcp_alerts: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return _build_rogue_dhcp_alert_statuses(rows, serving)
+
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig
     ) -> None:
         """Ported from
         ``network_config/renderers.py::render_port_forwarding_rule`` --
         same real ``/ip firewall nat add chain=dstnat ... action=dst-nat``
-        operation, issued directly over the structured API."""
+        operation, issued directly over the structured API.
+
+        **The comment is the rule's identity**, exactly as it is for
+        :meth:`configure_nat_masquerade`, and for the same reason. This was
+        an unconditional ``.add()``, so the second push of an unchanged
+        rule died on RouterOS's "already have such item" -- and re-pushing
+        is an ordinary operation, not a recovery step. Keying instead on
+        any RouterOS field would be worse than failing: ``dst-port``,
+        ``to-addresses``, ``to-ports`` and ``protocol`` are precisely what
+        a customer edits, so the push after an edit would match nothing,
+        add a second rule, and leave the old one forwarding a live public
+        port at a host that has moved. Keyed on the row's own id, the same
+        push finds what it wrote last time and *updates* it.
+
+        A ``"both"`` rule becomes two device rules, one per transport,
+        under ``<id> tcp`` and ``<id> udp``. RouterOS cannot express "both"
+        on a rule carrying a ``dst-port`` (see
+        :func:`_port_forward_protocols`), and this domain both stores and
+        defaults to that value, so refusing it would make the ordinary case
+        unpushable. Narrowing a rule from both to one transport reaps the
+        other's row rather than leaving it forwarding.
+
+        ``disabled`` is normalized back to ``no`` via :func:`_is_truthy`,
+        never by string comparison: a rule someone disabled by hand is
+        forwarding nothing, and a re-push is the operator asking for it
+        back.
+        """
         await asyncio.to_thread(self._configure_port_forward_sync, creds, rule)
 
     def _configure_port_forward_sync(
@@ -1142,21 +4552,728 @@ class MikroTikAdapter:
         api = self._connect_api(creds)
         try:
             try:
-                fields: dict[str, str] = {
-                    "chain": "dstnat",
-                    "protocol": rule.protocol,
-                    "action": "dst-nat",
-                    "to-addresses": rule.internal_ip,
-                    "to-ports": str(rule.internal_port),
-                }
-                fields["dst-port"] = str(rule.external_port)
-                api.path("ip", "firewall", "nat").add(**fields)
+                self._ensure_port_forward_rules(api, rule)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_port_forward: {exc}"
                 ) from exc
         finally:
             api.close()
+
+    def _port_forward_desired(
+        self, rule: PortForwardConfig, protocol: str
+    ) -> dict[str, str]:
+        """The complete state one device rule should be in.
+
+        ``chain`` and ``action`` belong to the desired state, not only to
+        the ``add``: a row found under this rule's comment but sitting on
+        the wrong chain is this rule in a broken state, and correcting it
+        is right where adding a second one alongside would not be.
+
+        The two optional matchers are carried as ``""`` when unset rather
+        than omitted, so that clearing a source restriction on the row
+        really clears it on the device. Omitting them from the comparison
+        would let a rule the operator narrowed to one source and then
+        widened stay narrow, and the reverse -- a rule left restricted to a
+        network that no longer exists -- forwards nothing while reporting
+        success.
+        """
+        return {
+            "chain": "dstnat",
+            "action": "dst-nat",
+            "protocol": protocol,
+            "dst-port": str(rule.external_port),
+            "to-addresses": rule.internal_ip,
+            "to-ports": str(rule.internal_port),
+            "dst-address": rule.dst_address or "",
+            "src-address": rule.src_address or "",
+        }
+
+    def _ensure_port_forward_rules(self, api, rule: PortForwardConfig) -> None:
+        """Brings this rule's whole set of device rows into line: update
+        what is already there under its comment, add what is missing, drop
+        what it no longer claims."""
+        wanted = {
+            _port_forward_comment(rule.rule_id, protocol): protocol
+            for protocol in _port_forward_protocols(rule.protocol)
+        }
+        menu = api.path("ip", "firewall", "nat")
+        # Materialized before any write: adds append to the same live menu,
+        # and iterating it while writing would revisit rows this call made.
+        rows = [
+            row
+            for row in menu
+            if _owns_port_forward_comment(row.get("comment"), rule.rule_id)
+        ]
+        found: set[str] = set()
+        for row in rows:
+            comment = str(row.get("comment"))
+            protocol = wanted.get(comment)
+            if protocol is None:
+                # This rule's own row for a transport it no longer matches
+                # -- left in place it would keep forwarding the port.
+                menu.remove(row[".id"])
+                continue
+            found.add(comment)
+            desired = self._port_forward_desired(rule, protocol)
+            changed = {
+                key: value
+                for key, value in desired.items()
+                if str(row.get(key) or "") != value
+            }
+            # Boolean, never string -- see ``_is_truthy``. RouterOS accepts
+            # "no" on write and answers reads with a real bool, so comparing
+            # the raw value against "no" reports a difference on every push
+            # and issues a pointless update forever.
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+        for comment, protocol in wanted.items():
+            if comment in found:
+                continue
+            # Empty optional matchers are dropped here, not sent blank: an
+            # ``add`` naming a field with no value is not the same request
+            # as one that never named it.
+            fields = {
+                key: value
+                for key, value in self._port_forward_desired(rule, protocol).items()
+                if value != ""
+            }
+            menu.add(**fields, comment=comment, disabled="no")
+
+    async def delete_port_forward(
+        self, creds: DeviceCredentials, *, rule: PortForwardConfig
+    ) -> None:
+        """Removes every device row this rule owns, by the same comment
+        identity :meth:`configure_port_forward` writes them under.
+
+        Only ``rule.rule_id`` is read. The current field values deliberately
+        are not: a row left from an earlier external port or internal host
+        is still this rule's row, and matching on what the row says *now* is
+        exactly how one would be orphaned -- still forwarding a public port,
+        with nothing in this platform left pointing at it.
+
+        Idempotent: removing what is already absent is a no-op, so deleting
+        a rule twice, or one whose push never landed, completes cleanly.
+        """
+        await asyncio.to_thread(self._delete_port_forward_sync, creds, rule)
+
+    def _delete_port_forward_sync(
+        self, creds: DeviceCredentials, rule: PortForwardConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                menu = api.path("ip", "firewall", "nat")
+                for row in list(menu):
+                    if _owns_port_forward_comment(row.get("comment"), rule.rule_id):
+                        menu.remove(row[".id"])
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_port_forward: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    # ------------------------------------------------------------------
+    # NAT / internet access
+    # ------------------------------------------------------------------
+
+    async def resolve_wan_interface(self, creds: DeviceCredentials) -> str:
+        """The router's own WAN-facing interface, derived from its live
+        state -- never a hardcoded ``"WAN"``/``"ether1"``.
+
+        **The rule: the interface the currently-usable default route
+        leaves by.** A default route is the router's own statement of
+        where the internet is, and it is the only signal on the box that
+        is true by construction rather than by convention. Interface
+        *names* are pure convention: a fleet router may call its uplink
+        ``ether1``, ``WAN``, ``pppoe-out1`` or ``sfp1``, and this platform
+        stores that name nowhere.
+
+        The default route itself is picked by the same two-tier rule every
+        other WAN read here uses (:func:`_select_default_route_row`:
+        dynamic first, then an *active*, non-disabled static one) -- so
+        this agrees with ``get_wan_health`` and ``get_active_default
+        _gateway`` by construction rather than by a second, drifting copy.
+
+        From that one route, four ordered ways to name its interface, each
+        checked against the real ``/interface`` list before it is
+        accepted:
+
+        1. the route row's own ``interface`` field, when RouterOS
+           populates it -- the device saying it outright;
+        2. its ``immediate-gw``/``gateway`` token's ``%``-suffix
+           (``"192.168.1.1%ether1"``), RouterOS v7's own way of naming the
+           egress interface of a gateway route;
+        3. the ``/ip address`` whose subnet actually contains the
+           gateway -- the gateway is by definition reachable on the
+           interface holding an address in its subnet, so this is a
+           derivation, not a heuristic. This is the tier that resolves the
+           ordinary DHCP-WAN router (uplink ``192.168.1.100/24`` on
+           ``ether1``, gateway ``192.168.1.1``);
+        4. the ``/ip dhcp-client`` that negotiated that same gateway. Not
+           redundant with tier 3: a client mid-renewal has withdrawn its
+           dynamic ``/ip address`` row while the default route still
+           stands, which is precisely when a DHCP-WAN router would
+           otherwise resolve to nothing.
+
+        Note what is *not* used: bridge membership, name matching, "the
+        first ethernet port", or the single interface holding an address.
+        Each would return an answer on a router where the honest answer is
+        "cannot tell".
+
+        Raises :class:`MikroTikWanInterfaceError` when no tier produces a
+        real interface -- the router has no usable default route at all
+        (a genuine outage, or an uplink RouterOS has stopped considering
+        active), or its gateway sits on nothing this router knows about.
+        Guessing here is worse than failing: the wrong ``out-interface``
+        either masquerades guest traffic onto an internal segment or
+        matches nothing, and both report success.
+        """
+        return await asyncio.to_thread(self._resolve_wan_interface_sync, creds)
+
+    def _resolve_wan_interface_sync(self, creds: DeviceCredentials) -> str:
+        api = self._connect_api(creds)
+        try:
+            return self._resolve_wan_interface(api, creds)
+        finally:
+            api.close()
+
+    def _resolve_wan_interface(self, api, creds: DeviceCredentials) -> str:
+        """Same resolution as :meth:`resolve_wan_interface`, against an
+        already-open connection -- so a NAT push resolves the WAN and
+        writes the rule over one connection rather than two."""
+        try:
+            route_rows = list(api.path("ip", "route"))
+            address_rows = list(api.path("ip", "address"))
+            interface_rows = list(api.path("interface"))
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                creds.host, f"resolve_wan_interface: {exc}"
+            ) from exc
+        try:
+            dhcp_client_rows = list(api.path("ip", "dhcp-client"))
+        except LibRouterosError:
+            # Tier 4 only. An unreadable optional menu must not sink a
+            # resolution the earlier tiers can already make on their own.
+            dhcp_client_rows = []
+
+        interface_names = {
+            str(row["name"]) for row in interface_rows if row.get("name")
+        }
+        resolved = _select_wan_interface(
+            route_rows, address_rows, dhcp_client_rows, interface_names
+        )
+        if resolved is None:
+            raise MikroTikWanInterfaceError(
+                creds.host,
+                "could not determine the WAN interface: no usable default "
+                "route, or its gateway is on no known interface",
+            )
+        return resolved
+
+    async def configure_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Realizes ``/ip firewall nat add chain=srcnat
+        src-address=<subnet> out-interface=<wan> action=masquerade
+        comment="WyfyGuest VLAN <id>"`` -- the rule that turns a routed
+        but isolated VLAN into one whose guests actually reach the
+        internet.
+
+        Nothing in it is hardcoded. The subnet is the VLAN's own
+        ``src_address``; the interface is resolved from the router's live
+        default route (:meth:`resolve_wan_interface`) unless the caller
+        passed an explicit override; the comment carries the VLAN's real
+        id.
+
+        **The comment is the rule's identity, and that is the whole
+        design.** Every other field is something an operator edits:
+        re-subnet a VLAN and ``src-address`` changes, re-cable a site and
+        ``out-interface`` changes. Keyed on any of those, the next push
+        would find no match, add a second rule, and leave the first one
+        masquerading a subnet nothing uses -- silent, cumulative, and
+        invisible in this platform's own UI. Keyed on the comment, the
+        same push finds the rule it wrote last time and *updates* it,
+        which is what "if the VLAN config changes, update the existing
+        rule" actually requires.
+
+        ``disabled`` is normalized back to ``no`` via :func:`_is_truthy`,
+        never by string comparison: a rule someone disabled by hand is not
+        providing internet access, and a re-push is the operator asking
+        for it.
+        """
+        await asyncio.to_thread(self._configure_nat_masquerade_sync, creds, rule)
+
+    def _configure_nat_masquerade_sync(
+        self, creds: DeviceCredentials, rule: NatRuleConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            # The WAN is resolved before anything is written: a rule whose
+            # out-interface could not be determined must not exist at all,
+            # half-written and matching everything.
+            out_interface = self._nat_out_interface(api, creds, rule)
+            try:
+                self._ensure_nat_masquerade_rule(api, rule, out_interface)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_nat_masquerade: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _nat_out_interface(
+        self, api, creds: DeviceCredentials, rule: NatRuleConfig
+    ) -> str:
+        """The interface to masquerade out of -- resolved from the router
+        unless the caller named one, and in either case confirmed to be a
+        real interface on this device first.
+
+        The check is not redundant for the override path: RouterOS does
+        reject an unknown interface name on a firewall rule, but with a
+        message about an input not matching a value, attributed to the NAT
+        write. Checking first names the missing interface instead.
+        """
+        if rule.out_interface is None:
+            return self._resolve_wan_interface(api, creds)
+        try:
+            names = {
+                str(row["name"])
+                for row in api.path("interface")
+                if row.get("name")
+            }
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                creds.host, f"configure_nat_masquerade: {exc}"
+            ) from exc
+        if rule.out_interface not in names:
+            raise MikroTikWanInterfaceError(
+                creds.host,
+                f"no interface named '{rule.out_interface}' exists on this device",
+            )
+        return rule.out_interface
+
+    def _ensure_nat_masquerade_rule(
+        self, api, rule: NatRuleConfig, out_interface: str
+    ) -> None:
+        """Creates this VLAN's masquerade rule, or brings the one already
+        carrying its comment into line with what is wanted now.
+
+        ``chain`` and ``action`` are part of the desired state, not just of
+        the ``add``: a rule found by this VLAN's comment but sitting on the
+        wrong chain is this VLAN's rule in a broken state, and correcting
+        it is right where adding a second one alongside it would not be.
+        """
+        comment = _nat_rule_comment(rule.vlan_id)
+        desired = {
+            "chain": "srcnat",
+            "action": "masquerade",
+            "src-address": rule.src_address,
+            "out-interface": out_interface,
+        }
+        menu = api.path("ip", "firewall", "nat")
+        for row in menu:
+            if row.get("comment") != comment:
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            # Boolean, never string -- see ``_is_truthy``. Comparing the raw
+            # value against "no" reports a difference on every single push
+            # and issues a pointless update forever.
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(**desired, comment=comment, disabled="no")
+
+    async def delete_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Removes this VLAN's masquerade rule, by the same comment
+        identity :meth:`configure_nat_masquerade` writes it under.
+
+        Only ``rule.vlan_id`` is read. ``src_address`` deliberately is not:
+        a rule left from an older subnet is still this VLAN's rule, and
+        matching on the current subnet is exactly how it would be orphaned
+        instead of removed.
+
+        **No WAN resolution happens here**, unlike on the write path. A
+        VLAN must stay removable from a router whose uplink is down --
+        which is the state a router is often in when someone is tearing
+        its configuration down -- and the comment is enough to find the
+        rule without knowing where the internet is.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error.
+        """
+        await asyncio.to_thread(self._delete_nat_masquerade_sync, creds, rule)
+
+    def _delete_nat_masquerade_sync(
+        self, creds: DeviceCredentials, rule: NatRuleConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where(
+                    api,
+                    ("ip", "firewall", "nat"),
+                    "comment",
+                    _nat_rule_comment(rule.vlan_id),
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_nat_masquerade: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    # ------------------------------------------------------------------
+    # WAN failover
+    # ------------------------------------------------------------------
+
+    async def read_default_routes(self, creds: DeviceCredentials) -> list[DefaultRoute]:
+        """Every ``0.0.0.0/0`` route in the device's own ``main`` table,
+        each resolved to the interface it actually leaves by.
+
+        The read a failover is decided from, and the reason this is a
+        separate call rather than something folded into the write: a
+        caller has to be able to refuse -- because the target is not
+        active, because the platform and the router disagree about the
+        topology, because the route is one RouterOS will not let anyone
+        modify -- *before* it has moved anything. Nothing here is
+        filtered: inactive, disabled and dynamic rows are all returned,
+        flagged, because each is a different refusal.
+        """
+        return await asyncio.to_thread(self._read_default_routes_sync, creds)
+
+    def _read_default_routes_sync(self, creds: DeviceCredentials) -> list[DefaultRoute]:
+        api = self._connect_api(creds)
+        try:
+            return self._read_default_routes(api, creds)
+        finally:
+            api.close()
+
+    def _read_default_routes(self, api, creds: DeviceCredentials) -> list[DefaultRoute]:
+        """Same read, against an already-open connection -- so the write
+        below re-reads and validates over the connection it then writes on
+        rather than trusting what a previous connection saw."""
+        try:
+            route_rows = list(api.path("ip", "route"))
+            address_rows = list(api.path("ip", "address"))
+            interface_rows = list(api.path("interface"))
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                creds.host, f"read_default_routes: {exc}"
+            ) from exc
+        try:
+            dhcp_client_rows = list(api.path("ip", "dhcp-client"))
+        except LibRouterosError:
+            # Tier 4 of interface resolution only. An unreadable optional
+            # menu must not sink a read the earlier tiers can satisfy.
+            dhcp_client_rows = []
+        interface_names = {
+            str(row["name"]) for row in interface_rows if row.get("name")
+        }
+        return _build_default_routes(
+            route_rows, address_rows, dhcp_client_rows, interface_names
+        )
+
+    async def set_default_route_distances(
+        self, creds: DeviceCredentials, *, distances: Mapping[str, int]
+    ) -> None:
+        """Set the administrative distance of the ``main``-table default
+        route leaving by each named interface. **This is what failover
+        means on a RouterOS device in this platform.**
+
+        WHY DISTANCE, AND NOT THE ALTERNATIVES:
+
+        * *Disabling the primary's route* moves traffic too, and moves it
+          just as fast. It is rejected because it takes the primary out of
+          RouterOS's own decision entirely: while it is disabled the
+          router cannot fall back to it no matter what happens to the
+          backup, so a backup that dies during a failover leaves the site
+          dark even though a working uplink is sitting right there. With
+          distances, both routes keep their ``check-gateway=ping`` and
+          RouterOS keeps doing what it is good at -- the platform only
+          says which it should prefer. It also fails a blunter test: if
+          this backend never gets to run the reversal (process killed,
+          credentials rotated, site unreachable), a wrong distance is a
+          preference nobody notices, and an administratively disabled
+          route is an uplink nothing will ever bring back.
+        * *``check-gateway``* is not an alternative at all -- it is the
+          automatic mechanism, already provisioned on every route this
+          platform writes (``render_wan_routing_section``). There is no
+          way to tell RouterOS "pretend this gateway is down", so it
+          cannot express an operator's deliberate failover.
+        * *``/routing rule`` or policy routing* would work, and would
+          collide head-on with the routing-marks and ``to_wan<N>`` tables
+          ``render_wan_mangle_section`` already writes for load balancing.
+          Two mechanisms deciding the same thing is how a site ends up
+          with traffic that follows neither.
+
+        WHAT ACTUALLY HAPPENS TO TRAFFIC. RouterOS recomputes the FIB when
+        a distance changes, so new connections take the new uplink
+        immediately. Established connections do NOT survive: they were
+        masqueraded to the old uplink's source address, and the far end
+        will not accept them from a different one. A failover is a brief,
+        real interruption for anyone mid-download; it is not, and cannot
+        be made, seamless on this hardware.
+
+        ON PRIMARY RECOVERY: **sticky**. Distances are exactly what this
+        method set them to, so a primary coming back does not take traffic
+        back on its own -- it is reclaimed only by an explicit failback
+        (which the caller may automate via ``IspLink.auto_failback``, but
+        that is the platform deciding, not the router flapping). The one
+        thing the router still does by itself is the safety net that
+        disabling would have removed: if the *backup* then fails,
+        ``check-gateway`` deactivates its route and the primary's route --
+        still present, still probed, merely at a worse distance -- takes
+        over.
+
+        VALIDATED IN FULL BEFORE THE FIRST WRITE. A half-applied swap can
+        leave two default routes tied at the lowest distance, which is
+        RouterOS load sharing across an uplink that is down -- strictly
+        worse than the state it started from. Every route is resolved and
+        checked before any of them is written, so no *validation* failure
+        can produce that state.
+
+        WHAT VALIDATION DOES NOT CLOSE. RouterOS has no multi-row atomic
+        update, so a device error raised partway through the write loop
+        still leaves the earlier routes changed and the later ones not --
+        the tie above, reachable and not preventable here. Two things
+        follow, and both are deliberate. The failure is raised, never
+        swallowed, so the caller records ``failed`` rather than a green
+        badge. And the error names the routes that were already written,
+        because an operator looking at a failed failover needs to know
+        whether the device is in the state it started in or halfway to the
+        new one -- reading it back off the router is the only alternative,
+        and that is exactly what an outage leaves no time for.
+
+        IDEMPOTENT ON REAL VALUES. A route already carrying the requested
+        distance is skipped, so re-triggering an already-applied failover
+        issues no write at all. The comparison is on parsed integers, not
+        on RouterOS's reply strings.
+        """
+        await asyncio.to_thread(
+            self._set_default_route_distances_sync, creds, dict(distances)
+        )
+
+    def _set_default_route_distances_sync(
+        self, creds: DeviceCredentials, distances: dict[str, int]
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            routes = self._read_default_routes(api, creds)
+            by_interface: dict[str, list[DefaultRoute]] = {}
+            for route in routes:
+                if route.interface is None:
+                    continue
+                by_interface.setdefault(route.interface, []).append(route)
+
+            pending: list[tuple[DefaultRoute, int]] = []
+            for interface, desired in distances.items():
+                matches = by_interface.get(interface, [])
+                if not matches:
+                    raise MikroTikRouteNotFoundError(
+                        creds.host,
+                        f"no main-table default route leaves by interface "
+                        f"'{interface}' on this device",
+                    )
+                if len(matches) > 1:
+                    raise MikroTikAmbiguousRouteError(
+                        creds.host,
+                        f"{len(matches)} main-table default routes leave by "
+                        f"interface '{interface}'; which one is this uplink's "
+                        f"has no single answer",
+                    )
+                route = matches[0]
+                if route.distance == desired:
+                    continue
+                if route.dynamic:
+                    raise MikroTikImmutableRouteError(
+                        creds.host,
+                        f"the default route on '{interface}' is dynamic "
+                        f"(RouterOS created it, and refuses /ip route set on "
+                        f"it), so its distance cannot be changed",
+                    )
+                pending.append((route, desired))
+
+            if not pending:
+                return
+            menu = api.path("ip", "route")
+            applied: list[str] = []
+            for route, desired in pending:
+                try:
+                    menu.update(**{".id": route.route_id, "distance": str(desired)})
+                except LibRouterosError as exc:
+                    # Name what already landed -- see this method's own
+                    # "WHAT VALIDATION DOES NOT CLOSE" note. Without this
+                    # the operator cannot tell a no-op failure from a
+                    # half-applied swap without reading the router back.
+                    done = (
+                        "; already applied: " + ", ".join(applied)
+                        if applied
+                        else "; no route was changed"
+                    )
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"set_default_route_distances: {exc}{done}",
+                    ) from exc
+                applied.append(f"{route.interface}->distance {desired}")
+        finally:
+            api.close()
+
+    async def ensure_wan_egress(
+        self, creds: DeviceCredentials, *, interface: str
+    ) -> None:
+        """Make sure traffic leaving by ``interface`` is masqueraded and
+        that the interface is in the ``WAN`` interface list.
+
+        **THE NAT PROBLEM THIS EXISTS FOR.** A router provisioned by this
+        platform carries ``/ip firewall nat`` ``chain=srcnat
+        action=masquerade out-interface=ether1
+        comment="cloudguest-nat-wan1"`` -- hard-bound to the primary port.
+        Move the default route to a backup and that rule stops matching:
+        guest traffic leaves the router from an un-NATed RFC1918 source
+        address and dies at the first upstream hop. Every guest loses
+        internet *because of* the failover, and the route move looks
+        perfectly correct on the device.
+
+        **ADDITIVE, NEVER A REWRITE, AND THAT IS THE WHOLE POINT.** The
+        obvious fix is to widen the existing rule to
+        ``out-interface-list=WAN``. It is rejected for two reasons. First,
+        it is a mutation of a live router-wide NAT rule -- the exact class
+        of change that took a guest network down on 2026-08-18 -- carried
+        out at the moment a site is already in an outage, which is the
+        worst possible time to be wrong. Second, it is genuinely wider
+        than intended: this platform's *own* provisioning script adds
+        discovered uplinks to the ``WAN`` list at runtime
+        (``DISCOVERED_WAN_LIST_COMMENT``), so a list-scoped masquerade
+        starts NATing out of whatever lands in that list later, including
+        interfaces nobody decided should carry guest traffic.
+
+        What this does instead is what the provisioning script already
+        does per WAN slot: ensure the target interface has *its own*
+        masquerade rule. A masquerade rule matches only traffic that
+        actually leaves its own ``out-interface``, so adding the backup's
+        rule changes nothing whatsoever about traffic on the primary --
+        it is inert until the route moves, and stays inert after a
+        failback. No existing rule is read for permission, edited, or
+        removed.
+
+        **The existence check is on effect, not on identity.** Any
+        enabled, un-narrowed ``srcnat``/``masquerade`` rule on this
+        interface already answers the question "is traffic leaving here
+        NATed?" -- whoever wrote it. So a router provisioned with
+        ``cloudguest-nat-wan2`` gets nothing added, rather than a second,
+        redundant rule accumulating on every failover. A rule carrying a
+        ``src-address``, an ``in-interface`` or a port narrows to less
+        than all guest traffic (one VLAN's own rule looks exactly like
+        this) and is deliberately not counted.
+
+        **WAN list membership too**, for the same "otherwise the route
+        moves and traffic still does not flow" reason: the firewall this
+        platform provisions matches ``in-interface-list=WAN``, and an
+        uplink outside that list is one the input/forward rules treat as
+        an internal segment.
+
+        Idempotent in both halves, and the whole thing is a no-op on a
+        router already configured for this uplink.
+        """
+        await asyncio.to_thread(self._ensure_wan_egress_sync, creds, interface)
+
+    def _ensure_wan_egress_sync(
+        self, creds: DeviceCredentials, interface: str
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                names = {
+                    str(row["name"])
+                    for row in api.path("interface")
+                    if row.get("name")
+                }
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_wan_egress: {exc}"
+                ) from exc
+            if interface not in names:
+                # Named first, rather than left to RouterOS to reject with
+                # a message about an input not matching a value attributed
+                # to whichever write happened to go first.
+                raise MikroTikWanInterfaceError(
+                    creds.host,
+                    f"no interface named '{interface}' exists on this device",
+                )
+            try:
+                self._ensure_wan_list_member(api, interface)
+                self._ensure_uplink_masquerade(api, interface)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_wan_egress: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_wan_list_member(self, api, interface: str) -> None:
+        """``/interface list member`` for ``list=WAN``, added only if this
+        interface is not already a member under any comment."""
+        menu = api.path("interface", "list", "member")
+        for row in menu:
+            if row.get("interface") == interface and row.get("list") == "WAN":
+                if _is_truthy(row.get("disabled")):
+                    # Membership that exists but is switched off is not
+                    # membership. Boolean, never a string comparison --
+                    # see ``_is_truthy``.
+                    menu.update(**{".id": row[".id"], "disabled": "no"})
+                return
+        menu.add(
+            list="WAN",
+            interface=interface,
+            comment=_uplink_wan_list_comment(interface),
+            disabled="no",
+        )
+
+    def _ensure_uplink_masquerade(self, api, interface: str) -> None:
+        """A blanket ``srcnat``/``masquerade`` on this interface, added
+        only if nothing already provides one -- see
+        :meth:`ensure_wan_egress` for why the check is on effect rather
+        than on this method's own comment."""
+        menu = api.path("ip", "firewall", "nat")
+        own_comment = _uplink_nat_comment(interface)
+        for row in menu:
+            if (
+                row.get("chain") != "srcnat"
+                or row.get("action") != "masquerade"
+                or row.get("out-interface") != interface
+            ):
+                continue
+            if any(row.get(field) for field in _NAT_NARROWING_FIELDS):
+                continue
+            if _is_truthy(row.get("disabled")):
+                if row.get("comment") == own_comment:
+                    # Ours, switched off. Re-enabling something this
+                    # method wrote is repairing its own state.
+                    menu.update(**{".id": row[".id"], "disabled": "no"})
+                    return
+                # Someone else's rule, deliberately disabled. Not
+                # re-enabled -- that is a decision about their rule --
+                # and not counted as covering, so a rule of our own is
+                # added alongside it.
+                continue
+            return
+        menu.add(
+            chain="srcnat",
+            action="masquerade",
+            **{"out-interface": interface},
+            comment=own_comment,
+            disabled="no",
+        )
 
     async def set_radius_client_config(
         self, creds: DeviceCredentials, *, config: RadiusClientConfig
@@ -1168,8 +5285,51 @@ class MikroTikAdapter:
         port=3799`` (RFC 5176 Change-of-Authorization enablement, a
         router-global setting, not per-client) operations, issued directly
         over the structured API. See module docstring for why
-        ``src-address`` (the original's WireGuard-tunnel-IP field) is
-        intentionally not part of this vendor-agnostic port."""
+        ``src-address`` is carried here, unlike in an earlier version of
+        this port that dropped it as tunnel-specific: the hub's FreeRADIUS
+        matches a request to a ``client{}`` stanza by source address, so a
+        ``/radius`` row without it registers a client that cannot
+        authenticate. See :class:`RadiusClientConfig`.
+
+        ## This converges; it used to append
+
+        The previous implementation issued a bare ``/radius add`` every
+        time, with no read first. Two pushes meant two ``/radius`` rows for
+        the same server -- and two NAS registrations with possibly
+        different secrets is a router that authenticates intermittently
+        depending on which row RouterOS consults. The script half
+        (``network_config.renderers.render_radius_client``) carried the
+        identical defect and has since been converged the same way -- it
+        guards its ``add`` behind a ``find where address=`` and falls back
+        to a ``set``, and it stamps ``renderers.RADIUS_CLIENT_COMMENT``,
+        which is kept byte-equal to :data:`_RADIUS_CLIENT_COMMENT` exactly
+        so each path finds a row the other wrote instead of adding a
+        second one beside it.
+
+        **Identity is the natural key, not the comment.** Everywhere else
+        in this adapter the comment is the handle, because every other
+        field is something a customer edits. Here the row is identified by
+        ``service=hotspot`` plus ``address=<radius server>``, because that
+        pair *is* the identity as far as RouterOS is concerned -- one NAS
+        registration per server -- and because the row already on the lab
+        router carries ``comment=cloudguest-radius``, a marker this
+        codebase has never written. Somebody set it by hand at
+        provisioning. Keying on our own comment would not find it, and we
+        would add a second row beside a working one. So an existing row for
+        this server is **adopted**: updated in place and stamped with this
+        platform's comment, which makes it ours from then on.
+
+        ## The CoA half
+
+        ``/ip radius incoming`` is router-global, not per-client, and is
+        converged the same way: read, compare, write only on a difference.
+        ``accept`` is resolved through :func:`_is_truthy` rather than a
+        string compare, for the reason documented on
+        :meth:`_ensure_dhcp_server` -- the API answers a read with a real
+        ``bool`` while accepting ``"yes"``/``"no"`` on write.
+
+        Idempotent throughout: re-pushing an unchanged registration issues
+        no write at all."""
         await asyncio.to_thread(self._set_radius_client_config_sync, creds, config)
 
     def _set_radius_client_config_sync(
@@ -1178,22 +5338,64 @@ class MikroTikAdapter:
         api = self._connect_api(creds)
         try:
             try:
-                api.path("radius").add(
-                    service="hotspot",
-                    address=config.radius_server_host,
-                    secret=config.radius_secret,
-                    **{
-                        "authentication-port": str(config.auth_port),
-                        "accounting-port": str(config.acct_port),
-                    },
-                )
-                api.path("radius", "incoming").update(accept="yes", port="3799")
+                self._ensure_radius_client_row(api, config)
+                self._ensure_radius_incoming(api, config)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"set_radius_client_config: {exc}"
                 ) from exc
         finally:
             api.close()
+
+    def _ensure_radius_client_row(self, api, config: RadiusClientConfig) -> None:  # noqa: ANN001
+        """The ``/radius`` NAS registration, one per server -- see
+        :meth:`set_radius_client_config` for why the natural key and not
+        the comment."""
+        desired = {
+            "service": "hotspot",
+            "address": config.radius_server_host,
+            "secret": config.radius_secret,
+            "authentication-port": str(config.auth_port),
+            "accounting-port": str(config.acct_port),
+            "comment": _RADIUS_CLIENT_COMMENT,
+        }
+        if config.src_address:
+            desired["src-address"] = config.src_address
+
+        menu = api.path("radius")
+        for row in list(menu):
+            same_server = (
+                str(row.get("service", "")) == "hotspot"
+                and str(row.get("address", "")) == config.radius_server_host
+            )
+            if not same_server:
+                continue
+            changed = {
+                key: value
+                for key, value in desired.items()
+                if str(row.get(key, "")) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(**desired, disabled="no")
+
+    def _ensure_radius_incoming(self, api, config: RadiusClientConfig) -> None:  # noqa: ANN001
+        """RFC 5176 Change-of-Authorization enablement.
+
+        Router-global: RouterOS has exactly one ``/radius incoming``
+        settings object, so this is written once regardless of how many
+        client rows exist, and re-writing it per push is a no-op rather
+        than a duplicate.
+        """
+        wanted_port = str(config.coa_port)
+        for row in api.path("radius", "incoming"):
+            if _is_truthy(row.get("accept")) and str(row.get("port", "")) == wanted_port:
+                return
+            break
+        api.path("radius", "incoming").update(accept="yes", port=wanted_port)
 
     async def configure_content_filter_rule(
         self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
@@ -1248,7 +5450,41 @@ class MikroTikAdapter:
         inspect or block encrypted traffic by content. See
         ``app.domains.content_filtering``'s own module docstring
         (cloud-guest-repo) for the full customer-facing scope write-up
-        this ports; that same reasoning applies here unchanged."""
+        this ports; that same reasoning applies here unchanged.
+
+        ## The comment is the rule's identity, and that is the whole design
+
+        Every object above carries
+        ``"WyfyGuest content filter <rule_id>[ (subdomains)]: <label>"``,
+        and each write finds its object again by the marker in front of
+        the colon. Nothing else on the row can serve: ``name``/``regexp``/
+        ``address`` *are* the blocked target, and ``label`` is the name
+        the customer typed, so both change the moment somebody edits the
+        rule. Keyed on either, the next push would match nothing, add a
+        second sinkhole, and leave the first one still blocking a site the
+        customer already unblocked -- silent, cumulative, and invisible in
+        this platform's own UI. Keyed on the marker, the same push finds
+        what it wrote last time and *updates* it. This is
+        :meth:`configure_nat_masquerade`'s reasoning applied to a domain
+        with two objects per rule instead of one.
+
+        A rule that changed ``value_type`` since its last push is the one
+        case where the objects to write are not the objects already there,
+        so the mechanism it is no longer using is torn down first -- a
+        domain rule re-typed to ``ip_cidr`` would otherwise leave its DNS
+        sinkhole answering forever, with this push reporting success.
+
+        ``disabled`` is normalized back to ``no`` through
+        :func:`_is_truthy`, never by string comparison: an entry somebody
+        disabled by hand is blocking nothing, a re-push is the customer
+        asking for it again, and comparing the raw value against ``"no"``
+        would instead issue a pointless update on every single push.
+
+        Idempotent throughout: re-pushing an unchanged rule adds nothing
+        and raises nothing. RouterOS answers a duplicate ``add`` with
+        "already have such item", and re-pushing is an ordinary operation
+        -- the customer pressing the button twice, or a retry after a
+        partial failure."""
         await asyncio.to_thread(self._configure_content_filter_rule_sync, creds, rule)
 
     def _configure_content_filter_rule_sync(
@@ -1258,26 +5494,21 @@ class MikroTikAdapter:
         try:
             try:
                 if rule.value_type == "ip_cidr":
-                    api.path("ip", "firewall", "address-list").add(
-                        list=_CONTENT_FILTER_ADDRESS_LIST_NAME,
-                        address=rule.value,
-                        comment=rule.label,
-                    )
+                    # A rule re-typed from "domain" leaves two DNS entries
+                    # still answering for a name nobody is blocking any
+                    # more; the objects this rule no longer uses come off
+                    # before the ones it does go on.
+                    self._remove_content_filter_dns_entries(api, rule.rule_id)
+                    self._ensure_content_filter_address_list_entry(api, rule)
                     self._ensure_content_filter_enforcement_rule(api)
                 else:
-                    domain = rule.value
-                    api.path("ip", "dns", "static").add(
-                        name=domain,
-                        type="A",
-                        address=_CONTENT_FILTER_SINKHOLE_ADDRESS,
-                        comment=rule.label,
+                    self._remove_where_prefixed(
+                        api,
+                        ("ip", "firewall", "address-list"),
+                        "comment",
+                        _content_filter_marker(rule.rule_id),
                     )
-                    api.path("ip", "dns", "static").add(
-                        regexp=_domain_subdomain_regex(domain),
-                        type="A",
-                        address=_CONTENT_FILTER_SINKHOLE_ADDRESS,
-                        comment=f"{rule.label} (subdomains)",
-                    )
+                    self._ensure_content_filter_dns_entries(api, rule)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_content_filter_rule: {exc}"
@@ -1285,24 +5516,445 @@ class MikroTikAdapter:
         finally:
             api.close()
 
+    def _ensure_content_filter_address_list_entry(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Puts this rule's IP/CIDR in the shared blocked address-list, or
+        corrects the entry already carrying this rule's marker.
+
+        ``address`` is part of the desired state, not only of the ``add``:
+        an entry found by this rule's marker but holding a different
+        address is this rule blocking the wrong destination, and correcting
+        it is right where adding a second entry beside it would not be.
+        """
+        self._ensure_content_filter_object(
+            api,
+            ("ip", "firewall", "address-list"),
+            marker=_content_filter_marker(rule.rule_id),
+            desired={
+                "list": _CONTENT_FILTER_ADDRESS_LIST_NAME,
+                "address": rule.value,
+                "comment": _content_filter_comment(rule.rule_id, rule.label),
+            },
+        )
+
+    def _ensure_content_filter_dns_entries(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> None:
+        """The two ``/ip dns static`` entries one blocked domain becomes.
+
+        Two, not one, because RouterOS treats ``name=`` and ``regexp=`` as
+        mutually exclusive per entry: the first sinkholes the domain
+        itself, the second every subdomain of it. They carry different
+        markers so a later push can find and correct each on its own --
+        one marker for both would make the second write update the first
+        entry and the domain's subdomains stop being blocked at all.
+        """
+        domain = rule.value
+        self._ensure_content_filter_object(
+            api,
+            ("ip", "dns", "static"),
+            marker=_content_filter_marker(rule.rule_id),
+            desired={
+                "name": domain,
+                "type": "A",
+                "address": _CONTENT_FILTER_SINKHOLE_ADDRESS,
+                "comment": _content_filter_comment(rule.rule_id, rule.label),
+            },
+        )
+        self._ensure_content_filter_object(
+            api,
+            ("ip", "dns", "static"),
+            marker=_content_filter_marker(rule.rule_id, subdomains=True),
+            desired={
+                "regexp": _domain_subdomain_regex(domain),
+                "type": "A",
+                "address": _CONTENT_FILTER_SINKHOLE_ADDRESS,
+                "comment": _content_filter_comment(
+                    rule.rule_id, rule.label, subdomains=True
+                ),
+            },
+        )
+
+    def _ensure_content_filter_object(
+        self,
+        api,
+        path_segments: tuple[str, ...],
+        *,
+        marker: str,
+        desired: dict[str, str],
+    ) -> None:
+        """Creates one content-filtering object, or brings the one already
+        carrying ``marker`` into line with ``desired``.
+
+        The row is found by the marker *prefix* of its comment rather than
+        by the whole comment, because the customer's label lives in the
+        same field behind it -- see :func:`_content_filter_comment`. A
+        renamed rule therefore updates its comment in place instead of
+        being missed and duplicated.
+
+        ``disabled`` is compared as a boolean through :func:`_is_truthy`,
+        never as a string: RouterOS accepts ``"no"`` on write and answers
+        reads with a real ``bool``, so a string comparison reports a
+        difference on every single push and issues a pointless update
+        forever.
+        """
+        menu = api.path(*path_segments)
+        for row in menu:
+            if not str(row.get("comment", "")).startswith(marker):
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(**desired, disabled="no")
+
+    def _remove_content_filter_dns_entries(self, api, rule_id: str) -> None:
+        """Both of one rule's DNS entries, by their own two markers."""
+        for subdomains in (False, True):
+            self._remove_where_prefixed(
+                api,
+                ("ip", "dns", "static"),
+                "comment",
+                _content_filter_marker(rule_id, subdomains=subdomains),
+            )
+
+    async def delete_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Removes the objects :meth:`configure_content_filter_rule`
+        created, by the same marker identity it writes them under.
+
+        Only ``rule.rule_id`` is read. ``value`` and ``value_type``
+        deliberately are not: an entry left from a domain the customer has
+        since edited -- or from before they switched the rule from a
+        domain to an address -- is still *this rule's* entry, and matching
+        on the current value is exactly how it would be orphaned instead of
+        removed. Both mechanisms are swept for the same reason.
+
+        **The shared ``/ip firewall filter`` DROP rule is deliberately left
+        in place.** It is router-global, referencing the address-list by
+        name rather than any one entry, and every other ``ip_cidr`` rule on
+        this router depends on it -- removing it here would silently
+        unblock all of them. Once this rule's own membership is gone the
+        DROP rule simply matches one fewer address, and against an empty
+        list it drops nothing at all. It is created once, by
+        :meth:`_ensure_content_filter_enforcement_rule`, and belongs to the
+        router rather than to any rule that made it necessary.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error, so a retry after a partial failure completes cleanly.
+        """
+        await asyncio.to_thread(self._delete_content_filter_rule_sync, creds, rule)
+
+    def _delete_content_filter_rule_sync(
+        self, creds: DeviceCredentials, rule: ContentFilterRuleConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # The address-list entry goes before the DNS ones for the
+                # only ordering that matters here: it is the object the
+                # surviving DROP rule's match depends on, so it stops being
+                # dropped first and nothing is ever half-enforced against a
+                # list this rule has already left.
+                self._remove_where_prefixed(
+                    api,
+                    ("ip", "firewall", "address-list"),
+                    "comment",
+                    _content_filter_marker(rule.rule_id),
+                )
+                self._remove_content_filter_dns_entries(api, rule.rule_id)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_content_filter_rule: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
     def _ensure_content_filter_enforcement_rule(self, api) -> None:  # noqa: ANN001
-        """Real read-before-write dedup for the one, router-global
+        """Real read-before-write convergence for the one, router-global
         ``/ip firewall filter`` DROP rule every ``ip_cidr``-type content
         filter rule relies on -- see
         ``configure_content_filter_rule``'s own docstring for why this
-        must exist exactly once, not once per rule."""
-        existing_filters = list(api.path("ip", "firewall", "filter"))
-        already_present = any(
-            row.get("comment") == _CONTENT_FILTER_ENFORCEMENT_COMMENT
-            for row in existing_filters
+        must exist exactly once, not once per rule.
+
+        ## Position is managed, not left to where RouterOS appends
+
+        This used to ``add`` with no ``place-before``, so the DROP landed
+        at the bottom of ``forward``, and the dedup check read only the
+        comment -- once the rule existed, nothing ever verified or
+        corrected where it sat. Any ``accept`` ahead of it silently ended
+        blocking.
+
+        It is now placed immediately **before the first ``accept`` in
+        ``forward``**, and the position is re-checked on every push rather
+        than only at creation.
+
+        Two device tests on RouterOS 7.23.3 (hEX lite) make that placement
+        buildable rather than guessed, and both are recorded in
+        ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §7:
+
+        * **T1** -- ``librouteros``' ``Path.add()`` accepts ``place-before``
+          and it takes a ``.id``, not an ordinal. Verified: rules added
+          ``a``, ``b``, then ``c`` with ``place-before=<b .id>`` printed in
+          the order ``a, c, b``.
+        * **T2** -- a static rule *can* sit above hotspot's dynamic
+          ``forward`` rules. Verified: a rule placed before the first
+          dynamic row landed at index 0, above both ``jump`` rules.
+
+        ## Why the first accept, and why that is safe here
+
+        Read off the lab router, ``forward`` is two dynamic hotspot
+        ``jump`` rules (both gated ``hotspot=...,!auth``, so authenticated
+        guest traffic does not match them and falls through), three
+        ``cloudguest-block-*`` drops, then
+        ``accept cloudguest-fw-fwd-established``
+        (``connection-state=established,related``) and a drop for
+        ``invalid``.
+
+        Below that accept, a blocked destination is only dropped on a *new*
+        connection: a flow already established when the block was added
+        keeps flowing, so "blocked" does not take effect until the guest's
+        existing connection closes. Above it, the block applies to the
+        traffic already in flight, which is what an operator pressing Block
+        means.
+
+        Placing a rule above the accepts is the dangerous direction in
+        general -- §5.2.2 of that document says so, and a drop over the
+        management tunnel is a router nobody can reach again. It is safe
+        for *this* rule because it is not a general-purpose access rule: it
+        matches ``dst-address-list=<content filter list>`` and nothing else,
+        so it can only ever affect traffic to a destination the customer
+        explicitly blocked. It cannot match the portal, the tunnel, or
+        8728 unless one of those addresses is put in the block list.
+
+        ## Convergence, and what is never touched
+
+        ``librouteros`` exposes no ``move``, so correcting a misplaced rule
+        is an ``add`` at the right position followed by a ``remove`` of the
+        old row -- in that order, so the window has two identical DROPs
+        rather than none. Duplicated drops are harmless; a gap is a site
+        briefly unblocked, and this is a control that must fail closed.
+
+        Only rows carrying this platform's own enforcement comment are ever
+        added, moved or removed. No other rule in the chain is written,
+        reordered, or read for permission. When ``forward`` has no
+        ``accept`` at all there is nothing to sit above, so the rule is
+        appended, which is where it already belongs.
+
+        Still not claimed: that a marked packet reaches this chain at all on
+        an arbitrary router. That is the ordered-band question §5.2 exists
+        for, and it stays the firewall domain's to answer."""
+        menu = api.path("ip", "firewall", "filter")
+        forward = [
+            row for row in menu if str(row.get("chain", "")) == "forward"
+        ]
+
+        ours = [
+            row
+            for row in forward
+            if row.get("comment") == _CONTENT_FILTER_ENFORCEMENT_COMMENT
+        ]
+        anchor_index = next(
+            (
+                index
+                for index, row in enumerate(forward)
+                if str(row.get("action", "")) == "accept"
+            ),
+            None,
         )
-        if not already_present:
-            api.path("ip", "firewall", "filter").add(
-                chain="forward",
-                **{"dst-address-list": _CONTENT_FILTER_ADDRESS_LIST_NAME},
-                action="drop",
-                comment=_CONTENT_FILTER_ENFORCEMENT_COMMENT,
-            )
+        anchor_id = forward[anchor_index][".id"] if anchor_index is not None else None
+
+        if ours:
+            first_index = forward.index(ours[0])
+            correctly_placed = anchor_index is None or first_index < anchor_index
+            # More than one is not a state this method can produce, but a
+            # half-finished reposition (or an older build) can leave one.
+            extras = ours[1:]
+            if correctly_placed and not extras:
+                return
+            if correctly_placed:
+                for row in extras:
+                    menu.remove(row[".id"])
+                return
+
+        self._add_content_filter_enforcement_rule(menu, anchor_id)
+        # Add first, remove second: the chain is never left without a DROP.
+        for row in ours:
+            menu.remove(row[".id"])
+
+    @staticmethod
+    def _add_content_filter_enforcement_rule(menu, anchor_id: str | None) -> None:  # noqa: ANN001
+        """The DROP itself, before ``anchor_id`` when there is one.
+
+        ``place-before`` takes a ``.id`` (T1), so this passes the anchor
+        row's own id rather than an index -- an index would go stale the
+        moment the hotspot adds or removes one of its dynamic rules, which
+        is the failure the ordering scheme exists to avoid.
+        """
+        fields = {
+            "chain": "forward",
+            "dst-address-list": _CONTENT_FILTER_ADDRESS_LIST_NAME,
+            "action": "drop",
+            "comment": _CONTENT_FILTER_ENFORCEMENT_COMMENT,
+        }
+        if anchor_id is not None:
+            fields["place-before"] = anchor_id
+        menu.add(**fields)
+
+    # ------------------------------------------------------------------
+    # QoS: the packet-mark half
+    # ------------------------------------------------------------------
+
+    async def configure_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule: QosPacketMarkConfig
+    ) -> None:
+        """Realizes one QoS rule's ``/ip firewall mangle`` packet mark.
+
+        ## Why this exists
+
+        RouterOS realizes QoS as two independent objects, and this platform
+        only ever wrote one of them on any path a customer can reach.
+        :meth:`create_queue_tree` had a caller
+        (``app.domains.qos.service.QosService.push_rule_to_device``); the
+        mangle rule that *sets* the mark that queue references was rendered
+        only into a config script. That script's push endpoint
+        (``POST /network-config/routers/{router_id}/push``) *is*
+        customer-reachable -- the reason it did not rescue QoS is transport,
+        not routing: the script goes over SSH, and a port sweep run from the
+        platform against a fleet router reached only ``8728``, with ``22``
+        timing out alongside every other port tried, including one nothing
+        listens on. The result on a real router was a queue tree matching
+        zero packets, under a dashboard badge reading "Applied to your
+        router". A mark with no queue is inert; a queue with no mark is
+        equally inert, and harder to notice, because the object the
+        platform records an id for does exist.
+
+        ## The comment is the rule's identity
+
+        ``"WyfyGuest qos <rule_id>: <label> (priority=<n>)"``, found again
+        by the marker in front of the colon -- :meth:`configure_nat_masquerade`'s
+        reasoning, unchanged. Nothing else on this rule can serve as the
+        handle: ``protocol``/``dst-port``/``dscp`` *are* the classification
+        the customer edits, and ``new-packet-mark`` is derived from the
+        name they typed. Keyed on any of them, the push after an edit finds
+        nothing, adds a second mangle rule, and leaves the first one still
+        marking traffic for a classification nobody asked for -- silent,
+        cumulative, and invisible in this platform's own UI.
+
+        ## A re-typed rule is rewritten, not updated
+
+        A rule that switched between a port-range match and a DSCP match is
+        the one case where the fields to write are not the fields already
+        there: leaving ``dst-port`` set on a rule that now matches by DSCP
+        would keep matching the old ports. RouterOS has no "unset these
+        fields" in an update the way it has an ``add``, so the old rule
+        comes off before the new one goes on -- the same shape
+        :meth:`configure_content_filter_rule` uses for a rule re-typed
+        between a DNS sinkhole and an address list.
+
+        ``disabled`` is normalized through :func:`_is_truthy`, never by
+        string comparison, for the reason documented on
+        :meth:`_ensure_dhcp_server`.
+
+        ## Position in the chain: what this does NOT claim
+
+        This appends to ``/ip firewall mangle`` and takes no view on where
+        in the ``prerouting`` chain the rule lands, which is exactly what
+        ``network_config.renderers.render_qos_traffic_rule``'s own
+        ``/ip firewall mangle add`` has always done -- so a router pushed
+        through this method carries the same rule in the same place as one
+        pushed the script way, and no new ordering scheme is introduced
+        here. Mangle is order-sensitive in the same way filter rules are
+        (this rule sets ``passthrough=no``, so an earlier rule that matches
+        the same packet and also stops pre-empts it), and the ordered-write
+        design for that -- a sentinel band and ``place-before`` -- is
+        specified in ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md``
+        §5.2 and explicitly gated on two device tests (T1, T2) that have not
+        been run. **Whether a marked packet actually reaches this rule on a
+        given router is therefore unverified against hardware**, and is
+        flagged here rather than assumed -- the same posture
+        ``app.domains.qos.constants.QOS_QUEUE_TREE_PARENT`` already takes
+        about ``parent=global``.
+
+        Idempotent: re-pushing an unchanged rule writes nothing and raises
+        nothing."""
+        await asyncio.to_thread(self._configure_qos_packet_mark_sync, creds, rule)
+
+    def _configure_qos_packet_mark_sync(
+        self, creds: DeviceCredentials, rule: QosPacketMarkConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                desired = _qos_mangle_fields(rule)
+                marker = _qos_marker(rule.rule_id)
+                menu = api.path("ip", "firewall", "mangle")
+                for row in list(menu):
+                    if not str(row.get("comment", "")).startswith(marker):
+                        continue
+                    if any(
+                        key not in desired and row.get(key) not in (None, "")
+                        for key in _QOS_MANGLE_MATCH_FIELDS
+                    ):
+                        # Re-typed between a port-range match and a DSCP
+                        # one -- see this method's own docstring.
+                        menu.remove(row[".id"])
+                        break
+                    changed = {
+                        key: value
+                        for key, value in desired.items()
+                        if str(row.get(key, "")) != value
+                    }
+                    if _is_truthy(row.get("disabled")):
+                        changed["disabled"] = "no"
+                    if changed:
+                        menu.update(**{".id": row[".id"], **changed})
+                    return
+                menu.add(**desired, disabled="no")
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_qos_packet_mark: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    async def delete_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule_id: str
+    ) -> None:
+        """Removes one QoS rule's mangle mark, by the marker the write path
+        stamped it with -- so a rule whose match was edited since its last
+        push is still found.
+
+        Without this, deleting a QoS rule removed its ``/queue tree`` entry
+        and left the router marking packets for a rule the customer had
+        deleted, until somebody re-pushed a whole config script. Idempotent:
+        removing what is already absent is a no-op."""
+        await asyncio.to_thread(self._delete_qos_packet_mark_sync, creds, rule_id)
+
+    def _delete_qos_packet_mark_sync(
+        self, creds: DeviceCredentials, rule_id: str
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where_prefixed(
+                    api,
+                    ("ip", "firewall", "mangle"),
+                    "comment",
+                    _qos_marker(rule_id),
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_qos_packet_mark: {exc}"
+                ) from exc
+        finally:
+            api.close()
 
     # ------------------------------------------------------------------
     # queue management (QoS/bandwidth shaping)
@@ -1451,6 +6103,42 @@ class MikroTikAdapter:
         priority: int = 8,
         queue_type_name: str | None = None,
     ) -> str:
+        """Creates the ``/queue tree`` entry, or brings the entry already
+        carrying ``name`` into line with these fields. Returns the
+        device-side queue id either way.
+
+        ## Why this reads before it writes
+
+        This used to be a bare ``add``. Its only protection against a
+        duplicate was the caller's own stored ``device_queue_id`` column,
+        and a caller that lost that pointer -- which
+        ``app.domains.qos.service`` did on every failed push, since the
+        failure record was rolled back rather than committed -- could never
+        push that rule again: RouterOS answers a duplicate ``add`` with
+        "already have such item", forever, with no way out through the
+        dashboard. Idempotency that lives only in the caller's database is
+        not idempotency; it is a pointer that can be lost. ``name`` is the
+        right key because that is what RouterOS itself treats as this row's
+        identity, and this domain's names are deterministic
+        (``cloudguest-qos-<rule id>``), never customer-typed.
+
+        ## And why it updates rather than skipping
+
+        ``priority`` and ``packet-mark`` are precisely what an edited rule
+        changes; skipping would report success and leave the old values, the
+        failure mode ``_ensure_ip_pool`` documents for address ranges.
+
+        ``max-limit`` is compared as a *rate*, not as a string:
+        ``"0k"`` goes out on the wire and ``0`` comes back, so a string
+        comparison would find a difference on every single push and issue a
+        pointless update forever -- the same trap :func:`_is_truthy` exists
+        for on booleans. ``disabled`` goes through :func:`_is_truthy` for
+        exactly that reason: an entry somebody disabled by hand is
+        prioritising nothing, and a re-push is the operator asking for it
+        again.
+
+        Idempotent: re-pushing an unchanged queue writes nothing and raises
+        nothing."""
         fields: dict[str, str] = {
             "name": name,
             "parent": parent,
@@ -1462,8 +6150,36 @@ class MikroTikAdapter:
         if queue_type_name is not None:
             fields["queue"] = queue_type_name
         return await asyncio.to_thread(
-            self._queue_add_sync, creds, ("queue", "tree"), fields, "create_queue_tree"
+            self._ensure_queue_tree_sync, creds, name, fields
         )
+
+    def _ensure_queue_tree_sync(
+        self, creds: DeviceCredentials, name: str, fields: dict[str, str]
+    ) -> str:
+        api = self._connect_api(creds)
+        try:
+            try:
+                menu = api.path("queue", "tree")
+                for row in menu:
+                    if row.get("name") != name:
+                        continue
+                    changed = {
+                        key: value
+                        for key, value in fields.items()
+                        if _queue_tree_field_differs(key, row.get(key), value)
+                    }
+                    if _is_truthy(row.get("disabled")):
+                        changed["disabled"] = "no"
+                    if changed:
+                        menu.update(**{".id": row[".id"], **changed})
+                    return str(row[".id"])
+                return menu.add(**fields, disabled="no")
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"create_queue_tree: {exc}"
+                ) from exc
+        finally:
+            api.close()
 
     async def apply_pcq(
         self,
@@ -1642,7 +6358,9 @@ class MikroTikAdapter:
         :class:`MikroTikConnectionError` subclass) is deliberately not
         caught here and propagates, exactly like the original."""
         try:
-            resource = await asyncio.to_thread(self._health_check_sync, creds)
+            resource, interface_rows = await asyncio.to_thread(
+                self._health_check_sync, creds
+            )
         except MikroTikConnectionError as exc:
             return DeviceHealthResult(
                 healthy=False,
@@ -1656,15 +6374,45 @@ class MikroTikAdapter:
             cpu_load_percent=_as_float(resource.get("cpu-load")),
             free_memory_bytes=_as_int(resource.get("free-memory")),
             uptime_seconds=_parse_routeros_uptime(resource.get("uptime")),
+            interfaces=_interface_counters_from_rows(interface_rows),
         )
 
-    def _health_check_sync(self, creds: DeviceCredentials) -> dict[str, object]:
+    def _health_check_sync(
+        self, creds: DeviceCredentials
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        """One session, two reads.
+
+        ``/interface`` is fetched here rather than by a second call
+        because the connection, the TLS handshake and the login are the
+        expensive part of a poll; the extra command costs one round trip
+        on a socket that is already open. Those counters were already
+        being fetched wholesale by
+        ``_get_interface_traffic_counters_sync`` (which reads the entire
+        table and then keeps exactly one row) -- this stops throwing the
+        rest away.
+
+        The interface read is deliberately non-fatal. CPU and uptime are
+        what "is this router alive" is decided on, and losing that answer
+        because the interface table could not be listed would turn a
+        richer reading into a *worse* one. A failure here yields an empty
+        list, which the caller turns into ``interfaces=None`` -- "not
+        measured", honestly distinct from "measured, and empty".
+        """
         api = self._connect_api(creds)
         try:
             try:
-                return next(iter(api("/system/resource/print")), {})
+                resource = next(iter(api("/system/resource/print")), {})
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(creds.host, f"health_check: {exc}") from exc
+            try:
+                interface_rows = list(api.path("interface"))
+            except LibRouterosError as exc:
+                logger.warning(
+                    "mikrotik_health_check_interface_read_failed",
+                    extra={"host": creds.host, "error": _describe_exception(exc)},
+                )
+                interface_rows = []
+            return resource, interface_rows
         finally:
             api.close()
 
@@ -1702,18 +6450,94 @@ class MikroTikAdapter:
     async def execute_raw_command(
         self, creds: DeviceCredentials, *, command: str
     ) -> RawCommandResult:
-        """Ported from
-        ``provisioning_engine/device_adapters.py::execute_raw_command`` --
-        runs exactly ``command`` over the device's real SSH console
-        connection with no interpretation, whitelisting, or retry. Unlike
-        every other method here, a non-zero ``exit_status`` is not raised
-        as an exception (see :class:`~.contract.RawCommandResult`'s own
-        docstring)."""
+        """Runs exactly ``command`` on the device, with no whitelisting or
+        retry. Unlike every other method here, a non-zero ``exit_status`` is
+        not raised as an exception (see
+        :class:`~.contract.RawCommandResult`'s own docstring) -- a typo in
+        the console is a result, not a 500.
+
+        ## Why this runs over the API (8728), not SSH (22)
+
+        This method was ported from ``provisioning_engine/device_adapters
+        .py`` running over SSH, and SSH does not reach this fleet. Port 22
+        is filtered on real routers -- a port sweep from the platform
+        reached only 8728, and 22 timed out (recorded in
+        ``app.domains.qos.models`` and ``app.domains.content_filtering
+        .device_adapters``, both of which moved off this same dead
+        transport for the same reason). The failure that motivated *this*
+        change: Master Console's Device Console ran ``/interface print``
+        against a healthy router and reported "connection attempt timed
+        out" after asyncssh's own 10s ``connect_timeout``, while the same
+        credential over 8728 answered the same command in 57ms. Nothing
+        was wrong with the device, the credential, the host or the tunnel
+        -- the console was simply knocking on a port nothing answers.
+
+        So a command that can be expressed *faithfully* as a single API
+        sentence is executed over the API, the transport that actually
+        reaches the fleet. Anything else (``[find ...]``, ``:``-script
+        commands, ``where`` filters, ``;``-chained lines --
+        see :func:`_console_command_to_api_sentence`) still goes over SSH
+        rather than being approximated, and its connection error now names
+        the transport and port it failed on so the next operator is not
+        sent hunting the wrong subsystem.
+        """
+        sentence = _console_command_to_api_sentence(command)
+        if sentence is None:
+            return await self._execute_raw_command_over_ssh(creds, command=command)
+        return await asyncio.to_thread(
+            self._execute_raw_command_over_api_sync, creds, command, *sentence
+        )
+
+    def _execute_raw_command_over_api_sync(
+        self,
+        creds: DeviceCredentials,
+        command: str,
+        sentence: str,
+        arguments: Mapping[str, str],
+    ) -> RawCommandResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = [dict(row) for row in api(sentence, **arguments)]
+            except LibRouterosError as exc:
+                # A device-side rejection (unknown command, bad argument,
+                # permission denied) is this console's equivalent of a
+                # non-zero shell exit status, not a transport failure.
+                return RawCommandResult(
+                    command=command,
+                    stdout="",
+                    stderr=_describe_exception(exc),
+                    exit_status=1,
+                )
+        finally:
+            api.close()
+        return RawCommandResult(
+            command=command,
+            stdout=_format_console_rows(rows),
+            stderr="",
+            exit_status=0,
+        )
+
+    async def _execute_raw_command_over_ssh(
+        self, creds: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        """The original SSH path, kept for the commands the API cannot
+        express. See ``execute_raw_command``'s own docstring for why this is
+        no longer the default and why its connection error names the port:
+        an operator who sees a bare timeout has no way to tell "the device
+        is unreachable" from "this platform tried a port your fleet
+        filters"."""
         try:
             async with self._ssh_connect(creds) as conn:
                 result = await conn.run(command, check=False)
         except (OSError, asyncssh.Error) as exc:
-            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
+            raise MikroTikConnectionError(
+                creds.host,
+                f"{_describe_exception(exc)} (over SSH, port "
+                f"{self._ssh_port(creds)}; this command has no RouterOS API "
+                f"equivalent, so it could not use port "
+                f"{creds.port or _DEFAULT_API_PORT})",
+            ) from exc
         return RawCommandResult(
             command=command,
             stdout=str(result.stdout or ""),
@@ -1733,8 +6557,14 @@ class MikroTikAdapter:
             "provision_device": True,
             "reboot_device": True,
             "configure_vlan": True,
+            "configure_vlan_hotspot": True,
+            "delete_vlan_hotspot": True,
+            "read_network_snapshot": True,
             "configure_dhcp_pool": True,
             "configure_port_forward": True,
+            "delete_port_forward": True,
+            "configure_nat_masquerade": True,
+            "delete_nat_masquerade": True,
             "set_radius_client_config": True,
             "configure_content_filter_rule": True,
             "disconnect_device": True,
@@ -1744,6 +6574,7 @@ class MikroTikAdapter:
             "get_pppoe_interface_status": True,
             "get_interface_traffic_counters": True,
             "run_speed_test": True,
+            "push_hotspot_certificate": True,
             "create_simple_queue": True,
             "update_simple_queue": True,
             "delete_simple_queue": True,
@@ -1825,6 +6656,28 @@ def _select_default_route(
     ``_get_wan_health_sync``, which also needs to know *which* interface
     the default route rides on to resolve PPPoE status/traffic counters
     against it."""
+    winning_row = _select_default_route_row(rows)
+    if winning_row is None:
+        return None, None
+    gateway = winning_row.get("gateway")
+    interface = winning_row.get("interface")
+    return (
+        str(gateway) if gateway else None,
+        str(interface) if interface else None,
+    )
+
+
+def _select_default_route_row(
+    rows: list[dict[str, object]],
+) -> dict[str, object] | None:
+    """The raw ``/ip/route`` row the two-tier rule above selects, or
+    ``None``.
+
+    Extracted so WAN-interface resolution reads the *same* winning route
+    as the gateway/health reads rather than re-implementing the choice --
+    it needs fields (``immediate-gw``) the two-value view above does not
+    carry, and a second copy of "which default route counts" is exactly
+    the kind of drift that produced the 2026-08-17 incident."""
     dynamic_row: dict[str, object] | None = None
     active_fallback_row: dict[str, object] | None = None
     for row in rows:
@@ -1840,15 +6693,246 @@ def _select_default_route(
         is_disabled = str(row.get("disabled", "false")).lower() == "true"
         if is_active and not is_disabled and row.get("gateway"):
             active_fallback_row = row
-    winning_row = dynamic_row if dynamic_row is not None else active_fallback_row
-    if winning_row is None:
-        return None, None
-    gateway = winning_row.get("gateway")
-    interface = winning_row.get("interface")
-    return (
-        str(gateway) if gateway else None,
-        str(interface) if interface else None,
+    return dynamic_row if dynamic_row is not None else active_fallback_row
+
+
+def _gateway_address(value: object) -> str | None:
+    """The bare gateway IP from a RouterOS gateway token.
+
+    RouterOS v7 qualifies a gateway with the interface it is reachable on
+    -- ``"192.168.1.1%ether1"`` -- in ``gateway`` and ``immediate-gw``
+    alike. Everything that has to *match* the gateway against something
+    else (an address's subnet, a dhcp-client's own gateway) needs the
+    address half alone."""
+    text = _safe_str(value)
+    if not text:
+        return None
+    return text.split("%", 1)[0].strip() or None
+
+
+def _gateway_token_interface(value: object) -> str | None:
+    """The interface half of that same token, when RouterOS supplies one
+    -- the device naming its own egress interface for this route."""
+    text = _safe_str(value)
+    if not text or "%" not in text:
+        return None
+    return text.split("%", 1)[1].strip() or None
+
+
+def _interface_holding_gateway(
+    gateway: str | None, address_rows: list[dict[str, object]]
+) -> str | None:
+    """The interface carrying an address whose subnet contains
+    ``gateway``.
+
+    A derivation rather than a heuristic: a next-hop gateway is reachable
+    precisely because the router holds an address in its subnet, and the
+    interface that address is on is the one traffic to it leaves by. This
+    is the tier that resolves an ordinary DHCP-WAN router, whose default
+    route names no interface of its own."""
+    if not gateway:
+        return None
+    try:
+        gateway_ip = ipaddress.ip_address(gateway)
+    except ValueError:
+        return None
+    for row in address_rows:
+        address = _safe_str(row.get("address"))
+        interface = _safe_str(row.get("interface"))
+        if not address or not interface:
+            continue
+        try:
+            network = ipaddress.ip_interface(address).network
+        except ValueError:
+            continue
+        if gateway_ip in network:
+            return interface
+    return None
+
+
+def _dhcp_client_interface_for_gateway(
+    gateway: str | None, dhcp_client_rows: list[dict[str, object]]
+) -> str | None:
+    """The interface of the ``/ip dhcp-client`` that negotiated exactly
+    this gateway.
+
+    Matched on the gateway, never on "there is only one dhcp-client": a
+    router with a second dhcp-client on an internal link would otherwise
+    have guest traffic masqueraded onto that internal segment."""
+    if not gateway:
+        return None
+    for row in dhcp_client_rows:
+        interface = _safe_str(row.get("interface"))
+        if interface and _gateway_address(row.get("gateway")) == gateway:
+            return interface
+    return None
+
+
+def _select_wan_interface(
+    route_rows: list[dict[str, object]],
+    address_rows: list[dict[str, object]],
+    dhcp_client_rows: list[dict[str, object]],
+    interface_names: set[str],
+) -> str | None:
+    """The WAN-facing interface name, or ``None`` when the router's own
+    live state does not honestly identify one.
+
+    The full rule -- which default route counts, the four ordered ways to
+    name its interface, and what is deliberately not used -- is documented
+    on :meth:`MikroTikAdapter.resolve_wan_interface`. This function is
+    that rule with no I/O in it, so it can be reasoned about (and tested)
+    against raw RouterOS reply rows.
+
+    Every candidate is checked against ``interface_names`` before it wins,
+    so a stale name in a route row can never become an ``out-interface``
+    referring to an interface this device does not have."""
+    row = _select_default_route_row(route_rows)
+    if row is None:
+        return None
+    return _route_interface(row, address_rows, dhcp_client_rows, interface_names)
+
+
+def _route_interface(
+    row: dict[str, object],
+    address_rows: list[dict[str, object]],
+    dhcp_client_rows: list[dict[str, object]],
+    interface_names: set[str],
+) -> str | None:
+    """The egress interface of ONE route row -- the four ordered tiers
+    documented on :meth:`MikroTikAdapter.resolve_wan_interface`, with no
+    opinion about which route is the important one.
+
+    Split out of :func:`_select_wan_interface` when WAN failover needed the
+    same naming rule applied to *every* default route rather than only to
+    the winning one. Deliberately not a second copy: a failover that named
+    interfaces by one rule while ``resolve_wan_interface`` (and therefore
+    every NAT push) named them by another would put the masquerade on one
+    interface and the route on a different one, and each would look correct
+    on its own.
+
+    Every candidate is checked against ``interface_names`` before it wins,
+    so a stale name in a route row can never become an ``out-interface``
+    referring to an interface this device does not have."""
+    gateway = _gateway_address(row.get("gateway"))
+    candidates = (
+        _safe_str(row.get("interface")),
+        _gateway_token_interface(row.get("immediate-gw")),
+        _gateway_token_interface(row.get("gateway")),
+        _interface_holding_gateway(gateway, address_rows),
+        _dhcp_client_interface_for_gateway(gateway, dhcp_client_rows),
     )
+    for candidate in candidates:
+        if candidate and candidate in interface_names:
+            return candidate
+    return None
+
+
+def _is_main_table_row(row: dict[str, object]) -> bool:
+    """Whether a ``/ip route`` row lives in the ``main`` routing table.
+
+    RouterOS omits the property on an unmarked route rather than spelling
+    out ``"main"``, so absent means main. The filter matters because this
+    module's own caller (``network_config/wan/renderers.py``) provisions a
+    ``routing-table="to_wan<N>"`` default route *per WAN* plus a
+    ``distance=2`` crossover backup in load-balance mode. Those are active
+    in their own tables simultaneously; counting them as candidates would
+    make every load-balanced router look permanently ambiguous."""
+    table = _safe_str(row.get("routing-table"))
+    return table is None or table == "main"
+
+
+def _build_rogue_dhcp_alert_statuses(
+    alert_rows: list[dict[str, object]],
+    dhcp_serving_interfaces: set[str],
+) -> list[RogueDhcpAlertStatus]:
+    """One :class:`RogueDhcpAlertStatus` per interface, from the union of
+    the alert rows and the interfaces actually serving DHCP.
+
+    The union, not the alert rows alone: an interface handing out
+    addresses with no alert on it is precisely the thing a caller asks
+    this question to find, and it has no row to be listed by. Pure, and
+    module-level, so the shape of the answer is testable without a
+    transport at all -- ``_build_default_routes``'s precedent.
+
+    Sorted by interface name so a caller diffing two reads, or a test
+    asserting on one, is not comparing against RouterOS's row order.
+    """
+    statuses: dict[str, RogueDhcpAlertStatus] = {}
+    for row in alert_rows:
+        interface = _safe_str(row.get("interface"))
+        if interface is None:
+            # A row that names no interface watches nothing identifiable;
+            # reporting it under a made-up name would be worse than
+            # leaving it out.
+            continue
+        statuses[interface] = RogueDhcpAlertStatus(
+            interface=interface,
+            serves_dhcp=interface in dhcp_serving_interfaces,
+            alert_present=True,
+            # RouterOS answers with a real bool and accepts "no" on write;
+            # see ``_is_truthy``.
+            enabled=not _is_truthy(row.get("disabled")),
+            valid_servers=_split_valid_servers(row.get("valid-server")),
+            alert_timeout=_safe_str(row.get("alert-timeout")),
+            managed=_safe_str(row.get("comment")) == _ROGUE_DHCP_ALERT_COMMENT,
+            unknown_server=_safe_str(row.get("unknown-server")),
+        )
+    for interface in dhcp_serving_interfaces:
+        if interface in statuses:
+            continue
+        statuses[interface] = RogueDhcpAlertStatus(
+            interface=interface,
+            serves_dhcp=True,
+            alert_present=False,
+            enabled=False,
+            valid_servers=(),
+            alert_timeout=None,
+            managed=False,
+            unknown_server=None,
+        )
+    return [statuses[name] for name in sorted(statuses)]
+
+
+def _build_default_routes(
+    route_rows: list[dict[str, object]],
+    address_rows: list[dict[str, object]],
+    dhcp_client_rows: list[dict[str, object]],
+    interface_names: set[str],
+) -> list[DefaultRoute]:
+    """Every ``0.0.0.0/0`` row in the ``main`` table, as
+    :class:`~.contract.DefaultRoute` values.
+
+    No I/O, so the whole failover decision can be reasoned about (and
+    tested) against raw RouterOS reply rows. Nothing is filtered out for
+    being inactive or disabled: "the backup route exists but RouterOS has
+    stopped considering it active" is precisely the fact a caller has to
+    see before it moves traffic onto it, and dropping such rows here would
+    turn a refusal into a route-not-found."""
+    routes: list[DefaultRoute] = []
+    for row in route_rows:
+        if row.get("dst-address") != "0.0.0.0/0" or not _is_main_table_row(row):
+            continue
+        route_id = _safe_str(row.get(".id"))
+        if route_id is None:
+            # No handle to address it by, so no write could ever target it.
+            # Reporting it as a candidate would let a caller select a route
+            # it cannot then move.
+            continue
+        routes.append(
+            DefaultRoute(
+                route_id=route_id,
+                gateway=_gateway_address(row.get("gateway")),
+                interface=_route_interface(
+                    row, address_rows, dhcp_client_rows, interface_names
+                ),
+                distance=_safe_int(row.get("distance")),
+                active=_is_truthy(row.get("active")),
+                disabled=_is_truthy(row.get("disabled")),
+                dynamic=_is_truthy(row.get("dynamic")),
+                comment=_safe_str(row.get("comment")),
+            )
+        )
+    return routes
 
 
 def _parse_ping_rows(
@@ -2003,44 +7087,37 @@ def _row_mac(row: dict[str, object]) -> str | None:
     return normalize_mac_address(row.get("mac-address"))
 
 
-def _parse_signal_strength(value: object) -> int | None:
-    """Ported verbatim from
-    ``connected_devices/device_adapters.py::_parse_signal_strength`` --
-    RouterOS reports signal strength as e.g. ``"-55dBm@6Mbps"`` or plain
-    ``"-55"`` depending on version."""
-    if value is None:
-        return None
-    text = str(value)
-    digits = ""
-    for index, char in enumerate(text):
-        if (char in "+-" and index == 0) or char.isdigit():
-            digits += char
-        else:
-            break
-    try:
-        return int(digits)
-    except ValueError:
-        return None
+# `_parse_signal_strength` was removed alongside the wireless
+# registration-table read (see `MikroTikAdapter.list_connected_devices`).
+# It parsed the legacy `wireless` package's `"-55dBm@6Mbps"` /`"-55"`
+# signal field, and had no other caller. Restoring it is not enough to
+# restore the capability: the newer `/interface/wifi` stack reports a
+# plain numeric `signal` with `rx-rate`/`tx-rate` alongside it, so the
+# parser to write depends on which wireless stack the device actually
+# runs -- which is the version gate described in that method's docstring.
 
 
 def _merge_connected_devices(
     leases: list[dict[str, object]],
     arp_entries: list[dict[str, object]],
-    wireless_entries: list[dict[str, object]],
 ) -> list[ConnectedDevice]:
-    """Ported verbatim from
-    ``connected_devices/device_adapters.py::_merge_discovered_devices`` --
-    merges DHCP-lease/ARP/wireless-registration-table replies into one
-    :class:`ConnectedDevice` per MAC address. See that module's own
-    docstring for why each menu answers a different question about the
-    same device and why a device present in more than one source is never
-    duplicated."""
-    wireless_by_mac: dict[str, dict[str, object]] = {}
-    for row in wireless_entries:
-        mac = _row_mac(row)
-        if mac is not None:
-            wireless_by_mac[mac] = row
+    """Merges ``/ip/dhcp-server/lease`` and ``/ip/arp`` replies into one
+    :class:`ConnectedDevice` per MAC address.
 
+    The two menus answer different questions about the same device -- a
+    lease carries the client-reported hostname and the address the router
+    handed out; ARP carries an address and interface for a device that
+    took no lease -- so a device present in both is one row, never two.
+    ARP is applied first and the lease overwrites it field by field,
+    keeping the ARP value wherever the lease has none.
+
+    ``is_wireless`` is ``None`` on every row: neither of these two menus
+    can answer it, and the third menu that could
+    (``/interface/wireless/registration-table``) does not exist on this
+    fleet's hardware. See :meth:`MikroTikAdapter.list_connected_devices`
+    for the full reasoning and :class:`ConnectedDevice` for why ``None``
+    rather than ``False``.
+    """
     merged: dict[str, ConnectedDevice] = {}
 
     for row in arp_entries:
@@ -2052,13 +7129,27 @@ def _merge_connected_devices(
             ip_address=_safe_str(row.get("address")),
             hostname=None,
             interface=_safe_str(row.get("interface")),
-            is_wireless=mac in wireless_by_mac,
+            is_wireless=None,
             signal_strength_dbm=None,
         )
 
     for row in leases:
         mac = _row_mac(row)
         if mac is None:
+            continue
+        # A lease row is address bookkeeping, not physical liveness.
+        # RouterOS keeps the entry for a client that powered off without
+        # releasing -- its ``status`` moves to ``expired``/``waiting`` once
+        # the lease time elapses, but the row itself stays. Treating every
+        # row as "seen" therefore kept a dead access point UP forever: the
+        # 15-minute device sync kept finding its MAC and refreshing
+        # ``is_active``/``last_seen_at`` (bug report: "AP Hall Lobby went
+        # down but the console still shows UP"). Only a ``bound`` lease is
+        # a client the router is actually willing to serve. The ``status``
+        # key is absent in this project's fake transports and on some
+        # RouterOS print shapes -- absence keeps the row (backward
+        # compatible), an explicit non-``bound`` status drops it.
+        if (status := row.get("status")) is not None and status != "bound":
             continue
         existing = merged.get(mac)
         merged[mac] = ConnectedDevice(
@@ -2068,20 +7159,8 @@ def _merge_connected_devices(
             hostname=_safe_str(row.get("host-name")),
             interface=_safe_str(row.get("interface"))
             or (existing.interface if existing else None),
-            is_wireless=mac in wireless_by_mac,
-            signal_strength_dbm=existing.signal_strength_dbm if existing else None,
-        )
-
-    for mac, row in wireless_by_mac.items():
-        existing = merged.get(mac)
-        merged[mac] = ConnectedDevice(
-            mac_address=mac,
-            ip_address=existing.ip_address if existing else None,
-            hostname=existing.hostname if existing else None,
-            interface=_safe_str(row.get("interface"))
-            or (existing.interface if existing else None),
-            is_wireless=True,
-            signal_strength_dbm=_parse_signal_strength(row.get("signal-strength")),
+            is_wireless=None,
+            signal_strength_dbm=None,
         )
 
     return list(merged.values())

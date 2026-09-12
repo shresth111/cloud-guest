@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.domains.router.enums import RouterStatus
+from app.domains.router.enums import RouterReachabilityState, RouterStatus
 from app.domains.router.models import Router
 from app.domains.router_provisioning.constants import (
     EnrollmentStatus,
@@ -26,8 +26,12 @@ from .constants import (
     ALERT_STATUS_TRANSITIONS,
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
+    ALERT_TARGET_ROUTER_REACHABILITY,
     INCIDENT_STATUS_TRANSITIONS,
+    NETWORK_CONTROLLER_TARGET_STATES,
+    ROGUE_DHCP_STATE_UNGUARDED,
     ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES,
     ROUTER_HEARTBEAT_WARNING_STALE_MINUTES,
     STORAGE_DEGRADED_USED_PERCENT,
@@ -97,25 +101,86 @@ def validate_alert_rule_condition_config(
         if not target_component:
             raise InvalidAlertRuleConfigError(
                 "health_status_change rules require target_component "
-                "(a HealthComponent value, 'router', 'isp_link', or "
-                "'monitored_hardware')"
+                "(a HealthComponent value, 'router', 'router_reachability', "
+                "'isp_link', 'monitored_hardware', 'rogue_dhcp_guard', "
+                "'network_controller', 'network_controller_authorize', or "
+                "'network_controller_setup')"
             )
-        valid_components = {c.value for c in HealthComponent} | {
-            ALERT_TARGET_ROUTER,
-            ALERT_TARGET_ISP_LINK,
-            ALERT_TARGET_MONITORED_HARDWARE,
-        }
+        valid_components = (
+            {c.value for c in HealthComponent}
+            | {
+                ALERT_TARGET_ROUTER,
+                ALERT_TARGET_ROUTER_REACHABILITY,
+                ALERT_TARGET_ISP_LINK,
+                ALERT_TARGET_MONITORED_HARDWARE,
+                ALERT_TARGET_ROGUE_DHCP_GUARD,
+            }
+            | set(NETWORK_CONTROLLER_TARGET_STATES)
+        )
         if target_component not in valid_components:
             raise InvalidAlertRuleConfigError(
                 f"target_component '{target_component}' is not a known "
-                "HealthComponent value, 'router', 'isp_link', or "
-                "'monitored_hardware'"
+                "HealthComponent value, 'router', 'router_reachability', "
+                "'isp_link', 'monitored_hardware', 'rogue_dhcp_guard', "
+                "'network_controller', 'network_controller_authorize', or "
+                "'network_controller_setup'"
             )
         expected_status = condition_config.get("expected_status")
         if not isinstance(expected_status, str) or not expected_status:
             raise InvalidAlertRuleConfigError(
                 "condition_config.expected_status is required for "
                 "health_status_change rules"
+            )
+        if (
+            target_component == ALERT_TARGET_ROUTER_REACHABILITY
+            and expected_status != RouterReachabilityState.UNREACHABLE.value
+        ):
+            # The same discipline the rogue-DHCP guard below applies, for
+            # the same reason. "reachable" would be an alert that fires
+            # when everything is fine, and "unknown" means the sweep has
+            # never been able to judge this router at all (never enrolled,
+            # expired agent credential, mid-provisioning) -- an unanswered
+            # question, not an outage. Rejected at write time so an
+            # operator finds out when they save the rule rather than at
+            # 3am when it pages them for a router nobody ever plugged in.
+            raise InvalidAlertRuleConfigError(
+                "router_reachability rules require condition_config"
+                f".expected_status == "
+                f"'{RouterReachabilityState.UNREACHABLE.value}' -- "
+                "'reachable' has no finding behind it and 'unknown' means "
+                "the platform has never been able to judge this router, "
+                "which is an unanswered question, not an alert"
+            )
+        if (
+            target_component == ALERT_TARGET_ROGUE_DHCP_GUARD
+            and expected_status != ROGUE_DHCP_STATE_UNGUARDED
+        ):
+            # The only rogue-DHCP state with a finding behind it. A rule
+            # asking for "guarded" would be an alert that fires when
+            # everything is fine, and one asking for "unknown" would page
+            # somebody for every router the detector could not reach --
+            # which is precisely the conflation
+            # ``constants.ALERT_TARGET_ROGUE_DHCP_GUARD`` exists to keep
+            # out. Rejected at write time rather than silently evaluating
+            # to nothing, so an operator finds out when they save the
+            # rule, not six hours later when it never fires.
+            raise InvalidAlertRuleConfigError(
+                "rogue_dhcp_guard rules require condition_config"
+                f".expected_status == '{ROGUE_DHCP_STATE_UNGUARDED}' -- "
+                "'guarded' has no finding behind it and 'unknown' means "
+                "the detector could not reach the router, which is an "
+                "unanswered question, not an alert"
+            )
+        required_state = NETWORK_CONTROLLER_TARGET_STATES.get(target_component)
+        if required_state is not None and expected_status != required_state:
+            # Same discipline again: each network-controller target has
+            # exactly one state with a finding behind it, and the
+            # evaluator computes that state itself from the integration's
+            # persisted row. Any other value would be a rule that can never
+            # fire, which an operator should hear about when they save it.
+            raise InvalidAlertRuleConfigError(
+                f"{target_component} rules require condition_config"
+                f".expected_status == '{required_state}'"
             )
     elif trigger_type == AlertTriggerType.THRESHOLD:
         if target_component:

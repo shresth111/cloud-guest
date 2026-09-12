@@ -27,16 +27,15 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
-from app.core.logging import get_logger
 from app.domains.auth.models import AuthUser
 from app.domains.billing.constants import PlanFeatureKey
 from app.domains.billing.dependencies import RequireFeature
-from app.domains.monitoring.constants import (
-    ALERT_TARGET_MONITORED_HARDWARE,
-    AlertTriggerType,
+from app.domains.monitoring.default_alerting import ensure_default_alerting
+from app.domains.monitoring.dependencies import (
+    get_alert_service,
+    get_notification_service,
 )
-from app.domains.monitoring.dependencies import get_alert_service
-from app.domains.monitoring.service import AlertService
+from app.domains.monitoring.service import AlertService, NotificationService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -57,6 +56,7 @@ from .schemas import (
     OrganizationResponse,
     OrganizationUpdateRequest,
 )
+from .scoping import enforce_target_organization
 from .service import OrganizationService
 
 router = APIRouter(tags=["Organizations"])
@@ -105,6 +105,27 @@ def _member_response(member: OrganizationMember) -> OrganizationMemberResponse:
         created_at=member.created_at,
         updated_at=member.updated_at,
     )
+
+
+# Every new organization gets real, working, ALREADY-WIRED alerting from day
+# one -- the rules, an email channel built from the organization's own
+# contact address, and the link between them.
+#
+# The tuple and the "is it already there?" logic used to live here. They now
+# live in ``app.domains.monitoring.default_alerting`` because the same
+# behaviour is needed twice: here, on organization creation, and in
+# ``scripts/backfill_default_alerting.py`` for the organizations that
+# predate it -- including the platform's one real customer, which on
+# 2026-09-07 had zero alert rules and no channel of its own.
+#
+# What has NOT changed is where this is composed. ``OrganizationService``
+# is a foundational domain with no business knowing about alerting, so this
+# stays at the router/orchestration layer, the same layer that already
+# composes billing's ``RequireFeature`` for this endpoint.
+#
+# Still non-fatal, and still non-fatal per rule: a customer's organization
+# successfully existing matters more than any default rule existing. See
+# ``ensure_default_alerting``'s own docstring.
 
 
 # ============================================================================
@@ -161,6 +182,7 @@ async def create_organization(
     user: AuthUser = Depends(CurrentUser),
     organization_service: OrganizationService = Depends(get_organization_service),
     alert_service: AlertService = Depends(get_alert_service),
+    notification_service: NotificationService = Depends(get_notification_service),
 ):
     organization = await organization_service.create_organization(
         actor_user_id=uuid.UUID(user.id),
@@ -177,37 +199,12 @@ async def create_organization(
         settings=payload.settings,
         subscription_tier=payload.subscription_tier,
     )
-    # Every new organization gets a real, working "hardware down" alert rule
-    # from day one -- previously this had to be created by hand per org
-    # (confirmed live: neither of the two organizations that existed before
-    # this had one until created manually), so a real customer's access
-    # points/printers/cameras going down produced no notification at all
-    # unless someone remembered this separate step. Deliberately kept out
-    # of OrganizationService itself (a foundational domain with no business
-    # knowing about alerting) -- composed here at the router/orchestration
-    # layer instead, the same layer that already composes billing's
-    # RequireFeature for this exact endpoint. Non-fatal: a customer's
-    # organization successfully existing matters more than this default
-    # rule existing, so a failure here is logged, never raised -- the org
-    # creation response is unaffected either way.
-    try:
-        await alert_service.create_alert_rule(
-            name="Network hardware down",
-            description=(
-                "Fires when a registered access point, printer, camera, or "
-                "other monitored device goes from up to down."
-            ),
-            organization_id=organization.id,
-            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
-            target_component=ALERT_TARGET_MONITORED_HARDWARE,
-            condition_config={"expected_status": "down"},
-            severity="warning",
-        )
-    except Exception:
-        get_logger(__name__).exception(
-            "default_hardware_down_alert_rule_creation_failed",
-            extra={"organization_id": str(organization.id)},
-        )
+    await ensure_default_alerting(
+        alert_service,
+        notification_service,
+        organization_id=organization.id,
+        contact_email=organization.contact_email,
+    )
     return build_response(
         success=True,
         message="Organization created",
@@ -225,8 +222,18 @@ async def create_organization(
 async def get_organization(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter, so without an explicit check the two name different
+    # organizations. The sibling /branding route below already threads
+    # requesting_organization_id; these three never did.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     organization = await organization_service.get_organization(organization_id)
     return build_response(
         success=True,
@@ -410,8 +417,18 @@ async def activate_organization(
 async def list_organization_children(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter, so without an explicit check the two name different
+    # organizations. The sibling /branding route below already threads
+    # requesting_organization_id; these three never did.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     children = await organization_service.list_children(organization_id)
     return build_response(
         success=True,
@@ -435,8 +452,18 @@ async def list_organization_children(
 async def list_organization_members(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter, so without an explicit check the two name different
+    # organizations. The sibling /branding route below already threads
+    # requesting_organization_id; these three never did.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     members = await organization_service.list_members(organization_id)
     return build_response(
         success=True,
@@ -457,12 +484,14 @@ async def invite_organization_member(
     organization_id: uuid.UUID,
     payload: OrganizationMemberInviteRequest,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
     member = await organization_service.invite_member(
         actor_user_id=uuid.UUID(user.id),
         organization_id=organization_id,
         user_id=payload.user_id,
+        requesting_organization_id=requesting_organization_id,
         is_primary_contact=payload.is_primary_contact,
     )
     return build_response(
@@ -484,12 +513,14 @@ async def remove_organization_member(
     organization_id: uuid.UUID,
     member_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
     await organization_service.remove_member(
         actor_user_id=uuid.UUID(user.id),
         organization_id=organization_id,
         member_id=member_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,

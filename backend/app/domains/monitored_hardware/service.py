@@ -14,14 +14,18 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.location.models import Location
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
-from .constants import HardwareStatus
+from .constants import STALE_SIGHTING_AFTER_SECONDS, HardwareStatus
 from .events import MonitoredHardwareDeleted, MonitoredHardwareRegistered
 from .exceptions import DuplicateMonitoredHardwareError, MonitoredHardwareNotFoundError
 from .models import MonitoredHardware
@@ -77,11 +81,16 @@ class HardwareWithStatus:
     """A ``MonitoredHardware`` row plus its derived status -- see module
     docstring. ``last_seen_at`` is only ever a real
     ``ConnectedDevice.last_seen_at`` value (or ``None`` when the device
-    has never been observed), never invented."""
+    has never been observed), never invented. ``connected_at`` is the
+    companion fact that answers a different question -- "how long has
+    this device actually been on the network" rather than "when did the
+    sync sweep last see it" -- and is likewise only ever a real
+    ``ConnectedDevice.connected_at`` (``None`` when never observed)."""
 
     device: MonitoredHardware
     status: HardwareStatus
     last_seen_at: datetime | None
+    connected_at: datetime | None
 
 
 class MonitoredHardwareService:
@@ -94,11 +103,14 @@ class MonitoredHardwareService:
         router_lookup: RouterLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.location_lookup = location_lookup
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     async def register_device(
         self,
@@ -164,6 +176,23 @@ class MonitoredHardwareService:
             and device.organization_id != requesting_organization_id
         ):
             raise MonitoredHardwareNotFoundError(device_id)
+        # Same reasoning as firewall, but raising this domain's own
+        # NotFound rather than a 403: it already answers a foreign
+        # *organization* that way so as not to confirm the row exists,
+        # and a location refusal that 403s would leak exactly what the
+        # organization refusal is careful not to.
+        #
+        # DO NOT "harmonise" this to the CrossLocation*AccessError 403 the
+        # other domains raise. "No such row" and "that row is not yours"
+        # are different answers, and this domain has deliberately chosen
+        # the first. No test asserts that a refusal must be uninformative,
+        # so that change would pass CI and quietly turn an
+        # existence-hiding refusal into an existence-confirming one.
+        enforce_entity_location(
+            entity_location_id=getattr(device, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=MonitoredHardwareNotFoundError(device_id),
+        )
         return device
 
     async def with_status(self, device: MonitoredHardware) -> HardwareWithStatus:
@@ -172,11 +201,40 @@ class MonitoredHardwareService:
         )
         if connected is None:
             return HardwareWithStatus(
-                device=device, status=HardwareStatus.UNKNOWN, last_seen_at=None
+                device=device,
+                status=HardwareStatus.UNKNOWN,
+                last_seen_at=None,
+                connected_at=None,
             )
-        status = HardwareStatus.UP if connected.is_active else HardwareStatus.DOWN
+        # An ``is_active`` row whose last sighting is older than the stale
+        # window is not a live device -- it is a row the device-sync sweep
+        # could not refresh (its uplink router went unreachable, or the
+        # sweep itself stalled), and deriving UP from it repeats the
+        # reported bug: a venue access point that physically went down kept
+        # showing UP because the sweep that would have flipped ``is_active``
+        # never ran. See STALE_SIGHTING_AFTER_SECONDS in this domain's
+        # constants for the window's derivation. ``last_seen_at`` is never
+        # None for a row the sync wrote (every create/update branch stamps
+        # it), so a None here falls back to trusting ``is_active`` alone --
+        # the pre-existing contract the unit tests pin.
+        if connected.is_active and connected.last_seen_at is not None:
+            age_seconds = (datetime.now(UTC) - connected.last_seen_at).total_seconds()
+            is_active = age_seconds <= STALE_SIGHTING_AFTER_SECONDS
+        else:
+            is_active = connected.is_active
+        status = HardwareStatus.UP if is_active else HardwareStatus.DOWN
         return HardwareWithStatus(
-            device=device, status=status, last_seen_at=connected.last_seen_at
+            device=device,
+            status=status,
+            last_seen_at=connected.last_seen_at,
+            # ``connected_at`` is preserved by the sync sweep across ticks
+            # for a device that stays active (see connected_devices/
+            # service.py's own update branch) -- i.e. it is genuinely
+            # "this device has been on the network since", the fact a
+            # venue owner means when they ask "how long has it been up?".
+            # Deliberately only surfaced for UP devices: a DOWN device's
+            # stale ``connected_at`` would read as current uptime.
+            connected_at=connected.connected_at if is_active else None,
         )
 
     async def list_devices(

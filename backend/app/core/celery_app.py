@@ -121,8 +121,16 @@ from app.domains.campaigns.constants import (
 )
 from app.domains.connected_devices.constants import (
     CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
+    MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
+    TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
     TASK_SYNC_SINGLE_ROUTER_DEVICES,
+)
+from app.domains.dhcp.constants import (
+    ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
+    TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER,
+    TASK_DETECT_ROGUE_DHCP_FOR_ROUTER,
+    TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
 )
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
@@ -142,7 +150,17 @@ from app.domains.isp.constants import (
 )
 from app.domains.monitoring.constants import (
     ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
+    HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
+    TASK_RUN_HEALTH_CHECK_SWEEP,
+)
+from app.domains.network_diagnostics.constants import (
+    DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
+)
+from app.domains.network_integration.constants import (
+    NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
 )
 from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
@@ -160,8 +178,10 @@ from app.domains.queue_management.constants import (
 )
 from app.domains.router.constants import (
     PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
+    ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
     STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
+    TASK_RUN_ROUTER_REACHABILITY_SWEEP,
     TASK_RUN_STALE_HEARTBEAT_SWEEP,
 )
 
@@ -206,10 +226,13 @@ celery_app = Celery(
         "app.domains.billing.tasks",
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
+        "app.domains.dhcp.tasks",
         "app.domains.guest.tasks",
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
         "app.domains.monitoring.tasks",
+        "app.domains.network_diagnostics.tasks",
+        "app.domains.network_integration.tasks",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
@@ -272,6 +295,34 @@ celery_app.conf.update(
         # .TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP's own docstring), so it
         # belongs on the real-device-I/O queue for the identical reason.
         TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The rogue-DHCP detector's per-router fan-out *leaf* task -- a real
+        # RouterOS API read of ``/ip dhcp-server alert`` per router (see
+        # app.domains.dhcp.tasks's own module docstring). On this queue for
+        # the identical reason TASK_POLL_SINGLE_ROUTER_HEALTH is: it is
+        # where the actual device round trip happens. Its Beat-scheduled
+        # coordinator (TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP) is deliberately
+        # left off -- one DB query plus N .delay() calls, no device I/O of
+        # its own.
+        TASK_DETECT_ROGUE_DHCP_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The captive-portal DHCP-option converger -- one real RouterOS
+        # write per router, so it belongs here for the same reason. Routed
+        # but NOT Beat-scheduled: see the constant's own note on why a
+        # recurring remover must wait for the Master Console generator to
+        # stop emitting the option-114 chunk.
+        TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER: {
+            "queue": DEVICE_IO_QUEUE_NAME
+        },
+        # The network-integration sync sweep issues real HTTPS round trips
+        # to *customer-owned* network controllers -- one login plus several
+        # resource reads per enabled integration, each with its own
+        # multi-second timeout against hardware this platform does not
+        # operate and cannot restart. Exactly the reason this queue exists,
+        # and the same "single sequential sweep, no per-integration
+        # fan-out, real device I/O of its own" shape as
+        # TASK_RUN_ISP_HEALTH_CHECK_SWEEP above: even un-fanned-out, one
+        # unreachable controller can no longer starve a pure-DB sweep
+        # waiting behind it in the shared default queue.
+        TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
@@ -296,6 +347,21 @@ celery_app.conf.update(
         # calls to the hub's own agents on the private network, not a
         # per-router RouterOS round trip, and it is capped and
         # overlap-locked. It belongs with the pure sweeps.
+        # The Health Engine had no schedule at all. `GET /monitoring/health`
+        # only reads stored `service_health` rows, and the sole writer was
+        # the Master console's own "Run health checks now" button -- so the
+        # System Health page's timestamps were exactly as old as the last
+        # time a human clicked it. Found 2026-09-04 showing two-day-old
+        # rows while the page called itself live, with FreeRADIUS parked on
+        # "Degraded, 5 consecutive failures" from a check nobody had re-run.
+        #
+        # Not on DEVICE_IO_QUEUE_NAME: these checks touch this platform's
+        # own database, Redis, disk and hub agents, never a per-router
+        # RouterOS round trip.
+        "monitoring-health-check-sweep": {
+            "task": TASK_RUN_HEALTH_CHECK_SWEEP,
+            "schedule": HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+        },
         "hub-reconciliation-sweep": {
             "task": TASK_RUN_HUB_RECONCILIATION_SWEEP,
             "schedule": HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
@@ -445,6 +511,29 @@ celery_app.conf.update(
             "task": TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
             "schedule": ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS,
         },
+        # Rogue-DHCP detection -- every 6 hours, by a wide margin the
+        # slowest cadence in this schedule, and deliberately so. What it
+        # reads is configuration, not liveness: an ``/ip dhcp-server alert``
+        # row changes when this platform pushes a DHCP pool (which writes
+        # the alert in the same call, so that transition is already known
+        # without a sweep) or when a human edits the router by hand -- an
+        # out-of-band event with no deadline. Against that, the cost is a
+        # real RouterOS round trip per DHCP-serving router, forever. See
+        # app.domains.dhcp.constants
+        # .ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS's own docstring for
+        # the full cadence reasoning, and app.domains.dhcp.tasks's module
+        # docstring for why this is a separate task rather than extra work
+        # folded into the 10-minute health poll above.
+        #
+        # This is the entry that gives
+        # ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts``
+        # its first caller: a router that is not being watched has no alert
+        # row, raises no error, and was invisible precisely because it was
+        # unguarded.
+        "dhcp-rogue-detection-sweep": {
+            "task": TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
+            "schedule": ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
+        },
         # Queue Management Engine: re-evaluates every ACTIVE/SUSPENDED
         # QueueAssignment scoped to a QueueSchedule and flips its device
         # state the moment a time window opens or closes -- the real
@@ -471,9 +560,11 @@ celery_app.conf.update(
             "task": TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
             "schedule": ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
         },
-        # Connected Device Management: real DHCP-lease/ARP/wireless
-        # registration-table sync sweep -- every 5 minutes, an
-        # operationally-visible (not safety-critical) cadence, see
+        # Connected Device Management: real DHCP-lease/ARP sync sweep --
+        # an operationally-visible (not safety-critical) cadence. The
+        # interval is whatever CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS
+        # says (900s today; this comment used to hardcode "every 5
+        # minutes" and had been wrong since that constant was raised), see
         # app.domains.connected_devices.constants
         # .CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS's own docstring
         # for the full reasoning. Per-router failure isolation mirrors
@@ -482,6 +573,17 @@ celery_app.conf.update(
         "connected-device-sync-sweep": {
             "task": TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
             "schedule": CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
+        },
+        # Monitored Hardware: fast ping-driven liveness (every 30s) -- makes
+        # a monitored device that physically dies flip to DOWN within a
+        # minute instead of waiting out its RouterOS DHCP lease plus the
+        # 15-minute discovery sweep above. Registered hardware is a small
+        # list (handfuls per venue), so this cadence is safe at today's
+        # scale -- see MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS's
+        # own docstring for the full reasoning and the scale caveat.
+        "monitored-hardware-liveness-sweep": {
+            "task": TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
+            "schedule": MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS,
         },
         # Campaigns domain: keeps the stored Campaign.status reasonably
         # fresh for admin dashboards (SCHEDULED -> ACTIVE -> ENDED) --
@@ -548,6 +650,35 @@ celery_app.conf.update(
             "task": TASK_RUN_STALE_HEARTBEAT_SWEEP,
             "schedule": STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
         },
+        # The FAST half of the same problem, and a genuinely different
+        # question from the sweep above -- not a faster copy of it.
+        #
+        # The sweep above owns `Router.status` at the 15-minute
+        # `ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES` that
+        # `compute_lifecycle_stage`, `compute_internet_availability` and the
+        # frontend's `location-liveness` module all share. That number must
+        # not move: its own docstring says a second, slightly different
+        # definition of "offline" is how two screens start disagreeing about
+        # one router.
+        #
+        # But 15 minutes cannot produce the two-minute outage email a real
+        # venue needs. So this sweep writes a separate, alert-only
+        # `Router.reachability_state` off a separate, five-times-faster
+        # signal -- `router_agent_credentials.last_used_at`, stamped by the
+        # 60-second `/agent/authorized-macs` poll rather than the 5-minute
+        # heartbeat -- debounced over two consecutive misses and confirmed
+        # against the hub's live `wg show` before anything is raised.
+        # Nothing that reads `status` changes behaviour because of it.
+        #
+        # 30s matches the alert evaluation sweep below, so the two compose
+        # into: site dies -> <=120s to UNREACHABLE -> <=30s to an Alert and
+        # its email. See RouterService.sweep_router_reachability for the
+        # awake-window, fleet-outage and tunnel-confirmation guards that
+        # keep a two-minute threshold from crying wolf on our own deploys.
+        "router-reachability-sweep": {
+            "task": TASK_RUN_ROUTER_REACHABILITY_SWEEP,
+            "schedule": ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
+        },
         # Monitoring domain: the Alert Engine's evaluation sweep -- the real
         # background job behind an already-fully-built-but-previously-
         # dormant capability. ``AlertService.evaluate_alert_rules`` (and
@@ -568,6 +699,40 @@ celery_app.conf.update(
         "monitoring-alert-rule-evaluation-sweep": {
             "task": TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
             "schedule": ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
+        },
+        # Network Diagnostics: the diagnostic_runs retention sweep. That
+        # table is append-only and, until this entry, had no TTL and no
+        # purge job of any kind -- an authenticated customer could grow it
+        # without bound, one JSONB blob per row, and nothing on the
+        # platform would ever remove any of it.
+        #
+        # Daily, and deliberately NOT on DEVICE_IO_QUEUE_NAME: this sweep
+        # touches only this platform's own database and never opens a
+        # RouterOS connection, so it belongs with the pure-DB sweeps. See
+        # app.domains.network_diagnostics.constants
+        # .DIAGNOSTIC_RUN_RETENTION_DAYS for why ninety days, and that
+        # module's own tasks.py for why the deletion is batched.
+        "network-diagnostics-run-retention-sweep": {
+            "task": TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
+            "schedule": DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
+        },
+        # Network integrations: poll each enabled third-party controller
+        # (TP-Link Omada today) for its sites/devices/clients. The
+        # 60-second schedule here is the Beat *tick*, not the polling
+        # period -- each integration row carries its own
+        # sync_interval_seconds (300s by default) and the sweep selects
+        # only the rows whose own interval has actually elapsed, because a
+        # single Beat entry cannot express "every row has its own period".
+        # The tick is therefore the floor of the allowed intervals; see
+        # app.domains.network_integration.constants
+        # .NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS's own comment,
+        # and app.domains.notification.tasks for the identical
+        # arrangement. Routed onto DEVICE_IO_QUEUE_NAME above -- unlike
+        # every other entry in this block it does real outbound I/O to
+        # hardware this platform does not own.
+        "network-integration-sync-sweep": {
+            "task": TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
+            "schedule": NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

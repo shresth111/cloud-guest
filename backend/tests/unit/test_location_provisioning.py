@@ -30,18 +30,26 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
+from app.domains.auth.models import AuthUser
 from app.domains.auth.service import AuthService, PasswordChangeRequiredError
 from app.domains.billing.constants import PlanFeatureKey, PlanFeatureType, PlanType
 from app.domains.location.enums import PropertyType
 from app.domains.location.exceptions import (
     DefaultConfigTemplateNotFoundError,
     NewOrganizationRequiredError,
+    RouterConfigTemplateWithoutRouterError,
 )
 from app.domains.location.number_generator import generate_location_code
+from app.domains.location.provisioning_schemas import (
+    ProvisionLocationRequest,
+    ProvisionLocationResponse,
+)
 from app.domains.location.provisioning_service import (
     FeatureOverride,
     LocationInput,
@@ -52,8 +60,15 @@ from app.domains.location.provisioning_service import (
     OwnerRoleNotSeededError,
     ProvisionLocationInput,
     RouterInput,
+    RouterTunnelProvisioningFailedError,
     _generate_temporary_password,
     _generate_username,
+)
+from app.domains.location.router import (
+    preview_provision_location as preview_provision_location_route,
+)
+from app.domains.location.router import (
+    provision_location as provision_location_route,
 )
 from app.domains.location.service import LocationService
 from app.domains.notification.constants import (
@@ -279,6 +294,20 @@ class FakeTunnelDeliveryInfo:
 
 
 @dataclass
+class FakeHubTunnelAllocation:
+    """Stands in for ``WireGuardService.allocate_tunnel_via_hub``'s
+    ``HubTunnelAllocation``. Only ``peer`` is read by
+    ``provision_location``; the rest is carried so a test can assert the
+    provisioning result reports what the HUB said, not what the platform
+    guessed."""
+
+    peer: FakePeer
+    peer_private_key: str | None = "hub-generated-private-key"
+    reused: bool = False
+    adopted: bool = False
+
+
+@dataclass
 class FakePlan:
     id: uuid.UUID
     name: str
@@ -332,10 +361,15 @@ class ProvisioningFakes:
     notifications_enqueued: list[dict[str, object]] = field(default_factory=list)
 
     fail_at: str | None = None
+    # What ``fail_at`` raises. Defaults to a plain ``RuntimeError`` (the
+    # original behaviour, which proves the rollback is not conditional on
+    # the exception type); a test that needs a specific domain error --
+    # e.g. the hub bridge being down -- supplies it here.
+    fail_with: Exception | None = None
 
     def _maybe_fail(self, step: str) -> None:
         if self.fail_at == step:
-            raise RuntimeError(f"forced failure at step '{step}'")
+            raise self.fail_with or RuntimeError(f"forced failure at step '{step}'")
 
     # -- OrganizationProvisioningProtocol ---------------------------------
 
@@ -471,13 +505,39 @@ class ProvisioningFakes:
 
     # -- WireGuardProvisioningProtocol ---------------------------------------
 
+    async def allocate_tunnel_via_hub(
+        self,
+        *,
+        actor_user_id,
+        router_id,
+        requesting_organization_id,
+        rotate=False,
+        force=False,
+    ):
+        self._maybe_fail("wireguard.allocate_tunnel_via_hub")
+        self.session.flush("wireguard.allocate_tunnel_via_hub")
+        self.calls.append("wireguard.allocate_tunnel_via_hub")
+        return FakeHubTunnelAllocation(peer=FakePeer(tunnel_ip_address="10.100.0.5"))
+
     async def create_tunnel(
         self, *, actor_user_id, router_id, requesting_organization_id
     ):
-        self._maybe_fail("wireguard.create_tunnel")
-        self.session.flush("wireguard.create_tunnel")
+        """DELIBERATELY A TRIPWIRE, NOT AN IMPLEMENTATION.
+
+        The real ``WireGuardService.create_tunnel`` generates the keypair on
+        the platform and the hub agent has no verb to be told a public key
+        it did not generate, so it refuses with
+        ``HubCannotLearnPlatformKeyError`` -- which is exactly what made
+        "add a customer" fail for every operator who tried it. A fake that
+        quietly succeeded here is what let that regression be invisible to
+        this suite for as long as it was. If provisioning ever reaches this
+        method again, the suite says so."""
         self.calls.append("wireguard.create_tunnel")
-        return FakeTunnelDeliveryInfo(peer=FakePeer(tunnel_ip_address="10.100.0.5"))
+        raise AssertionError(
+            "provision_location called create_tunnel -- the platform-"
+            "generates-the-keypair path the hub can never learn. It must "
+            "allocate through the hub bridge (allocate_tunnel_via_hub)."
+        )
 
     # -- PlanProvisioningProtocol ---------------------------------------------
 
@@ -629,11 +689,38 @@ class _NotificationServiceAdapter:
 # ============================================================================
 
 
+class RecordingDefaultAlerting:
+    """Stands in for ``ensure_default_alerting`` partially applied over its
+    two monitoring services -- see ``provisioning_dependencies.py``.
+
+    ``raises`` is as important as the recording. The real helper is
+    documented as never raising, and this is how we prove the wizard does
+    not lean on that: ``provision_location`` runs in one transaction, so an
+    exception escaping would roll back the whole customer over their
+    default alert rules.
+    """
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self.calls: list[dict] = []
+        self.raises = raises
+
+    async def __call__(self, *, organization_id, contact_email):
+        self.calls.append(
+            {"organization_id": organization_id, "contact_email": contact_email}
+        )
+        if self.raises is not None:
+            raise self.raises
+        return None
+
+
 def make_service(
-    *, fail_at: str | None = None
+    *,
+    fail_at: str | None = None,
+    fail_with: Exception | None = None,
+    default_alerting: RecordingDefaultAlerting | None = None,
 ) -> tuple[LocationProvisioningService, ProvisioningFakes, FakeSharedSession]:
     session = FakeSharedSession()
-    fakes = ProvisioningFakes(session=session, fail_at=fail_at)
+    fakes = ProvisioningFakes(session=session, fail_at=fail_at, fail_with=fail_with)
     fakes.roles_by_slug["organization-owner"] = FakeRole(
         id=uuid.uuid4(), slug="organization-owner"
     )
@@ -694,8 +781,17 @@ def make_service(
         _EmailProviderAdapter(fakes),
         _SmsProviderAdapter(fakes),
         notification_service=_NotificationServiceAdapter(fakes),
+        default_alerting=default_alerting,
     )
     return service, fakes, base_plan_id
+
+
+_DEFAULT_ROUTER = RouterInput(
+    name="Lobby Router",
+    serial_number="SN-00001",
+    mac_address="AA:BB:CC:DD:EE:01",
+    model="RB5009",
+)
 
 
 def _input(
@@ -704,6 +800,7 @@ def _input(
     new_organization: NewOrganizationInput | None = None,
     plan_id: uuid.UUID,
     feature_overrides: tuple[FeatureOverride, ...] = (),
+    router: RouterInput | None = _DEFAULT_ROUTER,
 ) -> ProvisionLocationInput:
     return ProvisionLocationInput(
         location=LocationInput(
@@ -721,12 +818,7 @@ def _input(
             last_name="Shah",
             email="priya@example.com",
         ),
-        router=RouterInput(
-            name="Lobby Router",
-            serial_number="SN-00001",
-            mac_address="AA:BB:CC:DD:EE:01",
-            model="RB5009",
-        ),
+        router=router,
         plan_id=plan_id,
         existing_organization_id=existing_organization_id,
         new_organization=new_organization,
@@ -925,11 +1017,16 @@ class TestHappyPath:
             "user.create",
             "identity.update_user",
             "router.create",
-            "wireguard.create_tunnel",
             "router_provisioning.list_templates",
             "router_provisioning.assign_profile",
             "subscription.create",
             "captive_portal.create_config",
+            # Spec step (e), executed LAST among the write steps -- the hub
+            # allocation is the only one this transaction cannot undo (the
+            # deployed agent has no removal verb), so every step that can
+            # still fail runs before it. See provision_location's own
+            # comments at both positions.
+            "wireguard.allocate_tunnel_via_hub",
             "audit:location_provisioned",
             "email.send",
         ]
@@ -1170,20 +1267,158 @@ class TestOrganizationConditional:
 
 
 # ============================================================================
+# The hub bridge is the ONLY path to a tunnel (regression, 2026-09-01)
+# ============================================================================
+
+
+class TestHubBridgeAllocation:
+    """The bug these exist for.
+
+    ``provision_location`` step (e) called
+    ``WireGuardService.create_tunnel``, which generates the keypair on the
+    platform. ``ops/hub-agents/wg_agent.py`` exposes only ``POST /wg/peer``
+    (it mints its own keypair) and ``GET /wg/peers`` -- there is no verb to
+    be told a public key it did not generate -- so ``create_tunnel``
+    refuses with ``HubCannotLearnPlatformKeyError`` rather than writing a
+    row describing a tunnel that could never establish.
+
+    The result was that provisioning a new customer failed 100% of the
+    time, and failed at step (e), which an operator experiences as an error
+    "after entering the plan": the plan is submitted with the rest of the
+    wizard form and step (g) is where it would have been used, so the
+    backend never got that far.
+
+    The suite could not see it because the WireGuard fake implemented
+    ``create_tunnel`` and quietly succeeded. It now raises instead (see
+    ``ProvisioningFakes.create_tunnel``), so any future drift back to the
+    platform-keypair path fails these tests rather than production.
+    """
+
+    async def test_provisioning_allocates_through_the_hub_bridge(self) -> None:
+        service, fakes, base_plan_id = make_service()
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert "wireguard.allocate_tunnel_via_hub" in fakes.calls
+        assert result.tunnel_ip_address == "10.100.0.5"
+
+    async def test_provisioning_never_calls_create_tunnel(self) -> None:
+        """The guard itself. ``ProvisioningFakes.create_tunnel`` raises, so
+        this asserts on the call log as well -- if someone reintroduces the
+        call inside a ``try``/``except`` that swallows, the log still
+        catches it."""
+        service, fakes, base_plan_id = make_service()
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert "wireguard.create_tunnel" not in fakes.calls
+
+    async def test_the_protocol_itself_does_not_expose_create_tunnel(self) -> None:
+        """Structural, not behavioural: a fake could always grow a method
+        back. ``WireGuardProvisioningProtocol`` is the contract this
+        orchestration is allowed to depend on, and ``create_tunnel`` must
+        not be in it."""
+        from app.domains.location.provisioning_service import (
+            WireGuardProvisioningProtocol,
+        )
+
+        members = set(WireGuardProvisioningProtocol.__protocol_attrs__)  # type: ignore[attr-defined]
+        assert "allocate_tunnel_via_hub" in members
+        assert "create_tunnel" not in members
+
+    async def test_hub_bridge_down_rolls_everything_back_and_says_so(self) -> None:
+        """A hub-bridge failure must not leave a half-provisioned customer.
+
+        ``HubBridgeUnavailableError`` subclasses ``CloudGuestError``, NOT
+        ``WireGuardError`` -- an ``except WireGuardError`` would miss the
+        single most likely failure on this path (the hub is another machine
+        at the end of an HTTP call). This proves the handler catches it,
+        re-raises so the transaction still rolls back, preserves the 502 so
+        a client can tell "retry, upstream is down" from "this platform is
+        broken", and tells the operator nothing was saved."""
+        from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+
+        service, fakes, base_plan_id = make_service(
+            fail_at="wireguard.allocate_tunnel_via_hub",
+            fail_with=HubBridgeUnavailableError(
+                "Could not reach the WireGuard hub bridge"
+            ),
+        )
+
+        with pytest.raises(RouterTunnelProvisioningFailedError) as excinfo:
+            await run_within_transaction(
+                fakes.session,
+                service.provision_location(
+                    actor_user_id=uuid.uuid4(),
+                    data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+                ),
+            )
+
+        assert excinfo.value.status_code == 502
+        assert "NOT provisioned" in excinfo.value.message
+        assert "rolled back" in excinfo.value.message
+        assert "Could not reach the WireGuard hub bridge" in excinfo.value.message
+
+        # The whole customer really was discarded.
+        assert fakes.session.rolled_back is True
+        assert fakes.session.committed is False
+        # ...and no success was reported: the welcome email, which is what
+        # tells a customer their account exists, never went out.
+        assert "email.send" not in fakes.calls
+
+    async def test_a_wireguard_domain_failure_is_caught_too(self) -> None:
+        """The other half of the two-type ``except``.
+        ``HubPeerAllocatorNotConfiguredError`` (503) is a ``WireGuardError``
+        and does NOT subclass ``HubBridgeUnavailableError`` -- naming only
+        one of the two types would leak a raw domain error to the wizard."""
+        from app.domains.wireguard.exceptions import (
+            HubPeerAllocatorNotConfiguredError,
+        )
+
+        service, fakes, base_plan_id = make_service(
+            fail_at="wireguard.allocate_tunnel_via_hub",
+            fail_with=HubPeerAllocatorNotConfiguredError(),
+        )
+
+        with pytest.raises(RouterTunnelProvisioningFailedError) as excinfo:
+            await run_within_transaction(
+                fakes.session,
+                service.provision_location(
+                    actor_user_id=uuid.uuid4(),
+                    data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+                ),
+            )
+
+        assert excinfo.value.status_code == 503
+        assert fakes.session.rolled_back is True
+
+
+# ============================================================================
 # Real single-transaction rollback proof
 # ============================================================================
 
 
 class TestTransactionalRollback:
     async def test_forced_failure_rolls_back_and_stops_subsequent_steps(self) -> None:
-        """Forces a failure inside step (e) (WireGuard tunnel creation) --
-        after Organization/Location/User/Router have already flushed -- and
-        proves: (1) no step after (e) ever ran, (2) the shared fake session's
+        """Forces a failure inside step (d) (router registration) -- after
+        Organization/Location/User have already flushed -- and proves:
+        (1) no step after it ever ran, (2) the shared fake session's
         rollback fired, (3) commit never fired, mirroring
         ``app.database.session.get_db_session``'s real commit-once /
         rollback-on-exception shape exactly (see
-        ``run_within_transaction`` above)."""
-        service, fakes, base_plan_id = make_service(fail_at="wireguard.create_tunnel")
+        ``run_within_transaction`` above).
+
+        This used to force the failure at the WireGuard step. It cannot any
+        more and still prove what it is named for: that step now runs LAST
+        (see ``TestHubBridgeAllocation``), so failing there leaves nothing
+        after it to assert was skipped."""
+        service, fakes, base_plan_id = make_service(fail_at="router.create")
 
         with pytest.raises(RuntimeError, match="forced failure"):
             await run_within_transaction(
@@ -1197,13 +1432,13 @@ class TestTransactionalRollback:
         # Steps before the failure point ran (and flushed)...
         assert "organization.create" in fakes.calls
         assert "user.create" in fakes.calls
-        assert "router.create" in fakes.calls
         assert "location.create" in fakes.session.flushed
 
         # ...but nothing from or after the failing step ever executed.
         assert "router_provisioning.assign_profile" not in fakes.calls
         assert "subscription.create" not in fakes.calls
         assert "captive_portal.create_config" not in fakes.calls
+        assert "wireguard.allocate_tunnel_via_hub" not in fakes.calls
         assert "email.send" not in fakes.calls
         assert not any(
             call == f"audit:{AuditAction.LOCATION_PROVISIONED.value}"
@@ -1218,9 +1453,14 @@ class TestTransactionalRollback:
     async def test_forced_failure_late_in_the_flow_still_rolls_back_everything(
         self,
     ) -> None:
-        """Same proof, but failing at the very last composed step
+        """Same proof, but failing at the last composed DATABASE step
         (captive portal config) -- confirms rollback discards even a nearly-
-        complete flow, not just an early failure."""
+        complete flow, not just an early failure.
+
+        It also proves the thing the step reordering exists for: a failure
+        this late must not have already burned a hub peer. The hub agent
+        has no removal verb, so a peer minted before this point would
+        survive the rollback and hold its tunnel address forever."""
         service, fakes, base_plan_id = make_service(
             fail_at="captive_portal.create_config"
         )
@@ -1236,6 +1476,9 @@ class TestTransactionalRollback:
 
         assert "subscription.create" in fakes.calls
         assert "email.send" not in fakes.calls
+        # No unreclaimable hub allocation was made for a customer that does
+        # not exist.
+        assert "wireguard.allocate_tunnel_via_hub" not in fakes.calls
         # The overall-event audit entry (written last, step k) never fired --
         # LocationService's own earlier CRUD audits (steps b/i) legitimately
         # did, before the forced failure.
@@ -1301,6 +1544,284 @@ class TestDefaultConfigTemplate:
                 actor_user_id=uuid.uuid4(),
                 data=_input(new_organization=_new_org(), plan_id=base_plan_id),
             )
+
+
+# ============================================================================
+# Provisioning without a router (a venue on an Omada controller)
+# ============================================================================
+
+# Every call the fakes log that is router-shaped. "No router" means none of
+# these, not merely "no router row" -- a peer minted for nothing is a hub
+# address burned for good (the hub agent has no removal verb).
+_ROUTER_SHAPED_CALLS = (
+    "router.",
+    "router_provisioning.",
+    "wireguard.",
+)
+
+
+def _router_shaped(calls: list[str]) -> list[str]:
+    return [call for call in calls if call.startswith(_ROUTER_SHAPED_CALLS)]
+
+
+def _request_payload(**overrides: object) -> dict[str, object]:
+    """A wire-shaped ``POST /locations/provision`` body, router omitted."""
+    body: dict[str, object] = {
+        "new_organization": {
+            "name": "Omada Cafe",
+            "slug": f"omada-cafe-{uuid.uuid4().hex[:6]}",
+            "contact_email": "ops@omada-cafe.example.com",
+        },
+        "location": {
+            "name": "Omada Cafe Main",
+            "slug": "main",
+            "address_line1": "1 Mall Rd",
+            "city": "Dehradun",
+            "state_province": "UK",
+            "postal_code": "248001",
+            "country": "IN",
+        },
+        "owner": {
+            "first_name": "Asha",
+            "last_name": "Rawat",
+            "email": "asha@omada-cafe.example.com",
+        },
+        "plan_id": str(uuid.uuid4()),
+    }
+    body.update(overrides)
+    return body
+
+
+def _fake_request() -> Any:
+    # The route's `_request_id` only ever reads `request.state.request_id`.
+    return SimpleNamespace(state=SimpleNamespace())
+
+
+class TestProvisionWithoutRouter:
+    """A venue whose WiFi is a TP-Link Omada controller has no MikroTik, so
+    ``RouterInput`` (serial, MAC, model) has nothing honest to hold. Before
+    ``router`` became optional, such a customer could not be created at
+    all. The controller is onboarded afterwards through
+    ``POST /network-integrations/platform/onboard``, which makes its own
+    fleet ``Router`` row -- so this flow must make none."""
+
+    async def test_no_router_provisions_the_customer_and_nothing_router_shaped(
+        self,
+    ) -> None:
+        service, fakes, base_plan_id = make_service()
+
+        result = await run_within_transaction(
+            fakes.session,
+            service.provision_location(
+                actor_user_id=uuid.uuid4(),
+                data=_input(
+                    new_organization=_new_org(), plan_id=base_plan_id, router=None
+                ),
+            ),
+        )
+
+        # Zero routers, zero config templates, zero hub calls.
+        assert _router_shaped(fakes.calls) == []
+        assert _router_shaped(fakes.session.flushed) == []
+        assert result.router_id is None
+        assert result.router_name is None
+        assert result.tunnel_ip_address is None
+
+        # Everything else still happened, in order, and committed.
+        expected_order = [
+            "organization.create",
+            "user.create",
+            "identity.update_user",
+            "subscription.create",
+            "captive_portal.create_config",
+            "audit:location_provisioned",
+            "email.send",
+        ]
+        positions = [fakes.calls.index(step) for step in expected_order]
+        assert positions == sorted(positions), f"steps out of order: {fakes.calls}"
+        assert fakes.session.committed is True
+        assert result.location_code.startswith("LOC-")
+        assert result.owner_temporary_password
+
+        # The audit trail says "no router" as a real null, never "None".
+        (provisioned,) = [
+            entry
+            for entry in fakes.audit_entries
+            if entry["action"] == AuditAction.LOCATION_PROVISIONED.value
+        ]
+        assert provisioned["event_metadata"]["router_id"] is None  # type: ignore[index]
+
+    async def test_no_router_does_not_need_a_system_config_template(self) -> None:
+        """Without a router the default template is never looked up, so a
+        deployment with no seeded system template (the documented gap --
+        see ``TestDefaultConfigTemplate``) can still onboard an Omada
+        venue."""
+        service, fakes, base_plan_id = make_service()
+        fakes.system_templates.clear()
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id, router=None),
+        )
+
+        assert result.router_id is None
+        assert "router_provisioning.list_templates" not in fakes.calls
+
+    async def test_template_without_router_is_refused_before_anything_is_written(
+        self,
+    ) -> None:
+        service, fakes, base_plan_id = make_service()
+        data = dataclasses.replace(
+            _input(new_organization=_new_org(), plan_id=base_plan_id, router=None),
+            router_config_template_id=uuid.uuid4(),
+        )
+
+        with pytest.raises(RouterConfigTemplateWithoutRouterError) as excinfo:
+            await service.provision_location(actor_user_id=uuid.uuid4(), data=data)
+
+        assert excinfo.value.status_code == 422
+        assert "router_config_template_id" in excinfo.value.message
+        assert fakes.session.flushed == []
+        assert fakes.calls == []
+
+    async def test_preview_without_router_has_no_router_lines(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        fakes.system_templates.clear()
+
+        preview = await service.preview_provision_location(
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id, router=None)
+        )
+
+        assert preview.controller_id is None
+        assert preview.router_name is None
+        # Location-derived, not router-derived -- unchanged either way.
+        assert preview.nas_id == f"NAS-{preview.site_id}-0001"
+        assert "router_provisioning.list_templates" not in fakes.calls
+        assert fakes.session.flushed == []
+
+    async def test_preview_refuses_template_without_router_too(self) -> None:
+        service, _fakes, base_plan_id = make_service()
+        data = dataclasses.replace(
+            _input(new_organization=_new_org(), plan_id=base_plan_id, router=None),
+            router_config_template_id=uuid.uuid4(),
+        )
+
+        with pytest.raises(RouterConfigTemplateWithoutRouterError):
+            await service.preview_provision_location(data=data)
+
+    def test_request_accepts_an_omitted_or_null_router(self) -> None:
+        omitted = ProvisionLocationRequest.model_validate(_request_payload())
+        explicit_null = ProvisionLocationRequest.model_validate(
+            _request_payload(router=None)
+        )
+
+        assert omitted.router is None
+        assert explicit_null.router is None
+
+    def test_request_rejects_a_template_without_a_router(self) -> None:
+        with pytest.raises(ValidationError, match="router_config_template_id"):
+            ProvisionLocationRequest.model_validate(
+                _request_payload(router_config_template_id=str(uuid.uuid4()))
+            )
+
+    def test_template_without_router_is_a_422_through_the_real_handler(self) -> None:
+        """End to end through FastAPI's body validation and this app's own
+        ``RequestValidationError`` handler -- which once turned exactly
+        this shape (a ``ValueError`` from a validator, whose ``ctx`` holds
+        the raw exception) into an unrelated 500. The real provisioning
+        route cannot be mounted bare here (its ``RequirePermission`` runs
+        first), so this mounts the same request model on a bare route."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.common.exceptions import register_exception_handlers
+
+        app = FastAPI()
+        register_exception_handlers(app)
+
+        @app.post("/provision")
+        async def _provision(payload: ProvisionLocationRequest) -> dict[str, bool]:
+            return {"ok": True}
+
+        client = TestClient(app)
+        rejected = client.post(
+            "/provision",
+            json=_request_payload(router_config_template_id=str(uuid.uuid4())),
+        )
+        accepted = client.post("/provision", json=_request_payload())
+
+        assert rejected.status_code == 422
+        assert "router_config_template_id" in rejected.text
+        assert accepted.status_code == 200
+
+    async def test_route_returns_null_router_fields_without_a_router(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        payload = ProvisionLocationRequest.model_validate(
+            _request_payload(plan_id=str(base_plan_id))
+        )
+
+        response = await provision_location_route(
+            request=_fake_request(),
+            payload=payload,
+            user=AuthUser(id=str(uuid.uuid4()), email="admin@wyfy.example.com"),
+            provisioning_service=service,
+        )
+
+        data = response["data"]
+        assert response["success"] is True
+        assert data["router_id"] is None
+        assert data["router_name"] is None
+        assert data["tunnel_ip_address"] is None
+        # The ids the wizard hands to /network-integrations/platform/onboard.
+        assert uuid.UUID(data["organization_id"])
+        assert uuid.UUID(data["location_id"])
+        assert _router_shaped(fakes.calls) == []
+
+    async def test_route_with_a_router_is_unchanged(self) -> None:
+        """The other half of the contract: a request that carries a router
+        gets the same response as before, same keys, string ids."""
+        service, _fakes, base_plan_id = make_service()
+        payload = ProvisionLocationRequest.model_validate(
+            _request_payload(
+                plan_id=str(base_plan_id),
+                router={
+                    "name": "Lobby Router",
+                    "serial_number": "SN-00002",
+                    "mac_address": "AA:BB:CC:DD:EE:02",
+                    "model": "RB5009",
+                },
+            )
+        )
+
+        response = await provision_location_route(
+            request=_fake_request(),
+            payload=payload,
+            user=AuthUser(id=str(uuid.uuid4()), email="admin@wyfy.example.com"),
+            provisioning_service=service,
+        )
+
+        data = response["data"]
+        assert set(data) == set(ProvisionLocationResponse.model_fields)
+        assert isinstance(data["router_id"], str)
+        assert uuid.UUID(data["router_id"])
+        assert data["router_name"] == "Lobby Router"
+        assert data["tunnel_ip_address"] == "10.100.0.5"
+
+    async def test_preview_route_returns_null_router_lines(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        payload = ProvisionLocationRequest.model_validate(
+            _request_payload(plan_id=str(base_plan_id))
+        )
+
+        response = await preview_provision_location_route(
+            request=_fake_request(),
+            payload=payload,
+            provisioning_service=service,
+        )
+
+        assert response["data"]["controller_id"] is None
+        assert response["data"]["router_name"] is None
+        assert response["data"]["nas_id"].startswith("NAS-")
 
 
 # ============================================================================
@@ -1550,3 +2071,145 @@ def _hash(password: str) -> str:
     from app.domains.auth.password import PasswordManager
 
     return PasswordManager.hash(password)
+
+
+# ============================================================================
+# Default alerting for a customer created by this wizard
+# ============================================================================
+#
+# `ensure_default_alerting` had exactly one caller, `POST /organizations`.
+# This wizard creates organizations too and is the path a master operator
+# actually uses, so a customer created here had no alert rules at all: the
+# 30s evaluation sweep had nothing to evaluate and their venue could go dark
+# without an email. For an Omada venue it also meant the three
+# `network_controller*` rules never existed, leaving the controller-health
+# alerting inert for exactly the customers it was built for.
+
+
+class TestDefaultAlertingOnOrganizationCreation:
+    async def test_a_new_organization_gets_default_alerting(self) -> None:
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert len(alerting.calls) == 1
+
+    async def test_it_names_the_organization_that_was_created(self) -> None:
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert alerting.calls[0]["organization_id"] == result.organization_id
+
+    async def test_the_contact_email_is_carried_through(self) -> None:
+        """Without it the organization gets rules that can notify nobody --
+        the half-configured state `default_alerting` exists to end."""
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+        new_org = _new_org()
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=new_org, plan_id=base_plan_id),
+        )
+
+        assert alerting.calls[0]["contact_email"] == new_org.contact_email
+
+    async def test_an_omada_venue_with_no_router_still_gets_alerting(self) -> None:
+        """The case that motivated this. A controller-only customer is
+        provisioned with `router=None`, and is precisely the customer whose
+        `network_controller*` rules must exist."""
+        alerting = RecordingDefaultAlerting()
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(
+                new_organization=_new_org(), plan_id=base_plan_id, router=None
+            ),
+        )
+
+        assert len(alerting.calls) == 1
+
+
+class TestExistingOrganizationsAreNotReconfigured:
+    async def test_provisioning_into_an_existing_organization_does_not_ask(
+        self,
+    ) -> None:
+        """A second location for a tenant that already exists must not
+        re-run the defaults. That tenant was given them when it was created,
+        and an operator who has since retuned or deleted a rule meant to."""
+        alerting = RecordingDefaultAlerting()
+        service, fakes, base_plan_id = make_service(default_alerting=alerting)
+        organization = await fakes.create_organization(
+            actor_user_id=uuid.uuid4(),
+            name="Existing Co",
+            slug=f"existing-{uuid.uuid4().hex[:6]}",
+            contact_email="ops@existing.example.com",
+            contact_phone=None,
+            legal_name=None,
+            timezone="UTC",
+            default_locale="en",
+            settings={},
+        )
+        fakes.organizations[organization.id] = organization
+        alerting.calls.clear()
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(
+                existing_organization_id=organization.id, plan_id=base_plan_id
+            ),
+        )
+
+        assert alerting.calls == []
+
+
+class TestAlertingNeverCostsTheCustomer:
+    async def test_a_raising_helper_does_not_roll_back_the_customer(self) -> None:
+        """`provision_location` runs inside one request-scoped session, so
+        an exception escaping here would roll back the organization, the
+        owner account, the location and the router. The customer existing
+        matters more than their default alert rules existing."""
+        alerting = RecordingDefaultAlerting(raises=RuntimeError("smtp exploded"))
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert result.organization_id is not None
+
+    async def test_the_rest_of_provisioning_still_completes(self) -> None:
+        alerting = RecordingDefaultAlerting(raises=RuntimeError("boom"))
+        service, _fakes, base_plan_id = make_service(default_alerting=alerting)
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert result.location_id is not None and result.owner_email
+
+
+class TestNothingWiredIsSafe:
+    async def test_provisioning_works_with_no_alerting_wired(self) -> None:
+        """The default is a logging no-op, so a construction that predates
+        this parameter keeps working unchanged."""
+        service, _fakes, base_plan_id = make_service()
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert result.organization_id is not None

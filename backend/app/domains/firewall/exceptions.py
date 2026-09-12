@@ -39,6 +39,24 @@ class FirewallRuleNotFoundError(FirewallError):
         )
 
 
+class CrossLocationFirewallRuleAccessError(FirewallError):
+    """A caller confined to particular sites reached a rule at another site.
+
+    Distinct from ``CrossOrganizationFirewallRuleAccessError``: both sites
+    belong to the *same* organization, so the organization comparison sees
+    nothing wrong. A firewall rule is reached by its own id, so
+    ``RequirePermission`` had nothing to pin the check to -- see
+    ``app.domains.rbac.location_scope`` for why the confinement is derived
+    from the caller's grants rather than from ``X-Location-Id``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a firewall rule at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationFirewallRuleAccessError(FirewallError):
     """Mirrors ``app.domains.dhcp.exceptions
     .CrossOrganizationDhcpPoolAccessError``'s identical shape."""

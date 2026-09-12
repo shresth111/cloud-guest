@@ -806,6 +806,34 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # independent real-device-I/O path alongside the RouterOS-API-based
     # sweep above -- see app.domains.provisioning_engine.service
     # .run_router_snmp_metrics_poll_sweep's own module docstring.
+    # Monitoring domain adds a nineteenth Beat entry
+    # ("monitoring-health-check-sweep") -- the Health Engine had no
+    # schedule at all, so every row on the System Health page was exactly
+    # as old as the last time a human pressed "Run health checks now". See
+    # app.domains.monitoring.constants
+    # .HEALTH_CHECK_SWEEP_INTERVAL_SECONDS's own comment.
+    # DHCP domain adds a twentieth Beat entry ("dhcp-rogue-detection-sweep")
+    # -- the scheduled rogue-DHCP detector, and the first caller
+    # ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts`` has
+    # ever had. See app.domains.dhcp.tasks's own module docstring.
+    # Network Diagnostics adds a twenty-first Beat entry
+    # ("network-diagnostics-run-retention-sweep") -- the first and only
+    # thing that ever deletes a `diagnostic_runs` row. See
+    # app.domains.network_diagnostics.tasks's own module docstring.
+    # Router domain adds a twenty-second Beat entry
+    # ("router-reachability-sweep") -- the FAST outage path, and a
+    # different question from "router-stale-heartbeat-sweep" rather than a
+    # faster copy of it. That one owns `Router.status` at the 15-minute
+    # ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES every screen shares; this one
+    # owns a separate, alert-only `Router.reachability_state` sized to a
+    # two-minute outage email. See
+    # app.domains.router.service.RouterService.sweep_router_reachability's
+    # own docstring for the awake-window, fleet-outage and tunnel-
+    # confirmation guards.
+    # Network Integrations adds a twenty-third Beat entry
+    # ("network-integration-sync-sweep") -- the only thing that refreshes a
+    # third-party controller's status without a human pressing Sync Now.
+    # See app.domains.network_integration.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -819,9 +847,33 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-quota-reset-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
+        # Monitored hardware liveness: the fast ping-driven UP/DOWN path
+        # for registered devices. The 15-minute discovery sweep above
+        # treats a RouterOS bound lease as "seen" -- a device that powered
+        # off keeps its lease until it expires, so without this entry a
+        # dead venue AP would keep reading UP for lease-time + one
+        # discovery interval. This sweep pings each registered device
+        # through its uplink router every 30s and owns the liveness fields
+        # on those rows. Its absence from this set is not a missing
+        # schedule entry, it is a dashboard whose UP means "the router
+        # still holds a lease for a dead device".
+        "monitored-hardware-liveness-sweep",
         "campaigns-sweep-status-transitions",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
+        # Its absence from this set is not a missing schedule entry, it is
+        # a venue whose router went down and whose owner finds out when a
+        # guest complains -- which is exactly what happened on 2026-09-07,
+        # for twenty-two minutes, with nothing sent.
+        "router-reachability-sweep",
+        # `GET /monitoring/health` only reads the stored `service_health`
+        # table; it probes nothing. Without this entry the sole writer is
+        # the Master console's own button, so the page's timestamps are as
+        # old as the last human click -- found at two days on 2026-09-04,
+        # while the page described itself as live. Its absence from this
+        # set is not a missing schedule entry, it is a reliability page
+        # reporting a moment nobody chose.
+        "monitoring-health-check-sweep",
         # The only writer of ONLINE -> OFFLINE on the platform. Before it
         # existed, `heartbeat()` wrote ONLINE and nothing ever wrote it
         # back, so a router that died weeks ago read as online to every
@@ -838,6 +890,28 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "notification-dispatch-sweep",
         "monitoring-alert-rule-evaluation-sweep",
         "provisioning-engine-router-snmp-metrics-poll-sweep",
+        # `diagnostic_runs` is append-only and had no TTL and no purge job
+        # of any kind, while the endpoint that writes it had no rate limit
+        # -- an authenticated customer could grow the table without bound,
+        # one JSONB blob per row. Its absence from this set is not a
+        # missing schedule entry, it is a table with no ceiling.
+        "network-diagnostics-run-retention-sweep",
+        # Reads /ip dhcp-server alert per DHCP-serving router and persists
+        # the answer for the readiness checklist to display. Its absence
+        # from this set is not a missing schedule entry, it is a fleet in
+        # which a router that is not watching for a rogue DHCP server looks
+        # exactly like one that is -- there is no alert row, no error, and
+        # nothing anywhere that says so.
+        "dhcp-rogue-detection-sweep",
+        # Polls each enabled network integration's controller for status,
+        # devices, clients and guest sessions, on that integration's own
+        # configured interval. Its absence from this set is not a missing
+        # schedule entry, it is an Integrations page whose "Last synced" and
+        # connection status only ever change when someone presses Sync Now
+        # -- an integration whose controller died would go on reporting
+        # CONNECTED indefinitely. See
+        # app.domains.network_integration.tasks's own module docstring.
+        "network-integration-sync-sweep",
     }
 
 
@@ -950,3 +1024,82 @@ def test_run_daily_aggregation_for_organization_task_bridges_into_async(monkeypa
         "organization_id": str(organization_id),
         "snapshot_count": 3,
     }
+
+
+class TestFleetCountExcludesArchivedParents:
+    """The platform router total must count the fleet an operator can
+    actually reach.
+
+    Live on 2026-09-04 the Master console showed `ROUTERS ONLINE 7/11`
+    while Router Fleet listed 8. Neither number was wrong about what it
+    counted: `count_routers_by_status` filtered on `Router.is_deleted`
+    alone, while the fleet screen walks the org -> location tree and
+    `RouterService.list_routers` 404s on a soft-deleted location.
+    `LocationService.archive_location` soft-deletes the location row and
+    does **not** cascade to the routers under it, so those routers stay
+    `is_deleted = False` -- counted platform-wide, unreachable and
+    unmanageable everywhere else.
+
+    This repo has no database-backed test harness, so these capture the
+    statement the method actually builds rather than executing it. That is
+    enough for the regression that matters: someone dropping the join.
+    """
+
+    @staticmethod
+    def _compiled(statement) -> str:
+        from sqlalchemy.dialects import postgresql
+
+        return str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    class _CapturingSession:
+        def __init__(self) -> None:
+            self.statement = None
+
+        async def execute(self, statement):
+            self.statement = statement
+
+            class _Empty:
+                @staticmethod
+                def all():
+                    return []
+
+            return _Empty()
+
+    async def _statement_for(self, repository_factory):
+        session = self._CapturingSession()
+        repository = repository_factory(session)
+        await repository.count_routers_by_status(organization_id=None)
+        return self._compiled(session.statement)
+
+    async def test_analytics_count_excludes_archived_locations_and_orgs(
+        self,
+    ) -> None:
+        from app.domains.analytics.repository import AnalyticsRepository
+
+        sql = await self._statement_for(AnalyticsRepository)
+
+        assert "JOIN locations" in sql
+        assert "JOIN organizations" in sql
+        assert "locations.is_deleted IS false" in sql
+        assert "organizations.is_deleted IS false" in sql
+        assert "routers.is_deleted IS false" in sql
+
+    async def test_monitoring_count_excludes_archived_locations_and_orgs(
+        self,
+    ) -> None:
+        """The two domains carry the same query and must not drift apart --
+        the console reads one and the fleet page's KPIs the other."""
+        from app.domains.monitoring.repository import MonitoringRepository
+
+        sql = await self._statement_for(MonitoringRepository)
+
+        assert "JOIN locations" in sql
+        assert "JOIN organizations" in sql
+        assert "locations.is_deleted IS false" in sql
+        assert "organizations.is_deleted IS false" in sql
+        assert "routers.is_deleted IS false" in sql

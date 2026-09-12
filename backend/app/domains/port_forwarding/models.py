@@ -1,9 +1,11 @@
 """SQLAlchemy ORM model for the Port Forwarding Management domain.
 
 One table -- ``PortForwardingRule``. A row's own state *is* its current
-state; there is no live device push in this pass to produce a history of
-(see module docstring -- realized onto a device later by Network
-Configuration Management's own provisioning pass, not this domain).
+state, plus the three ``device_push_*`` columns recording whether that
+state has actually reached a router -- see
+``constants.PortForwardingDevicePushStatus``. There is no per-push history
+table, deliberately: what an operator needs is "is this rule live right
+now, and why not", which the current row answers.
 
 Extends ``app.database.base.BaseModel`` (UUID PK, timestamps, soft-delete,
 audit, version columns) for the same reason every other domain does.
@@ -23,14 +25,23 @@ real, honest gap documented here rather than silently assumed away.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import PortForwardingProtocol
+from .constants import PortForwardingDevicePushStatus, PortForwardingProtocol
 
 
 class PortForwardingRule(BaseModel):
@@ -71,6 +82,23 @@ class PortForwardingRule(BaseModel):
     internal_port: Mapped[int] = mapped_column(Integer, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: Whether a real ``/ip firewall nat`` DSTNAT rule for this row exists on
+    #: the router right now -- see ``constants.PortForwardingDevicePushStatus``.
+    #: Deliberately independent of ``is_enabled``, which is intent: a rule can
+    #: be enabled and never have reached a device. Before this existed,
+    #: creating a rule wrote a row and contacted nothing, so the port the
+    #: dashboard reported as published was never actually forwarded.
+    device_push_status: Mapped[str] = mapped_column(
+        String(20),
+        default=PortForwardingDevicePushStatus.PENDING.value,
+        nullable=False,
+    )
+    #: The raw ``str(exc)`` from the last failed push, shown to the operator
+    #: verbatim -- a RouterOS error is more useful unedited than summarized.
+    device_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_port_forwarding_rules_router_id", "router_id"),

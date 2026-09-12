@@ -166,6 +166,7 @@ class OrganizationLookupProtocol(Protocol):
         actor_user_id: uuid.UUID,
         organization_id: uuid.UUID,
         user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         is_primary_contact: bool = False,
     ) -> OrganizationMember: ...
 
@@ -488,6 +489,11 @@ class UserService:
                 actor_user_id=actor_user_id,
                 organization_id=organization_id,
                 user_id=user.id,
+                # Same value this method already checked at the top via
+                # _assert_organization_in_scope, so invite_member's own
+                # tenant guard reaches the same verdict rather than a
+                # second, differently-derived one.
+                requesting_organization_id=requesting_organization_id,
             )
             await self.organization_lookup.accept_invite(
                 user_id=user.id,
@@ -912,6 +918,22 @@ class UserService:
         if organization.parent_organization_id == requesting_organization_id:
             return
         raise CrossOrganizationUserAccessError()
+
+    async def assert_user_accessible(
+        self, user_id: uuid.UUID, requesting_organization_id: uuid.UUID | None
+    ) -> None:
+        """Public tenant check for callers that need the guard without the
+        aggregate ``get_user_detail`` assembles.
+
+        The RBAC domain's ``/users/{id}/roles`` and ``/users/{id}/permissions``
+        reads had no tenant check at all: ``RequirePermission("users.read")``
+        scopes off the ``X-Organization-Id`` header while both handlers read
+        by path id, so any organization user could enumerate the role
+        assignments and effective permissions of any user on the platform,
+        including platform administrators.
+        """
+        user = await self._get_user_or_raise(user_id)
+        await self._enforce_user_tenant_access(user, requesting_organization_id)
 
     async def _enforce_user_tenant_access(
         self, user: User, requesting_organization_id: uuid.UUID | None

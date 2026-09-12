@@ -42,18 +42,32 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from app.domains.dhcp.constants import RogueDhcpAlertState
 from app.domains.isp.constants import HealthStatus as IspHealthStatus
 from app.domains.isp.constants import IspLinkRole, IspLinkType
 from app.domains.isp.device_adapters import PingResult
 from app.domains.monitoring.constants import (
     ALERT_TARGET_ISP_LINK,
+    ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_NETWORK_CONTROLLER,
+    ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+    ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
+    ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
+    ALERT_TARGET_ROUTER_REACHABILITY,
+    ROGUE_DHCP_STATE_GUARDED,
+    ROGUE_DHCP_STATE_UNGUARDED,
+    ROGUE_DHCP_STATE_UNKNOWN,
     AlertSeverity,
     AlertStatus,
     AlertTriggerType,
     IncidentStatus,
     NotificationChannelType,
     NotificationStatus,
+)
+from app.domains.monitoring.default_alerting import (
+    DEFAULT_ALERT_RULES,
+    ensure_default_alerting,
 )
 from app.domains.monitoring.exceptions import (
     AlertNotFoundError,
@@ -67,6 +81,7 @@ from app.domains.monitoring.exceptions import (
     InvalidSlaTargetConfigError,
     NotificationChannelNotFoundError,
     SlaTargetNotFoundError,
+    UnscopedOrganizationListError,
 )
 from app.domains.monitoring.models import (
     Alert,
@@ -80,9 +95,11 @@ from app.domains.monitoring.models import (
     SlaReport,
     SlaTarget,
 )
+from app.domains.monitoring.repository import MonitoringRepository
 from app.domains.monitoring.service import (
     AlertService,
     IncidentService,
+    NotificationDeliveryError,
     NotificationService,
     SlaService,
 )
@@ -121,13 +138,25 @@ def _base_fields(**overrides: object) -> dict[str, object]:
 @dataclass
 class FakeRouter:
     """Duck-typed stand-in for ``app.domains.router.models.Router`` -- only
-    the four attributes ``AlertService`` actually reads."""
+    the attributes ``AlertService`` actually reads.
+
+    ``reachability_state`` is declared here rather than being stuck on
+    instances ad hoc, so that a test can never assert against a field the
+    real ``Router`` does not have. Defaults to ``None`` -- "the reachability
+    sweep has never judged this router" -- which is what every pre-existing
+    test in this file means, and which the evaluator must never alert on."""
 
     id: uuid.UUID
     organization_id: uuid.UUID
     location_id: uuid.UUID
     name: str
     health_status: str | None
+    reachability_state: str | None = None
+    # Contract 11.5. Defaulted to the column's own default so every
+    # pre-existing construction in this file means exactly what it always
+    # meant -- a MikroTik running this platform's agent -- and the vendor
+    # gate this field feeds is only visible to the tests that set it.
+    vendor: str = "mikrotik"
 
 
 @dataclass
@@ -156,6 +185,21 @@ class FakeIspLink:
 
 
 @dataclass
+class FakeRogueDhcpStatus:
+    """Duck-typed stand-in for
+    ``app.domains.dhcp.models.RouterRogueDhcpStatus`` -- only the two
+    attributes ``AlertService._evaluate_rogue_dhcp_guard_rule`` actually
+    reads. The real row carries ``alert_present``/``enabled``/
+    ``serves_dhcp``/``checked_at``/``detail`` beside these; the alert
+    engine reads none of them, because the detector has already rolled them
+    up into ``alert_state`` and re-deriving that here would be a second
+    opinion about a device this process never spoke to."""
+
+    interface: str
+    alert_state: str
+
+
+@dataclass
 class FakeRepository:
     """Stand-in for ``MonitoringRepositoryProtocol``'s BE-011 Part 2 surface
     -- covers every method ``AlertService``/``NotificationService``/
@@ -168,6 +212,16 @@ class FakeRepository:
     alerts: dict[uuid.UUID, Alert] = field(default_factory=dict)
     routers: list[FakeRouter] = field(default_factory=list)
     isp_links: list[FakeIspLink] = field(default_factory=list)
+    rogue_dhcp_rows: list[tuple[FakeRouter, FakeRogueDhcpStatus]] = field(
+        default_factory=list
+    )
+    # Duck-typed ``NetworkIntegration`` rows and per-integration
+    # ``AuthorizationOutcomeCounts`` -- see
+    # ``tests/unit/test_monitoring_network_controller_alerts.py``.
+    network_integrations: list[object] = field(default_factory=list)
+    authorization_counts: list[object] = field(default_factory=list)
+    organization_names: dict[uuid.UUID, str] = field(default_factory=dict)
+    location_names: dict[uuid.UUID, str] = field(default_factory=dict)
     snapshots: dict[uuid.UUID, FakeSnapshot] = field(default_factory=dict)
     service_health_rows: dict[str, ServiceHealth] = field(default_factory=dict)
     platform_events: list[PlatformEvent] = field(default_factory=list)
@@ -204,8 +258,28 @@ class FakeRepository:
         rule.is_deleted = True
         return rule
 
-    async def list_alert_rules(self, **kwargs: object):
-        raise NotImplementedError("not exercised by these unit tests")
+    async def list_alert_rules(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
+        is_active: bool | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[AlertRule], object]:
+        """Taught to this fake because ``ensure_default_alerting`` calls it
+        to decide what is already there. Kept faithful on the one axis that
+        decides that answer -- the organization filter -- because a fake
+        that returned every organization's rules would make the idempotency
+        assertions below pass for the wrong reason."""
+        rules = [
+            rule
+            for rule in self.alert_rules.values()
+            if not rule.is_deleted
+            and (organization_id is None or rule.organization_id == organization_id)
+            and (is_active is None or rule.is_active == is_active)
+        ]
+        return rules, None
 
     async def list_active_alert_rules(self) -> list[AlertRule]:
         return [
@@ -288,6 +362,84 @@ class FakeRepository:
             link for link in self.isp_links if link.organization_id == organization_id
         ]
 
+    async def list_rogue_dhcp_statuses_with_routers(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[tuple[FakeRouter, FakeRogueDhcpStatus]]:
+        """Taught to this fake *before* any assertion below relies on it.
+
+        That ordering is not ceremony. cloud-guest#131 landed wiring in this
+        same domain that no test actually exercised, because a fake was
+        missing the new method and a broad ``except Exception`` upstream
+        swallowed the resulting ``AttributeError`` -- the suite went green
+        over code that had never run. A fake that answers every method the
+        service calls is what keeps that from happening twice.
+        """
+        if organization_id is None:
+            return list(self.rogue_dhcp_rows)
+        return [
+            (router, status)
+            for router, status in self.rogue_dhcp_rows
+            if router.organization_id == organization_id
+        ]
+
+    async def list_network_integrations(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[object]:
+        """Taught to this fake for the same reason as the rogue-DHCP read
+        above: every organization's defaults now include the three
+        network-controller rules, so every test here that evaluates default
+        rules calls this. A missing method would be swallowed by the
+        per-rule isolation and counted into ``skipped_rules``."""
+        return [
+            row
+            for row in self.network_integrations
+            if not getattr(row, "is_deleted", False)
+            and (organization_id is None or row.organization_id == organization_id)
+        ]
+
+    async def count_authorization_outcomes_since(
+        self, *, since: datetime, organization_id: uuid.UUID | None = None
+    ) -> list[object]:
+        """Counts are handed in pre-aggregated, the way the real grouped
+        query returns them; the window itself is the SQL's job and is
+        checked against the compiled statement in the network-controller
+        test file."""
+        wanted = {
+            row.id
+            for row in await self.list_network_integrations(
+                organization_id=organization_id
+            )
+        }
+        return [c for c in self.authorization_counts if c.integration_id in wanted]
+
+    async def get_organization_and_location_names(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> tuple[str | None, str | None]:
+        return (
+            self.organization_names.get(organization_id) if organization_id else None,
+            self.location_names.get(location_id) if location_id else None,
+        )
+
+    async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
+        """The bulk de-duplication read. Same predicate and same
+        newest-first ordering as ``find_active_alert`` above, because the
+        real repository's two methods are deliberately the same query
+        asked for one target vs. all of them."""
+        return sorted(
+            (
+                alert
+                for alert in self.alerts.values()
+                if alert.rule_id == rule_id
+                and not alert.is_deleted
+                and alert.status != AlertStatus.RESOLVED.value
+            ),
+            key=lambda alert: alert.triggered_at,
+            reverse=True,
+        )
+
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
     ) -> FakeSnapshot | None:
@@ -337,8 +489,28 @@ class FakeRepository:
         channel.is_deleted = True
         return channel
 
-    async def list_notification_channels(self, **kwargs: object):
-        raise NotImplementedError("not exercised by these unit tests")
+    async def list_notification_channels(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
+        channel_type: str | None = None,
+        is_active: bool | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[NotificationChannel], object]:
+        channels = [
+            channel
+            for channel in self.notification_channels.values()
+            if not channel.is_deleted
+            and (
+                organization_id is None
+                or channel.organization_id == organization_id
+            )
+            and (channel_type is None or channel.channel_type == channel_type)
+            and (is_active is None or channel.is_active == is_active)
+        ]
+        return channels, None
 
     async def get_notification_channels_by_ids(
         self, channel_ids: list[uuid.UUID]
@@ -408,7 +580,10 @@ class FakeRepository:
         return self.sla_targets.get(target_id)
 
     async def list_sla_targets(
-        self, *, organization_id: uuid.UUID | None = None
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
     ) -> list[SlaTarget]:
         if organization_id is None:
             return list(self.sla_targets.values())
@@ -635,6 +810,166 @@ async def test_health_status_rule_auto_resolves_on_recovery():
 # ============================================================================
 # Alert Engine: evaluation -- HEALTH_STATUS_CHANGE (per-router)
 # ============================================================================
+
+
+# ============================================================================
+# Contract 11.5: a controller-managed fleet row is never judged as a device
+# ============================================================================
+
+
+def _controller_row(org_id: uuid.UUID, **overrides) -> FakeRouter:
+    """A TP-Link Omada controller as `create_integration_with_fleet_device`
+    actually writes it: a real `Router` row (because
+    `guest_sessions.router_id` is NOT NULL and an Omada-only venue has no
+    MikroTik in the path at all) whose agent-written columns are NULL
+    forever, not temporarily."""
+    fields = dict(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Lobby Controller",
+        health_status=None,
+        reachability_state=None,
+        vendor="tplink_omada",
+    )
+    fields.update(overrides)
+    return FakeRouter(**fields)
+
+
+async def test_a_controller_is_not_alerted_on_by_a_router_health_rule():
+    """The rule reads `Router.health_status`, which only an agent health
+    snapshot ever writes. A rule written for the NULL-ish state -- and
+    `unknown` is a state an operator would plausibly want to watch -- would
+    otherwise fire on every Omada venue, forever, with no action anyone
+    could take: the device will never run an agent."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    repo.routers.append(_controller_row(org_id, health_status="unhealthy"))
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+
+
+async def test_a_controller_is_not_alerted_on_by_a_reachability_rule():
+    """`reachability_state` is written solely by
+    `RouterService.sweep_router_reachability`, whose candidate query is
+    inner-joined to `router_agent_credentials`. A controller has none, so
+    the column is permanently NULL -- and a rule watching for a state the
+    sweep can never write is a rule that can never resolve either."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    repo.routers.append(_controller_row(org_id, reachability_state="unreachable"))
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER_REACHABILITY,
+            condition_config={"expected_status": "unreachable"},
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+
+
+async def test_a_controller_is_not_alerted_on_by_a_threshold_rule():
+    """Threshold rules read `RouterHealthSnapshot` metrics, which the agent
+    poll writes. Today a controller simply has no snapshot, so the rule
+    falls through -- this pins the gate rather than the accident, because
+    a snapshot arriving from some other writer would otherwise start
+    paging on a device with no CPU of ours to measure."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    controller = _controller_row(org_id)
+    repo.routers.append(controller)
+    repo.snapshots[controller.id] = FakeSnapshot(cpu_usage_percent=99.0)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.THRESHOLD,
+            target_component=None,
+            condition_config={
+                "metric": "cpu_usage_percent",
+                "operator": "gte",
+                "value": 75,
+            },
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+
+
+async def test_a_mikrotik_beside_a_controller_is_still_alerted_on():
+    """The gate has to be narrow. An Omada controller at one venue must not
+    make the MikroTik at the next one invisible to the same rule."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    mikrotik = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Router One",
+        health_status="unhealthy",
+    )
+    repo.routers.append(_controller_row(org_id, health_status="unhealthy"))
+    repo.routers.append(mikrotik)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert [a.router_id for a in result.triggered] == [mikrotik.id]
+
+
+async def test_a_controller_still_resolves_to_its_name_on_the_alerts_page():
+    """The other half, and the reason `MonitoringRepository.list_routers`
+    is deliberately NOT filtered in SQL. An alert can legitimately carry a
+    controller's `router_id` -- the network integration links one -- and a
+    name lookup that hid the row would put a bare UUID back on the
+    customer's Alerts page, the exact defect
+    `get_router_names_for_alerts` was written to fix."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    controller = _controller_row(org_id)
+    repo.routers.append(controller)
+    alert = await repo.create_alert(
+        rule_id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=controller.location_id,
+        router_id=controller.id,
+        message="something",
+        severity=AlertSeverity.CRITICAL.value,
+        status=AlertStatus.TRIGGERED.value,
+    )
+
+    names = await service.get_router_names_for_alerts(
+        [alert], organization_id=org_id
+    )
+
+    assert names == {controller.id: controller.name}
 
 
 async def test_router_health_status_rule_triggers_and_resolves():
@@ -867,6 +1202,446 @@ def test_validate_health_status_change_accepts_isp_link_target():
         ALERT_TARGET_ISP_LINK,
         {"expected_status": "unhealthy"},
     )
+
+
+# ============================================================================
+# Alert Engine: evaluation -- ALERT_TARGET_ROGUE_DHCP_GUARD
+# ============================================================================
+#
+# The push half of cloud-guest#139's rogue-DHCP detector. #139 persisted a
+# ``RouterRogueDhcpStatus`` row per ``(router_id, interface)`` and put a
+# readiness checklist item over it; an unguarded router therefore only ever
+# appeared if somebody opened that router's checklist, which nobody does.
+#
+# Every test below builds its rows through ``_rogue_router``/``_rogue_rows``
+# and drives the real ``AlertService.evaluate_alert_rules`` -- never the
+# private branch directly -- so the wiring from ``evaluate_alert_rules``
+# through the new repository surface is what is under test, not just the
+# branch's arithmetic.
+
+
+def _rogue_router(org_id: uuid.UUID, name: str = "Lobby Router") -> FakeRouter:
+    return FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name=name,
+        health_status="healthy",
+    )
+
+
+def _rogue_rows(
+    router: FakeRouter, states: dict[str, str]
+) -> list[tuple[FakeRouter, FakeRogueDhcpStatus]]:
+    return [
+        (router, FakeRogueDhcpStatus(interface=iface, alert_state=state))
+        for iface, state in states.items()
+    ]
+
+
+async def _rogue_dhcp_harness(
+    org_id: uuid.UUID,
+) -> tuple[FakeRepository, AlertService]:
+    repo = FakeRepository()
+    service = AlertService(repo)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROGUE_DHCP_GUARD,
+            condition_config={"expected_status": ROGUE_DHCP_STATE_UNGUARDED},
+            organization_id=org_id,
+            severity=AlertSeverity.WARNING,
+        )
+    )
+    return repo, service
+
+
+def test_rogue_dhcp_state_constants_match_the_detector_enum():
+    """``app.domains.monitoring`` holds these as plain strings rather than
+    importing ``dhcp``'s enum, keeping this module's zero-cross-domain-import
+    shape. That is only safe if the two cannot drift apart silently, which
+    is what this pins."""
+    assert RogueDhcpAlertState.GUARDED.value == ROGUE_DHCP_STATE_GUARDED
+    assert RogueDhcpAlertState.UNGUARDED.value == ROGUE_DHCP_STATE_UNGUARDED
+    assert RogueDhcpAlertState.UNKNOWN.value == ROGUE_DHCP_STATE_UNKNOWN
+
+
+def test_validate_health_status_change_accepts_rogue_dhcp_guard_target():
+    validate_alert_rule_condition_config(
+        AlertTriggerType.HEALTH_STATUS_CHANGE,
+        ALERT_TARGET_ROGUE_DHCP_GUARD,
+        {"expected_status": ROGUE_DHCP_STATE_UNGUARDED},
+    )
+
+
+def test_validate_rogue_dhcp_guard_rejects_guarded_and_unknown_expected_status():
+    """A rule asking for ``guarded`` would fire when everything is fine, and
+    one asking for ``unknown`` would page somebody for every router the
+    detector could not reach. Both are rejected when the rule is saved, not
+    silently evaluated to nothing six hours later."""
+    for bad in (ROGUE_DHCP_STATE_GUARDED, ROGUE_DHCP_STATE_UNKNOWN):
+        with pytest.raises(InvalidAlertRuleConfigError):
+            validate_alert_rule_condition_config(
+                AlertTriggerType.HEALTH_STATUS_CHANGE,
+                ALERT_TARGET_ROGUE_DHCP_GUARD,
+                {"expected_status": bad},
+            )
+
+
+async def test_rogue_dhcp_guard_rule_triggers_on_unguarded_interface():
+    """A device that *answered*, and answered "nothing is watching this",
+    is a real finding and raises a real alert."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "ether2": ROGUE_DHCP_STATE_UNGUARDED,
+                "vlan10": ROGUE_DHCP_STATE_GUARDED,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    alert = result.triggered[0]
+    assert alert.router_id == router.id
+    assert alert.organization_id == org_id
+    assert alert.location_id == router.location_id
+    # The interface an operator has to go and fix is named, and the one
+    # that is fine is not.
+    assert "ether2" in alert.message
+    assert "vlan10" not in alert.message
+
+    # Second pass, same condition: de-duplicated, never a second alert.
+    assert (await service.evaluate_alert_rules()).triggered == []
+
+
+async def test_rogue_dhcp_guard_rule_never_triggers_on_unknown():
+    """A router the detector could not reach is **not** a router we know is
+    unwatched.
+
+    The tri-state is carried end to end -- the gateway reader, the
+    persisted ``alert_state``, the detector's per-router summary counts,
+    and the readiness item's NOT_CHECKED-not-FAIL branch all keep
+    ``unknown`` separate from ``unguarded``. This is the last step, and it
+    does not collapse it either. Reporting every unreachable router as
+    unguarded would page somebody for every offline router in the fleet
+    while telling them nothing true about rogue DHCP -- the same conflation
+    that once rendered a missing SMS provider as "delivery failed" and
+    silently dropped locations from a fleet list.
+    """
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id, name="Unreachable Router")
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "ether2": ROGUE_DHCP_STATE_UNKNOWN,
+                "vlan10": ROGUE_DHCP_STATE_UNKNOWN,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+    assert result.resolved == []
+    assert repo.alerts == {}
+
+
+async def test_rogue_dhcp_guard_unknown_beside_unguarded_still_triggers():
+    """Ordering, and it matters: a known-unguarded interface outranks an
+    unknown one beside it. The finding was established by a device that
+    answered, and the unknown next to it does not soften it -- the same
+    ordering ``ReadinessService._check_rogue_dhcp_detection`` uses on these
+    same rows."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "ether2": ROGUE_DHCP_STATE_UNGUARDED,
+                "vlan10": ROGUE_DHCP_STATE_UNKNOWN,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert "ether2" in result.triggered[0].message
+
+
+async def test_rogue_dhcp_guard_unknown_never_resolves_an_open_alert():
+    """The half that is easy to get wrong. An alert is open, then the
+    detector loses contact with the router: that is not evidence anybody
+    fixed anything, so the alert stays open. Auto-resolving on a timeout
+    would tell an operator "the guard is back" on the strength of no answer
+    at all."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    triggered = (await service.evaluate_alert_rules()).triggered
+    assert len(triggered) == 1
+
+    repo.rogue_dhcp_rows[:] = _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNKNOWN})
+    result = await service.evaluate_alert_rules()
+
+    assert result.resolved == []
+    assert result.triggered == []
+    assert repo.alerts[triggered[0].id].status == AlertStatus.TRIGGERED.value
+
+
+async def test_rogue_dhcp_guard_rule_resolves_when_the_guard_is_restored():
+    """An alert that fires when a router becomes unguarded and never clears
+    when the guard comes back trains people to ignore alerts. Same
+    no-separate-recovery-rule design every other target here uses: the
+    condition is re-evaluated each pass and the open alert is transitioned
+    straight to RESOLVED."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    triggered = (await service.evaluate_alert_rules()).triggered
+    assert len(triggered) == 1
+
+    repo.rogue_dhcp_rows[:] = _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_GUARDED})
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.resolved) == 1
+    assert result.resolved[0].id == triggered[0].id
+    assert result.resolved[0].status == AlertStatus.RESOLVED.value
+    assert result.resolved[0].resolved_at is not None
+    # The text is replaced at resolution time, so the "[RESOLVED]" prefix
+    # _format_alert_message adds cannot produce "[RESOLVED] ... detection
+    # is off" -- the contradiction a real operator read in a real email
+    # once already.
+    assert "is off" not in result.resolved[0].message
+    assert "active again" in result.resolved[0].message
+
+    # And it stays resolved: a resolved alert is not re-resolved next pass.
+    assert (await service.evaluate_alert_rules()).resolved == []
+
+
+async def test_rogue_dhcp_guard_alert_text_never_claims_protection():
+    """``/ip dhcp-server alert`` logs. It blocks nothing, drops nothing and
+    rate-limits nothing. Copy that says otherwise describes a defence this
+    platform has never had and leaves an operator believing the fix
+    restores one -- so both the trigger and the resolution wording are
+    pinned here, on the real ``Alert.message`` the notifiers send."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    triggered = (await service.evaluate_alert_rules()).triggered
+    # Snapshotted *before* resolving, and this is load-bearing:
+    # ``_auto_resolve`` replaces the message on the very same ``Alert``
+    # object it resolves, so ``triggered[0]`` and ``resolved[0]`` are one
+    # object and reading ``.message`` afterwards would silently check the
+    # resolution copy twice and never look at the trigger copy at all.
+    # Caught by mutation-testing this test -- putting "protection" into the
+    # trigger wording left it green.
+    trigger_message = triggered[0].message
+    repo.rogue_dhcp_rows[:] = _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_GUARDED})
+    resolved = (await service.evaluate_alert_rules()).resolved
+    resolved_message = resolved[0].message
+
+    forbidden = (
+        "protect",
+        "protection",
+        "protected",
+        "unprotected",
+        "block",
+        "blocked",
+        "blocking",
+        "prevent",
+        "prevented",
+        "defend",
+        "defence",
+        "defense",
+        "secured",
+        "guard",  # incl. "guarded"/"unguarded" -- internal vocabulary
+        "shield",
+        "stop",
+    )
+    assert trigger_message != resolved_message
+    for message in (trigger_message, resolved_message):
+        lowered = message.lower()
+        for word in forbidden:
+            # "it does not block" is the one permitted use, and it is a
+            # denial of protection, not a claim of it.
+            occurrences = lowered.count(word)
+            allowed = 1 if word == "block" and "does not block" in lowered else 0
+            assert occurrences == allowed, (
+                f"alert copy claims protection via {word!r}: {message}"
+            )
+        assert "detection only -- it logs, it does not block" in lowered
+
+
+async def test_rogue_dhcp_guard_two_unguarded_interfaces_are_one_alert():
+    """The de-duplication key is ``(rule_id, organization_id, location_id,
+    router_id)`` and has no interface dimension. Evaluating per interface
+    would address two findings to one key -- one alert plus one silently
+    swallowed duplicate, with whichever interface the query returned first
+    in the message. So the rows are grouped per router and both interfaces
+    are named."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "vlan10": ROGUE_DHCP_STATE_UNGUARDED,
+                "ether2": ROGUE_DHCP_STATE_UNGUARDED,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    # Sorted, not insertion-ordered: the message must read the same however
+    # the rows came back.
+    assert "ether2, vlan10" in result.triggered[0].message
+
+
+async def test_rogue_dhcp_guard_rule_is_scoped_to_its_organization():
+    org_id = uuid.uuid4()
+    other_org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    mine = _rogue_router(org_id, name="Mine")
+    theirs = _rogue_router(other_org_id, name="Theirs")
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(mine, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(theirs, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert result.triggered[0].router_id == mine.id
+
+
+async def test_rogue_dhcp_guard_rule_reads_state_only_never_a_device():
+    """The engine's standing promise, and the reason cloud-guest#139 split
+    detector-writes from surface-reads in the first place: evaluation reads
+    already-persisted rows and performs no per-device I/O. A fake with no
+    device surface at all is the assertion -- if the branch ever tried to
+    reach a router it would have nothing to reach it with.
+
+    It is also O(1) queries in fleet size: one bulk status read and one
+    bulk open-alert read per rule, not one of each per router. Counted
+    here, because "don't make evaluation scale with router count" is the
+    kind of promise that quietly stops being true.
+    """
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    calls: list[str] = []
+    real_statuses = repo.list_rogue_dhcp_statuses_with_routers
+    real_open = repo.list_open_alerts_for_rule
+    real_find = repo.find_active_alert
+
+    async def counted_statuses(**kwargs):
+        calls.append("statuses")
+        return await real_statuses(**kwargs)
+
+    async def counted_open(**kwargs):
+        calls.append("open_alerts")
+        return await real_open(**kwargs)
+
+    async def counted_find(**kwargs):
+        calls.append("find_active_alert")
+        return await real_find(**kwargs)
+
+    repo.list_rogue_dhcp_statuses_with_routers = counted_statuses
+    repo.list_open_alerts_for_rule = counted_open
+    repo.find_active_alert = counted_find
+    for index in range(12):
+        repo.rogue_dhcp_rows.extend(
+            _rogue_rows(
+                _rogue_router(org_id, name=f"Router {index}"),
+                {"ether2": ROGUE_DHCP_STATE_UNGUARDED},
+            )
+        )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 12
+    assert calls == ["statuses", "open_alerts"]
+
+
+async def test_new_organizations_get_a_working_rogue_dhcp_rule_from_day_one():
+    """This is the answer to the foreign key that blocked this feature.
+
+    ``Alert.rule_id`` is a non-nullable FK to ``alert_rules``, so the
+    detector in ``app.domains.dhcp.tasks`` could not raise anything without
+    a rule existing first -- which is exactly why cloud-guest#139 stopped at
+    a persisted row and a checklist item. The fix is the mechanism this
+    codebase already uses for ``ALERT_TARGET_MONITORED_HARDWARE``: a default
+    rule created with the organization, at the router/orchestration layer,
+    non-fatally. Not a nullable column, and not a new seeding path.
+
+    Exercised through the real ``AlertService.create_alert_rule`` (which
+    runs ``validate_alert_rule_condition_config``), so a default whose
+    ``condition_config`` the validator would reject fails here rather than
+    silently logging "default_alert_rule_creation_failed" in production and
+    leaving a new customer with no rule -- the failure mode that
+    ``except Exception`` is deliberately wide enough to hide.
+    """
+    repo = FakeRepository()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200))
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        notification_service = NotificationService(repo, http_client)
+        service = AlertService(repo, notification_service=notification_service)
+        org_id = uuid.uuid4()
+
+        await ensure_default_alerting(
+            service,
+            notification_service,
+            organization_id=org_id,
+            contact_email="owner@venue.example",
+        )
+
+    rules = {rule.target_component: rule for rule in repo.alert_rules.values()}
+    assert set(rules) == {
+        ALERT_TARGET_ROUTER_REACHABILITY,
+        ALERT_TARGET_ISP_LINK,
+        ALERT_TARGET_MONITORED_HARDWARE,
+        ALERT_TARGET_ROGUE_DHCP_GUARD,
+        ALERT_TARGET_NETWORK_CONTROLLER,
+        ALERT_TARGET_NETWORK_CONTROLLER_AUTHORIZE,
+        ALERT_TARGET_NETWORK_CONTROLLER_SETUP,
+    }
+    rogue_rule = rules[ALERT_TARGET_ROGUE_DHCP_GUARD]
+    assert rogue_rule.organization_id == org_id
+    assert rogue_rule.is_active
+    assert rogue_rule.condition_config == {
+        "expected_status": ROGUE_DHCP_STATE_UNGUARDED
+    }
+    assert rogue_rule.trigger_type == AlertTriggerType.HEALTH_STATUS_CHANGE.value
+    # Detector-only naming, same rule as the alert copy itself: nothing an
+    # operator reads about this may imply /ip dhcp-server alert protects
+    # anything.
+    for text in (rogue_rule.name.lower(), (rogue_rule.description or "").lower()):
+        assert "protect" not in text
+        assert text.count("block") == ("does not block" in text)
 
 
 # ============================================================================
@@ -1439,18 +2214,27 @@ async def test_incident_lifecycle_transitions():
     assert incident.status == IncidentStatus.OPEN.value
 
     investigating = await service.update_incident(
-        incident.id, status=IncidentStatus.INVESTIGATING
+        incident.id,
+        status=IncidentStatus.INVESTIGATING,
+        requesting_organization_id=None,
     )
     assert investigating.status == IncidentStatus.INVESTIGATING.value
 
     resolved = await service.update_incident(
-        incident.id, status=IncidentStatus.RESOLVED, resolution_notes="Fixed"
+        incident.id,
+        status=IncidentStatus.RESOLVED,
+        resolution_notes="Fixed",
+        requesting_organization_id=None,
     )
     assert resolved.status == IncidentStatus.RESOLVED.value
     assert resolved.resolved_at is not None
     assert resolved.resolution_notes == "Fixed"
 
-    closed = await service.update_incident(incident.id, status=IncidentStatus.CLOSED)
+    closed = await service.update_incident(
+        incident.id,
+        status=IncidentStatus.CLOSED,
+        requesting_organization_id=None,
+    )
     assert closed.status == IncidentStatus.CLOSED.value
     assert closed.closed_at is not None
 
@@ -1464,9 +2248,17 @@ async def test_incident_invalid_transition_raises():
         severity=AlertSeverity.INFO.value,
         organization_id=None,
     )
-    await service.update_incident(incident.id, status=IncidentStatus.CLOSED)
+    await service.update_incident(
+        incident.id,
+        status=IncidentStatus.CLOSED,
+        requesting_organization_id=None,
+    )
     with pytest.raises(InvalidIncidentStatusTransitionError):
-        await service.update_incident(incident.id, status=IncidentStatus.OPEN)
+        await service.update_incident(
+            incident.id,
+            status=IncidentStatus.OPEN,
+            requesting_organization_id=None,
+        )
 
 
 async def test_incident_attach_alert_is_idempotent():
@@ -1494,8 +2286,16 @@ async def test_incident_attach_alert_is_idempotent():
         severity="warning",
     )
 
-    await service.attach_alert(incident.id, alert.id)
-    await service.attach_alert(incident.id, alert.id)
+    await service.attach_alert(
+        incident.id,
+        alert.id,
+        requesting_organization_id=None,
+    )
+    await service.attach_alert(
+        incident.id,
+        alert.id,
+        requesting_organization_id=None,
+    )
 
     alerts = await service.list_alerts_for_incident(incident.id)
     assert len(alerts) == 1
@@ -1535,7 +2335,10 @@ async def test_generate_report_computes_simple_ratio():
         measurement_window_days=30,
     )
 
-    report = await service.generate_report(target.id)
+    report = await service.generate_report(
+        target.id,
+        requesting_organization_id=None,
+    )
     assert report.total_checks == 100
     assert report.healthy_checks == 80
     assert report.achieved_percentage == 80.0
@@ -1553,7 +2356,10 @@ async def test_generate_report_raises_when_no_health_check_data():
         measurement_window_days=30,
     )
     with pytest.raises(InsufficientSlaDataError):
-        await service.generate_report(target.id)
+        await service.generate_report(
+            target.id,
+            requesting_organization_id=None,
+        )
 
 
 async def test_sla_target_not_found_raises():
@@ -1576,7 +2382,10 @@ async def test_list_targets_with_latest_report_pairs_correctly():
     pairs_before = await service.list_targets_with_latest_report()
     assert pairs_before == [(target, None)]
 
-    report = await service.generate_report(target.id)
+    report = await service.generate_report(
+        target.id,
+        requesting_organization_id=None,
+    )
     pairs_after = await service.list_targets_with_latest_report()
     assert pairs_after == [(target, report)]
 
@@ -1668,3 +2477,929 @@ def test_endpoint_requires_expected_permission_key(
 ):
     route = monitoring_routes_by_path_method[(path, method)]
     assert _permission_key_for_route(route) == expected_key
+
+
+# ============================================================================
+# Tenant scoping of the alerts / alert-rules listings
+# ----------------------------------------------------------------------------
+# GET /alerts and GET /alerts/rules must derive the effective organization
+# from the caller's auth scope, never from a client-supplied query param, and
+# a missing org filter must never silently mean "every organization" for a
+# scoped caller. See ``fix(monitoring): scope alerts/rules to caller org``.
+# ============================================================================
+
+
+@dataclass
+class _FakeAlertRow:
+    organization_id: uuid.UUID
+    location_id: uuid.UUID | None = None
+
+
+@dataclass
+class _FakePaginateMeta:
+    total_items: int
+
+
+class _RecordingPaginator:
+    """Stands in for a ``GenericRepository`` on ``MonitoringRepository`` --
+    just enough of ``paginate`` to observe the org filter the repository builds
+    and mimic ``apply_filters``' "``None`` org -> no WHERE clause -> every
+    row" behaviour, so the test proves the repository's own guard, not
+    ``apply_filters`` itself."""
+
+    def __init__(self, rows: list[_FakeAlertRow]) -> None:
+        self._rows = rows
+        self.last_filters: dict[str, object] | None = None
+
+    async def paginate(self, *, page, page_size, filters, sort_by, sort_order):
+        self.last_filters = filters
+        org = filters.get("organization_id")
+        loc = filters.get("location_id")
+        selected = [
+            r
+            for r in self._rows
+            if (org is None or r.organization_id == org)
+            # Mirrors apply_filters: a None filter contributes no WHERE clause.
+            and (loc is None or r.location_id == loc)
+        ]
+        return selected, _FakePaginateMeta(total_items=len(selected))
+
+
+def _repo_with_alert_rows(rows: list[_FakeAlertRow]) -> MonitoringRepository:
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    paginator = _RecordingPaginator(rows)
+    # Both listings route through their respective GenericRepository; swap in a
+    # recording double so no live session is touched.
+    repo.alerts = paginator  # type: ignore[assignment]
+    repo.alert_rules = paginator  # type: ignore[assignment]
+    return repo
+
+
+async def test_list_alerts_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    # An organization-scoped caller resolves to their own org (org_a) and sees
+    # only org_a's alerts -- never org_b's.
+    items, _meta = await service.list_alerts(organization_id=org_a)
+    assert len(items) == 2
+    assert all(row.organization_id == org_a for row in items)
+
+
+async def test_list_alerts_missing_org_without_optin_is_refused():
+    rows = [_FakeAlertRow(uuid.uuid4())]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    # Defense-in-depth: a missing org filter without an explicit cross-org
+    # opt-in must never fall through to "every organization".
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_alerts(organization_id=None)
+
+
+async def test_list_alerts_platform_caller_may_read_across_orgs():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    # A platform/GLOBAL caller (org resolves to None) explicitly opts into the
+    # cross-organization read and sees every org's alerts.
+    items, _meta = await service.list_alerts(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+async def test_list_alert_rules_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    items, _meta = await service.list_alert_rules(organization_id=org_a)
+    assert len(items) == 1
+    assert items[0].organization_id == org_a
+
+
+async def test_list_alert_rules_missing_org_without_optin_is_refused():
+    service = AlertService(_repo_with_alert_rows([_FakeAlertRow(uuid.uuid4())]))
+
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_alert_rules(organization_id=None)
+
+
+async def test_list_alert_rules_platform_caller_may_read_across_orgs():
+    rows = [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    items, _meta = await service.list_alert_rules(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+# ----------------------------------------------------------------------------
+# Same tenant-scoping guard for the notification-channels / incidents / SLA
+# listings (the endpoints fixed alongside alerts/alert-rules): an org-scoped
+# caller omitting the param must see only their own org's rows, never every
+# organization's. See ``fix(monitoring): scope channels/incidents/sla``.
+# ----------------------------------------------------------------------------
+
+
+class _RecordingLister:
+    """``get_all`` counterpart to ``_RecordingPaginator`` -- stands in for a
+    ``GenericRepository`` whose listing returns a plain ``list`` (SLA targets),
+    mimicking ``apply_filters``' "``None`` org -> every row" so the test proves
+    the repository's own guard, not ``apply_filters``."""
+
+    def __init__(self, rows: list[_FakeAlertRow]) -> None:
+        self._rows = rows
+
+    async def get_all(self, *, filters, sort_by=None, sort_order=None, **kwargs):
+        org = filters.get("organization_id")
+        return [r for r in self._rows if org is None or r.organization_id == org]
+
+
+def _repo_with_rows_on(attr: str, rows: list[_FakeAlertRow]) -> MonitoringRepository:
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    setattr(repo, attr, _RecordingPaginator(rows))
+    return repo
+
+
+async def test_list_channels_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = NotificationService(
+        _repo_with_rows_on("notification_channels", rows), httpx.AsyncClient()
+    )
+
+    items, _meta = await service.list_channels(organization_id=org_a)
+    assert len(items) == 2
+    assert all(row.organization_id == org_a for row in items)
+
+
+async def test_list_channels_missing_org_without_optin_is_refused():
+    service = NotificationService(
+        _repo_with_rows_on("notification_channels", [_FakeAlertRow(uuid.uuid4())]),
+        httpx.AsyncClient(),
+    )
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_channels(organization_id=None)
+
+
+async def test_list_channels_platform_caller_may_read_across_orgs():
+    rows = [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    service = NotificationService(
+        _repo_with_rows_on("notification_channels", rows), httpx.AsyncClient()
+    )
+    items, _meta = await service.list_channels(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+async def test_list_incidents_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = IncidentService(_repo_with_rows_on("incidents", rows))
+
+    items, _meta = await service.list_incidents(organization_id=org_a)
+    assert len(items) == 1
+    assert items[0].organization_id == org_a
+
+
+async def test_list_incidents_missing_org_without_optin_is_refused():
+    service = IncidentService(
+        _repo_with_rows_on("incidents", [_FakeAlertRow(uuid.uuid4())])
+    )
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_incidents(organization_id=None)
+
+
+async def test_list_incidents_platform_caller_may_read_across_orgs():
+    rows = [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    service = IncidentService(_repo_with_rows_on("incidents", rows))
+    items, _meta = await service.list_incidents(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+async def test_list_sla_targets_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    repo.sla_targets = _RecordingLister(  # type: ignore[assignment]
+        [_FakeAlertRow(org_a), _FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    )
+    targets = await repo.list_sla_targets(organization_id=org_a)
+    assert len(targets) == 2
+    assert all(t.organization_id == org_a for t in targets)
+
+
+async def test_list_sla_targets_missing_org_without_optin_is_refused():
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    repo.sla_targets = _RecordingLister([_FakeAlertRow(uuid.uuid4())])  # type: ignore[assignment]
+    with pytest.raises(UnscopedOrganizationListError):
+        await repo.list_sla_targets(organization_id=None)
+
+
+async def test_list_sla_targets_platform_caller_may_read_across_orgs():
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    repo.sla_targets = _RecordingLister(  # type: ignore[assignment]
+        [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    )
+    targets = await repo.list_sla_targets(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(targets) == 2
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [
+        ("/api/v1/alerts", "GET"),
+        ("/api/v1/alerts/rules", "GET"),
+        ("/api/v1/notifications/channels", "GET"),
+        ("/api/v1/incidents", "GET"),
+        ("/api/v1/sla", "GET"),
+    ],
+)
+def test_alerts_listings_resolve_org_from_auth_scope_not_query_param(
+    monitoring_routes_by_path_method, path, method
+):
+    """The two listings must take ``organization_id`` from
+    ``CurrentOrganization`` (the caller's validated auth scope), not from a
+    client-supplied query param -- otherwise an org-scoped admin omitting the
+    param would read every organization's rows."""
+    from app.domains.rbac.dependencies import CurrentOrganization
+
+    route = monitoring_routes_by_path_method[(path, method)]
+    dependant = route.dependant
+
+    # organization_id is no longer a request query parameter ...
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    # ... it is resolved via the CurrentOrganization dependency instead.
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [
+        ("/api/v1/events", "GET"),
+        ("/api/v1/monitoring/dashboard", "GET"),
+        ("/api/v1/monitoring/devices", "GET"),
+        ("/api/v1/ztp/dashboard", "GET"),
+        ("/api/v1/ztp/analytics", "GET"),
+    ],
+)
+def test_platform_dashboards_resolve_org_from_auth_scope_not_query_param(
+    monitoring_routes_by_path_method, path, method
+):
+    """The platform monitoring/ZTP dashboards must take ``organization_id``
+    from ``CurrentOrganization`` (the caller's validated auth scope), not from
+    a client-supplied query param.
+
+    ``monitoring.read``/``analytics.read`` are grantable at ORGANIZATION scope
+    (see ``rbac.seed`` MODULE_NARROWEST_SCOPE), so an org-scoped admin who sent
+    ``X-Organization-Id`` (passing the org-scoped permission check) but omitted
+    ``?organization_id=`` previously had the org filter silently dropped and
+    aggregated every organization's data cross-tenant. A caller with no org
+    header resolves to ``None`` and, having passed the GLOBAL-scope permission
+    gate, may still legitimately read across organizations.
+    """
+    from app.domains.rbac.dependencies import CurrentOrganization
+
+    route = monitoring_routes_by_path_method[(path, method)]
+    dependant = route.dependant
+
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls
+
+
+async def test_list_alerts_filters_by_location_server_side():
+    """A venue's alerts must be selectable by location in the query, not by
+    over-fetching the organization and narrowing client-side.
+
+    The customer dashboard's Monitoring tab did the latter: it asked for the
+    org's first 100 alerts and filtered on `a.locationId === locationId`, so a
+    location whose alerts fell past that page reported "Open alerts 0", and
+    browsing N locations issued N byte-identical org-wide requests.
+    """
+    org = uuid.uuid4()
+    venue_a, venue_b = uuid.uuid4(), uuid.uuid4()
+    rows = [
+        _FakeAlertRow(org, venue_a),
+        _FakeAlertRow(org, venue_b),
+        _FakeAlertRow(org, venue_b),
+        _FakeAlertRow(org, None),
+    ]
+    repo = _repo_with_alert_rows(rows)
+    service = AlertService(repo)
+
+    items, meta = await service.list_alerts(organization_id=org, location_id=venue_b)
+
+    assert len(items) == 2
+    assert all(row.location_id == venue_b for row in items)
+    # total_items must reflect the filtered set, so the tile shows the venue's
+    # real count rather than the organization's.
+    assert meta.total_items == 2
+    assert repo.alerts.last_filters["location_id"] == venue_b  # type: ignore[union-attr]
+
+
+async def test_list_alerts_without_location_still_returns_the_whole_org():
+    """The new filter is additive -- omitting it must not narrow anything."""
+    org = uuid.uuid4()
+    rows = [_FakeAlertRow(org, uuid.uuid4()), _FakeAlertRow(org, None)]
+    repo = _repo_with_alert_rows(rows)
+    service = AlertService(repo)
+
+    items, _meta = await service.list_alerts(organization_id=org)
+
+    assert len(items) == 2
+    assert repo.alerts.last_filters["location_id"] is None  # type: ignore[union-attr]
+
+
+class TestHealthCheckSweepIsScheduled:
+    """The Health Engine had no schedule at all.
+
+    `GET /monitoring/health` only reads stored `service_health` rows, and
+    the only writer was the Master console's own "Run health checks now"
+    button. So the System Health page's component timestamps were exactly
+    as old as the last time a human clicked it -- two days, when this was
+    found on 2026-09-04, while the page described itself as live and
+    FreeRADIUS sat on "Degraded, 5 consecutive failures" from a check
+    nobody had re-run.
+
+    A scheduled sweep that is registered but not in `beat_schedule`, or in
+    `beat_schedule` under a task name nothing registered, fails exactly the
+    same way and just as silently -- so both halves are asserted, and that
+    they name the same task.
+    """
+
+    def test_the_task_is_registered_and_scheduled_under_the_same_name(
+        self,
+    ) -> None:
+        import app.domains.monitoring.tasks  # noqa: F401 -- registers the task
+        from app.core.celery_app import celery_app
+        from app.domains.monitoring.constants import (
+            HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+            TASK_RUN_HEALTH_CHECK_SWEEP,
+        )
+
+        entry = celery_app.conf.beat_schedule.get("monitoring-health-check-sweep")
+        assert entry is not None, "the Health Engine has no Beat entry again"
+        assert entry["task"] == TASK_RUN_HEALTH_CHECK_SWEEP
+        assert entry["schedule"] == HEALTH_CHECK_SWEEP_INTERVAL_SECONDS
+        assert TASK_RUN_HEALTH_CHECK_SWEEP in celery_app.tasks, (
+            "scheduled under a task name nothing registered"
+        )
+
+    def test_the_cadence_is_not_silently_widened(self) -> None:
+        """Five minutes is a deliberate choice, not a default: these checks
+        touch the database, Redis, disk and the hub's own agents, so they
+        are far more expensive than the 30-second alert sweep that only
+        reads persisted state. Widening this to hours would restore the
+        stale-data problem without removing the entry, which is the change
+        that would not look like a regression in review."""
+        from app.domains.monitoring.constants import (
+            HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+        )
+
+        assert 60.0 <= HEALTH_CHECK_SWEEP_INTERVAL_SECONDS <= 900.0
+
+
+# ============================================================================
+# Alert Engine: per-rule failure isolation, and the malformed rows that
+# proved it was needed
+# ============================================================================
+
+
+async def test_a_malformed_rule_does_not_blind_every_other_rule():
+    """THE REGRESSION. This is the defect, reproduced exactly.
+
+    Production carried two demo rules whose ``condition_config`` read
+    ``{"metric": ..., "operator": ..., "threshold": 75}``. The canonical key
+    is ``value`` -- ``validators.validate_alert_rule_condition_config``
+    requires it, the frontend's ``conditionConfigFromAlertRuleForm`` emits
+    it, and ``_evaluate_threshold_rule`` reads it -- and nothing in either
+    repository has ever written ``threshold``, so those rows were inserted
+    around the validator.
+
+    ``_evaluate_threshold_rule``'s bare ``rule.condition_config["value"]``
+    then raised ``KeyError('value')`` out of the middle of the evaluation
+    loop, aborting the whole pass. In the six hours before this was found:
+    276 tracebacks, zero completed runs, and therefore no rule belonging to
+    any real customer evaluated even once. Two malformed demo rows blinded
+    alerting for the entire platform.
+
+    So the assertion that matters is not that the bad rule is skipped. It is
+    that the GOOD rule -- ordered after it, exactly as the malformed demo
+    rules were -- still fires.
+    """
+    repo = FakeRepository()
+    service = AlertService(repo)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.THRESHOLD,
+            target_component=None,
+            # The literal production shape.
+            condition_config={
+                "metric": "cpu_usage_percent",
+                "operator": "gte",
+                "threshold": 75,
+            },
+        )
+    )
+    healthy_rule = await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component="database",
+            condition_config={"expected_status": "unhealthy"},
+        )
+    )
+    repo.service_health_rows["database"] = ServiceHealth(
+        **_base_fields(
+            component="database",
+            status="unhealthy",
+            last_checked_at=_now(),
+            consecutive_failure_count=3,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert result.triggered[0].rule_id == healthy_rule.id
+    assert result.skipped_rules == 1, (
+        "the bad rule must be counted, not silently swallowed -- isolation "
+        "is only an improvement if the skipping is loud"
+    )
+
+
+async def test_the_canonical_threshold_key_is_value_and_still_evaluates():
+    """The other half of the same decision: ``value`` is canonical and the
+    reader was right. This pins that down so nobody later 'fixes' the
+    KeyError by teaching the evaluator to accept ``threshold`` as well,
+    which would leave two spellings of one field in the database forever."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    router = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        location_id=uuid.uuid4(),
+        name="Office Guest",
+        health_status="healthy",
+    )
+    repo.routers.append(router)
+    repo.snapshots[router.id] = FakeSnapshot(cpu_usage_percent=91.0)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.THRESHOLD,
+            target_component=None,
+            condition_config={
+                "metric": "cpu_usage_percent",
+                "operator": "gte",
+                "value": 75,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert result.skipped_rules == 0
+
+
+async def test_one_rule_raising_never_costs_the_others():
+    """Isolation is not specific to malformed config. Anything a single
+    rule's evaluation can raise -- a repository hiccup, a collaborator
+    returning something unexpected -- must cost that rule and nothing
+    else. Same discipline ``RouterService.sweep_stale_heartbeats``
+    documents for its own per-router loop."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    exploding = await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component="database",
+            condition_config={"expected_status": "unhealthy"},
+        )
+    )
+    healthy_rule = await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component="redis",
+            condition_config={"expected_status": "unhealthy"},
+        )
+    )
+    for component in ("database", "redis"):
+        repo.service_health_rows[component] = ServiceHealth(
+            **_base_fields(
+                component=component,
+                status="unhealthy",
+                last_checked_at=_now(),
+                consecutive_failure_count=1,
+            )
+        )
+
+    original = repo.get_service_health
+
+    async def exploding_lookup(component: str):
+        if component == "database":
+            raise RuntimeError("connection reset")
+        return await original(component)
+
+    repo.get_service_health = exploding_lookup
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.skipped_rules == 1
+    assert [alert.rule_id for alert in result.triggered] == [healthy_rule.id]
+    assert exploding.id not in {alert.rule_id for alert in result.triggered}
+
+
+async def test_one_broken_channel_does_not_stop_the_others():
+    """A rule fanning out to several channels must reach the rest even if
+    one of them blows up outside ``dispatch_notification``'s own
+    never-raises guarantee -- an unknown ``channel_type``, say. Otherwise
+    the exception climbs into the per-rule isolation above and takes the
+    whole rule with it."""
+    repo = FakeRepository()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    ) as http_client:
+        notification_service = NotificationService(repo, http_client)
+        service = AlertService(repo, notification_service=notification_service)
+        good = await notification_service.create_channel(
+            organization_id=None,
+            channel_type=NotificationChannelType.SLACK,
+            name="Ops",
+            config={"webhook_url": "https://hooks.example/abc"},
+        )
+        broken = await repo.create_notification_channel(
+            organization_id=None,
+            channel_type="carrier_pigeon",
+            name="Nope",
+            config_encrypted="{}",
+            is_active=True,
+        )
+        rule = await repo.create_alert_rule(
+            **_alert_rule_fields(
+                trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+                target_component="database",
+                condition_config={"expected_status": "unhealthy"},
+            )
+        )
+        repo.rule_channels[rule.id] = [broken.id, good.id]
+        repo.service_health_rows["database"] = ServiceHealth(
+            **_base_fields(
+                component="database",
+                status="unhealthy",
+                last_checked_at=_now(),
+                consecutive_failure_count=1,
+            )
+        )
+
+        result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert result.skipped_rules == 0
+    assert [log.channel_id for log in repo.notification_logs] == [good.id]
+
+
+# ============================================================================
+# Alert Engine: the two-minute outage rule
+# ============================================================================
+
+
+def _unreachable_rule_fields(**overrides: object) -> dict[str, object]:
+    return _alert_rule_fields(
+        trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+        target_component=ALERT_TARGET_ROUTER_REACHABILITY,
+        condition_config={"expected_status": "unreachable"},
+        **overrides,
+    )
+
+
+async def test_a_router_going_down_raises_an_alert():
+    """THE OTHER REGRESSION. Nothing on this platform raised an alert when
+    a router went down.
+
+    ``sweep_stale_heartbeats`` was the only writer of ONLINE -> OFFLINE and
+    its own docstring called alerting "a future alert rule". On 2026-09-07
+    it correctly marked a real router offline and notified nobody. This is
+    that alert.
+    """
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    router = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Office Guest",
+        health_status="healthy",
+        reachability_state="unreachable",
+    )
+    repo.routers.append(router)
+    rule = await repo.create_alert_rule(
+        **_unreachable_rule_fields(organization_id=org_id)
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    alert = result.triggered[0]
+    assert alert.rule_id == rule.id
+    assert alert.router_id == router.id
+    assert alert.organization_id == org_id
+
+
+async def test_the_outage_email_never_claims_the_isp_is_down():
+    """THE COPY CONSTRAINT, as an assertion.
+
+    Outage #1 on 2026-09-07 was a router reboot -- the device's own log
+    shows a cold boot with NTP correcting the clock -- while the ISP was
+    perfectly healthy. From the cloud it looked identical to an uplink
+    failure. An email saying "your ISP is down" would have been
+    checkably wrong and would have sent the owner to argue with their
+    provider about an outage the provider did not cause.
+
+    So the trigger copy may say what was observed and must not name a
+    cause it cannot know.
+    """
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    router = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Office Guest",
+        health_status="healthy",
+        reachability_state="unreachable",
+    )
+    repo.routers.append(router)
+    await repo.create_alert_rule(**_unreachable_rule_fields(organization_id=org_id))
+
+    result = await service.evaluate_alert_rules()
+    message = result.triggered[0].message.lower()
+
+    assert "office guest" in message
+    assert "stopped responding" in message
+    assert "isp" not in message, (
+        "the platform only knows it stopped hearing from the site"
+    )
+    assert "can't tell" in message, "the uncertainty has to be stated, not implied"
+
+
+async def test_the_alert_resolves_and_says_it_stayed_up():
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    router = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Office Guest",
+        health_status="healthy",
+        reachability_state="unreachable",
+    )
+    repo.routers.append(router)
+    await repo.create_alert_rule(**_unreachable_rule_fields(organization_id=org_id))
+
+    await service.evaluate_alert_rules()
+    router.reachability_state = "reachable"
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.resolved) == 1
+    assert result.resolved[0].status == AlertStatus.RESOLVED.value
+    assert "back online" in result.resolved[0].message.lower()
+
+
+async def test_a_router_the_sweep_cannot_judge_never_alerts():
+    """NULL and "unknown" both mean "we have never been able to tell" -- a
+    freshly enrolled device, one mid-provisioning, one whose agent
+    credential expired. Alerting on an unanswered question is exactly what
+    the rogue-DHCP guard already refuses to do."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    for state in (None, "unknown"):
+        router = FakeRouter(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            location_id=uuid.uuid4(),
+            name="Never seen",
+            health_status=None,
+            reachability_state=state,
+        )
+        repo.routers.append(router)
+    await repo.create_alert_rule(**_unreachable_rule_fields(organization_id=org_id))
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+
+
+async def test_a_reachability_rule_may_only_watch_for_unreachable():
+    with pytest.raises(InvalidAlertRuleConfigError):
+        validate_alert_rule_condition_config(
+            AlertTriggerType.HEALTH_STATUS_CHANGE,
+            ALERT_TARGET_ROUTER_REACHABILITY,
+            {"expected_status": "reachable"},
+        )
+    with pytest.raises(InvalidAlertRuleConfigError):
+        validate_alert_rule_condition_config(
+            AlertTriggerType.HEALTH_STATUS_CHANGE,
+            ALERT_TARGET_ROUTER_REACHABILITY,
+            {"expected_status": "unknown"},
+        )
+
+
+# ============================================================================
+# Default alerting: a venue that never opened the alerts screen
+# ============================================================================
+
+
+async def _ensure_defaults(repo: FakeRepository, org_id, contact_email):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    ) as http_client:
+        notification_service = NotificationService(repo, http_client)
+        alert_service = AlertService(repo, notification_service=notification_service)
+        return await ensure_default_alerting(
+            alert_service,
+            notification_service,
+            organization_id=org_id,
+            contact_email=contact_email,
+        )
+
+
+async def test_a_new_organization_can_actually_be_emailed():
+    """THE THIRD REGRESSION.
+
+    Default rules already existed. What did not exist was anywhere for them
+    to send. A rule with no row in ``alert_rule_notification_channels``
+    reaches ``_dispatch_for_alert`` and returns -- the ``Alert`` appears on
+    the dashboard and no mail is sent. On 2026-09-07 the platform's one real
+    organization had zero rules AND no channel of its own, so even a working
+    evaluator would have emailed nobody.
+
+    ``notifiable`` is the whole assertion: rules AND a channel AND the link.
+    """
+    repo = FakeRepository()
+    org_id = uuid.uuid4()
+
+    report = await _ensure_defaults(repo, org_id, "owner@venue.example")
+
+    assert report.notifiable
+    assert report.channel_created
+    reachability_rules = [
+        rule
+        for rule in repo.alert_rules.values()
+        if rule.target_component == ALERT_TARGET_ROUTER_REACHABILITY
+    ]
+    assert len(reachability_rules) == 1
+    linked = repo.rule_channels[reachability_rules[0].id]
+    assert len(linked) == 1
+    channel = repo.notification_channels[linked[0]]
+    assert channel.channel_type == NotificationChannelType.EMAIL.value
+    assert json.loads(decrypt_secret(channel.config_encrypted)) == {
+        "email": "owner@venue.example"
+    }
+
+
+async def test_running_the_backfill_twice_changes_nothing():
+    """The backfill script runs against live customer data, so a second run
+    -- or a re-run after an interruption -- must be a no-op rather than a
+    duplicate set of rules and a second channel."""
+    repo = FakeRepository()
+    org_id = uuid.uuid4()
+
+    first = await _ensure_defaults(repo, org_id, "owner@venue.example")
+    rules_after_first = dict(repo.alert_rules)
+    channels_after_first = dict(repo.notification_channels)
+
+    second = await _ensure_defaults(repo, org_id, "owner@venue.example")
+
+    assert first.rules_created and not second.rules_created
+    assert second.channel_already_present
+    assert set(repo.alert_rules) == set(rules_after_first)
+    assert set(repo.notification_channels) == set(channels_after_first)
+
+
+async def test_an_organization_with_no_contact_email_is_reported_not_silent():
+    """It still gets its rules, but "this venue cannot be emailed" has to be
+    a visible outcome rather than a half-configured organization nobody
+    notices until the night it matters."""
+    repo = FakeRepository()
+
+    report = await _ensure_defaults(repo, uuid.uuid4(), None)
+
+    assert report.rules_created
+    assert not report.notifiable
+    assert report.channel_skipped_reason
+
+
+async def test_the_backfill_never_argues_with_a_rule_somebody_changed():
+    """An operator who retuned, renamed or switched off a default meant to.
+    Idempotency here means "fill in what is missing", never "restore what I
+    think it should be"."""
+    repo = FakeRepository()
+    org_id = uuid.uuid4()
+    await _ensure_defaults(repo, org_id, "owner@venue.example")
+    existing = next(
+        rule
+        for rule in repo.alert_rules.values()
+        if rule.target_component == ALERT_TARGET_ROUTER_REACHABILITY
+    )
+    existing.is_active = False
+    existing.severity = AlertSeverity.INFO.value
+
+    await _ensure_defaults(repo, org_id, "owner@venue.example")
+
+    assert existing.is_active is False
+    assert existing.severity == AlertSeverity.INFO.value
+
+
+async def test_every_default_rule_survives_the_real_validator():
+    """Each default goes through ``AlertService.create_alert_rule``, which
+    runs ``validate_alert_rule_condition_config`` -- so a default whose
+    config the validator would reject fails here, loudly, rather than
+    logging ``default_alert_rule_creation_failed`` in production and
+    leaving a new customer with one fewer rule than they think they have.
+    """
+    repo = FakeRepository()
+
+    report = await _ensure_defaults(repo, uuid.uuid4(), "owner@venue.example")
+
+    assert report.rules_failed == []
+    assert len(report.rules_created) == len(DEFAULT_ALERT_RULES)
+
+
+# ============================================================================
+# A bad mail setting must not take down alerting for every other channel
+# ============================================================================
+
+
+def test_a_broken_smtp_setting_no_longer_kills_the_whole_sweep():
+    """``get_configured_email_provider`` raises at SERVICE-CONSTRUCTION
+    time when ``email_delivery_provider`` is ``smtp``/``ses`` and the
+    matching settings are incomplete -- most easily by leaving
+    ``smtp_from_address`` at its ``noreply@cloudguest.local`` default while
+    authenticating as a real mailbox, which ``SmtpIdentity`` refuses.
+
+    It was called eagerly in two places. In
+    ``_run_alert_rule_evaluation_sweep_async`` it built the service graph
+    before a single rule was evaluated, so ONE wrong mail setting took down
+    alert evaluation for every channel type on the platform -- Slack,
+    webhooks and SMS included, none of which involve email at all. In
+    ``dependencies.get_notification_service`` it is a FastAPI dependency, so
+    the same setting 500'd every monitoring endpoint that touches it,
+    including the alerts screen an operator would open to find out why they
+    were not being alerted. Both now go through the same resolver.
+    """
+    from app.core.config import Settings
+    from app.domains.monitoring.email_provider import resolve_email_provider
+
+    settings = Settings(
+        email_delivery_provider="smtp",
+        smtp_host="smtp.zoho.in",
+        smtp_username="alerts@example.com",
+        smtp_password="hunter2",
+        # The default, and a different mailbox from the username -- the
+        # exact misconfiguration SmtpIdentity refuses.
+        smtp_from_address="noreply@cloudguest.local",
+    )
+
+    provider = resolve_email_provider(settings)
+
+    assert provider is not None, "constructing the service must still succeed"
+
+
+async def test_an_unconfigured_mailbox_fails_loudly_rather_than_reporting_success():
+    """And it must NOT degrade to ``LoggingEmailProvider``.
+
+    That provider returns success, so ``dispatch_notification`` writes
+    ``notification_logs.status = 'sent'`` with ``response_summary`` reading
+    "queued to ... via EmailProviderProtocol" for a mail that was never
+    sent -- indistinguishable from a real delivery in both the database and
+    the API, and the single most dangerous failure mode on this path.
+
+    The misconfiguration is carried to the point of use instead, so the
+    operator finds the original config error in a FAILED row, which is
+    exactly where they will look for it.
+    """
+    from app.domains.monitoring.email_provider import UnconfiguredEmailProvider
+
+    provider = UnconfiguredEmailProvider("smtp_from_address does not match")
+    with pytest.raises(NotificationDeliveryError) as exc_info:
+        await provider.send("owner@venue.example", "subject", "body")
+
+    assert "smtp_from_address does not match" in str(exc_info.value)

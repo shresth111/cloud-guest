@@ -56,6 +56,42 @@ class GuestFontChoice(StrEnum):
     BOLD_DISPLAY = "bold-display"
 
 
+class PortalContentMode(StrEnum):
+    """What the guest-facing captive portal presents as its primary content
+    before (or instead of) the sign-in form. Stored as a plain ``String``
+    column for the same additive-migration reason ``PortalTheme`` is (see
+    this module's header) -- adding a mode never needs an ``ALTER TYPE``.
+
+    ``LOGIN`` is the default and is the *existing*, unchanged behaviour: the
+    portal renders only the sign-in card, exactly as every venue does today.
+    Making it the default (and the value migration 0098 backfills every
+    existing row to) is what keeps this whole feature a pure addition -- no
+    venue's rendered portal changes until an admin deliberately picks a
+    different mode. The other four are the demo-showcased content modes, each
+    rendered by ``PortalContentBlock`` on the frontend and sourced from a
+    dedicated column:
+
+    * ``IMAGE`` -- a full-bleed content image (``content_image_url``), e.g. a
+      promo, menu board, or event card, shown above the connect action.
+    * ``TEXT`` -- a venue-authored text block (``content_heading`` +
+      ``content_body``), e.g. house rules or a welcome note.
+    * ``REDIRECT`` -- the portal sends the guest straight to ``redirect_url``
+      (the pre-existing post-login destination column, reused here rather
+      than a parallel field). Rendered as the existing ``/portal/redirect``
+      countdown screen.
+    * ``SURVEY`` -- a short guest survey (``content_survey`` JSON) shown
+      before connect, e.g. a satisfaction rating or a single choice question.
+
+    This module stores the *selection* and its content; it renders nothing --
+    the frontend owns every mode's presentation."""
+
+    LOGIN = "login"
+    IMAGE = "image"
+    TEXT = "text"
+    REDIRECT = "redirect"
+    SURVEY = "survey"
+
+
 # 6-digit hex color, leading '#' required (e.g. "#1A73E8") -- deliberately
 # does not accept the 3-digit shorthand (e.g. "#FFF") or an alpha channel:
 # a single, unambiguous, copy-paste-from-a-design-tool format keeps
@@ -86,6 +122,19 @@ DEFAULT_SUPPORTED_LANGUAGES: tuple[str, ...] = ("en",)
 # Editorial Serif, Bold Display, or back to System via its own branding
 # settings.
 DEFAULT_GUEST_FONT_CHOICE = GuestFontChoice.MODERN_SANS
+
+# The mode every existing venue is on and every new config starts at -- see
+# PortalContentMode.LOGIN's docstring for why the default must be "render the
+# sign-in card and nothing else" (this feature is purely additive).
+DEFAULT_PORTAL_CONTENT_MODE = PortalContentMode.LOGIN
+
+# Authoring-time ceilings for the two venue-authored content-mode strings.
+# Unlike the splash limits above these are not derived from an above-the-fold
+# render budget -- content-mode copy renders in its own scrollable block, not
+# stacked above the primary CTA -- so they are plain generous column limits
+# that only exist to keep a single row from being unbounded free text.
+CONTENT_HEADING_MAX_LENGTH = 120
+CONTENT_BODY_MAX_LENGTH = 2000
 
 # Integer 0-100, the guest-facing scrim's peak opacity as a percentage --
 # v6 design spec §4.2. 55 is not arbitrary: it is defined to reproduce the
@@ -223,6 +272,114 @@ MAX_BACKGROUND_FOCAL = 100
 SPLASH_HEADLINE_MAX_LENGTH = 26
 SPLASH_WELCOME_MESSAGE_MAX_LENGTH = 78
 
+# Byte ceiling on ``captive_portal_configs.post_login_html`` -- the HTML a
+# venue authors for the page a guest sees *after* a successful sign-in.
+#
+# Measured in UTF-8 **bytes**, not characters, unlike SPLASH_*_MAX_LENGTH
+# above. Those two are rendered-line budgets, so code points are the right
+# unit; this one is a resource limit on a blob that gets parsed on write,
+# cached in Redis and shipped in every guest resolve response, so the unit
+# that matters is what it costs to move and store.
+#
+# 64 KiB is roughly 20x the largest thing a hand-authored page plausibly
+# needs (a full page of prose with inline CSS runs 2-4 KB) while staying
+# small enough that a hostile 64 KB payload is not a useful way to make the
+# sanitizer or the resolve cache expensive. Enforced against the *submitted*
+# value, before sanitizing, so the size in the 400 is the size the venue
+# sees in their own editor -- see html_sanitizer.sanitize_post_login_html.
+#
+# It is deliberately not a DB-level constraint: the column is Text, and the
+# sanitizer can return slightly *more* bytes than it was given (it appends
+# rel/target to anchors), so a hard column limit at exactly this number
+# would reject a payload that passed validation.
+POST_LOGIN_HTML_MAX_BYTES = 64 * 1024
+
+# ``captive_portal_configs.review_url`` -- the venue's own Google review
+# link, pasted from Business Profile -> Read reviews -> Get more reviews.
+#
+# **Merchant-pasted, never synthesised.** The ``g.page/r/...`` and
+# ``search.google.com/local/writereview?placeid=`` shapes are not documented
+# stable contracts and have changed before, so this platform does not build
+# one from a place id and does not rewrite what was pasted. Stored verbatim:
+# no normalising, no parameter stripping, no appending. A helpful rewrite
+# becomes a broken link the first time Google changes the shape, and a
+# silently-wrong link is worse than an empty field because the venue
+# believes the feature is working.
+REVIEW_URL_MAX_LENGTH = 500
+
+# The hosts a pasted review link may live on.
+#
+# This is a *host* allowlist, not a URL-shape allowlist, and the difference
+# is the whole point: the shapes change, the hosts have not. Checking the
+# host catches the realistic paste errors -- a Maps listing, a competitor's
+# link, a typo, an ``http://`` downgrade -- without pretending to know what
+# a valid review path looks like this quarter.
+#
+# Matched against the host exactly, or as a suffix after a dot, so
+# ``maps.google.co.in`` passes via ``google.co.in`` and
+# ``notgoogle.com`` does not pass via ``google.com``.
+REVIEW_URL_ALLOWED_HOST_SUFFIXES = (
+    "google.com",
+    "g.page",
+    "goo.gl",
+    "maps.app.goo.gl",
+    # Google runs a country-code domain per market and an Indian venue is
+    # as likely to copy a ``.co.in`` link as a ``.com`` one. Listing the
+    # markets this product actually sells into rather than every ccTLD
+    # Google owns: an unlisted one is a 400 the venue can report, not a
+    # silent acceptance of a host nobody checked.
+    "google.co.in",
+    "google.co.uk",
+    # ⚠ ``goo.gl`` and ``g.page`` are *redirectors*. Allowlisting them
+    # checks who operates the first hop, not where the guest ends up --
+    # a legacy ``goo.gl/maps/...`` short link is required (Google's own
+    # Maps "Share" produced them for years and they still resolve), and
+    # the price of accepting it is that this validator cannot promise the
+    # destination. It promises the venue pasted a Google-operated link,
+    # which is what catches the realistic mistake: a competitor's URL, a
+    # Maps listing for the wrong branch, an ``http://`` downgrade. The
+    # thing that would promise a destination is a server-side fetch, and
+    # ``validators.validate_review_url`` says why that is a feature rather
+    # than a line in a validator.
+)
+
+# Bounds on ``captive_portal_configs.feedback_dwell_minutes`` -- how long a
+# guest must have been connected before the private star-feedback card is
+# allowed to appear.
+#
+# The card asks "how is it going?", and the honest answer requires having
+# been there a while. Asked at second three it measures the WiFi; asked at
+# minute twenty it measures the visit, which is the thing the venue wants
+# to know. The dwell gate is the whole difference between the two.
+#
+# **These three numbers are the portal's, not this module's.** The guest
+# frontend clamps the value it renders against
+# (``clampFeedbackDwellMinutes`` in ``lib/portal-post-connect.ts``):
+# absent or non-numeric becomes 25, anything below 5 is raised to 5.
+# They are duplicated here so the server rejects what the client would
+# have silently overridden -- a backend that accepts 2 and a frontend
+# that shows the card at 5 is a venue setting a number that does nothing,
+# with no error to explain it. If either side moves, both move.
+#
+# A floor of 5 rather than 0 does mean "no dwell gate at all" cannot be
+# expressed. That is the frontend's existing behaviour rather than a
+# decision taken here, and it is a real product question -- a two-minute
+# QSR counter has a genuine case for showing the card immediately. Left
+# for the PM; see the PR description.
+#
+# The ceiling is a day, and it is not a judgement about what is useful --
+# anything past an hour almost certainly is not. It guards against a
+# value that silently means "never": a session that ends before the gate
+# opens shows nothing, with no error and nothing on screen to explain it.
+# A venue that types 10000 has made a mistake this platform can catch.
+MIN_FEEDBACK_DWELL_MINUTES = 5
+MAX_FEEDBACK_DWELL_MINUTES = 1440
+
+# 25 minutes, matching the frontend's own ``DEFAULT_FEEDBACK_DWELL_MINUTES``
+# -- long enough that the card is asking about a visit rather than about
+# the WiFi. A judgement, not a measurement.
+DEFAULT_FEEDBACK_DWELL_MINUTES = 25
+
 # Field-label constants for the "at most one of text/url" validation --
 # see validators.validate_single_content_source's docstring for why this is
 # "at most one", not "exactly one".
@@ -232,8 +389,12 @@ PRIVACY_POLICY_LABEL = "privacy policy"
 __all__ = [
     "PortalTheme",
     "GuestFontChoice",
+    "PortalContentMode",
     "HEX_COLOR_PATTERN",
     "DEFAULT_THEME",
+    "DEFAULT_PORTAL_CONTENT_MODE",
+    "CONTENT_HEADING_MAX_LENGTH",
+    "CONTENT_BODY_MAX_LENGTH",
     "DEFAULT_PRIMARY_COLOR",
     "DEFAULT_SECONDARY_COLOR",
     "DEFAULT_LANGUAGE",
@@ -248,6 +409,12 @@ __all__ = [
     "MAX_BACKGROUND_FOCAL",
     "SPLASH_HEADLINE_MAX_LENGTH",
     "SPLASH_WELCOME_MESSAGE_MAX_LENGTH",
+    "POST_LOGIN_HTML_MAX_BYTES",
+    "REVIEW_URL_MAX_LENGTH",
+    "REVIEW_URL_ALLOWED_HOST_SUFFIXES",
+    "MIN_FEEDBACK_DWELL_MINUTES",
+    "MAX_FEEDBACK_DWELL_MINUTES",
+    "DEFAULT_FEEDBACK_DWELL_MINUTES",
     "TERMS_AND_CONDITIONS_LABEL",
     "PRIVACY_POLICY_LABEL",
 ]

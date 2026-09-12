@@ -27,7 +27,11 @@ from app.database.exceptions import DuplicateRecordError
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.channel_partner.constants import (
     CHANNEL_PARTNER_PRODUCT_NAME,
+    EMAIL_PROVIDER_NOT_CONFIGURED,
+    SMS_PROVIDER_NOT_CONFIGURED,
     ChannelPartnerStatus,
+    WelcomeDeliveryStatus,
+    welcome_delivery_status,
 )
 from app.domains.channel_partner.exceptions import (
     ChannelPartnerEmailMissingError,
@@ -37,6 +41,7 @@ from app.domains.channel_partner.exceptions import (
 )
 from app.domains.channel_partner.models import ChannelPartner
 from app.domains.channel_partner.router import (
+    _build_partner_response,
     _onboard_message,
     _resend_message,
     router,
@@ -215,6 +220,173 @@ def _make_request(**overrides: object) -> ChannelPartnerCreateRequest:
 # ============================================================================
 # GSTIN validator
 # ============================================================================
+
+
+class TestPartnerResponseCarriesTheDerivedStatuses:
+    """Builds the response the way the endpoint does.
+
+    The first attempt at this feature derived the two statuses in
+    `_build_partner_response` with
+    `ChannelPartnerResponse.model_validate(partner, update={...})`.
+    `update` belongs to `model_copy`, not `model_validate`, so every call
+    raised `TypeError` and `GET /channel-partners` returned 500 in
+    production. The classifier had tests; the thing that assembles the
+    response did not, so nothing caught it.
+
+    These call the real builder against a real ORM instance for exactly
+    that reason.
+    """
+
+    @staticmethod
+    def _partner(
+        *,
+        sms_sent_at: datetime | None = None,
+        sms_error: str | None = None,
+        email_sent_at: datetime | None = None,
+        email_error: str | None = None,
+    ) -> ChannelPartner:
+        partner = ChannelPartner()
+        partner.id = uuid.uuid4()
+        partner.name = "CB BROADBAND"
+        partner.phone = "+917830900309"
+        partner.email = "cbbroadband1@gmail.com"
+        partner.address = "addr"
+        partner.city = "HALDWANI"
+        partner.gst_number = "05AAQFC7351Q1Z5"
+        partner.status = ChannelPartnerStatus.ACTIVE.value
+        partner.welcome_sms_sent_at = sms_sent_at
+        partner.welcome_sms_error = sms_error
+        partner.welcome_email_sent_at = email_sent_at
+        partner.welcome_email_error = email_error
+        partner.created_at = datetime(2026, 8, 24, tzinfo=UTC)
+        partner.updated_at = partner.created_at
+        return partner
+
+    def test_the_builder_does_not_raise(self) -> None:
+        """The 500. Kept as its own case so a regression reads as
+        "the endpoint is broken", not as a wrong label."""
+        _build_partner_response(self._partner(sms_error=SMS_PROVIDER_NOT_CONFIGURED))
+
+    def test_the_live_shape_reads_as_delivered_not_failed(self) -> None:
+        """Three of the five live partners looked exactly like this: no SMS
+        provider on the server, email delivered. The console showed
+        "Welcome failed"."""
+        response = _build_partner_response(
+            self._partner(
+                sms_error=SMS_PROVIDER_NOT_CONFIGURED,
+                email_sent_at=datetime(2026, 8, 24, 9, 42, tzinfo=UTC),
+            )
+        )
+
+        assert response.welcome_sms_status is WelcomeDeliveryStatus.NOT_CONFIGURED
+        assert response.welcome_email_status is WelcomeDeliveryStatus.SENT
+
+    def test_a_real_failure_still_reads_as_failed(self) -> None:
+        response = _build_partner_response(
+            self._partner(
+                sms_error=SMS_PROVIDER_NOT_CONFIGURED,
+                email_error="(535, b'Authentication Failed')",
+            )
+        )
+
+        assert response.welcome_email_status is WelcomeDeliveryStatus.FAILED
+
+    def test_the_statuses_survive_serialization(self) -> None:
+        """They are computed fields; a `@property` that pydantic does not
+        know about would vanish from the JSON and the console would fall
+        back to its own derivation without anyone noticing."""
+        dumped = _build_partner_response(
+            self._partner(sms_error=SMS_PROVIDER_NOT_CONFIGURED)
+        ).model_dump()
+
+        assert dumped["welcome_sms_status"] == WelcomeDeliveryStatus.NOT_CONFIGURED
+        assert dumped["welcome_email_status"] == WelcomeDeliveryStatus.NOT_ATTEMPTED
+
+
+class TestWelcomeDeliveryStatus:
+    """The console reads these, and it must not call a server-configuration
+    fact a per-partner failure.
+
+    On the live fleet all five channel partners carried a red *Welcome
+    failed* badge. Three of them had had their welcome email delivered
+    successfully; the badge came entirely from SMS, which that deployment
+    has no provider for at all. Nothing was wrong with those three
+    partners, and no amount of following up on them would have changed
+    anything.
+    """
+
+    def test_a_delivered_channel_is_sent(self) -> None:
+        assert (
+            welcome_delivery_status(
+                sent_at=datetime(2026, 8, 26, tzinfo=UTC),
+                error=None,
+                not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.SENT
+        )
+
+    def test_a_missing_provider_is_not_a_failure(self) -> None:
+        assert (
+            welcome_delivery_status(
+                sent_at=None,
+                error=SMS_PROVIDER_NOT_CONFIGURED,
+                not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.NOT_CONFIGURED
+        )
+
+    def test_a_real_send_error_is_a_failure(self) -> None:
+        """The one partner on the live fleet that genuinely failed carried
+        `(535, b'Authentication Failed')` from the mailbox that was
+        misconfigured at the time. That one is worth chasing; the other
+        four were not."""
+        assert (
+            welcome_delivery_status(
+                sent_at=None,
+                error="(535, b'Authentication Failed')",
+                not_configured_message=EMAIL_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.FAILED
+        )
+
+    def test_a_channel_never_attempted_is_neither(self) -> None:
+        """A partner onboarded without an email address never had one
+        attempted -- that is not a failure and not a missing provider."""
+        assert (
+            welcome_delivery_status(
+                sent_at=None,
+                error=None,
+                not_configured_message=EMAIL_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.NOT_ATTEMPTED
+        )
+
+    def test_a_later_success_outranks_stale_error_text(self) -> None:
+        """A resend clears the error, but if any path ever left both set,
+        the recorded send is the fact that actually happened."""
+        assert (
+            welcome_delivery_status(
+                sent_at=datetime(2026, 8, 26, tzinfo=UTC),
+                error=SMS_PROVIDER_NOT_CONFIGURED,
+                not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.SENT
+        )
+
+    def test_the_service_writes_exactly_the_message_the_classifier_reads(
+        self,
+    ) -> None:
+        """The classification is a string compare, so the writer and the
+        reader must not be allowed to drift apart. Both now import the same
+        constant; this pins that they still do."""
+        import inspect
+
+        from app.domains.channel_partner import service as service_module
+
+        source = inspect.getsource(service_module)
+        assert "SMS_PROVIDER_NOT_CONFIGURED" in source
+        assert "EMAIL_PROVIDER_NOT_CONFIGURED" in source
+        assert "No real SMS delivery provider is configured" not in source
 
 
 class TestGstinValidator:

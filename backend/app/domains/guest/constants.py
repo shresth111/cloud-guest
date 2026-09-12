@@ -155,6 +155,40 @@ GUEST_SESSION_STATUS_TRANSITIONS: dict[
 # short-lived (minutes) verification codes.
 DEFAULT_SESSION_TIMEOUT_MINUTES = 240
 
+# How long a guest's device may pass ZERO bytes in either direction before
+# the NAS closes their session -- the RFC 2865 s5.28 ``Idle-Timeout`` reply
+# attribute this platform now sends on every Access-Accept
+# (``RadiusService.authorize``).
+#
+# Thirty minutes, and the number is not arbitrary: it is the SAME value the
+# Master console's own router setup script already writes onto RouterOS's
+# built-in ``default`` hotspot user profile
+# (``RouterDetailTabs.tsx``'s ``HOTSPOT_IDLE_TIMEOUT``). Two things follow
+# from deliberately matching it rather than picking a fresh number:
+#
+# * A venue that has never opened the Guest WiFi Limits screen sees no
+#   behaviour change at all from this platform starting to send the
+#   attribute. The reply now merely states, per session, what the device
+#   was already doing.
+# * The reply becomes the single source of truth. The profile value is a
+#   device-side *backstop* that only applies to a session RADIUS never
+#   answered for; every real guest's idle timeout is decided here, so it no
+#   longer depends on whether a given router was provisioned before or
+#   after that constant existed.
+#
+# It is emphatically NOT RouterOS's own factory default. RouterOS ships
+# ``idle-timeout=none`` on that profile, and this fleet also sets
+# ``keepalive-timeout=none`` (a fix for a confirmed incident where phones
+# locking their screens were hard-logged-out at the factory two-minute
+# keepalive). With both off, NOTHING closed an abandoned session: slots
+# stayed held against ``shared-users``, device counts only ever rose, and
+# RADIUS never saw an Accounting-Stop. The 30m was introduced to fix
+# exactly that. Anything here that lengthens or removes it is re-opening a
+# closed incident, which is why "no idle timeout at all" is deliberately
+# not an option this platform offers -- see
+# ``app.domains.policy.constants.PLATFORM_DEFAULT_RULES``.
+DEFAULT_IDLE_TIMEOUT_MINUTES = 30
+
 # How long, after an admin-driven ``terminate_session`` (punitive, not a
 # normal disconnect), the same guest is blocked from reconnecting at all --
 # see ``exceptions.SessionTerminationCooldownError``.
@@ -251,10 +285,13 @@ DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST = 20
 # Device limit -- Guest Session Engine (Phase 1).
 # ============================================================================
 
-# The maximum number of distinct ``GuestDevice`` rows (by MAC address) one
-# guest may have registered at once, enforced by
-# ``service._enforce_device_limit`` at the start of both
-# ``login_via_otp``/``login_via_voucher``. Unlike
+# The maximum number of a guest's devices that may be **connected at the
+# same time** (distinct devices currently holding ``ACTIVE`` sessions),
+# enforced by ``service._enforce_device_limit`` at the start of both
+# ``login_via_otp``/``login_via_voucher``. The basis is deliberately
+# *connected*, not *registered*: a guest can register more devices than
+# this over time (each was once connected), and an idle registered device
+# does not occupy the limit. Unlike
 # ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` above (which predates
 # ``app.domains.policy`` and was only ever a plain constant), this value is
 # resolved through the real ``PolicyType.DEVICE`` seam
@@ -296,6 +333,27 @@ TASK_RUN_SESSION_TIMEOUT_SWEEP = "app.domains.guest.tasks.run_session_timeout_sw
 # ============================================================================
 
 MAX_BULK_DEVICE_LOOKUP_IDS = 100
+
+# ============================================================================
+# Bulk voucher-redemption lookup -- see
+# ``GuestRepository.list_voucher_redemptions``'s own docstring.
+#
+# The Vouchers screen has the opposite problem to the one above, for a
+# structural reason rather than an oversight: ``app.domains.voucher.models
+# .Voucher`` stores a *self-reported* ``redeemed_identifier`` string and
+# deliberately no FK to a guest, device or session, so a voucher row cannot
+# say which device actually redeemed it. ``guest_sessions.voucher_id`` is
+# the only link, and it belongs to this domain -- which is why the resolver
+# is exposed from here and the voucher domain is left untouched, rather
+# than ``voucher/service.py`` querying ``guest_sessions`` and inverting the
+# dependency direction ``voucher/models.py`` sets out explicitly.
+#
+# Same bound and same reasoning as the device lookup above: a page-sized
+# batch, matching every list endpoint's own ``page_size<=100`` cap, rather
+# than an unbounded ``IN (...)``.
+# ============================================================================
+
+MAX_BULK_VOUCHER_LOOKUP_IDS = 100
 
 # Every 5 minutes -- shorter than analytics' 15-minute rolling aggregation
 # cadence (``SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS``-adjacent), because an
@@ -513,7 +571,31 @@ NAS_CODE_SEQUENCE_DIGITS = 4
 # FreeRADIUS's own config and never manually retyped afterward).
 NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES = 32
 
+# ---------------------------------------------------------------------------
+# Login-failure reasons
+# ---------------------------------------------------------------------------
+
+# What ``GuestLoginHistory.failure_reason`` carries when a whitelist-only
+# property turned a guest away.
+#
+# Every other value in that column is an exception class name
+# (``type(exc).__name__``, see ``GuestService._record_login_failure``'s
+# callers), and this one keeps that convention deliberately: it is exactly
+# ``WhitelistOnlyAccessDeniedError.__name__``, spelled out as a constant so
+# the reporting query that answers "who did we turn away?" does not have to
+# import an exception class out of another domain to build a filter -- and
+# so renaming that class cannot silently split one venue's refusal history
+# into two buckets.
+#
+# It is its own value rather than reusing ``GuestAccessDeniedError``: an
+# operator reviewing refusals needs "we admit only listed guests and this
+# person is not on the list" separated from "this person is barred". They
+# lead to opposite actions -- add them to the list, or do not.
+WHITELIST_ONLY_LOGIN_FAILURE_REASON = "WhitelistOnlyAccessDeniedError"
+
+
 __all__ = [
+    "WHITELIST_ONLY_LOGIN_FAILURE_REASON",
     "GuestAuthMethod",
     "GuestSessionStatus",
     "GUEST_SESSION_STATUS_TRANSITIONS",
@@ -546,4 +628,143 @@ __all__ = [
     "NAS_CODE_SEQUENCE_DIGITS",
     "NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES",
     "MAX_BULK_DEVICE_LOOKUP_IDS",
+    "MAX_BULK_VOUCHER_LOOKUP_IDS",
 ]
+
+
+class RadiusNasDevicePushStatus(StrEnum):
+    """Lifecycle of a :class:`~.models.RadiusNasClient`'s **router-side**
+    push -- the device's own ``/radius`` row and its ``/radius incoming``
+    CoA listener.
+
+    Deliberately separate from ``hub_client_synced_ip``/``_at``, which
+    record the *other* half: that the hub's FreeRADIUS confirmed a
+    ``client{}`` stanza. Both halves are required and neither implies the
+    other. A NAS registration synced to the hub but never pushed to the
+    router is the state the whole fleet was in, because until now nothing
+    in this application called the gateway writer for it.
+
+    * ``PENDING`` -- registered, never pushed from here. Every pre-existing
+      row is backfilled to this, truthfully: no code path could push one.
+      It does **not** mean the router has nothing -- a router provisioned
+      by pasting the generated setup script has a ``/radius`` row this
+      platform never wrote and cannot account for. ``PENDING`` says only
+      that *this* path has not run.
+    * ``ACTIVE`` -- the ``/radius`` row for this server exists on the
+      device carrying this platform's secret and ``src-address``, and
+      ``/radius incoming`` accepts on the CoA port. Stated that narrowly on
+      purpose: it is a claim about objects written and read back, **not**
+      that a Disconnect-Request from the hub arrives. That is device test
+      T8 (``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md``), unrun,
+      and it needs a shell on the RADIUS host. ``guest_access``'s block
+      enforcement is built not to depend on CoA for exactly this reason.
+    * ``FAILED`` -- the last attempt raised; ``device_push_error`` holds the
+      device's own words.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
+class GuestSessionEndedReason(StrEnum):
+    """What the captive portal is allowed to tell a returning guest about
+    the session that just ended on their device -- see
+    ``schemas.GuestLastEndedSessionResponse`` and
+    ``service.GuestService.get_last_ended_session_for_device``.
+
+    This is a **closed, derived** vocabulary, not
+    ``models.GuestSession.disconnect_reason``. That column is free text
+    written by three mutually distrusting sources and can never be handed
+    to a guest:
+
+    * an operator's own words, via
+      ``app.domains.guest_access.enforcement.BlockEnforcer._disconnect_reason``,
+      which stores ``f"Blocked: {reason}"`` -- returning that raw would
+      re-open precisely the operator-reason leak closed in backend #169;
+    * the NAS's ``Acct-Terminate-Cause`` verbatim (``Lost-Service``,
+      ``Idle-Timeout``, ...), which is vendor jargon, not guest copy;
+    * the portal's own prose (``"guest tapped disconnect"``).
+
+    So the mapping keys off ``GuestSessionStatus`` -- an enum this domain
+    owns -- and nothing else. Four members:
+
+    * ``TIMED_OUT`` -- ``EXPIRED``: ``enforce_session_timeouts`` swept the
+      session because ``last_activity_at`` fell further behind than
+      ``session_timeout_minutes``. This is the founder's case.
+    * ``IDLE_TIMED_OUT`` -- ``DISCONNECTED`` carrying the NAS's own
+      ``Idle-Timeout`` terminate cause (RFC 2866 s5.10 value 4). The
+      venue's configured idle timeout fired on the device. See
+      ``service.RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE`` for why this became
+      a distinguishable event only once this platform started *sending*
+      ``Idle-Timeout``, and why it is not folded into ``DISCONNECTED``.
+    * ``TIME_LIMIT_REACHED`` -- ``EXPIRED`` carrying one of
+      ``service.FUP_TIME_QUOTA_DISCONNECT_REASONS``:
+      ``run_fup_time_accrual`` expired the session because the guest has
+      spent their venue-configured daily/weekly/monthly connected-time
+      allowance. Distinct from ``TIMED_OUT`` because the two need
+      opposite advice: one guest can sign straight back in, the other
+      cannot until the period rolls over.
+    * ``DISCONNECTED`` -- ``DISCONNECTED``: a normal, non-punitive end.
+      The NAS reported an Accounting-Stop, the router rebooted
+      (``close_sessions_for_nas_restart``), or the guest tapped
+      Disconnect. These are not split further because the only column
+      that could split them is the free text above, and guessing a
+      cause from it would be a confident lie rather than a message.
+
+    The two added members do not weaken the "no free text ever reaches a
+    guest" guarantee that the original two-member vocabulary was built
+    on. Both are still *derived*: the mapping compares
+    ``disconnect_reason`` against string literals written in this
+    repository (or, for ``IDLE_TIMED_OUT``, against a closed RFC
+    enumeration arriving from a shared-secret-authenticated NAS), and
+    returns one of these members. The column's own contents are still
+    never returned.
+
+    ``TERMINATED`` and ``PAUSED`` map to **no member at all** -- the
+    lookup returns ``None`` and the portal shows an ordinary sign-in
+    page. See the service method's docstring for why that is the only
+    safe answer for both.
+    """
+
+    TIMED_OUT = "timed_out"
+    IDLE_TIMED_OUT = "idle_timed_out"
+    TIME_LIMIT_REACHED = "time_limit_reached"
+    DISCONNECTED = "disconnected"
+
+
+#: How long after a session ends the portal may still greet the returning
+#: device with "you were disconnected" instead of a plain sign-in page.
+#:
+#: The message has to be true *from the guest's side*: the only thing they
+#: actually observed is that the internet stopped, and this screen exists
+#: to connect that observation to a cause. That connection has a shelf
+#: life. Ten seconds later it is the obvious explanation; the next morning
+#: it is a non-sequitur about something they have long since stopped
+#: thinking about, and reads as a fresh fault rather than an explanation
+#: of an old one.
+#:
+#: 60 minutes, against the 240-minute ``DEFAULT_SESSION_TIMEOUT_MINUTES``:
+#:
+#: * Long enough for the real gap between a session dying and the guest
+#:   next opening a browser. The portal is only ever reached when the
+#:   device asks for a page, so a phone in a pocket through a meal or a
+#:   meeting routinely delays the visit by tens of minutes. A 5- or
+#:   10-minute window would silently miss most genuine cases while looking
+#:   like it worked in testing.
+#: * Short enough never to span two visits. A guest who leaves a venue and
+#:   comes back more than an hour later is a returning guest, and telling
+#:   them they "were disconnected" describes an event from their last
+#:   visit, not this one.
+#: * A quarter of the timeout it most often explains, so the explanation
+#:   can never outlive the session it is about by more than a fraction of
+#:   that session's own length. Tying it to the timeout directly
+#:   (``timeout // 4``) was rejected: the window is a fact about human
+#:   memory, not about venue policy, and it should not move when a venue
+#:   picks a different timeout.
+#:
+#: The 240-minute figure is itself only the platform default -- no venue
+#: has ever chosen it (there was no setting to choose it with). If venues
+#: gain a real timeout setting, revisit this number, but revisit it as a
+#: question about the guest, not as an arithmetic function of theirs.
+LAST_ENDED_SESSION_WINDOW_MINUTES = 60

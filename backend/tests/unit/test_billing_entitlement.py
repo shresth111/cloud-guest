@@ -470,9 +470,7 @@ class TestLicenseServiceInvalidatesEntitlementCache:
 
     async def test_activate_suspend_cancel_invalidate(self) -> None:
         cache = FakeEntitlementCache()
-        service, license_repo, plan_repo = make_license_service(
-            entitlement_cache=cache
-        )
+        service, license_repo, plan_repo = make_license_service(entitlement_cache=cache)
         plan = _make_plan()
         plan_repo.plans[plan.id] = plan
         org_id = uuid.uuid4()
@@ -481,22 +479,31 @@ class TestLicenseServiceInvalidatesEntitlementCache:
         )
         license_repo.licenses[lic.id] = lic
 
-        await service.activate_license(actor_user_id=None, license_id=lic.id)
+        await service.activate_license(
+            actor_user_id=None,
+            license_id=lic.id,
+            requesting_organization_id=None,
+        )
         assert cache.invalidated.count(org_id) == 1
 
         await service.suspend_license(
-            actor_user_id=None, license_id=lic.id, reason="payment failed"
+            actor_user_id=None,
+            license_id=lic.id,
+            reason="payment failed",
+            requesting_organization_id=None,
         )
         assert cache.invalidated.count(org_id) == 2
 
-        await service.cancel_license(actor_user_id=None, license_id=lic.id)
+        await service.cancel_license(
+            actor_user_id=None,
+            license_id=lic.id,
+            requesting_organization_id=None,
+        )
         assert cache.invalidated.count(org_id) == 3
 
     async def test_expire_license_invalidates(self) -> None:
         cache = FakeEntitlementCache()
-        service, license_repo, plan_repo = make_license_service(
-            entitlement_cache=cache
-        )
+        service, license_repo, plan_repo = make_license_service(entitlement_cache=cache)
         plan = _make_plan()
         plan_repo.plans[plan.id] = plan
         org_id = uuid.uuid4()
@@ -509,9 +516,7 @@ class TestLicenseServiceInvalidatesEntitlementCache:
 
     async def test_upgrade_license_invalidates(self) -> None:
         cache = FakeEntitlementCache()
-        service, license_repo, plan_repo = make_license_service(
-            entitlement_cache=cache
-        )
+        service, license_repo, plan_repo = make_license_service(entitlement_cache=cache)
         old_plan = _make_plan()
         new_plan = _make_plan()
         plan_repo.plans[old_plan.id] = old_plan
@@ -521,7 +526,10 @@ class TestLicenseServiceInvalidatesEntitlementCache:
         license_repo.licenses[lic.id] = lic
 
         await service.upgrade_license(
-            actor_user_id=None, license_id=lic.id, new_plan_id=new_plan.id
+            actor_user_id=None,
+            license_id=lic.id,
+            new_plan_id=new_plan.id,
+            requesting_organization_id=None,
         )
 
         assert org_id in cache.invalidated

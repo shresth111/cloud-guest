@@ -13,10 +13,13 @@ request_id}`` contract, only the fact(s) it asked for.
 
 from __future__ import annotations
 
+import ipaddress
+import re
+import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domains.router.enums import RouterStatus
 
@@ -36,6 +39,34 @@ __all__ = [
     "AgentNetwatchEventRequest",
     "AgentNetwatchEventResponse",
 ]
+
+
+# Mirrors app.domains.router.schemas._validate_host_address exactly --
+# management_ip_address/public_ip_address end up used as a literal `host`
+# in an outbound request elsewhere in the Router domain (the WebFig proxy),
+# so an unvalidated value here is a request-forgery-shaped risk, not just a
+# data-quality one. Kept as a local copy rather than a cross-domain import
+# of that domain's private helper, matching how _MAC_PATTERN/_validate_mac
+# is never shared across domains either.
+_HOSTNAME_LABEL_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def _validate_host_address(value: str) -> str:
+    candidate = value.strip()
+    try:
+        ipaddress.ip_address(candidate)
+        return candidate
+    except ValueError:
+        pass
+    if (
+        candidate
+        and len(candidate) <= 253
+        and all(_HOSTNAME_LABEL_PATTERN.match(label) for label in candidate.split("."))
+    ):
+        return candidate
+    raise ValueError(
+        "must be a valid IPv4/IPv6 address or a syntactically valid hostname"
+    )
 
 
 # ============================================================================
@@ -60,6 +91,11 @@ class AgentHeartbeatRequest(BaseModel):
     # app.domains.isp.service._resolve_credentials's own
     # `router.management_ip_address or router.public_ip_address`).
     public_ip_address: str | None = Field(default=None, max_length=45)
+
+    @field_validator("management_ip_address", "public_ip_address")
+    @classmethod
+    def validate_host_address(cls, value: str | None) -> str | None:
+        return _validate_host_address(value) if value is not None else value
 
 
 class AgentHeartbeatResponse(BaseModel):
@@ -187,7 +223,7 @@ class AgentNetwatchEventRequest(BaseModel):
     ``validators.netwatch_status_to_ping_result`` never has to handle
     anything else."""
 
-    isp_link_id: str
+    isp_link_id: uuid.UUID
     status: Literal["up", "down"]
     host: str | None = Field(
         default=None,

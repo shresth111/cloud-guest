@@ -45,6 +45,10 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import MacAuthorizationType
@@ -54,6 +58,7 @@ from .events import (
     MacAuthorizationEntryUpdated,
 )
 from .exceptions import (
+    CrossLocationMacAuthorizationAccessError,
     CrossOrganizationMacAuthorizationAccessError,
     MacAuthorizationAlreadyExistsError,
     MacAuthorizationEntryNotFoundError,
@@ -115,9 +120,19 @@ class MacAuthorizationService:
         *,
         audit_writer: AuditLogWriter | None = None,
         router_lookup: RouterLookupProtocol | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.audit_writer = audit_writer
+        # Constructor-injected while `requesting_organization_id` stays
+        # per-method: an organization id is an *argument* (which tenant
+        # this call is about, and a Celery task legitimately varies it
+        # per call), whereas a location confinement is a *property of
+        # the caller*, fixed for the request, and a security control.
+        # Threading a security control through every method means every
+        # method can forget it, silently. See
+        # `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
         # Optional, additive (mirrors app.domains.network_config.service
         # .NetworkConfigService's own wireguard_lookup/radius_nas_lookup
         # convention): only needed for list_active_entries_for_router,
@@ -188,6 +203,14 @@ class MacAuthorizationService:
             and entry.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationMacAuthorizationAccessError()
+        # Not enough on its own: this row is reached by its own id, so the
+        # permission check had nothing to pin to and a LOCATION grant on
+        # the caller's own site satisfied it.
+        enforce_entity_location(
+            entity_location_id=getattr(entry, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationMacAuthorizationAccessError(),
+        )
         return entry
 
     async def list_entries(
@@ -386,13 +409,33 @@ class MacAuthorizationService:
         ]
 
     async def is_mac_authorized(
-        self, mac_address: str, *, organization_id: uuid.UUID
+        self,
+        mac_address: str,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> bool:
         """Whether ``mac_address`` currently has a valid (enabled,
-        non-expired) authorization entry for ``organization_id`` -- see
-        module docstring for this method's own "not yet wired into guest
-        login" scope note. A malformed ``mac_address`` is never
-        authorized (returns ``False``, never raises)."""
+        non-expired) authorization entry that applies at ``location_id``
+        within ``organization_id``. A malformed ``mac_address`` is never
+        authorized (returns ``False``, never raises).
+
+        ``location_id`` is the location the device is actually trying to
+        connect at -- in practice the connecting router's own
+        ``location_id``. An entry with a ``NULL`` ``location_id`` is
+        organization-wide and applies everywhere; an entry that names a
+        location applies only there. That is exactly the predicate
+        ``list_active_entries_for_router`` a few lines above has always
+        used to decide which entries a given router should be told about.
+
+        This method did not apply it, and the two therefore disagreed: the
+        column was stored, the dashboard sent it, the router-facing list
+        honoured it, and the login-time check ignored it. A hotel chain
+        that trusted a lobby TV at one property had silently trusted that
+        MAC at every property in the organization. Passing no
+        ``location_id`` keeps the old organization-wide behaviour, so a
+        caller that genuinely has no location in hand is unchanged.
+        """
         try:
             normalized_mac = normalize_mac_address(mac_address)
         except MacAuthorizationError:
@@ -401,6 +444,12 @@ class MacAuthorizationService:
             organization_id, normalized_mac
         )
         if entry is None:
+            return False
+        if (
+            location_id is not None
+            and entry.location_id is not None
+            and entry.location_id != location_id
+        ):
             return False
         return is_currently_valid(
             is_enabled=entry.is_enabled,

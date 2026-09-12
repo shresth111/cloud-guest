@@ -62,9 +62,7 @@ class ChannelPartnerRepository:
     async def create_partner(self, **fields: object) -> ChannelPartner:
         return await self.partners.create(fields)
 
-    async def get_by_id(
-        self, channel_partner_id: uuid.UUID
-    ) -> ChannelPartner | None:
+    async def get_by_id(self, channel_partner_id: uuid.UUID) -> ChannelPartner | None:
         return await self.partners.get_by_id(channel_partner_id)
 
     async def update_partner(

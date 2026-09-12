@@ -21,13 +21,15 @@ from app.domains.auth.dependencies import get_auth_repository
 from app.domains.auth.repository import AuthRepositoryProtocol
 from app.domains.monitored_hardware.dependencies import get_monitored_hardware_service
 from app.domains.monitored_hardware.service import MonitoredHardwareService
-from app.domains.otp.service import (
-    get_configured_email_provider,
-    get_configured_sms_provider,
+from app.domains.otp.service import get_configured_sms_provider
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
 )
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
+from .email_provider import resolve_email_provider
 from .repository import MonitoringRepository, MonitoringRepositoryProtocol
 from .service import (
     AlertService,
@@ -83,7 +85,14 @@ def get_notification_service(
         repository,
         http_client,
         sms_provider=get_configured_sms_provider(settings),
-        email_provider=get_configured_email_provider(settings),
+        # Not ``get_configured_email_provider`` directly: it raises on an
+        # incomplete SMTP configuration, and this is a FastAPI dependency,
+        # so one wrong mail setting would 500 every monitoring endpoint
+        # that touches it -- including the alerts screen an operator would
+        # open in order to find out why they were not being alerted. See
+        # ``email_provider`` for why the failure is carried to the point of
+        # use rather than swallowed into a log-only fallback.
+        email_provider=resolve_email_provider(settings),
     )
 
 
@@ -94,12 +103,16 @@ def get_alert_service(
     monitored_hardware_service: MonitoredHardwareService = Depends(
         get_monitored_hardware_service
     ),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
+    settings: Settings = Depends(get_settings),
 ) -> AlertService:
     return AlertService(
         repository,
         notification_service=notification_service,
         redis_client=redis_client,
         monitored_hardware_service=monitored_hardware_service,
+        caller_location_scope=caller_location_scope,
+        platform_alert_emails=settings.platform_alert_email_list,
     )
 
 

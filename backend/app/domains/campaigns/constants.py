@@ -109,6 +109,30 @@ DEFAULT_DISPLAY_INTERVAL_DAYS = 7
 # at request time (see `validators.compute_effective_status`), since a
 # campaign that ended 30 seconds ago must never be served just because
 # the sweep hasn't ticked yet.
+# Ceiling on how many live questions one campaign may carry.
+#
+# There was no cap at all. A venue could author two hundred questions and
+# ``CampaignOverlay`` would render every one of them as a flat stacked list
+# with no pagination and no sectioning -- on a phone, inside a
+# captive-portal websheet. That is not a survey, it is a wall, and it is a
+# defect independent of any particular feature.
+#
+# Ten is roughly what fits a phone screen as a stack of ``rating_5`` rows
+# before it stops being answerable. It is a judgement, not a measurement,
+# and it is a constant with this comment rather than a literal in the
+# service so the next person can move it knowing what it was chosen
+# against.
+#
+# Enforced on ``add_question`` only -- the authoring path. Deliberately not
+# on ``clone_campaign``: a clone copies a campaign that was legal when it
+# was authored, and refusing to duplicate an existing over-limit campaign
+# would strand a venue with a survey they can neither run twice nor
+# shrink without deleting questions one at a time. Same grandfathering
+# reasoning as the splash-length ceilings in
+# ``app.domains.captive_portal.service.update_config``: the limit binds
+# the next time somebody adds, which is the only moment it does any good.
+MAX_QUESTIONS_PER_CAMPAIGN = 10
+
 CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS = 300.0
 
 TASK_SWEEP_CAMPAIGN_STATUS_TRANSITIONS = (
@@ -124,6 +148,7 @@ __all__ = [
     "DEFAULT_IS_SKIPPABLE",
     "DEFAULT_DISPLAY_RULE",
     "DEFAULT_DISPLAY_INTERVAL_DAYS",
+    "MAX_QUESTIONS_PER_CAMPAIGN",
     "CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS",
     "TASK_SWEEP_CAMPAIGN_STATUS_TRANSITIONS",
 ]

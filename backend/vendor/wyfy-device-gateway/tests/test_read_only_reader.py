@@ -169,3 +169,104 @@ def test_sanitized_fields_do_not_include_public_key() -> None:
     assert "private-key" in SANITIZED_ROW_FIELDS
     assert "password" in SANITIZED_ROW_FIELDS
     assert "secret" in SANITIZED_ROW_FIELDS
+
+
+# ============================================================================
+# Venue diagnostics read-set (section G)
+# ============================================================================
+
+
+def test_venue_diagnostic_sections_are_allowlisted_at_the_right_paths() -> None:
+    """The four reads the Connection Tools redesign is built on. The exact
+    path tuples matter -- a plausible-but-wrong one (``ip/hotspot/hosts``,
+    ``interface/bridge/hosts``) raises on the device, and per-section error
+    capture would degrade that to a quietly missing tile rather than a
+    failure anyone notices."""
+    assert READ_ONLY_SECTION_PATHS["hotspot_hosts"] == ("ip", "hotspot", "host")
+    assert READ_ONLY_SECTION_PATHS["bridge_hosts"] == (
+        "interface",
+        "bridge",
+        "host",
+    )
+    assert READ_ONLY_SECTION_PATHS["neighbors"] == ("ip", "neighbor")
+    assert READ_ONLY_SECTION_PATHS["dns_cache"] == ("ip", "dns", "cache")
+
+
+@pytest.mark.asyncio
+async def test_venue_diagnostic_sections_read_real_rows() -> None:
+    """Each of the four returns its rows through the reader unchanged --
+    these carry no secret-bearing fields, so sanitization must not eat
+    anything. Rows are shaped as the real menus reply."""
+    canned = {
+        ("ip", "hotspot", "host"): [
+            {"mac-address": "AA:BB:CC:DD:EE:01", "address": "10.5.50.20",
+             "authorized": "false", "bypassed": "false"},
+        ],
+        ("interface", "bridge", "host"): [
+            {"mac-address": "C0:3A:55:11:22:33", "on-interface": "ether2",
+             "bridge": "bridge", "local": "false"},
+        ],
+        ("ip", "neighbor"): [
+            {"interface": "ether2", "address": "192.168.0.254",
+             "identity": "AP-1", "platform": "TP-Link", "board": "EAP225"},
+        ],
+        ("ip", "dns", "cache"): [
+            {"name": "wifi.wyfyguest.com", "type": "A",
+             "data": "10.5.50.1", "ttl": "1d"},
+        ],
+    }
+    reader, _ = _reader(canned)
+
+    hotspot_hosts = await reader.read_section("hotspot_hosts")
+    bridge_hosts = await reader.read_section("bridge_hosts")
+    neighbors = await reader.read_section("neighbors")
+    dns_cache = await reader.read_section("dns_cache")
+
+    # The whole point of hotspot_hosts: "on the network but not logged in"
+    # is a state the platform previously could not see at all.
+    assert hotspot_hosts[0]["authorized"] == "false"
+    # The whole point of bridge_hosts: which physical port, hence which AP.
+    assert bridge_hosts[0]["on-interface"] == "ether2"
+    assert neighbors[0]["identity"] == "AP-1"
+    assert dns_cache[0]["data"] == "10.5.50.1"
+
+
+@pytest.mark.asyncio
+async def test_absent_venue_diagnostic_menu_degrades_one_section_only() -> None:
+    """A router with no hotspot configured has no ``/ip/hotspot/host``
+    menu, and an AP that speaks no LLDP leaves ``/ip/neighbor`` empty.
+    Neither may cost the other three sections -- this is the property that
+    lets a diagnostics page show a dead tile instead of a dead page."""
+    reader, _ = _reader(
+        {
+            ("interface", "bridge", "host"): [{"mac-address": "AA:BB:CC:DD:EE:01"}],
+            ("ip", "neighbor"): [],
+            ("ip", "dns", "cache"): [{"name": "example.com"}],
+        },
+        failing=[("ip", "hotspot", "host")],
+    )
+
+    capture = await reader.read_all(
+        ["hotspot_hosts", "bridge_hosts", "neighbors", "dns_cache"]
+    )
+
+    assert "hotspot_hosts" in capture.errors
+    assert capture.sections["bridge_hosts"] == [{"mac-address": "AA:BB:CC:DD:EE:01"}]
+    # Empty is a real, expected answer for neighbour discovery on this
+    # fleet -- distinct from the error above, and it must not be conflated.
+    assert capture.sections["neighbors"] == []
+    assert capture.sections["dns_cache"] == [{"name": "example.com"}]
+
+
+def test_dangerous_tools_are_not_reachable_through_this_reader() -> None:
+    """`/tool/bandwidth-test` saturates a live venue's uplink and `/tool/torch`
+    streams forever without a server-enforced duration. Neither belongs on
+    a customer path. This asserts the omission on purpose, so re-adding one
+    has to be a deliberate act that breaks a test naming the reason."""
+    paths = set(READ_ONLY_SECTION_PATHS.values())
+    assert ("tool", "bandwidth-test") not in paths
+    assert ("tool", "torch") not in paths
+    assert ("tool", "sniffer") not in paths
+    for segments in paths:
+        assert segments[:2] != ("tool", "bandwidth-test")
+        assert "torch" not in segments

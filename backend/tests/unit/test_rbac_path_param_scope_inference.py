@@ -138,7 +138,24 @@ class TestCurrentScopeContext:
         assert context.location_id is None
         assert context.router_id is None
 
-    async def test_header_still_wins_over_path_param(self) -> None:
+    async def test_the_url_wins_over_the_header(self) -> None:
+        """Inverted deliberately. This test used to assert the opposite, and
+        the opposite was the root of a whole defect class.
+
+        The URL names the entity the handler is about to act on; the header
+        only says which tenant the caller *claims* to be working within. When
+        they disagree, letting the header win means the permission check is
+        evaluated against one organization and the read or write happens
+        against another -- which is exactly how
+        ``GET /billing/dashboard/{organization_id}`` came to need a
+        hand-placed ``enforce_target_organization`` guard, and how
+        ``/customers/{customer_id}/features`` leaked another tenant's plan
+        because its parameter was not even spelled ``organization_id``.
+
+        With the URL winning, the check is evaluated against the thing being
+        acted on, and those guards become belt-and-braces rather than the only
+        thing standing between tenants.
+        """
         header_org_id = uuid.uuid4()
         path_org_id = uuid.uuid4()
         request = _make_request(
@@ -146,7 +163,7 @@ class TestCurrentScopeContext:
             path_params={"organization_id": str(path_org_id)},
         )
         context = await _current_scope_context(request)
-        assert context.organization_id == header_org_id
+        assert context.organization_id == path_org_id
 
     async def test_location_and_router_path_params_also_resolved(self) -> None:
         location_id = uuid.uuid4()

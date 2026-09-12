@@ -7,17 +7,22 @@ independent, composed real device pushes (mirrors ``app.domains.dhcp``/
 .hotspot``'s own identical "config resource, realized onto a device
 later" precedent for the DB-row-is-desired-state half of that story):
 
-1. The mangle *mark* (``/ip firewall mangle ... action=mark-packet``),
-   rendered by ``app.domains.network_config.renderers
-   .render_qos_traffic_rule`` and pushed through that domain's own real
-   ``ConfigVersion``/``ProvisioningJob`` pipeline
-   (``POST /network-config/routers/{router_id}/push``).
+1. The mangle *mark* (``/ip firewall mangle ... action=mark-packet``).
 2. The paired ``/queue tree`` entry that actually makes the mark do
-   anything, pushed directly by this domain's own
-   ``device_adapters.py``/``service.QosService.push_rule_to_device`` (see
-   that method's own docstring). This row's own ``device_queue_id``/
+   anything.
+
+Both are pushed by this domain's own ``device_adapters.py``/
+``service.QosService.push_rule_to_device``, in that order (see that
+method's own docstring). Only the second one used to be, on the grounds
+that ``app.domains.network_config.renderers.render_qos_traffic_rule``
+covered the first -- it does render it, and its push endpoint
+(``POST /network-config/routers/{router_id}/push``) is customer-reachable,
+but that script is delivered over SSH and a port sweep from the platform
+reached only ``8728`` on a fleet router; ``22`` timed out. So the mark
+never arrived and the queue matched nothing. This row's own
+``device_queue_id``/
    ``device_packet_mark``/``device_push_status``/``device_push_error``/
-   ``device_pushed_at`` columns are that second push's real, current
+   ``device_pushed_at`` columns are that push's real, current
    device state -- mirrors ``app.domains.queue_management.models
    .QueueAssignment``'s own ``device_queue_id``/``error_message``/
    ``applied_at`` columns exactly, just narrower (this domain never
@@ -98,10 +103,13 @@ class QosTrafficRule(BaseModel):
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    # -- Real device push state for the paired /queue tree entry -- see
-    # module docstring's numbered list above. Independent of the mangle
-    # mark's own push state, which network_config's ConfigVersion already
-    # tracks separately.
+    # -- Real device push state for both halves this rule becomes on the
+    # router -- see module docstring's numbered list above. ``active``
+    # means the mangle mark *and* the queue tree that references it are
+    # both on the device, which is what the customer-facing badge asserts;
+    # an edit to any field in ``constants.DEVICE_CARRIED_FIELDS`` demotes
+    # it back to ``pending`` (see ``app.common.device_push``), because the
+    # router is then holding the previous values.
     device_queue_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # The qos_packet_mark_identifier(self) value in effect when
     # device_queue_id was created -- lets a later push detect a changed

@@ -27,9 +27,12 @@ __all__ = [
     "GuestError",
     "GuestNotFoundError",
     "CrossOrganizationGuestAccessError",
+    "CrossLocationGuestAccessError",
     "GuestBlockedError",
     "GuestSessionNotFoundError",
     "GuestAuthMethodNotEnabledError",
+    "VenueClosedError",
+    "GuestTeamSharedQuotaExceededError",
     "RouterNotEligibleForGuestSessionError",
     "InvalidSessionStatusTransitionError",
     "SessionTerminationCooldownError",
@@ -43,6 +46,7 @@ __all__ = [
     "InvalidNasStatusTransitionError",
     "InvalidAnalyticsDateRangeError",
     "TooManyDeviceIdsError",
+    "TooManyVoucherIdsError",
     "ConcurrentSessionLimitExceededError",
     "GuestDeviceLimitExceededError",
     "FairUsagePolicyExceededError",
@@ -56,6 +60,8 @@ __all__ = [
     "GuestPinSetupNotAuthorizedError",
     "GuestPinTooWeakError",
     "GuestPinLockedError",
+    "GuestProfileFieldNotCollectedError",
+    "GuestReviewLinkOpenedNotAuthorizedError",
 ]
 
 
@@ -75,6 +81,27 @@ class GuestNotFoundError(GuestError):
         )
 
 
+class CrossLocationGuestAccessError(GuestError):
+    """A caller confined to particular sites reached a guest, session or NAS
+    record belonging to another site.
+
+    Distinct from ``CrossOrganizationGuestAccessError``: both sites belong to
+    the *same* organization, so that comparison sees nothing wrong. These rows
+    are reached by their own id, so ``RequirePermission`` had nothing to pin
+    the check to -- see ``app.domains.rbac.location_scope``.
+
+    This is the PII surface: a guest row carries the phone number or email a
+    person handed over at a portal. A front-desk account at one site reading
+    another site's guest list is the case this exists to stop.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a guest record at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationGuestAccessError(GuestError):
     """A caller acting within organization A attempted to read/mutate a
     guest (or guest session) belonging to organization B -- mirrors
@@ -91,13 +118,26 @@ class GuestBlockedError(GuestError):
     """The guest identified by this identifier has ``is_blocked=True`` --
     an admin-set ban. Raised before any OTP/voucher verification is even
     attempted, so a blocked guest never learns whether their code/voucher
-    would otherwise have been valid."""
+    would otherwise have been valid.
+
+    **The admin's ``reason`` is deliberately not in the message, and not in
+    ``data`` either** -- see ``app.domains.guest_access.exceptions
+    .GuestAccessDeniedError`` for the argument, which applies identically
+    here: the portal renders a 403's message verbatim, so this appended the
+    operator's private note about a guest onto that guest's own screen.
+    ``data`` is no better a hiding place, since the app-wide handler
+    serialises it into the same response body.
+
+    Kept as ``self.reason``, an attribute and never serialised, so the raise
+    site can log it."""
 
     def __init__(self, reason: str | None = None) -> None:
-        message = "This guest has been blocked from guest WiFi access"
-        if reason:
-            message += f": {reason}"
-        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+        self.reason = reason
+        super().__init__(
+            "This guest has been blocked from guest WiFi access",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "guest_blocked"},
+        )
 
 
 class GuestSessionNotFoundError(GuestError):
@@ -118,6 +158,51 @@ class GuestAuthMethodNotEnabledError(GuestError):
         super().__init__(
             f"Auth method '{auth_method}' is not enabled for this location's "
             "captive portal",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class VenueClosedError(GuestError):
+    """The venue's Open Hours schedule says it is closed right now.
+
+    ``captive_portal.validators.is_open_now`` shipped, was validated, and was
+    evaluated on exactly one line in the whole backend --
+    ``captive_portal/router.py``'s config-resolve response, as an advisory
+    boolean for the portal UI. No login path consulted it, so a guest (or a
+    script) hitting the login endpoint directly outside opening hours was
+    authenticated normally. /how-it-works sells the opposite: "Outside those
+    hours, guests see a 'we're closed' message instead of a working login
+    screen. Nobody has to remember to switch anything off at close."
+
+    Carries the venue's own ``business_hours_closed_message`` when one is set,
+    so the guest sees the words the operator wrote rather than a generic
+    refusal.
+    """
+
+    def __init__(self, closed_message: str | None = None) -> None:
+        super().__init__(
+            closed_message or "This WiFi network is closed right now.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestTeamSharedQuotaExceededError(GuestError):
+    """The guest belongs to a team that has used up its shared data limit.
+
+    Distinct from ``FairUsagePolicyExceededError``, which is a cap on one
+    guest: this is the *pooled* cap across a whole team, the thing
+    /features calls "one shared data limit" and /how-it-works shows as a
+    usage bar on each group.
+
+    ``GuestTeamService.check_shared_quota`` computed this correctly from the
+    day it shipped and had no caller anywhere in the application, so a team
+    with a 5 GB limit could use 50 GB unimpeded. See
+    ``guest_teams.quota.SharedQuotaResolver`` for the gate.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Your group has used up its shared data allowance",
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
@@ -178,6 +263,56 @@ class NoReconnectableSessionError(GuestError):
             "exists, or the prior session is outside the reconnect grace "
             "window)",
             status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class RadiusNasDeviceOperationError(GuestError):
+    """A router-side RADIUS write failed.
+
+    502, not 200-with-an-error-body: the frontend's response interceptor
+    unwraps ``data`` and never reads ``success``, so a ``200 {"success":
+    false}`` is indistinguishable from a working push to every caller in
+    the app -- which is the exact failure mode a device-push path exists to
+    remove.
+    """
+
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"RADIUS NAS device operation '{operation}' failed: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class RadiusNasMissingCredentialsError(GuestError):
+    """The router has no reachable API credentials, so no push is possible.
+
+    Refuses rather than reporting a push that never happened -- mirrors
+    ``VlanMissingCredentialsError``.
+    """
+
+    def __init__(self, router_id: object) -> None:
+        super().__init__(
+            f"Router {router_id} has no management address or API credentials, "
+            "so its RADIUS registration cannot be pushed",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class RadiusNasNotSyncedError(GuestError):
+    """The NAS row has no tunnel address, so there is nothing to send as
+    ``src-address``.
+
+    Refuses rather than pushing a registration without it: the hub matches
+    an incoming request to a ``client{}`` stanza by source address, so such
+    a registration would sit on the router looking correct and never
+    authenticate anybody.
+    """
+
+    def __init__(self, nas_id: object) -> None:
+        super().__init__(
+            f"RADIUS NAS client {nas_id} has no tunnel address yet "
+            "(the hub has not confirmed it), so it cannot be pushed to the router",
+            status_code=status.HTTP_409_CONFLICT,
         )
 
 
@@ -305,6 +440,26 @@ class TooManyDeviceIdsError(GuestError):
         )
 
 
+class TooManyVoucherIdsError(GuestError):
+    """Raised by ``GET /voucher-redemptions`` when a caller passes more
+    ``voucher_ids`` than the endpoint accepts in one request. The exact
+    sibling of ``TooManyDeviceIdsError`` above, and it exists for the
+    same reason: silently truncating to the first ``limit`` ids would
+    leave a Vouchers page's later rows showing no device at all, with
+    nothing to distinguish "this voucher was never redeemed" from "your
+    request was too big and we quietly dropped it" -- which is exactly
+    the class of silent blank this whole change set is fixing."""
+
+    def __init__(self, *, requested: int, limit: int) -> None:
+        self.limit = limit
+        super().__init__(
+            f"Requested {requested} voucher_ids, which exceeds the maximum "
+            f"of {limit} allowed per request",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"max_voucher_ids": limit},
+        )
+
+
 class RadiusAccountingUnsupportedStatusTypeError(GuestError):
     """Raised by ``POST /radius/accounting`` for an
     ``Acct-Status-Type`` this module does not (yet) handle -- e.g. RFC
@@ -335,39 +490,57 @@ class ConcurrentSessionLimitExceededError(GuestError):
     the existing ``terminate_session``/``disconnect_session`` endpoints --
     this module deliberately does not auto-evict the oldest session on the
     guest's behalf, so a guest never loses an active connection they didn't
-    ask to end."""
+    ask to end.
+
+    **The message names no guest identifier.** This 409 is answered to the
+    unauthenticated captive-portal client, and the portal renders the
+    exception ``message`` verbatim on the guest's own screen -- so the
+    internal ``Guest.id`` UUID this error is raised with must not appear in
+    the text (``GuestBlockedError``'s docstring makes the identical
+    argument for an admin's ``reason``). ``guest_id`` is kept as
+    ``self.guest_id``, an attribute that is never serialised, so the raise
+    site can still log it; ``data`` carries only the machine-readable
+    limit, never the guest."""
 
     def __init__(self, *, guest_id: uuid.UUID | str, limit: int) -> None:
+        self.guest_id = guest_id
         self.limit = limit
         super().__init__(
-            f"Guest {guest_id} already has {limit} active session(s), which "
-            "is the maximum allowed at once",
+            f"This account already has {limit} active session(s), which is "
+            "the maximum allowed at once",
             status_code=status.HTTP_409_CONFLICT,
             data={"max_concurrent_sessions": limit},
         )
 
 
 class GuestDeviceLimitExceededError(GuestError):
-    """The guest already has ``limit`` (or more) distinct
-    :class:`~.models.GuestDevice` rows registered -- raised by
-    ``service._enforce_device_limit`` before a *new* device would be
-    registered (or an existing device reassigned to this guest) via
-    ``login_via_otp``/``login_via_voucher``. ``limit`` is resolved through
-    the real ``PolicyType.DEVICE`` seam when a ``policy_lookup`` hook is
-    wired (``app.domains.policy.schemas.DevicePolicyRules
-    .max_devices_per_guest``), falling back to
+    """The guest already has ``limit`` (or more) distinct devices
+    **connected at the same time** (each holding an ``ACTIVE`` session) --
+    raised by ``service._enforce_device_limit`` before another device would
+    push the guest's simultaneously-connected devices over their limit via
+    ``login_via_otp``/``login_via_voucher``. The basis is connected, not
+    registered: a registered-but-idle device does not occupy the limit,
+    and registering a new device is never itself an error -- only bringing
+    one online while ``limit`` others are already connected is. ``limit``
+    is resolved through the real ``PolicyType.DEVICE`` seam when a
+    ``policy_lookup`` hook is wired (``app.domains.policy.schemas
+    .DevicePolicyRules.max_devices_per_guest``), falling back to
     ``constants.DEFAULT_MAX_DEVICES_PER_GUEST`` otherwise -- mirrors
     ``ConcurrentSessionLimitExceededError``'s identical shape and "surface
-    the limit back to the caller as structured ``data``" convention. MAC
-    uniqueness itself is unchanged by this check -- it only gates *how
-    many* devices one guest may hold, never which physical device a MAC
-    address belongs to."""
+    the limit back to the caller as structured ``data``" convention.
+
+    **The message names no guest identifier** -- the same captive-portal
+    reasoning as ``ConcurrentSessionLimitExceededError`` above: this 409 is
+    rendered verbatim on the guest's own screen, so the internal
+    ``Guest.id`` UUID stays in ``self.guest_id`` (an attribute, never
+    serialised) rather than in the text the portal shows."""
 
     def __init__(self, *, guest_id: uuid.UUID | str, limit: int) -> None:
+        self.guest_id = guest_id
         self.limit = limit
         super().__init__(
-            f"Guest {guest_id} already has {limit} device(s) registered, "
-            "which is the maximum allowed",
+            f"This account already has {limit} device(s) connected at the "
+            "same time, which is the maximum allowed",
             status_code=status.HTTP_409_CONFLICT,
             data={"max_devices_per_guest": limit},
         )
@@ -388,7 +561,13 @@ class FairUsagePolicyExceededError(GuestError):
     ``FUP``); a deployment with no Policy Engine configured, or one with
     no FUP policy assigned, never raises this at all. ``metric``
     distinguishes a data cap (``"data"``, ``limit``/``used`` in MB) from a
-    time cap (``"time"``, ``limit``/``used`` in minutes)."""
+    time cap (``"time"``, ``limit``/``used`` in minutes).
+
+    **The message names no guest identifier** -- same reasoning as
+    ``ConcurrentSessionLimitExceededError``/``GuestDeviceLimitExceededError``
+    above: this 409 is rendered verbatim on the guest's own screen, so the
+    internal ``Guest.id`` UUID stays in ``self.guest_id`` (an attribute,
+    never serialised) rather than in the text the portal shows."""
 
     def __init__(
         self,
@@ -399,13 +578,14 @@ class FairUsagePolicyExceededError(GuestError):
         limit: int,
         used: int,
     ) -> None:
+        self.guest_id = guest_id
         self.period_type = period_type
         self.metric = metric
         self.limit = limit
         self.used = used
         unit = "MB" if metric == "data" else "minute(s)"
         super().__init__(
-            f"Guest {guest_id} has used {used} {unit} of their {period_type} "
+            f"This account has used {used} {unit} of its {period_type} "
             f"{metric} allowance ({limit} {unit}), which is the maximum "
             "allowed for this period",
             status_code=status.HTTP_409_CONFLICT,
@@ -470,6 +650,58 @@ class GuestPasswordSetupNotAuthorizedError(GuestError):
         super().__init__(
             "This session isn't eligible to set a password -- please sign "
             "in again with a one-time code and try again right after.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestProfileFieldNotCollectedError(GuestError):
+    """A guest tried to write a profile field this venue has switched off
+    -- ``captive_portal_configs.collect_guest_name`` /
+    ``collect_guest_email``.
+
+    A 400 rather than a 403: nothing is wrong with the caller's proof of
+    session, the field simply is not collected here. The distinction
+    matters to whoever reads the log, because the two have completely
+    different causes -- an expired session versus a venue setting.
+
+    Enforced server-side deliberately. The frontend does not render a
+    field whose flag is off, so in normal operation this never fires; it
+    fires for a stale portal bundle, a replayed request, or anyone
+    posting directly. "Off" has to mean off at the write path or the
+    toggle is decoration, and the venue -- not this platform -- is the
+    Data Fiduciary who would be holding the data."""
+
+    def __init__(self, field_label: str) -> None:
+        super().__init__(
+            f"This venue doesn't collect a guest {field_label}.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class GuestReviewLinkOpenedNotAuthorizedError(GuestError):
+    """``POST /guest/review-link-opened`` was called without a live
+    session belonging to the named guest.
+
+    **Deliberately a weaker check than
+    ``GuestProfileUpdateNotAuthorizedError``.** That one additionally
+    requires an OTP auth method and a session started within the last
+    ``SET_PASSWORD_SESSION_WINDOW_MINUTES``, because it guards a write of
+    personal data. This one guards a timestamp that stores nothing about
+    the guest, grants no capability, and can be set by no one but a
+    device already holding a live session id.
+
+    The cost of being stricter falls in the wrong place. The portal calls
+    this fire-and-forget as it navigates the guest away to Google; a
+    refusal is never seen by anybody, and its only effect is that the
+    card comes back next visit -- to the one guest who did what was
+    asked. A narrow window would also break a voucher or password guest,
+    and a guest who taps the card late in a long session, neither of whom
+    is doing anything wrong.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "A live session for this guest is required",
             status_code=status.HTTP_403_FORBIDDEN,
         )
 

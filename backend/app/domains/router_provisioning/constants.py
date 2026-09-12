@@ -226,6 +226,33 @@ class RouterEventType(StrEnum):
     HEALTH_SNAPSHOT_RECORDED = "health_snapshot_recorded"
 
 
+# ============================================================================
+# Health-snapshot provenance
+# ============================================================================
+
+
+class MetricsSource(StrEnum):
+    """Which transport actually took a ``RouterHealthSnapshot`` reading.
+
+    These values are a wire contract, not an internal label: they are
+    serialised verbatim by ``RouterHealthSnapshotRead.metrics_source`` and
+    mapped by name in the dashboard (``toMetricsSource`` in
+    ``src/services/deviceHealth.service.ts``, which turns ``"routeros_api"``
+    into the ``"routerApi"`` it labels "Router API"). An unrecognised
+    string there falls through to ``null``, which the UI renders as "Not
+    recorded" -- so a typo here does not raise anywhere, it silently
+    mislabels every row it writes.
+
+    An enum rather than the bare literals that used to be scattered across
+    the two sweeps, precisely because of that failure mode: the
+    RouterOS-API sweep spent its entire life passing no value at all, and
+    the result was indistinguishable from a genuinely unrecorded row.
+    """
+
+    ROUTEROS_API = "routeros_api"
+    SNMP = "snmp"
+
+
 __all__ = [
     "TEMPLATE_PLACEHOLDER_PATTERN",
     "ConfigVariableScope",
@@ -240,4 +267,5 @@ __all__ = [
     "PROVISIONING_QUEUE_REDIS_KEY",
     "ROTATED_SECRET_BYTES",
     "RouterEventType",
+    "MetricsSource",
 ]

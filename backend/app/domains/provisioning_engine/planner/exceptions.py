@@ -14,6 +14,7 @@ __all__ = [
     "NoRouterSnapshotError",
     "DiscoveryMissingCredentialsError",
     "DiscoveryDeviceConnectionError",
+    "DiscoveryPreconditionsUnmetError",
     "NoWanLinksToVerifyError",
     "ConfigurationPlanNotFoundError",
     "ConfigurationPlanNotApprovableError",
@@ -60,14 +61,70 @@ class DiscoveryMissingCredentialsError(PlannerError):
         )
 
 
+class DiscoveryPreconditionsUnmetError(PlannerError):
+    """Discovery refused *before* opening a socket, naming what is missing.
+
+    A 400, not a 502: nothing was attempted against the device, so this
+    is a statement about the platform's own records, not about the
+    device's reachability. Reporting it as a gateway error would tell an
+    operator to go look at a router that was never dialled.
+
+    ``data["preconditions"]`` carries every check, not only the failing
+    ones. The unmet ones say what to fix; the ``unknown`` ones say what
+    could not be established at all, and dropping those would let a
+    caller render "one thing is wrong" over a report that actually means
+    "one thing is wrong and two others are unknowable from here".
+    """
+
+    def __init__(self, report: object) -> None:
+        self.report = report
+        checks = getattr(report, "checks", ())
+        summary = getattr(report, "summary", None)
+        super().__init__(
+            str(summary or "Discovery preconditions are unmet"),
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={
+                "preconditions": [
+                    {
+                        "key": str(check.key),
+                        "label": check.label,
+                        "status": str(check.status),
+                        "detail": check.detail,
+                        "next_step": check.next_step,
+                    }
+                    for check in checks
+                ]
+            },
+        )
+
+
 class DiscoveryDeviceConnectionError(PlannerError):
-    def __init__(self, host: str, detail: str) -> None:
+    """The device was genuinely dialled and did not answer.
+
+    ``candidates`` is what turns this from honest into *identifying*. The
+    transport's own words are always preserved verbatim -- masking them
+    would be its own bug -- but a bare "timed out" names none of the
+    several independent things that could produce it, and each has a
+    different fix. When the caller has already established that every
+    checkable precondition passed, it passes the remaining suspects here
+    so the message ends by saying what is actually left to look at.
+    """
+
+    def __init__(
+        self, host: str, detail: str, *, candidates: list[str] | None = None
+    ) -> None:
         self.host = host
         self.detail = detail
-        super().__init__(
-            f"Could not connect to device at '{host}' for discovery: {detail}",
-            status_code=status.HTTP_502_BAD_GATEWAY,
-        )
+        self.candidates = candidates or []
+        message = f"Could not connect to device at '{host}' for discovery: {detail}"
+        if self.candidates:
+            message += (
+                ". Every precondition the platform can check from here passed, "
+                "so what remains is one of: "
+                + "; ".join(self.candidates)
+                + "."
+            )
+        super().__init__(message, status_code=status.HTTP_502_BAD_GATEWAY)
 
 
 class NoWanLinksToVerifyError(PlannerError):

@@ -53,6 +53,7 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import Depends, Request
 from redis.asyncio import Redis
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.redis import get_redis_client
@@ -71,6 +72,7 @@ from app.domains.organization.exceptions import (
     OrganizationNotFoundError,
 )
 from app.domains.organization.models import Organization, OrganizationMember
+from app.domains.router.models import Router
 from app.middleware.request_context import get_masking_context
 
 from .authorization import AccessValidator, RoleResolver
@@ -78,11 +80,21 @@ from .cache import PermissionCache
 from .context import ScopeContext
 from .enums import ScopeType
 from .exceptions import (
+    CrossOrganizationScopeDeniedError,
     InvalidScopeHeaderError,
     MissingScopeContextError,
     RoleNotHeldError,
+    SingleOrganizationRequiredError,
+    UnspecifiedOrganizationScopeError,
+)
+from .organization_scope import (
+    ORGANIZATION_SCOPE_HEADER,
+    ORGANIZATION_SCOPE_QUERY_PARAM,
+    OrganizationScope,
+    wants_all_organizations,
 )
 from .repository import RBACRepository, RBACRepositoryProtocol
+from .scope_params import ScopeDimension, scope_dimension_for
 from .service import RBACService
 
 # Re-exported as-is: RBAC's notion of "current user" is auth's, unchanged.
@@ -171,45 +183,80 @@ def _parse_uuid_path_param(request: Request, param_name: str) -> uuid.UUID | Non
         return None
 
 
-async def CurrentOrganization(
+async def CurrentOrganizationScope(
     request: Request,
     user: AuthUser = Depends(CurrentUser),
     db: AsyncSession = Depends(get_db_session),
     repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
-) -> uuid.UUID | None:
-    """The organization context for this request, if any (``X-Organization-Id``).
+) -> OrganizationScope:
+    """Which tenant this request is about -- one organization, or explicitly all.
 
-    When the header is present, validates the organization exists and, for
-    everyone except a GLOBAL-scoped caller, that the current user is an
-    *active* member of it (see module docstring for why this is no longer a
-    trust-the-header parse). Returns ``None`` (no DB lookup performed) when
-    the header is absent.
+    See ``app.domains.rbac.organization_scope`` for why this returns a value
+    object rather than a nullable UUID. The short version: ``None`` used to mean
+    both "a platform admin deliberately reading the whole estate" and "nobody
+    said, so I picked the whole estate", and the second one was what a founder
+    with a ``Super Admin`` role got every time he opened a report about his own
+    venue.
 
-    ## GLOBAL-scope bypass
+    ## Resolution order
+
+    1. **The organization the route itself names** -- a path or query parameter
+       recognised by ``SCOPE_PARAM_ALIASES`` (``organization_id``,
+       ``customer_id``, ...). This is deliberately checked *before* the header,
+       because it is the order ``_current_scope_context`` already uses to decide
+       what ``RequirePermission`` checks against. Reading them in a different
+       order is precisely the defect class this codebase has already been bitten
+       by -- the permission check evaluated against the header's organization
+       while the handler went on to operate on the path's. Same source, same
+       order, one answer.
+    2. **``X-Organization-Id``**, as before.
+    3. **``X-Organization-Scope: all``** (or ``?organization_scope=all``) -- a
+       deliberate cross-tenant read. Honoured only for a caller holding an
+       active GLOBAL-scoped role.
+
+    A named organization always wins over an all-organizations request. The two
+    together are contradictory, and narrowing is the safe way to resolve a
+    contradiction: a stale "all" left on a client cannot widen a request that
+    names its tenant.
+
+    ## What is *not* relaxed
+
+    Whichever of (1) or (2) supplied the id, it goes through the same checks it
+    always did: the organization must exist, and a caller who does **not** hold
+    a GLOBAL-scoped role must hold an *active* ``OrganizationMember`` row for
+    it. Widening where an id may come from is not the same as widening who may
+    use one, and a client-supplied id is still worth nothing to a caller with no
+    membership behind it.
+
+    ## GLOBAL-scope bypass (unchanged)
 
     A platform-level admin (any active role with ``Role.scope_type ==
     ScopeType.GLOBAL``, e.g. Super Admin/Platform Admin) is never an
-    ``OrganizationMember`` row of any individual organization -- their
-    authority comes from holding a global role, not from tenant membership,
-    the same distinction ``app.domains.rbac.seed``'s own module docstring
-    draws ("a GLOBAL-scoped role can always exercise a location-level
-    permission"). Before this bypass, every org-scoped read/write endpoint
-    that resolves ``X-Organization-Id`` (which is most of them) was
-    unreachable for such a caller on any organization they hadn't also been
-    separately, manually added to as a member -- a real gap surfaced by the
-    Master (super-admin) dashboard's cross-tenant pages 403ing on every
-    organization except the one an operator had happened to add a
-    membership row for by hand. The membership check below still applies in
-    full to every non-GLOBAL caller -- this narrows, not removes, the
-    original guard."""
-    organization_id = _parse_uuid_header(request, _ORG_HEADER)
-    if organization_id is None:
-        return None
+    ``OrganizationMember`` row of any individual organization -- their authority
+    comes from holding a global role, not from tenant membership, the same
+    distinction ``app.domains.rbac.seed``'s own module docstring draws ("a
+    GLOBAL-scoped role can always exercise a location-level permission"). The
+    membership check below still applies in full to every non-GLOBAL caller.
 
-    organization_repo = GenericRepository(Organization, db)
-    organization = await organization_repo.get_by_id(organization_id)
-    if organization is None:
-        raise OrganizationNotFoundError(organization_id)
+    ## Why a caller who says nothing is now an error
+
+    A tenant caller who names no organization has always been an error
+    (``MissingScopeContextError``) -- ``ScopeResolver.satisfies`` compares only
+    ``location_id`` for a LOCATION grant, so before that check existed a
+    front-desk account could send ``X-Location-Id`` alone, resolve LOCATION
+    scope, and have the handler run unfiltered across every tenant.
+
+    A *platform* caller who names no organization used to fall through to
+    ``None`` -- "every organization". That is now
+    ``UnspecifiedOrganizationScopeError``, because a platform admin has two
+    genuinely different intentions here and the request has to say which. Every
+    caller that really does want the estate says so in one header.
+    """
+    organization_id = _requested_organization_id(request)
+    asked_for_all = wants_all_organizations(
+        request.headers.get(ORGANIZATION_SCOPE_HEADER),
+        _query_param(request, ORGANIZATION_SCOPE_QUERY_PARAM),
+    )
 
     resolver = RoleResolver(repository)
     active_assignments = await resolver.get_active_assignments(uuid.UUID(user.id))
@@ -217,6 +264,20 @@ async def CurrentOrganization(
         assignment.role.scope_type == ScopeType.GLOBAL.value
         for assignment in active_assignments
     )
+
+    if organization_id is None:
+        if asked_for_all:
+            if not holds_global_role:
+                raise CrossOrganizationScopeDeniedError()
+            return OrganizationScope.all()
+        if holds_global_role:
+            raise UnspecifiedOrganizationScopeError()
+        raise MissingScopeContextError("organization")
+
+    organization_repo = GenericRepository(Organization, db)
+    organization = await organization_repo.get_by_id(organization_id)
+    if organization is None:
+        raise OrganizationNotFoundError(organization_id)
 
     if not holds_global_role:
         member_repo = GenericRepository(OrganizationMember, db)
@@ -237,7 +298,58 @@ async def CurrentOrganization(
     # critical (only descriptive metadata on an audit row), so this is
     # populated opportunistically rather than guaranteed for every route.
     get_masking_context().organization_id = str(organization_id)
-    return organization_id
+    return OrganizationScope.for_organization(organization_id)
+
+
+async def CurrentOrganization(
+    scope: OrganizationScope = Depends(CurrentOrganizationScope),
+) -> uuid.UUID | None:
+    """The organization to scope this request's data to, or ``None`` for all.
+
+    Kept as ``uuid.UUID | None`` because ~456 handlers, services and
+    repositories already consume that shape, and every one of them reads
+    ``None`` as "no organization filter -- every tenant". That reading is now
+    *true*: :func:`CurrentOrganizationScope` only ever produces ``None`` for a
+    caller who holds a GLOBAL-scoped role **and** explicitly asked for every
+    organization. The ~90 ``if requesting_organization_id is not None:`` filter
+    sites downstream are therefore correct as written, without touching one of
+    them -- the value reaching them is what they always assumed it was.
+
+    New code that genuinely needs to tell the two states apart (rather than
+    inferring them from a nullable) should depend on
+    :func:`CurrentOrganizationScope` directly.
+    """
+    return scope.organization_id
+
+
+def _requested_organization_id(request: Request) -> uuid.UUID | None:
+    """The organization this request names, from the route first then the header.
+
+    Route-named first, deliberately: see :func:`CurrentOrganizationScope`.
+    """
+    named = _named_scope_ids(request).get(ScopeDimension.ORGANIZATION)
+    if named is not None:
+        return named
+    return _parse_uuid_header(request, _ORG_HEADER)
+
+
+def _query_param(request: Request, name: str) -> str | None:
+    """One query-string value, or ``None``.
+
+    Guarded the same way :func:`_named_scope_ids` guards these accessors:
+    Starlette's ``query_params`` is a property that *raises* when the ASGI scope
+    has no ``query_string`` key, which several unit-test request doubles do not
+    set, so a bare ``getattr(..., None)`` would return the exception rather than
+    a default.
+    """
+    try:
+        query_params = request.query_params
+    except (KeyError, AttributeError):
+        return None
+    if query_params is None:
+        return None
+    value = query_params.get(name)
+    return value if isinstance(value, str) else None
 
 
 async def CurrentLocation(
@@ -272,7 +384,9 @@ async def CurrentRouter(request: Request) -> uuid.UUID | None:
     return _parse_uuid_header(request, _ROUTER_HEADER)
 
 
-async def _current_scope_context(request: Request) -> ScopeContext:
+async def _current_scope_context(
+    request: Request, db: AsyncSession | None = None
+) -> ScopeContext:
     """The scope this request is acting within.
 
     Resolved from the ``X-*-Id`` scope headers first and, for any of the
@@ -305,28 +419,147 @@ async def _current_scope_context(request: Request) -> ScopeContext:
     itself is untouched, so this cannot grant access a caller's actual
     role assignments don't otherwise justify at that scope.
     """
+    named = _named_scope_ids(request)
+
+    organization_id = (
+        named.get(ScopeDimension.ORGANIZATION)
+        or _parse_uuid_header(request, _ORG_HEADER)
+    )
+    location_id = (
+        named.get(ScopeDimension.LOCATION)
+        or _parse_uuid_header(request, _LOCATION_HEADER)
+    )
+    router_id = (
+        named.get(ScopeDimension.ROUTER) or _parse_uuid_header(request, _ROUTER_HEADER)
+    )
+
+    # Containment. When the request names a router or a location, that entity
+    # -- not a header the caller chose -- determines the broader dimensions.
+    #
+    # This is the root fix for the whole defect class. Before it, a request
+    # naming a router got `router_id` from the path and `location_id` from the
+    # caller's own `X-Location-Id`; `_infer_scope_type` resolved ROUTER, and
+    # `ScopeResolver.satisfies` then let a LOCATION-scoped grant satisfy that
+    # ROUTER check by comparing *only* `location_id` -- the header against
+    # itself. So a location-scoped account could run `POST
+    # /network-diagnostics/routers/{router at another site}/ping` and RBAC
+    # said yes. Nothing about the router was ever checked. Cross-*tenant* was
+    # caught only because `RouterService._enforce_organization_scope` happened
+    # to re-check it at the service layer; cross-*site* inside one tenant was
+    # not caught at all, and the payload there is command execution on
+    # hardware.
+    #
+    # Deriving the broader ids from the target makes the context describe the
+    # thing being acted on, which is what an authorization check should be
+    # evaluated against.
+    if db is not None:
+        if router_id is not None:
+            owner = await _router_owner(db, router_id)
+            if owner is not None:
+                location_id, organization_id = owner
+        elif location_id is not None:
+            owner_org = await _location_owner(db, location_id)
+            if owner_org is not None:
+                organization_id = owner_org
+
     return ScopeContext(
-        organization_id=(
-            _parse_uuid_header(request, _ORG_HEADER)
-            or _parse_uuid_path_param(request, "organization_id")
-        ),
-        location_id=(
-            _parse_uuid_header(request, _LOCATION_HEADER)
-            or _parse_uuid_path_param(request, "location_id")
-        ),
-        router_id=(
-            _parse_uuid_header(request, _ROUTER_HEADER)
-            or _parse_uuid_path_param(request, "router_id")
-        ),
+        organization_id=organization_id,
+        location_id=location_id,
+        router_id=router_id,
     )
 
 
+def _named_scope_ids(request: Request) -> dict[ScopeDimension, uuid.UUID]:
+    """Scope ids this request names in its own URL, by dimension.
+
+    Reads **path and query** parameters through ``SCOPE_PARAM_ALIASES`` rather
+    than looking for three hardcoded names. `GET /customers/{customer_id}/
+    features` names an organization without spelling it `organization_id`, and
+    `GET /guests?location_id=<other site>` names a location in the query
+    string -- both were invisible to the old lookup.
+
+    A value that will not parse as a UUID contributes nothing: FastAPI's own
+    validation of the endpoint's typed signature already 422s a genuinely
+    malformed required parameter, and this resolver has no business raising
+    ahead of it.
+    """
+    found: dict[ScopeDimension, uuid.UUID] = {}
+    sources: list[object] = []
+    # Both accessors are guarded: on Starlette's ``Request`` these are
+    # properties that *raise* when the ASGI scope lacks the underlying key
+    # (``query_params`` raises ``KeyError: 'query_string'``), so a plain
+    # ``getattr(..., None)`` is not enough -- it returns the property's
+    # exception, not a default.
+    try:
+        path_params = request.path_params
+    except (KeyError, AttributeError):
+        path_params = None
+    if isinstance(path_params, dict):
+        sources.append(path_params)
+    try:
+        query_params = request.query_params
+    except (KeyError, AttributeError):
+        query_params = None
+    if query_params is not None:
+        sources.append(query_params)
+
+    for source in sources:
+        for name, raw in source.items():  # type: ignore[union-attr]
+            dimension = scope_dimension_for(name)
+            if dimension is None or dimension in found or raw is None:
+                continue
+            try:
+                found[dimension] = (
+                    raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
+                )
+            except (ValueError, TypeError, AttributeError):
+                continue
+    return found
+
+
+async def _router_owner(
+    db: AsyncSession, router_id: uuid.UUID
+) -> tuple[uuid.UUID | None, uuid.UUID | None] | None:
+    """``(location_id, organization_id)`` for ``router_id``, or ``None``.
+
+    ``None`` when the router does not exist, in which case scope resolution
+    keeps whatever the headers supplied and the handler goes on to 404 it --
+    an unknown id is the handler's error to report, not an authorization
+    outcome, and turning it into a 403 here would leak whether the id exists.
+    """
+    try:
+        row = await db.get(Router, router_id)
+    except SQLAlchemyError:
+        return None
+    if row is None:
+        return None
+    return row.location_id, row.organization_id
+
+
+async def _location_owner(db: AsyncSession, location_id: uuid.UUID) -> uuid.UUID | None:
+    """The organization owning ``location_id``, or ``None`` if unknown."""
+    try:
+        row = await db.get(Location, location_id)
+    except SQLAlchemyError:
+        return None
+    return None if row is None else row.organization_id
+
+
 async def RequireOrganization(
-    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope: OrganizationScope = Depends(CurrentOrganizationScope),
 ) -> uuid.UUID:
-    """400s if no valid organization context (``X-Organization-Id``) is present."""
+    """The one organization this request is about; 400s if it is about all of them.
+
+    ``CurrentOrganizationScope`` has already rejected a caller who named no
+    tenancy at all, so the only way to arrive here with nothing is to have
+    explicitly asked for every organization on a route whose answer is only
+    meaningful for one -- a per-tenant report, a usage summary, an invoice list.
+    Saying that out loud beats the old message, which told a platform admin to
+    send a header they had deliberately replaced with a different one.
+    """
+    organization_id = scope.organization_id
     if organization_id is None:
-        raise MissingScopeContextError("organization")
+        raise SingleOrganizationRequiredError()
     return organization_id
 
 
@@ -345,8 +578,10 @@ def RequireScope(
     """Dependency factory: 400s unless the identifier ``scope_type`` needs is
     present."""
 
-    async def _dependency(request: Request) -> ScopeContext:
-        context = await _current_scope_context(request)
+    async def _dependency(
+        request: Request, db: AsyncSession = Depends(get_db_session)
+    ) -> ScopeContext:
+        context = await _current_scope_context(request, db)
         if scope_type == ScopeType.ORGANIZATION and context.organization_id is None:
             raise MissingScopeContextError("organization")
         if scope_type == ScopeType.LOCATION and context.location_id is None:
@@ -374,8 +609,9 @@ def RequirePermission(
         request: Request,
         user: AuthUser = Depends(CurrentUser),
         access_validator: AccessValidator = Depends(get_access_validator),
+        db: AsyncSession = Depends(get_db_session),
     ) -> AuthUser:
-        context = await _current_scope_context(request)
+        context = await _current_scope_context(request, db)
         resolved_scope = scope or _infer_scope_type(context)
         await access_validator.check(
             uuid.UUID(user.id),
@@ -399,8 +635,9 @@ def RequireRole(
         request: Request,
         user: AuthUser = Depends(CurrentUser),
         repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+        db: AsyncSession = Depends(get_db_session),
     ) -> AuthUser:
-        context = await _current_scope_context(request) if scope else None
+        context = await _current_scope_context(request, db) if scope else None
         resolver = RoleResolver(repository)
         roles = await resolver.get_active_roles(
             uuid.UUID(user.id), scope_context=context

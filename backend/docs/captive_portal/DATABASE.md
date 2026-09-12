@@ -35,6 +35,7 @@ guest WiFi captive portal -- either an organization-level default
 | `splash_headline` | String(200), nullable | |
 | `splash_welcome_message` | Text, nullable | |
 | `redirect_url` | String(500), nullable | Where a guest is sent after a successful login -- consumed by the future `guest` module, never followed by this one |
+| `post_login_html` | Text, nullable | Venue-authored HTML for the page a guest sees **after** a successful sign-in. NULL/empty means the pre-existing behaviour (countdown to `redirect_url` if set, built-in success screen otherwise), so no existing row changes what any guest sees. Not a `content_mode` value -- `content_mode` is the *pre*-login step. Set together with `redirect_url` both apply; they are not alternatives. **Sanitized on write** by `html_sanitizer.sanitize_post_login_html` (nh3/ammonia allowlist + a CSS pass); anything writing this column outside the service layer must sanitize first, there is no read-path net. Capped at 64 KiB of submitted UTF-8 (`POST_LOGIN_HTML_MAX_BYTES`) |
 | `otp_sms_enabled` | Boolean, default `true` | |
 | `otp_email_enabled` | Boolean, default `false` | |
 | `voucher_enabled` | Boolean, default `true` | |

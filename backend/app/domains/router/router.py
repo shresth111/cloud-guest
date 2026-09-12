@@ -20,6 +20,21 @@ enforced the same way ``OrganizationService``/``LocationService`` enforce it
 -- not just left to the permission check, which only verifies *what* the
 caller can do, not *which tenant's data* they are doing it to.
 
+**Credential/SNMP fields are platform-scope only.** ``routers.read``/
+``routers.create``/``routers.update`` are held at *organization* scope by
+``organization-owner`` (``app.domains.rbac.seed``: ``default_level=FULL``,
+no ``ROUTERS`` override) -- the role
+``LocationProvisioningService.provision_location`` assigns to every venue
+owner it creates -- and the customer dashboard genuinely calls
+``GET /locations/{location_id}/routers`` for venue liveness. So the
+organization-scoped routes here are customer-reachable by construction, and
+the platform's own RouterOS credential plus the device's SNMP transport
+configuration do not belong on their schemas at all. They live on
+``/platform/routers/...`` (``RouterPlatformResponse`` /
+``RouterManagementAccessRequest``), gated at ``ScopeType.GLOBAL`` -- the
+same fix shape ``DELETE /routers/{router_id}`` already carries for the same
+class of bug, and the same one the WireGuard domain uses wholesale.
+
 **Provisioning-token generation is approval-gated**: ``router_provisioning``
 is the only permission module seeded with an ``approve`` action alongside
 ``create`` (``routers`` itself has no ``approve`` action) -- a strong signal
@@ -103,6 +118,7 @@ from app.domains.provisioning_engine.planner.schemas import (
     ConfigurationPlanRenderResponse,
     ConfigurationPlanResponse,
     DiscoverRouterResponse,
+    DiscoveryPreflightResponse,
     GuestInterfaceAvailabilityResponse,
     RouterSnapshotListResponse,
     RouterSnapshotResponse,
@@ -149,9 +165,12 @@ from .schemas import (
     ProvisioningTokenResponse,
     RouterCreateRequest,
     RouterListResponse,
+    RouterManagementAccessRequest,
+    RouterPlatformResponse,
     RouterResponse,
     RouterUpdateRequest,
     WebfigSessionResponse,
+    redact_customer_router_settings,
 )
 from .service import RouterService
 
@@ -165,6 +184,21 @@ def _request_id(request: Request) -> str:
 
 
 def _router_response(router_device: Router) -> RouterResponse:
+    """The organization-scoped serialization -- what a venue admin receives.
+
+    ``settings`` goes through ``redact_customer_router_settings`` rather
+    than out of the column verbatim. The column is a free-form JSONB blob
+    and a controller-managed fleet row keeps its back-reference to the
+    network integration in it, so serving it as-is handed a venue admin the
+    integration's primary key on ``GET /locations/{id}/routers`` -- see
+    that function and ``CUSTOMER_FORBIDDEN_ROUTER_SETTINGS_KEYS`` for what
+    is removed and why it is a no-op on a MikroTik row.
+
+    Applied here, in the one place every organization-scoped route
+    serializes a router, rather than at each of the five call sites: a new
+    route that forgets is the failure this is guarding against, and it
+    cannot forget something it does not do.
+    """
     return RouterResponse(
         id=str(router_device.id),
         location_id=str(router_device.location_id),
@@ -182,13 +216,36 @@ def _router_response(router_device: Router) -> RouterResponse:
         last_health_check_at=router_device.last_health_check_at,
         health_status=router_device.health_status,
         has_api_credentials=router_device.api_credentials_encrypted is not None,
+        settings=redact_customer_router_settings(router_device.settings),
+        created_at=router_device.created_at,
+        updated_at=router_device.updated_at,
+    )
+
+
+def _router_platform_response(router_device: Router) -> RouterPlatformResponse:
+    """The platform-only serialization: everything ``_router_response``
+    emits, plus this device's SNMP transport configuration.
+
+    Used exclusively by the ``/platform/routers/...`` routes below. Keeping
+    it a separate function (over a flag on ``_router_response``) is the
+    point: an organization-scoped route physically cannot emit an SNMP
+    field by forgetting to pass something.
+    """
+    return RouterPlatformResponse(
+        **(
+            _router_response(router_device).model_dump()
+            # Undo the customer redaction: the back-reference from a
+            # controller's fleet row to its network integration is exactly
+            # what a Master operator opened this view to find, and the
+            # /platform/... routes are GLOBAL-only. Spelled as an explicit
+            # override rather than by rebuilding the object, so the two
+            # serializations cannot drift in any other field.
+            | {"settings": dict(router_device.settings or {})}
+        ),
         snmp_enabled=router_device.snmp_enabled,
         has_snmp_community=router_device.snmp_community_encrypted is not None,
         snmp_version=router_device.snmp_version,
         snmp_port=router_device.snmp_port,
-        settings=router_device.settings,
-        created_at=router_device.created_at,
-        updated_at=router_device.updated_at,
     )
 
 
@@ -263,12 +320,6 @@ async def create_router(
         vendor=payload.vendor,
         management_ip_address=payload.management_ip_address,
         public_ip_address=payload.public_ip_address,
-        api_username=payload.api_username,
-        api_secret=payload.api_secret,
-        snmp_enabled=payload.snmp_enabled,
-        snmp_community=payload.snmp_community,
-        snmp_version=payload.snmp_version,
-        snmp_port=payload.snmp_port,
         settings=payload.settings,
     )
     return build_response(
@@ -332,6 +383,97 @@ async def update_router(
         success=True,
         message="Router updated",
         data=_router_response(updated).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# Platform-only router endpoints (Master console)
+# ============================================================================
+#
+# Everything below is gated at ``ScopeType.GLOBAL``, the same way
+# ``DELETE /routers/{router_id}`` below and the entire WireGuard domain are.
+#
+# ``routers.read``/``routers.update`` are held at *organization* scope by
+# ``organization-owner`` -- the role ``LocationProvisioningService`` assigns
+# to every venue owner it provisions -- so the org-scoped routes above are
+# customer-reachable by construction (the customer dashboard really does
+# call ``GET /locations/{id}/routers`` for venue liveness). An explicit
+# GLOBAL scope is the only thing that separates the two audiences, since an
+# ORGANIZATION-scoped grant can never satisfy a GLOBAL check however the
+# caller sets ``X-Organization-Id`` (``ScopeResolver.satisfies``).
+
+
+@router.get(
+    "/platform/routers/{router_id}",
+    response_model=ApiResponse[RouterPlatformResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read", scope=ScopeType.GLOBAL))],
+)
+async def get_router_platform_view(
+    request: Request,
+    router_id: uuid.UUID,
+    router_service: RouterService = Depends(get_router_service),
+):
+    """The Master console's view of a router: ``RouterResponse`` plus its
+    SNMP transport configuration (on/off, version, UDP port, whether a
+    community string is configured).
+
+    ``requesting_organization_id`` is deliberately ``None`` here rather than
+    ``Depends(CurrentOrganization)``: this route is already GLOBAL-only, so
+    the caller is a platform operator looking at any tenant's device, the
+    same shape ``decommission_router`` uses.
+    """
+    router_device = await router_service.get_router(
+        router_id, requesting_organization_id=None
+    )
+    return build_response(
+        success=True,
+        message="Router retrieved",
+        data=_router_platform_response(router_device).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/platform/routers/{router_id}/management-access",
+    response_model=ApiResponse[RouterPlatformResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.update", scope=ScopeType.GLOBAL))],
+)
+async def update_router_management_access(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: RouterManagementAccessRequest,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Sets the platform's own RouterOS management credential and this
+    device's SNMP transport configuration.
+
+    These fields used to ride on ``RouterUpdateRequest``, i.e. on the
+    organization-scoped ``PUT /routers/{router_id}``, which meant a venue
+    owner holding ``routers.update`` at organization scope could set the
+    router's SNMP community string and the platform's own API secret. They
+    are not on that schema any more; this route is the only way in, and it
+    is GLOBAL-only.
+
+    Reuses ``RouterService.update_router`` unchanged -- that method already
+    does the encrypt-on-the-way-in handling for both secrets, and the live
+    ``_rotate_live_api_secret_if_needed`` push, so this is a narrower
+    entry point onto existing behaviour, not a second implementation of it.
+    """
+    data = payload.model_dump(exclude_unset=True)
+    updated = await router_service.update_router(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        requesting_organization_id=None,
+        data=data,
+    )
+    return build_response(
+        success=True,
+        message="Router management access updated",
+        data=_router_platform_response(updated).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1099,6 +1241,54 @@ async def preview_bootstrap_script(
 # ============================================================================
 # Wave 1 discovery / snapshot / compatibility
 # ============================================================================
+
+
+@router.get(
+    "/routers/{router_id}/discover/preflight",
+    response_model=ApiResponse[DiscoveryPreflightResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def get_discovery_preflight(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    discovery_service: DiscoveryService = Depends(get_discovery_service),
+):
+    """Every discovery precondition, evaluated without dialling anything.
+
+    The service behind this has existed since #146 and was deliberately left
+    unrouted -- *"the HTTP endpoint is NOT wired: that needs a route,
+    permissions and its own tests, and inventing a public surface inside
+    someone else's half-finished feature is how the next person inherits this
+    same problem."* This is that route, those permissions and those tests.
+
+    It was not optional in practice: the fleet wizard has called
+    ``GET /routers/{id}/discover/preflight`` since #127 -- earlier than the
+    service landed -- so the precondition panel that tells an installer *why*
+    discovery will fail has been rendering its error state on every router, on
+    every run, against a 404. The backend could compute all of it.
+
+    ``routers.read``, not ``routers.manage``: this opens no socket, writes no
+    snapshot and changes nothing. Requiring the permission that lets someone
+    *run* discovery would hide the explanation from exactly the reader who
+    needs it -- somebody diagnosing why the button is disabled. The button
+    itself still needs ``routers.manage``.
+    """
+    result = await discovery_service.get_discovery_preflight(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        #  Deliberately neutral. `can_attempt` false is not a failure of this
+        #  call -- the report succeeded and its answer is "not yet" -- so the
+        #  message must not read as an error to a caller that only surfaces
+        #  `message`.
+        message="Discovery preflight evaluated",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
 
 
 @router.post(

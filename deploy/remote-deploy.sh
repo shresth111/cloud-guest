@@ -16,7 +16,9 @@
 # CANONICAL COPY. cloudguest-foundation/deploy/remote-deploy.sh is a verbatim
 # duplicate so that repo's workflow is self-contained (same deliberate
 # duplication the repos already use for MIN_PAGES). Fix bugs here and copy
-# across in the same PR.
+# across in the same PR. This paragraph is the only sanctioned difference;
+# diff the two files before merging either. Last synced: the build:->image:
+# conversion from foundation #153.
 #
 # WHY IMAGE REFS AND NOT `git pull && docker compose build`
 # ---------------------------------------------------------
@@ -28,6 +30,17 @@
 # the working tree. A `git checkout -f`/`git clean` deploy would delete
 # ~/deploy/cloud-guest/backend/.env, which is the stack's entire production
 # configuration and is not in git. Neither is a thing to automate.
+#
+# CORRECTION 2026-08-27, later the same day: both checkouts are CLEAN again --
+# they were tidied by a stash plus a deploy-branch checkout, which is also
+# where ~/deploy/frontend-worktree-backup-*.tgz came from. The dirty-tree
+# observation above was real but point-in-time, so do not cite it as current
+# state. It is not what carries this argument in any case: "clean right now"
+# is not a property a deploy pipeline can be built on, since the next person
+# to debug something on the box makes it false again without telling anyone.
+# The load-bearing half is the sentence about `.env`, and that is unchanged --
+# verified still present, 7019 bytes, mode 600, ubuntu-owned, untracked, and
+# with no other copy anywhere.
 #
 # Building here is also a bad trade on its own terms: m6i.large, 2 vCPU,
 # ~1 GB free RAM while serving live traffic. A bun/vite build and a pip
@@ -65,11 +78,36 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 cd "$DEPLOY_DIR" || die "no such directory: $DEPLOY_DIR"
 [[ -f docker-compose.yml ]] || die "no docker-compose.yml in $DEPLOY_DIR"
 
-if grep -qE '^\s*build:' docker-compose.yml; then
-  die "$DEPLOY_DIR/docker-compose.yml still has build: stanzas.
-     Install deploy/docker-compose.prod.yml first -- see the enable-list.
-     Refusing to deploy against a compose file that would rebuild from the
-     box's dirty checkouts instead of using the image this pipeline built."
+# The box's compose must reference the image this pipeline built, not carry
+# `build:` stanzas (those would rebuild from the box's dirty checkouts on a
+# 2-vCPU box serving live traffic). If it still does -- the one-time
+# enable-list step to install deploy/docker-compose.prod.yml was never run --
+# neutralise the build stanzas IN PLACE rather than refusing: back the file
+# up, convert each service's `build:` block to the matching `image:` ref
+# (frontend -> ${FRONTEND_IMAGE}, everything else -> ${API_IMAGE}), and abort
+# with a restore if any survives. This preserves everything else in the
+# operator's file byte-for-byte (ports, env_file, named volumes, an nginx
+# service, healthchecks) -- only build->image changes -- and self-heals the
+# deploy without anyone SSHing to the box. The deploy below only ever
+# `up -d`s the target service, so the database and other services are never
+# recreated by this.
+if grep -qE '^[[:space:]]*build:' docker-compose.yml; then
+  bak="docker-compose.yml.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp docker-compose.yml "$bak"
+  log "docker-compose.yml still has build: stanzas -- converting to image: refs in place (backup: $bak)"
+  awk '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { svc=$0; sub(/:.*/,"",svc); gsub(/ /,"",svc) }
+    /^    build:/ { print "    image: " (svc=="frontend" ? "${FRONTEND_IMAGE}" : "${API_IMAGE}"); inb=1; next }
+    inb { if ($0 ~ /^      /) next; inb=0 }
+    { print }
+  ' "$bak" > docker-compose.yml
+  if grep -qE '^[[:space:]]*build:' docker-compose.yml; then
+    cp "$bak" docker-compose.yml
+    die "could not convert every build: stanza in docker-compose.yml automatically.
+     Restored $bak and refused to deploy -- install deploy/docker-compose.prod.yml
+     by hand (see the enable-list) rather than shipping a half-converted file."
+  fi
+  log "converted build: stanzas to image: refs"
 fi
 
 # --- .deploy.env ----------------------------------------------------------
@@ -77,7 +115,13 @@ fi
 # services this deploy is not touching, so both vars must always be present.
 # Seed missing ones from what is actually running rather than guessing.
 current_image_of() {
-  docker inspect --format '{{.Config.Image}}' "deploy-$1-1" 2>/dev/null || true
+  # Prefer compose's default <project>-<service>-1 naming, but fall back to a
+  # container_name: cloudguest-<service> (what the pre-enable-list box was
+  # started with by hand) so seeding works before the first pipeline deploy
+  # has renamed anything.
+  docker inspect --format '{{.Config.Image}}' "deploy-$1-1" 2>/dev/null \
+    || docker inspect --format '{{.Config.Image}}' "cloudguest-$1" 2>/dev/null \
+    || true
 }
 
 touch "$ENV_FILE"

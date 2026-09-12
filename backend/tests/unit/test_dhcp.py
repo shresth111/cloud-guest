@@ -24,16 +24,38 @@ from datetime import UTC, datetime
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.dhcp.constants import (
+    CAPTIVE_PORTAL_DHCP_OPTION_NAME,
+    CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME,
+    DhcpDevicePushStatus,
+    RogueDhcpAlertState,
+)
+from app.domains.dhcp.device_adapters import (
+    DhcpOptionReading,
+    DhcpOptionRemovalReport,
+    DhcpOptionSnapshotReading,
+    DhcpOptionSpec,
+    RogueDhcpInterfaceReading,
+)
 from app.domains.dhcp.exceptions import (
     CrossOrganizationDhcpPoolAccessError,
+    DhcpDeviceConnectionError,
+    DhcpDeviceOperationError,
+    DhcpMissingCredentialsError,
+    DhcpOptionValueRequiredError,
+    DhcpPoolMissingGatewayError,
+    DhcpPoolMissingInterfaceError,
+    DhcpPoolNotEnabledError,
     DhcpPoolNotFoundError,
     DhcpPoolRangeConflictError,
     InvalidAddressRangeError,
     InvalidIpAddressError,
+    UnsupportedDhcpVendorError,
 )
-from app.domains.dhcp.models import DhcpPool
+from app.domains.dhcp.models import DhcpPool, RouterRogueDhcpStatus
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.dhcp.service import DhcpService
+from app.domains.rbac.enums import AuditAction
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
@@ -121,6 +143,14 @@ class FakeDhcpRepository:
         pool.deleted_at = _now()
         return pool
 
+    #: Counts the explicit commit ``push_pool_to_device`` issues before
+    #: re-raising a device failure. Without it the failure record is
+    #: discarded by the session rollback and the row still reads "pending".
+    commits: int = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
+
     async def list_pools(
         self,
         *,
@@ -148,6 +178,64 @@ class FakeDhcpRepository:
             for v in self.pools.values()
             if v.router_id == router_id and not v.is_deleted
         ]
+
+    # ------------------------------------------------------------------
+    # Rogue-DHCP detection state.
+    #
+    # TAUGHT TO THIS FAKE BEFORE A SINGLE ASSERTION WAS WRITTEN AGAINST
+    # IT, deliberately. ``DhcpService.run_rogue_dhcp_detection_for_router``
+    # catches ``DhcpError`` and records UNKNOWN; a fake missing one of
+    # these methods would raise ``AttributeError``, which is NOT a
+    # ``DhcpError`` and so surfaces as a real test failure rather than
+    # being silently recorded as an unreachable router. That narrowing is
+    # itself a response to cloud-guest#131, where a blanket
+    # ``except Exception`` in this domain swallowed exactly that
+    # AttributeError and let untested wiring pass as green.
+    # ------------------------------------------------------------------
+
+    rogue_statuses: dict[tuple[uuid.UUID, str], RouterRogueDhcpStatus] = field(
+        default_factory=dict
+    )
+
+    async def list_router_ids_serving_dhcp(self) -> list[uuid.UUID]:
+        seen: dict[uuid.UUID, None] = {}
+        for pool in self.pools.values():
+            if pool.is_enabled and not pool.is_deleted:
+                seen.setdefault(pool.router_id, None)
+        return list(seen)
+
+    async def list_rogue_dhcp_statuses(
+        self, router_id: uuid.UUID
+    ) -> list[RouterRogueDhcpStatus]:
+        return [
+            row
+            for (rid, _iface), row in self.rogue_statuses.items()
+            if rid == router_id
+        ]
+
+    async def upsert_rogue_dhcp_status(
+        self, router_id: uuid.UUID, interface: str, data: dict[str, object]
+    ) -> RouterRogueDhcpStatus:
+        existing = self.rogue_statuses.get((router_id, interface))
+        if existing is None:
+            row = RouterRogueDhcpStatus(
+                **_base_fields(router_id=router_id, interface=interface, **data)
+            )
+        else:
+            row = existing
+            for key, value in data.items():
+                setattr(row, key, value)
+        self.rogue_statuses[(router_id, interface)] = row
+        return row
+
+    async def delete_rogue_dhcp_statuses(
+        self, router_id: uuid.UUID, interfaces: set[str]
+    ) -> int:
+        deleted = 0
+        for interface in interfaces:
+            if self.rogue_statuses.pop((router_id, interface), None) is not None:
+                deleted += 1
+        return deleted
 
 
 @dataclass
@@ -183,6 +271,14 @@ class FakeRouterLookup:
         ):
             raise RouterNotFoundError(router_id)
         return router
+
+    # Really part of the protocol -- the device-push path calls it. The
+    # sentinel lets a test blank it out to exercise the missing-credentials
+    # guard without hand-building a half-populated Router.
+    secret: str | None = "s3cret"
+
+    def get_decrypted_api_secret(self, router: Router) -> str | None:
+        return self.secret
 
 
 # ============================================================================
@@ -444,8 +540,1469 @@ class TestListPoolsForRouter:
 
 class TestEveryRouteRequiresPermission:
     def test_every_dhcp_route_has_a_permission_dependency(self) -> None:
-        assert len(dhcp_router.routes) == 5
+        assert len(dhcp_router.routes) == 9
         for route in dhcp_router.routes:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# Device push -- the piece this domain never had. Creating a pool wrote a
+# row and contacted nothing, so a guest joining the network got no address.
+# ============================================================================
+
+
+@dataclass
+class FakeDhcpAdapter:
+    """Records what the service actually asked the device to do."""
+
+    vendor: str = "mikrotik"
+    calls: list[dict[str, object]] = field(default_factory=list)
+    raises: Exception | None = None
+    deletes: list[dict[str, object]] = field(default_factory=list)
+    # The rogue-DHCP watch the service asks for after a successful push.
+    # `alert_mac` is what the device would report as the trusted server;
+    # None models an interface with no hardware address, where the alert
+    # must be skipped rather than written with a guessed value.
+    alerts: list[str] = field(default_factory=list)
+    alert_mac: str | None = "04:F4:1C:25:EC:79"
+    alert_raises: Exception | None = None
+    delete_raises: Exception | None = None
+
+    async def ensure_rogue_dhcp_alert(self, credentials, *, interface: str):
+        if self.alert_raises is not None:
+            raise self.alert_raises
+        if self.alert_mac is None:
+            return None
+        self.alerts.append(interface)
+        return self.alert_mac
+
+    #: What ``read_rogue_dhcp_alerts`` reports back, and what it raises
+    #: instead. Both default to the honest empty case rather than to a
+    #: healthy one -- a fake that answers "all good" by default lets a
+    #: wiring bug read as a pass.
+    readings: list[RogueDhcpInterfaceReading] = field(default_factory=list)
+    read_raises: Exception | None = None
+    reads: int = 0
+
+    async def read_rogue_dhcp_alerts(
+        self, credentials
+    ) -> list[RogueDhcpInterfaceReading]:
+        """Taught to this fake before any assertion was written against it.
+
+        Without it, ``get_dhcp_adapter`` would hand the service an object
+        with no such attribute and the service would die on an
+        ``AttributeError`` -- which is the failure cloud-guest#131 showed
+        can hide inside a broad ``except``. Here it cannot: the service
+        catches only ``DhcpError``.
+        """
+        self.reads += 1
+        if self.read_raises is not None:
+            raise self.read_raises
+        return list(self.readings)
+
+    async def delete_dhcp_pool(
+        self,
+        credentials,
+        *,
+        interface: str,
+        range_start: str,
+        range_end: str,
+    ) -> None:
+        self.deletes.append(
+            {
+                "host": credentials.host,
+                "interface": interface,
+                "range_start": range_start,
+                "range_end": range_end,
+            }
+        )
+        if self.delete_raises is not None:
+            raise self.delete_raises
+
+    #: The captive-portal DHCP option. Like ``readings`` above, every
+    #: default here is the honest empty case rather than a convenient one:
+    #: a fake that answered "removed something" by default would let a
+    #: converger that never reached the device read as a pass.
+    option_snapshot: DhcpOptionSnapshotReading | None = None
+    option_removal: DhcpOptionRemovalReport = field(
+        default_factory=DhcpOptionRemovalReport
+    )
+    option_reads: list[str] = field(default_factory=list)
+    option_removals: list[DhcpOptionSpec] = field(default_factory=list)
+    option_writes: list[DhcpOptionSpec] = field(default_factory=list)
+    option_raises: Exception | None = None
+
+    async def read_dhcp_options(self, credentials) -> DhcpOptionSnapshotReading:
+        self.option_reads.append(credentials.host)
+        if self.option_raises is not None:
+            raise self.option_raises
+        return self.option_snapshot or DhcpOptionSnapshotReading(
+            supported=True, options=(), option_set_names=(), bindings=()
+        )
+
+    async def remove_dhcp_option(
+        self, credentials, *, option: DhcpOptionSpec
+    ) -> DhcpOptionRemovalReport:
+        self.option_removals.append(option)
+        if self.option_raises is not None:
+            raise self.option_raises
+        return self.option_removal
+
+    async def configure_dhcp_option(
+        self, credentials, *, option: DhcpOptionSpec
+    ) -> None:
+        self.option_writes.append(option)
+        if self.option_raises is not None:
+            raise self.option_raises
+
+    async def configure_dhcp_pool(
+        self,
+        credentials,
+        *,
+        interface: str,
+        range_start: str,
+        range_end: str,
+        gateway: str,
+        dns_servers: list[str],
+        lease_time_seconds: int,
+    ) -> None:
+        self.calls.append(
+            {
+                "host": credentials.host,
+                "username": credentials.username,
+                "password": credentials.password,
+                "interface": interface,
+                "range_start": range_start,
+                "range_end": range_end,
+                "gateway": gateway,
+                "dns_servers": dns_servers,
+                "lease_time_seconds": lease_time_seconds,
+            }
+        )
+        if self.raises is not None:
+            raise self.raises
+
+
+@pytest.fixture
+def adapter(monkeypatch: pytest.MonkeyPatch) -> FakeDhcpAdapter:
+    """Replaces the registry lookup the service performs.
+
+    Patched on ``service``'s own reference, not on ``device_adapters`` --
+    the service imported the name at module load, so patching the source
+    module would leave the bound name untouched and the test would silently
+    exercise the real adapter.
+    """
+    fake = FakeDhcpAdapter()
+    monkeypatch.setattr(
+        "app.domains.dhcp.service.get_dhcp_adapter", lambda vendor: fake
+    )
+    return fake
+
+
+class TestDhcpPoolDevicePush:
+    async def test_push_reaches_the_device_and_records_it(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        assert pool.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.calls) == 1
+        call = adapter.calls[0]
+        assert call["host"] == "10.0.0.1"
+        assert call["username"] == "admin"
+        assert call["password"] == "s3cret"
+        assert call["interface"] == "ether2"
+        assert call["range_start"] == "192.168.10.10"
+        assert call["range_end"] == "192.168.10.100"
+        assert call["gateway"] == "192.168.10.1"
+
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+        assert pushed.device_push_error is None
+        assert pushed.device_pushed_at is not None
+
+    async def test_only_the_dns_servers_actually_set_are_advertised(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """An empty entry would reach RouterOS as a blank ``dns-server=``,
+        which looks configured and resolves nothing."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)  # dns_primary only
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.calls[0]["dns_servers"] == ["8.8.8.8"]
+
+    async def test_a_pushed_pool_gets_a_rogue_dhcp_watch_on_its_interface(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A DHCP server appearing on a segment is the moment it becomes
+        worth guarding: a consumer router plugged in there answers leases
+        too, and wins whenever it answers first."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.alerts == ["ether2"]
+
+    async def test_a_watch_that_cannot_be_set_does_not_fail_the_push(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The alert is a guard around the feature, not the feature. A pool
+        that reached the router must not be reported as failed because a
+        watch could not be set beside it -- the operator would be told the
+        addresses are not being handed out when they are."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        adapter.alert_raises = RuntimeError("device said no")
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+        assert pushed.device_push_error is None
+        assert adapter.alerts == []
+
+    async def test_an_interface_with_no_mac_is_left_unwatched(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """`valid-server` would have to be guessed, and a wrong trusted
+        server makes every legitimate lease reply look rogue -- which is how
+        a real one gets ignored. Skipped, not defaulted."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        adapter.alert_mac = None
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.alerts == []
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+    async def test_push_writes_a_real_audit_entry(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        before = len(h.audit_writer.entries)
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(h.audit_writer.entries) == before + 1
+        assert (
+            h.audit_writer.entries[-1]["action"]
+            == AuditAction.DHCP_POOL_PUSHED.value
+        )
+
+    async def test_a_device_failure_is_recorded_committed_and_re_raised(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The commit is the point. ``GenericRepository.update`` only
+        flushes and ``get_db_session`` rolls back on any exception, so
+        without an explicit commit the failure record is discarded and the
+        row still reads "pending" with a NULL error after a real failure."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        adapter.raises = DhcpDeviceOperationError(
+            "configure_dhcp_pool", "already have such item"
+        )
+
+        with pytest.raises(DhcpDeviceOperationError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert pool.device_push_status == DhcpDevicePushStatus.FAILED.value
+        assert "already have such item" in (pool.device_push_error or "")
+        assert h.repository.commits == 1
+
+    async def test_a_disabled_pool_is_refused_before_any_connection(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            is_enabled=False,
+        )
+
+        with pytest.raises(DhcpPoolNotEnabledError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_pool_with_no_interface_is_refused(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """``interface`` is nullable, and the adapter derives both RouterOS
+        identifiers and the server's own binding from it."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router, interface=None)
+
+        with pytest.raises(DhcpPoolMissingInterfaceError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_pool_with_no_gateway_is_refused(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Guests would get an address and no route off the subnet.
+        Defaulting to ``.1`` would be a fabricated network fact."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            gateway_ip_address=None,
+        )
+
+        with pytest.raises(DhcpPoolMissingGatewayError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_router_with_no_usable_credentials_is_refused(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        h.router_lookup.secret = None
+
+        with pytest.raises(DhcpMissingCredentialsError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_another_organizations_pool_cannot_be_pushed(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+
+        with pytest.raises(CrossOrganizationDhcpPoolAccessError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=uuid.uuid4(),
+            )
+        assert adapter.calls == []
+
+
+class TestUnsupportedVendorIsATypedError:
+    async def test_an_unknown_vendor_gets_a_400_not_a_gateway_error(self) -> None:
+        """``Router.vendor`` is a free ``String(50)``, so a row carrying
+        "MikroTik" or "mikrotik_routeros" must fail here, typed, rather than
+        opaquely inside the gateway's own enum lookup."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        router.vendor = "ubiquiti"
+        pool = await _create_pool(h, router)
+
+        with pytest.raises(UnsupportedDhcpVendorError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+
+class TestDhcpPoolDeleteReachesTheDevice:
+    """Deleting a pool used to soft-delete the row and nothing else, so a
+    DHCP server this platform created went on handing out addresses after
+    the operator deleted it."""
+
+    async def _pushed_pool(
+        self, h: Harness, router: Router, adapter: FakeDhcpAdapter
+    ) -> DhcpPool:
+        pool = await _create_pool(h, router)
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        adapter.calls.clear()
+        return pool
+
+    async def test_deleting_a_pushed_pool_removes_it_from_the_router(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        deleted = await h.service.delete_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.deletes == [
+            {
+                "host": "10.0.0.1",
+                "interface": "ether2",
+                "range_start": "192.168.10.10",
+                "range_end": "192.168.10.100",
+            }
+        ]
+        assert deleted.is_deleted is True
+
+    async def test_a_pool_that_never_reached_a_device_skips_the_connection(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Opening a connection to delete nothing would make every such
+        delete fail whenever a router happened to be unreachable."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        assert pool.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+        deleted = await h.service.delete_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.deletes == []
+        assert deleted.is_deleted is True
+
+    async def test_a_device_failure_aborts_the_delete_and_keeps_the_row(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Removing the row while the server is still live is exactly the
+        drift this closes -- the operator would believe it was gone and
+        nothing would ever reconcile it."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+        adapter.delete_raises = DhcpDeviceConnectionError("10.0.0.1", "timed out")
+
+        with pytest.raises(DhcpDeviceConnectionError):
+            await h.service.delete_pool(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert pool.is_deleted is False
+        assert await h.repository.get_pool_by_id(pool.id) is not None
+
+
+class TestDnsServerFallback:
+    """A pool with no DNS configured must still point guests at this
+    router, never past it.
+
+    MikroTik documents that a DHCP server with no ``dns-server`` hands out
+    the router's own *upstream* resolvers. Both DNS fields are optional and
+    blank by default on the customer's screen, so the ordinary pool was the
+    broken one -- and nobody had to touch a DNS setting to cause it.
+    """
+
+    async def test_a_pool_with_no_dns_advertises_the_gateway(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            dns_primary=None,
+            dns_secondary=None,
+        )
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        # Not [] -- an empty list makes the adapter omit dns-server=, which
+        # is what sent guests to 8.8.8.8 and silently disabled every
+        # feature built on this router's resolver.
+        assert adapter.calls[0]["dns_servers"] == ["192.168.10.1"]
+
+    async def test_configured_dns_still_wins_over_the_fallback(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)  # dns_primary=8.8.8.8
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.calls[0]["dns_servers"] == ["8.8.8.8"]
+
+    async def test_no_dns_and_no_gateway_advertises_nothing_rather_than_guessing(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """There is nothing truthful to advertise, and inventing an address
+        would be worse than the gap. The push itself is refused earlier for
+        a missing gateway, so this covers the helper directly."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        pool.dns_primary = None
+        pool.dns_secondary = None
+        pool.gateway_ip_address = None
+
+        assert h.service._dns_servers(pool) == []
+
+
+# ============================================================================
+# Editing a pushed pool stops it claiming the router has the new values
+# ============================================================================
+
+
+class TestEditDemotesAnAppliedPool:
+    """``active`` renders as a green "Applied" badge. An edit to anything
+    the router actually carries makes that false the moment it is saved,
+    and nothing used to say so -- the row went on reading ``active`` while
+    the device handed out the *old* range."""
+
+    async def _pushed_pool(
+        self, h: Harness, router: Router, adapter: FakeDhcpAdapter
+    ) -> DhcpPool:
+        pool = await _create_pool(h, router)
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        adapter.calls.clear()
+        return pool
+
+    async def test_widening_the_range_demotes_the_row(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+        assert pool.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            address_range_end="192.168.10.200",
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+    async def test_changing_dns_demotes_the_row(self, adapter: FakeDhcpAdapter) -> None:
+        """A DNS server the router is not advertising is exactly the kind of
+        edit whose effect a customer cannot see from the device."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            dns_primary="1.1.1.1",
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+    async def test_renaming_the_pool_does_not_demote(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """``name``/``description`` never leave the database. The device
+        state still is exactly what the row describes, so demoting would
+        nag the operator into a pointless re-push."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="Lobby Pool",
+            description="Renamed for clarity",
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+    async def test_resubmitting_the_same_range_does_not_demote(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            address_range_start=pool.address_range_start,
+            address_range_end=pool.address_range_end,
+            interface=pool.interface,
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+    async def test_a_demoted_pool_is_still_torn_off_the_device_on_delete(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The demotion says "the router has the old values", so the delete
+        that follows must remove them. Reading ``pending`` as "nothing to
+        remove" would orphan a live DHCP server -- which is why the delete
+        guard keys on ``device_pushed_at``, not on the status."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            address_range_end="192.168.10.200",
+        )
+
+        await h.service.delete_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.deletes) == 1
+
+
+# ============================================================================
+# Rogue-DHCP detection -- the reader, which had zero callers.
+#
+# ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts`` was
+# implemented, documented, and called from nowhere in ``app/``. The writer
+# was wired on both config paths; the reader was not. A router that is not
+# being watched has no alert row, raises no error and appears nowhere -- it
+# is invisible precisely because it is unwatched.
+#
+# THE DISTINCTION UNDER TEST throughout this section is ``unknown`` vs
+# ``unguarded``. A router we could not reach is not a router we know is
+# unwatched. Every test below that produces one asserts it is not the other.
+# ============================================================================
+
+
+def _reading(
+    interface: str = "ether2",
+    *,
+    serves_dhcp: bool = True,
+    alert_present: bool = True,
+    enabled: bool = True,
+) -> RogueDhcpInterfaceReading:
+    return RogueDhcpInterfaceReading(
+        interface=interface,
+        serves_dhcp=serves_dhcp,
+        alert_present=alert_present,
+        enabled=enabled,
+    )
+
+
+async def _detect(h: Harness, router: Router):  # noqa: ANN202 -- test helper
+    return await h.service.run_rogue_dhcp_detection_for_router(router.id)
+
+
+def _state(h: Harness, router: Router, interface: str = "ether2") -> str:
+    return h.repository.rogue_statuses[(router.id, interface)].alert_state
+
+
+class TestRogueDhcpDetection:
+    async def test_a_watched_interface_reads_as_guarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=True, enabled=True)]
+
+        summary = await _detect(h, router)
+
+        assert adapter.reads == 1
+        assert _state(h, router) == RogueDhcpAlertState.GUARDED.value
+        assert summary.guarded == 1
+        assert summary.unguarded == 0
+        assert summary.unknown == 0
+
+    async def test_no_alert_row_at_all_reads_as_unguarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """An interface handing out addresses with nothing watching it.
+
+        This is the finding the whole reader exists for, and it has no
+        alert row of its own to be listed by -- the gateway's
+        ``_build_rogue_dhcp_alert_statuses`` synthesises it from the set of
+        DHCP-serving interfaces precisely so it cannot be a silence the
+        caller has to notice.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=False, enabled=False)]
+
+        summary = await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNGUARDED.value
+        assert row.alert_present is False
+        assert row.enabled is False
+        assert summary.unguarded == 1
+        # Not the same answer as "we could not check".
+        assert summary.unknown == 0
+
+    async def test_a_row_present_but_disabled_reads_as_unguarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """THE STATE ROUTEROS'S OWN DEFAULT PRODUCES.
+
+        ``/ip dhcp-server alert`` rows are created **disabled**. Such a row
+        appears in a ``/export`` looking exactly like a configured watch and
+        observes nothing -- the first careful by-hand attempt on the lab
+        router left three of them. A check that tested only for presence
+        would certify this router as watched.
+
+        ``alert_present`` and ``enabled`` stay legible as separate columns
+        rather than collapsing into a bare ``unguarded``, so an operator can
+        tell a switched-off watch from an interface nobody ever configured.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=True, enabled=False)]
+
+        await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNGUARDED.value
+        # Present, and switched off -- both facts survive.
+        assert row.alert_present is True
+        assert row.enabled is False
+        assert "switched off" in (row.detail or "")
+
+    async def test_an_unreachable_router_reads_as_unknown_not_unguarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A router we could not reach is an unanswered question.
+
+        Reporting it as ``unguarded`` would raise a finding on every
+        offline router in the fleet that no operator could act on, while
+        saying nothing true about rogue DHCP. Same posture
+        ``monitoring.constants.HealthStatus.UNKNOWN`` documents.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_pool(h, router)
+        adapter.read_raises = DhcpDeviceConnectionError(
+            "10.0.0.1", "connection refused"
+        )
+
+        summary = await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNKNOWN.value
+        # THE ASSERTION THIS TEST EXISTS FOR: unknown is never unguarded.
+        assert row.alert_state != RogueDhcpAlertState.UNGUARDED.value
+        assert summary.unknown == 1
+        assert summary.unguarded == 0
+        assert summary.guarded == 0
+        # And it says why, rather than leaving an unanswered question with
+        # no reason attached.
+        assert "connection refused" in (row.detail or "")
+
+    async def test_an_unknown_row_does_not_keep_stale_liveness_booleans(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A router that was watched, then became unreachable.
+
+        ``enabled`` must not stay True beside an ``unknown`` state: a
+        consumer glancing at the boolean would conclude the segment is
+        watched, on evidence that is now of unknown age. ``alert_state`` is
+        the only field carrying an answer here.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=True, enabled=True)]
+        await _detect(h, router)
+        assert _state(h, router) == RogueDhcpAlertState.GUARDED.value
+
+        adapter.read_raises = DhcpDeviceConnectionError("10.0.0.1", "timed out")
+        await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNKNOWN.value
+        assert row.enabled is False
+        assert row.alert_present is False
+
+    async def test_missing_credentials_is_unknown_not_a_finding(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Every way of failing to get an answer lands as ``unknown`` --
+        not only a refused connection. A router with no API credentials was
+        never asked, so nothing about it is known either way."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_pool(h, router)
+        # No decryptable API secret -- ``_resolve_device_credentials``
+        # raises rather than guessing, and the detector never opens a
+        # connection at all.
+        h.router_lookup.secret = None
+
+        summary = await _detect(h, router)
+
+        assert summary.unknown == 1
+        assert summary.unguarded == 0
+        assert _state(h, router) == RogueDhcpAlertState.UNKNOWN.value
+
+    async def test_a_bug_in_the_reader_fails_loudly_rather_than_reading_unknown(
+        self,
+        adapter: FakeDhcpAdapter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """cloud-guest#131, guarded against directly.
+
+        The detector catches ``DhcpError`` and records UNKNOWN. It must NOT
+        catch everything: an ``AttributeError`` from a collaborator that
+        does not implement the reader is a bug in this code, and recording
+        it as "router unreachable" is exactly how broken wiring passes as
+        green. That precise failure -- a fake missing a new method, an
+        ``except Exception`` swallowing the AttributeError -- already
+        happened once in this domain's own test file.
+        """
+
+        class AdapterWithoutTheReader:
+            vendor = "mikrotik"
+
+        monkeypatch.setattr(
+            "app.domains.dhcp.service.get_dhcp_adapter",
+            lambda vendor: AdapterWithoutTheReader(),
+        )
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(AttributeError):
+            await _detect(h, router)
+
+        # And nothing was recorded -- no fabricated "unknown" row papering
+        # over a code defect.
+        assert h.repository.rogue_statuses == {}
+
+    async def test_every_dhcp_serving_interface_appears_even_with_no_row(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The union, not the alert rows alone."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [
+            _reading("ether2", alert_present=True, enabled=True),
+            _reading("ether3", alert_present=False, enabled=False),
+            _reading("vlan10", alert_present=True, enabled=False),
+        ]
+
+        summary = await _detect(h, router)
+
+        assert summary.interfaces == 3
+        assert summary.guarded == 1
+        assert summary.unguarded == 2
+        assert _state(h, router, "ether2") == RogueDhcpAlertState.GUARDED.value
+        assert _state(h, router, "ether3") == RogueDhcpAlertState.UNGUARDED.value
+        assert _state(h, router, "vlan10") == RogueDhcpAlertState.UNGUARDED.value
+
+    async def test_an_interface_the_device_stops_reporting_is_retired(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A stale ``unguarded`` row for an interface that no longer serves
+        DHCP would fail the readiness item forever, with nothing an
+        operator could do to clear it."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [
+            _reading("ether2", alert_present=False, enabled=False),
+            _reading("ether3", alert_present=False, enabled=False),
+        ]
+        await _detect(h, router)
+        assert (router.id, "ether3") in h.repository.rogue_statuses
+
+        adapter.readings = [_reading("ether2", alert_present=True, enabled=True)]
+        await _detect(h, router)
+
+        assert (router.id, "ether3") not in h.repository.rogue_statuses
+        assert _state(h, router, "ether2") == RogueDhcpAlertState.GUARDED.value
+
+    async def test_an_unreachable_router_never_retires_its_rows(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Deleting on a failed read would turn "we could not reach this
+        router" into "this router has nothing to report", which reads as
+        fine."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [
+            _reading("ether2", alert_present=False, enabled=False),
+            _reading("ether3", alert_present=False, enabled=False),
+        ]
+        await _detect(h, router)
+
+        adapter.read_raises = DhcpDeviceConnectionError("10.0.0.1", "no route to host")
+        summary = await _detect(h, router)
+
+        assert (router.id, "ether2") in h.repository.rogue_statuses
+        assert (router.id, "ether3") in h.repository.rogue_statuses
+        assert summary.unknown == 2
+
+    async def test_get_rogue_dhcp_statuses_performs_no_device_io(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The property that lets the readiness checklist compose this at
+        all: ``get_checklist`` re-runs every AUTO item on every GET, so a
+        device read here would put a RouterOS timeout behind a dashboard
+        page load."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading()]
+        await _detect(h, router)
+        reads_after_detection = adapter.reads
+
+        rows = await h.service.get_rogue_dhcp_statuses(router.id)
+
+        assert len(rows) == 1
+        assert adapter.reads == reads_after_detection
+
+
+class TestRogueDhcpSweepTargets:
+    async def test_only_routers_with_an_enabled_pool_are_swept(self) -> None:
+        """A disabled pool hands out nothing, so RouterOS's own alert would
+        have no baseline either -- polling that router spends a real device
+        round trip to learn nothing."""
+        h = make_harness()
+        serving = h.router_lookup.add(_make_router())
+        idle = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, serving)
+        assert pool.is_enabled
+
+        router_ids = await h.repository.list_router_ids_serving_dhcp()
+
+        assert router_ids == [serving.id]
+        assert idle.id not in router_ids
+
+    async def test_a_router_with_many_pools_is_swept_once(self) -> None:
+        """``read_rogue_dhcp_alerts`` answers for every interface in a
+        single pass, so six pools is still one API read."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_pool(h, router, start="192.168.10.10", end="192.168.10.100")
+        await _create_pool(
+            h, router, start="192.168.11.10", end="192.168.11.100", interface="ether3"
+        )
+
+        assert await h.repository.list_router_ids_serving_dhcp() == [router.id]
+
+
+# ============================================================================
+# The captive-portal DHCP option (RFC 8910, code 114)
+#
+# The gap this closes is not a bug in a feature -- it is a missing
+# capability. ``grep -rn "dhcp-server option" app/`` returned nothing, so
+# the only writer of option 114 in this entire system was a human pasting
+# the Master Console setup script, and therefore the only remover was a
+# human too. The gateway-level RouterOS behaviour (ordering, ``unset``,
+# name-not-code matching) is covered in
+# ``vendor/wyfy-device-gateway/tests/test_mikrotik_dhcp_options.py``; what
+# is asserted here is that the service reaches a real device with the right
+# identity, scopes by tenant, and reports what actually changed.
+# ============================================================================
+
+
+class TestCaptivePortalDhcpOption:
+    async def test_removal_reaches_the_device_with_the_platform_option_identity(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        await h.service.converge_captive_portal_dhcp_option_for_router(
+            router.id, present=False, requesting_organization_id=router.organization_id
+        )
+
+        assert len(adapter.option_removals) == 1
+        option = adapter.option_removals[0]
+        assert option.name == CAPTIVE_PORTAL_DHCP_OPTION_NAME
+        assert option.option_set_name == CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME
+        # Carried for humans reading logs and for the write path. It is
+        # never a match key: a code-scoped sweep could only ever hit a row
+        # somebody else added.
+        assert option.code == 114
+
+    async def test_changed_is_the_devices_answer_not_the_requests_intent(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Removal is idempotent, so "no exception" is equally true of a
+        router that was cleaned last week. ``changed`` is the only field
+        that distinguishes the two, and a fleet sweep is unreadable
+        without it."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.option_removal = DhcpOptionRemovalReport(
+            option_removed=True,
+            option_sets_removed=(CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME,),
+            bindings_detached=("ip/dhcp-server/network:10.5.50.0/24",),
+        )
+
+        first = await h.service.converge_captive_portal_dhcp_option_for_router(
+            router.id, present=False, requesting_organization_id=router.organization_id
+        )
+        adapter.option_removal = DhcpOptionRemovalReport()
+        second = await h.service.converge_captive_portal_dhcp_option_for_router(
+            router.id, present=False, requesting_organization_id=router.organization_id
+        )
+
+        assert first.changed is True
+        assert first.option_removed is True
+        assert first.bindings_detached == ("ip/dhcp-server/network:10.5.50.0/24",)
+        assert second.changed is False
+
+    async def test_a_real_removal_is_audited_against_the_router(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.option_removal = DhcpOptionRemovalReport(option_removed=True)
+        actor = uuid.uuid4()
+
+        await h.service.converge_captive_portal_dhcp_option_for_router(
+            router.id,
+            present=False,
+            actor_user_id=actor,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(h.audit_writer.entries) == 1
+        entry = h.audit_writer.entries[0]
+        assert entry["action"] == AuditAction.DHCP_OPTION_REMOVED.value
+        # A router, not a pool: the option is a property of the device and
+        # belongs to no DhcpPool row.
+        assert entry["entity_type"] == "router"
+        assert entry["entity_id"] == router.id
+
+    async def test_a_no_op_removal_writes_no_audit_row(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A fleet sweep that audited every router every run would bury the
+        handful of entries recording a real change to a production network
+        under thousands recording nothing happening."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        await h.service.converge_captive_portal_dhcp_option_for_router(
+            router.id,
+            present=False,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert h.audit_writer.entries == []
+
+    async def test_writing_the_option_requires_a_value(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Refused rather than defaulted. Nothing in this database has ever
+        stored a per-router option-114 value, so any fallback would be a
+        fabricated URI handed to every client on a guest network."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(DhcpOptionValueRequiredError):
+            await h.service.converge_captive_portal_dhcp_option_for_router(
+                router.id,
+                present=True,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert adapter.option_writes == []
+
+    async def test_the_refusal_happens_before_any_connection(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(DhcpOptionValueRequiredError):
+            await h.service.converge_captive_portal_dhcp_option_for_router(
+                router.id,
+                present=True,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert adapter.option_reads == []
+        assert adapter.option_removals == []
+
+    async def test_writing_the_option_carries_force_and_the_binding(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """``force`` matches what the fleet actually carries: every client
+        gets the option whether or not it asked for the code."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        await h.service.converge_captive_portal_dhcp_option_for_router(
+            router.id,
+            present=True,
+            option_value="https://master.wyfyguest.com/api/v1/captive-portal/rfc8908",
+            network_addresses=("10.5.50.0/24",),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.option_writes) == 1
+        option = adapter.option_writes[0]
+        assert option.force is True
+        assert option.network_addresses == ("10.5.50.0/24",)
+        assert option.value.endswith("/rfc8908")
+
+    async def test_a_device_failure_propagates_rather_than_reporting_clean(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """An unreachable router is not a router without the option. A
+        converger that swallowed this would certify exactly the venues
+        nobody has checked."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.option_raises = DhcpDeviceConnectionError("10.20.0.19", "timed out")
+
+        with pytest.raises(DhcpDeviceConnectionError):
+            await h.service.converge_captive_portal_dhcp_option_for_router(
+                router.id,
+                present=False,
+                requesting_organization_id=router.organization_id,
+            )
+
+    async def test_a_router_in_another_organization_is_refused(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The permission dependency only ever sees the header org, while
+        the handler reads ``router_id`` from the path. Scoping has to
+        happen here, on the lookup, or this is a cross-tenant write to
+        somebody else's production router."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.converge_captive_portal_dhcp_option_for_router(
+                router.id,
+                present=False,
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+        assert adapter.option_removals == []
+
+    async def test_a_router_with_no_credentials_is_refused_before_connecting(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        router.api_username = None
+
+        with pytest.raises(DhcpMissingCredentialsError):
+            await h.service.converge_captive_portal_dhcp_option_for_router(
+                router.id,
+                present=False,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert adapter.option_removals == []
+
+    async def test_an_unsupported_vendor_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        router.vendor = "tplink"
+
+        with pytest.raises(UnsupportedDhcpVendorError):
+            await h.service.converge_captive_portal_dhcp_option_for_router(
+                router.id,
+                present=False,
+                requesting_organization_id=router.organization_id,
+            )
+
+
+class TestCaptivePortalDhcpOptionRead:
+    async def test_read_reports_what_the_device_advertises(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.option_snapshot = DhcpOptionSnapshotReading(
+            supported=True,
+            options=(
+                DhcpOptionReading(
+                    name=CAPTIVE_PORTAL_DHCP_OPTION_NAME,
+                    code=114,
+                    value="https://master.wyfyguest.com/api/v1/captive-portal/rfc8908",
+                    force=True,
+                ),
+            ),
+            option_set_names=(CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME,),
+            bindings=("ip/dhcp-server/network:10.5.50.0/24",),
+        )
+
+        snapshot = await h.service.read_captive_portal_dhcp_option(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert snapshot.advertises(CAPTIVE_PORTAL_DHCP_OPTION_NAME) is True
+        assert snapshot.option(CAPTIVE_PORTAL_DHCP_OPTION_NAME).force is True
+
+    async def test_the_read_changes_nothing(self, adapter: FakeDhcpAdapter) -> None:
+        """An audit of the fleet must not itself be a change to the
+        fleet."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        await h.service.read_captive_portal_dhcp_option(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert adapter.option_removals == []
+        assert adapter.option_writes == []
+
+    async def test_an_unaskable_router_is_not_reported_as_clean(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """``supported=False`` means the RouterOS has no option menu at
+        all. Flattening that into "advertises nothing" would let an audit
+        certify a whole class of devices it could not question."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.option_snapshot = DhcpOptionSnapshotReading(
+            supported=False, options=(), option_set_names=(), bindings=()
+        )
+
+        snapshot = await h.service.read_captive_portal_dhcp_option(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert snapshot.supported is False
+        assert snapshot.advertises(CAPTIVE_PORTAL_DHCP_OPTION_NAME) is False
+
+
+class TestCaptivePortalDhcpOptionSweepTargets:
+    async def test_a_router_with_no_pool_of_ours_is_invisible_to_the_other_lister(
+        self,
+    ) -> None:
+        """Establishes the hazard the sweep has to avoid.
+
+        ``list_router_ids_serving_dhcp`` is scoped to routers this platform
+        holds a ``DhcpPool`` row for -- correct for the rogue-DHCP
+        detector, and wrong here. The captive-portal option was pasted from
+        the Master Console setup script onto routers whose DHCP that same
+        script configured, so this lister cannot see them.
+        """
+        h = make_harness()
+        with_pool = h.router_lookup.add(_make_router())
+        without_pool = h.router_lookup.add(_make_router())
+        await _create_pool(h, with_pool)
+
+        serving = await h.repository.list_router_ids_serving_dhcp()
+
+        assert serving == [with_pool.id]
+        assert without_pool.id not in serving
+
+    def test_the_coordinator_fans_out_over_the_whole_fleet(self) -> None:
+        """...and that the coordinator therefore uses the fleet-wide
+        lister.
+
+        Asserted against the source because the alternative -- standing up
+        a real database session for one query -- is not what these unit
+        tests do, and the mistake being guarded is a single identifier: a
+        sweep wired to ``list_router_ids_serving_dhcp`` would run cleanly,
+        report success, and silently skip every router that actually has
+        the option.
+        """
+        import inspect
+
+        from app.domains.dhcp import tasks
+
+        body = inspect.getsource(
+            tasks._dispatch_captive_portal_dhcp_option_sweep_async
+        )
+        assert "list_all_router_ids()" in body
+        assert "list_router_ids_serving_dhcp" not in body
+
+    def test_the_fleet_wide_lister_is_on_the_repository_protocol(self) -> None:
+        """So a substitute repository that omits it fails at the boundary
+        rather than inside a Celery worker at 2am."""
+        from app.domains.dhcp.repository import (
+            DhcpRepository,
+            DhcpRepositoryProtocol,
+        )
+
+        assert hasattr(DhcpRepositoryProtocol, "list_all_router_ids")
+        assert hasattr(DhcpRepository, "list_all_router_ids")
+
+    def test_neither_option_task_is_beat_scheduled(self) -> None:
+        """A recurring remover would undo, in the background, the option an
+        operator had just deliberately pasted onto a freshly-provisioned
+        router -- because the Master Console setup script still emits the
+        chunk. It is routed to the device-I/O queue and dispatched by hand
+        until that generator change lands.
+        """
+        from app.core.celery_app import DEVICE_IO_QUEUE_NAME, celery_app
+        from app.domains.dhcp.constants import (
+            TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER,
+            TASK_RUN_CAPTIVE_PORTAL_DHCP_OPTION_SWEEP,
+        )
+
+        scheduled = {
+            entry["task"] for entry in celery_app.conf.beat_schedule.values()
+        }
+        assert TASK_RUN_CAPTIVE_PORTAL_DHCP_OPTION_SWEEP not in scheduled
+        assert TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER not in scheduled
+        assert celery_app.conf.task_routes[
+            TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER
+        ] == {"queue": DEVICE_IO_QUEUE_NAME}
+
+
+class TestCaptivePortalDhcpOptionLeafReachability:
+    """``reachable`` in a leaf's result must mean "the router answered".
+
+    The 2026-09-06 removal run against the one real router reported::
+
+        {'changed': False, 'reachable': False,
+         'detail': 'Router rejected remove_dhcp_option: ...'}
+
+    The router was plainly reachable -- it was read over the same API
+    connection immediately before and after. "Router rejected" *is* the
+    router answering. Reporting that as unreachable sends whoever reads it
+    hunting a network fault instead of reading the rejection the device
+    actually gave, and it makes a fleet sweep's reachable-count a
+    fiction.
+    """
+
+    @staticmethod
+    def _run_leaf(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> dict:
+        import asyncio
+
+        from app.domains.dhcp import tasks
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def commit(self):
+                return None
+
+            async def rollback(self):
+                return None
+
+        class _Service:
+            async def converge_captive_portal_dhcp_option_for_router(
+                self, router_id, *, present
+            ):
+                raise exc
+
+        monkeypatch.setattr(tasks, "SessionLocal", lambda: _Session())
+        monkeypatch.setattr(tasks, "_build_dhcp_service", lambda session: _Service())
+        return asyncio.run(
+            tasks._converge_captive_portal_dhcp_option_async(
+                uuid.uuid4(), present=False
+            )
+        )
+
+    def test_a_router_that_answered_and_refused_is_reachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result = self._run_leaf(
+            monkeypatch,
+            DhcpDeviceOperationError(
+                "remove_dhcp_option",
+                "delete_dhcp_option: input does not match any value of value-name",
+            ),
+        )
+
+        assert result["reachable"] is True
+        assert result["changed"] is False
+        assert "Router rejected" in result["detail"]
+
+    def test_a_router_that_could_not_be_dialled_is_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the distinction. If this ever stops being
+        False, the flag has become a constant and means nothing."""
+        result = self._run_leaf(
+            monkeypatch, DhcpDeviceConnectionError("10.20.0.19", "timed out")
+        )
+
+        assert result["reachable"] is False
+        assert result["changed"] is False
+
+    def test_changed_stays_false_either_way(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one thing the shipped version got right: a failed removal
+        reports ``changed: False`` instead of claiming success. Fixing
+        ``reachable`` must not cost that."""
+        for exc in (
+            DhcpDeviceOperationError("remove_dhcp_option", "nope"),
+            DhcpDeviceConnectionError("10.20.0.19", "timed out"),
+        ):
+            assert self._run_leaf(monkeypatch, exc)["changed"] is False

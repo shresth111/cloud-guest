@@ -30,6 +30,7 @@ __all__ = [
     "GuestTeamJoinResponse",
     "GuestTeamMemberRemovalResponse",
     "GuestTeamRevokeResponse",
+    "OpenGuestTeamResponse",
 ]
 
 
@@ -119,6 +120,22 @@ class GuestTeamListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class OpenGuestTeamResponse(BaseModel):
+    """One team a guest at this portal could join right now -- the subset
+    of ``GuestTeamResponse`` the sign-in screen's "which group do you
+    belong to?" dropdown needs, plus the live member count so the portal
+    knows the team is genuinely open (never the admin list shape: the
+    guest-facing endpoint that serves this deliberately returns no org/
+    location ids, no timestamps, no revoke fields -- nothing but what a
+    guest picking a group needs to see)."""
+
+    id: str
+    name: str
+    team_code: str
+    max_members: int | None
+    member_count: int
 
 
 class GuestTeamMemberResponse(BaseModel):

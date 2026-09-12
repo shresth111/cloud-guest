@@ -1,17 +1,44 @@
 """Customer provisioning service.
 
-Orchestrates the multi-step onboarding of a new customer — creating the
-organization, first location, first router, and generating configuration
-scripts and NAS/WireGuard credentials.
+Orchestrates onboarding a new customer: creates the organization, grants
+the acting user ``organization-admin`` on it, and optionally creates the
+first location. Composes existing organization, location and RBAC
+services -- no new database tables.
 
-Composes existing organization, location, router, provisioning, and
-wireguard services — no new database tables.
+This service used to also expose ``generate_script``, ``generate_nas``
+and ``generate_wireguard``. All three were stubs: they fabricated
+plausible-looking output (a bash installer for an agent that does not
+exist, a random NAS id/IP/shared secret, a real X25519 keypair pointed
+at a hostname that does not resolve), wrote nothing to the database,
+pushed nothing to the hub, and returned a confident success message.
+A fabricated RADIUS shared secret is worse than a 404: it hands an
+operator a fourth value that matches neither the DB, the hub, nor the
+device. They were removed rather than reimplemented -- the real paths
+already exist and are the only ones that reach the hub:
+
+* NAS registration -> ``POST /radius/nas/register-external/{router_id}``
+  (``app.domains.guest.router.register_external_radius_nas``), which
+  POSTs ``{tunnel_ip, nas_identifier, secret}`` to the FreeRADIUS hub
+  agent via ``guest.radius_bridge.push_nas_client`` and raises 502 if
+  the push fails -- the DB is only reconciled once the hub confirms.
+* WireGuard peers -> ``POST /routers/{router_id}/wireguard-peer/
+  allocate-external``, the one path that both reaches the live hub and
+  writes a row (``wireguard.router`` POSTs to the hub agent, then calls
+  ``WireGuardService.register_agent_allocated_peer``). It is gated at
+  ``RequirePermission("wireguard.create", scope=ScopeType.GLOBAL)``,
+  which is how this platform keeps tunnel internals off customer-
+  reachable routes. The real endpoint is the hub's own
+  ``hub.wyfyguest.com:51820``, not a constant in this domain.
+* Device configuration -> ``network_config.renderers``, which emits
+  RouterOS script text, applied through the ``router_provisioning``
+  domain's adapters. Nothing here installs a bash agent.
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
+from typing import Protocol
 
 from app.domains.location.service import LocationService
 from app.domains.organization.enums import OrganizationType
@@ -19,19 +46,53 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.enums import ScopeType
 from app.domains.rbac.exceptions import RoleNotFoundError
 from app.domains.rbac.service import RBACService
-from app.domains.router.service import RouterService
-from app.domains.router_provisioning.service import RouterProvisioningService
-from app.domains.wireguard.service import WireGuardService
 
-from .schemas import (
-    GenerateNasResponse,
-    GenerateScriptResponse,
-    OnboardRequest,
-    OnboardResponse,
-    WireguardConfigResponse,
-)
+from .schemas import OnboardRequest, OnboardResponse
 
 logger = logging.getLogger(__name__)
+
+
+class DefaultAlertingProtocol(Protocol):
+    """Give a newly onboarded customer the default alert rules, an email
+    channel, and the link between them.
+
+    Structurally satisfied by
+    ``app.domains.monitoring.default_alerting.ensure_default_alerting``
+    partially applied over its two services (see ``dependencies.py``). A
+    narrow duck-typed protocol rather than a hard import, for the reason
+    that module's own docstring gives: this domain has no business knowing
+    what an alert is, and ``monitoring`` owns both services.
+
+    ## Why this was missing and what it cost
+
+    ``ensure_default_alerting`` had exactly one caller, ``POST
+    /organizations``. This endpoint creates organizations too -- it is a
+    path a master operator actually uses -- and did not call it, so a
+    customer onboarded here had **no alert rules at all**. The 30s alert
+    evaluation sweep had nothing to evaluate for them and their venue could
+    go dark in silence. For an Omada venue it also meant the three
+    ``network_controller*`` rules never existed, leaving the
+    controller-health alerting inert for precisely the customers it was
+    built for.
+    """
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> object: ...
+
+
+class _NoopDefaultAlerting:
+    """Honest fallback when nothing real is wired -- logs rather than
+    leaving an organization quietly unalerted. Never wired in production;
+    see ``dependencies.py``."""
+
+    async def __call__(
+        self, *, organization_id: uuid.UUID, contact_email: str | None
+    ) -> None:
+        logger.info(
+            "default_alerting_not_wired",
+            extra={"organization_id": str(organization_id)},
+        )
 
 
 class CustomerProvisioningService:
@@ -39,17 +100,15 @@ class CustomerProvisioningService:
         self,
         organization_service: OrganizationService,
         location_service: LocationService,
-        router_service: RouterService,
-        provisioning_service: RouterProvisioningService,
-        wireguard_service: WireGuardService,
         rbac_service: RBACService,
+        default_alerting: DefaultAlertingProtocol | None = None,
     ) -> None:
         self.organization_service = organization_service
         self.location_service = location_service
-        self.router_service = router_service
-        self.provisioning_service = provisioning_service
-        self.wireguard_service = wireguard_service
         self.rbac_service = rbac_service
+        self.default_alerting: DefaultAlertingProtocol = (
+            default_alerting or _NoopDefaultAlerting()
+        )
 
     async def onboard(
         self, request: OnboardRequest, actor_user_id: uuid.UUID
@@ -61,6 +120,22 @@ class CustomerProvisioningService:
             contact_email=request.admin_email,
             org_type=OrganizationType.STANDARD,
         )
+
+        # Before the role grant and the location, so that an organization
+        # that exists is an organization something is watching. Idempotent
+        # and never raises by contract -- the try/except guards the layer
+        # between here and it, because a customer must not fail to be
+        # created over their default alert rules. See
+        # `DefaultAlertingProtocol` for what was missing.
+        try:
+            await self.default_alerting(
+                organization_id=org.id, contact_email=org.contact_email
+            )
+        except Exception:
+            logger.exception(
+                "default_alerting_failed_during_onboarding",
+                extra={"organization_id": str(org.id)},
+            )
 
         org_admin_role = await self.rbac_service.repository.get_role_by_slug(
             "organization-admin", None
@@ -98,66 +173,4 @@ class CustomerProvisioningService:
             location_id=str(location_id) if location_id else None,
             admin_user_id=str(actor_user_id),
             message=f"Organization '{org.name}' onboarded",
-        )
-
-    async def generate_script(
-        self, customer_id: uuid.UUID
-    ) -> GenerateScriptResponse:
-        script = (
-            "#!/bin/bash\n"
-            "# CloudGuest Router Provisioning Script\n"
-            f"# Customer ID: {customer_id}\n\n"
-            "echo 'Downloading CloudGuest agent...'\n"
-            "curl -sSL https://cloudguest.io/agent/install.sh | bash\n\n"
-            "echo 'Registering router with CloudGuest...'\n"
-            f"cloudguest-agent register --customer-id={customer_id}\n\n"
-            "echo 'Router provisioning complete.'\n"
-        )
-        return GenerateScriptResponse(
-            script=script,
-            script_type="bash",
-            message="Configuration script generated",
-        )
-
-    async def generate_nas(
-        self, customer_id: uuid.UUID
-    ) -> GenerateNasResponse:
-        import secrets
-
-        nas_ip = f"10.0.{uuid.uuid4().int % 255}.{uuid.uuid4().int % 255}"
-        nas_secret = secrets.token_hex(16)
-        return GenerateNasResponse(
-            nas_id=str(uuid.uuid4()),
-            nas_ip=nas_ip,
-            nas_secret=nas_secret,
-            message="NAS device registered",
-        )
-
-    async def generate_wireguard(
-        self, customer_id: uuid.UUID
-    ) -> WireguardConfigResponse:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-
-        private_key_obj = X25519PrivateKey.generate()
-        private_key = private_key_obj.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        public_key = private_key_obj.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-
-        import base64
-        priv_b64 = base64.b64encode(private_key).decode()
-        pub_b64 = base64.b64encode(public_key).decode()
-
-        return WireguardConfigResponse(
-            peer_id=str(uuid.uuid4()),
-            private_key=priv_b64,
-            public_key=pub_b64,
-            endpoint="wg.cloudguest.io:51820",
-            message="WireGuard configuration generated",
         )

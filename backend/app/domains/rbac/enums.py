@@ -153,6 +153,17 @@ class PermissionModule(StrEnum):
     # DEMO_REQUESTS above -- a channel partner is Wyfy Guest's own business
     # relationship, never scoped to a customer Organization.
     CHANNEL_PARTNERS = "channel_partners"
+    # Network Integrations: a tenant's own connection to a third-party
+    # network controller they own and operate (TP-Link Omada today) -- the
+    # controller URL, auth mode, encrypted credentials, the Omada site the
+    # integration is bound to, and the guest SSID the captive portal
+    # authorizes clients onto. See app.domains.network_integration's own
+    # module docstring. Distinct from NETWORK_DEVICE (this platform's NAC
+    # registry of devices seen on a network) and from ROUTERS (hardware
+    # this platform itself provisioned): the box on the other end of an
+    # integration belongs to the customer, and this module gates who may
+    # point this platform at it.
+    NETWORK_INTEGRATIONS = "network_integrations"
 
 
 class OverrideEffect(StrEnum):
@@ -478,6 +489,14 @@ class AuditAction(StrEnum):
     # flag flip doesn't need a dedicated one" judgment call.
     GUEST_ACCESS_RULE_CREATED = "guest_access_rule_created"
     GUEST_ACCESS_RULE_DELETED = "guest_access_rule_deleted"
+    # One row per bulk import, not per imported rule -- see
+    # ``GuestAccessService.import_guest_rules``. A 200-room hotel
+    # re-uploads its Always Allowed list nightly; auditing each row would
+    # write 200 entries a night per property to answer a question nobody
+    # asks at that granularity ("who uploaded the list, where, and when"
+    # is the question), and would drown the genuinely per-guest
+    # create/delete entries above.
+    GUEST_ACCESS_RULES_IMPORTED = "guest_access_rules_imported"
 
     # Billing domain events (Module 013 Part 1: Plan + License + Usage Core)
     # -- written through this same table by
@@ -768,6 +787,11 @@ class AuditAction(StrEnum):
     VLAN_CREATED = "vlan_created"
     VLAN_UPDATED = "vlan_updated"
     VLAN_DELETED = "vlan_deleted"
+    # VLAN_PUSHED is the real device-push event: the row was realized on an
+    # actual router over the RouterOS API. Distinct from VLAN_CREATED, which
+    # only ever meant "a database row exists" -- for most of this domain's
+    # life that was all a "created" VLAN was.
+    VLAN_PUSHED = "vlan_pushed"
 
     # DHCP Pool Management domain events -- written through this same
     # table by ``app.domains.dhcp.service.DhcpService`` via the same
@@ -778,6 +802,19 @@ class AuditAction(StrEnum):
     DHCP_POOL_CREATED = "dhcp_pool_created"
     DHCP_POOL_UPDATED = "dhcp_pool_updated"
     DHCP_POOL_DELETED = "dhcp_pool_deleted"
+    # The real device-push event: the pool was realized on a router, not
+    # merely written to a row. Distinct from DHCP_POOL_CREATED, which says
+    # nothing about any device -- and used to be the only DHCP audit entry
+    # that ever existed, which is how "created" came to mean "a row exists".
+    DHCP_POOL_PUSHED = "dhcp_pool_pushed"
+    # The captive-portal DHCP option (RFC 8910, code 114) written to, or
+    # removed from, a router. Its entity is a **router**, not a DhcpPool:
+    # the option is a property of the device and belongs to no pool row.
+    # Recorded only when the device actually changed -- a fleet sweep is
+    # idempotent, and a row per router per run would bury the handful of
+    # entries recording a real change to a production network.
+    DHCP_OPTION_WRITTEN = "dhcp_option_written"
+    DHCP_OPTION_REMOVED = "dhcp_option_removed"
 
     # Port Forwarding Management domain events -- written through this
     # same table by
@@ -789,6 +826,11 @@ class AuditAction(StrEnum):
     PORT_FORWARDING_RULE_CREATED = "port_forwarding_rule_created"
     PORT_FORWARDING_RULE_UPDATED = "port_forwarding_rule_updated"
     PORT_FORWARDING_RULE_DELETED = "port_forwarding_rule_deleted"
+    # The real device-push event: the row was realized on an actual router
+    # over the RouterOS API. Distinct from PORT_FORWARDING_RULE_CREATED,
+    # which only ever meant "a row was written" -- same distinction as
+    # VLAN_PUSHED and DHCP_POOL_PUSHED above.
+    PORT_FORWARDING_RULE_PUSHED = "port_forwarding_rule_pushed"
 
     # MAC Authorization domain events -- written through this same table
     # by
@@ -924,13 +966,17 @@ class AuditAction(StrEnum):
     # Content Filtering domain events -- written through this same table
     # by ``app.domains.content_filtering.service.ContentFilterService``
     # via the same narrow ``AuditLogWriter`` protocol shape every other
-    # domain's service uses. A pure rules/inventory domain (no live
-    # device push in this pass -- see that module's own docstring), so
-    # create/update/delete are its only lifecycle events, mirroring
-    # FIREWALL_RULE_CREATED/_UPDATED/_DELETED's identical shape above.
+    # domain's service uses.
     CONTENT_FILTER_RULE_CREATED = "content_filter_rule_created"
     CONTENT_FILTER_RULE_UPDATED = "content_filter_rule_updated"
     CONTENT_FILTER_RULE_DELETED = "content_filter_rule_deleted"
+    # The real device-push event: the rule was realized on a router, not
+    # merely written to a row. Distinct from CONTENT_FILTER_RULE_CREATED,
+    # which says nothing about any device -- and used to be the only
+    # evidence a block existed, which is how "blocked" came to mean "a row
+    # exists" on a dashboard that showed it as enforced. Same distinction,
+    # and the same reason, as DHCP_POOL_PUSHED and VLAN_PUSHED above.
+    CONTENT_FILTER_RULE_PUSHED = "content_filter_rule_pushed"
 
     # Support Tickets domain events -- written through this same table by
     # ``app.domains.support_tickets.service.TicketService`` via the same
@@ -980,6 +1026,19 @@ class AuditAction(StrEnum):
     # for, and the per-channel outcome rides along in ``event_metadata``.
     CHANNEL_PARTNER_REVOKED = "channel_partner_revoked"
     CHANNEL_PARTNER_WELCOME_RESENT = "channel_partner_welcome_resent"
+
+    # System Settings domain event -- the platform-wide (GLOBAL-scope)
+    # configuration store (``app.domains.system_settings``), written through
+    # this same table via the identical narrow ``AuditLogWriter`` protocol
+    # shape the Channel Partner/Organization/Voucher domains already use.
+    # A platform default (e.g. ``new_customer_default_plan_id``) is exactly
+    # the kind of change an operator needs a "who changed this, when, from
+    # what to what" trail for -- the same bar ``PLAN_UPDATED``/
+    # ``TAX_RATE_UPDATED`` are held to -- so every ``PUT /system-settings``
+    # that actually changes a value records one entry carrying the changed
+    # keys (old + new) in ``event_metadata``. ``organization_id`` is always
+    # ``None``: this is platform state that belongs to no tenant.
+    SYSTEM_SETTINGS_UPDATED = "system_settings_updated"
 
 
 # Actions that must never surface on an organization-scoped audit query --

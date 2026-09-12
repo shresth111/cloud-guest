@@ -228,12 +228,36 @@ class ScopeResolver:
         level than itself (a location-scoped grant cannot authorize an
         organization-level action).
 
-        Note: because the Location/Router domains don't exist yet, this
-        cannot look up "which organization does this location belong to" --
-        it relies entirely on the caller (``CurrentOrganization`` /
-        ``CurrentLocation`` dependencies) supplying ``organization_id``
-        alongside ``location_id``/``router_id`` in the requested
-        :class:`ScopeContext`. See RBAC_ARCHITECTURE.md.
+        ## What makes the broader-covers-narrower rule sound
+
+        This method compares the grant against **one** dimension -- its own.
+        An ORGANIZATION grant satisfying a ROUTER check compares organization
+        ids and never looks at the router; a LOCATION grant satisfying a
+        ROUTER check compares location ids and never looks at the router.
+        That is only correct if the requested context's broader ids genuinely
+        describe the narrower target.
+
+        They did not used to. This docstring previously said the resolver
+        "relies entirely on the caller ... supplying ``organization_id``
+        alongside ``location_id``/``router_id``" -- and the caller supplied it
+        in a header they chose. So a LOCATION-scoped account could name a
+        router at another site, send its own ``X-Location-Id``, and have this
+        method compare that header against that account's own grant and say
+        yes. Nothing about the router was checked. The payload on the worst
+        such route was ping/traceroute -- command execution on hardware at a
+        site the caller had no grant on.
+
+        ``dependencies._current_scope_context`` now derives the broader ids
+        from the target entity itself (one indexed read; ``Router`` carries a
+        denormalized ``organization_id`` alongside its ``location_id``), so
+        ``requested.location_id`` means "the location this router is actually
+        at". The comparison below is sound because the context is honest, not
+        because it grew more comparisons.
+
+        A context whose broader ids could not be resolved (an id naming a row
+        that does not exist) keeps whatever the headers held and fails closed
+        here on mismatch; the handler then reports the 404 that is really the
+        problem.
         """
         if grant_scope.scope_type == ScopeType.GLOBAL:
             return True

@@ -13,27 +13,43 @@ environment.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
-from app.domains.guest_access.constants import AccessRuleType
+from app.domains.guest_access.constants import (
+    MAX_IMPORT_BATCH_SIZE,
+    WHITELIST_ONLY_DENIAL_REASON,
+    AccessRuleType,
+    GuestRuleImportRejectionCode,
+)
 from app.domains.guest_access.exceptions import (
     AccessRuleNotFoundError,
+    CountryCodeRequiredError,
     CrossOrganizationAccessRuleError,
     InvalidGuestIdentifierError,
     InvalidRuleExpiryError,
+    OrganizationRequiredError,
     TemporaryRuleRequiresExpiryError,
 )
 from app.domains.guest_access.models import DeviceAccessRule, GuestAccessRule
+from app.domains.guest_access.repository import GuestAccessRepository
+from app.domains.guest_access.router import router as guest_access_router
+from app.domains.guest_access.schemas import GuestAccessRuleImportRequest
 from app.domains.guest_access.service import (
     AccessDecision,
     AccessDecisionResolver,
     GuestAccessService,
 )
 from app.domains.guest_access.validators import (
+    canonicalize_rule_identifier,
+    identifier_match_terms,
+    identifiers_match,
     is_rule_expired,
     validate_identifier_shape,
     validate_rule_expiry,
@@ -122,6 +138,48 @@ class FakeGuestAccessRepository:
 
         return items, _Meta(total)
 
+    async def find_guest_rule_for_import(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        identifier: str,
+        rule_type: str,
+    ) -> GuestAccessRule | None:
+        # Mirrors ``GuestAccessRepository.find_guest_rule_for_import``'s
+        # candidate set: the canonical spelling plus the "+"-less ones a
+        # pre-2026-09 row is in, and deliberately *not* the "+"-carrying
+        # widened terms the read path uses. See that method for why a
+        # write must match more narrowly than a read.
+        candidates = {
+            spelling
+            for spelling in identifier_match_terms(identifier).exact
+            if not spelling.startswith("+")
+        } | {identifier}
+        matches = [
+            rule
+            for rule in self.guest_rules.values()
+            if rule.organization_id == organization_id
+            and rule.location_id == location_id
+            and rule.identifier in candidates
+            and rule.rule_type == rule_type
+            and not rule.is_deleted
+        ]
+        if not matches:
+            return None
+        # Canonical first, as the SQL ORDER BY does.
+        matches.sort(key=lambda rule: rule.identifier != identifier)
+        return matches[0]
+
+    async def list_all_guest_rules_for_organization(
+        self, organization_id: uuid.UUID
+    ) -> list[GuestAccessRule]:
+        return [
+            rule
+            for rule in self.guest_rules.values()
+            if rule.organization_id == organization_id and not rule.is_deleted
+        ]
+
     async def list_matching_guest_rules(
         self,
         *,
@@ -130,11 +188,16 @@ class FakeGuestAccessRepository:
         identifier: str,
         now: datetime,
     ) -> list[GuestAccessRule]:
+        # ``identifiers_match``, not ``==``: the real repository resolves
+        # a guest against every stored spelling of the same number (see
+        # ``validators.identifier_match_terms``), and a fake that still
+        # compared exactly would keep passing for the exact defect this
+        # domain was fixed for.
         return [
             rule
             for rule in self.guest_rules.values()
             if rule.organization_id == organization_id
-            and rule.identifier == identifier
+            and identifiers_match(rule.identifier, identifier)
             and rule.is_active
             and not rule.is_deleted
             and (rule.location_id is None or rule.location_id == location_id)
@@ -221,7 +284,16 @@ class Fixture:
 def make_fixture() -> Fixture:
     repository = FakeGuestAccessRepository()
     audit_writer = FakeAuditLogWriter()
-    service = GuestAccessService(repository, audit_writer=audit_writer)
+    # No block enforcer: this module covers rule CRUD, tenant scoping and
+    # precedence resolution, none of which touch a device. The
+    # device-side half -- blocking a guest actually ending the session
+    # they are in -- has its own suite in
+    # ``test_guest_access_block_enforcement.py``, including a test that a
+    # ``None`` enforcer records ``UNENFORCED`` rather than pretending the
+    # block reached a router.
+    service = GuestAccessService(
+        repository, block_enforcer=None, audit_writer=audit_writer
+    )
     return Fixture(
         repository=repository,
         audit_writer=audit_writer,
@@ -279,14 +351,26 @@ class TestValidators:
             "guest@example.com",
             "a@b.co",
             "+919876543210",
-            "919876543210",
-            "14155552671",
+            "+14155552671",
         ],
     )
     def test_validate_identifier_shape_accepts_phone_or_email(
         self, identifier: str
     ) -> None:
         validate_identifier_shape(identifier)  # does not raise
+
+    @pytest.mark.parametrize("identifier", ["919876543210", "14155552671"])
+    def test_validate_identifier_shape_rejects_missing_country_code(
+        self, identifier: str
+    ) -> None:
+        # These two used to pass -- the old ``_PHONE_RE`` made the "+"
+        # optional, which is what let the customer dashboard write rules
+        # that could never match a guest (2026-09). A number without a
+        # country code is now refused at the door, and with its own
+        # exception: it is under-specified, not malformed, and the admin
+        # needs different words in front of them.
+        with pytest.raises(CountryCodeRequiredError):
+            validate_identifier_shape(identifier)
 
     @pytest.mark.parametrize(
         "identifier",
@@ -408,6 +492,199 @@ class TestAccessDecisionResolver:
         decision = resolver.resolve(guest_rules=[], device_rules=[device_blocklist])
         assert decision.allowed is False
         assert decision.rule_type == AccessRuleType.BLOCKLIST
+
+
+class TestWhitelistOnlyDefault:
+    """The single behavioural change per-property whitelist-only mode makes
+    to resolution: what "nothing matched" means."""
+
+    def test_no_rules_denies_when_whitelist_only_is_on(self) -> None:
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+        assert decision.allowed is False
+        assert decision.matched_rule_id is None
+        assert decision.rule_type is None
+        assert decision.reason == WHITELIST_ONLY_DENIAL_REASON
+
+    def test_the_denial_is_distinguishable_from_a_blocklist_denial(self) -> None:
+        """The whole reason this is a separate decision shape: the portal
+        has to be able to say "you are barred" and "this venue admits only
+        listed guests" differently, and it can only do that if the two
+        refusals do not look identical coming out of the resolver."""
+        resolver = AccessDecisionResolver()
+        blocked = resolver.resolve(
+            guest_rules=[_guest_rule(AccessRuleType.BLOCKLIST, reason="abuse")],
+            device_rules=[],
+            whitelist_only_enabled=True,
+        )
+        unlisted = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+
+        assert blocked.allowed is False and unlisted.allowed is False
+        assert blocked.is_whitelist_only_denial is False
+        assert unlisted.is_whitelist_only_denial is True
+        assert blocked.reason != unlisted.reason
+        assert blocked.matched_rule_id is not None
+        assert unlisted.matched_rule_id is None
+
+    @pytest.mark.parametrize(
+        "rule_type", [AccessRuleType.WHITELIST, AccessRuleType.VIP]
+    )
+    def test_an_allow_rule_still_admits_under_whitelist_only(
+        self, rule_type: AccessRuleType
+    ) -> None:
+        """The list is what the mode is *for*. A guest on it gets in."""
+        rule = _guest_rule(rule_type)
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[rule], device_rules=[], whitelist_only_enabled=True
+        )
+        assert decision.allowed is True
+        assert decision.matched_rule_id == rule.id
+
+    def test_a_device_rule_admits_under_whitelist_only_too(self) -> None:
+        rule = _device_rule(AccessRuleType.WHITELIST)
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[], device_rules=[rule], whitelist_only_enabled=True
+        )
+        assert decision.allowed is True
+
+    def test_a_blocklist_still_refuses_an_otherwise_listed_guest(self) -> None:
+        """Precedence is untouched: whitelist-only mode changes the
+        default, not the walk. A BLOCKLIST still outranks a WHITELIST."""
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[
+                _guest_rule(AccessRuleType.WHITELIST),
+                _guest_rule(AccessRuleType.BLOCKLIST, reason="abuse"),
+            ],
+            device_rules=[],
+            whitelist_only_enabled=True,
+        )
+        assert decision.allowed is False
+        assert decision.rule_type == AccessRuleType.BLOCKLIST
+        assert decision.is_whitelist_only_denial is False
+
+    def test_every_matched_decision_is_byte_for_byte_what_it_was(self) -> None:
+        """The flag must not leak into any decision that matched a rule.
+
+        Asserted as equality of whole decisions across both settings,
+        rather than field by field, so a future field added to
+        ``AccessDecision`` is covered without anyone remembering to.
+        """
+        resolver = AccessDecisionResolver()
+        for rules in (
+            [_guest_rule(AccessRuleType.WHITELIST)],
+            [_guest_rule(AccessRuleType.VIP)],
+            [_guest_rule(AccessRuleType.TEMPORARY)],
+            [_guest_rule(AccessRuleType.BLOCKLIST, reason="abuse")],
+            [
+                _guest_rule(AccessRuleType.BLOCKLIST),
+                _guest_rule(AccessRuleType.VIP),
+            ],
+        ):
+            assert resolver.resolve(
+                guest_rules=rules, device_rules=[], whitelist_only_enabled=False
+            ) == resolver.resolve(
+                guest_rules=rules, device_rules=[], whitelist_only_enabled=True
+            )
+
+    def test_the_default_is_off(self) -> None:
+        """Omitting the parameter must mean allow, not deny -- every
+        pre-existing caller (this domain's own ``POST .../check`` endpoint
+        included) relies on it."""
+        assert (
+            AccessDecisionResolver().resolve(guest_rules=[], device_rules=[]).allowed
+            is True
+        )
+
+    def test_the_deny_singleton_is_shared_and_frozen(self) -> None:
+        """``_DEFAULT_DENY`` sits beside ``_DEFAULT_ALLOW`` as a
+        module-level frozen singleton -- one object, not one per refusal."""
+        resolver = AccessDecisionResolver()
+        first = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+        second = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+        assert first is second
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            first.allowed = True  # type: ignore[misc]
+
+
+class TestCheckAccessThreadsTheFlag:
+    async def test_check_access_denies_an_unmatched_guest_when_asked_to(self) -> None:
+        fx = make_fixture()
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            mac_address=None,
+            whitelist_only_enabled=True,
+        )
+        assert decision.is_whitelist_only_denial is True
+
+    async def test_check_access_defaults_to_allow_without_the_flag(self) -> None:
+        """The parameter defaults to ``False``, so the admin-facing
+        ``POST /guest-access/check`` -- which knows nothing about a portal
+        config -- keeps answering exactly as it always has."""
+        fx = make_fixture()
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.allowed is True
+
+    def test_this_domain_still_imports_nothing_from_captive_portal(self) -> None:
+        """The acyclic module graph this domain's docstring documents as a
+        design constraint, asserted rather than trusted.
+
+        ``whitelist_only_enabled`` lives on ``captive_portal_configs``, and
+        the shortest way to read it here would have been to import that
+        domain -- which is exactly the edge that must not exist. It is a
+        parameter instead, so this assertion must keep holding.
+
+        Parses the imports rather than grepping the text, so a docstring
+        that merely *mentions* the other domain (this file's own do)
+        cannot trip it and, more importantly, cannot mask a real import.
+        """
+        import ast
+        import pathlib
+
+        import app.domains.guest_access.service as svc
+
+        tree = ast.parse(pathlib.Path(svc.__file__).read_text())
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+
+        assert not [m for m in imported if "captive_portal" in m], imported
+        assert not [m for m in imported if m.startswith("app.domains.guest.")], imported
+
+    def test_the_resolver_is_a_pure_function_of_its_arguments(self) -> None:
+        """``AccessDecisionResolver`` holds no collaborators at all -- no
+        repository, no session, no config service. Constructing one takes
+        no arguments and resolving needs nothing but rows and the flag."""
+        resolver = AccessDecisionResolver()
+        assert vars(resolver) == {}
+        assert (
+            resolver.resolve(
+                guest_rules=[], device_rules=[], whitelist_only_enabled=True
+            ).allowed
+            is False
+        )
 
 
 # ============================================================================
@@ -722,3 +999,786 @@ class TestCheckAccess:
                 identifier="guest@example.com",
                 mac_address=None,
             )
+
+
+# ============================================================================
+# Identifier normalization: the 2026-09 "Always Allowed matches nobody" fix
+# ============================================================================
+
+
+def _legacy_rule(
+    fx: Fixture,
+    *,
+    identifier: str,
+    rule_type: AccessRuleType = AccessRuleType.WHITELIST,
+    reason: str | None = None,
+) -> GuestAccessRule:
+    """Writes a rule straight into the repository, bypassing the service.
+
+    Not laziness -- necessity. ``create_guest_rule`` now refuses the very
+    shape these tests are about, and this is exactly how those rows got
+    into production: the customer dashboard's Always Allowed / Block User
+    forms POSTed bare national digits, the API stored them verbatim, and
+    nothing downstream could ever match them again.
+    """
+    rule = GuestAccessRule(
+        **_base_fields(
+            organization_id=fx.organization_id,
+            location_id=None,
+            identifier=identifier,
+            rule_type=rule_type.value,
+            reason=reason,
+            email=None,
+            expires_at=None,
+            is_active=True,
+        )
+    )
+    fx.repository.guest_rules[rule.id] = rule
+    return rule
+
+
+class TestIdentifierCanonicalization:
+    def test_bare_national_number_is_refused_not_guessed(self) -> None:
+        # Nothing server-side knows which country "9876543210" belongs to.
+        # Prefixing one would put the same class of unmatchable row in the
+        # table for a new reason, so the write is refused instead.
+        with pytest.raises(CountryCodeRequiredError):
+            validate_identifier_shape("9876543210")
+
+    def test_rejection_message_tells_the_admin_what_to_do(self) -> None:
+        with pytest.raises(CountryCodeRequiredError) as excinfo:
+            validate_identifier_shape("9876543210")
+        message = str(excinfo.value)
+        assert "country code" in message
+        assert "+919876543210" in message
+
+    @pytest.mark.parametrize(
+        ("submitted", "stored"),
+        [
+            ("  +919876543210  ", "+919876543210"),
+            ("+91 98765 43210", "+919876543210"),
+            ("+91-98765-43210", "+919876543210"),
+            ("+1 (415) 555-2671", "+14155552671"),
+            # Excel and Google Sheets autocorrect a typed hyphen into
+            # U+2011 without telling anyone, and a bulk import is fed
+            # straight out of a spreadsheet.
+            ("+91\u201198765\u201143210", "+919876543210"),
+        ],
+    )
+    def test_human_formatting_is_stripped_not_rejected(
+        self, submitted: str, stored: str
+    ) -> None:
+        # An admin bounced for punctuation retypes the number without the
+        # "+" next, which is the one shape this domain must keep out of
+        # the table -- so punctuation is absorbed, not punished.
+        canonical = canonicalize_rule_identifier(submitted)
+        assert canonical == stored
+        validate_identifier_shape(canonical)  # does not raise
+
+    def test_email_identifiers_are_left_alone(self) -> None:
+        # Case-folding emails would be an unrelated behaviour change to a
+        # column ``Guest.identifier`` compares case-sensitively.
+        assert canonicalize_rule_identifier("  Guest@Example.com ") == (
+            "Guest@Example.com"
+        )
+
+    async def test_create_guest_rule_stores_e164(self) -> None:
+        fx = make_fixture()
+        rule = await fx.service.create_guest_rule(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+91 98765 43210",
+            rule_type=AccessRuleType.WHITELIST,
+            reason="owner's family",
+            expires_at=None,
+            actor_user_id=fx.actor_user_id,
+        )
+        assert rule.identifier == "+919876543210"
+
+    async def test_create_guest_rule_refuses_bare_national_number(self) -> None:
+        fx = make_fixture()
+        with pytest.raises(CountryCodeRequiredError):
+            await fx.service.create_guest_rule(
+                organization_id=fx.organization_id,
+                requesting_organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                identifier="9876543210",
+                rule_type=AccessRuleType.WHITELIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=fx.actor_user_id,
+            )
+        assert fx.repository.guest_rules == {}
+
+
+class TestLegacyIdentifierMatching:
+    async def test_bare_digit_rule_matches_e164_guest(self) -> None:
+        # The failure that was live: every row the Always Allowed form
+        # ever wrote is bare national digits, every guest signs in as
+        # E.164, and rules were resolved by string equality -- so no rule
+        # that screen wrote could match anybody. Under the per-property
+        # whitelist-only mode this same unchanged data refuses every
+        # guest at the property, staff included.
+        fx = make_fixture()
+        _legacy_rule(fx, identifier="9876543210", reason="owner's family")
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.rule_type == AccessRuleType.WHITELIST.value
+        assert decision.allowed is True
+
+    async def test_bare_digit_blocklist_rule_still_denies(self) -> None:
+        # The same row shape on the deny side: a block written by that
+        # form let the blocked guest straight back on.
+        fx = make_fixture()
+        _legacy_rule(
+            fx,
+            identifier="9876543210",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="repeated abuse",
+        )
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.allowed is False
+        assert decision.reason == "repeated abuse"
+
+    async def test_e164_rule_matches_bare_digit_guest(self) -> None:
+        # The reverse direction. A canonically-written rule must not go
+        # inert the moment a portal (or a NAS forwarding whatever the
+        # browser POSTed) sends the number without its country code.
+        fx = make_fixture()
+        await fx.service.create_guest_rule(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            rule_type=AccessRuleType.VIP,
+            reason="regular",
+            expires_at=None,
+            actor_user_id=fx.actor_user_id,
+        )
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="9876543210",
+            mac_address=None,
+        )
+        assert decision.rule_type == AccessRuleType.VIP.value
+
+    async def test_country_code_without_plus_also_matches(self) -> None:
+        # The third spelling the old, "+"-optional regex accepted and the
+        # table therefore holds.
+        fx = make_fixture()
+        _legacy_rule(fx, identifier="919876543210")
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.rule_type == AccessRuleType.WHITELIST.value
+
+    async def test_a_different_number_still_does_not_match(self) -> None:
+        # The widening is bounded at one country code, not "ends with".
+        fx = make_fixture()
+        _legacy_rule(fx, identifier="9876543210", rule_type=AccessRuleType.BLOCKLIST)
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876500000",
+            mac_address=None,
+        )
+        assert decision.allowed is True
+        assert decision.rule_type is None
+
+    @pytest.mark.parametrize(
+        ("stored", "incoming"),
+        [
+            ("guest@example.com", "other@example.com"),
+            ("guest@example.com", "+919876543210"),
+            ("+919876543210", "guest@example.com"),
+            # Never widen what cannot be proved to be a phone number.
+            ("123456", "+91123456"),
+        ],
+    )
+    def test_non_phone_identifiers_are_never_widened(
+        self, stored: str, incoming: str
+    ) -> None:
+        assert identifiers_match(stored, incoming) is False
+
+    def test_identical_email_still_matches(self) -> None:
+        assert identifiers_match("guest@example.com", " guest@example.com ") is True
+
+
+class TestMatchTermsAndSqlAgree:
+    """The Python mirror (``identifiers_match``, used by this module's fake
+    repository) and the real SQL clause must not drift -- one of them is
+    what the tests above exercise and the other is what production runs,
+    and there is no live Postgres here to run both against."""
+
+    async def test_repository_statement_carries_every_match_term(self) -> None:
+        captured: list[object] = []
+
+        class _Result:
+            def scalars(self) -> _Result:
+                return self
+
+            def all(self) -> list[GuestAccessRule]:
+                return []
+
+        class _Session:
+            async def execute(self, statement: object) -> _Result:
+                captured.append(statement)
+                return _Result()
+
+        repository = GuestAccessRepository(_Session())  # type: ignore[arg-type]
+        await repository.list_matching_guest_rules(
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            identifier="+919876543210",
+            now=_now(),
+        )
+        compiled = str(
+            captured[0].compile(  # type: ignore[attr-defined]
+                compile_kwargs={"literal_binds": True}
+            )
+        )
+        terms = identifier_match_terms("+919876543210")
+        assert "9876543210" in terms.exact  # the legacy shape, spelled out
+        for term in terms.exact:
+            assert f"'{term}'" in compiled
+        for pattern in terms.prefix_patterns:
+            assert f"'{pattern}'" in compiled
+        assert "LIKE" in compiled.upper()
+
+
+# ============================================================================
+# Bulk import / export
+#
+# The endpoint exists because a per-property whitelist-only mode makes the
+# Always Allowed list the entire guest population of a venue -- a 200-room
+# hotel cannot type that in one number at a time. These tests pin the four
+# decisions that make it safe to point at a whole property: per-row
+# rejection, server-side canonicalisation, upsert-on-repeat, and the
+# refusal to bulk-write blocks.
+# ============================================================================
+
+
+async def _import(
+    f: Fixture,
+    rows: list[dict[str, object]],
+    **overrides: object,
+) -> object:
+    kwargs: dict[str, object] = {
+        "organization_id": f.organization_id,
+        "requesting_organization_id": f.organization_id,
+        "default_location_id": None,
+        "default_rule_type": AccessRuleType.WHITELIST,
+        "default_expires_at": None,
+        "rows": rows,
+        "actor_user_id": f.actor_user_id,
+    }
+    kwargs.update(overrides)
+    return await f.service.import_guest_rules(**kwargs)
+
+
+class TestBulkImport:
+    async def test_one_bad_row_does_not_cost_the_batch(self) -> None:
+        f = make_fixture()
+        result = await _import(
+            f,
+            [
+                {"identifier": "+919876543210"},
+                {"identifier": "not a number at all"},
+                {"identifier": "+919876543211"},
+            ],
+        )
+        assert result.imported_count == 2
+        assert len(result.rejected) == 1
+        assert result.rejected[0].row_number == 2
+        assert (
+            result.rejected[0].code == GuestRuleImportRejectionCode.MALFORMED_IDENTIFIER
+        )
+
+    async def test_national_format_row_is_rejected_with_an_instruction(self) -> None:
+        f = make_fixture()
+        result = await _import(f, [{"identifier": "9876543210"}])
+        assert result.imported_count == 0
+        assert (
+            result.rejected[0].code
+            == GuestRuleImportRejectionCode.COUNTRY_CODE_REQUIRED
+        )
+        # Never accepted-and-stored-wrong: the message has to say what to
+        # send instead, because the operator is holding a spreadsheet.
+        assert "+91" in result.rejected[0].reason
+
+    async def test_stored_identifier_is_canonical_not_as_submitted(self) -> None:
+        f = make_fixture()
+        await _import(f, [{"identifier": "+91 98765 43210"}])
+        stored = next(iter(f.repository.guest_rules.values()))
+        assert stored.identifier == "+919876543210"
+
+    async def test_repeat_row_updates_rather_than_duplicating(self) -> None:
+        f = make_fixture()
+        first = await _import(f, [{"identifier": "+919876543210"}])
+        later = _now() + timedelta(days=1)
+        second = await _import(
+            f, [{"identifier": "+919876543210"}], default_expires_at=later
+        )
+        assert first.imported_count == 1
+        assert second.imported_count == 0
+        assert second.updated_count == 1
+        # One row, not two -- otherwise a nightly re-upload grows the table
+        # by a full list a night and every login matches N copies.
+        assert len(f.repository.guest_rules) == 1
+        assert next(iter(f.repository.guest_rules.values())).expires_at == later
+
+    async def test_a_guest_listed_twice_in_one_file_writes_one_row(self) -> None:
+        f = make_fixture()
+        later = _now() + timedelta(days=2)
+        result = await _import(
+            f,
+            [
+                {"identifier": "+919876543210"},
+                {"identifier": "+919876543210", "expires_at": later},
+            ],
+        )
+        # A two-sheet spreadsheet really does produce this. One row, last
+        # occurrence wins.
+        assert result.imported_count == 1
+        assert result.updated_count == 1
+        assert len(f.repository.guest_rules) == 1
+        assert next(iter(f.repository.guest_rules.values())).expires_at == later
+
+    async def test_a_pre_e164_row_is_repaired_not_duplicated(self) -> None:
+        # Every rule written before the 2026-09 fix is a bare national
+        # number that matches nobody. Without this, the first upload after
+        # that fix files a canonical row beside every dead one and the
+        # venue ends up holding two rows per guest.
+        f = make_fixture()
+        legacy = _legacy_rule(f, identifier="9876543210")
+        result = await _import(f, [{"identifier": "+919876543210"}])
+        assert result.imported_count == 0
+        assert result.updated_count == 1
+        assert len(f.repository.guest_rules) == 1
+        # The import is the one moment a human supplies the country code
+        # no migration could invent -- so it is taken.
+        assert legacy.identifier == "+919876543210"
+
+    async def test_a_pre_e164_row_of_a_different_number_is_left_alone(self) -> None:
+        # The read path treats "+19876543210" (a US number) as a possible
+        # spelling of "+919876543210" and accepts that looseness because
+        # the alternative is every legacy rule dead. A *write* cannot: a
+        # false match here relabels a real person's rule with someone
+        # else's number and leaves no record of the old value. Anything
+        # already carrying a "+" is already canonical and is never
+        # rewritten.
+        f = make_fixture()
+        someone_else = _legacy_rule(f, identifier="+19876543210")
+        result = await _import(f, [{"identifier": "+919876543210"}])
+        assert result.imported_count == 1
+        assert result.updated_count == 0
+        assert someone_else.identifier == "+19876543210"
+
+    async def test_expired_row_is_revived_not_reported_as_duplicate(self) -> None:
+        f = make_fixture()
+        await _import(f, [{"identifier": "+919876543210"}])
+        stored = next(iter(f.repository.guest_rules.values()))
+        stored.expires_at = _now() - timedelta(days=1)
+        stored.is_active = False
+        checkout = _now() + timedelta(days=2)
+        result = await _import(
+            f, [{"identifier": "+919876543210"}], default_expires_at=checkout
+        )
+        # A guest who checked out on Tuesday and checks in on Friday is the
+        # same person. "Already exists" would leave them offline behind a
+        # green success message.
+        assert result.updated_count == 1
+        assert stored.expires_at == checkout
+        assert stored.is_active is True
+
+    async def test_blocklist_rows_are_refused(self) -> None:
+        f = make_fixture()
+        result = await _import(
+            f,
+            [{"identifier": "+919876543210", "rule_type": AccessRuleType.BLOCKLIST}],
+        )
+        assert result.imported_count == 0
+        assert (
+            result.rejected[0].code
+            == GuestRuleImportRejectionCode.RULE_TYPE_NOT_IMPORTABLE
+        )
+
+    async def test_unknown_rule_type_is_rejected_per_row(self) -> None:
+        f = make_fixture()
+        result = await _import(
+            f, [{"identifier": "+919876543210", "rule_type": "platinum"}]
+        )
+        assert result.rejected[0].code == GuestRuleImportRejectionCode.UNKNOWN_RULE_TYPE
+
+    async def test_batch_expiry_applies_to_every_row(self) -> None:
+        f = make_fixture()
+        checkout = _now() + timedelta(hours=12)
+        await _import(
+            f,
+            [{"identifier": f"+91987654321{n}"} for n in range(3)],
+            default_expires_at=checkout,
+        )
+        assert all(
+            rule.expires_at == checkout for rule in f.repository.guest_rules.values()
+        )
+
+    async def test_row_expiry_overrides_the_batch_default(self) -> None:
+        f = make_fixture()
+        batch = _now() + timedelta(hours=12)
+        own = _now() + timedelta(days=3)
+        await _import(
+            f,
+            [
+                {"identifier": "+919876543210"},
+                {"identifier": "+919876543211", "expires_at": own},
+            ],
+            default_expires_at=batch,
+        )
+        by_identifier = {
+            rule.identifier: rule for rule in f.repository.guest_rules.values()
+        }
+        assert by_identifier["+919876543210"].expires_at == batch
+        assert by_identifier["+919876543211"].expires_at == own
+
+    async def test_a_blank_expiry_cell_inherits_the_batch_expiry(self) -> None:
+        # A blank cell arrives as "" from one CSV client and null from the
+        # next. Either becoming "permanent" would leave a departed guest on
+        # the network indefinitely while every row around them expires.
+        f = make_fixture()
+        checkout = _now() + timedelta(hours=12)
+        await _import(
+            f,
+            [
+                {"identifier": "+919876543210", "expires_at": ""},
+                {"identifier": "+919876543211", "expires_at": None},
+            ],
+            default_expires_at=checkout,
+        )
+        assert all(
+            rule.expires_at == checkout for rule in f.repository.guest_rules.values()
+        )
+
+    async def test_a_permanent_staff_list_carries_no_expiry(self) -> None:
+        f = make_fixture()
+        await _import(f, [{"identifier": "staff@hotel.example"}])
+        assert next(iter(f.repository.guest_rules.values())).expires_at is None
+
+    async def test_past_expiry_is_rejected_per_row(self) -> None:
+        f = make_fixture()
+        result = await _import(
+            f,
+            [{"identifier": "+919876543210", "expires_at": _now() - timedelta(days=1)}],
+        )
+        assert result.rejected[0].code == GuestRuleImportRejectionCode.INVALID_EXPIRY
+
+    async def test_temporary_row_without_any_expiry_is_rejected(self) -> None:
+        f = make_fixture()
+        result = await _import(
+            f,
+            [{"identifier": "+919876543210", "rule_type": AccessRuleType.TEMPORARY}],
+        )
+        assert result.rejected[0].code == GuestRuleImportRejectionCode.INVALID_EXPIRY
+
+    async def test_one_bad_cell_never_fails_the_whole_batch(self) -> None:
+        # The failure mode a strongly-typed row schema would have caused:
+        # FastAPI answering 422 for all 200 rows because one guest's email
+        # column picked up a stray character. Every one of these is a row
+        # to report, not a batch to lose.
+        f = make_fixture()
+        result = await _import(
+            f,
+            [
+                {"identifier": "+919876543210"},
+                {"identifier": "+919876543211", "email": "not-an-email"},
+                {"identifier": "+919876543212", "location_id": "not-a-uuid"},
+                {"identifier": "+919876543213", "expires_at": "07/09/2026"},
+                {"identifier": ""},
+                {"identifier": "+919876543215"},
+            ],
+        )
+        assert result.imported_count == 2
+        assert [row.code for row in result.rejected] == [
+            GuestRuleImportRejectionCode.INVALID_CONTACT_EMAIL,
+            GuestRuleImportRejectionCode.INVALID_LOCATION_ID,
+            GuestRuleImportRejectionCode.INVALID_EXPIRY,
+            GuestRuleImportRejectionCode.MALFORMED_IDENTIFIER,
+        ]
+        assert [row.row_number for row in result.rejected] == [2, 3, 4, 5]
+
+    async def test_iso_strings_parse_so_an_export_re_imports(self) -> None:
+        f = make_fixture()
+        checkout = _now() + timedelta(days=1)
+        await _import(
+            f,
+            [{"identifier": "+919876543210", "expires_at": checkout.isoformat()}],
+        )
+        stored = next(iter(f.repository.guest_rules.values()))
+        assert stored.expires_at == checkout
+
+    async def test_a_naive_expiry_is_read_as_utc_not_crashed_on(self) -> None:
+        # A naive datetime compared against datetime.now(UTC) raises
+        # TypeError, which escapes CORSMiddleware and reaches the browser
+        # as a CORS failure -- see schemas._assume_utc_if_naive.
+        f = make_fixture()
+        naive = (_now() + timedelta(days=1)).replace(tzinfo=None).isoformat()
+        result = await _import(
+            f, [{"identifier": "+919876543210", "expires_at": naive}]
+        )
+        assert result.imported_count == 1
+        assert next(iter(f.repository.guest_rules.values())).expires_at.tzinfo
+
+    async def test_cross_organization_import_is_refused_outright(self) -> None:
+        f = make_fixture()
+        with pytest.raises(CrossOrganizationAccessRuleError):
+            await _import(
+                f, [{"identifier": "+919876543210"}], organization_id=uuid.uuid4()
+            )
+
+    async def test_confined_caller_cannot_import_into_another_site(self) -> None:
+        f = make_fixture()
+        f.service.caller_location_scope = frozenset({f.location_id})
+        other_site = uuid.uuid4()
+        result = await _import(
+            f,
+            [
+                {"identifier": "+919876543210", "location_id": f.location_id},
+                {"identifier": "+919876543211", "location_id": other_site},
+            ],
+        )
+        # Checked per row on the *effective* location, so row two cannot
+        # smuggle a rule to another site behind a well-formed batch default.
+        assert result.imported_count == 1
+        assert (
+            result.rejected[0].code
+            == GuestRuleImportRejectionCode.LOCATION_OUT_OF_SCOPE
+        )
+
+    async def test_batch_writes_one_audit_row_not_one_per_rule(self) -> None:
+        f = make_fixture()
+        await _import(f, [{"identifier": f"+91987654321{n}"} for n in range(5)])
+        assert len(f.audit_writer.entries) == 1
+        assert f.audit_writer.entries[0]["action"] == "guest_access_rules_imported"
+
+    async def test_an_imported_whitelist_never_overrides_a_block(self) -> None:
+        f = make_fixture()
+        await f.service.create_guest_rule(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="chargeback",
+            expires_at=None,
+            actor_user_id=f.actor_user_id,
+        )
+        await _import(f, [{"identifier": "+919876543210"}])
+        decision = await f.service.check_access(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        # WHITELIST ranks below BLOCKLIST in ACCESS_RULE_TYPE_PRECEDENCE.
+        # That is correct and must stay correct: a bulk upload must not be
+        # able to un-block someone by accident.
+        assert decision.allowed is False
+
+
+class TestBulkImportRequestBounds:
+    def test_a_thousand_rows_is_accepted(self) -> None:
+        payload = GuestAccessRuleImportRequest(
+            organization_id=uuid.uuid4(),
+            rules=[
+                {"identifier": f"+9198765{n:05d}"} for n in range(MAX_IMPORT_BATCH_SIZE)
+            ],
+        )
+        assert len(payload.rules) == MAX_IMPORT_BATCH_SIZE
+
+    def test_one_more_is_refused_before_anything_is_written(self) -> None:
+        # A 422 out of pydantic, not a partial import of the first 1000.
+        with pytest.raises(ValidationError):
+            GuestAccessRuleImportRequest(
+                organization_id=uuid.uuid4(),
+                rules=[
+                    {"identifier": f"+9198765{n:05d}"}
+                    for n in range(MAX_IMPORT_BATCH_SIZE + 1)
+                ],
+            )
+
+    def test_an_empty_batch_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            GuestAccessRuleImportRequest(organization_id=uuid.uuid4(), rules=[])
+
+
+class TestCsvExport:
+    async def test_header_matches_the_import_row_so_a_list_round_trips(self) -> None:
+        f = make_fixture()
+        await _import(f, [{"identifier": "+919876543210"}])
+        csv_text = await f.service.export_guest_rules_csv(
+            requesting_organization_id=f.organization_id
+        )
+        lines = csv_text.strip().splitlines()
+        assert lines[0].split(",")[:4] == [
+            "identifier",
+            "rule_type",
+            "location_id",
+            "expires_at",
+        ]
+        assert "+919876543210" in lines[1]
+
+    async def test_free_text_is_escaped_but_the_phone_column_is_not(self) -> None:
+        f = make_fixture()
+        await _import(
+            f,
+            [{"identifier": "+919876543210", "reason": '=HYPERLINK("http://x")'}],
+        )
+        csv_text = await f.service.export_guest_rules_csv(
+            requesting_organization_id=f.organization_id
+        )
+        # The operator-typed column is a formula cell on the colleague's
+        # machine that opens this file -- see app.common.spreadsheet_safety.
+        assert "'=HYPERLINK" in csv_text
+        # The identifier column is not escaped, and must not be: an E.164
+        # number starts with "+", and "'+919876543210" no longer
+        # canonicalizes, so escaping it would make the export unimportable
+        # -- which is the entire reason the export exists.
+        assert "+919876543210" in csv_text
+        assert "'+91" not in csv_text
+
+    async def test_export_without_an_organization_is_refused(self) -> None:
+        f = make_fixture()
+        # Otherwise a missing X-Organization-Id downloads every tenant's
+        # guest list in one file.
+        with pytest.raises(OrganizationRequiredError):
+            await f.service.export_guest_rules_csv(requesting_organization_id=None)
+
+    async def test_confined_caller_only_exports_its_own_sites(self) -> None:
+        f = make_fixture()
+        other_site = uuid.uuid4()
+        await _import(
+            f,
+            [
+                {"identifier": "+919876543210", "location_id": f.location_id},
+                {"identifier": "+919876543211", "location_id": other_site},
+                {"identifier": "+919876543212"},
+            ],
+        )
+        f.service.caller_location_scope = frozenset({f.location_id})
+        csv_text = await f.service.export_guest_rules_csv(
+            requesting_organization_id=f.organization_id
+        )
+        assert "+919876543210" in csv_text
+        assert "+919876543211" not in csv_text
+        # An org-wide rule belongs to no location, so it stays visible.
+        assert "+919876543212" in csv_text
+
+
+class TestBulkRoutesRequirePermission:
+    def test_import_and_export_carry_their_own_permission(self) -> None:
+        wanted = {
+            ("/guest-access/rules/import", "POST"),
+            ("/guest-access/rules/export", "GET"),
+        }
+        seen = set()
+        for route in guest_access_router.routes:
+            for method in getattr(route, "methods", set()):
+                key = (route.path, method)
+                if key in wanted:
+                    seen.add(key)
+                    assert (
+                        route.dependencies != []
+                    ), f"{key} has no permission dependency"
+        assert seen == wanted
+
+
+class TestARefusalNeverCarriesTheOperatorsNote:
+    """`GuestAccessRule.reason` and `Guest.blocked_reason` are an operator's
+    private note *about* a guest. The guest is the one party who must never
+    read them.
+
+    They used to be appended to the error message, and the portal renders a
+    403's message verbatim -- so an operator who wrote "ex-employee, do not
+    readmit" had that sentence displayed to the person at the counter.
+
+    Both halves are asserted, because `data` is not a hiding place: the
+    app-wide handler in `app.common.exceptions` serialises `exc.data`
+    straight into the response body, so moving the note there would have
+    changed which JSON key leaked it and nothing else.
+    """
+
+    _NOTE = "ex-employee, do not readmit"
+
+    def test_a_blocklist_refusal_leaks_neither_in_message_nor_data(self) -> None:
+        from app.domains.guest_access.exceptions import GuestAccessDeniedError
+
+        err = GuestAccessDeniedError(self._NOTE)
+
+        assert self._NOTE not in err.message
+        assert self._NOTE not in json.dumps(err.data)
+        # Still reachable to the raise site, which logs it.
+        assert err.reason == self._NOTE
+
+    def test_a_blocked_guest_refusal_leaks_neither_in_message_nor_data(self) -> None:
+        from app.domains.guest.exceptions import GuestBlockedError
+
+        err = GuestBlockedError(self._NOTE)
+
+        assert self._NOTE not in err.message
+        assert self._NOTE not in json.dumps(err.data)
+        assert err.reason == self._NOTE
+
+    def test_the_two_refusals_are_distinguishable_without_reading_the_message(
+        self,
+    ) -> None:
+        """Every 403 from this application collapses to one client-side error
+        shape, so before these codes the portal could only tell a blocklist
+        denial from a whitelist-only refusal by comparing message text --
+        against copy an operator can edit. They are different facts and the
+        guest is told different things, so they need different codes."""
+        from app.domains.guest_access.exceptions import (
+            GuestAccessDeniedError,
+            WhitelistOnlyAccessDeniedError,
+        )
+
+        blocklist = GuestAccessDeniedError("some note").data["code"]
+        whitelist = WhitelistOnlyAccessDeniedError(None).data["code"]
+
+        assert blocklist != whitelist
+        assert blocklist and whitelist
+
+    def test_the_whitelist_refusal_still_says_the_venues_own_words(self) -> None:
+        """The opposite case, and the reason this is not a blanket "never put
+        text in a refusal" rule: `whitelist_only_denied_message` is authored
+        by the venue *for* the guest, so it belongs in the message."""
+        from app.domains.guest_access.exceptions import (
+            DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE,
+            WhitelistOnlyAccessDeniedError,
+        )
+
+        venue_words = "Please collect your WiFi access at the front desk."
+
+        assert WhitelistOnlyAccessDeniedError(venue_words).message == venue_words
+        assert (
+            WhitelistOnlyAccessDeniedError("   ").message
+            == DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE
+        )

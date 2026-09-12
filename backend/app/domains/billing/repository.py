@@ -37,7 +37,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -383,6 +383,10 @@ class SubscriptionRepositoryProtocol(Protocol):
 
     async def list_due_for_renewal(self, *, now: datetime) -> list[Subscription]: ...
 
+    async def list_lapsed_non_renewing(
+        self, *, now: datetime
+    ) -> list[Subscription]: ...
+
 
 class SubscriptionRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -420,6 +424,43 @@ class SubscriptionRepository:
 
     async def list_by_status(self, statuses: Sequence[str]) -> list[Subscription]:
         return await self.subscriptions.get_all(filters={"status": list(statuses)})
+
+    async def list_lapsed_non_renewing(
+        self, *, now: datetime
+    ) -> list[Subscription]:
+        """Subscriptions that have run past the end of the period they paid
+        for and are not going to renew -- the exact complement of
+        ``list_due_for_renewal``'s ``auto_renew`` predicate, otherwise the
+        identical filter.
+
+        Nothing used to look for these. ``list_due_for_renewal`` requires
+        ``auto_renew=True``, so a customer who turned auto-renewal off via
+        Renewal Settings dropped out of the sweep entirely: never renewed,
+        therefore never ``PAST_DUE``, therefore never seen by
+        ``expire_lapsed_subscriptions`` -- and ``cancel_at_period_end`` was
+        never set, so the scheduled-cancellation path did not apply either.
+        The subscription stayed ``ACTIVE`` past its period end forever, with
+        a valid license, indefinitely, for free.
+        """
+        statement = select(Subscription).where(
+            Subscription.is_deleted.is_(False),
+            Subscription.auto_renew.is_(False),
+            Subscription.billing_cycle.in_(
+                [cycle.value for cycle in CYCLIC_BILLING_CYCLES]
+            ),
+            # ACTIVE/TRIALING only -- deliberately NOT the full
+            # RENEWABLE_SUBSCRIPTION_STATUSES, which also contains PAST_DUE.
+            # A PAST_DUE subscription is already owned by
+            # expire_lapsed_subscriptions' grace-period machinery, and
+            # sweeping it up here would cut a customer off early, before the
+            # grace days they still had. One row, one phase.
+            Subscription.status.in_(
+                [SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIALING.value]
+            ),
+            Subscription.current_period_end <= now,
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def list_due_for_renewal(self, *, now: datetime) -> list[Subscription]:
         statement = select(Subscription).where(
@@ -463,6 +504,7 @@ class CouponRepositoryProtocol(Protocol):
         page: int,
         page_size: int,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
     ) -> tuple[list[Coupon], PaginationMeta]: ...
 
@@ -477,6 +519,10 @@ class CouponRepositoryProtocol(Protocol):
     async def increment_current_uses(self, coupon_id: uuid.UUID) -> Coupon: ...
 
     async def create_coupon_usage(self, **fields: object) -> CouponUsage: ...
+
+    async def get_usage_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> CouponUsage | None: ...
 
 
 class CouponRepository:
@@ -527,20 +573,36 @@ class CouponRepository:
         page: int,
         page_size: int,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
     ) -> tuple[list[Coupon], PaginationMeta]:
-        filters: dict[str, object] = {}
-        if organization_id is not None:
-            filters["organization_id"] = organization_id
+        # Tenant scoping. A ``Coupon`` is either GLOBAL (``organization_id IS
+        # NULL``, usable by any org) or organization-specific. Previously an
+        # absent ``organization_id`` meant "no filter" -> every organization's
+        # private coupons, so an org-scoped caller who omitted the param read
+        # other tenants' exclusive discount codes. An org-scoped caller must
+        # instead see exactly their own org's coupons *plus* the GLOBAL ones;
+        # only a platform/GLOBAL caller (``include_all_organizations``) reads
+        # every organization's coupons.
+        conditions = [Coupon.is_deleted.is_(False)]
         if is_active is not None:
-            filters["is_active"] = is_active
-        return await self.coupons.paginate(
-            page=page,
-            page_size=page_size,
-            filters=filters,
-            sort_by="created_at",
-            sort_order=SortOrder.DESC,
+            conditions.append(Coupon.is_active.is_(is_active))
+        if not include_all_organizations:
+            conditions.append(
+                or_(
+                    Coupon.organization_id == organization_id,
+                    Coupon.organization_id.is_(None),
+                )
+            )
+        params = PageParams(page=page, page_size=page_size)
+        count_statement = select(func.count()).select_from(Coupon).where(*conditions)
+        total_items = int((await self.session.execute(count_statement)).scalar_one())
+        statement = (
+            select(Coupon).where(*conditions).order_by(Coupon.created_at.desc())
         )
+        result = await self.session.execute(paginate(statement, params))
+        rows = list(result.scalars().all())
+        return rows, PaginationMeta.from_total(params, total_items)
 
     async def set_applicable_plans(
         self, coupon_id: uuid.UUID, plan_ids: Sequence[uuid.UUID]
@@ -571,6 +633,34 @@ class CouponRepository:
 
     async def create_coupon_usage(self, **fields: object) -> CouponUsage:
         return await self.usages.create(fields)
+
+    async def get_usage_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> CouponUsage | None:
+        """The redemption ``CouponService.apply_coupon`` recorded for this
+        subscription, or ``None`` if none was.
+
+        ``InvoiceService.generate_invoice_for_subscription`` reads the
+        frozen ``discount_amount_applied`` off this row rather than
+        recomputing the discount from the ``Coupon``: the coupon's
+        ``discount_value`` is editable, and an invoice must grant what was
+        actually redeemed at signup, not what the coupon happens to be
+        worth on the day the invoice is cut.
+
+        Ordered oldest-first and limited to one. A subscription is expected
+        to have at most one usage row -- ``apply_coupon`` runs once, at
+        creation -- but the schema does not constrain it to one, and
+        picking the earliest makes the "which redemption is the signup
+        one" question deterministic rather than dependent on physical row
+        order if a second ever appears.
+        """
+        results = await self.usages.get_all(
+            filters={"subscription_id": subscription_id},
+            sort_by="used_at",
+            sort_order=SortOrder.ASC,
+            limit=1,
+        )
+        return results[0] if results else None
 
 
 # ============================================================================
@@ -990,6 +1080,8 @@ class InvoiceRepositoryProtocol(Protocol):
 
     async def list_issued_past_due(self, *, now: datetime) -> list[Invoice]: ...
 
+    async def has_discounted_invoice(self, subscription_id: uuid.UUID) -> bool: ...
+
     async def create_invoice_item(self, **fields: object) -> InvoiceItem: ...
 
     async def list_items(self, invoice_id: uuid.UUID) -> list[InvoiceItem]: ...
@@ -1067,6 +1159,37 @@ class InvoiceRepository:
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def has_discounted_invoice(self, subscription_id: uuid.UUID) -> bool:
+        """Whether any live invoice for this subscription already granted a
+        coupon discount.
+
+        This is what makes "the coupon applies once, at signup" true in the
+        invoice layer. ``CouponService``'s own policy (and
+        ``compute_renewal_charge_amount``'s docstring) is that a redemption
+        is a one-time grant, but ``generate_invoice_for_subscription`` can
+        legitimately be called more than once for the same subscription --
+        it is wired to an operator-triggered endpoint, not to signup -- and
+        without this check the second call would grant the discount a
+        second time off the same single ``CouponUsage`` row.
+
+        ``VOID`` and ``CANCELLED`` invoices are deliberately excluded: a
+        discount on an invoice that was formally reversed, or withdrawn
+        before it ever reached the customer, was not in the end granted, so
+        the reissue must carry it rather than silently charging full price
+        for a coupon the organization already spent. Soft-deleted rows are
+        excluded for the same reason every other query here excludes them.
+        """
+        statement = select(Invoice.id).where(
+            Invoice.is_deleted.is_(False),
+            Invoice.subscription_id == subscription_id,
+            Invoice.status.not_in(
+                [InvoiceStatus.VOID.value, InvoiceStatus.CANCELLED.value]
+            ),
+            Invoice.discount_amount > 0,
+        )
+        result = await self.session.execute(statement.limit(1))
+        return result.first() is not None
 
     async def list_issued_past_due(self, *, now: datetime) -> list[Invoice]:
         statement = select(Invoice).where(

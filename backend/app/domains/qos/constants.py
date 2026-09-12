@@ -44,24 +44,29 @@ class QosProtocol(StrEnum):
 
 
 class QosDevicePushStatus(StrEnum):
-    """Lifecycle of a :class:`~.models.QosTrafficRule`'s own paired
-    ``/queue tree`` device push -- distinct from ``is_enabled`` (whether
-    the rule *should* be active) and independent of whatever state the
-    mangle-mark half is in (that half is realized by
-    ``app.domains.network_config``'s own separate ``ConfigVersion``/
-    ``ProvisioningJob`` pipeline, which tracks its own status). See
+    """Lifecycle of a :class:`~.models.QosTrafficRule`'s own device push
+    -- both halves of it, the ``/ip firewall mangle`` mark and the
+    ``/queue tree`` entry that references it. Distinct from ``is_enabled``
+    (whether the rule *should* be active). See
     ``service.py::push_rule_to_device``'s own docstring for the full
     device-push write-up.
 
-    * ``PENDING`` -- created, never yet pushed (or a previous device
-      queue was removed and not yet re-pushed).
-    * ``ACTIVE`` -- a real ``/queue tree`` entry for this rule exists on
-      the router right now (``device_queue_id`` is set and current).
+    * ``PENDING`` -- created, never yet pushed; or pushed and then edited
+      in a way the router does not know about (see
+      ``DEVICE_CARRIED_FIELDS`` below); or a previous device queue was
+      removed and not yet re-pushed.
+    * ``ACTIVE`` -- a real mangle rule *and* a real ``/queue tree`` entry
+      for this rule exist on the router right now, carrying these exact
+      values. This is what the customer-facing "Applied to your router"
+      badge renders, so it may never be written for a push that realized
+      only part of the mechanism.
     * ``FAILED`` -- the most recent push attempt raised a real device
-      error (connection or RouterOS command failure); ``device_queue_id``
-      may still reference a stale/nonexistent device row if the failure
-      happened on a re-push rather than the first push -- see
-      ``push_rule_to_device``'s own handling.
+      error (connection or RouterOS command failure). The record is
+      committed before the exception propagates, so it survives the
+      session rollback and is actually readable afterward;
+      ``device_queue_id`` may still reference a device row created earlier
+      in the same push, which is why the gateway's ``create_queue_tree``
+      finds an existing queue by name rather than trusting that column.
     """
 
     PENDING = "pending"
@@ -100,6 +105,38 @@ QOS_QUEUE_TREE_PARENT = "global"
 QOS_QUEUE_UNLIMITED_MAX_LIMIT_KBPS = UNLIMITED_RATE_KBPS
 
 
+# Every column ``QosService.push_rule_to_device`` actually puts on the
+# router. ``protocol``/``port_range_start``/``port_range_end``/
+# ``dscp_value`` are the mangle rule's own match conditions, and
+# ``priority`` is the ``/queue tree`` field the whole feature exists to
+# set. Changing any of them makes an ``ACTIVE`` row describe a
+# classification the device is not performing -- see
+# ``app.common.device_push``.
+#
+# ``name`` is in this set, and it is the one domain where a display name
+# genuinely is device configuration:
+# ``identifiers.qos_packet_mark_identifier`` derives the RouterOS packet
+# mark from ``name`` + the row id, so a rename changes the real
+# ``new-packet-mark`` on the mangle rule and the ``packet-mark`` the queue
+# tree references. ``push_rule_to_device`` already has to remove and
+# recreate the device objects for exactly this reason; leaving the row
+# ``active`` through a rename would say the router is prioritising a mark
+# it has never been told about.
+#
+# ``is_enabled`` is not here: it is intent, not configuration -- see
+# ``app.common.device_push``'s own note.
+DEVICE_CARRIED_FIELDS = frozenset(
+    {
+        "name",
+        "protocol",
+        "port_range_start",
+        "port_range_end",
+        "dscp_value",
+        "priority",
+    }
+)
+
+
 __all__ = [
     "MIN_PRIORITY",
     "MAX_PRIORITY",
@@ -110,4 +147,5 @@ __all__ = [
     "QosDevicePushStatus",
     "QOS_QUEUE_TREE_PARENT",
     "QOS_QUEUE_UNLIMITED_MAX_LIMIT_KBPS",
+    "DEVICE_CARRIED_FIELDS",
 ]
