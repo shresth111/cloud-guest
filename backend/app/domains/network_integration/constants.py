@@ -622,6 +622,13 @@ class ErrorCode(StrEnum):
     # on the External Portal Server contract, or asked to move an
     # integration into RADIUS mode without the authority to do so.
     PORTAL_MODE_NOT_PERMITTED = "NETWORK_INTEGRATION_PORTAL_MODE_NOT_PERMITTED"
+    # "Forget the stored hotspot operator login" was asked of a legacy-mode
+    # integration, where that pair is the *only* credential -- clearing it
+    # would leave the row unable to authenticate at all, which is what
+    # deleting the integration is for. Its own code because the caller is
+    # not wrong about the operation, only about which integration to run it
+    # on, and the frontend hides the control rather than explaining it.
+    GUEST_OPERATOR_REQUIRED = "NETWORK_INTEGRATION_GUEST_OPERATOR_REQUIRED"
 
     AUTH_FAILED = "OMADA_AUTH_FAILED"
     CONNECTION_FAILED = "OMADA_CONNECTION_FAILED"

@@ -1578,6 +1578,49 @@ async def rotate_credentials(
     )
 
 
+@router.delete(
+    "/{integration_id}/credentials/operator",
+    response_model=ApiResponse[NetworkIntegrationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
+)
+async def clear_operator_credentials(
+    request: Request,
+    integration_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Forget the stored hotspot operator login. Open API mode only.
+
+    The escape hatch from a wrong operator account. Rotation cannot do this
+    on its own -- it overwrites the whole set, so it demands the Open API
+    secret again, which the venue may no longer have. See
+    ``service.clear_operator_credentials`` for the case that forced it.
+
+    Idempotent, and never touches the Open API client pair. Afterwards
+    ``configure-controller`` creates a dedicated operator account of its
+    own, so nobody types an operator password at any point.
+    """
+    integration = await service.clear_operator_credentials(
+        integration_id,
+        actor_user_id=_actor_id(actor),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Stored hotspot operator login cleared",
+        data=_integration_response(
+            integration, counts=await service.counts_for(integration)
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @router.post(
     "/{integration_id}/sync",
     response_model=ApiResponse[NetworkIntegrationSyncResponse],
