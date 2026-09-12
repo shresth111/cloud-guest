@@ -79,11 +79,26 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import AuthUser
+
+# The guest domain, reached the one direction this seam allows: this
+# domain imports from ``app.domains.guest``, never the reverse (see
+# ``dependencies.py``). A controller in RADIUS mode is a NAS on the same
+# FreeRADIUS server every MikroTik router registers against, so it gets a
+# real ``radius_nas_clients`` row through the same service rather than a
+# parallel notion of a NAS owned by this domain.
+from app.domains.guest.dependencies import get_radius_service
+from app.domains.guest.radius_bridge import (
+    RadiusBridgePushError,
+    RadiusClientAddressRejected,
+    push_controller_nas_client,
+    validate_controller_nas_address,
+)
+from app.domains.guest.service import RadiusService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -91,12 +106,16 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 
+from .constants import PortalAuthMode
 from .dependencies import get_network_integration_service
+from .exceptions import RadiusNasPreconditionsError
 from .models import NetworkIntegration
 from .schemas import (
     ControllerConfigureRequest,
     ControllerConfigureResponse,
     ControllerConfigureStepResponse,
+    ControllerRadiusNasRequest,
+    ControllerRadiusNasResponse,
     NetworkIntegrationClientListResponse,
     NetworkIntegrationClientResponse,
     NetworkIntegrationCreateRequest,
@@ -118,6 +137,7 @@ from .schemas import (
     NetworkIntegrationUpdateRequest,
     PlatformNetworkIntegrationListResponse,
     PlatformNetworkIntegrationSummaryResponse,
+    PlatformNetworkIntegrationUpdateRequest,
     PlatformOnboardRequest,
     PlatformOnboardResponse,
     PlatformTestConnectionRequest,
@@ -134,6 +154,23 @@ router = APIRouter(prefix="/network-integrations", tags=["Network Integrations"]
 portal_router = APIRouter(
     prefix="/network-integrations", tags=["Network Integrations (Portal)"]
 )
+
+
+def _controller_host(base_url: str) -> str | None:
+    """The host out of a normalized controller URL, or ``None``.
+
+    Only ever used as a *default* for the NAS address, and only when it is
+    already an IP -- `validate_controller_nas_address` refuses a hostname,
+    deliberately. `base_url` is normalized before it is stored
+    (`validators.validate_controller_url`: lowercase scheme and host,
+    explicit port, no path), so this is a split rather than a parse.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        return urlsplit(base_url).hostname
+    except ValueError:
+        return None
 
 
 def _request_id(request: Request) -> str:
@@ -180,6 +217,9 @@ def _integration_response(
         location_id=integration.location_id,
         router_id=integration.router_id,
         provider=integration.provider,
+        # The stored answer, not a guess: a RADIUS-mode venue's URL carries
+        # `portalMode=radius`, which is what the guest portal dispatches on.
+        portal_mode=integration.portal_mode,
     )
     return NetworkIntegrationResponse(
         id=str(integration.id),
@@ -196,6 +236,7 @@ def _integration_response(
         is_enabled=integration.is_enabled,
         base_url=integration.base_url,
         auth_mode=integration.auth_mode,
+        portal_mode=integration.portal_mode,
         tls_mode=integration.tls_mode,
         tls_pinned_sha256=integration.tls_pinned_sha256,
         tls_trust_decided_at=integration.tls_trust_decided_at,
@@ -479,11 +520,18 @@ async def list_platform_integration_events(
 async def update_platform_integration(
     request: Request,
     integration_id: uuid.UUID,
-    payload: NetworkIntegrationUpdateRequest,
+    payload: PlatformNetworkIntegrationUpdateRequest,
     actor: AuthUser = Depends(CurrentUser),
     service: NetworkIntegrationService = Depends(get_network_integration_service),
 ):
     """Finish a controller setup from the Master console.
+
+    The one field this body carries that the customer body does not is
+    ``portal_mode`` -- see that schema, and
+    ``constants.PortalAuthMode`` for what the two modes actually do. It is
+    here and nowhere else because moving a venue onto the RADIUS contract
+    is a platform decision with prerequisites outside this API
+    (``ops/runbooks/omada-radius-mode.md``), not a self-service toggle.
 
     ``POST /platform/onboard`` already accepts ``external_site_id``,
     ``guest_ssid_id``, ``tls_mode`` and ``controller_id`` -- but only at
@@ -629,6 +677,188 @@ async def test_platform_integration_connection(
         success=error is None,
         message="Connection test completed",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/integrations/{integration_id}/radius-nas",
+    response_model=ApiResponse[ControllerRadiusNasResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
+)
+async def register_controller_radius_nas(
+    request: Request,
+    integration_id: uuid.UUID,
+    payload: ControllerRadiusNasRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+    radius_service: RadiusService = Depends(get_radius_service),
+):
+    """Register a RADIUS-mode venue's controller as a NAS client, and write
+    its ``client{}`` stanza to the real FreeRADIUS server.
+
+    The counterpart of ``POST /radius/nas/register-external/{router_id}``
+    in the guest domain, which does the same job for a MikroTik router --
+    and deliberately a *second* route rather than a flag on that one,
+    because the two differ in the thing that matters: a router's stanza is
+    keyed on a WireGuard tunnel address this platform allocated, and a
+    controller's is keyed on a public address the venue's ISP owns. That
+    route requires a WireGuard peer to exist and derives the address from
+    it; a controller has no peer and never will. See
+    ``guest.radius_bridge``'s module docstring for the full comparison.
+
+    ## What this does NOT do, and must not be read as doing
+
+    It writes a ``client{}`` stanza and returns a shared secret. It does
+    **not** make a guest able to log in at this venue, because on the
+    RADIUS contract the controller has to be able to *reach* this
+    platform's FreeRADIUS on UDP 1812, and today nothing on the internet
+    can: the hub's security group allows 1812/1813/3799 from the WireGuard
+    overlay and the VPC only. Opening that path is a deliberate,
+    approved, security-affecting change with a prerequisite of its own --
+    the ``0.0.0.0/0`` catch-all client already in ``clients.conf`` has to
+    go first, or exposing the port hands every unmatched source address on
+    the internet a client entry with a fixed secret. The whole sequence is
+    ``ops/runbooks/omada-radius-mode.md``; this endpoint is step 4 of it
+    and has no opinion about whether steps 1-3 were done.
+
+    Platform (GLOBAL) scope, like every other ``/platform/...`` route
+    here: a RADIUS NAS registration hands out a shared secret and changes
+    what the fleet's RADIUS server will accept, which is not a
+    self-service operation.
+    """
+    integration, _names = await service.get_platform_integration(integration_id)
+
+    if integration.portal_mode != PortalAuthMode.RADIUS.value:
+        # Refused rather than silently allowed, because a stanza for an
+        # External Portal Server venue is a live shared secret on an
+        # internet-facing RADIUS server for a controller that will never
+        # send it an Access-Request. Unused credentials that nobody
+        # remembers creating are how the hub ended up with 16 orphan
+        # stanzas.
+        raise RadiusNasPreconditionsError(
+            "This integration is on the External Portal Server contract. "
+            "Move it to RADIUS mode deliberately before registering a NAS "
+            "client for it."
+        )
+    if integration.router_id is None:
+        raise RadiusNasPreconditionsError(
+            "This integration has no fleet device. A RADIUS NAS client is "
+            "registered against one, because that is what binds an "
+            "Access-Request to this venue. Use 'Register controller' first."
+        )
+
+    raw_address = payload.controller_ip or _controller_host(integration.base_url)
+    try:
+        controller_ip = validate_controller_nas_address(raw_address or "")
+    except RadiusClientAddressRejected as exc:
+        raise RadiusNasPreconditionsError(str(exc)) from exc
+
+    # Rotate an existing registration rather than creating a second one:
+    # `radius_nas_clients.router_id` is unique, and a controller that has
+    # been registered before is being re-registered because its address or
+    # its secret changed. The hub agent is idempotent on the shortname, so
+    # the stanza converges either way.
+    existing, _meta = await radius_service.list_nas_clients(
+        requesting_organization_id=None,
+        router_id=integration.router_id,
+        page=1,
+        page_size=1,
+    )
+    if existing:
+        nas_identifier = existing[0].nas_identifier
+
+        async def _push_rotated(secret: str) -> None:
+            await push_controller_nas_client(
+                controller_ip=controller_ip,
+                nas_identifier=nas_identifier,
+                secret=secret,
+            )
+
+        try:
+            rotated = await radius_service.regenerate_secret(
+                nas_id=existing[0].id,
+                requesting_organization_id=None,
+                actor_user_id=_actor_id(actor),
+                # PUSH FIRST, THEN WRITE. `regenerate_secret` performs this
+                # hook before its own database write, so a hub that refuses
+                # cannot leave this platform holding a secret the RADIUS
+                # server has never seen -- which is a venue that rejects
+                # every guest with nothing looking wrong.
+                push_secret=_push_rotated,
+            )
+        except RadiusBridgePushError as exc:
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        nas_client = await radius_service.record_hub_client_sync(
+            nas_id=rotated.nas_client.id,
+            tunnel_ip_address=controller_ip,
+            requesting_organization_id=None,
+        )
+        return build_response(
+            success=True,
+            message="Controller RADIUS NAS client re-registered",
+            data=ControllerRadiusNasResponse(
+                integration_id=str(integration.id),
+                nas_identifier=nas_client.nas_identifier,
+                controller_ip=controller_ip,
+                shared_secret=rotated.shared_secret,
+                hub_confirmed=nas_client.hub_client_synced_ip == controller_ip,
+            ).model_dump(),
+            request_id=_request_id(request),
+        )
+
+    result = await radius_service.register_nas(
+        actor_user_id=_actor_id(actor),
+        router_id=integration.router_id,
+        # Same shape as the router-side identifier (`cg-<8 hex>`), so one
+        # `%{client:shortname}` vocabulary covers both kinds of NAS and the
+        # backend's own `X-RADIUS-NAS-Identifier` header keeps meaning one
+        # thing. The prefix says which kind it is without a second column.
+        nas_identifier=f"cg-omada-{str(integration.id)[:8]}",
+        name=f"{integration.name} (Omada controller)",
+        ip_address=controller_ip,
+        requesting_organization_id=None,
+    )
+    try:
+        await push_controller_nas_client(
+            controller_ip=controller_ip,
+            nas_identifier=result.nas_client.nas_identifier,
+            secret=result.shared_secret,
+        )
+    except RadiusBridgePushError as exc:
+        # The row exists and the stanza does not. That is visible (
+        # `hub_client_synced_ip` stays NULL) and converges on the next call,
+        # which takes the rotate branch above -- the same trade the
+        # router-side registration documents, for the same reason: the
+        # identifier is server-assigned, so there is nothing to push until
+        # the row exists.
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+
+    nas_client = await radius_service.record_hub_client_sync(
+        nas_id=result.nas_client.id,
+        # The parameter is still called `tunnel_ip_address` on the guest
+        # service; what it records is "the address the hub confirmed it
+        # wrote", which for a controller is its public address. Renaming it
+        # is a guest-domain change and would touch the router path, so the
+        # honest note lives here rather than in a rename nobody asked for.
+        tunnel_ip_address=controller_ip,
+        requesting_organization_id=None,
+    )
+    return build_response(
+        success=True,
+        message="Controller RADIUS NAS client registered",
+        data=ControllerRadiusNasResponse(
+            integration_id=str(integration.id),
+            nas_identifier=nas_client.nas_identifier,
+            controller_ip=controller_ip,
+            shared_secret=result.shared_secret,
+            hub_confirmed=nas_client.hub_client_synced_ip == controller_ip,
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1612,6 +1842,7 @@ async def disconnect_guest(
             str(outcome.guest_session_id) if outcome.guest_session_id else None
         ),
         guest_session_ended=outcome.guest_session_ended,
+        mechanism=outcome.mechanism,
     )
     return build_response(
         success=True,

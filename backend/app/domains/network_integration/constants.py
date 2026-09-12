@@ -57,6 +57,9 @@ from enum import StrEnum
 
 __all__ = [
     "AuthorizationStatus",
+    "DEFAULT_PORTAL_AUTH_MODE",
+    "DisconnectMechanism",
+    "PortalAuthMode",
     "CONTROLLER_SETUP_GAP_LABELS",
     "CONTROLLER_SETUP_OPERATOR_PREFIX",
     "CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH",
@@ -161,6 +164,72 @@ FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
 # id/secret before it can serve a venue; see
 # ``PortalReadinessGap.GUEST_OPERATOR_MISSING``.
 GUEST_OPERATOR_CREDENTIAL_FIELDS: frozenset[str] = frozenset({"username", "password"})
+
+
+class PortalAuthMode(StrEnum):
+    """Which of the controller's two captive-portal contracts this venue is
+    on. **Stored, never inferred.**
+
+    An Omada controller can put a guest online by two completely different
+    routes, and they are not variants of one flow -- they invert the
+    direction of trust:
+
+    * ``EXTERNAL_PORTAL`` -- TP-Link ``authType 4``, *External Portal
+      Server*. The guest's browser posts its identity to **us**; this
+      platform then calls the controller's ``hotspot/extPortal/auth`` with
+      a stored operator session and the controller opens the gate. Every
+      call is **outbound** from this platform, so it works through a
+      venue's NAT with nothing exposed on our side. This is what the whole
+      integration was built and proven on (a real guest, real hardware,
+      2026-09-11) and it is the default for every integration, existing
+      and new.
+    * ``RADIUS`` -- TP-Link ``authType 2`` + *External Web Portal*. The
+      guest's browser posts its identity to **the controller**
+      (``POST /portal/radius/browserauth``), the controller becomes the
+      RADIUS client and sends an **inbound** Access-Request to this
+      platform's FreeRADIUS, and the controller opens the gate on the
+      Access-Accept. This platform is not in the authorization path at
+      all.
+
+    ## Why this is a column and not a derivation
+
+    The two modes send *different redirect parameters* (``authType 2``
+    carries ``target``/``targetPort``/``scheme`` and carries **no**
+    ``site`` and no ``t``; ``authType 4`` is the mirror image of that), so
+    it is tempting to let each surface sniff the query string and decide
+    for itself. Three surfaces would then be guessing independently -- the
+    guest portal, ``authorize_portal_client`` and the disconnect path --
+    and a venue mid-migration, a stale pasted URL or a controller firmware
+    that adds a parameter would make them disagree. A guest's internet
+    access is the thing that disagreement breaks.
+
+    So the row holds the answer, ``build_external_portal_url`` stamps it
+    into the URL the operator pastes, and each surface dispatches on that
+    one answer. Where a surface can *also* see the redirect's own shape it
+    uses it as a **cross-check** that refuses loudly, never as a second
+    opinion that quietly wins.
+
+    ## RADIUS is opt-in and must stay opt-in
+
+    ``EXTERNAL_PORTAL`` is the column default and the server default, so
+    every existing row and every new row is on the proven path. Moving a
+    venue to ``RADIUS`` requires, today, all of: an inbound UDP path to
+    this platform's FreeRADIUS that does not exist yet, a NAS client
+    keyed on the controller's public address, and a certificate the
+    guest's browser will accept on the controller itself. None of those
+    can be arranged by flipping a field, which is why the field alone
+    never turns anything on -- see ``ops/runbooks/omada-radius-mode.md``.
+    """
+
+    EXTERNAL_PORTAL = "external_portal"
+    RADIUS = "radius"
+
+
+# The mode every integration is in unless somebody deliberately moved it.
+# Named once, here, so the column default, the server default, the
+# migration's backfill and the "is this venue on the proven path" checks
+# cannot drift apart.
+DEFAULT_PORTAL_AUTH_MODE: PortalAuthMode = PortalAuthMode.EXTERNAL_PORTAL
 
 
 class ControllerAuthMode(StrEnum):
@@ -415,6 +484,36 @@ CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH = 128
 CONTROLLER_SETUP_OPERATOR_PREFIX = "wyfy-"
 
 
+class DisconnectMechanism(StrEnum):
+    """*How* a staff disconnect actually took a guest off the network, which
+    differs by portal mode and does not mean the same thing in both.
+
+    * ``CONTROLLER_AUTHORIZATION`` -- External Portal Server mode. This
+      platform issued the authorization, holds a
+      ``network_integration_authorizations`` row for it, and revokes that
+      authorization on the controller. The row is flipped to
+      ``DEAUTHORIZED`` and the guest's ``GuestSession`` is ended from it, so
+      re-admission is closed as well.
+    * ``CONTROLLER_CLIENT_ONLY`` -- RADIUS mode. This platform never issued
+      the authorization (the controller did, on an Access-Accept), so there
+      is no authorization row to revoke and none to find the guest's
+      session from. All this call can do is ask the controller to drop the
+      client. **Re-admission is not closed by it**: what closes that is
+      ending the guest's ``GuestSession``, because the RADIUS authorize
+      path is a session lookup -- see ``app.domains.guest.service
+      .RadiusService.authorize``. That is a separate action on the guest
+      domain, and this value is how a caller knows it is still outstanding.
+
+    Named rather than inferred from the other booleans for the usual reason
+    in this domain: "disconnected: true" already means one narrow thing, and
+    a second narrow thing wearing the same word is how an operator ends up
+    believing a guest was removed when they were merely dropped.
+    """
+
+    CONTROLLER_AUTHORIZATION = "controller_authorization"
+    CONTROLLER_CLIENT_ONLY = "controller_client_only"
+
+
 class IntegrationEventType(StrEnum):
     """What happened, for the operational feed
     (``network_integration_events``).
@@ -507,6 +606,22 @@ class ErrorCode(StrEnum):
     # so a caller can tell "we could not talk to the box" from "we talked
     # to the box and there is nothing to talk to it about".
     SETUP_INCOMPLETE = "NETWORK_INTEGRATION_SETUP_INCOMPLETE"
+    # A guest portal called `POST /portal/authorize` for an integration
+    # whose stored `portal_mode` is RADIUS. In that mode this platform is
+    # not in the authorization path -- the guest's browser submits to the
+    # controller and the controller asks our FreeRADIUS -- so the call is
+    # a stale pasted URL or a mode change that has not reached the
+    # controller yet. Refused with its own code rather than a generic
+    # failure, because "this venue is configured for the other contract"
+    # is the single most likely explanation and nothing else says it.
+    # Never returned to the guest: this endpoint answers one
+    # indistinguishable 403. It is what the integration's own event feed
+    # records, which is where an operator looks.
+    PORTAL_MODE_MISMATCH = "NETWORK_INTEGRATION_PORTAL_MODE_MISMATCH"
+    # A caller asked for a RADIUS-mode operation on an integration that is
+    # on the External Portal Server contract, or asked to move an
+    # integration into RADIUS mode without the authority to do so.
+    PORTAL_MODE_NOT_PERMITTED = "NETWORK_INTEGRATION_PORTAL_MODE_NOT_PERMITTED"
 
     AUTH_FAILED = "OMADA_AUTH_FAILED"
     CONNECTION_FAILED = "OMADA_CONNECTION_FAILED"

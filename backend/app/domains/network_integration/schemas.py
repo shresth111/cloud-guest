@@ -97,6 +97,9 @@ __all__ = [
     "NetworkIntegrationStatusResponse",
     "NetworkIntegrationSyncResponse",
     "NetworkIntegrationUpdateRequest",
+    "PlatformNetworkIntegrationUpdateRequest",
+    "ControllerRadiusNasRequest",
+    "ControllerRadiusNasResponse",
     "PlatformNetworkIntegrationListResponse",
     "PlatformNetworkIntegrationSummaryResponse",
     "PlatformOnboardRequest",
@@ -112,6 +115,30 @@ __all__ = [
 _AuthMode = Literal["openapi", "legacy"]
 _Provider = Literal["omada"]
 _TlsMode = Literal["strict", "pinned", "insecure"]
+
+#: Which captive-portal contract a venue is on. See
+#: ``constants.PortalAuthMode``. Deliberately absent from every *customer*
+#: request body on this domain: moving a venue to RADIUS mode needs an
+#: inbound network path, a NAS client keyed on the controller's public
+#: address and a certificate the guest's browser accepts, none of which a
+#: self-service toggle can arrange -- so the field is reachable only on the
+#: platform (Master console) update body, and the service re-checks that
+#: rather than trusting the schema split.
+_PortalMode = Literal["external_portal", "radius"]
+
+_PORTAL_MODE_DESCRIPTION = (
+    "Which captive-portal contract this venue is on. 'external_portal' "
+    "(default, and what every existing integration is) is TP-Link authType "
+    "4: the guest's browser posts to this platform and this platform calls "
+    "the controller -- outbound only, works behind a venue's NAT. 'radius' "
+    "is authType 2 with an External Web Portal: the guest's browser posts "
+    "to the controller and the controller sends an inbound RADIUS "
+    "Access-Request to this platform. RADIUS mode additionally requires an "
+    "inbound UDP path to this platform's FreeRADIUS, a registered NAS "
+    "client keyed on the controller's public address, and a certificate on "
+    "the controller that a guest's browser will accept; setting this field "
+    "arranges none of them."
+)
 
 #: Shared field definitions for the certificate-trust pair, so the create,
 #: onboard, update, rotate and probe bodies cannot describe them three
@@ -487,6 +514,29 @@ class NetworkIntegrationUpdateRequest(BaseModel):
     )
 
 
+class PlatformNetworkIntegrationUpdateRequest(NetworkIntegrationUpdateRequest):
+    """The Master console's partial update: everything a customer may
+    change, plus ``portal_mode``.
+
+    A separate class rather than one more optional field on the shared body,
+    because the difference is not cosmetic. ``portal_mode`` decides which of
+    two incompatible contracts a venue's guests are put through, and the
+    RADIUS one cannot work until somebody has arranged an inbound UDP path,
+    a NAS client and a controller certificate. A customer-facing toggle for
+    that would be a switch labelled "break guest WiFi until three other
+    things happen elsewhere".
+
+    The schema split is the *first* of two guards, not the only one:
+    ``service.update_integration`` refuses the field outright when the
+    caller is organization-scoped, so a body that somehow reached the
+    customer route cannot set it either.
+    """
+
+    portal_mode: _PortalMode | None = Field(
+        default=None, description=_PORTAL_MODE_DESCRIPTION
+    )
+
+
 class NetworkIntegrationCredentialRotateRequest(_CredentialFields):
     """New credentials for an existing integration.
 
@@ -528,6 +578,11 @@ class NetworkIntegrationResponse(BaseModel):
     is_enabled: bool
     base_url: str
     auth_mode: str
+    # Which captive-portal contract this venue is on -- see
+    # `constants.PortalAuthMode`. Returned on every integration read so an
+    # operator (and the Master console) can see which contract a venue is
+    # on without inferring it from the portal URL's parameters.
+    portal_mode: str
     tls_mode: str
     # Returned, unlike every credential on this row. A certificate
     # fingerprint is a hash of something the controller hands to anyone who
@@ -1003,6 +1058,13 @@ class NetworkIntegrationDisconnectGuestResponse(BaseModel):
 
     A UI showing only "Disconnected" is correct; a UI explaining what
     happened should read all three rather than inferring two from one.
+
+    ``mechanism`` is the fourth fact and the one that says how much the
+    other three are worth at this venue -- see
+    ``constants.DisconnectMechanism``. On ``controller_client_only``
+    (RADIUS mode) the controller dropped the client but nothing stopped the
+    guest logging back in, because this platform never issued the
+    authorization and holds no row to revoke.
     """
 
     disconnected: bool
@@ -1012,6 +1074,60 @@ class NetworkIntegrationDisconnectGuestResponse(BaseModel):
     deauthorized_at: datetime | None = None
     guest_session_id: str | None = None
     guest_session_ended: bool = False
+    mechanism: str = "controller_authorization"
+
+
+class ControllerRadiusNasRequest(BaseModel):
+    """Register this venue's controller as a RADIUS NAS client.
+
+    ``controller_ip`` is the address the controller's Access-Requests will
+    *arrive from*, which is not always the address this platform talks to
+    it on: a controller behind its venue's NAT is reached on one address
+    and egresses from another, and only the egress address can key a
+    ``client{}`` stanza. It is therefore accepted explicitly and defaults
+    to the host of ``base_url`` only when that host is already a literal
+    IP.
+
+    There is no ``shared_secret`` field, and there will not be one. The
+    secret is generated by this platform and returned once, in the
+    response, for the operator to paste into the controller's RADIUS
+    profile. Accepting one would mean a RADIUS shared secret travelling in
+    a request body somebody typed.
+    """
+
+    controller_ip: str | None = Field(
+        default=None,
+        max_length=45,
+        description=(
+            "The public IP the controller's RADIUS Access-Requests arrive "
+            "from. Must be a literal, public, global unicast address -- a "
+            "hostname is refused because clients.conf resolves one only at "
+            "FreeRADIUS start-up. Defaults to the host of the integration's "
+            "base_url when that host is itself an IP."
+        ),
+    )
+
+
+class ControllerRadiusNasResponse(BaseModel):
+    """What was registered, and the one-time secret.
+
+    ``shared_secret`` is returned exactly once, on the call that created or
+    rotated it, and is never readable again -- the same contract the
+    router-side NAS registration already has. It has to be returned at all
+    because the operator types it into the controller's RADIUS profile;
+    there is no channel by which this platform could put it there itself.
+
+    ``hub_confirmed`` is what the hub's FreeRADIUS agent answered, not what
+    this platform intended. A row that exists with ``hub_confirmed:
+    false`` means the database is ahead of the RADIUS server, which is the
+    exact divergence that silently rejects every guest at a venue.
+    """
+
+    integration_id: str
+    nas_identifier: str
+    controller_ip: str
+    shared_secret: str
+    hub_confirmed: bool
 
 
 # ============================================================================

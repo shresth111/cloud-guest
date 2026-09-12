@@ -88,6 +88,7 @@ from .constants import (
     PORTAL_READINESS_GAP_LABELS,
     ControllerAuthMode,
     ControllerTlsMode,
+    PortalAuthMode,
     PortalReadinessGap,
 )
 from .crypto import stored_credential_fields
@@ -101,6 +102,7 @@ _HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdef")
 __all__ = [
     "CLOUD_METADATA_ADDRESSES",
     "ExternalPortalUrl",
+    "EXTERNAL_PORTAL_MODE_PARAM",
     "EXTERNAL_PORTAL_OWNERSHIP_PARAM",
     "build_external_portal_url",
     "ValidatedControllerUrl",
@@ -883,6 +885,25 @@ _GUEST_PORTAL_PATH = "/portal"
 # is named once here rather than repeated as a literal in the service.
 EXTERNAL_PORTAL_OWNERSHIP_PARAM = "routerId"
 
+# The query parameter that tells the guest portal WHICH CONTRACT this venue
+# is on -- absent (or `external_portal`) for the proven External Portal
+# Server path, `radius` for `authType 2`.
+#
+# It is stamped here, from `network_integrations.portal_mode`, for the same
+# reason `netProvider` is: this is the only place that knows the answer for
+# certain. The portal could instead sniff its own query string -- `authType
+# 2`'s redirect carries `target`/`targetPort`/`scheme` and carries no
+# `site` -- and that is exactly the inference this parameter exists to
+# prevent. The portal DOES check the redirect's shape, but as a
+# cross-check that refuses loudly when it disagrees with this parameter,
+# never as a second opinion that quietly wins.
+#
+# Only emitted for RADIUS mode. An External Portal Server venue's URL is
+# byte-for-byte what it was before this parameter existed, so no operator
+# has to re-paste anything and no already-configured controller changes
+# behaviour.
+EXTERNAL_PORTAL_MODE_PARAM = "portalMode"
+
 
 @dataclass(frozen=True, slots=True)
 class ExternalPortalUrl:
@@ -925,6 +946,7 @@ def build_external_portal_url(
     location_id: uuid.UUID | None,
     router_id: uuid.UUID | None,
     provider: str,
+    portal_mode: str = PortalAuthMode.EXTERNAL_PORTAL.value,
 ) -> ExternalPortalUrl | None:
     """The URL a venue operator pastes into their Omada controller.
 
@@ -972,6 +994,23 @@ def build_external_portal_url(
     inferring it downstream from "``clientMac`` is present" would put the
     decision in whichever parameter happened to survive the trip.
 
+    ## In RADIUS mode the same URL goes in a different field
+
+    An ``authType 2`` venue pastes this into ``ExternalRadiusSetting``'s
+    ``externalUrl``/``externalUrlScheme`` rather than into
+    ``ExternalServerPortalSetting``'s ``serverUrl``/``serverUrlScheme``.
+    The two fields carry the **same published regex** (re-read off the live
+    controller's own ``/v3/api-docs`` on 2026-09-12), so the same split
+    applies and the same constraint bites: ``?`` and ``&`` are inside the
+    PATH character class, so a query string is legal only **after a
+    ``/``** -- which is why the ``/portal`` segment is load-bearing in both
+    modes and why an IP-typed host cannot carry one at all.
+
+    The only difference in the string itself is one extra parameter,
+    ``portalMode=radius``, which is what tells the portal that the gate it
+    has to open is the controller's ``browserauth`` form and not this
+    platform's own authorize endpoint.
+
     ## Returns ``None`` rather than a URL that cannot work
 
     An integration with no mapped location, or no fleet device, has no
@@ -983,14 +1022,18 @@ def build_external_portal_url(
     """
     if location_id is None or router_id is None:
         return None
-    query = urlencode(
-        {
-            "organizationId": str(organization_id),
-            "locationId": str(location_id),
-            EXTERNAL_PORTAL_OWNERSHIP_PARAM: str(router_id),
-            "netProvider": provider,
-        }
-    )
+    params = {
+        "organizationId": str(organization_id),
+        "locationId": str(location_id),
+        EXTERNAL_PORTAL_OWNERSHIP_PARAM: str(router_id),
+        "netProvider": provider,
+    }
+    if portal_mode == PortalAuthMode.RADIUS.value:
+        # RADIUS mode only. An External Portal Server venue's URL keeps the
+        # exact four parameters it has always had -- see
+        # `EXTERNAL_PORTAL_MODE_PARAM`.
+        params[EXTERNAL_PORTAL_MODE_PARAM] = PortalAuthMode.RADIUS.value
+    query = urlencode(params)
     return ExternalPortalUrl(
         # The bare word, not `https:`. The controller's own field pattern is
         # literally `http|https`.

@@ -99,6 +99,7 @@ from .constants import (
     CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH,
     CONTROLLER_SETUP_PORTAL_NAME_PREFIX,
     DEFAULT_CONTROLLER_TLS_MODE,
+    DEFAULT_PORTAL_AUTH_MODE,
     FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER,
     GUEST_OPERATOR_CREDENTIAL_FIELDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
@@ -114,12 +115,14 @@ from .constants import (
     ControllerAuthMode,
     ControllerSetupGap,
     ControllerTlsMode,
+    DisconnectMechanism,
     ErrorCode,
     IntegrationEventStatus,
     IntegrationEventType,
     IntegrationStatus,
     NetworkIntegrationAuditAction,
     NetworkProviderKind,
+    PortalAuthMode,
     SyncStatus,
 )
 from .crypto import (
@@ -146,6 +149,7 @@ from .exceptions import (
     NetworkIntegrationLocationRequiredError,
     NetworkIntegrationNotFoundError,
     NetworkIntegrationOrganizationRequiredError,
+    NetworkIntegrationPortalModeNotPermittedError,
     NetworkIntegrationRateLimitedError,
     NetworkIntegrationSiteNotSelectedError,
     NetworkIntegrationTlsPinRequiredError,
@@ -406,6 +410,14 @@ class GuestDisconnectOutcome:
     deauthorized_at: datetime | None = None
     guest_session_id: uuid.UUID | None = None
     guest_session_ended: bool = False
+    # WHICH OF THE TWO REVOCATIONS THIS WAS -- see
+    # `constants.DisconnectMechanism`. In RADIUS mode the three booleans
+    # above are all still true statements and they add up to something
+    # weaker than they do in External Portal Server mode, because this
+    # platform never issued the authorization being revoked. A caller that
+    # renders "Disconnected" without reading this will overstate what
+    # happened at exactly one kind of venue.
+    mechanism: str = DisconnectMechanism.CONTROLLER_AUTHORIZATION.value
 
 
 @dataclass(frozen=True, slots=True)
@@ -1153,6 +1165,14 @@ class NetworkIntegrationService:
             # Required only for a cloud-managed controller, where there is
             # nothing to discover.
             controller_id=(controller_id or None),
+            # Written explicitly rather than left to the column default, for
+            # the reason `tls_mode` below is: the Python-side default is only
+            # applied at flush, so a caller reading the returned object back
+            # before then would see None -- a state the database cannot hold
+            # and the response schema will not serialise. Every integration
+            # starts on the proven External Portal Server contract; nothing
+            # here can create one in RADIUS mode.
+            portal_mode=DEFAULT_PORTAL_AUTH_MODE.value,
             tls_mode=trust_mode.value,
             tls_pinned_sha256=pinned,
             # Only a decision that departs from the default is a decision
@@ -1549,6 +1569,23 @@ class NetworkIntegrationService:
         updates: dict[str, object] = {}
         changed: list[str] = []
 
+        if "portal_mode" in fields and fields["portal_mode"] is not None:
+            # PLATFORM CALLERS ONLY, re-checked here rather than trusted to
+            # the schema split. `PlatformNetworkIntegrationUpdateRequest` is
+            # the only body with this field, but this method is the one
+            # entry point both the customer PATCH and the Master PATCH go
+            # through, and "the other route's schema does not have it" is
+            # not a check -- it is an assumption about a file somebody else
+            # may edit. `requesting_organization_id is None` is exactly the
+            # "platform caller, no tenant filter" argument every other
+            # platform method in this class already makes.
+            if requesting_organization_id is not None:
+                raise NetworkIntegrationPortalModeNotPermittedError()
+            mode = PortalAuthMode(str(fields["portal_mode"]))
+            if mode.value != integration.portal_mode:
+                updates["portal_mode"] = mode.value
+                changed.append("portal_mode")
+
         if "auth_mode" in fields and fields["auth_mode"] is not None:
             mode = ControllerAuthMode(str(fields["auth_mode"]))
             if mode.value != integration.auth_mode:
@@ -1767,6 +1804,18 @@ class NetworkIntegrationService:
                             "tls_pinned_sha256": updates.get("tls_pinned_sha256"),
                         }
                         if "tls_mode" in changed
+                        else {}
+                    )
+                    | (
+                        # The other config change whose *value* belongs in
+                        # the audit trail, for the same reason: "somebody
+                        # changed portal_mode" does not answer "which
+                        # contract are this venue's guests on now", and
+                        # that answer decides whether the gate is opened
+                        # by this platform or by an inbound RADIUS
+                        # exchange. Neither value is a secret.
+                        {"portal_mode": updates["portal_mode"]}
+                        if "portal_mode" in changed
                         else {}
                     )
                 ),
@@ -3551,6 +3600,44 @@ class NetworkIntegrationService:
             raise NetworkIntegrationNotFoundError(
                 f"no enabled {provider} integration for this location"
             )
+        if integration.portal_mode == PortalAuthMode.RADIUS.value:
+            # THIS PLATFORM IS NOT IN THE AUTHORIZATION PATH AT THIS VENUE.
+            #
+            # On the RADIUS contract the guest's browser submits to the
+            # controller's own `POST /portal/radius/browserauth`, the
+            # controller sends an Access-Request to this platform's
+            # FreeRADIUS, and the controller opens the gate on the
+            # Access-Accept. Nothing here can authorize anybody, and an
+            # `extPortal/auth` call made anyway would either fail against a
+            # portal configured for `authType 2` or -- worse -- succeed and
+            # produce an authorization nobody asked for.
+            #
+            # A call arriving here therefore means one of two things, and
+            # both are configuration rather than abuse: a guest is using a
+            # portal URL captured before this venue moved contracts, or the
+            # controller is still configured for the mode the row no longer
+            # says. The event row names it; see `ErrorCode
+            # .PORTAL_MODE_MISMATCH`.
+            #
+            # Refused with the SAME opaque 403 as every other failure of
+            # this endpoint. It is unauthenticated and reachable by anyone
+            # on a venue's WiFi (see `GuestSessionNotActiveError`), so it
+            # does not become an oracle for which contract a venue is on
+            # just because that answer happens to be operationally
+            # interesting.
+            await self._record_event(
+                integration,
+                event_type=IntegrationEventType.PORTAL_AUTHORIZE,
+                status=IntegrationEventStatus.ERROR,
+                error_code=ErrorCode.PORTAL_MODE_MISMATCH.value,
+                message=(
+                    "A guest portal called the authorize endpoint for a "
+                    "venue configured for RADIUS mode, where this platform "
+                    "is not in the authorization path"
+                ),
+                context={"portal_mode": integration.portal_mode},
+            )
+            raise GuestSessionNotActiveError()
         if not integration.external_site_id:
             raise NetworkIntegrationSiteNotSelectedError()
         context = ProviderPortalContext(
@@ -3790,6 +3877,34 @@ class NetworkIntegrationService:
         the guest is not authorized. It is not a claim that this call is
         what ended it.
 
+        ## What it means at a RADIUS-mode venue, which is less
+
+        Dispatched on the integration's stored ``portal_mode``, and the two
+        branches make genuinely different promises -- see
+        ``constants.DisconnectMechanism``:
+
+        * **External Portal Server.** This platform issued the
+          authorization and holds the row for it. The controller call
+          revokes that authorization, the row is flipped, and the guest's
+          ``GuestSession`` is ended *from that row*, so re-admission is
+          closed too.
+        * **RADIUS.** This platform never issued the authorization -- the
+          controller did, on an Access-Accept from our FreeRADIUS -- so
+          there is no ``network_integration_authorizations`` row, nothing
+          to flip, and nothing to find the guest's session from. The
+          controller is still asked to drop the client, which is the only
+          outbound revocation that exists on this contract; the
+          Disconnect-Request the mode advertises (``receiverPort``) travels
+          *inbound to the venue* and has never been received by anything.
+          So this call drops the device and does **not** stop the guest
+          from logging straight back in: the RADIUS authorize path is a
+          session lookup, so what closes re-admission is ending the
+          ``GuestSession`` on the guest domain.
+
+        ``outcome.mechanism`` is how a caller tells the two apart. It is
+        not inferred from the other booleans, because in RADIUS mode all of
+        them are individually true and collectively weaker.
+
         ## Tenant authorization
 
         Through ``_load_owned_integration`` like every other by-id
@@ -3801,6 +3916,11 @@ class NetworkIntegrationService:
         """
         integration = await self._load_owned_integration(
             integration_id, requesting_organization_id=requesting_organization_id
+        )
+        mechanism = (
+            DisconnectMechanism.CONTROLLER_CLIENT_ONLY
+            if integration.portal_mode == PortalAuthMode.RADIUS.value
+            else DisconnectMechanism.CONTROLLER_AUTHORIZATION
         )
         if not integration.external_site_id:
             raise NetworkIntegrationSiteNotSelectedError()
@@ -3858,10 +3978,16 @@ class NetworkIntegrationService:
             integration,
             event_type=IntegrationEventType.PORTAL_DEAUTHORIZE,
             status=IntegrationEventStatus.OK,
-            message="Guest access ended on the controller",
+            message=(
+                "Guest access ended on the controller"
+                if mechanism is DisconnectMechanism.CONTROLLER_AUTHORIZATION
+                else "Client dropped on the controller; the guest's session "
+                "must be ended separately to stop re-admission"
+            ),
             context={
                 "had_active_authorization": active is not None,
                 "guest_session_ended": session_ended,
+                "mechanism": mechanism.value,
                 "reason": reason,
             },
         )
@@ -3876,12 +4002,14 @@ class NetworkIntegrationService:
             metadata={
                 "had_active_authorization": active is not None,
                 "guest_session_ended": session_ended,
+                "mechanism": mechanism.value,
                 "guest_session_id": (
                     str(guest_session_id) if guest_session_id else None
                 ),
             },
         )
         return GuestDisconnectOutcome(
+            mechanism=mechanism.value,
             disconnected=bool(result),
             provider=integration.provider,
             client_mac=normalized_mac,
