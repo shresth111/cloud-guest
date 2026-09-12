@@ -92,7 +92,11 @@ from app.core.logging import get_logger
 from app.database.utils.pagination import PaginationMeta
 from app.domains.monitored_hardware.constants import HardwareStatus
 from app.domains.monitored_hardware.service import MonitoredHardwareService
-from app.domains.network_integration.constants import IntegrationStatus
+from app.domains.network_integration.constants import (
+    ControllerAuthMode,
+    ErrorCode,
+    IntegrationStatus,
+)
 from app.domains.organization.exceptions import CrossOrganizationAccessError
 from app.domains.otp.service import (
     EmailProviderProtocol,
@@ -2720,6 +2724,24 @@ def _consecutive_sync_failures(integration: object) -> int:
         return 0
 
 
+def _is_capability_boundary_row(integration: object) -> bool:
+    """True when this row's recorded failure is a capability boundary
+    rather than a fault.
+
+    The mirror of ``NetworkIntegrationService._is_capability_boundary``,
+    read off the stored row instead of off a live exception, and read the
+    same forgiving way as the counter above. Deliberately duplicated as two
+    small predicates rather than shared: monitoring must not import the
+    network-integration service, and the two answer different questions --
+    that one decides what to write, this one decides what to page about.
+    """
+    return (
+        getattr(integration, "auth_mode", None) == ControllerAuthMode.LEGACY.value
+        and getattr(integration, "last_error_code", None)
+        == ErrorCode.API_UNSUPPORTED.value
+    )
+
+
 def network_controller_verdict(
     target: str,
     integration: object,
@@ -2743,6 +2765,18 @@ def network_controller_verdict(
     status = getattr(integration, "status", None)
 
     if target == ALERT_TARGET_NETWORK_CONTROLLER:
+        if _is_capability_boundary_row(integration):
+            # A hotspot-operator (`legacy`) integration whose last recorded
+            # error is "these credentials cannot read inventory" is not
+            # failing -- it is a documented, supported configuration doing
+            # exactly what it does, and the portal it exists to run is
+            # unaffected. The sweep no longer produces this state
+            # (`NetworkIntegrationService._sync` stops asking), but rows
+            # already carrying it must be able to RESOLVE rather than wait
+            # for their next successful sync: `False`, not `None`, closes
+            # the alert that has been paging the venue and the platform
+            # inbox every evaluation since it opened.
+            return False
         if status in _NETWORK_CONTROLLER_FAILING_STATUSES:
             # Failing, but not yet for long enough to page anybody -- and
             # not recovered either, so an open alert stays open. See
