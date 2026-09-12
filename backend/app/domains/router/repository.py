@@ -19,6 +19,7 @@ living alongside ``roles`` in one repository.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
 
@@ -146,6 +147,10 @@ class RouterRepositoryProtocol(Protocol):
         self, router_id: uuid.UUID
     ) -> int: ...
 
+    async def integrations_for_routers(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, NetworkIntegration]: ...
+
     async def create_router(self, **fields: object) -> Router: ...
 
     async def update_router(
@@ -247,6 +252,52 @@ class RouterRepository:
             )
         )
         return int(result.scalar_one())
+
+    async def integrations_for_routers(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, NetworkIntegration]:
+        """The live network integration for each of these fleet rows.
+
+        ONE query for a whole page, not one per row. The ``.in_()`` batch is
+        this codebase's established anti-N+1 shape (see
+        ``analytics.get_wireguard_peers_by_router_ids``, which exists to
+        replace exactly such a loop), and the column is indexed
+        (``ix_network_integrations_router_id``).
+
+        Same cross-domain read-only posture as
+        :meth:`count_integrations_referencing_router` above.
+
+        **Not scoped by organization, deliberately** -- the caller has
+        already established its right to these router rows, and adding an
+        org parameter here would be the path-id-versus-header defect shape
+        one layer down. Mirrors ``find_integration_for_router``'s own note.
+
+        ``ix_network_integrations_router_id`` is NOT unique, so a row could
+        in principle carry two. The newest wins, matching
+        ``find_integration_for_router``'s ``ORDER BY created_at DESC LIMIT
+        1`` -- two derivations of "the integration for this router" that
+        disagreed would be the defect this whole field exists to remove.
+
+        Disabled integrations ARE returned: ``disabled`` is a state, and
+        dropping the row here would make it indistinguishable from
+        ``not_registered``.
+        """
+        if not router_ids:
+            return {}
+        result = await self.session.execute(
+            select(NetworkIntegration)
+            .where(
+                NetworkIntegration.router_id.in_(list(router_ids)),
+                NetworkIntegration.is_deleted.is_(False),
+            )
+            .order_by(NetworkIntegration.created_at.desc())
+        )
+        found: dict[uuid.UUID, NetworkIntegration] = {}
+        for integration in result.scalars().all():
+            key = integration.router_id
+            if key is not None:
+                found.setdefault(key, integration)
+        return found
 
     async def create_router(self, **fields: object) -> Router:
         return await self.routers.create(fields)

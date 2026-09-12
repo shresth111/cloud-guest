@@ -49,10 +49,13 @@ where that decision gets recorded.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import Any, TypeVar
 
 __all__ = [
     "AGENT_EVIDENCE_FIELDS",
+    "ControllerState",
+    "controller_state_for",
     "CONTROLLER_MANAGED_VENDORS",
     "MIKROTIK_MODEL_MARKERS",
     "NOT_APPLICABLE_REASON",
@@ -331,3 +334,148 @@ def agent_managed_rows(rows: Iterable[_Row]) -> list[_Row]:
     restates the vendor list, so the vendor question still has one home.
     """
     return [row for row in rows if is_agent_managed_row(row)]
+
+
+# ---------------------------------------------------------------------------
+# FIX-PLAN D2 -- one status vocabulary for a controller-managed venue
+# ---------------------------------------------------------------------------
+
+
+class ControllerState(StrEnum):
+    """The state of THIS PLATFORM'S CONNECTION TO THE CONTROLLER that runs a
+    fleet row's network. Seven values, in precedence order; the first that
+    applies wins.
+
+    ## What this is not
+
+    **It is not a second answer to "is this router up".** That question is
+    already answered, for the rows it means anything on, by ``status`` and
+    ``last_seen_at`` -- and ``Router.reachability_state`` carries a comment
+    forbidding its own exposure for exactly this reason: *"the moment a
+    screen can render it, the platform has two answers ... and they disagree
+    for up to thirteen minutes."*
+
+    The mechanism that keeps this field from becoming that second answer is
+    that **it has no value at all on a row an agent manages**. Not
+    ``unknown``, not ``not_applicable`` -- ``None``. A field that is null on
+    every agent-managed row cannot be read as a claim about one. And "by
+    evidence, not by label": a row whose ``vendor`` says controller while its
+    own data says agent (the 2026-09-10 mislabel) is agent-managed here too,
+    so this field can never contradict the heartbeat. ``controller_state``
+    and the agent columns are therefore never both populated on one row.
+
+    ## The two questions it answers
+
+    *Do we poll this?* -- a non-null value means no: this row is reached
+    through a controller, and everything we know about it we learned from a
+    conversation with that controller. Null means the device checks in, and
+    the existing columns are the answer.
+
+    *Does the vendor claim match the evidence?* -- that is
+    ``vendor_claim_is_contradicted``, reported beside this rather than folded
+    into it, because it is a statement about the ROW'S DATA and every value
+    here is a statement about a CONTROLLER. Folding them would produce a
+    state that means two things.
+
+    ## Three rules the words obey (owned by the console's
+    ``router-vendors.ts``, restated here because they decide the ladder)
+
+    1. Agent columns are never rendered for a controller row.
+    2. Agent vocabulary is reserved -- "Online", "Offline", "Live", "Gone
+       quiet" all mean *an agent checked in*. Hence ``reachable``, never
+       ``online``.
+    3. ``reachable`` is a claim about us reaching the controller. Not about
+       the venue's access points, and not about a guest's internet.
+    """
+
+    NOT_REGISTERED = "not_registered"
+    DISABLED = "disabled"
+    CREDENTIALS_REJECTED = "credentials_rejected"
+    CERTIFICATE_UNVERIFIED = "certificate_unverified"
+    UNREACHABLE = "unreachable"
+    NOT_MAPPED = "not_mapped"
+    REACHABLE = "reachable"
+
+
+#: ``NetworkIntegration.last_error_code`` values that mean the controller
+#: refused who we said we were. String literals, not an import: this module
+#: stays free of the ``network_integration`` domain (see the module
+#: docstring), and these are wire values pinned by that domain's own
+#: ``PROVIDER_ERRORS_BY_CODE`` test.
+_CREDENTIAL_ERROR_CODES: frozenset[str] = frozenset(
+    {"OMADA_AUTH_FAILED", "OMADA_SESSION_EXPIRED", "OMADA_PERMISSION_DENIED"}
+)
+
+#: ...that mean we reached it and could not verify it was who it claimed.
+#: Two codes and not one: ``TLS_PIN_MISMATCH`` is a certificate that CHANGED,
+#: which is a materially more alarming event than one that was never trusted,
+#: and failing loudly on it is the whole reason pinning exists. They share a
+#: state because the operator's next action is the same -- go and look at the
+#: certificate -- and are told apart by ``controller_state_reason``.
+_TLS_ERROR_CODES: frozenset[str] = frozenset(
+    {"OMADA_TLS_UNTRUSTED", "OMADA_TLS_PIN_MISMATCH"}
+)
+
+#: ...that mean we never got there.
+_UNREACHABLE_ERROR_CODES: frozenset[str] = frozenset(
+    {"OMADA_CONNECTION_FAILED", "OMADA_TIMEOUT", "OMADA_INVALID_CONTROLLER"}
+)
+
+
+def controller_state_for(row: Any, integration: Any) -> tuple[str, str] | None:
+    """``(state, reason)`` for a fleet row, or ``None`` if it has neither.
+
+    ``None`` means *this row is not reached through a controller* -- see
+    :class:`ControllerState` for why that is an absence rather than a value.
+
+    ``integration`` is the live ``NetworkIntegration`` referencing this row,
+    or ``None`` for "no integration row references it" -- which is a real,
+    distinguishable state (``not_registered``) and NOT the same as "the
+    caller did not load one". Callers must resolve it; every read path does.
+
+    Duck-typed through ``getattr`` like every predicate above, so the ORM row,
+    a Protocol stand-in and a test double all work and this module still
+    imports no ORM.
+
+    The reason is a machine-readable code, never prose: the console owns the
+    words (``CONTROLLER_STATE_COPY``), and a sentence composed here would be
+    a second copy of them free to drift.
+    """
+    if not is_controller_managed_row(row):
+        return None
+
+    if integration is None:
+        return (ControllerState.NOT_REGISTERED.value, "no_integration")
+
+    if not getattr(integration, "is_enabled", True):
+        return (ControllerState.DISABLED.value, "integration_disabled")
+
+    error_code = getattr(integration, "last_error_code", None)
+    if error_code in _CREDENTIAL_ERROR_CODES:
+        return (ControllerState.CREDENTIALS_REJECTED.value, str(error_code))
+    if error_code in _TLS_ERROR_CODES:
+        return (ControllerState.CERTIFICATE_UNVERIFIED.value, str(error_code))
+    if error_code in _UNREACHABLE_ERROR_CODES:
+        return (ControllerState.UNREACHABLE.value, str(error_code))
+
+    # The mapping, last among the faults and before the healthy state. A
+    # controller we can reach and have not been told which site or guest
+    # network to use finishes every guest's sign-in and then refuses them,
+    # which is a worse failure than a visible one -- so it is a state of its
+    # own rather than rounded up to `reachable`.
+    #
+    # `site` and `router` only. A missing `guest_ssid_id` is deliberately NOT
+    # a gap (see `PortalReadinessGap`'s own note): the controller's redirect
+    # carries the SSID, so an unset one is unspecified rather than wrong.
+    if not getattr(integration, "external_site_id", None):
+        return (ControllerState.NOT_MAPPED.value, "site_not_selected")
+    if getattr(integration, "router_id", None) is None:
+        return (ControllerState.NOT_MAPPED.value, "fleet_device_missing")
+
+    # Everything else is reachable -- including a row whose last error is
+    # OMADA_API_UNSUPPORTED on a hotspot-operator login, which is a
+    # capability boundary and not a fault (see the network_integration
+    # service's `_is_capability_boundary`). A controller we are talking to
+    # and cannot read the inventory of is still a controller we are talking
+    # to, and the captive portal it runs is unaffected.
+    return (ControllerState.REACHABLE.value, str(error_code or "ok"))

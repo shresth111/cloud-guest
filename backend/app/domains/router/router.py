@@ -80,6 +80,7 @@ import ipaddress
 import logging
 import secrets
 import uuid
+from collections.abc import Sequence
 
 import httpx
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -173,7 +174,7 @@ from .schemas import (
     WebfigSessionResponse,
     redact_customer_router_settings,
 )
-from .service import RouterService
+from .service import ControllerContext, RouterService
 
 router = APIRouter(tags=["Routers"])
 
@@ -184,7 +185,43 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
 
-def _router_response(router_device: Router) -> RouterResponse:
+async def _one(
+    router_device: Router, router_service: RouterService
+) -> RouterResponse:
+    """Serialize one router, resolving its controller context first.
+
+    Every route that emits a ``RouterResponse`` goes through this or through
+    :func:`_many` / :func:`_one_platform`. None of them may skip it: a
+    ``controller_state`` of ``None`` means "this row is not reached through a
+    controller", so a path that emitted ``None`` merely because it had not
+    looked would make the field mean two different things on two responses
+    about the same row.
+
+    One indexed query, and none at all for an agent-managed row -- see
+    ``RouterService.controller_context``.
+    """
+    contexts = await router_service.controller_context([router_device])
+    return _router_response(router_device, contexts[router_device.id])
+
+
+async def _many(
+    routers: Sequence[Router], router_service: RouterService
+) -> list[RouterResponse]:
+    """The list shape. ONE query for the whole page, not one per row."""
+    contexts = await router_service.controller_context(routers)
+    return [_router_response(r, contexts[r.id]) for r in routers]
+
+
+async def _one_platform(
+    router_device: Router, router_service: RouterService
+) -> RouterPlatformResponse:
+    contexts = await router_service.controller_context([router_device])
+    return _router_platform_response(router_device, contexts[router_device.id])
+
+
+def _router_response(
+    router_device: Router, controller: ControllerContext
+) -> RouterResponse:
     """The organization-scoped serialization -- what a venue admin receives.
 
     ``settings`` goes through ``redact_customer_router_settings`` rather
@@ -218,12 +255,23 @@ def _router_response(router_device: Router) -> RouterResponse:
         health_status=router_device.health_status,
         has_api_credentials=router_device.api_credentials_encrypted is not None,
         settings=redact_customer_router_settings(router_device.settings),
+        # FIX-PLAN D2. Computed, never stored: every input is already a
+        # column on this row or on the integration that references it, so a
+        # persisted copy would be a second set of the same facts able to
+        # disagree with them -- the same reasoning `portal_readiness_gaps`
+        # records in the network_integration domain.
+        controller_state=controller.state,
+        controller_state_reason=controller.reason,
+        controller_last_contacted_at=controller.last_contacted_at,
+        vendor_claim_is_contradicted=controller.vendor_claim_is_contradicted,
         created_at=router_device.created_at,
         updated_at=router_device.updated_at,
     )
 
 
-def _router_platform_response(router_device: Router) -> RouterPlatformResponse:
+def _router_platform_response(
+    router_device: Router, controller: ControllerContext
+) -> RouterPlatformResponse:
     """The platform-only serialization: everything ``_router_response``
     emits, plus this device's SNMP transport configuration.
 
@@ -234,7 +282,7 @@ def _router_platform_response(router_device: Router) -> RouterPlatformResponse:
     """
     return RouterPlatformResponse(
         **(
-            _router_response(router_device).model_dump()
+            _router_response(router_device, controller).model_dump()
             # Undo the customer redaction: the back-reference from a
             # controller's fleet row to its network integration is exactly
             # what a Master operator opened this view to find, and the
@@ -280,7 +328,7 @@ async def list_routers(
         status=router_status,
     )
     payload = RouterListResponse(
-        items=[_router_response(item) for item in routers],
+        items=await _many(routers, router_service),
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -326,7 +374,7 @@ async def create_router(
     return build_response(
         success=True,
         message="Router registered",
-        data=_router_response(created).model_dump(),
+        data=(await _one(created, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -354,7 +402,7 @@ async def get_router(
     return build_response(
         success=True,
         message="Router retrieved",
-        data=_router_response(router_device).model_dump(),
+        data=(await _one(router_device, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -383,7 +431,7 @@ async def update_router(
     return build_response(
         success=True,
         message="Router updated",
-        data=_router_response(updated).model_dump(),
+        data=(await _one(updated, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -431,7 +479,7 @@ async def get_router_platform_view(
     return build_response(
         success=True,
         message="Router retrieved",
-        data=_router_platform_response(router_device).model_dump(),
+        data=(await _one_platform(router_device, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -478,7 +526,7 @@ async def change_router_vendor(
     return build_response(
         success=True,
         message="Router device type updated",
-        data=_router_platform_response(updated).model_dump(),
+        data=(await _one_platform(updated, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -521,7 +569,7 @@ async def update_router_management_access(
     return build_response(
         success=True,
         message="Router management access updated",
-        data=_router_platform_response(updated).model_dump(),
+        data=(await _one_platform(updated, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -646,7 +694,7 @@ async def suspend_router(
     return build_response(
         success=True,
         message="Router suspended",
-        data=_router_response(updated).model_dump(),
+        data=(await _one(updated, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -672,7 +720,7 @@ async def reinstate_router(
     return build_response(
         success=True,
         message="Router reinstated",
-        data=_router_response(updated).model_dump(),
+        data=(await _one(updated, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1108,7 +1156,7 @@ async def router_heartbeat(
     return build_response(
         success=True,
         message="Heartbeat recorded",
-        data=_router_response(updated).model_dump(),
+        data=(await _one(updated, router_service)).model_dump(),
         request_id=_request_id(request),
     )
 

@@ -49,6 +49,8 @@ import hashlib
 import logging
 import secrets
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -109,10 +111,28 @@ from .repository import RouterRepositoryProtocol
 from .vendor_capabilities import (
     AGENT_EVIDENCE_FIELDS,
     SUPPORTED_ROUTER_VENDORS,
+    controller_state_for,
     is_controller_managed,
     looks_like_mikrotik_hardware,
     supports_zero_touch_provisioning,
+    vendor_claim_is_contradicted,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerContext:
+    """The controller half of a router's serialization.
+
+    A value object rather than a tuple so the three fields cannot be
+    reordered at a call site, and so the agent-managed case -- every field
+    at its default -- is constructible in one obvious way.
+    """
+
+    state: str | None = None
+    reason: str | None = None
+    last_contacted_at: datetime | None = None
+    vendor_claim_is_contradicted: bool = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +287,56 @@ class RouterService:
             search=search,
             status=status.value if status else None,
         )
+
+    async def controller_context(
+        self, routers: Sequence[Router]
+    ) -> dict[uuid.UUID, ControllerContext]:
+        """FIX-PLAN D2's ``controller_state`` for each of these rows.
+
+        ONE extra query per response, not one per row, and none at all for a
+        page with no controller-managed row on it -- the overwhelmingly
+        common case, since `CONTROLLER_MANAGED_VENDORS` holds one vendor and
+        most venues are MikroTik.
+
+        **Every caller that serializes a router must go through this**, and
+        the route module has no path that skips it. That is not tidiness: a
+        `controller_state` of `None` means "this row is not reached through a
+        controller", and if a write path could emit `None` merely because it
+        had not looked, the field would mean two different things on two
+        responses about the same row. Resolved everywhere, or the value could
+        not be trusted anywhere.
+        """
+        contexts = {
+            r.id: ControllerContext(
+                vendor_claim_is_contradicted=vendor_claim_is_contradicted(r)
+            )
+            for r in routers
+        }
+        controller_rows = [r for r in routers if controller_state_for(r, None)]
+        if not controller_rows:
+            return contexts
+        integrations = await self.repository.integrations_for_routers(
+            [r.id for r in controller_rows]
+        )
+        for router in controller_rows:
+            integration = integrations.get(router.id)
+            derived = controller_state_for(router, integration)
+            if derived is None:  # pragma: no cover - filtered above
+                continue
+            state, reason = derived
+            contexts[router.id] = ControllerContext(
+                state=state,
+                reason=reason,
+                # `last_sync_at`, and nothing else. Both probe paths state
+                # that they persist nothing, deliberately -- a manual probe
+                # is an operator action, and the scheduled sync is what "are
+                # we still reaching this controller" means. So there is no
+                # `last_probe_at` to prefer, and inventing one would be a
+                # second, more optimistic answer to the same question.
+                last_contacted_at=getattr(integration, "last_sync_at", None),
+                vendor_claim_is_contradicted=False,
+            )
+        return contexts
 
     # -- writes ------------------------------------------------------------------
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -228,6 +229,10 @@ class FakeRouterRepository:
     # a router missing from this dict has no usable credential and the real
     # query excludes it. See ``list_reachability_candidates`` below.
     agent_contact: dict[uuid.UUID, datetime] = field(default_factory=dict)
+    # router_id -> the live NetworkIntegration referencing it, for
+    # `controller_context`. A router missing from this dict has none, which
+    # is `not_registered` and not an absence of data.
+    integrations: dict[uuid.UUID, object] = field(default_factory=dict)
 
     async def get_by_id(
         self, router_id: uuid.UUID, *, include_deleted: bool = False
@@ -268,6 +273,15 @@ class FakeRouterRepository:
 
     async def count_integrations_referencing_router(self, router_id: uuid.UUID) -> int:
         return self.integration_counts.get(router_id, 0)
+
+    async def integrations_for_routers(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, object]:
+        return {
+            rid: self.integrations[rid]
+            for rid in router_ids
+            if rid in self.integrations
+        }
 
     async def create_router(self, **fields: object) -> Router:
         defaults = {
@@ -3673,3 +3687,249 @@ class TestRouterFieldChangeHelpers:
 
     def test_an_empty_change_set_describes_as_the_empty_string(self) -> None:
         assert describe_router_changes({}) == ""
+
+
+# ============================================================================
+# FIX-PLAN D2 -- controller_state
+# ============================================================================
+
+
+@dataclass
+class FakeIntegration:
+    """Only what `controller_state_for` reads. Duck-typed on purpose: the
+    derivation imports no ORM, which is what lets `readiness` and
+    `monitoring` keep importing `vendor_capabilities`."""
+
+    is_enabled: bool = True
+    last_error_code: str | None = None
+    external_site_id: str | None = "6aa3913c3ee1605f71ac35a1"
+    router_id: uuid.UUID | None = field(default_factory=uuid.uuid4)
+    last_sync_at: datetime | None = None
+
+
+async def _controller_row(repo: FakeRouterRepository, **overrides: object) -> Router:
+    """A genuine controller row: `tplink_omada` and NO agent evidence."""
+    router_device = await make_router(
+        repo,
+        location_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        serial_number=f"SN-{uuid.uuid4()}",
+        mac_address="AA:BB:CC:DD:EE:01",
+    )
+    router_device.vendor = "tplink_omada"
+    for key, value in overrides.items():
+        setattr(router_device, key, value)
+    return router_device
+
+
+class TestControllerStateIsNotASecondLivenessAnswer:
+    """The constraint the whole field is built around.
+
+    `Router.reachability_state` carries a comment forbidding its own
+    exposure: "the moment a screen can render it, the platform has two
+    answers to 'is this router up?' and they disagree for up to thirteen
+    minutes." `controller_state` must not become that second answer, and the
+    mechanism is that it has NO VALUE AT ALL on a row an agent manages.
+    """
+
+    async def test_an_agent_managed_row_has_no_controller_state(self) -> None:
+        service, repo, _loc, _org, _audit = make_service()
+        router_device = await make_router(
+            repo, location_id=uuid.uuid4(), organization_id=uuid.uuid4()
+        )
+        (context,) = (await service.controller_context([router_device])).values()
+        assert context.state is None
+        assert context.reason is None
+        assert context.last_contacted_at is None
+
+    async def test_a_mislabelled_row_is_judged_on_its_evidence(self) -> None:
+        """The 2026-09-10 mislabel, from this field's side. A row whose
+        `vendor` says controller while it has heartbeated is agent-managed
+        HERE TOO -- so `controller_state` can never contradict a heartbeat,
+        and the two are never both populated on one row."""
+        service, repo, _loc, _org, _audit = make_service()
+        router_device = await _controller_row(
+            repo, last_seen_at=datetime.now(UTC) - timedelta(days=2)
+        )
+        repo.integrations[router_device.id] = FakeIntegration()
+        (context,) = (await service.controller_context([router_device])).values()
+        assert context.state is None
+        # ...and the contradiction is REPORTED rather than only routed
+        # around, so the null above is explicable instead of looking like
+        # "no integration".
+        assert context.vendor_claim_is_contradicted is True
+
+    async def test_a_genuine_controller_is_not_flagged_as_contradicted(self) -> None:
+        service, repo, _loc, _org, _audit = make_service()
+        router_device = await _controller_row(repo)
+        repo.integrations[router_device.id] = FakeIntegration()
+        (context,) = (await service.controller_context([router_device])).values()
+        assert context.vendor_claim_is_contradicted is False
+        assert context.state == "reachable"
+
+
+class TestTheControllerStateLadder:
+    @pytest.mark.parametrize(
+        ("integration", "expected_state", "expected_reason"),
+        [
+            (None, "not_registered", "no_integration"),
+            (FakeIntegration(is_enabled=False), "disabled", "integration_disabled"),
+            (
+                FakeIntegration(last_error_code="OMADA_AUTH_FAILED"),
+                "credentials_rejected",
+                "OMADA_AUTH_FAILED",
+            ),
+            (
+                FakeIntegration(last_error_code="OMADA_TLS_UNTRUSTED"),
+                "certificate_unverified",
+                "OMADA_TLS_UNTRUSTED",
+            ),
+            # A certificate that CHANGED. Same state, different reason --
+            # the operator's next action is identical (go and look at the
+            # certificate) but the events are not, and failing loudly on a
+            # changed one is the entire reason pinning was chosen.
+            (
+                FakeIntegration(last_error_code="OMADA_TLS_PIN_MISMATCH"),
+                "certificate_unverified",
+                "OMADA_TLS_PIN_MISMATCH",
+            ),
+            (
+                FakeIntegration(last_error_code="OMADA_TIMEOUT"),
+                "unreachable",
+                "OMADA_TIMEOUT",
+            ),
+            (
+                FakeIntegration(external_site_id=None),
+                "not_mapped",
+                "site_not_selected",
+            ),
+            (FakeIntegration(router_id=None), "not_mapped", "fleet_device_missing"),
+            (FakeIntegration(), "reachable", "ok"),
+        ],
+    )
+    async def test_the_first_matching_rung_wins(
+        self,
+        integration: object | None,
+        expected_state: str,
+        expected_reason: str,
+    ) -> None:
+        service, repo, _loc, _org, _audit = make_service()
+        router_device = await _controller_row(repo)
+        if integration is not None:
+            repo.integrations[router_device.id] = integration
+        (context,) = (await service.controller_context([router_device])).values()
+        assert (context.state, context.reason) == (expected_state, expected_reason)
+
+    async def test_a_disabled_integration_outranks_its_stale_error(self) -> None:
+        """Precedence, not a lookup. Switched off is a deliberate answer to
+        whatever the last error was, and an alert about something its owner
+        turned off is one they learn to ignore."""
+        service, repo, _loc, _org, _audit = make_service()
+        router_device = await _controller_row(repo)
+        repo.integrations[router_device.id] = FakeIntegration(
+            is_enabled=False, last_error_code="OMADA_AUTH_FAILED"
+        )
+        (context,) = (await service.controller_context([router_device])).values()
+        assert context.state == "disabled"
+
+    async def test_a_capability_boundary_is_still_reachable(self) -> None:
+        """A hotspot-operator login cannot read the controller's inventory,
+        by design. A controller we are talking to and cannot list the
+        devices of is still a controller we are talking to, and the captive
+        portal it runs is unaffected -- so it is `reachable`, not a fault.
+        The reason still carries the code."""
+        service, repo, _loc, _org, _audit = make_service()
+        router_device = await _controller_row(repo)
+        repo.integrations[router_device.id] = FakeIntegration(
+            last_error_code="OMADA_API_UNSUPPORTED"
+        )
+        (context,) = (await service.controller_context([router_device])).values()
+        assert context.state == "reachable"
+        assert context.reason == "OMADA_API_UNSUPPORTED"
+
+    async def test_last_contacted_is_the_scheduled_sync_not_a_probe(self) -> None:
+        """Both probe paths persist nothing, deliberately -- a manual probe
+        is an operator action, and the scheduled sync is what "are we still
+        reaching this controller" means. So `last_sync_at` is the only
+        honest answer, and there is nothing more optimistic to prefer."""
+        service, repo, _loc, _org, _audit = make_service()
+        router_device = await _controller_row(repo)
+        when = datetime.now(UTC) - timedelta(minutes=9)
+        repo.integrations[router_device.id] = FakeIntegration(last_sync_at=when)
+        (context,) = (await service.controller_context([router_device])).values()
+        assert context.last_contacted_at == when
+
+
+class TestControllerStateOnTheReadShape:
+    @staticmethod
+    def _shapes() -> tuple[type, type]:
+        from app.domains.router.schemas import RouterPlatformResponse, RouterResponse
+
+        return RouterResponse, RouterPlatformResponse
+
+    def test_the_customer_shape_carries_it(self) -> None:
+        """`GET /locations/{id}/routers` is the list the customer dashboard
+        reads for venue liveness AND the list the Master fleet assembles
+        itself from -- the one endpoint feeding the three surfaces that
+        contradicted each other."""
+        response_shape, _ = self._shapes()
+        for name in (
+            "controller_state",
+            "controller_state_reason",
+            "controller_last_contacted_at",
+            "vendor_claim_is_contradicted",
+        ):
+            assert name in response_shape.model_fields
+
+    def test_reachability_state_is_still_not_exposed(self) -> None:
+        """The line this field must not cross. `Router.reachability_state`
+        is an input to an alert, not a second status, and adding
+        `controller_state` must not have made it feel safe to ship."""
+        response_shape, platform_shape = self._shapes()
+        assert "reachability_state" not in response_shape.model_fields
+        assert "reachability_state" not in platform_shape.model_fields
+
+    async def test_the_page_costs_one_query_not_one_per_row(self) -> None:
+        service, repo, _loc, _org, _audit = make_service()
+        rows = [await _controller_row(repo) for _ in range(5)]
+        for row in rows:
+            repo.integrations[row.id] = FakeIntegration()
+        calls: list[int] = []
+        original = repo.integrations_for_routers
+
+        async def counting(router_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, object]:
+            calls.append(len(router_ids))
+            return await original(router_ids)
+
+        repo.integrations_for_routers = counting  # type: ignore[assignment]
+        contexts = await service.controller_context(rows)
+        assert calls == [5]
+        assert all(c.state == "reachable" for c in contexts.values())
+
+    async def test_an_all_mikrotik_page_asks_the_integration_table_nothing(
+        self,
+    ) -> None:
+        """`CONTROLLER_MANAGED_VENDORS` holds one vendor and most venues are
+        MikroTik, so the common page must cost nothing extra at all."""
+        service, repo, _loc, _org, _audit = make_service()
+        rows = [
+            await make_router(
+                repo,
+                location_id=uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                serial_number=f"SN-{uuid.uuid4()}",
+                mac_address=f"AA:BB:CC:DD:EE:{i:02X}",
+            )
+            for i in range(3)
+        ]
+        called = False
+
+        async def explode(router_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, object]:
+            nonlocal called
+            called = True
+            return {}
+
+        repo.integrations_for_routers = explode  # type: ignore[assignment]
+        contexts = await service.controller_context(rows)
+        assert called is False
+        assert all(c.state is None for c in contexts.values())
