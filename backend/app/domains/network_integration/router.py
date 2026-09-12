@@ -291,6 +291,44 @@ def _tls_fields(observation) -> dict[str, object]:  # noqa: ANN001
     }
 
 
+def _probe_message(error) -> str:  # noqa: ANN001
+    """The envelope message for a connectivity probe, following its verdict.
+
+    ALL FOUR PROBE ROUTES USED ONE CONSTANT, ``"Connection test completed"``,
+    on both branches. The verdict itself was never lost -- ``success`` is
+    ``error is None`` and the body carries ``ok``, ``error_code`` and the
+    provider's own sentence -- but the two things a human or a shell script
+    reads first were outcome-independent:
+
+        POST /platform/integrations/{id}/test-connection
+        -> HTTP 200  "Connection test completed"
+
+    on an integration sitting in ``auth_failed`` with ten consecutive
+    failures behind it. Measured on the live QA integration on 2026-09-12,
+    where the same response carried ``success: false``, ``ok: false`` and
+    ``OMADA_AUTH_FAILED``. A probe whose entire job is to answer "does this
+    controller accept us" must not lead with a success-shaped sentence while
+    it is being refused.
+
+    **The 200 stays.** It is the deliberate contract, not an oversight: a
+    refused probe still returns the certificate it observed, which is what
+    lets the console offer "pin this fingerprint" on a self-signed
+    controller, and
+    ``test_a_self_signed_controller_fails_with_its_fingerprint_and_pinned``
+    pins that. The frontend reads ``ok`` and never the status line. So the
+    fix is the sentence, not the status code.
+
+    The provider's own message is deliberately NOT interpolated here: it is
+    already in ``data.message``, the console owns the customer-facing copy
+    (``describeIntegrationError``), and an envelope that restates it would be
+    a second copy free to drift. The envelope says which of the two happened;
+    the body says why.
+    """
+    if error is None:
+        return "Connection test succeeded"
+    return f"Connection test failed: the controller was not usable ({error.code.value})"
+
+
 def _controller_configure_response(
     outcome: ControllerSetupOutcome,
 ) -> ControllerConfigureResponse:
@@ -675,7 +713,7 @@ async def test_platform_integration_connection(
     )
     return build_response(
         success=error is None,
-        message="Connection test completed",
+        message=_probe_message(error),
         data=payload.model_dump(),
         request_id=_request_id(request),
     )
@@ -983,7 +1021,7 @@ async def test_platform_draft_connection(
     )
     return build_response(
         success=error is None,
-        message="Connection test completed",
+        message=_probe_message(error),
         data=response.model_dump(),
         request_id=_request_id(request),
     )
@@ -1134,7 +1172,7 @@ async def test_connection(
     )
     return build_response(
         success=error is None,
-        message="Connection test completed",
+        message=_probe_message(error),
         data=response.model_dump(),
         request_id=_request_id(request),
     )
@@ -1437,7 +1475,7 @@ async def test_integration_connection(
     )
     return build_response(
         success=error is None,
-        message="Connection test completed",
+        message=_probe_message(error),
         data=payload.model_dump(),
         request_id=_request_id(request),
     )
