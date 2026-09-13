@@ -344,6 +344,19 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "reached it through `sync_router`, which the gated "
         "`list_routers_for_sync` no longer dispatches for a controller."
     ),
+    # -- network integration ------------------------------------------------
+    "app/domains/network_integration/repository.py::"
+    "NetworkIntegrationRepository.get_omada_openapi_integration_for_location": (
+        "Router is joined ONLY to resolve `Router.location_id` as a filter "
+        "key; the query returns a `NetworkIntegration` row, not a router, and "
+        "is already narrowed to `provider == omada AND auth_mode == openapi` "
+        "in the WHERE. So it is vendor-scoped by construction, and a "
+        "controller row is exactly what it is meant to reach -- a vendor "
+        "filter on the joined router would make the read find nothing, "
+        "defeating the customer-facing controller-device inventory it backs. "
+        "Every integration row it returns genuinely belongs (the caller's own "
+        "Omada integration for their own location)."
+    ),
 }
 
 
