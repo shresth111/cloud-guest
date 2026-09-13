@@ -30,6 +30,8 @@ from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
+from app.domains.router.fleet_scope import agent_managed_only
+from app.domains.router.models import Router
 
 from .constants import GuestSessionStatus
 from .models import (
@@ -272,6 +274,8 @@ class GuestRepositoryProtocol(Protocol):
     async def list_active_sessions_for_router(
         self, router_id: uuid.UUID
     ) -> list[GuestSession]: ...
+
+    async def list_routers_with_active_sessions(self) -> list[Router]: ...
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]: ...
 
@@ -1075,6 +1079,32 @@ class GuestRepository:
         return await self.sessions.get_all(
             filters={"router_id": router_id, "status": GuestSessionStatus.ACTIVE.value}
         )
+
+    async def list_routers_with_active_sessions(self) -> list[Router]:
+        """Every agent-managed, non-deleted router that currently has at
+        least one ``ACTIVE`` session -- the presence sweep's fan-out list
+        (``tasks.run_session_presence_sweep``).
+
+        Narrowed two ways in SQL, for two different reasons. By active
+        session: a router nobody is signed in on has nothing to reconcile,
+        so it is never dialled. By ``agent_managed_only``: every row returned
+        here is handed to a RouterOS API read with the row's own stored
+        credentials, which a controller-managed row (an Omada controller)
+        has NULL by construction -- see ``app.domains.router.fleet_scope``."""
+        has_active_session = (
+            select(GuestSession.id)
+            .where(
+                GuestSession.router_id == Router.id,
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+                GuestSession.is_deleted.is_(False),
+            )
+            .exists()
+        )
+        statement = agent_managed_only(
+            select(Router).where(Router.is_deleted.is_(False), has_active_session)
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
         """Every distinct ``(guest_id, organization_id, location_id)``

@@ -135,9 +135,11 @@ from app.domains.dhcp.constants import (
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
     QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
+    SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS,
     SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
+    TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
 )
 from app.domains.hub_reconciliation.constants import (
@@ -443,6 +445,18 @@ celery_app.conf.update(
         "guest-session-timeout-sweep": {
             "task": TASK_RUN_SESSION_TIMEOUT_SWEEP,
             "schedule": SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+        },
+        # Session presence: closes ACTIVE sessions whose device is no longer
+        # in the router's own /ip/hotspot/host table. The timeout sweep above
+        # cannot do this for a guest admitted by an authorized-MAC bypass --
+        # a bypassed host sends no RADIUS accounting, so last_activity_at
+        # never moves and "idle" collapses into the full session timeout.
+        # Print-only RouterOS reads, one per router with an active session,
+        # and fail-closed on any read failure. See
+        # ``app.domains.guest.service.reconcile_sessions_with_router_presence``.
+        "guest-session-presence-sweep": {
+            "task": TASK_RUN_SESSION_PRESENCE_SWEEP,
+            "schedule": SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS,
         },
         # Phase 1 BhaiFi-parity: FUP (Fair Usage Policy) time-quota accrual
         # -- every 5 minutes, the same cadence as the session-timeout sweep

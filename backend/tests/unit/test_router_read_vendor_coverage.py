@@ -123,6 +123,16 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "Online' on a venue where it can only ever read 0 of 1. Narrowed in "
         "SQL rather than filtered afterwards so the row is never loaded."
     ),
+    "app/domains/guest/repository.py::"
+    "GuestRepository.list_routers_with_active_sessions": (
+        "The session presence sweep's fan-out list. Each row is dispatched "
+        "to `reconcile_router_session_presence`, which opens a RouterOS API "
+        "session with the row's own stored credentials to read "
+        "`/ip/hotspot/host` -- NULL credentials and no hotspot table on a "
+        "controller, so every tick would be a guaranteed failed read. "
+        "Presence for a controller-managed venue is not something this "
+        "RouterOS read can answer and is deliberately out of its scope."
+    ),
     "app/domains/dhcp/repository.py::DhcpRepository.list_all_router_ids": (
         "The captive-portal DHCP-option convergence sweep. Every id goes "
         "straight to a RouterOS write. Note this method's docstring "

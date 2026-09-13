@@ -363,6 +363,66 @@ MAX_BULK_VOUCHER_LOOKUP_IDS = 100
 SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS = 300.0
 
 # ============================================================================
+# Session presence reconciliation -- closes ``ACTIVE`` sessions whose device
+# is no longer on the router at all. See ``service
+# .reconcile_sessions_with_router_presence``'s docstring for the incident
+# and the full design; these are only its tunables.
+#
+# The short version of why this has to exist: on this fleet a guest is let
+# through the hotspot by an ``/ip hotspot ip-binding type=bypassed`` row
+# (``GET /agent/authorized-macs``), not by a hotspot login. A bypassed host
+# never becomes an ``/ip hotspot active`` session, so RouterOS sends no
+# RADIUS Accounting-Start/Interim-Update/Stop for it -- nothing ever tells
+# the platform that guest left, and the only remaining exit was the idle
+# sweep above at ``session_timeout_minutes`` (240 at the venue that
+# reported it). And because ``/agent/authorized-macs`` returns every
+# ``ACTIVE`` session's MAC, the stale row also kept the bypass itself alive.
+# ============================================================================
+
+TASK_RUN_SESSION_PRESENCE_SWEEP = "app.domains.guest.tasks.run_session_presence_sweep"
+TASK_RECONCILE_ROUTER_SESSION_PRESENCE = (
+    "app.domains.guest.tasks.reconcile_router_session_presence"
+)
+
+# Same 5-minute cadence as the timeout sweep: a stale "connected" row is
+# exactly as operator-visible, and each tick is one print-only RouterOS API
+# connection per router that currently has an active session -- not per
+# router in the fleet.
+SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS = 300.0
+
+# A session younger than this (by both ``started_at`` and
+# ``last_activity_at``) is never judged. It covers the window between a
+# guest's OTP verify and their device's first frame through the hotspot,
+# and a portal re-POST that has just refreshed the row. Twice the sweep
+# interval, so a session is always looked at by at least one full tick
+# before it can be closed.
+SESSION_PRESENCE_GRACE_MINUTES = 10
+
+# A host row that is still listed but whose ``host-dead-time`` (time since
+# RouterOS last heard from that MAC) has reached this is treated as gone.
+# Normally RouterOS drops a silent host from ``/ip/hotspot/host`` on its
+# own (the hotspot server's ``idle-timeout``, default 5m); this is the
+# belt-and-braces for a server configured with ``idle-timeout=none``, where
+# a departed bypassed host can otherwise sit in the table indefinitely.
+# Deliberately well above RouterOS's own default so a phone that is merely
+# dozing -- still associated, still answering ARP -- is never mistaken for
+# a departed one.
+SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS = 15 * 60
+
+# Written to ``GuestSession.disconnect_reason``. ``DISCONNECTED`` rather
+# than ``EXPIRED``: leaving the venue is the textbook "normal,
+# non-punitive end of use" that status is defined as, and it is what lets
+# the portal greet a returning device with "sign in again".
+SESSION_PRESENCE_DISCONNECT_REASON = "device_left_network"
+
+# Overlap-prevention lock for the coordinator -- same SETNX shape, and the
+# same "crash-safety backstop, not the normal release path" TTL semantics,
+# as ``app.domains.connected_devices.constants
+# .CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY``.
+SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY = "cloudguest:guest:session-presence-sweep:lock"
+SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS = 240
+
+# ============================================================================
 # Fair Usage Policy (FUP) quota tracking -- Phase 1 BhaiFi-parity.
 # See ``models.GuestQuotaUsage``'s own docstring and ``service.py``'s "FUP
 # quota tracking" section for the full read/bump/rollover write-up.
@@ -608,6 +668,14 @@ __all__ = [
     "QuotaPeriodType",
     "TASK_RUN_SESSION_TIMEOUT_SWEEP",
     "SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_SESSION_PRESENCE_SWEEP",
+    "TASK_RECONCILE_ROUTER_SESSION_PRESENCE",
+    "SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS",
+    "SESSION_PRESENCE_GRACE_MINUTES",
+    "SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS",
+    "SESSION_PRESENCE_DISCONNECT_REASON",
+    "SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY",
+    "SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS",
     "TASK_RUN_FUP_TIME_ACCRUAL_SWEEP",
     "FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_QUOTA_RESET_SWEEP",
