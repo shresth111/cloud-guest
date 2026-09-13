@@ -58,7 +58,9 @@ from app.database.utils.pagination import PageParams, PaginationMeta
 
 from .constants import (
     AuthorizationStatus,
+    ControllerAuthMode,
     IntegrationStatus,
+    NetworkProviderKind,
 )
 from .models import (
     NetworkIntegration,
@@ -162,6 +164,10 @@ class NetworkIntegrationRepositoryProtocol(Protocol):
 
     async def list_due_for_sync(
         self, *, now: datetime, limit: int
+    ) -> list[NetworkIntegration]: ...
+
+    async def list_omada_openapi_for_usage_sync(
+        self, *, limit: int
     ) -> list[NetworkIntegration]: ...
 
     # -- events ------------------------------------------------------------
@@ -551,6 +557,48 @@ class NetworkIntegrationRepository:
                     NetworkIntegration.last_sync_at.is_(None),
                     NetworkIntegration.last_sync_at <= (now - interval),
                 ),
+            )
+            .order_by(NetworkIntegration.last_sync_at.asc().nullsfirst())
+            .limit(limit)
+        )
+        return list((await self.session.execute(statement)).scalars().all())
+
+    async def list_omada_openapi_for_usage_sync(
+        self, *, limit: int
+    ) -> list[NetworkIntegration]:
+        """Enabled, non-deleted Omada integrations that can actually serve
+        guest data-usage over Open API -- backs
+        ``usage_tasks.run_omada_usage_sync_sweep``.
+
+        Four filters, all in the WHERE clause rather than in a Python loop,
+        for the same "the sweep runs with no user in the request" reason
+        ``list_due_for_sync`` puts ``is_enabled``/``is_deleted`` there:
+
+        * ``provider == omada`` -- this is the only vendor with a client
+          traffic contract, and the sweep is deliberately vendor-scoped.
+        * ``auth_mode == openapi`` -- a ``legacy`` hotspot-operator
+          credential cannot read client inventory at all (contract CR-002),
+          so a legacy row would only ever answer ``OMADA_API_UNSUPPORTED``.
+          Skipped here, not fetched and then discarded.
+        * ``external_site_id IS NOT NULL`` -- ``list_clients`` needs a
+          selected site; a half-configured row has no clients to read.
+        * ``router_id IS NOT NULL`` -- guest sessions at an Omada venue are
+          tied to the synthetic fleet ``Router`` row (``guest_sessions
+          .router_id`` is NOT NULL); with no such row there is nothing to
+          match a controller client against.
+
+        Ordered by ``last_sync_at`` ascending so the most stale venues are
+        polled first when ``limit`` truncates the run, mirroring
+        ``list_due_for_sync``.
+        """
+        statement = (
+            self._live()
+            .where(
+                NetworkIntegration.is_enabled.is_(True),
+                NetworkIntegration.provider == NetworkProviderKind.OMADA.value,
+                NetworkIntegration.auth_mode == ControllerAuthMode.OPENAPI.value,
+                NetworkIntegration.external_site_id.is_not(None),
+                NetworkIntegration.router_id.is_not(None),
             )
             .order_by(NetworkIntegration.last_sync_at.asc().nullsfirst())
             .limit(limit)
