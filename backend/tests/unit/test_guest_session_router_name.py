@@ -79,7 +79,7 @@ class TestSessionResponseCarriesRouterName:
         [response] = _session_responses(
             [session],
             {},
-            {str(session.router_id): "QA Omada Venue -- Fleet"},
+            router_names={str(session.router_id): "QA Omada Venue -- Fleet"},
         )
         assert response.router_name == "QA Omada Venue -- Fleet"
         # The id is kept alongside the name, never replaced -- it is the
@@ -88,7 +88,7 @@ class TestSessionResponseCarriesRouterName:
 
     def test_absent_router_name_is_none_not_fabricated(self) -> None:
         session = _session()
-        [response] = _session_responses([session], {}, {})
+        [response] = _session_responses([session], {}, router_names={})
         assert response.router_name is None
 
     def test_router_names_arg_is_optional_for_back_compat(self) -> None:
