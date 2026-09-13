@@ -156,6 +156,13 @@ class GuestRepositoryProtocol(Protocol):
         sort_order: SortOrder = SortOrder.DESC,
     ) -> tuple[list[Guest], PaginationMeta]: ...
 
+    async def list_guests_by_ids(
+        self,
+        *,
+        guest_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[Guest]: ...
+
     # -- devices -----------------------------------------------------------------
     async def create_device(self, **fields: object) -> GuestDevice: ...
 
@@ -517,6 +524,34 @@ class GuestRepository:
             sort_by=sort_by,
             sort_order=sort_order,
         )
+
+    async def list_guests_by_ids(
+        self,
+        *,
+        guest_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[Guest]:
+        """Bulk-resolve ``guest_ids`` (e.g. a page of ``GuestSession
+        .guest_id`` values) to their :class:`~.models.Guest` rows in one
+        query -- the identity sibling of ``list_devices_by_ids`` below, and
+        the whole anti-N+1 story for ``GuestSessionResponse
+        .guest_identifier``: one extra query per page, never one per row.
+
+        Unlike a device, a ``Guest`` carries its own ``organization_id``
+        column, so tenant scoping for an organization-scoped caller is a
+        plain ``WHERE`` clause with no join. A platform-level caller
+        (``organization_id is None``, the same convention every other method
+        in this repository uses) deliberately skips the tenant filter."""
+        if not guest_ids:
+            return []
+        conditions = [
+            Guest.id.in_(guest_ids),
+            Guest.is_deleted.is_(False),
+        ]
+        if organization_id is not None:
+            conditions.append(Guest.organization_id == organization_id)
+        result = await self.session.execute(select(Guest).where(*conditions))
+        return list(result.scalars().all())
 
     # -- devices -----------------------------------------------------------------
 
