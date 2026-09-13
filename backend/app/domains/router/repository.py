@@ -151,6 +151,10 @@ class RouterRepositoryProtocol(Protocol):
         self, router_ids: Sequence[uuid.UUID]
     ) -> dict[uuid.UUID, NetworkIntegration]: ...
 
+    async def names_for_routers(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]: ...
+
     async def create_router(self, **fields: object) -> Router: ...
 
     async def update_router(
@@ -298,6 +302,37 @@ class RouterRepository:
             if key is not None:
                 found.setdefault(key, integration)
         return found
+
+    async def names_for_routers(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        """The display ``name`` of each of these fleet rows -- ``{router_id:
+        name}`` -- for a caller that needs to label a page of rows referencing
+        routers by id (the guest-session list's Router column).
+
+        ONE query for a whole page, not one per row -- the same ``.in_()``
+        anti-N+1 shape as :meth:`integrations_for_routers` above, on the
+        primary key.
+
+        **Not scoped by organization, deliberately** -- identical posture to
+        :meth:`integrations_for_routers`: the caller has already established
+        its right to these router rows (they came off sessions it fetched
+        under its own scope), and adding an org parameter here would be the
+        path-id-versus-header defect shape one layer down.
+
+        Soft-deleted routers ARE included: a session can outlive the
+        decommission of the router it ran on, and a name is a better label for
+        such a historical row than the bare id -- read-only, and it discloses
+        nothing the ``router_id`` on the same row did not already.
+        """
+        if not router_ids:
+            return {}
+        result = await self.session.execute(
+            select(Router.id, Router.name).where(
+                Router.id.in_(list(router_ids))
+            )
+        )
+        return {row.id: row.name for row in result.all()}
 
     async def create_router(self, **fields: object) -> Router:
         return await self.routers.create(fields)

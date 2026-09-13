@@ -357,6 +357,16 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "Every integration row it returns genuinely belongs (the caller's own "
         "Omada integration for their own location)."
     ),
+    # -- the router domain's own accessors (names) -------------------------
+    "app/domains/router/repository.py::RouterRepository.names_for_routers": (
+        "Resolves a page of router ids the caller already holds to their "
+        "display names -- {router_id: name} -- to label the guest-session "
+        "list's Router column. Same posture as `integrations_for_routers` "
+        "and the `get_by_id` family: a controller row MUST resolve, because a "
+        "name is a better label for it than a bare id, and a vendor filter "
+        "would make an Omada venue's own controller show as an unlabelled "
+        "uuid. Read-only, every row genuinely belongs."
+    ),
 }
 
 

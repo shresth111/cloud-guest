@@ -318,14 +318,16 @@ def _session_response(
     *,
     device_mac: str | None = None,
     guest_identifier: str | None = None,
+    router_name: str | None = None,
 ) -> GuestSessionResponse:
-    """``device_mac`` and ``guest_identifier`` are passed in, never looked
-    up here, because the only correct way to resolve either for a *list* of
-    sessions is one bulk query for the whole page -- see
-    ``_resolve_session_macs`` / ``_resolve_session_guest_identifiers`` below.
-    A helper that fetched its own device or guest would turn every list
-    endpoint into an N+1, which is the exact cost
-    ``constants.MAX_BULK_DEVICE_LOOKUP_IDS`` was written to avoid."""
+    """``device_mac``, ``guest_identifier`` and ``router_name`` are passed
+    in, never looked up here, because the only correct way to resolve any of
+    them for a *list* of sessions is one bulk query for the whole page -- see
+    ``_resolve_session_macs`` / ``_resolve_session_guest_identifiers`` /
+    ``_resolve_router_names`` below. A helper that fetched its own device,
+    guest or router would turn every list endpoint into an N+1, which is the
+    exact cost ``constants.MAX_BULK_DEVICE_LOOKUP_IDS`` was written to
+    avoid."""
     return GuestSessionResponse(
         id=str(session.id),
         guest_id=str(session.guest_id),
@@ -333,6 +335,7 @@ def _session_response(
         device_id=str(session.device_id) if session.device_id else None,
         device_mac=device_mac,
         router_id=str(session.router_id),
+        router_name=router_name,
         location_id=str(session.location_id),
         organization_id=str(session.organization_id),
         auth_method=session.auth_method,
@@ -472,23 +475,53 @@ async def _resolve_session_guest_identifiers(
     return identifiers
 
 
+async def _resolve_router_names(
+    sessions: Sequence[GuestSession],
+    *,
+    service: GuestService,
+) -> dict[str, str]:
+    """Resolve one page of sessions' ``router_id``s to router display names
+    in a single query, returning ``{router_id: name}``.
+
+    The router-side twin of ``_resolve_session_macs``: one extra query per
+    page, never one per row. De-duplicates ids first, which is not a micro-
+    optimization here but the common case -- an Omada venue runs every one of
+    its sessions against a single synthetic fleet ``Router``, so a whole page
+    collapses to one id in the ``IN (...)``.
+
+    Not organization-scoped, matching ``RouterService.router_names_for_ids``:
+    the sessions were already fetched under the caller's tenant scope, so the
+    router ids taken off them are already authorized. A router id absent from
+    the result (a hard-deleted row) simply yields no name -- an honest "could
+    not resolve", never a fabricated label."""
+    router_ids = list({session.router_id for session in sessions})
+    if not router_ids:
+        return {}
+    names = await service.list_router_names_for_ids(router_ids)
+    return {str(rid): name for rid, name in names.items()}
+
+
 def _session_responses(
     sessions: Sequence[GuestSession],
     macs: dict[str, str],
     identifiers: dict[str, str] | None = None,
+    router_names: dict[str, str] | None = None,
 ) -> list[GuestSessionResponse]:
-    """Zip a page of sessions with an already-resolved MAC map and guest
-    identifier map. A session whose device is absent from ``macs`` (no
+    """Zip a page of sessions with already-resolved MAC, guest-identifier and
+    router-name maps. A session whose device is absent from ``macs`` (no
     ``device_id``, or a device outside the caller's organization scope) gets
     ``None`` -- an honest "no device on record", never a fabricated or
-    borrowed address. ``guest_identifier`` follows the same rule against the
-    ``identifiers`` map."""
+    borrowed address. ``guest_identifier`` (against ``identifiers``) and
+    ``router_name`` (against ``router_names``) follow the same rule: an
+    absent id yields ``None``, never a fabricated label."""
     identifiers = identifiers or {}
+    router_names = router_names or {}
     return [
         _session_response(
             s,
             device_mac=macs.get(str(s.device_id)) if s.device_id else None,
             guest_identifier=identifiers.get(str(s.guest_id)),
+            router_name=router_names.get(str(s.router_id)),
         )
         for s in sessions
     ]
@@ -523,10 +556,12 @@ async def _session_response_resolved(
         service=service,
         requesting_organization_id=requesting_organization_id,
     )
+    router_names = await _resolve_router_names([session], service=service)
     return _session_response(
         session,
         device_mac=macs.get(str(session.device_id)) if session.device_id else None,
         guest_identifier=identifiers.get(str(session.guest_id)),
+        router_name=router_names.get(str(session.router_id)),
     )
 
 
@@ -1106,10 +1141,11 @@ async def get_guest(
         service=service,
         requesting_organization_id=requesting_organization_id,
     )
+    router_names = await _resolve_router_names(sessions, service=service)
     guest_payload = _guest_response(guest, devices=devices_by_guest.get(guest.id, []))
     payload = GuestDetailResponse(
         **guest_payload.model_dump(),
-        sessions=_session_responses(sessions, macs, identifiers),
+        sessions=_session_responses(sessions, macs, identifiers, router_names),
     )
     return build_response(
         success=True,
@@ -1253,8 +1289,9 @@ async def list_guest_sessions(
         service=service,
         requesting_organization_id=requesting_organization_id,
     )
+    router_names = await _resolve_router_names(sessions, service=service)
     payload = GuestSessionListResponse(
-        items=_session_responses(sessions, macs, identifiers),
+        items=_session_responses(sessions, macs, identifiers, router_names),
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
