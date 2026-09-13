@@ -51,6 +51,9 @@ from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
+from app.domains.network_integration.customer_router import (
+    customer_router as network_integration_customer_router,
+)
 from app.domains.network_integration.router import (
     portal_router as network_integration_portal_router,
 )
@@ -188,6 +191,10 @@ api_v1_router.include_router(
     network_integration_router, dependencies=_PAID_WRITES
 )
 api_v1_router.include_router(network_integration_portal_router)
+# Customer-facing (organization-scoped), read-only controller device
+# inventory -- deliberately NOT on the GLOBAL network_integration_router,
+# and not license-gated for writes because it has none (see its module).
+api_v1_router.include_router(network_integration_customer_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(campaigns_guest_router)

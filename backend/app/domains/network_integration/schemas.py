@@ -1191,3 +1191,29 @@ class ControllerConfigureResponse(BaseModel):
     portal_url_scheme: str
     portal_url_host_and_query: str
     pre_auth_host: str
+
+
+class ControllerDeviceView(BaseModel):
+    """One device the customer's Omada controller manages -- the controller
+    itself and each adopted AP. Read-only projection of the provider's
+    ``ProviderDevice``; carries no credentials and nothing writable."""
+
+    mac: str
+    name: str | None = None
+    device_type: str = "unknown"
+    model: str | None = None
+    status: str = "unknown"
+    ip_address: str | None = None
+    firmware_version: str | None = None
+    uptime_seconds: int | None = None
+    client_count: int | None = None
+
+
+class ControllerInventoryResponse(BaseModel):
+    """The customer-facing controller device inventory. ``status`` is
+    ``"ok"`` | ``"no_controller"`` | ``"unreachable"`` (see
+    ``service.ControllerInventoryResult``); ``devices`` is empty for the
+    latter two and may legitimately be empty for ``"ok"``."""
+
+    status: str
+    devices: list[ControllerDeviceView]

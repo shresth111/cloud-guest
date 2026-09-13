@@ -105,6 +105,10 @@ class NetworkIntegrationRepositoryProtocol(Protocol):
         self, integration_id: uuid.UUID, *, organization_id: uuid.UUID
     ) -> NetworkIntegration | None: ...
 
+    async def get_omada_openapi_integration_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None: ...
+
     async def list_live_integrations_on_controller_site(
         self,
         *,
@@ -249,6 +253,40 @@ class NetworkIntegrationRepository:
             NetworkIntegration.organization_id == organization_id,
         )
         return (await self.session.execute(statement.limit(1))).scalars().first()
+
+    async def get_omada_openapi_integration_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None:
+        """The one live Omada Open-API integration serving a customer's own
+        location, resolved WITH the owner and the location in the WHERE clause.
+
+        Backs the customer-facing controller-device read. Like
+        ``get_integration_for_organization``, the organization is part of the
+        query rather than checked after the load, so a location id belonging to
+        another tenant is simply not found (a 404 that reveals nothing) rather
+        than read and then refused. Joined to ``Router`` because the integration
+        row carries ``router_id`` (its synthetic fleet router), and that router
+        carries ``location_id``. Filtered to Omada + Open API (a legacy
+        hotspot-operator credential cannot read controller inventory at all) with
+        a selected site, mirroring ``list_omada_openapi_for_usage_sync``.
+        """
+        from app.domains.router.models import Router
+
+        statement = (
+            self._live()
+            .join(Router, Router.id == NetworkIntegration.router_id)
+            .where(
+                Router.location_id == location_id,
+                NetworkIntegration.organization_id == organization_id,
+                NetworkIntegration.is_enabled.is_(True),
+                NetworkIntegration.provider == NetworkProviderKind.OMADA.value,
+                NetworkIntegration.auth_mode == ControllerAuthMode.OPENAPI.value,
+                NetworkIntegration.external_site_id.is_not(None),
+            )
+            .order_by(NetworkIntegration.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(statement)).scalars().first()
 
     async def list_live_integrations_on_controller_site(
         self,
