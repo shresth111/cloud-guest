@@ -628,6 +628,25 @@ def build_portal_authorize_diagnostics(
 # ============================================================================
 
 
+@dataclass(frozen=True, slots=True)
+class ControllerInventoryResult:
+    """What the customer-facing controller-device read found.
+
+    ``status`` is a small closed set so the dashboard can tell the three
+    genuinely different states apart without guessing from an empty list:
+    ``"ok"`` (devices below, possibly empty for a controller with nothing
+    adopted yet), ``"no_controller"`` (this location has no Omada Open-API
+    integration -- a MikroTik/RouterOS venue, or not yet onboarded), and
+    ``"unreachable"`` (the controller exists but did not answer this read).
+    An empty ``"ok"`` and a ``"no_controller"`` must never be collapsed --
+    "your controller reports no devices" and "you have no controller" are
+    different facts.
+    """
+
+    status: str
+    devices: tuple[ProviderDevice, ...]
+
+
 class NetworkIntegrationService:
     """Core Network Integration business logic."""
 
@@ -2495,6 +2514,43 @@ class NetworkIntegrationService:
                 during_sync=False,
             )
             raise
+
+    async def list_controller_devices_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> ControllerInventoryResult:
+        """Read-only: the devices the customer's own Omada controller manages
+        at this location -- the controller and every AP adopted under it, which
+        ``list_devices`` returns in one call (integrate the controller, and the
+        mesh/downlink APs come along; no per-AP onboarding).
+
+        Customer-facing and org-scoped, unlike ``list_devices`` and every other
+        route on the GLOBAL ``network_integration`` router: the integration is
+        resolved WITH the caller's organization and location in the query, so a
+        location that is not theirs is simply "no_controller", never someone
+        else's inventory. Never writes to the controller.
+
+        A ``ProviderError`` (unreachable / still provisioning) is turned into a
+        ``"unreachable"`` status rather than propagated, so a venue owner
+        loading their dashboard sees an honest "couldn't reach your controller"
+        instead of a 5xx -- the same read that ``list_devices`` performs still
+        records the failure on the integration's own event feed.
+        """
+        integration = (
+            await self.repository.get_omada_openapi_integration_for_location(
+                location_id=location_id, organization_id=organization_id
+            )
+            if organization_id is not None
+            else None
+        )
+        if integration is None:
+            return ControllerInventoryResult(status="no_controller", devices=())
+        try:
+            devices = await self.list_devices(
+                integration.id, requesting_organization_id=organization_id
+            )
+        except ProviderError:
+            return ControllerInventoryResult(status="unreachable", devices=())
+        return ControllerInventoryResult(status="ok", devices=tuple(devices))
 
     async def list_clients(
         self,
