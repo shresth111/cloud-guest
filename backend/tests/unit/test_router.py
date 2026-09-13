@@ -283,6 +283,15 @@ class FakeRouterRepository:
             if rid in self.integrations
         }
 
+    async def names_for_routers(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        return {
+            rid: self.routers[rid].name
+            for rid in router_ids
+            if rid in self.routers
+        }
+
     async def create_router(self, **fields: object) -> Router:
         defaults = {
             "routeros_version": None,
@@ -3933,3 +3942,42 @@ class TestControllerStateOnTheReadShape:
         contexts = await service.controller_context(rows)
         assert called is False
         assert all(c.state is None for c in contexts.values())
+
+
+# ============================================================================
+# Bulk router-name resolution -- backs GuestSessionResponse.router_name
+# (the guest-session list's Router column). See
+# tests/unit/test_guest_session_router_name.py for the serializer side.
+# ============================================================================
+
+
+class TestRouterNamesForIds:
+    async def test_resolves_ids_to_names_in_one_query(self) -> None:
+        service, repo, _loc, _org, _audit = make_service()
+        a = await repo.create_router(
+            location_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            name="QA Omada Venue -- Fleet",
+            serial_number=f"SN-{uuid.uuid4()}",
+            mac_address="AA:BB:CC:DD:EE:01",
+            model="omada-controller",
+        )
+        b = await repo.create_router(
+            location_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            name="Reception AP",
+            serial_number=f"SN-{uuid.uuid4()}",
+            mac_address="AA:BB:CC:DD:EE:02",
+            model="hAP ac2",
+        )
+        names = await service.router_names_for_ids([a.id, b.id])
+        assert names == {a.id: "QA Omada Venue -- Fleet", b.id: "Reception AP"}
+
+    async def test_unknown_ids_are_simply_absent(self) -> None:
+        service, _repo, _loc, _org, _audit = make_service()
+        names = await service.router_names_for_ids([uuid.uuid4()])
+        assert names == {}
+
+    async def test_empty_input_makes_no_claim(self) -> None:
+        service, _repo, _loc, _org, _audit = make_service()
+        assert await service.router_names_for_ids([]) == {}

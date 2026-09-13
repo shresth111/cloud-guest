@@ -253,6 +253,19 @@ class RouterService:
         await self._enforce_organization_scope(router, requesting_organization_id)
         return router
 
+    async def router_names_for_ids(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        """Resolve a batch of router ids to their display names in one query,
+        for a caller labelling rows that reference routers by id (the
+        guest-session list's Router column).
+
+        A thin pass-through to :meth:`RouterRepository.names_for_routers`
+        -- deliberately NOT org-scoped, for the reason documented there: the
+        caller has already established its right to these rows. Read-only.
+        """
+        return await self.repository.names_for_routers(router_ids)
+
     async def get_by_serial_number(self, serial_number: str) -> Router:
         router = await self.repository.get_by_serial_number(serial_number)
         if router is None:
