@@ -38,6 +38,7 @@ from app.domains.guest.constants import (
 from app.domains.guest.exceptions import TooManyVoucherIdsError
 from app.domains.guest.router import (
     _guest_response,
+    _resolve_session_guest_identifiers,
     _resolve_session_macs,
     _session_responses,
 )
@@ -348,6 +349,156 @@ class TestSessionMacResolutionIsNotAnNPlusOne:
         )
 
         assert batch_sizes == [MAX_BULK_DEVICE_LOOKUP_IDS, 25]
+
+
+# ============================================================================
+# Gap 2b -- Guests/Dashboard: GuestSessionResponse had a bare guest_id FK
+# and no human-readable identifier, so the customer Guests table and the
+# dashboard could show nothing but "Guest <8 hex>" for the person on each
+# session (frontend lib/guest-label.ts's fallback). The identity
+# counterpart of Gap 2's device_mac -- same denormalization, same anti-N+1.
+# ============================================================================
+
+REAL_IDENTIFIER = "8824655613"
+
+
+class TestSessionResponseCarriesGuestIdentifier:
+    def test_session_response_exposes_a_readable_identifier(self) -> None:
+        session = _session()
+        identifiers = {str(session.guest_id): REAL_IDENTIFIER}
+
+        [payload] = [
+            r.model_dump() for r in _session_responses([session], {}, identifiers)
+        ]
+
+        assert payload["guest_identifier"] == REAL_IDENTIFIER
+
+    def test_guest_id_is_kept_alongside_the_identifier(self) -> None:
+        """The opaque FK stays -- callers that key on ``guest_id`` (the
+        frontend joins per-guest history on it) must keep working; the
+        identifier is added beside it, never in place of it."""
+        session = _session()
+
+        [payload] = [
+            r.model_dump()
+            for r in _session_responses(
+                [session], {}, {str(session.guest_id): REAL_IDENTIFIER}
+            )
+        ]
+
+        assert payload["guest_id"] == str(session.guest_id)
+        assert payload["guest_identifier"] == REAL_IDENTIFIER
+
+    def test_an_unresolved_guest_gets_none_not_a_borrowed_identifier(self) -> None:
+        """A session whose guest is outside the caller's org scope (absent
+        from the map) gets ``None`` -- an honest "not resolved", never
+        another guest's identity."""
+        unresolved = _session()
+        resolved = _session()
+
+        payloads = [
+            r.model_dump()
+            for r in _session_responses(
+                [unresolved, resolved],
+                {},
+                {str(resolved.guest_id): REAL_IDENTIFIER},
+            )
+        ]
+
+        assert payloads[0]["guest_identifier"] is None
+        assert payloads[1]["guest_identifier"] == REAL_IDENTIFIER
+
+    def test_identifier_defaults_to_none_when_no_map_is_passed(self) -> None:
+        """Callers that do not resolve identities (the guest-facing login
+        and self-disconnect acknowledgements) omit the map entirely and
+        must still serialize cleanly."""
+        [payload] = [r.model_dump() for r in _session_responses([_session()], {})]
+
+        assert payload["guest_identifier"] is None
+
+    def test_identifier_is_returned_unmasked_like_guest_response(self) -> None:
+        """``GuestResponse.identifier`` is returned plain (the dashboard
+        applies its own display masking); the session identifier follows
+        the same rule so the two views agree, and there is no masking type
+        silently rewriting one but not the other."""
+        session = _session()
+        raw = "guest@example.com"
+
+        [payload] = [
+            r.model_dump()
+            for r in _session_responses([session], {}, {str(session.guest_id): raw})
+        ]
+
+        assert payload["guest_identifier"] == raw
+
+
+class TestSessionGuestIdentifierResolutionIsNotAnNPlusOne:
+    async def test_one_query_resolves_a_whole_page(self) -> None:
+        calls: list[list[uuid.UUID]] = []
+
+        class _Service:
+            async def list_guests_by_ids(self, *, guest_ids, **_):
+                calls.append(list(guest_ids))
+                return []
+
+        sessions = [_session() for _ in range(40)]
+        await _resolve_session_guest_identifiers(
+            sessions, service=_Service(), requesting_organization_id=None
+        )
+
+        assert len(calls) == 1
+        assert len(calls[0]) == 40
+
+    async def test_a_returning_guests_many_sessions_are_deduplicated(self) -> None:
+        """One guest reconnecting all day produces many sessions on one
+        ``guest_id`` -- the common case, and it must send that id once."""
+        calls: list[list[uuid.UUID]] = []
+
+        class _Service:
+            async def list_guests_by_ids(self, *, guest_ids, **_):
+                calls.append(list(guest_ids))
+                return []
+
+        shared = uuid.uuid4()
+        await _resolve_session_guest_identifiers(
+            [_session(guest_id=shared) for _ in range(30)],
+            service=_Service(),
+            requesting_organization_id=None,
+        )
+
+        assert calls == [[shared]]
+
+    async def test_no_sessions_means_no_query_at_all(self) -> None:
+        class _Service:
+            async def list_guests_by_ids(self, **_):
+                raise AssertionError("must not query for an empty session page")
+
+        result = await _resolve_session_guest_identifiers(
+            [], service=_Service(), requesting_organization_id=None
+        )
+
+        assert result == {}
+
+    async def test_an_unbounded_session_history_is_chunked_not_rejected(self) -> None:
+        """``GET /guests/{id}`` resolves a guest's entire session history
+        unbounded; the resolver splits at the bound rather than handing an
+        oversized ``IN (...)`` to the repository."""
+        batch_sizes: list[int] = []
+
+        class _Service:
+            async def list_guests_by_ids(self, *, guest_ids, **_):
+                batch_sizes.append(len(guest_ids))
+                assert len(guest_ids) <= MAX_BULK_DEVICE_LOOKUP_IDS
+                return []
+
+        # One session each -> distinct guest_ids, so the page cannot be
+        # collapsed by de-duplication and must be chunked.
+        sessions = [_session() for _ in range(MAX_BULK_DEVICE_LOOKUP_IDS + 25)]
+        await _resolve_session_guest_identifiers(
+            sessions, service=_Service(), requesting_organization_id=None
+        )
+
+        assert sorted(batch_sizes, reverse=True) == [MAX_BULK_DEVICE_LOOKUP_IDS, 25]
 
 
 # ============================================================================

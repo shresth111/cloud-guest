@@ -473,10 +473,25 @@ class GuestSessionResponse(BaseModel):
     ``ip_address`` is the session's own DHCP lease at the time it ran, and
     is meaningful only within this session -- unlike ``device_mac``, which
     is a stable property of the device. See ``GuestResponse``'s docstring
-    for why that difference keeps IP off the per-guest Users row."""
+    for why that difference keeps IP off the per-guest Users row.
+
+    ``guest_identifier`` is the human-readable resolution of ``guest_id``
+    (the phone/email the guest presented -- ``Guest.identifier``),
+    denormalized onto this response exactly like ``device_mac`` above: one
+    bulk ``Guest`` lookup per page (``router._resolve_session_guest_identifiers``),
+    never one query per row. Without it every session row carried only an
+    opaque ``guest_id`` UUID, so the customer Guests table and dashboard
+    could show nothing but ``Guest <8 hex>`` for the person on each session
+    (see the frontend ``lib/guest-label.ts``'s own note). ``None`` means the
+    guest row could not be resolved (outside the caller's organization
+    scope, or a guest-facing endpoint with no org to scope by) -- never
+    "this endpoint forgot to resolve it", the same discipline ``device_mac``
+    documents. Returned unmasked, matching ``GuestResponse.identifier``; the
+    dashboard applies its own display masking."""
 
     id: str
     guest_id: str
+    guest_identifier: str | None = None
     device_id: str | None
     device_mac: MaskedMac = None
     router_id: str
