@@ -83,6 +83,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -143,6 +144,7 @@ class _ActiveSession(Protocol):
     device_id: uuid.UUID | None
     bytes_uploaded: int
     bytes_downloaded: int
+    started_at: datetime
 
 
 class _Device(Protocol):
@@ -185,21 +187,93 @@ def _canonical_mac(raw: str | None) -> str | None:
     return hex_only
 
 
+_USAGE_CURSOR_KEY = "omada:usage:cursor:{session_id}"
+# Comfortably longer than any guest session; if a cursor does expire mid-session
+# the next sweep simply re-baselines (accrues 0 that tick), i.e. a bounded
+# under-count, never a false over-count. Not a correctness dependency -- a
+# durability convenience on top of the session's own persisted bytes.
+_USAGE_CURSOR_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+async def _load_cursors(
+    redis, session_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, tuple[int, int]]:
+    """Last controller totals this sweep recorded per session. A malformed or
+    missing value is treated as "never seen" (absent) so a first sight
+    re-baselines rather than accruing against garbage."""
+    cursors: dict[uuid.UUID, tuple[int, int]] = {}
+    for session_id in session_ids:
+        raw = await redis.get(_USAGE_CURSOR_KEY.format(session_id=session_id))
+        if raw is None:
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            up_str, down_str = raw.split(",", 1)
+            cursors[session_id] = (int(up_str), int(down_str))
+        except (ValueError, AttributeError):
+            continue
+    return cursors
+
+
+async def _store_cursors(
+    redis, new_cursors: Mapping[uuid.UUID, tuple[int, int]]
+) -> None:
+    for session_id, (up, down) in new_cursors.items():
+        await redis.set(
+            _USAGE_CURSOR_KEY.format(session_id=session_id),
+            f"{up},{down}",
+            ex=_USAGE_CURSOR_TTL_SECONDS,
+        )
+
+
 async def apply_controller_usage(
     *,
     clients: Sequence[ProviderClient],
     active_sessions: Sequence[_ActiveSession],
     devices_by_id: Mapping[uuid.UUID, _Device],
     guest_service: _UsageRecorder,
-) -> tuple[int, int, int]:
-    """Match ``clients`` to ``active_sessions`` by MAC and push the monotonic
-    byte delta through ``guest_service.record_usage``.
+    cursors: Mapping[uuid.UUID, tuple[int, int]],
+) -> tuple[int, int, int, dict[uuid.UUID, tuple[int, int]]]:
+    """Match ``clients`` to ``active_sessions`` by MAC and push the delta of
+    the controller's cumulative totals *since this sweep last saw them* through
+    ``guest_service.record_usage``.
 
-    Returns ``(sessions_updated, bytes_uploaded_applied,
-    bytes_downloaded_applied)``. Pure of any DB or provider access -- every
-    collaborator is passed in -- which is what makes it the unit-test seam for
-    the delta/matching contract.
+    Returns ``(sessions_updated, bytes_uploaded_applied, bytes_downloaded_applied,
+    new_cursors)`` where ``new_cursors`` is the controller total last observed
+    for each matched session, to be persisted by the caller. Pure of any DB,
+    provider or cache access -- every collaborator is passed in -- which is what
+    makes it the unit-test seam for the delta/matching contract.
+
+    ## Why a per-session cursor, not ``total - session.bytes``
+
+    Omada's ``traffic_*_bytes`` accumulate over the **client's association with
+    the AP**, and a captive-portal re-authorization does not deassociate the
+    client -- so those counters are NOT reset when one ``guest_session`` ends
+    and the next login opens a fresh row at ``bytes = 0``. Subtracting the new
+    session's ``bytes`` (0) from the still-high controller total would dump the
+    entire prior session's usage into the new session as one delta and trip its
+    FUP/data cap the instant the guest reconnects. So instead the delta is taken
+    against the controller total this sweep *last recorded for this session*:
+    the first time a session is seen, its cursor is set to the current total and
+    **zero** is accrued (the inherited total is a baseline, not usage); only
+    growth after that point counts. This is the standard interface-counter
+    polling model, and it makes the byte lifecycle depend on the session's own
+    first-sight rather than on a controller counter it does not control.
+
+    A counter that moves backwards (a controller-side reset, or a roam to
+    another AP whose counter starts lower) yields ``current < cursor``: the
+    delta clamps to 0 and the cursor re-baselines at the lower value, so usage
+    never runs backwards and a reset costs at most the unseen tail -- the safe
+    direction to be wrong in for a cap meant to be enforced.
     """
+    # Deterministic session selection: a device that overran its session
+    # timeout can briefly hold an ACTIVE stale row AND a fresh re-login row at
+    # once (the login path does not reuse an overrun ACTIVE session, and
+    # sessions are append-only). The controller's live traffic belongs to the
+    # current connection, i.e. the most recently started session -- pick that
+    # one, deterministically, instead of whichever the query happened to order
+    # first.
     session_by_mac: dict[str, _ActiveSession] = {}
     for session in active_sessions:
         if session.device_id is None:
@@ -210,14 +284,14 @@ async def apply_controller_usage(
         canonical = _canonical_mac(device.mac_address)
         if canonical is None:
             continue
-        # First match wins; a MAC is globally unique to one device row, so a
-        # collision here would mean two active sessions for one physical
-        # device, which the login path already prevents.
-        session_by_mac.setdefault(canonical, session)
+        incumbent = session_by_mac.get(canonical)
+        if incumbent is None or session.started_at > incumbent.started_at:
+            session_by_mac[canonical] = session
 
     sessions_updated = 0
     up_applied = 0
     down_applied = 0
+    new_cursors: dict[uuid.UUID, tuple[int, int]] = {}
     for client in clients:
         canonical = _canonical_mac(client.mac)
         if canonical is None:
@@ -229,18 +303,29 @@ async def apply_controller_usage(
         down_total = client.traffic_down_bytes
         if up_total is None and down_total is None:
             # The controller reported no counters for this client. A missing
-            # reading is not a zero -- writing a zero delta would be
-            # harmless, but there is nothing to write, so skip.
+            # reading is not a zero -- there is nothing to baseline or accrue.
             continue
-        # Mirror of RadiusService.accounting_interim_update's clamp: the
-        # controller totals are cumulative, so the delta against what this
-        # session already recorded is max(0, total - recorded). Clamps a
-        # counter reset to zero rather than crediting quota back.
-        up_delta = max(0, (up_total or 0) - session.bytes_uploaded)
-        down_delta = max(0, (down_total or 0) - session.bytes_downloaded)
+        cur_up = up_total or 0
+        cur_down = down_total or 0
+
+        prev = cursors.get(session.id)
+        if prev is None:
+            # First sight of this session: the controller total is a carried-in
+            # baseline, not usage. Record the cursor, accrue nothing, and do not
+            # call record_usage. This is the fix for the session-boundary
+            # inheritance that would otherwise false-trip a data cap on
+            # reconnect.
+            new_cursors[session.id] = (cur_up, cur_down)
+            continue
+        prev_up, prev_down = prev
+        up_delta = max(0, cur_up - prev_up)
+        down_delta = max(0, cur_down - prev_down)
+        # Re-baseline to the current reading regardless of direction so a
+        # backwards move (reset/roam) does not keep re-crediting the same drop.
+        new_cursors[session.id] = (cur_up, cur_down)
         if up_delta == 0 and down_delta == 0:
-            # Idempotent no-op: a repeated poll with no new traffic, exactly
-            # like a RADIUS accounting retransmit.
+            # Idempotent no-op: a repeated poll with no new traffic since the
+            # last sweep, exactly like a RADIUS accounting retransmit.
             continue
         await guest_service.record_usage(
             session_id=session.id,
@@ -250,7 +335,7 @@ async def apply_controller_usage(
         sessions_updated += 1
         up_applied += up_delta
         down_applied += down_delta
-    return sessions_updated, up_applied, down_applied
+    return sessions_updated, up_applied, down_applied, new_cursors
 
 
 async def sync_omada_session_usage(
@@ -258,6 +343,7 @@ async def sync_omada_session_usage(
     ni_service: NetworkIntegrationService,
     guest_repository: GuestRepository,
     guest_service: _UsageRecorder,
+    redis,
     limit: int,
 ) -> OmadaUsageSyncSummary:
     """Poll every eligible Omada Open-API integration once and apply its
@@ -309,12 +395,16 @@ async def sync_omada_session_usage(
         )
         devices_by_id = {device.id: device for device in devices}
 
+        cursors = await _load_cursors(redis, [s.id for s in active_sessions])
         try:
-            updated, up_applied, down_applied = await apply_controller_usage(
-                clients=clients,
-                active_sessions=active_sessions,
-                devices_by_id=devices_by_id,
-                guest_service=guest_service,
+            updated, up_applied, down_applied, new_cursors = (
+                await apply_controller_usage(
+                    clients=clients,
+                    active_sessions=active_sessions,
+                    devices_by_id=devices_by_id,
+                    guest_service=guest_service,
+                    cursors=cursors,
+                )
             )
         except Exception:  # noqa: BLE001 -- one venue must not stop the sweep
             logger.exception(
@@ -324,6 +414,9 @@ async def sync_omada_session_usage(
             summary.integrations_failed += 1
             continue
 
+        # Persist cursors only after record_usage succeeded for this venue, so a
+        # mid-venue failure re-baselines next tick rather than skipping usage.
+        await _store_cursors(redis, new_cursors)
         summary.integrations_synced += 1
         summary.sessions_updated += updated
         summary.bytes_uploaded_applied += up_applied
@@ -394,6 +487,7 @@ async def _run_omada_usage_sync_async() -> OmadaUsageSyncSummary:
                 # the one GuestRepository the service already holds.
                 guest_repository=guest_service.repository,
                 guest_service=guest_service,
+                redis=redis_client,
                 limit=OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN,
             )
             await session.commit()
