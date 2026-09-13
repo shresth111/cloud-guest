@@ -804,6 +804,15 @@ class RouterLookupProtocol(Protocol):
         include_deleted: bool = False,
     ) -> Router: ...
 
+    async def router_names_for_ids(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        """Batch-resolve router ids to display names for a page of sessions'
+        Router column -- one query per page, not one per row. Satisfied
+        structurally by the real ``RouterService``.
+        """
+        ...
+
     def get_decrypted_api_secret(self, router: Router) -> str | None:
         """The router's API password, decrypted, for a real device push.
 
@@ -3676,6 +3685,27 @@ class GuestService:
         return await self.repository.list_devices_for_session_ids(
             device_ids=device_ids, organization_id=requesting_organization_id
         )
+
+    async def list_router_names_for_ids(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        """Resolve the distinct router ids on one page of sessions to their
+        display names -- backs ``GuestSessionResponse.router_name``, the
+        Router column on the guest-session list.
+
+        One query per page, deduped by the caller (``router._resolve_router
+        _names``), exactly like ``list_devices_for_session_ids`` backs
+        ``device_mac``. Thin pass-through to ``self.router_lookup``; the
+        sessions were already fetched under the caller's tenant scope, so the
+        router ids taken off them are already authorized (the same posture
+        ``RouterRepository.names_for_routers`` documents).
+
+        This is the whole point of resolving it server-side rather than
+        leaving the frontend to render the bare ``router_id``: an Omada venue
+        runs all its sessions against one synthetic fleet ``Router``, whose id
+        is meaningless to a customer, and every RADIUS venue's sessions
+        likewise want the human name, not the uuid."""
+        return await self.router_lookup.router_names_for_ids(router_ids)
 
     async def list_devices_for_guest_ids(
         self,

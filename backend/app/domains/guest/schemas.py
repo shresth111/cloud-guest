@@ -480,6 +480,17 @@ class GuestSessionResponse(BaseModel):
     device_id: str | None
     device_mac: MaskedMac = None
     router_id: str
+    #: The human-readable ``Router.name`` for ``router_id``, denormalized onto
+    #: this response by ``router._session_response`` from a single bulk router
+    #: lookup per page (never one query per row -- the same anti-N+1 shape as
+    #: ``device_mac``). ``None`` means the referenced router row could not be
+    #: resolved (e.g. hard-deleted); it never means "this endpoint forgot to
+    #: resolve it". Kept alongside ``router_id``, not replacing it: the id is
+    #: the stable key the "View router" link routes on, while this is only a
+    #: label. An Omada venue runs every session against one synthetic fleet
+    #: ``Router`` whose id is meaningless to a customer -- this is the field
+    #: that lets the Router column and the CSV export show its name instead.
+    router_name: str | None = None
     location_id: str
     organization_id: str
     auth_method: str
