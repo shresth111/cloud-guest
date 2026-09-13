@@ -51,9 +51,11 @@ from .schemas import (
     GuestTeamJoinRequest,
     GuestTeamJoinResponse,
     GuestTeamListResponse,
+    GuestTeamMemberListResponse,
     GuestTeamMemberRemovalResponse,
     GuestTeamMemberRemoveRequest,
     GuestTeamMemberResponse,
+    GuestTeamMemberWithIdentityResponse,
     GuestTeamResponse,
     GuestTeamRevokeRequest,
     GuestTeamRevokeResponse,
@@ -292,6 +294,48 @@ async def get_guest_team(
     return build_response(
         success=True,
         message="Guest team retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
+    "/{team_id}/members",
+    response_model=ApiResponse[GuestTeamMemberListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_teams.read"))],
+)
+async def list_guest_team_members(
+    request: Request,
+    team_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestTeamService = Depends(get_guest_team_service),
+):
+    """The active roster of one team, each member carrying the guest's own
+    identifier/display name -- what an admin needs to decide whom to remove
+    (``DELETE .../members/{guest_id}`` below). ``guest_teams.read``, not
+    ``.execute``: this is a pure read of who is in the team, the same
+    permission (and the same tenant/location gate, applied inside
+    ``list_team_members`` via ``get_team``) as the detail/summary reads."""
+    members = await service.list_team_members(
+        team_id, requesting_organization_id=requesting_organization_id
+    )
+    items = [
+        GuestTeamMemberWithIdentityResponse(
+            id=str(entry.member.id),
+            team_id=str(entry.member.team_id),
+            guest_id=str(entry.member.guest_id),
+            identifier=entry.identifier,
+            display_name=entry.display_name,
+            joined_at=entry.member.joined_at,
+            is_active=entry.member.is_active,
+        )
+        for entry in members
+    ]
+    payload = GuestTeamMemberListResponse(items=items, total_items=len(items))
+    return build_response(
+        success=True,
+        message="Guest team members retrieved",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )

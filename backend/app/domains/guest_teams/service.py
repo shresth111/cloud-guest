@@ -340,6 +340,21 @@ class GuestTeamSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class TeamMemberWithIdentity:
+    """One active team member paired with the guest's own display identity.
+
+    ``identifier``/``display_name`` come straight off the member's ``Guest``
+    row (via ``GuestTeamRepository.get_guest_identities``) and are ``None``
+    only when that row is gone -- never fabricated. Exists so the "manage a
+    team" screen can list *who* is in a team, which the count-only
+    ``GuestTeamSummary`` cannot answer."""
+
+    member: GuestTeamMember
+    identifier: str | None
+    display_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class SharedQuotaCheckResult:
     team_id: uuid.UUID
     shared_data_limit_mb: int | None
@@ -805,6 +820,41 @@ class GuestTeamService:
             quota_exceeded=quota_exceeded,
         )
 
+    async def list_team_members(
+        self,
+        team_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[TeamMemberWithIdentity]:
+        """The active roster of ``team_id`` -- every current member paired
+        with the guest's own identifier/display name -- which a "remove a
+        member" admin screen needs and the count-only ``get_team_summary``
+        cannot give.
+
+        Authorized exactly like ``get_team_summary``: ``get_team`` runs
+        first and enforces both tenant scope (``_enforce_tenant_scope``) and
+        location scope (``enforce_entity_location``), 404-ing an unknown or
+        other-tenant team before a single member row is read. This method
+        therefore opens no new cross-tenant path -- it is a strict read layered
+        on the same gate the existing detail/summary/quota reads already pass
+        through. Identity enrichment is a single batched lookup (see
+        ``get_guest_identities``), never one query per member."""
+        team = await self.get_team(
+            team_id, requesting_organization_id=requesting_organization_id
+        )
+        members = await self.repository.list_active_members(team.id)
+        identities = await self.repository.get_guest_identities(
+            [member.guest_id for member in members], team.organization_id
+        )
+        return [
+            TeamMemberWithIdentity(
+                member=member,
+                identifier=identities.get(member.guest_id, (None, None))[0],
+                display_name=identities.get(member.guest_id, (None, None))[1],
+            )
+            for member in members
+        ]
+
     async def check_shared_quota(
         self,
         team_id: uuid.UUID,
@@ -920,5 +970,6 @@ __all__ = [
     "GuestTeamMemberRemovalResult",
     "GuestTeamRevocationResult",
     "GuestTeamSummary",
+    "TeamMemberWithIdentity",
     "SharedQuotaCheckResult",
 ]
