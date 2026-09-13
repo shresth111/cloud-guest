@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
+from app.domains.guest.models import Guest
 
 from .constants import GuestTeamStatus
 from .models import GuestTeam, GuestTeamMember
@@ -77,6 +78,10 @@ class GuestTeamRepositoryProtocol(Protocol):
     async def list_active_memberships_for_guest(
         self, guest_id: uuid.UUID
     ) -> list[GuestTeamMember]: ...
+
+    async def get_guest_identities(
+        self, guest_ids: Sequence[uuid.UUID], organization_id: uuid.UUID
+    ) -> dict[uuid.UUID, tuple[str, str | None]]: ...
 
 
 class GuestTeamRepository:
@@ -199,6 +204,42 @@ class GuestTeamRepository:
         return await self.members.get_all(
             filters={"guest_id": guest_id, "is_active": True},
         )
+
+    async def get_guest_identities(
+        self, guest_ids: Sequence[uuid.UUID], organization_id: uuid.UUID
+    ) -> dict[uuid.UUID, tuple[str, str | None]]:
+        """``(identifier, display_name)`` for each of ``guest_ids``, keyed by
+        guest id -- so a member roster can show *who* each member is instead
+        of an opaque uuid.
+
+        A read-only, cross-domain lookup against ``app.domains.guest.models
+        .Guest``, the same posture ``app.domains.monitored_hardware
+        .repository`` takes toward Router/ConnectedDevice: this module owns no
+        guest rows and never writes here. Deliberately NOT routed through the
+        guest domain's own ``GuestRepository.list_guests_by_ids`` (a separate
+        in-flight change owns that helper): a roster needs only these two
+        display columns, so a narrow two-column select kept local to this
+        repository lets the two efforts land independently and be reconciled
+        later, rather than either blocking the other.
+
+        Scoped to ``organization_id`` even though every id passed in is
+        already a member of a team in that org (the service resolves them
+        from ``list_active_members`` of a tenant-scoped team): the extra
+        ``WHERE`` costs nothing and means a guest row from another tenant can
+        never leak an identifier through this path no matter how the caller
+        assembles ``guest_ids`` -- the same path-id/header-org cross-tenant
+        shape this codebase guards against elsewhere. A guest id with no
+        matching row (e.g. hard-deleted) simply gets no entry."""
+        if not guest_ids:
+            return {}
+        statement = select(
+            Guest.id, Guest.identifier, Guest.display_name
+        ).where(
+            Guest.organization_id == organization_id,
+            Guest.id.in_(list(guest_ids)),
+        )
+        result = await self.session.execute(statement)
+        return {row[0]: (row[1], row[2]) for row in result.all()}
 
 
 __all__ = ["GuestTeamRepositoryProtocol", "GuestTeamRepository"]
