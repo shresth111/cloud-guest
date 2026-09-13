@@ -912,6 +912,16 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # CONNECTED indefinitely. See
         # app.domains.network_integration.tasks's own module docstring.
         "network-integration-sync-sweep",
+        # Back-fills guest data-usage bytes for Omada External-Portal venues
+        # from the controller's Open API, on a fixed 5-minute cadence,
+        # feeding the same GuestService.record_usage sink RADIUS accounting
+        # feeds for MikroTik venues. Its absence from this set is not a
+        # missing schedule entry, it is an Omada venue whose "Data Used"
+        # column, bandwidth tiles and FUP data-cap read zero forever while
+        # the controller has the real numbers -- because nothing on the
+        # Omada auth path ever reaches record_usage. See
+        # app.domains.network_integration.usage_tasks's own module docstring.
+        "omada-usage-sync-sweep",
     }
 
 

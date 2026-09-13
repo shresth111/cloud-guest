@@ -82,6 +82,8 @@ __all__ = [
     "MIN_SESSION_DURATION_SECONDS",
     "MIN_SYNC_INTERVAL_SECONDS",
     "NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS",
+    "OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN",
+    "OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS",
     "NetworkProviderKind",
     "PORTAL_READINESS_GAP_LABELS",
     "PortalReadinessGap",
@@ -100,6 +102,7 @@ __all__ = [
     "SYNC_SWEEP_MAX_INTEGRATIONS_PER_RUN",
     "SyncStatus",
     "TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP",
+    "TASK_RUN_OMADA_USAGE_SYNC_SWEEP",
 ]
 
 
@@ -820,6 +823,37 @@ SYNC_SWEEP_MAX_INTEGRATIONS_PER_RUN = 50
 # 288 pointless HTTP timeouts a day. Capped rather than unbounded so a box
 # that comes back is noticed within hours, not never.
 SYNC_BACKOFF_CAP_MULTIPLIER = 32
+
+# ============================================================================
+# Omada guest data-usage back-fill
+# ============================================================================
+
+# A second, independent producer for ``GuestService.record_usage`` -- the
+# one sink that writes ``guest_sessions.bytes_uploaded``/``bytes_downloaded``.
+# RADIUS Interim-Update accounting is the only thing that ever calls it, and
+# an Omada "External Portal Server" venue sends no RADIUS accounting at all,
+# so its guests' data-usage columns, bandwidth tiles and FUP data-quota
+# enforcement stay empty forever. The controller *does* have the numbers over
+# Open API, so this sweep polls them and pushes the delta through the exact
+# same sink RADIUS uses. Open-API only: a ``legacy`` (hotspot-operator)
+# integration cannot read client traffic and is excluded in the SQL.
+# See ``app.domains.network_integration.usage_tasks`` for the full write-up.
+TASK_RUN_OMADA_USAGE_SYNC_SWEEP = (
+    "app.domains.network_integration.usage_tasks.run_omada_usage_sync_sweep"
+)
+
+# A fixed cadence, not a per-row interval: unlike the inventory sync above
+# (whose freshness the customer reads as ``last_sync_at`` and whose cost is a
+# full sites/devices/clients crawl), this is a single cheap clients-list read
+# whose only job is to keep the dashboard's byte counters roughly live and to
+# let a mid-session FUP data cap fire within one cadence. Five minutes matches
+# the inventory sync's own default period and is frequent enough for both.
+OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS = 300.0
+
+# Same bound-per-run rationale as ``SYNC_SWEEP_MAX_INTEGRATIONS_PER_RUN``:
+# one tick must not run unbounded and overlap the next. Ordered by
+# ``last_sync_at`` ascending so the most stale venues go first.
+OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN = 50
 
 # ============================================================================
 # Portal authorize rate limiting

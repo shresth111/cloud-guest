@@ -160,7 +160,9 @@ from app.domains.network_diagnostics.constants import (
 )
 from app.domains.network_integration.constants import (
     NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
+    OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
+    TASK_RUN_OMADA_USAGE_SYNC_SWEEP,
 )
 from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
@@ -233,6 +235,7 @@ celery_app = Celery(
         "app.domains.monitoring.tasks",
         "app.domains.network_diagnostics.tasks",
         "app.domains.network_integration.tasks",
+        "app.domains.network_integration.usage_tasks",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
@@ -323,6 +326,13 @@ celery_app.conf.update(
         # unreachable controller can no longer starve a pure-DB sweep
         # waiting behind it in the shared default queue.
         TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The Omada guest data-usage back-fill sweep issues the same real
+        # outbound HTTPS to a customer-owned controller (one login plus a
+        # clients-list read per venue) as the inventory sync above, so it
+        # belongs on the device-I/O queue for the identical reason: one
+        # unreachable controller must not starve the pure-DB sweeps sharing
+        # the default queue.
+        TASK_RUN_OMADA_USAGE_SYNC_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
@@ -733,6 +743,22 @@ celery_app.conf.update(
         "network-integration-sync-sweep": {
             "task": TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
             "schedule": NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
+        },
+        # Omada guest data-usage back-fill: every
+        # OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS, pull each active Omada
+        # Open-API venue's connected-client traffic totals and push the
+        # monotonic delta into the matching active guest sessions through
+        # GuestService.record_usage -- the same sink RADIUS accounting feeds
+        # for MikroTik venues, which Omada External-Portal venues never
+        # reach. A fixed cadence, not a per-row interval: unlike the
+        # inventory sync above, this is one cheap clients read whose only
+        # job is to keep byte counters roughly live and let a mid-session
+        # FUP data cap fire within one cadence. Routed onto
+        # DEVICE_IO_QUEUE_NAME above -- it does real outbound I/O to
+        # hardware this platform does not own.
+        "omada-usage-sync-sweep": {
+            "task": TASK_RUN_OMADA_USAGE_SYNC_SWEEP,
+            "schedule": OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS,
         },
     },
 )
