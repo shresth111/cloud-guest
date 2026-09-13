@@ -3706,6 +3706,27 @@ class GuestService:
             grouped.setdefault(device.guest_id, []).append(device)
         return grouped
 
+    async def list_guests_by_ids(
+        self,
+        *,
+        guest_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[Guest]:
+        """Resolve guest ids taken from an already-tenant-filtered session
+        list to their :class:`~.models.Guest` rows -- backs
+        ``GuestSessionResponse.guest_identifier``, the identity counterpart
+        of ``list_devices_for_session_ids``'s ``device_mac``.
+
+        Takes no ``MAX_BULK_*`` bound of its own, for the same reason
+        ``list_devices_for_guest_ids`` above documents: the only callers are
+        page-bounded session listings, and the router chunks at
+        ``MAX_BULK_DEVICE_LOOKUP_IDS`` before calling (see
+        ``router._resolve_session_guest_identifiers``), so a second bound
+        here would be an unreachable branch pretending to be a safeguard."""
+        return await self.repository.list_guests_by_ids(
+            guest_ids=guest_ids, organization_id=requesting_organization_id
+        )
+
     async def list_voucher_redemptions(
         self,
         *,
