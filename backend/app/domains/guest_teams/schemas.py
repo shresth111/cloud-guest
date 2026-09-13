@@ -25,6 +25,8 @@ __all__ = [
     "GuestTeamResponse",
     "GuestTeamListResponse",
     "GuestTeamMemberResponse",
+    "GuestTeamMemberWithIdentityResponse",
+    "GuestTeamMemberListResponse",
     "GuestTeamSummaryResponse",
     "GuestTeamDetailResponse",
     "GuestTeamJoinResponse",
@@ -148,6 +150,41 @@ class GuestTeamMemberResponse(BaseModel):
     removal_reason: str | None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class GuestTeamMemberWithIdentityResponse(BaseModel):
+    """One active team member, enriched with the guest's own identifier and
+    display name so an admin managing a roster can tell *who* each member is
+    -- the bare ``GuestTeamMemberResponse`` carries only an opaque
+    ``guest_id``, which is not something a person can act on when deciding
+    whom to remove.
+
+    ``identifier``/``display_name`` are read straight off the ``Guest`` row
+    this membership points at (see ``GuestTeamRepository
+    .get_guest_identities``); neither is ever invented. Both are ``None``
+    only for the edge case of a member whose guest row has since been
+    hard-deleted -- surfaced as an unknown member rather than dropped, so the
+    count still reconciles with the summary's ``member_count``."""
+
+    id: str
+    team_id: str
+    guest_id: str
+    identifier: str | None
+    display_name: str | None
+    joined_at: datetime
+    is_active: bool
+
+
+class GuestTeamMemberListResponse(BaseModel):
+    """The active roster of a single team. Deliberately not paginated: a
+    team's membership is bounded by its own ``max_members`` (and unbounded
+    teams are still a roster a venue manages by hand, not an analytics-scale
+    dataset), so the "who is in this team" management view wants the whole
+    list at once, the same shape ``GET /guest-teams/open`` returns for its
+    own small, bounded list."""
+
+    items: list[GuestTeamMemberWithIdentityResponse]
+    total_items: int
 
 
 class GuestTeamSummaryResponse(BaseModel):

@@ -326,6 +326,13 @@ class _FailingSessionLookupGuestRepository(FakeGuestRepository):
 class FakeGuestTeamRepository:
     teams: dict[uuid.UUID, GuestTeam] = field(default_factory=dict)
     members: dict[uuid.UUID, GuestTeamMember] = field(default_factory=dict)
+    # guest_id -> (organization_id, identifier, display_name), the two
+    # display columns get_guest_identities reads off the Guest table, plus
+    # the owning org so this fake can exercise the real method's own
+    # organization filter.
+    guest_identities: dict[uuid.UUID, tuple[uuid.UUID, str, str | None]] = field(
+        default_factory=dict
+    )
 
     async def create_team(self, **fields: object) -> GuestTeam:
         team = GuestTeam(**_base_fields(**fields))
@@ -424,6 +431,16 @@ class FakeGuestTeamRepository:
         return [
             m for m in self.members.values() if m.team_id == team_id and m.is_active
         ]
+
+    async def get_guest_identities(
+        self, guest_ids: list[uuid.UUID], organization_id: uuid.UUID
+    ) -> dict[uuid.UUID, tuple[str, str | None]]:
+        out: dict[uuid.UUID, tuple[str, str | None]] = {}
+        for guest_id in guest_ids:
+            row = self.guest_identities.get(guest_id)
+            if row is not None and row[0] == organization_id:
+                out[guest_id] = (row[1], row[2])
+        return out
 
 
 # ============================================================================
@@ -1154,6 +1171,97 @@ class TestTeamSummary:
         assert summary.total_bandwidth_bytes == 10 * BYTES_PER_MB
         assert summary.remaining_shared_quota_mb == 90.0
         assert summary.quota_exceeded is False
+
+
+# ============================================================================
+# Team roster (list_team_members): who is in a team, with identity
+# ============================================================================
+
+
+class TestTeamRoster:
+    async def test_lists_active_members_with_identity(self) -> None:
+        service, team_repo, _, _ = _build_service()
+        team, org_id = await _create_active_team(service)
+        a = await service.join_team(
+            team_code=team.team_code, identifier="+15550001111"
+        )
+        b = await service.join_team(
+            team_code=team.team_code, identifier="+15550002222"
+        )
+        team_repo.guest_identities[a.guest_id] = (org_id, "+15550001111", "Ava")
+        team_repo.guest_identities[b.guest_id] = (org_id, "+15550002222", None)
+
+        roster = await service.list_team_members(
+            team.id, requesting_organization_id=org_id
+        )
+        by_guest = {entry.member.guest_id: entry for entry in roster}
+        assert len(roster) == 2
+        assert by_guest[a.guest_id].identifier == "+15550001111"
+        assert by_guest[a.guest_id].display_name == "Ava"
+        assert by_guest[b.guest_id].identifier == "+15550002222"
+        assert by_guest[b.guest_id].display_name is None
+        assert all(entry.member.is_active for entry in roster)
+
+    async def test_excludes_removed_member(self) -> None:
+        service, team_repo, _, _ = _build_service()
+        team, org_id = await _create_active_team(service)
+        stay = await service.join_team(team_code=team.team_code, identifier="stay")
+        go = await service.join_team(team_code=team.team_code, identifier="go")
+        team_repo.guest_identities[stay.guest_id] = (org_id, "stay", None)
+        team_repo.guest_identities[go.guest_id] = (org_id, "go", None)
+        await service.remove_team_member(
+            team_id=team.id,
+            guest_id=go.guest_id,
+            requesting_organization_id=org_id,
+            actor_user_id=uuid.uuid4(),
+            reason=None,
+        )
+
+        roster = await service.list_team_members(
+            team.id, requesting_organization_id=org_id
+        )
+        assert [entry.member.guest_id for entry in roster] == [stay.guest_id]
+
+    async def test_missing_guest_row_yields_none_identity(self) -> None:
+        # A member whose Guest row is gone is surfaced as an unknown member,
+        # never dropped -- so the roster length still matches member_count.
+        service, _, _, _ = _build_service()
+        team, org_id = await _create_active_team(service)
+        joined = await service.join_team(team_code=team.team_code, identifier="ghost")
+
+        roster = await service.list_team_members(
+            team.id, requesting_organization_id=org_id
+        )
+        assert len(roster) == 1
+        assert roster[0].member.guest_id == joined.guest_id
+        assert roster[0].identifier is None
+        assert roster[0].display_name is None
+
+    async def test_rejects_cross_organization_request(self) -> None:
+        service, _, _, _ = _build_service()
+        team, org_id = await _create_active_team(service)
+        other_org_id = uuid.uuid4()
+        assert other_org_id != org_id
+
+        with pytest.raises(CrossOrganizationGuestTeamAccessError):
+            await service.list_team_members(
+                team.id, requesting_organization_id=other_org_id
+            )
+
+    async def test_scopes_identity_lookup_to_team_organization(self) -> None:
+        # Even if a guest id somehow carried another tenant's identity row,
+        # get_guest_identities' organization filter means it never leaks
+        # through as this team's member identity.
+        service, team_repo, _, _ = _build_service()
+        team, org_id = await _create_active_team(service)
+        joined = await service.join_team(team_code=team.team_code, identifier="x")
+        team_repo.guest_identities[joined.guest_id] = (uuid.uuid4(), "leak", "Leak")
+
+        roster = await service.list_team_members(
+            team.id, requesting_organization_id=org_id
+        )
+        assert roster[0].identifier is None
+        assert roster[0].display_name is None
 
 
 # ============================================================================
