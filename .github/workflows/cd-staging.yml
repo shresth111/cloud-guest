@@ -1,0 +1,207 @@
+name: CD Staging
+
+# Continuous deployment of the backend (api + celery-worker + celery-beat) to
+# the staging app server (wyfy-staging-server, i-0a6a08bb87c6f0f84 in ap-south-1).
+
+on:
+  push:
+    branches: [staging]
+    paths:
+      - "backend/**"
+      - "deploy/**"
+      - ".github/workflows/cd-staging.yml"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Commit SHA to deploy to staging (blank = build and deploy this ref)."
+        required: false
+        default: ""
+
+concurrency:
+  group: cd-backend-staging
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required to mint the OIDC token
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: wyfy/api
+  INSTANCE_ID: ${{ vars.AWS_STAGING_INSTANCE_ID }}
+
+jobs:
+  ci:
+    name: CI
+    if: github.event.inputs.image_tag == ''
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build and push to ECR
+    needs: ci
+    if: always() && (needs.ci.result == 'success' || github.event.inputs.image_tag != '')
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.image_tag || github.sha }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image ref
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          SHA="${{ github.event.inputs.image_tag || github.sha }}"
+          echo "image=$REGISTRY/$ECR_REPOSITORY:staging-$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha=staging-$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse the existing image if this SHA is already in ECR
+        id: exists
+        run: |
+          if aws ecr describe-images --region "$AWS_REGION" \
+               --repository-name "$ECR_REPOSITORY" \
+               --image-ids imageTag="${{ steps.meta.outputs.sha }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ steps.meta.outputs.image }} already exists; skipping build."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Buildx
+        if: steps.exists.outputs.found == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.exists.outputs.found == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image imports
+        run: |
+          docker run --rm --entrypoint python "${{ steps.meta.outputs.image }}" \
+            -c "import app.main; print('app.main imported OK')"
+
+  deploy:
+    name: Deploy to staging app server
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.wyfyguest.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check the staging instance is registered with SSM
+        run: |
+          COUNT=$(aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+            --query 'length(InstanceInformationList)' --output text)
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::$INSTANCE_ID is not registered with SSM."
+            exit 1
+          fi
+          aws ssm describe-instance-information --region "$AWS_REGION" \
+            --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+            --query 'InstanceInformationList[0].{Ping:PingStatus,Agent:AgentVersion,Platform:PlatformName}'
+
+      - name: Send deploy command
+        id: send
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          SCRIPT_B64=$(base64 deploy/remote-deploy.sh | tr -d '\n')
+
+          jq -n --arg b64 "$SCRIPT_B64" --arg image "$IMAGE" '{
+            commands: [
+              "set -eu",
+              ("echo \($b64) | base64 -d > /tmp/remote-deploy.sh"),
+              "chmod 0755 /tmp/remote-deploy.sh",
+              ("sudo -u ubuntu -H env AWS_REGION=ap-south-1 DB_BACKUP=0 /tmp/remote-deploy.sh api \($image)"),
+              "rm -f /tmp/remote-deploy.sh"
+            ]
+          }' > params.json
+
+          CMD_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "CD Staging backend ${GITHUB_SHA:0:7}" \
+            --timeout-seconds 600 \
+            --parameters file://params.json \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command: $CMD_ID"
+
+      - name: Wait for the deploy to finish
+        env:
+          CMD_ID: ${{ steps.send.outputs.command_id }}
+        run: |
+          set -uo pipefail
+          sleep 15
+          DEADLINE=$(( SECONDS + 900 ))
+          STATUS=Pending
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            STATUS=$(aws ssm get-command-invocation --region "$AWS_REGION" \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Pending|InProgress|Delayed) sleep 10 ;;
+              *) break ;;
+            esac
+          done
+
+          echo "----- stdout -----"
+          aws ssm get-command-invocation --region "$AWS_REGION" \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text || true
+          echo "----- stderr -----"
+          aws ssm get-command-invocation --region "$AWS_REGION" \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardErrorContent' --output text || true
+
+          echo "----- status: $STATUS -----"
+          [ "$STATUS" = "Success" ] || exit 1
+
+      - name: Verify through the staging endpoint
+        run: |
+          set -euo pipefail
+          echo "Verifying staging API responds on Elastic IP..."
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              "http://13.207.123.212/api/v1/health/live?cb=$(date +%s)" || echo 000)
+            echo "attempt $i: HTTP $CODE"
+            [ "$CODE" = "200" ] && { echo "Staging API verified 200 OK"; exit 0; }
+            sleep 10
+          done
+          echo "::error::13.207.123.212/api/v1/health/live did not return 200 after the deploy."
+          exit 1
