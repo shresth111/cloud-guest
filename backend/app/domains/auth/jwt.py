@@ -41,7 +41,8 @@ class JWTManager:
         settings = get_settings()
         if settings.uses_public_jwt_secret_key() and settings.strict_production_secrets:
             raise JWTError(
-                "Signing tokens with the public default JWT secret is forbidden outside local environment."
+                "Signing tokens with the public default JWT secret is "
+                "forbidden outside local environment."
             )
         return pyjwt.encode(
             payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm

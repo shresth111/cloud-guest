@@ -2,6 +2,7 @@ import pytest
 from cryptography.fernet import Fernet
 
 from app.core.config import Settings
+from app.domains.auth.jwt import JWTError, JWTManager
 
 
 def test_settings_defaults_are_valid() -> None:
@@ -124,9 +125,6 @@ class TestStrictProductionSecrets:
     def test_jwt_encode_refused_under_strict_production_secrets(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import pytest
-        from app.domains.auth.jwt import JWTError, JWTManager
-
         settings = Settings(environment="production", strict_production_secrets=True)
         assert settings.uses_public_jwt_secret_key()
         monkeypatch.setattr("app.domains.auth.jwt.get_settings", lambda: settings)
