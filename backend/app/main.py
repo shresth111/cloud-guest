@@ -42,6 +42,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "environment": app_settings.environment,
                 },
             )
+        if app_settings.strict_production_secrets:
+            app_settings.validate_no_public_secrets()
         # WARNING, not CRITICAL: unlike a public default key this exposes
         # nothing, it just means an alert copy nobody asked for out loud is
         # not being sent. Logged for the same reason as the block above --
@@ -61,15 +63,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             extra={"service": app_settings.service_name},
         )
 
+    docs_url = "/docs" if app_settings.is_docs_enabled else None
+    redoc_url = "/redoc" if app_settings.is_docs_enabled else None
+    openapi_url = "/openapi.json" if app_settings.is_docs_enabled else None
+
     app = FastAPI(
         title="CloudGuest Backend",
         description=(
             "CloudGuest modular monolith API for managed MikroTik networking."
         ),
         version="0.1.0",
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        openapi_url=openapi_url,
         lifespan=lifespan,
     )
     app.state.settings = app_settings

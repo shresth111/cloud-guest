@@ -39,6 +39,10 @@ class JWTManager:
     def encode(payload: dict[str, Any]) -> str:
         """Low-level: sign an arbitrary claims dict with the configured secret/alg."""
         settings = get_settings()
+        if settings.uses_public_jwt_secret_key() and settings.strict_production_secrets:
+            raise JWTError(
+                "Signing tokens with the public default JWT secret is forbidden outside local environment."
+            )
         return pyjwt.encode(
             payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm
         )

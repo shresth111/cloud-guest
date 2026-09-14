@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     debug: bool = False
     service_name: str = "cloudguest-backend"
     api_v1_prefix: str = "/api/v1"
+    enable_api_docs: bool | None = Field(
+        default=None,
+        description=(
+            "Whether Swagger UI (/docs), ReDoc (/redoc), and OpenAPI schema "
+            "(/openapi.json) are mounted. In local and test environments, "
+            "defaults to True. In non-local environments (production, staging), "
+            "defaults to False to prevent unauthorized schema reconnaissance. "
+            "Can be explicitly overridden via CLOUDGUEST_ENABLE_API_DOCS."
+        ),
+    )
     allowed_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:3000",
@@ -109,6 +119,14 @@ class Settings(BaseSettings):
         ),
     )
     jwt_algorithm: str = Field(default="HS256")
+    strict_production_secrets: bool = Field(
+        default=False,
+        description=(
+            "When True outside a local developer environment, refuses "
+            "application startup if any secret in PUBLIC_DEFAULT_SECRET_FIELDS remains "
+            "at its public default value."
+        ),
+    )
     access_token_expire_minutes: int = Field(default=15, ge=1, le=1440)
     refresh_token_expire_days: int = Field(default=7, ge=1, le=90)
     max_login_attempts: int = Field(default=5, ge=1, le=100)
@@ -1828,6 +1846,16 @@ class Settings(BaseSettings):
     def is_local_environment(self) -> bool:
         return self.environment.strip().lower() in LOCAL_ENVIRONMENTS
 
+    @property
+    def is_docs_enabled(self) -> bool:
+        """API docs (Swagger, ReDoc, OpenAPI schema) are mounted in local/test
+        environments by default, and disabled in non-local environments unless
+        explicitly enabled via CLOUDGUEST_ENABLE_API_DOCS=true."""
+        if self.enable_api_docs is not None:
+            return self.enable_api_docs
+        return self.is_local_environment
+
+
     def secrets_at_public_default(self) -> list[str]:
         """Env var names of every secret still at its committed default,
         in a non-local environment. Empty on a developer machine.
@@ -1889,6 +1917,28 @@ class Settings(BaseSettings):
             and self.network_integration_encryption_key
             == INSECURE_LOCAL_DEV_FERNET_KEY
         )
+
+    def uses_public_jwt_secret_key(self) -> bool:
+        """True when JWTs would be signed under the public default key
+        outside a developer machine."""
+        return (
+            not self.is_local_environment
+            and self.jwt_secret_key
+            == type(self).model_fields["jwt_secret_key"].default
+        )
+
+    def validate_no_public_secrets(self) -> None:
+        """Raise ValueError if any secret is at public default in a non-local
+        environment. Used when strict_production_secrets is enabled."""
+        if self.is_local_environment:
+            return
+        defaulted = self.secrets_at_public_default()
+        if defaulted:
+            raise ValueError(
+                f"Refusing to run in '{self.environment}' environment with secrets at "
+                f"public default: {', '.join(defaulted)}"
+            )
+
 
 
 @lru_cache
