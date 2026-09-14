@@ -120,7 +120,7 @@ async def test_create_location_also_provisions_a_captive_portal_config() -> None
     assert call["otp_sms_enabled"] is False
     assert call["otp_whatsapp_enabled"] is False
     assert call["voucher_enabled"] is False
-    assert call["username_password_enabled"] is False
+    assert call["username_password_enabled"] is True
     assert call["social_login_enabled"] is False
     # See the router's own comment: this must be None, not the endpoint's
     # `requesting_organization_id`, or an MSP parent creating a location

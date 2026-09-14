@@ -92,27 +92,27 @@ async def _register_guest_with_password(fx: Fixture) -> None:
     )
 
 
-class TestNewLocationsDoNotGetPasswordLogin:
-    """Part 1 -- the three independent defaults, asserted together."""
+class TestNewLocationsGetPasswordLoginByDefault:
+    """The default baseline: password login / account creation is enabled by default."""
 
-    def test_create_schema_defaults_password_login_off(self) -> None:
+    def test_create_schema_defaults_password_login_on(self) -> None:
         payload = CaptivePortalConfigCreateRequest(
             organization_id=uuid.uuid4(),
             name="Sunset Cafe guest wifi",
         )
-        assert payload.username_password_enabled is False
+        assert payload.username_password_enabled is True
 
-    def test_provisioning_defaults_password_login_off(self) -> None:
+    def test_provisioning_defaults_password_login_on(self) -> None:
         """``_LoginMethods``'s own default, which is what a freshly
         provisioned location actually gets -- a separate code path from
-        the schema above, and historically a separate always-on default."""
+        the schema above."""
         methods = _LoginMethods(
             otp_sms_enabled=True,
             otp_email_enabled=True,
             voucher_enabled=True,
             social_login_enabled=False,
         )
-        assert methods.username_password_enabled is False
+        assert methods.username_password_enabled is True
 
     def test_the_two_defaults_agree(self) -> None:
         """The actual invariant. Either default alone being ``False`` is

@@ -252,15 +252,9 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     # started as. Defaults to FALSE as of 2026-09-07: password sign-in is
     # being retired from the guest portal, so a config created now must not
     # be handed it as a baseline. Mirrors
-    # app.domains.location.provisioning_service._resolve_login_methods's
-    # identical default for a newly provisioned location -- the two must
-    # agree or the disagreement presents as a race. Existing rows are
-    # deliberately not migrated and the endpoint deliberately stays in
-    # place behind the flag; see CaptivePortalConfig's module docstring
-    # ("Retiring password sign-in") for the whole rollout, including the
-    # guest-facing cost. An admin can still explicitly turn it on per
-    # location via CaptivePortalConfigUpdateRequest.
-    username_password_enabled: bool = Field(default=False)
+    # Real, working login-method gate: defaults ON so guests can create an
+    # account / save a password on first login and sign in with password later.
+    username_password_enabled: bool = Field(default=True)
     pin_login_enabled: bool = Field(
         default=False,
         description=(

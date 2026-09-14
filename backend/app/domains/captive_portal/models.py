@@ -540,13 +540,10 @@ class CaptivePortalConfig(BaseModel):
     )
     voucher_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Real, working login-method gate -- see module docstring. Defaults
-    # OFF as of 2026-09-07: password sign-in is being retired from the
-    # guest portal, so a newly provisioned location must not be handed it
-    # as a baseline. Existing rows are deliberately NOT migrated -- see
-    # the module docstring's "Retiring password sign-in" note for the
-    # rollout, and for why the endpoint stays in place behind this flag.
+    # ON: guests can create an account / save a password on first login
+    # (via OTP SMS, Email, etc.) and use password login on subsequent visits.
     username_password_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False
+        Boolean, default=True, nullable=False
     )
     # Real, working login-method gate for Portal PIN
     # (app.domains.guest.service.GuestService.login_via_pin /

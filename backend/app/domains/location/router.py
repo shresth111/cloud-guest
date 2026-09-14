@@ -282,7 +282,7 @@ async def create_location(
         otp_email_enabled=True,
         otp_whatsapp_enabled=False,
         voucher_enabled=False,
-        username_password_enabled=False,
+        username_password_enabled=True,
         social_login_enabled=False,
         social_login_providers=[],
     )
