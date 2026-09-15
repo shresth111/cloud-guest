@@ -35,6 +35,8 @@ from fastapi import APIRouter, Depends, status
 
 from app.domains.guest.dependencies import get_guest_repository
 from app.domains.guest.repository import GuestRepositoryProtocol
+from app.domains.guest_access.dependencies import get_access_decision_service
+from app.domains.guest_access.service import GuestAccessService, is_blocklisted
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
 from app.domains.mac_authorization.dependencies import (
@@ -236,10 +238,11 @@ async def agent_authorized_macs(
     mac_authorization_service: MacAuthorizationService = Depends(
         get_mac_authorization_service
     ),
+    access_decision_service: GuestAccessService = Depends(get_access_decision_service),
 ) -> AuthorizedMacsResponse:
     """Every MAC this router should let straight through: guests with a
-    currently ``ACTIVE`` session, **and** the devices an admin marked
-    Trusted.
+    currently ``ACTIVE`` session that no ``BLOCKLIST`` rule now covers,
+    **and** the devices an admin marked Trusted.
 
     The agent's heartbeat script polls this and applies a local
     ``/ip hotspot ip-binding type=bypassed`` for each MAC returned. This
@@ -281,8 +284,24 @@ async def agent_authorized_macs(
         if session.device_id is None:
             continue
         device = await guest_repository.get_device_by_id(session.device_id)
-        if device is not None:
-            macs.append(device.mac_address)
+        if device is None:
+            continue
+        # A guest blocked after they were admitted keeps an ``ACTIVE`` row
+        # whenever the device-side removal failed (see
+        # ``guest_access.enforcement``). Returning their MAC here kept a
+        # ``type=bypassed`` binding on the router -- internet with no
+        # login and no expiry. Leaving it out makes the agent's own
+        # reconciliation withdraw that binding on its next poll.
+        guest = await guest_repository.get_guest_by_id(session.guest_id)
+        if await is_blocklisted(
+            access_decision_service,
+            organization_id=session.organization_id,
+            location_id=session.location_id,
+            identifier=guest.identifier if guest is not None else None,
+            mac_address=device.mac_address,
+        ):
+            continue
+        macs.append(device.mac_address)
 
     # Scoped by the service against this router's own organization and
     # location; the agent identity is the router, so there is no caller
