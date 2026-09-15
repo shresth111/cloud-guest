@@ -134,6 +134,60 @@ class RoleInactiveError(RBACError):
         )
 
 
+class RoleInUseError(RBACError):
+    """A role still held by staff cannot be deleted.
+
+    Refused rather than cascaded: soft-deleting the role would leave every
+    holder's ``user_roles`` row pointing at a deleted role (still resolving
+    its permissions, but invisible in Staff Access), and silently revoking
+    those rows would lock staff out without their owner choosing to. The
+    caller reassigns them first, which is a decision only the owner can make.
+    """
+
+    def __init__(self, role_name: str, holder_count: int) -> None:
+        staff = "staff member" if holder_count == 1 else "staff members"
+        super().__init__(
+            f"Role '{role_name}' is still assigned to {holder_count} {staff}. "
+            "Reassign them to another role first, then delete it.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class OwnerRoleProtectedError(RBACError):
+    """The Organization Owner role cannot be edited or deleted from inside an
+    organization.
+
+    It is the one role every organization is guaranteed to keep a holder of
+    (``LastOrganizationOwnerError``), which is what makes it the recovery path
+    for every other role: an owner who edits a custom role until it can no
+    longer manage Staff Access can still fix it, because this role still can.
+    Letting the owner role itself be customized or hidden would remove that
+    guarantee.
+    """
+
+    def __init__(self, role_name: str, action: str) -> None:
+        super().__init__(
+            f"'{role_name}' cannot be {action}: it is the role that keeps your "
+            "organization able to manage staff access.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class SharedRoleImmutableError(RBACError):
+    """A role shared by every organization (``organization_id IS NULL``)
+    cannot be mutated in place from inside one organization -- the change
+    would apply to every other organization too."""
+
+    def __init__(self, role_name: str, action: str) -> None:
+        super().__init__(
+            f"'{role_name}' is a built-in role shared by every organization and "
+            f"cannot be {action} from here. Edit it to create your "
+            "organization's own copy, or delete it to remove it from your "
+            "organization.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class LastOrganizationOwnerError(RBACError):
     """An organization must always retain at least one active
     ``organization-owner`` role holder -- revoking (or, via the assign-then-
