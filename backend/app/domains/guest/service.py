@@ -419,7 +419,7 @@ from .validators import (
     is_fup_usage_exceeded,
     is_quota_exceeded,
     is_session_presence_judgeable,
-    is_session_timed_out,
+    is_session_stale,
     is_weak_pin,
     normalize_identifier,
     normalize_mac_address,
@@ -578,12 +578,20 @@ async def enforce_session_timeouts(
     See the module docstring's "a reporting mechanism, not live
     enforcement" write-up for what this sweep does and does not do. Returns
     every session just flipped to ``EXPIRED``.
+
+    This sweep is the only thing that ends a session whose NAS never sends
+    an Accounting-Stop (an Omada guest, a lost Stop, a router that rebooted
+    without Accounting-On), and every "online" surface -- the dashboard's
+    "Online right now", the Users table, Live Sessions -- reads
+    ``status == active``. So the rule it applies is what decides how long a
+    departed guest keeps showing as online: see
+    ``validators.is_session_stale``.
     """
     now = datetime.now(UTC)
     candidates = await repository.list_timed_out_sessions(now=now)
     expired: list[GuestSession] = []
     for session in candidates:
-        if not is_session_timed_out(session, now=now):
+        if not is_session_stale(session, now=now):
             continue  # defensive re-check against the SQL-level filter
         updated = await repository.update_session(
             session,

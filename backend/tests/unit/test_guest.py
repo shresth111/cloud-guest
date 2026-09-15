@@ -38,6 +38,7 @@ from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest.constants import (
     BYTES_PER_MB,
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
@@ -46,6 +47,7 @@ from app.domains.guest.constants import (
     PIN_MAX_ATTEMPTS,
     PIN_STALE_AFTER_DAYS,
     RECONNECT_GRACE_MINUTES,
+    SESSION_ACTIVITY_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     WHITELIST_ONLY_LOGIN_FAILURE_REASON,
@@ -118,7 +120,9 @@ from app.domains.guest.validators import (
     is_device_limit_reached,
     is_fup_usage_exceeded,
     is_quota_exceeded,
+    is_session_stale,
     is_session_timed_out,
+    session_idle_cutoff_minutes,
     validate_nas_status_transition,
 )
 from app.domains.guest_access.constants import (
@@ -1189,8 +1193,7 @@ class FakeGuestRepository:
             s
             for s in self.sessions.values()
             if s.status == GuestSessionStatus.ACTIVE.value
-            and s.session_timeout_minutes is not None
-            and is_session_timed_out(s, now=now)
+            and is_session_stale(s, now=now)
         ]
 
     async def list_active_sessions_for_guest(
@@ -4615,7 +4618,8 @@ class TestTimeoutAndQuota:
         )
         session = result.session
         session.session_timeout_minutes = 5
-        session.last_activity_at = _now() - timedelta(minutes=10)
+        # Past the 5-minute limit *and* SESSION_ACTIVITY_GRACE_MINUTES.
+        session.last_activity_at = _now() - timedelta(minutes=20)
 
         expired = await fx.guest_service.enforce_timeouts()
         assert len(expired) == 1
@@ -4636,6 +4640,153 @@ class TestTimeoutAndQuota:
         result.session.session_timeout_minutes = 240
         expired = await fx.guest_service.enforce_timeouts()
         assert expired == []
+
+    async def _sweep_candidate(
+        self,
+        fx,
+        identifier: str,
+        *,
+        idle_timeout_minutes: int | None,
+        session_timeout_minutes: int | None,
+        idle_for: int,
+        open_for: int | None = None,
+    ) -> GuestSession:
+        result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        session = result.session
+        session.idle_timeout_minutes = idle_timeout_minutes
+        session.session_timeout_minutes = session_timeout_minutes
+        now = _now()
+        session.started_at = now - timedelta(minutes=open_for or idle_for)
+        session.last_activity_at = now - timedelta(minutes=idle_for)
+        return session
+
+    async def test_sweep_uses_idle_timeout_not_session_length(self) -> None:
+        """Production 2026-09-15: an Omada guest (idle 30, session 240) with
+        no accounting stayed "online" 242 minutes after their last activity,
+        because the sweep measured idleness against the 240-minute session
+        length. The idle timeout is the number that answers "how long may a
+        guest pass no traffic"."""
+        fx = make_fixture()
+        gone = await self._sweep_candidate(
+            fx,
+            "+15552220001",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=240,
+            idle_for=45,
+        )
+        expired = await fx.guest_service.enforce_timeouts()
+        assert [s.id for s in expired] == [gone.id]
+        assert gone.status == GuestSessionStatus.EXPIRED.value
+        assert gone.ended_at is not None
+        assert gone.disconnect_reason == "inactivity_timeout"
+
+    async def test_sweep_leaves_guest_inside_idle_timeout_plus_grace(self) -> None:
+        fx = make_fixture()
+        session = await self._sweep_candidate(
+            fx,
+            "+15552220002",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=240,
+            idle_for=35,
+        )
+        assert await fx.guest_service.enforce_timeouts() == []
+        assert session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_short_idle_timeout_does_not_expire_between_interim_updates(
+        self,
+    ) -> None:
+        """Interim-Updates arrive every 300s, so a busy guest at a venue
+        with a 5-minute idle timeout routinely looks 5-6 minutes idle when
+        the sweep runs. The grace must absorb that."""
+        fx = make_fixture()
+        session = await self._sweep_candidate(
+            fx,
+            "+15552220003",
+            idle_timeout_minutes=5,
+            session_timeout_minutes=30,
+            idle_for=6,
+        )
+        assert await fx.guest_service.enforce_timeouts() == []
+        assert session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_session_with_no_recorded_timeouts_is_not_exempt(self) -> None:
+        """A row with neither timeout used to be treated as unbounded and
+        stayed ACTIVE forever (one on production has shown online for 22
+        days). It now falls back to DEFAULT_IDLE_TIMEOUT_MINUTES."""
+        fx = make_fixture()
+        idle = await self._sweep_candidate(
+            fx,
+            "+15552220004",
+            idle_timeout_minutes=None,
+            session_timeout_minutes=None,
+            idle_for=DEFAULT_IDLE_TIMEOUT_MINUTES + SESSION_ACTIVITY_GRACE_MINUTES + 1,
+        )
+        expired = await fx.guest_service.enforce_timeouts()
+        assert [s.id for s in expired] == [idle.id]
+
+    async def test_sweep_expires_session_past_its_time_limit_without_a_stop(
+        self,
+    ) -> None:
+        """The router ends a session at Session-Timeout and reports a Stop.
+        If that Stop is lost, the row must not stay online just because its
+        last activity is recent."""
+        fx = make_fixture()
+        overrun = await self._sweep_candidate(
+            fx,
+            "+15552220005",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=30,
+            idle_for=2,
+            open_for=30 + SESSION_ACTIVITY_GRACE_MINUTES + 1,
+        )
+        inside = await self._sweep_candidate(
+            fx,
+            "+15552220006",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=30,
+            idle_for=2,
+            open_for=35,
+        )
+        expired = await fx.guest_service.enforce_timeouts()
+        assert [s.id for s in expired] == [overrun.id]
+        assert inside.status == GuestSessionStatus.ACTIVE.value
+
+    def test_idle_cutoff_prefers_the_smaller_recorded_timeout(self) -> None:
+        now = _now()
+        session = GuestSession(
+            **_base_fields(
+                guest_id=uuid.uuid4(),
+                device_id=None,
+                router_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                auth_method="otp_sms",
+                voucher_id=None,
+                status="active",
+                started_at=now,
+                ended_at=None,
+                last_activity_at=now,
+                ip_address=None,
+                bytes_uploaded=0,
+                bytes_downloaded=0,
+                data_limit_mb=None,
+                session_timeout_minutes=240,
+                idle_timeout_minutes=30,
+                disconnect_reason=None,
+            )
+        )
+        assert session_idle_cutoff_minutes(session) == 30
+        session.idle_timeout_minutes = None
+        assert session_idle_cutoff_minutes(session) == 240
+        session.session_timeout_minutes = None
+        assert session_idle_cutoff_minutes(session) == DEFAULT_IDLE_TIMEOUT_MINUTES
 
     async def test_record_usage_expires_session_on_quota_breach(self) -> None:
         fx = make_fixture()
@@ -8533,7 +8684,7 @@ class TestSessionTimeoutSweep:
             router_id=fx.router.id,
         )
         result.session.session_timeout_minutes = 5
-        result.session.last_activity_at = _now() - timedelta(minutes=10)
+        result.session.last_activity_at = _now() - timedelta(minutes=20)
 
         expired = await enforce_session_timeouts(fx.repository)
         assert len(expired) == 1
