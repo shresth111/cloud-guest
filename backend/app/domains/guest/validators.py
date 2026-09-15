@@ -15,9 +15,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .constants import (
     BYTES_PER_MB,
     DASHBOARD_SERIES_BUCKET_SECONDS,
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
     GUEST_SESSION_STATUS_TRANSITIONS,
     MAX_DASHBOARD_SERIES_WINDOW_DAYS,
     NAS_STATUS_TRANSITIONS,
+    SESSION_ACTIVITY_GRACE_MINUTES,
     DashboardSeriesBucket,
     GuestSessionStatus,
     NasStatus,
@@ -122,17 +124,72 @@ def validate_nas_status_transition(*, current: NasStatus, target: NasStatus) -> 
         raise InvalidNasStatusTransitionError(current.value, target.value)
 
 
+def session_idle_cutoff_minutes(session: GuestSession) -> int:
+    """How many minutes without reported activity a session may sit before
+    the stale-session sweep stops believing it is online (grace excluded).
+
+    The venue's **idle** timeout is the number that answers "how long can a
+    guest pass no traffic", so it wins. This used to read
+    ``session_timeout_minutes`` -- the absolute session length, 240 minutes
+    by default -- which is why a guest who walked away kept showing as
+    online for four hours: measured on production 2026-09-15, every
+    ``inactivity_timeout`` expiry in the preceding week landed 240-244
+    minutes after the session's last activity, including real Omada guests
+    whose idle timeout was 30.
+
+    ``session_timeout_minutes`` stays as a ceiling (a session cannot be
+    "idle but still online" for longer than it may exist at all), and
+    ``DEFAULT_IDLE_TIMEOUT_MINUTES`` covers a row with neither recorded, so
+    no ACTIVE row is ever exempt from the sweep. Previously such a row was
+    treated as unbounded and stayed online forever."""
+    recorded = [
+        minutes
+        for minutes in (session.idle_timeout_minutes, session.session_timeout_minutes)
+        if minutes is not None
+    ]
+    return min(recorded) if recorded else DEFAULT_IDLE_TIMEOUT_MINUTES
+
+
 def is_session_timed_out(session: GuestSession, *, now: datetime) -> bool:
-    """Whether ``session`` has been inactive longer than its own
-    ``session_timeout_minutes`` -- a pure, in-memory check used both by
-    ``GuestService.enforce_timeouts`` (after the repository's own SQL-level
-    filter already narrowed candidates) and directly by tests. Returns
-    ``False`` when no timeout was ever recorded for this session (an
-    unbounded session)."""
+    """Whether ``session`` has gone longer without reported activity than
+    its idle cutoff (``session_idle_cutoff_minutes``) plus
+    ``SESSION_ACTIVITY_GRACE_MINUTES`` -- a pure, in-memory check used both
+    by ``enforce_session_timeouts`` (after the repository's own SQL-level
+    filter already narrowed candidates) and directly by tests. The SQL in
+    ``GuestRepository.list_timed_out_sessions`` must express the same
+    rule."""
+    elapsed_minutes = (now - session.last_activity_at).total_seconds() / 60
+    return elapsed_minutes >= (
+        session_idle_cutoff_minutes(session) + SESSION_ACTIVITY_GRACE_MINUTES
+    )
+
+
+def has_session_overrun_time_limit(session: GuestSession, *, now: datetime) -> bool:
+    """Whether ``session`` is past its absolute ``session_timeout_minutes``
+    (measured from ``started_at``, like ``has_session_reached_time_limit``)
+    by more than ``SESSION_ACTIVITY_GRACE_MINUTES``.
+
+    The router enforces that limit itself from the Access-Accept's
+    ``Session-Timeout`` and reports an Accounting-Stop. When the Stop never
+    arrives, a guest the router has already logged out keeps an ACTIVE row
+    that a busy interim stream or reuse path would otherwise keep fresh.
+    The grace keeps the platform strictly behind the router, so this never
+    ends a session the NAS still considers live. ``False`` when no
+    session timeout was recorded."""
     if session.session_timeout_minutes is None:
         return False
-    elapsed_minutes = (now - session.last_activity_at).total_seconds() / 60
-    return elapsed_minutes >= session.session_timeout_minutes
+    elapsed_minutes = (now - session.started_at).total_seconds() / 60
+    return elapsed_minutes >= (
+        session.session_timeout_minutes + SESSION_ACTIVITY_GRACE_MINUTES
+    )
+
+
+def is_session_stale(session: GuestSession, *, now: datetime) -> bool:
+    """The stale-session sweep's single predicate: idle past its cutoff, or
+    past its absolute time limit (both with grace)."""
+    return is_session_timed_out(session, now=now) or has_session_overrun_time_limit(
+        session, now=now
+    )
 
 
 def has_session_reached_time_limit(session: GuestSession, *, now: datetime) -> bool:
@@ -478,11 +535,14 @@ __all__ = [
     "is_weak_pin",
     "validate_session_status_transition",
     "validate_nas_status_transition",
+    "session_idle_cutoff_minutes",
     "is_session_timed_out",
     "parse_routeros_duration_seconds",
     "hotspot_is_serving",
     "present_macs_from_hotspot_hosts",
     "is_session_presence_judgeable",
+    "has_session_overrun_time_limit",
+    "is_session_stale",
     "is_quota_exceeded",
     "validate_date_range",
     "is_concurrent_session_limit_reached",

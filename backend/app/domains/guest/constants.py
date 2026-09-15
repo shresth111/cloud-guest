@@ -404,6 +404,23 @@ DASHBOARD_OS_NAMES: tuple[str, ...] = (
 # long idle) rather than merely a reporting staleness window.
 SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS = 300.0
 
+# Slack the stale-session sweep adds on top of a session's own idle / time
+# limit before it flips an ``ACTIVE`` row to ``EXPIRED``.
+#
+# ``last_activity_at`` only moves when an accounting producer reports in:
+# RADIUS Interim-Update every 300s (``Acct-Interim-Interval`` in the
+# Authorize reply) or the Omada usage sync every 300s. A guest who is
+# genuinely browsing can therefore look up to one full interval "idle" at
+# the moment the sweep runs. Without slack, a venue with a 5-minute idle
+# timeout would have its busy guests expired between two interim updates.
+# Two intervals tolerates one late or dropped update while still clearing a
+# session whose NAS has gone silent (lost Accounting-Stop, router rebooted
+# without Accounting-On, no accounting at all) within minutes rather than
+# hours. The router's own idle/session timers are unaffected -- they fire
+# first and report an Accounting-Stop; this only matters when that report
+# never arrives.
+SESSION_ACTIVITY_GRACE_MINUTES = 10
+
 # ============================================================================
 # Session presence reconciliation -- closes ``ACTIVE`` sessions whose device
 # is no longer on the router at all. See ``service

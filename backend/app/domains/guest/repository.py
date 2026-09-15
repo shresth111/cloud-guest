@@ -24,6 +24,7 @@ from typing import Protocol
 from sqlalchemy import (
     DateTime,
     Integer,
+    and_,
     case,
     cast,
     func,
@@ -43,7 +44,11 @@ from app.domains.organization.models import Organization
 from app.domains.router.fleet_scope import agent_managed_only
 from app.domains.router.models import Router
 
-from .constants import GuestSessionStatus
+from .constants import (
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
+    SESSION_ACTIVITY_GRACE_MINUTES,
+    GuestSessionStatus,
+)
 from .models import (
     Guest,
     GuestConsent,
@@ -1077,20 +1082,49 @@ class GuestRepository:
         return result.scalars().first()
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
-        """Active sessions whose ``last_activity_at`` plus their own
-        ``session_timeout_minutes`` has already passed ``now`` -- a
-        per-row-varying comparison ``GenericRepository``'s equality-filter
-        support cannot express, hence hand-written here. Uses Postgres's
-        ``make_interval`` so the comparison happens entirely server-side
-        (real SQL, not a Python-side scan) regardless of how many active
-        sessions exist."""
+        """Active sessions ``validators.is_session_stale`` would expire, as
+        one server-side query (real SQL, not a Python-side scan):
+
+        * no reported activity for longer than the idle cutoff -- the
+          smaller of ``idle_timeout_minutes``/``session_timeout_minutes``
+          (Postgres ``LEAST`` ignores NULLs), else
+          ``DEFAULT_IDLE_TIMEOUT_MINUTES`` -- plus the grace; or
+        * open longer than ``session_timeout_minutes`` plus the grace.
+
+        A per-row-varying comparison ``GenericRepository``'s equality-filter
+        support cannot express, hence hand-written here. Keep it in lockstep
+        with ``validators.session_idle_cutoff_minutes``."""
+        idle_cutoff = func.coalesce(
+            func.least(
+                GuestSession.idle_timeout_minutes,
+                GuestSession.session_timeout_minutes,
+            ),
+            DEFAULT_IDLE_TIMEOUT_MINUTES,
+        )
+        idle_expired = (
+            GuestSession.last_activity_at
+            + func.make_interval(
+                0, 0, 0, 0, 0, idle_cutoff + SESSION_ACTIVITY_GRACE_MINUTES
+            )
+            < now
+        )
+        time_limit_overrun = and_(
+            GuestSession.session_timeout_minutes.isnot(None),
+            GuestSession.started_at
+            + func.make_interval(
+                0,
+                0,
+                0,
+                0,
+                0,
+                GuestSession.session_timeout_minutes + SESSION_ACTIVITY_GRACE_MINUTES,
+            )
+            < now,
+        )
         statement = select(GuestSession).where(
             GuestSession.status == GuestSessionStatus.ACTIVE.value,
-            GuestSession.session_timeout_minutes.isnot(None),
             GuestSession.is_deleted.is_(False),
-            GuestSession.last_activity_at
-            + func.make_interval(0, 0, 0, 0, 0, GuestSession.session_timeout_minutes)
-            < now,
+            or_(idle_expired, time_limit_overrun),
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
