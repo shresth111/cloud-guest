@@ -42,9 +42,15 @@ forwarding -- the same class of lie as the original bug.
 
 The outcome is recorded on the rule
 (``enforcement_status``/``enforcement_error``/``enforced_at``/
-``sessions_ended``, mirroring ``Vlan.device_push_*``) and, when the device
-cannot be made to agree, raised as a typed non-2xx rather than returned as
-a success envelope. The block itself is committed *first*, so a guest
+``sessions_ended``, mirroring ``Vlan.device_push_*``). When the device
+cannot be made to agree, the *create* still answers with the created rule
+carrying ``enforcement_status="failed"`` (the rule exists -- a 5xx made the
+dashboard re-submit it), while the retry endpoint raises a typed non-2xx.
+Independently of the device, ``is_blocklisted`` is consulted by every path
+that keeps an already-admitted guest online (RADIUS re-Authorize, the
+agent bypass list, the portal's "already connected" check), so a failed
+device removal no longer leaves those paths re-admitting the guest. The
+block itself is committed *first*, so a guest
 whose live session could not be cut is still barred from signing in again
 and an operator can retry the device half alone -- ``enforce_guest_rule``,
 the same "retry the push without re-submitting the form" separation
@@ -197,6 +203,88 @@ class AccessDecision:
         ``matched_rule_id`` says another.
         """
         return not self.allowed and self.rule_type is None
+
+    @property
+    def is_blocklist_denial(self) -> bool:
+        """Whether an operator's ``BLOCKLIST`` rule refused this guest --
+        the only refusal that must also withdraw access a guest *already
+        holds* (a live session, a bypass binding), as opposed to
+        whitelist-only mode, which only ever gates a new sign-in."""
+        return not self.allowed and self.rule_type is AccessRuleType.BLOCKLIST
+
+
+class AccessCheckProtocol(Protocol):
+    """The one method ``is_blocklisted`` needs -- satisfied by
+    ``GuestAccessService`` itself and by every test double of it."""
+
+    async def check_access(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        identifier: str | None,
+        mac_address: str | None,
+        whitelist_only_enabled: bool = False,
+    ) -> AccessDecision: ...
+
+
+#: Prefix of the synthetic identity ``login_via_mac_whitelist`` gives a
+#: device that signed in by MAC alone. It is not a phone number or email
+#: address, so no identifier-keyed rule can name it; its MAC is checked
+#: instead.
+_MAC_IDENTITY_PREFIX = "mac:"
+
+
+async def is_blocklisted(
+    access: AccessCheckProtocol,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+    identifier: str | None,
+    mac_address: str | None,
+) -> bool:
+    """Is a guest who is *already* admitted now barred by a ``BLOCKLIST``
+    rule, for their identifier or their device's MAC, at this location?
+
+    The login gate (``GuestService._enforce_access_control``) only runs
+    when a guest signs in. Everything that keeps an already-admitted guest
+    online -- a RADIUS re-Authorize that finds their ``ACTIVE`` session,
+    the ``/agent/authorized-macs`` bypass list, the portal's "you are
+    already connected" check -- read session status and nothing else, so a
+    block whose device-side session removal failed left every one of them
+    still saying yes. This is the question those paths now ask.
+
+    **Fails open, loudly.** These paths run for every connected guest on
+    every poll; a rule lookup that raises must not turn a database blip
+    into every guest at a venue losing their bypass binding at once. A
+    failure degrades to the behaviour before this check existed, with a
+    WARNING saying when.
+    """
+    if identifier is not None and identifier.startswith(_MAC_IDENTITY_PREFIX):
+        identifier = None
+    if identifier is None and mac_address is None:
+        return False
+    try:
+        decision = await access.check_access(
+            organization_id=organization_id,
+            requesting_organization_id=organization_id,
+            location_id=location_id,
+            identifier=identifier,
+            mac_address=mac_address,
+            whitelist_only_enabled=False,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: fail open
+        logger.warning(
+            "guest_access_live_block_check_failed",
+            extra={
+                "event_organization_id": str(organization_id),
+                "event_location_id": str(location_id),
+                "error": repr(exc),
+            },
+        )
+        return False
+    return decision.is_blocklist_denial
 
 
 _DEFAULT_ALLOW = AccessDecision(
@@ -457,6 +545,7 @@ class BlockEnforcerProtocol(Protocol):
         identifier: str,
         reason: str | None,
         actor_user_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
     ) -> BlockEnforcementReport: ...
 
 
@@ -555,7 +644,23 @@ class GuestAccessService:
         # can always deliver; it should not be forfeited because a router
         # was unreachable.
         await self.repository.commit()
-        return await self._enforce_block(rule, actor_user_id=actor_user_id)
+        try:
+            return await self._enforce_block(rule, actor_user_id=actor_user_id)
+        except Exception:  # noqa: BLE001 -- recorded on the rule, see below
+            # The rule exists and is committed, and ``_enforce_block`` has
+            # already recorded ``FAILED`` plus the error on it. Answering
+            # this *create* with a 5xx told the dashboard the block had not
+            # been saved: it showed "Could not block", left the row out of
+            # the list, and the owner submitted the same number again --
+            # in production, four rules for one guest in about a minute,
+            # three of them then deleted by hand. The resource was created,
+            # so the response is the resource, carrying
+            # ``enforcement_status="failed"``, which the dashboard's
+            # ``blockOutcomeMessage`` already turns into "blocked, but we
+            # could not take them off the WiFi". The retry endpoint
+            # (``enforce_guest_rule``) still raises: it creates nothing,
+            # and its only result is the device operation.
+            return rule
 
     def _initial_enforcement_status(
         self, rule_type: AccessRuleType
@@ -644,6 +749,7 @@ class GuestAccessService:
                 identifier=rule.identifier,
                 reason=rule.reason,
                 actor_user_id=actor_user_id,
+                location_id=rule.location_id,
             )
         except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
             await self.repository.update_guest_rule(

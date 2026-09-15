@@ -106,7 +106,20 @@ def get_guest_access_service(
     )
 
 
+def get_access_decision_service(
+    repository: GuestAccessRepositoryProtocol = Depends(get_guest_access_repository),
+) -> GuestAccessService:
+    """A ``GuestAccessService`` for callers that only *ask* whether a rule
+    applies (``check_access``) and never write one -- the router agent's
+    ``/agent/authorized-macs`` poll. No enforcer, no audit writer, no
+    caller location scope: the caller is a router, not a user, and this
+    path must not open a router connection or pull in the whole
+    ``RouterService`` graph on a once-a-minute, per-router request."""
+    return GuestAccessService(repository, block_enforcer=None)
+
+
 __all__ = [
+    "get_access_decision_service",
     "get_block_enforcer",
     "get_guest_access_repository",
     "get_guest_access_service",

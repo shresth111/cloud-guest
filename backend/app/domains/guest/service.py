@@ -260,7 +260,7 @@ from app.domains.guest_access.exceptions import (
     GuestAccessDeniedError,
     WhitelistOnlyAccessDeniedError,
 )
-from app.domains.guest_access.service import AccessDecision
+from app.domains.guest_access.service import AccessDecision, is_blocklisted
 from app.domains.location.models import Location
 from app.domains.mac_authorization.exceptions import MacAuthorizationError
 from app.domains.mac_authorization.validators import (
@@ -4097,6 +4097,13 @@ class GuestService:
         guest = await self.repository.get_guest_by_id(session.guest_id)
         if guest is None:
             return None
+        # A blocked guest is not "already connected": answering yes sends
+        # them to the "You're online" screen and skips the sign-in step,
+        # which is the one place the refusal is shown.
+        if await self.is_session_blocklisted(
+            session, guest=guest, mac_address=device.mac_address
+        ):
+            return None
         return GuestLoginResult(
             guest=guest, session=session, device=device, is_new_guest=False
         )
@@ -5049,6 +5056,44 @@ class GuestService:
                     },
                 )
             raise GuestBlockedError(guest.blocked_reason)
+
+    async def is_session_blocklisted(
+        self,
+        session: GuestSession,
+        *,
+        guest: Guest | None = None,
+        mac_address: str | None = None,
+    ) -> bool:
+        """Has a ``BLOCKLIST`` rule been written, since this session was
+        admitted, for its guest's identifier or its device's MAC at its
+        location?
+
+        ``_enforce_access_control`` answers that once, at sign-in. The
+        paths that keep a guest online afterwards -- RADIUS re-Authorize,
+        ``/agent/authorized-macs``, ``get_active_session_for_device`` --
+        only ever read ``session.status``, and a block whose device-side
+        removal failed leaves the status ``ACTIVE`` on purpose (see
+        ``guest_access.enforcement``). Without this check each of those
+        paths kept re-admitting a guest the operator had blocked.
+
+        ``guest``/``mac_address`` are optional so a caller that already
+        holds them does not pay a second lookup. No hook wired means no
+        rules to consult, exactly as at sign-in; a lookup failure is
+        fail-open (``guest_access.service.is_blocklisted``)."""
+        if self.access_control_hook is None:
+            return False
+        if guest is None:
+            guest = await self.repository.get_guest_by_id(session.guest_id)
+        if mac_address is None and session.device_id is not None:
+            device = await self.repository.get_device_by_id(session.device_id)
+            mac_address = device.mac_address if device is not None else None
+        return await is_blocklisted(
+            self.access_control_hook,
+            organization_id=session.organization_id,
+            location_id=session.location_id,
+            identifier=guest.identifier if guest is not None else None,
+            mac_address=mac_address,
+        )
 
     async def _enforce_access_control(
         self,
@@ -7068,6 +7113,20 @@ class RadiusService:
         ):
             logger.info(
                 "radius_authorize_session_past_time_limit",
+                extra={**decision_extra, "event_session_id": str(session.id)},
+            )
+            session = None
+        # A BLOCKLIST rule written after this session was admitted. The
+        # device-side removal in ``guest_access.enforcement`` can fail (a
+        # router that refuses the stored API credentials, an unreachable
+        # tunnel) and then deliberately leaves the row ``ACTIVE`` -- which,
+        # without this check, made every later Authorize for the blocked
+        # guest an Accept.
+        if session is not None and await self.guest_service.is_session_blocklisted(
+            session, mac_address=calling_station_id
+        ):
+            logger.info(
+                "radius_authorize_session_blocklisted",
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
             session = None

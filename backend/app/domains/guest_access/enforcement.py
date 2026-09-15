@@ -113,7 +113,7 @@ class BlockedDeviceRow(Protocol):
 
 
 class LiveSessionRow(Protocol):
-    """The three fields this module reads off a live session row.
+    """The four fields this module reads off a live session row.
 
     Deliberately not ``app.domains.guest.models.GuestSession``: naming the
     concrete model here would couple two domains through their ORM
@@ -123,6 +123,7 @@ class LiveSessionRow(Protocol):
 
     id: uuid.UUID
     router_id: uuid.UUID
+    location_id: uuid.UUID
     device_id: uuid.UUID | None
 
 
@@ -250,6 +251,7 @@ class BlocklistEnforcer:
         identifier: str,
         reason: str | None,
         actor_user_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
     ) -> BlockEnforcementReport:
         """Cuts ``identifier`` off, on the device and in this platform's
         records, and reports honestly on both.
@@ -288,6 +290,13 @@ class BlocklistEnforcer:
             return _NOTHING_TO_DO
 
         sessions = await self.session_lookup.list_active_sessions_for_guest(guest.id)
+        if location_id is not None:
+            # A rule written for one venue governs that venue only --
+            # ``repository.list_matching_guest_rules`` applies it at
+            # ``location_id`` or nowhere. Ending the same guest's session at
+            # a sibling venue the rule does not cover would be enforcing a
+            # block the login gate itself would not honour there.
+            sessions = [s for s in sessions if s.location_id == location_id]
         if not sessions:
             return _NOTHING_TO_DO
 
