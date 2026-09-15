@@ -841,6 +841,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "billing-subscription-renewal-sweep",
         "billing-invoice-overdue-sweep",
         "guest-session-timeout-sweep",
+        # Its absence is a guest who left hours ago still listed as
+        # connected: a guest admitted by an authorized-MAC bypass sends no
+        # RADIUS accounting, so nothing else ever notices they have gone.
+        "guest-session-presence-sweep",
         "provisioning-engine-drain-queue",
         "queue-management-sweep-schedule-transitions",
         "guest-fup-time-accrual-sweep",

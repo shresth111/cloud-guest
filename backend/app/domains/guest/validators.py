@@ -7,6 +7,8 @@ or transition" checks the service layer calls before touching the database.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -174,6 +176,109 @@ def has_session_reached_time_limit(session: GuestSession, *, now: datetime) -> b
     return elapsed_minutes >= session.session_timeout_minutes
 
 
+_ROUTEROS_DURATION_TOKEN = re.compile(r"(\d+)(w|d|h|ms|us|s|m)")
+_ROUTEROS_DURATION_UNIT_SECONDS: dict[str, float] = {
+    "w": 7 * 86400,
+    "d": 86400,
+    "h": 3600,
+    "m": 60,
+    "s": 1,
+    "ms": 0.001,
+    "us": 0.000001,
+}
+_ROUTEROS_CLOCK_DURATION = re.compile(r"^(?:(\d+)d)?(\d+):(\d{2}):(\d{2})$")
+
+
+def parse_routeros_duration_seconds(value: object) -> float | None:
+    """A RouterOS API duration (``"1w2d3h4m5s"``, ``"5m32s"``, ``"250ms"``,
+    or the older ``"00:05:32"`` clock form) in seconds -- ``None`` for an
+    absent, empty or unparseable value, so a caller can tell "RouterOS did
+    not say" apart from "RouterOS said zero".
+
+    Its own parser rather than ``isp.device_adapters``'s: that one has no
+    ``w`` unit, and a hotspot host that has been silent for over a week is
+    exactly the row this is used to catch."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    clock = _ROUTEROS_CLOCK_DURATION.match(text)
+    if clock is not None:
+        days, hours, minutes, seconds = clock.groups()
+        return (
+            int(days or 0) * 86400
+            + int(hours) * 3600
+            + int(minutes) * 60
+            + int(seconds)
+        )
+    tokens = _ROUTEROS_DURATION_TOKEN.findall(text)
+    if not tokens or "".join(a + u for a, u in tokens) != text:
+        return None
+    return sum(
+        int(amount) * _ROUTEROS_DURATION_UNIT_SECONDS[unit] for amount, unit in tokens
+    )
+
+
+def _routeros_flag(value: object) -> bool:
+    """librouteros hands ``true``/``false`` back as real booleans, but a
+    reply that went through any other path may carry the strings."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "yes"}
+
+
+def hotspot_is_serving(server_rows: Sequence[Mapping[str, object]]) -> bool:
+    """Whether at least one ``/ip/hotspot`` server on the router is enabled.
+
+    The presence sweep's precondition, and the reason it is one: an empty
+    ``/ip/hotspot/host`` table means "nobody is here" only on a router that
+    is actually running a hotspot. On a router whose hotspot is disabled or
+    was never configured it means nothing at all, and reading it as
+    "everyone has left" would close every session on that router."""
+    return any(not _routeros_flag(row.get("disabled", False)) for row in server_rows)
+
+
+def present_macs_from_hotspot_hosts(
+    host_rows: Sequence[Mapping[str, object]], *, dead_after_seconds: float
+) -> frozenset[str]:
+    """The normalized MACs RouterOS currently considers on the network,
+    from its ``/ip/hotspot/host`` table.
+
+    That table is the one list on the device that holds *every* host behind
+    the hotspot, whichever way it got through: an authenticated login
+    (``authorized=true``), an ``ip-binding type=bypassed`` row
+    (``bypassed=true`` -- how this fleet actually admits guests), or a
+    device still sitting on the portal. ``/ip/hotspot/active`` holds only
+    the first, so it would report every bypassed guest as gone.
+
+    A row whose ``host-dead-time`` has reached ``dead_after_seconds`` is
+    left out -- see ``constants.SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS``.
+    A row with no parseable ``host-dead-time`` counts as present: when in
+    doubt, the guest is still here."""
+    present: set[str] = set()
+    for row in host_rows:
+        mac = row.get("mac-address")
+        if not mac:
+            continue
+        dead_for = parse_routeros_duration_seconds(row.get("host-dead-time"))
+        if dead_for is not None and dead_for >= dead_after_seconds:
+            continue
+        present.add(normalize_mac_address(str(mac)))
+    return frozenset(present)
+
+
+def is_session_presence_judgeable(
+    session: GuestSession, *, now: datetime, grace_minutes: int
+) -> bool:
+    """Whether ``session`` is old enough for the presence sweep to close it
+    on the router's say-so -- both its ``started_at`` and its
+    ``last_activity_at`` must be at least ``grace_minutes`` in the past. See
+    ``constants.SESSION_PRESENCE_GRACE_MINUTES``."""
+    cutoff = now - timedelta(minutes=grace_minutes)
+    return session.started_at <= cutoff and session.last_activity_at <= cutoff
+
+
 def is_quota_exceeded(session: GuestSession) -> bool:
     """Whether ``session``'s cumulative ``bytes_uploaded +
     bytes_downloaded`` has reached or exceeded its own ``data_limit_mb`` --
@@ -305,6 +410,10 @@ __all__ = [
     "validate_session_status_transition",
     "validate_nas_status_transition",
     "is_session_timed_out",
+    "parse_routeros_duration_seconds",
+    "hotspot_is_serving",
+    "present_macs_from_hotspot_hosts",
+    "is_session_presence_judgeable",
     "is_quota_exceeded",
     "validate_date_range",
     "is_concurrent_session_limit_reached",

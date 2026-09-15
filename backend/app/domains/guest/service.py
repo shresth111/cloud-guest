@@ -300,6 +300,8 @@ from .constants import (
     PIN_MAX_ATTEMPTS,
     PIN_STALE_AFTER_DAYS,
     RECONNECT_GRACE_MINUTES,
+    SESSION_PRESENCE_DISCONNECT_REASON,
+    SESSION_PRESENCE_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     WHITELIST_ONLY_LOGIN_FAILURE_REASON,
@@ -410,6 +412,7 @@ from .validators import (
     is_device_limit_reached,
     is_fup_usage_exceeded,
     is_quota_exceeded,
+    is_session_presence_judgeable,
     is_session_timed_out,
     is_weak_pin,
     normalize_identifier,
@@ -630,6 +633,109 @@ async def close_sessions_for_nas_restart(
         )
         event = GuestSessionDisconnected(session_id=updated.id, reason=reason)
         logger.info("guest_session_closed_nas_restart", extra=_event_extra(event))
+        closed.append(updated)
+    return closed
+
+
+async def reconcile_sessions_with_router_presence(
+    repository: GuestRepositoryProtocol,
+    *,
+    router_id: uuid.UUID,
+    present_macs: frozenset[str],
+    now: datetime | None = None,
+    grace_minutes: int = SESSION_PRESENCE_GRACE_MINUTES,
+) -> list[GuestSession]:
+    """Closes every ``ACTIVE`` session on ``router_id`` whose device the
+    router itself no longer has on the network.
+
+    ## The incident
+
+    A venue reported a guest who had left still showing as connected. The
+    session had ``bytes_uploaded = bytes_downloaded = 0`` and a
+    ``last_activity_at`` 49 seconds after ``started_at`` (a portal re-POST
+    reusing the row, not accounting), and was still ``ACTIVE`` 2h45m later,
+    while the router's own device list was empty.
+
+    Every exit this platform had for an ``ACTIVE`` session depends on the
+    router saying something:
+
+    * **RADIUS Accounting-Stop** (``RadiusService.accounting_stop``) is sent
+      only for an ``/ip hotspot active`` session. This fleet admits guests
+      through ``GET /agent/authorized-macs`` instead, which the router's
+      ``cloudguest-authmac-sched`` turns into ``/ip hotspot ip-binding
+      type=bypassed`` rows. A bypassed host is by definition never a hotspot
+      session, so it produces no Accounting-Start, no Interim-Update and no
+      Stop -- which is also why the bytes stayed at 0 and
+      ``last_activity_at`` never moved.
+    * **The idle sweep** (``enforce_session_timeouts``) measures silence
+      against ``last_activity_at``, which only accounting refreshes. For a
+      bypassed guest that makes it an absolute ``session_timeout_minutes``
+      limit -- 240 minutes at this venue -- during which the row is
+      reported as connected whether the guest is there or not.
+    * **Accounting-On/Off** only fires on a NAS reboot.
+
+    And the stale row sustains itself: ``/agent/authorized-macs`` returns
+    the MAC of every ``ACTIVE`` session, so the router keeps the bypass for
+    a device that has gone, and would let it straight back in on return.
+
+    ## What this does instead
+
+    Asks the router. ``present_macs`` is the device's own
+    ``/ip/hotspot/host`` table (see
+    ``validators.present_macs_from_hotspot_hosts`` for why that table and
+    not ``/ip/hotspot/active``), read by ``tasks
+    .reconcile_router_session_presence``. A session whose device MAC is not
+    in it is flipped to ``DISCONNECTED`` with
+    ``SESSION_PRESENCE_DISCONNECT_REASON``. On the router's next one-minute
+    authorized-MAC poll the MAC is no longer returned and its bypass is
+    removed, so the fix reaches the device without this platform writing to
+    it.
+
+    ## What it refuses to judge
+
+    * A session with no device (no MAC to look for).
+    * A session younger than ``grace_minutes`` -- see
+      ``constants.SESSION_PRESENCE_GRACE_MINUTES``.
+    * Anything at all when the caller could not read the router. That is
+      the caller's contract rather than a check here: a read that failed
+      must never become an empty ``present_macs``, or an unreachable router
+      would disconnect every guest on it. The task skips the call entirely.
+
+    No CoA Disconnect-Request is sent, for the same reason
+    ``close_sessions_for_nas_restart`` sends none: the router has just told
+    us the host is not there, so there is no live session to cut.
+
+    Returns every session just closed."""
+    now = now or datetime.now(UTC)
+    sessions = await repository.list_active_sessions_for_router(router_id)
+    closed: list[GuestSession] = []
+    for session in sessions:
+        if session.device_id is None:
+            continue
+        if not is_session_presence_judgeable(
+            session, now=now, grace_minutes=grace_minutes
+        ):
+            continue
+        device = await repository.get_device_by_id(session.device_id)
+        if device is None:
+            continue
+        if normalize_mac_address(device.mac_address) in present_macs:
+            continue
+        updated = await repository.update_session(
+            session,
+            {
+                "status": GuestSessionStatus.DISCONNECTED.value,
+                "ended_at": now,
+                "disconnect_reason": SESSION_PRESENCE_DISCONNECT_REASON,
+            },
+        )
+        event = GuestSessionDisconnected(
+            session_id=updated.id, reason=SESSION_PRESENCE_DISCONNECT_REASON
+        )
+        logger.info(
+            "guest_session_closed_device_left_network",
+            extra={**_event_extra(event), "router_id": str(router_id)},
+        )
         closed.append(updated)
     return closed
 
