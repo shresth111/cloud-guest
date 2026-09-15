@@ -153,6 +153,13 @@ class RBACRepositoryProtocol(Protocol):
         exclude_assignment_id: uuid.UUID | None = None,
     ) -> int: ...
 
+    async def reassign_role_assignments_in_organization(
+        self,
+        from_role_id: uuid.UUID,
+        to_role_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> list[uuid.UUID]: ...
+
     # -- permission overrides ------------------------------------------------
     async def get_active_overrides_for_user(
         self, user_id: uuid.UUID, *, now: datetime | None = None
@@ -517,6 +524,29 @@ class RBACRepository:
             statement = statement.where(UserRole.id != exclude_assignment_id)
         result = await self.session.execute(statement)
         return int(result.scalar_one())
+
+    async def reassign_role_assignments_in_organization(
+        self,
+        from_role_id: uuid.UUID,
+        to_role_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> list[uuid.UUID]:
+        """Repoint one organization's active assignments of a role at another
+        role, returning the affected user ids (for cache invalidation).
+
+        Scoped by ``UserRole.organization_id`` -- the same predicate
+        ``count_active_role_assignments_in_organization`` uses -- so a shared
+        role's assignments in every *other* organization are untouched."""
+        statement = select(UserRole).where(
+            UserRole.role_id == from_role_id,
+            UserRole.organization_id == organization_id,
+            UserRole.is_active.is_(True),
+            UserRole.is_deleted.is_(False),
+        )
+        rows = list((await self.session.execute(statement)).scalars().all())
+        for row in rows:
+            await self.user_roles.update(row, {"role_id": to_role_id})
+        return list({row.user_id for row in rows})
 
     # -- permission overrides ------------------------------------------------
 
