@@ -248,12 +248,44 @@ def run_monitored_hardware_liveness_sweep() -> dict[str, int]:
     return result
 
 
+#: Deletes the lock only if it still holds this run's own token. A plain
+#: ``DEL`` in ``finally`` would be wrong in the one case that matters: a run
+#: that outlived the TTL would delete the *next* run's lock and let a third
+#: overlap it.
+_RELEASE_LOCK_IF_OWNER_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
 async def _run_monitored_hardware_liveness_sweep_async() -> dict[str, int]:
+    """Acquire the overlap lock, run one liveness pass, release the lock.
+
+    ## The release is not optional
+
+    This lock used to have no release at all -- the TTL was the only way it
+    ever cleared. With a 120s TTL on a 30s Beat cadence, a pass that took
+    well under a second still held the key for two full minutes, so the
+    next three ticks all logged ``skipped_locked`` and the sweep really ran
+    once every ~150s instead of every 30s. Measured on production
+    2026-09-15: 8 of 34 consecutive ticks ran, 26 were skipped, and
+    ``redis MONITOR`` showed only the one worker ever issuing ``SET NX``
+    and nothing ever issuing a ``DEL``. The docstring on the task above
+    promised "identical crash-safety semantics to the discovery sweep's
+    coordinator lock"; that lock *does* release in ``finally``, and this
+    one had been copied without it.
+
+    The TTL stays as the crash-safety backstop (a worker killed mid-pass
+    never reaches ``finally``). The release is token-guarded: see
+    ``_RELEASE_LOCK_IF_OWNER_LUA``."""
     redis = create_redis_client()
+    token = uuid.uuid4().hex
     try:
         acquired = await redis.set(
             MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY,
-            "1",
+            token,
             nx=True,
             ex=MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS,
         )
@@ -272,27 +304,35 @@ async def _run_monitored_hardware_liveness_sweep_async() -> dict[str, int]:
             }
         try:
             async with SessionLocal() as session:
-                repository = ConnectedDeviceRepository(session)
-                router_service = _build_router_service(session)
-                summary: MonitoredHardwareLivenessSummary = (
-                    await run_monitored_hardware_liveness_sweep_core(
-                        repository,
-                        router_service,
-                        device_adapter_resolver=get_connected_device_adapter,
+                try:
+                    repository = ConnectedDeviceRepository(session)
+                    router_service = _build_router_service(session)
+                    summary: MonitoredHardwareLivenessSummary = (
+                        await run_monitored_hardware_liveness_sweep_core(
+                            repository,
+                            router_service,
+                            device_adapter_resolver=get_connected_device_adapter,
+                        )
                     )
-                )
-                await session.commit()
-                return {
-                    "routers_probed": summary.routers_probed,
-                    "routers_failed": summary.routers_failed,
-                    "devices_up": summary.devices_up,
-                    "devices_down": summary.devices_down,
-                    "skipped": summary.skipped,
-                    "skipped_locked": False,
-                }
-        except Exception:
-            await session.rollback()
-            raise
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+            return {
+                "routers_probed": summary.routers_probed,
+                "routers_failed": summary.routers_failed,
+                "devices_up": summary.devices_up,
+                "devices_down": summary.devices_down,
+                "skipped": summary.skipped,
+                "skipped_locked": False,
+            }
+        finally:
+            await redis.eval(
+                _RELEASE_LOCK_IF_OWNER_LUA,
+                1,
+                MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY,
+                token,
+            )
     finally:
         await redis.aclose()
 

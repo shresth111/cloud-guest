@@ -48,6 +48,12 @@ class MonitoredHardwareResponse(BaseModel):
     # cannot. Null for "down"/"unknown"/never-observed rows -- never
     # fabricated from ``last_seen_at``.
     connected_at: datetime | None
+    # Why a non-"up" status has no trustworthy observation behind it --
+    # e.g. "router_auth_failed" when the venue router rejects the stored
+    # RouterOS login, so "unknown" must not be read as "never seen". Null
+    # for "up" rows and whenever the router was read fine. See
+    # ``constants.ObservationIssue`` for every value.
+    observation_issue: str | None = None
     created_at: datetime
 
 

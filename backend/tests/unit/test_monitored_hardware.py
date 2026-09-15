@@ -17,10 +17,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
-from app.domains.connected_devices.models import ConnectedDevice
+from app.domains.connected_devices.models import ConnectedDevice, RouterDeviceSyncState
 from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.location.models import Location
-from app.domains.monitored_hardware.constants import HardwareStatus
+from app.domains.monitored_hardware.constants import HardwareStatus, ObservationIssue
 from app.domains.monitored_hardware.exceptions import (
     DuplicateMonitoredHardwareError,
     InvalidMacAddressError,
@@ -28,7 +28,10 @@ from app.domains.monitored_hardware.exceptions import (
 )
 from app.domains.monitored_hardware.models import MonitoredHardware
 from app.domains.monitored_hardware.router import router as monitored_hardware_router
-from app.domains.monitored_hardware.service import MonitoredHardwareService
+from app.domains.monitored_hardware.service import (
+    MonitoredHardwareService,
+    derive_observation_issue,
+)
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
@@ -204,6 +207,20 @@ class FakeMonitoredHardwareRepository:
             if cd.location_id == location_id and cd.mac_address == mac_address:
                 return cd
         return None
+
+    #: Routers (with their latest discovery outcome) per location.
+    location_routers: list[tuple[Router, RouterDeviceSyncState | None]] = field(
+        default_factory=list
+    )
+    router_lookups: int = 0
+
+    async def list_location_routers_with_sync_state(
+        self, location_id: uuid.UUID
+    ) -> list[tuple[Router, RouterDeviceSyncState | None]]:
+        self.router_lookups += 1
+        return [
+            (r, st) for r, st in self.location_routers if r.location_id == location_id
+        ]
 
 
 @dataclass
@@ -582,6 +599,242 @@ class TestDerivedStatus:
         statuses = {item.device.id: item.status for item in items}
         assert statuses[up_device.id] == HardwareStatus.UP
         assert statuses[unknown_device.id] == HardwareStatus.UNKNOWN
+
+
+# ============================================================================
+# Observation issue -- why a device that is not UP has no trustworthy
+# observation. Founder report 2026-09-15: "Added access point ... status
+# shows 'Never observed' even though it is working." The venue router was
+# rejecting the stored RouterOS login, so discovery could never record the
+# AP; "unknown" was telling the owner their working hardware was missing.
+# ============================================================================
+
+
+def _sync_state(
+    router: Router,
+    *,
+    error_code: str | None,
+    attempted_at: datetime | None = None,
+) -> RouterDeviceSyncState:
+    at = attempted_at or _now()
+    return RouterDeviceSyncState(
+        router_id=router.id,
+        last_attempt_at=at,
+        last_success_at=at if error_code is None else None,
+        last_failure_at=None if error_code is None else at,
+        last_error_code=error_code,
+        consecutive_failures=0 if error_code is None else 1,
+    )
+
+
+def _device_at(location_id: uuid.UUID, *, router_id: uuid.UUID | None = None):
+    return MonitoredHardware(
+        **_base_fields(
+            organization_id=uuid.uuid4(),
+            location_id=location_id,
+            router_id=router_id,
+            name="AP",
+            mac_address="AA:BB:CC:DD:EE:01",
+            device_type="Access Point",
+            floor=None,
+        )
+    )
+
+
+class TestDeriveObservationIssue:
+    def test_up_never_has_an_issue(self) -> None:
+        location_id = uuid.uuid4()
+        router = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id),
+            HardwareStatus.UP,
+            [(router, _sync_state(router, error_code="auth_failed"))],
+        )
+        assert issue is None
+
+    def test_rejected_router_login_is_reported_not_never_observed(self) -> None:
+        location_id = uuid.uuid4()
+        router = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id),
+            HardwareStatus.UNKNOWN,
+            [(router, _sync_state(router, error_code="auth_failed"))],
+        )
+        assert issue == ObservationIssue.ROUTER_AUTH_FAILED
+
+    def test_down_behind_an_unreadable_router_says_so(self) -> None:
+        """A stale sighting derives DOWN; when the reason nothing refreshed
+        it is that the router cannot be read, that is the thing to say."""
+        location_id = uuid.uuid4()
+        router = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id),
+            HardwareStatus.DOWN,
+            [(router, _sync_state(router, error_code="unreachable"))],
+        )
+        assert issue == ObservationIssue.ROUTER_UNREACHABLE
+
+    def test_successful_read_means_genuinely_not_seen(self) -> None:
+        location_id = uuid.uuid4()
+        router = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id),
+            HardwareStatus.UNKNOWN,
+            [(router, _sync_state(router, error_code=None))],
+        )
+        assert issue == ObservationIssue.NOT_SEEN_BY_ROUTER
+
+    def test_successful_read_leaves_a_down_verdict_alone(self) -> None:
+        location_id = uuid.uuid4()
+        router = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id),
+            HardwareStatus.DOWN,
+            [(router, _sync_state(router, error_code=None))],
+        )
+        assert issue is None
+
+    def test_no_sync_recorded_yet(self) -> None:
+        location_id = uuid.uuid4()
+        router = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id), HardwareStatus.UNKNOWN, [(router, None)]
+        )
+        assert issue == ObservationIssue.ROUTER_NOT_SYNCED_YET
+
+    def test_no_router_at_location(self) -> None:
+        issue = derive_observation_issue(
+            _device_at(uuid.uuid4()), HardwareStatus.UNKNOWN, []
+        )
+        assert issue == ObservationIssue.NO_ROUTER
+
+    def test_controller_managed_venue(self) -> None:
+        location_id = uuid.uuid4()
+        controller = _make_router(location_id=location_id)
+        controller.vendor = "tplink_omada"
+        issue = derive_observation_issue(
+            _device_at(location_id), HardwareStatus.UNKNOWN, [(controller, None)]
+        )
+        assert issue == ObservationIssue.CONTROLLER_MANAGED
+
+    def test_null_router_id_is_judged_by_every_router_at_the_location(self) -> None:
+        """``router_id`` is optional at registration (the prod row that
+        prompted this has it NULL). Discovery files a sighting under
+        whichever router saw the MAC, so the location's routers decide."""
+        location_id = uuid.uuid4()
+        failing = _make_router(location_id=location_id)
+        healthy = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id, router_id=None),
+            HardwareStatus.UNKNOWN,
+            [
+                (failing, _sync_state(failing, error_code="auth_failed")),
+                (healthy, _sync_state(healthy, error_code=None)),
+            ],
+        )
+        assert issue == ObservationIssue.NOT_SEEN_BY_ROUTER
+
+    def test_pinned_router_is_judged_alone(self) -> None:
+        location_id = uuid.uuid4()
+        pinned = _make_router(location_id=location_id)
+        other = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id, router_id=pinned.id),
+            HardwareStatus.UNKNOWN,
+            [
+                (pinned, _sync_state(pinned, error_code="auth_failed")),
+                (other, _sync_state(other, error_code=None)),
+            ],
+        )
+        assert issue == ObservationIssue.ROUTER_AUTH_FAILED
+
+    def test_most_recent_failure_wins_across_failing_routers(self) -> None:
+        location_id = uuid.uuid4()
+        older = _make_router(location_id=location_id)
+        newer = _make_router(location_id=location_id)
+        issue = derive_observation_issue(
+            _device_at(location_id),
+            HardwareStatus.UNKNOWN,
+            [
+                (
+                    older,
+                    _sync_state(
+                        older,
+                        error_code="unreachable",
+                        attempted_at=_now() - timedelta(hours=1),
+                    ),
+                ),
+                (newer, _sync_state(newer, error_code="auth_failed")),
+            ],
+        )
+        assert issue == ObservationIssue.ROUTER_AUTH_FAILED
+
+
+class TestObservationIssueThroughTheService:
+    async def test_with_status_carries_the_router_auth_failure(self) -> None:
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        router = _make_router(
+            organization_id=location.organization_id, location_id=location.id
+        )
+        h.repository.location_routers.append(
+            (router, _sync_state(router, error_code="auth_failed"))
+        )
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:21")
+
+        item = await h.service.with_status(device)
+
+        assert item.status == HardwareStatus.UNKNOWN
+        assert item.observation_issue == ObservationIssue.ROUTER_AUTH_FAILED
+
+    async def test_up_device_skips_the_router_lookup(self) -> None:
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:22")
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                mac_address=device.mac_address,
+                is_active=True,
+            )
+        )
+
+        item = await h.service.with_status(device)
+
+        assert item.observation_issue is None
+        assert h.repository.router_lookups == 0
+
+    async def test_list_looks_routers_up_once_per_location(self) -> None:
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        for i in range(3):
+            await _register_device(h, location, mac_address=f"aa:bb:cc:dd:ee:3{i}")
+
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=location.organization_id, page=1, page_size=25
+        )
+
+        issues = {item.observation_issue for item in items}
+        assert issues == {ObservationIssue.NO_ROUTER}
+        assert h.repository.router_lookups == 1
+
+    def test_response_serialises_the_issue(self) -> None:
+        from app.domains.monitored_hardware.router import _device_response
+        from app.domains.monitored_hardware.service import HardwareWithStatus
+
+        device = _device_at(uuid.uuid4())
+        device.created_at = _now()
+        response = _device_response(
+            HardwareWithStatus(
+                device=device,
+                status=HardwareStatus.UNKNOWN,
+                last_seen_at=None,
+                connected_at=None,
+                observation_issue=ObservationIssue.ROUTER_AUTH_FAILED,
+            )
+        )
+        assert response.observation_issue == "router_auth_failed"
 
 
 # ============================================================================

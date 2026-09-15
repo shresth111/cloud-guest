@@ -159,6 +159,17 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- monitored_hardware ---------------------------------------------------
+    "app/domains/monitored_hardware/repository.py::"
+    "MonitoredHardwareRepository.list_location_routers_with_sync_state": (
+        "Explains why a registered device has no observation. It must see "
+        "a controller-managed row to answer 'this venue's devices come from "
+        "its controller' instead of 'there is no router here' -- narrowing "
+        "it would turn an Omada venue into the second, false answer. "
+        "Nothing is dispatched from it: `derive_observation_issue` "
+        "filters with `is_agent_managed` before judging any row by its "
+        "RouterOS sync outcome."
+    ),
     # -- dashboard ----------------------------------------------------------
     "app/domains/dashboard/repository.py::DashboardFleetRepository.count_routers": (
         "The denominator next to `count_agent_managed_routers` above, and "
