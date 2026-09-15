@@ -412,3 +412,167 @@ class TestMonitoredHardwareLivenessSweep:
         assert summary.skipped == 1
         assert adapter.ping_calls == []
         assert repository.update_log == []
+
+
+# ============================================================================
+# The sweep's overlap lock must be released when a pass ends
+# ============================================================================
+
+
+class _LockRedis:
+    """Just enough of ``redis.asyncio.Redis`` for the lock: ``SET NX EX``,
+    the owner-checked release script, and ``aclose``. Expiry is driven by
+    the test (``expire_now``), not by a clock."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.set_calls = 0
+
+    async def set(self, key, value, *, nx=False, ex=None):
+        self.set_calls += 1
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+    async def eval(self, script, numkeys, key, token):
+        # The Lua script's contract: delete only if the stored value is ours.
+        assert "redis.call('get', KEYS[1]) == ARGV[1]" in script
+        if self.store.get(key) == token:
+            del self.store[key]
+            return 1
+        return 0
+
+    async def aclose(self):
+        return None
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.committed = False
+        self.rolled_back = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def commit(self):
+        self.committed = True
+
+    async def rollback(self):
+        self.rolled_back = True
+
+
+def _patch_liveness_task(monkeypatch, redis, *, core=None):
+    from app.domains.connected_devices import service as service_module
+    from app.domains.connected_devices import tasks as tasks_module
+
+    session = _FakeSession()
+
+    async def _ok_core(repository, router_service, **kwargs):
+        return service_module.MonitoredHardwareLivenessSummary(
+            routers_probed=1, routers_failed=0, devices_up=1, devices_down=0, skipped=0
+        )
+
+    monkeypatch.setattr(tasks_module, "create_redis_client", lambda: redis)
+    monkeypatch.setattr(tasks_module, "SessionLocal", lambda: session)
+    monkeypatch.setattr(tasks_module, "_build_router_service", lambda s: object())
+    monkeypatch.setattr(
+        tasks_module, "run_monitored_hardware_liveness_sweep_core", core or _ok_core
+    )
+    return tasks_module, session
+
+
+class TestLivenessSweepLock:
+    """Regression, measured on production 2026-09-15: the liveness task took
+    a 120s ``SET NX`` lock and never released it, so on its 30s Beat
+    cadence three of every four ticks logged ``skipped_locked`` -- 26 of 34
+    in the sample, with ``redis MONITOR`` showing a ``SET NX`` per tick and
+    no ``DEL`` ever. A fast device-down detector that really ran every
+    ~150s."""
+
+    async def test_consecutive_ticks_both_run(self, monkeypatch) -> None:
+        from app.domains.connected_devices.constants import (
+            MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY as KEY,
+        )
+
+        redis = _LockRedis()
+        tasks_module, session = _patch_liveness_task(monkeypatch, redis)
+
+        first = await tasks_module._run_monitored_hardware_liveness_sweep_async()
+        second = await tasks_module._run_monitored_hardware_liveness_sweep_async()
+
+        assert first["skipped_locked"] is False
+        assert second["skipped_locked"] is False
+        assert second["routers_probed"] == 1
+        assert KEY not in redis.store
+        assert session.committed is True
+
+    async def test_lock_is_released_when_the_pass_raises(self, monkeypatch) -> None:
+        from app.domains.connected_devices.constants import (
+            MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY as KEY,
+        )
+
+        async def _boom(repository, router_service, **kwargs):
+            raise RuntimeError("database unavailable")
+
+        redis = _LockRedis()
+        tasks_module, session = _patch_liveness_task(monkeypatch, redis, core=_boom)
+
+        try:
+            await tasks_module._run_monitored_hardware_liveness_sweep_async()
+        except RuntimeError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("the failure must still propagate")
+
+        assert KEY not in redis.store
+        assert session.rolled_back is True
+
+    async def test_a_skipped_tick_does_not_release_the_holders_lock(
+        self, monkeypatch
+    ) -> None:
+        from app.domains.connected_devices.constants import (
+            MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY as KEY,
+        )
+
+        redis = _LockRedis()
+        redis.store[KEY] = "another-pass-token"
+        tasks_module, _ = _patch_liveness_task(monkeypatch, redis)
+
+        result = await tasks_module._run_monitored_hardware_liveness_sweep_async()
+
+        assert result["skipped_locked"] is True
+        assert redis.store[KEY] == "another-pass-token"
+
+    async def test_an_overrunning_pass_does_not_delete_its_successors_lock(
+        self, monkeypatch
+    ) -> None:
+        """A pass that outlives the TTL finds a different token under the
+        key when it finishes. A plain ``DEL`` would free that successor's
+        lock for a third overlapping pass; the owner check must not."""
+        from app.domains.connected_devices import service as service_module
+        from app.domains.connected_devices.constants import (
+            MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY as KEY,
+        )
+
+        redis = _LockRedis()
+
+        async def _overrun(repository, router_service, **kwargs):
+            # TTL expired mid-pass and the next tick took the lock.
+            redis.store[KEY] = "successor-token"
+            return service_module.MonitoredHardwareLivenessSummary(
+                routers_probed=0,
+                routers_failed=0,
+                devices_up=0,
+                devices_down=0,
+                skipped=0,
+            )
+
+        tasks_module, _ = _patch_liveness_task(monkeypatch, redis, core=_overrun)
+
+        await tasks_module._run_monitored_hardware_liveness_sweep_async()
+
+        assert redis.store[KEY] == "successor-token"

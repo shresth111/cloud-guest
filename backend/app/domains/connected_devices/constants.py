@@ -147,6 +147,37 @@ MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY = (
 # phase -- see CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS above.
 MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS = 120
 
+class RouterSyncErrorCode(StrEnum):
+    """Why the most recent discovery read of a router failed -- the
+    category stored on ``RouterDeviceSyncState.last_error_code``.
+
+    A category, not the exception text, because the text names the
+    router's address and this code reaches customer-facing responses.
+
+    ``AUTH_FAILED`` is split out from ``UNREACHABLE`` because the fixes are
+    different people's jobs: a rejected login is a credential to re-enter,
+    a dead route is a network to look at.
+    """
+
+    MISSING_CREDENTIALS = "missing_credentials"
+    AUTH_FAILED = "auth_failed"
+    UNREACHABLE = "unreachable"
+    UNSUPPORTED_VENDOR = "unsupported_vendor"
+    READ_FAILED = "read_failed"
+
+
+#: Substrings RouterOS / librouteros put in a rejected-login error. Matched
+#: case-insensitively against the gateway's connection-error detail, which
+#: is the only place the distinction survives (the gateway raises one
+#: ``MikroTikConnectionError`` for both a refused login and a dead route).
+ROUTEROS_AUTH_FAILURE_MARKERS = (
+    "invalid user name or password",
+    "cannot log in",
+    "login failure",
+    "not logged in",
+)
+
+
 #: The Beat-scheduled coordinator task name -- see tasks.py.
 TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP = (
     "app.domains.connected_devices.tasks.run_monitored_hardware_liveness_sweep"
@@ -167,4 +198,6 @@ __all__ = [
     "MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY",
     "MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS",
     "TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP",
+    "RouterSyncErrorCode",
+    "ROUTEROS_AUTH_FAILURE_MARKERS",
 ]

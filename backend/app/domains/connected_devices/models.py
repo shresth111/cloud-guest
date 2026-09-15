@@ -34,7 +34,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Te
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.database.base import BaseModel
+from app.database.base import Base, BaseModel
 
 from .constants import ConnectionType
 
@@ -153,4 +153,50 @@ class ConnectedDevice(BaseModel):
         )
 
 
-__all__ = ["ConnectedDevice"]
+class RouterDeviceSyncState(Base):
+    """The outcome of the most recent DHCP-lease/ARP discovery read of one
+    router -- one row per router, overwritten in place by every sync.
+
+    ``connected_devices`` can only say what a router *reported*. When the
+    router cannot be read at all (rejected RouterOS API credentials, no
+    route to it, no credentials stored) that table simply stays empty, and
+    an empty table reads exactly like "the network has never seen this
+    device". A venue owner who registered an access point that is plainly
+    working was told "Never observed" when the true answer was "we cannot
+    log in to your router". This row is what lets the Monitored Hardware
+    status say which of the two it is.
+
+    ``last_error_code`` is a short category (see
+    ``constants.RouterSyncErrorCode``), never the raw exception text: the
+    raw text carries the router's address, and this row is read by
+    customer-facing endpoints.
+
+    Not a ``BaseModel``: there is exactly one row per router, keyed by the
+    router itself, with nothing to soft-delete or version -- the row goes
+    when the router goes (``ON DELETE CASCADE``).
+    """
+
+    __tablename__ = "router_device_sync_states"
+
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    last_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_failure_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # NULL when the most recent attempt succeeded.
+    last_error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+
+
+__all__ = ["ConnectedDevice", "RouterDeviceSyncState"]

@@ -26,18 +26,22 @@ from datetime import UTC, datetime
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
-from app.domains.connected_devices.constants import ConnectionType
+from app.domains.connected_devices.constants import ConnectionType, RouterSyncErrorCode
 from app.domains.connected_devices.device_adapters import DiscoveredDevice
 from app.domains.connected_devices.exceptions import (
+    ConnectedDeviceConnectionError,
     ConnectedDeviceMissingCredentialsError,
     ConnectedDeviceNotFoundError,
+    ConnectedDeviceOperationError,
     CrossOrganizationConnectedDeviceAccessError,
+    UnsupportedConnectedDeviceVendorError,
 )
 from app.domains.connected_devices.models import ConnectedDevice
 from app.domains.connected_devices.router import router as connected_devices_router
 from app.domains.connected_devices.service import (
     ConnectedDeviceService,
     DeviceSyncSweepSummary,
+    classify_router_sync_failure,
     run_device_sync_sweep,
 )
 from app.domains.router.exceptions import RouterNotFoundError
@@ -192,6 +196,19 @@ class FakeConnectedDeviceRepository:
 
     async def list_routers_with_monitored_hardware(self) -> list[Router]:
         return []
+
+    #: ``(router_id, error_code)`` per ``record_router_sync_outcome`` call,
+    #: in call order.
+    sync_outcomes: list[tuple[uuid.UUID, str | None]] = field(default_factory=list)
+
+    async def record_router_sync_outcome(
+        self,
+        router_id: uuid.UUID,
+        *,
+        attempted_at: datetime,
+        error_code: str | None,
+    ) -> None:
+        self.sync_outcomes.append((router_id, error_code))
 
 
 @dataclass
@@ -1024,6 +1041,123 @@ class TestSyncSweep:
             device.router_id for device in repository.devices.values()
         }
         assert synced_router_ids == {target_router.id}
+
+
+class TestSyncOutcomeIsRecorded:
+    """Regression: a venue router whose stored RouterOS login was rejected
+    failed every discovery read, and the only trace was a warning log. With
+    ``connected_devices`` left empty, a registered, working access point at
+    that venue was reported "Never observed". The sweep now records each
+    router's outcome so the Monitored Hardware status can say the router
+    could not be read."""
+
+    @staticmethod
+    async def _sweep(repository, router_lookup, adapter, routers=None):
+        return await run_device_sync_sweep(
+            repository,
+            router_lookup,
+            FakeGuestAccessService(),
+            FakeGuestLookup(),
+            audit_writer=FakeAuditLogWriter(),
+            device_adapter_resolver=lambda vendor: adapter,
+            routers=routers,
+        )
+
+    async def test_rejected_login_is_recorded_as_auth_failed(self) -> None:
+        class RejectingAdapter(FakeConnectedDeviceAdapter):
+            async def discover_devices(self, credentials):
+                raise ConnectedDeviceConnectionError(
+                    credentials.host, "invalid user name or password (6)"
+                )
+
+        repository = FakeConnectedDeviceRepository()
+        router_lookup = FakeRouterLookup()
+        router = router_lookup.add(_make_router())
+        repository.routers = [router]
+
+        summary = await self._sweep(repository, router_lookup, RejectingAdapter())
+
+        assert summary.routers_failed == 1
+        assert repository.sync_outcomes == [(router.id, "auth_failed")]
+        assert repository.devices == {}
+
+    async def test_success_is_recorded_with_no_error(self) -> None:
+        repository = FakeConnectedDeviceRepository()
+        router_lookup = FakeRouterLookup()
+        router = router_lookup.add(_make_router())
+        repository.routers = [router]
+
+        await self._sweep(repository, router_lookup, FakeConnectedDeviceAdapter())
+
+        assert repository.sync_outcomes == [(router.id, None)]
+
+    async def test_missing_credentials_is_recorded(self) -> None:
+        repository = FakeConnectedDeviceRepository()
+        router_lookup = FakeRouterLookup()
+        router = router_lookup.add(_make_router(), secret=None)
+        repository.routers = [router]
+
+        await self._sweep(repository, router_lookup, FakeConnectedDeviceAdapter())
+
+        assert repository.sync_outcomes == [(router.id, "missing_credentials")]
+
+    async def test_a_deleted_router_records_nothing(self) -> None:
+        repository = FakeConnectedDeviceRepository()
+        router_lookup = FakeRouterLookup()
+        router = router_lookup.add(_make_router())
+        router_lookup.fail_router_ids = {router.id}
+
+        summary = await self._sweep(
+            repository, router_lookup, FakeConnectedDeviceAdapter(), routers=[router]
+        )
+
+        assert summary.routers_failed == 1
+        assert repository.sync_outcomes == []
+
+    async def test_a_failure_to_record_never_fails_the_sweep(self) -> None:
+        class BrokenRecorder(FakeConnectedDeviceRepository):
+            async def record_router_sync_outcome(self, router_id, **kwargs):
+                raise RuntimeError("db went away")
+
+        repository = BrokenRecorder()
+        router_lookup = FakeRouterLookup()
+        router = router_lookup.add(_make_router())
+        repository.routers = [router]
+
+        summary = await self._sweep(
+            repository, router_lookup, FakeConnectedDeviceAdapter()
+        )
+
+        assert summary.routers_synced == 1
+
+
+class TestClassifyRouterSyncFailure:
+    def test_rejected_login(self) -> None:
+        exc = ConnectedDeviceConnectionError(
+            "192.0.2.1", "invalid user name or password (6)"
+        )
+        assert classify_router_sync_failure(exc) == RouterSyncErrorCode.AUTH_FAILED
+
+    def test_connection_refused_is_unreachable_not_auth(self) -> None:
+        exc = ConnectedDeviceConnectionError("192.0.2.1", "timed out")
+        assert classify_router_sync_failure(exc) == RouterSyncErrorCode.UNREACHABLE
+
+    def test_missing_credentials(self) -> None:
+        exc = ConnectedDeviceMissingCredentialsError(uuid.uuid4())
+        assert (
+            classify_router_sync_failure(exc)
+            == RouterSyncErrorCode.MISSING_CREDENTIALS
+        )
+
+    def test_unsupported_vendor(self) -> None:
+        exc = UnsupportedConnectedDeviceVendorError("tplink_omada")
+        assert (
+            classify_router_sync_failure(exc) == RouterSyncErrorCode.UNSUPPORTED_VENDOR
+        )
+
+    def test_anything_else_is_read_failed(self) -> None:
+        exc = ConnectedDeviceOperationError("discover_devices", "no such command")
+        assert classify_router_sync_failure(exc) == RouterSyncErrorCode.READ_FAILED
 
 
 # ============================================================================

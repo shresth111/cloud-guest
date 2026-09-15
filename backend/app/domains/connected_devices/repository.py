@@ -18,9 +18,11 @@ to delegate to).
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
@@ -30,7 +32,7 @@ from app.domains.monitored_hardware.models import MonitoredHardware
 from app.domains.router.fleet_scope import agent_managed_only
 from app.domains.router.models import Router
 
-from .models import ConnectedDevice
+from .models import ConnectedDevice, RouterDeviceSyncState
 
 
 class ConnectedDeviceRepositoryProtocol(Protocol):
@@ -83,6 +85,14 @@ class ConnectedDeviceRepositoryProtocol(Protocol):
     async def list_routers_with_monitored_hardware(
         self,
     ) -> list[Router]: ...
+
+    async def record_router_sync_outcome(
+        self,
+        router_id: uuid.UUID,
+        *,
+        attempted_at: datetime,
+        error_code: str | None,
+    ) -> None: ...
 
 
 class ConnectedDeviceRepository:
@@ -253,6 +263,53 @@ class ConnectedDeviceRepository:
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def record_router_sync_outcome(
+        self,
+        router_id: uuid.UUID,
+        *,
+        attempted_at: datetime,
+        error_code: str | None,
+    ) -> None:
+        """Upsert the one ``RouterDeviceSyncState`` row for ``router_id``.
+
+        ``error_code=None`` records a success: the error clears and the
+        failure streak resets. Anything else records a failure and extends
+        the streak, leaving ``last_success_at`` as it was -- "the last time
+        this router could be read" must survive the failures after it.
+
+        One statement (``INSERT ... ON CONFLICT DO UPDATE``) rather than a
+        read-then-write, so two leaf tasks for the same router racing each
+        other cannot both insert."""
+        table = RouterDeviceSyncState.__table__
+        succeeded = error_code is None
+        statement = pg_insert(table).values(
+            router_id=router_id,
+            last_attempt_at=attempted_at,
+            last_success_at=attempted_at if succeeded else None,
+            last_failure_at=None if succeeded else attempted_at,
+            last_error_code=error_code,
+            consecutive_failures=0 if succeeded else 1,
+        )
+        if succeeded:
+            update = {
+                "last_attempt_at": attempted_at,
+                "last_success_at": attempted_at,
+                "last_error_code": None,
+                "consecutive_failures": 0,
+            }
+        else:
+            update = {
+                "last_attempt_at": attempted_at,
+                "last_failure_at": attempted_at,
+                "last_error_code": error_code,
+                "consecutive_failures": table.c.consecutive_failures + 1,
+            }
+        await self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[table.c.router_id], set_=update
+            )
+        )
 
 
 __all__ = ["ConnectedDeviceRepositoryProtocol", "ConnectedDeviceRepository"]

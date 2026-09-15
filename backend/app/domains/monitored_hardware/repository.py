@@ -20,11 +20,13 @@ from __future__ import annotations
 import uuid
 from typing import Protocol
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
-from app.domains.connected_devices.models import ConnectedDevice
+from app.domains.connected_devices.models import ConnectedDevice, RouterDeviceSyncState
+from app.domains.router.models import Router
 
 from .models import MonitoredHardware
 
@@ -56,6 +58,10 @@ class MonitoredHardwareRepositoryProtocol(Protocol):
     async def get_connected_device_by_mac(
         self, location_id: uuid.UUID, mac_address: str
     ) -> ConnectedDevice | None: ...
+
+    async def list_location_routers_with_sync_state(
+        self, location_id: uuid.UUID
+    ) -> list[tuple[Router, RouterDeviceSyncState | None]]: ...
 
 
 class MonitoredHardwareRepository:
@@ -114,6 +120,27 @@ class MonitoredHardwareRepository:
             limit=1,
         )
         return results[0] if results else None
+
+    async def list_location_routers_with_sync_state(
+        self, location_id: uuid.UUID
+    ) -> list[tuple[Router, RouterDeviceSyncState | None]]:
+        """Every non-deleted router at ``location_id``, each with its most
+        recent device-discovery outcome (``None`` when no discovery read
+        has been recorded). Read-only.
+
+        Deliberately vendor-neutral: the caller has to *see* a
+        controller-managed row to say "this venue's devices come from its
+        controller" rather than "no router here"."""
+        statement = (
+            select(Router, RouterDeviceSyncState)
+            .outerjoin(
+                RouterDeviceSyncState,
+                RouterDeviceSyncState.router_id == Router.id,
+            )
+            .where(Router.location_id == location_id, Router.is_deleted.is_(False))
+        )
+        result = await self.session.execute(statement)
+        return [(router, state) for router, state in result.all()]
 
 
 __all__ = ["MonitoredHardwareRepositoryProtocol", "MonitoredHardwareRepository"]

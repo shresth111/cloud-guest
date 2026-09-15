@@ -62,7 +62,9 @@ from app.domains.router.models import Router
 
 from .constants import (
     MONITORED_HARDWARE_LIVENESS_PING_COUNT,
+    ROUTEROS_AUTH_FAILURE_MARKERS,
     ConnectionType,
+    RouterSyncErrorCode,
 )
 from .device_adapters import (
     DeviceCredentials,
@@ -670,6 +672,48 @@ class ConnectedDeviceService:
         )
 
 
+def classify_router_sync_failure(exc: BaseException) -> RouterSyncErrorCode:
+    """Map a failed ``sync_router`` to the category stored on
+    ``RouterDeviceSyncState.last_error_code`` -- see
+    ``constants.RouterSyncErrorCode``.
+
+    A rejected login and an unreachable router both arrive as
+    ``ConnectedDeviceConnectionError`` (the gateway raises one
+    ``MikroTikConnectionError`` for "could not open a session", whatever
+    the reason), so the split reads the detail text RouterOS put there."""
+    if isinstance(exc, ConnectedDeviceMissingCredentialsError):
+        return RouterSyncErrorCode.MISSING_CREDENTIALS
+    if isinstance(exc, UnsupportedConnectedDeviceVendorError):
+        return RouterSyncErrorCode.UNSUPPORTED_VENDOR
+    if isinstance(exc, ConnectedDeviceConnectionError):
+        detail = str(exc).lower()
+        if any(marker in detail for marker in ROUTEROS_AUTH_FAILURE_MARKERS):
+            return RouterSyncErrorCode.AUTH_FAILED
+        return RouterSyncErrorCode.UNREACHABLE
+    return RouterSyncErrorCode.READ_FAILED
+
+
+async def _record_router_sync_outcome(
+    repository: ConnectedDeviceRepositoryProtocol,
+    router_id: uuid.UUID,
+    error_code: RouterSyncErrorCode | None,
+) -> None:
+    """Best-effort: bookkeeping about a sync must never be the reason the
+    sync's own results are lost, so a failure to write it is logged and
+    swallowed."""
+    try:
+        await repository.record_router_sync_outcome(
+            router_id,
+            attempted_at=datetime.now(UTC),
+            error_code=error_code.value if error_code is not None else None,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "connected_device_sync_outcome_record_failed",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+
+
 async def run_device_sync_sweep(
     repository: ConnectedDeviceRepositoryProtocol,
     router_lookup: RouterLookupProtocol,
@@ -723,16 +767,37 @@ async def run_device_sync_sweep(
     for router in routers:
         try:
             summary = await service.sync_router(router.id)
-            routers_synced += 1
-            discovered += summary.discovered
-            updated += summary.updated
-            disconnected += summary.disconnected
-        except Exception as exc:  # noqa: BLE001 -- per-router isolation, see docstring
+        except RouterNotFoundError as exc:
+            # Deleted between listing and syncing: there is no router left
+            # to record an outcome against.
             routers_failed += 1
             logger.warning(
                 "connected_device_sync_sweep_router_failed",
                 extra={"router_id": str(router.id), "error": str(exc)},
             )
+            continue
+        except Exception as exc:  # noqa: BLE001 -- per-router isolation, see docstring
+            routers_failed += 1
+            error_code = classify_router_sync_failure(exc)
+            logger.warning(
+                "connected_device_sync_sweep_router_failed",
+                extra={
+                    "router_id": str(router.id),
+                    "error": str(exc),
+                    "error_code": error_code.value,
+                },
+            )
+            # Recorded, because an unreadable router leaves
+            # ``connected_devices`` exactly as empty as a router that has
+            # never seen the device -- and only this row tells the two
+            # apart for the Monitored Hardware status.
+            await _record_router_sync_outcome(repository, router.id, error_code)
+            continue
+        routers_synced += 1
+        discovered += summary.discovered
+        updated += summary.updated
+        disconnected += summary.disconnected
+        await _record_router_sync_outcome(repository, router.id, None)
     return DeviceSyncSweepSummary(
         routers_synced=routers_synced,
         routers_failed=routers_failed,
@@ -910,6 +975,7 @@ __all__ = [
     "DeviceSyncSweepSummary",
     "MonitoredHardwareLivenessSummary",
     "ConnectedDeviceService",
+    "classify_router_sync_failure",
     "run_device_sync_sweep",
     "run_monitored_hardware_liveness_sweep",
 ]

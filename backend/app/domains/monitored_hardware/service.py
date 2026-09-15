@@ -17,6 +17,8 @@ import uuid
 from datetime import UTC, datetime
 from typing import Protocol
 
+from app.domains.connected_devices.constants import RouterSyncErrorCode
+from app.domains.connected_devices.models import RouterDeviceSyncState
 from app.domains.location.models import Location
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
@@ -24,8 +26,9 @@ from app.domains.rbac.location_scope import (
     enforce_entity_location,
 )
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_agent_managed
 
-from .constants import STALE_SIGHTING_AFTER_SECONDS, HardwareStatus
+from .constants import STALE_SIGHTING_AFTER_SECONDS, HardwareStatus, ObservationIssue
 from .events import MonitoredHardwareDeleted, MonitoredHardwareRegistered
 from .exceptions import DuplicateMonitoredHardwareError, MonitoredHardwareNotFoundError
 from .models import MonitoredHardware
@@ -91,6 +94,70 @@ class HardwareWithStatus:
     status: HardwareStatus
     last_seen_at: datetime | None
     connected_at: datetime | None
+    #: Why a non-UP status has no trustworthy observation behind it, or
+    #: ``None`` -- see ``ObservationIssue``. Always ``None`` for UP.
+    observation_issue: ObservationIssue | None = None
+
+
+_SYNC_ERROR_TO_ISSUE: dict[str, ObservationIssue] = {
+    RouterSyncErrorCode.MISSING_CREDENTIALS.value: (
+        ObservationIssue.ROUTER_MISSING_CREDENTIALS
+    ),
+    RouterSyncErrorCode.AUTH_FAILED.value: ObservationIssue.ROUTER_AUTH_FAILED,
+    RouterSyncErrorCode.UNREACHABLE.value: ObservationIssue.ROUTER_UNREACHABLE,
+    RouterSyncErrorCode.UNSUPPORTED_VENDOR.value: ObservationIssue.CONTROLLER_MANAGED,
+    RouterSyncErrorCode.READ_FAILED.value: ObservationIssue.ROUTER_READ_FAILED,
+}
+
+
+def derive_observation_issue(
+    device: MonitoredHardware,
+    status: HardwareStatus,
+    routers: list[tuple[Router, RouterDeviceSyncState | None]],
+) -> ObservationIssue | None:
+    """Why ``device`` is not UP, as far as the observation pipeline can say.
+
+    ``routers`` is every router at the device's location with its latest
+    discovery outcome. The rules, in order:
+
+    * UP needs no explanation.
+    * A device pinned to a router (``router_id``) at its own location is
+      judged by that router alone; otherwise by every router at its
+      location, because the discovery sync writes a sighting under
+      whichever router saw it.
+    * No router -> ``NO_ROUTER``. Only controller-managed routers ->
+      ``CONTROLLER_MANAGED``.
+    * If ANY candidate router's most recent read succeeded, the verdict
+      stands: an unknown device really was not on that router
+      (``NOT_SEEN_BY_ROUTER``), and a DOWN device really is down (``None``).
+    * Otherwise the reason the reads are failing is the answer -- the most
+      recently attempted router's error, or ``ROUTER_NOT_SYNCED_YET`` when
+      none has been attempted.
+    """
+    if status == HardwareStatus.UP:
+        return None
+    candidates = routers
+    if device.router_id is not None:
+        pinned = [(r, st) for r, st in routers if r.id == device.router_id]
+        candidates = pinned or routers
+    if not candidates:
+        return ObservationIssue.NO_ROUTER
+    readable = [(r, st) for r, st in candidates if is_agent_managed(r.vendor)]
+    if not readable:
+        return ObservationIssue.CONTROLLER_MANAGED
+    if any(st is not None and st.last_error_code is None for _r, st in readable):
+        return (
+            ObservationIssue.NOT_SEEN_BY_ROUTER
+            if status == HardwareStatus.UNKNOWN
+            else None
+        )
+    attempted = [st for _r, st in readable if st is not None]
+    if not attempted:
+        return ObservationIssue.ROUTER_NOT_SYNCED_YET
+    latest = max(attempted, key=lambda st: st.last_attempt_at)
+    return _SYNC_ERROR_TO_ISSUE.get(
+        latest.last_error_code or "", ObservationIssue.ROUTER_READ_FAILED
+    )
 
 
 class MonitoredHardwareService:
@@ -195,16 +262,28 @@ class MonitoredHardwareService:
         )
         return device
 
-    async def with_status(self, device: MonitoredHardware) -> HardwareWithStatus:
+    async def with_status(
+        self,
+        device: MonitoredHardware,
+        *,
+        _routers_by_location: dict[
+            uuid.UUID, list[tuple[Router, RouterDeviceSyncState | None]]
+        ]
+        | None = None,
+    ) -> HardwareWithStatus:
         connected = await self.repository.get_connected_device_by_mac(
             device.location_id, device.mac_address
         )
         if connected is None:
+            status = HardwareStatus.UNKNOWN
             return HardwareWithStatus(
                 device=device,
-                status=HardwareStatus.UNKNOWN,
+                status=status,
                 last_seen_at=None,
                 connected_at=None,
+                observation_issue=await self._observation_issue(
+                    device, status, _routers_by_location
+                ),
             )
         # An ``is_active`` row whose last sighting is older than the stale
         # window is not a live device -- it is a row the device-sync sweep
@@ -235,7 +314,30 @@ class MonitoredHardwareService:
             # Deliberately only surfaced for UP devices: a DOWN device's
             # stale ``connected_at`` would read as current uptime.
             connected_at=connected.connected_at if is_active else None,
+            observation_issue=await self._observation_issue(
+                device, status, _routers_by_location
+            ),
         )
+
+    async def _observation_issue(
+        self,
+        device: MonitoredHardware,
+        status: HardwareStatus,
+        cache: dict[uuid.UUID, list[tuple[Router, RouterDeviceSyncState | None]]]
+        | None,
+    ) -> ObservationIssue | None:
+        if status == HardwareStatus.UP:
+            return None
+        if cache is not None and device.location_id in cache:
+            routers = cache[device.location_id]
+        else:
+            routers = await self.repository.list_location_routers_with_sync_state(
+                device.location_id
+            )
+            if cache is not None:
+                cache[device.location_id] = routers
+        return derive_observation_issue(device, status, routers)
+
 
     async def list_devices(
         self,
@@ -251,7 +353,14 @@ class MonitoredHardwareService:
             page=page,
             page_size=page_size,
         )
-        return [await self.with_status(d) for d in devices], meta
+        # One router lookup per location, not per device.
+        routers_by_location: dict[
+            uuid.UUID, list[tuple[Router, RouterDeviceSyncState | None]]
+        ] = {}
+        return [
+            await self.with_status(d, _routers_by_location=routers_by_location)
+            for d in devices
+        ], meta
 
     async def list_all_devices_with_status(
         self, *, organization_id: uuid.UUID
@@ -326,4 +435,5 @@ __all__ = [
     "AuditLogWriter",
     "HardwareWithStatus",
     "MonitoredHardwareService",
+    "derive_observation_issue",
 ]

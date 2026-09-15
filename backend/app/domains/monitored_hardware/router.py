@@ -71,6 +71,9 @@ def _device_response(item: HardwareWithStatus) -> MonitoredHardwareResponse:
         status=item.status.value,
         last_seen_at=item.last_seen_at,
         connected_at=item.connected_at,
+        observation_issue=(
+            item.observation_issue.value if item.observation_issue else None
+        ),
         created_at=device.created_at,
     )
 
