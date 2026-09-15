@@ -422,6 +422,14 @@ class InvalidAnalyticsDateRangeError(GuestError):
         )
 
 
+class InvalidDashboardSeriesRangeError(GuestError):
+    """422 for a dashboard-series window that is empty, inverted, or longer
+    than ``constants.MAX_DASHBOARD_SERIES_WINDOW_DAYS``."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
 class TooManyDeviceIdsError(GuestError):
     """Raised by ``GET /guest-devices`` (bulk MAC-address resolution, see
     ``constants.MAX_BULK_DEVICE_LOOKUP_IDS``'s own docstring) when a caller

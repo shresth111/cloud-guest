@@ -311,6 +311,7 @@ _LOCATION_NARROWING_ROUTES = [
     ("/api/v1/guest-analytics/summary", "GET"),
     ("/api/v1/guest-analytics/otp-success-rate", "GET"),
     ("/api/v1/guest-analytics/voucher-usage", "GET"),
+    ("/api/v1/guest-analytics/dashboard-series", "GET"),
 ]
 
 
