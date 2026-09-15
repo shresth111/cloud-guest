@@ -22,7 +22,8 @@ path groups with four different authentication postures:
   endpoint that *is* RBAC-gated (an admin registering a NAS, not FreeRADIUS
   calling in).
 * ``analytics_router`` (``/guest-analytics/...``) -- gated by RBAC's
-  ``analytics.*`` permission keys.
+  ``analytics.*`` permission keys, except ``/dashboard-series``, which is
+  the customer dashboard's data source and keeps its ``guest_sessions.read``.
 
 All except the RADIUS-facing endpoints use the standard
 ``ApiResponse``/``build_response`` envelope. The RADIUS-facing endpoints
@@ -62,11 +63,14 @@ from app.domains.wireguard.validators import hub_reserved_ip
 from .constants import (
     MAX_BULK_DEVICE_LOOKUP_IDS,
     MAX_BULK_VOUCHER_LOOKUP_IDS,
+    MAX_DASHBOARD_TZ_OFFSET_MINUTES,
+    MIN_DASHBOARD_TZ_OFFSET_MINUTES,
     RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
     RADIUS_ACCT_STATUS_ACCOUNTING_ON,
     RADIUS_ACCT_STATUS_INTERIM_UPDATE,
     RADIUS_ACCT_STATUS_START,
     RADIUS_ACCT_STATUS_STOP,
+    DashboardSeriesBucket,
     GuestSessionStatus,
     NasStatus,
 )
@@ -84,10 +88,13 @@ from .exceptions import (
 from .models import Guest, GuestDevice, GuestLoginHistory, GuestSession, RadiusNasClient
 from .radius_bridge import RadiusBridgePushError, push_nas_client
 from .schemas import (
+    DashboardOsCountResponse,
+    DashboardSeriesPointResponse,
     GuestAnalyticsSummaryResponse,
     GuestBlockRequest,
     GuestConsentRequest,
     GuestConsentResponse,
+    GuestDashboardSeriesResponse,
     GuestDetailResponse,
     GuestDeviceListResponse,
     GuestDeviceResponse,
@@ -2668,6 +2675,79 @@ async def get_guest_analytics_summary(
             average_session_duration_seconds=summary.average_session_duration_seconds,
             total_bandwidth_bytes=summary.total_bandwidth_bytes,
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@analytics_router.get(
+    "/dashboard-series",
+    response_model=ApiResponse[GuestDashboardSeriesResponse],
+    status_code=status.HTTP_200_OK,
+    # guest_sessions.read, not analytics.read: this serves the customer
+    # dashboard, which venue owners already reach through GET /guest-sessions
+    # with exactly this permission. It replaces that endpoint's 100-row page
+    # as the dashboard's data source, so it must not demand a broader grant.
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def get_guest_dashboard_series(
+    request: Request,
+    location_id: uuid.UUID = Query(...),
+    start_date: datetime = Query(..., description="Inclusive window start."),
+    end_date: datetime = Query(
+        ..., description="Exclusive window end; at most 31 days after start_date."
+    ),
+    bucket: DashboardSeriesBucket = Query(...),
+    tz_offset_minutes: int = Query(
+        default=0,
+        ge=MIN_DASHBOARD_TZ_OFFSET_MINUTES,
+        le=MAX_DASHBOARD_TZ_OFFSET_MINUTES,
+        description="Minutes east of UTC that buckets align to (IST = 330).",
+    ),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
+    service: GuestAnalyticsService = Depends(get_guest_analytics_service),
+):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
+    # organization_id is the org RequirePermission checked (header-resolved),
+    # and the query filters on it AND location_id -- a location id from
+    # another organization matches no rows.
+    result = await service.get_dashboard_series(
+        organization_id=organization_id,
+        location_id=location_id,
+        start=start_date,
+        end=end_date,
+        bucket=bucket,
+        tz_offset_minutes=tz_offset_minutes,
+    )
+    payload = GuestDashboardSeriesResponse(
+        start=result.start,
+        end=result.end,
+        bucket=result.bucket,
+        guests=result.guests,
+        sessions=result.sessions,
+        avg_session_seconds=result.avg_session_seconds,
+        peak_online=result.peak_online,
+        series=[
+            DashboardSeriesPointResponse(
+                bucket_start=point.bucket_start,
+                arrivals=point.arrivals,
+                online=point.online,
+            )
+            for point in result.series
+        ],
+        os_breakdown=[
+            DashboardOsCountResponse(name=name, count=count)
+            for name, count in result.os_breakdown
+        ],
+    )
+    return build_response(
+        success=True,
+        message="Guest dashboard series retrieved",
+        data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

@@ -27,6 +27,7 @@ from .constants import (
     RADIUS_ACCT_STATUS_INTERIM_UPDATE,
     RADIUS_ACCT_STATUS_START,
     RADIUS_ACCT_STATUS_STOP,
+    DashboardSeriesBucket,
     GuestAuthMethod,
     GuestSessionEndedReason,
     GuestSessionStatus,
@@ -83,6 +84,9 @@ __all__ = [
     "TopDevicesResponse",
     "OtpSuccessRateResponse",
     "VoucherUsageResponse",
+    "DashboardSeriesPointResponse",
+    "DashboardOsCountResponse",
+    "GuestDashboardSeriesResponse",
 ]
 
 
@@ -1067,6 +1071,34 @@ class VoucherUsageResponse(BaseModel):
     sessions: int
     unique_guests: int
     total_bandwidth_bytes: int
+
+
+class DashboardSeriesPointResponse(BaseModel):
+    bucket_start: datetime
+    # Sessions started in this bucket.
+    arrivals: int
+    # Distinct sessions open at any point during this bucket.
+    online: int
+
+
+class DashboardOsCountResponse(BaseModel):
+    name: str
+    count: int
+
+
+class GuestDashboardSeriesResponse(BaseModel):
+    """``GET /guest-analytics/dashboard-series`` -- see
+    ``GuestAnalyticsService.get_dashboard_series``."""
+
+    start: datetime
+    end: datetime
+    bucket: DashboardSeriesBucket
+    guests: int
+    sessions: int
+    avg_session_seconds: int | None
+    peak_online: int
+    series: list[DashboardSeriesPointResponse]
+    os_breakdown: list[DashboardOsCountResponse]
 
 
 # Re-exported for router.py's status-filter query param.

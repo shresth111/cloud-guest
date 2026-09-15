@@ -355,6 +355,48 @@ MAX_BULK_DEVICE_LOOKUP_IDS = 100
 
 MAX_BULK_VOUCHER_LOOKUP_IDS = 100
 
+
+# ============================================================================
+# Customer dashboard series (GET /guest-analytics/dashboard-series)
+# ============================================================================
+
+
+class DashboardSeriesBucket(StrEnum):
+    """Bucket width for ``GuestAnalyticsService.get_dashboard_series``.
+
+    Both widths are fixed-length (3600s / 86400s) because the caller's
+    timezone arrives as a fixed UTC offset, not a named zone -- so a "day"
+    bucket can never be 23 or 25 hours long and bucket arithmetic stays
+    exact integer division in SQL."""
+
+    HOUR = "hour"
+    DAY = "day"
+
+
+DASHBOARD_SERIES_BUCKET_SECONDS: dict[DashboardSeriesBucket, int] = {
+    DashboardSeriesBucket.HOUR: 3600,
+    DashboardSeriesBucket.DAY: 86400,
+}
+
+# Longest window the dashboard series accepts. 31 days keeps a one-month view
+# possible while bounding the hourly series at 744 buckets.
+MAX_DASHBOARD_SERIES_WINDOW_DAYS = 31
+
+# Real-world UTC offsets run from UTC-12:00 to UTC+14:00.
+MIN_DASHBOARD_TZ_OFFSET_MINUTES = -720
+MAX_DASHBOARD_TZ_OFFSET_MINUTES = 840
+
+# OS labels, in classifier precedence order. Also the tie-break order when two
+# labels have the same count, so the response order is deterministic.
+DASHBOARD_OS_NAMES: tuple[str, ...] = (
+    "iOS",
+    "Android",
+    "Windows",
+    "macOS",
+    "Linux",
+    "Other",
+)
+
 # Every 5 minutes -- shorter than analytics' 15-minute rolling aggregation
 # cadence (``SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS``-adjacent), because an
 # expired-but-not-yet-flipped session is guest-facing/operationally visible
