@@ -287,6 +287,8 @@ from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
     BYTES_PER_MB,
+    DASHBOARD_OS_NAMES,
+    DASHBOARD_SERIES_BUCKET_SECONDS,
     DEFAULT_IDLE_TIMEOUT_MINUTES,
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
@@ -303,6 +305,7 @@ from .constants import (
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     WHITELIST_ONLY_LOGIN_FAILURE_REASON,
+    DashboardSeriesBucket,
     GuestAuthMethod,
     GuestSessionEndedReason,
     GuestSessionStatus,
@@ -398,13 +401,16 @@ from .radius_coa import (
     send_packet,
 )
 from .repository import (
+    DashboardSeriesAggregate,
     DeviceSessionCount,
     GuestRepositoryProtocol,
     LocationSessionCount,
     VoucherRedemptionRow,
 )
 from .validators import (
+    as_utc,
     compute_period_start,
+    dashboard_series_bucket_starts,
     has_session_reached_time_limit,
     is_concurrent_session_limit_reached,
     is_device_limit_reached,
@@ -414,6 +420,7 @@ from .validators import (
     is_weak_pin,
     normalize_identifier,
     normalize_mac_address,
+    validate_dashboard_series_window,
     validate_date_range,
     validate_extension_minutes,
     validate_nas_status_transition,
@@ -1611,6 +1618,26 @@ class VoucherUsageResult:
     sessions: int
     unique_guests: int
     total_bandwidth_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardSeriesPoint:
+    bucket_start: datetime
+    arrivals: int
+    online: int
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardSeries:
+    start: datetime
+    end: datetime
+    bucket: DashboardSeriesBucket
+    guests: int
+    sessions: int
+    avg_session_seconds: int | None
+    peak_online: int
+    series: list[DashboardSeriesPoint]
+    os_breakdown: list[tuple[str, int]]
 
 
 # ============================================================================
@@ -7330,6 +7357,78 @@ class GuestAnalyticsService:
             total_bandwidth_bytes=aggregate.total_bandwidth_bytes,
         )
 
+    async def get_dashboard_series(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        bucket: DashboardSeriesBucket,
+        tz_offset_minutes: int = 0,
+        now: datetime | None = None,
+    ) -> DashboardSeries:
+        """Range-aware customer-dashboard aggregate for one location.
+
+        Every figure is a SQL aggregate over the location's sessions (see
+        ``GuestRepository.get_dashboard_series``); this method only computes
+        the bucket grid, zero-fills it, and orders the OS breakdown. It
+        replaces the dashboard's old client-side bucketing of one
+        100-row ``GET /guest-sessions`` page, which undercounted any venue
+        with more than 100 sessions in the range."""
+        start = as_utc(start)
+        end = as_utc(end)
+        now = as_utc(now) if now is not None else datetime.now(UTC)
+        validate_dashboard_series_window(start, end)
+        bucket_starts = dashboard_series_bucket_starts(
+            start=start,
+            end=end,
+            bucket=bucket,
+            tz_offset_minutes=tz_offset_minutes,
+        )
+        aggregate: DashboardSeriesAggregate = (
+            await self.repository.get_dashboard_series(
+                organization_id=organization_id,
+                location_id=location_id,
+                start=start,
+                end=end,
+                first_bucket_start=bucket_starts[0],
+                bucket_seconds=DASHBOARD_SERIES_BUCKET_SECONDS[bucket],
+                bucket_count=len(bucket_starts),
+                now=now,
+            )
+        )
+        series = [
+            DashboardSeriesPoint(
+                bucket_start=bucket_start,
+                arrivals=aggregate.arrivals_by_bucket.get(index, 0),
+                online=aggregate.online_by_bucket.get(index, 0),
+            )
+            for index, bucket_start in enumerate(bucket_starts)
+        ]
+        os_breakdown = sorted(
+            ((name, count) for name, count in aggregate.os_counts.items() if count),
+            key=lambda item: (
+                -item[1],
+                DASHBOARD_OS_NAMES.index(item[0])
+                if item[0] in DASHBOARD_OS_NAMES
+                else len(DASHBOARD_OS_NAMES),
+            ),
+        )
+        return DashboardSeries(
+            start=start,
+            end=end,
+            bucket=bucket,
+            guests=aggregate.guests,
+            sessions=aggregate.sessions,
+            avg_session_seconds=round(aggregate.avg_session_seconds)
+            if aggregate.avg_session_seconds is not None
+            else None,
+            peak_online=max((point.online for point in series), default=0),
+            series=series,
+            os_breakdown=os_breakdown,
+        )
+
 
 __all__ = [
     "GuestService",
@@ -7345,4 +7444,6 @@ __all__ = [
     "GuestAnalyticsSummary",
     "OtpSuccessRateResult",
     "VoucherUsageResult",
+    "DashboardSeries",
+    "DashboardSeriesPoint",
 ]

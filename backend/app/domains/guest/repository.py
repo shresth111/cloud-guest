@@ -21,7 +21,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import (
+    DateTime,
+    Integer,
+    case,
+    cast,
+    func,
+    literal,
+    or_,
+    select,
+    true,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -71,6 +81,22 @@ class SessionAggregate:
     unique_guests: int
     avg_duration_seconds: float | None
     total_bandwidth_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardSeriesAggregate:
+    """Raw aggregates behind ``GET /guest-analytics/dashboard-series``.
+
+    ``arrivals_by_bucket``/``online_by_bucket`` are sparse -- keyed by bucket
+    index (0 = the first bucket start the service computed), holding only
+    buckets with a non-zero count. The service zero-fills."""
+
+    guests: int
+    sessions: int
+    avg_session_seconds: float | None
+    arrivals_by_bucket: dict[int, int]
+    online_by_bucket: dict[int, int]
+    os_counts: dict[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +419,19 @@ class GuestRepositoryProtocol(Protocol):
         end: datetime,
         auth_method: str,
     ) -> SessionAggregate: ...
+
+    async def get_dashboard_series(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        first_bucket_start: datetime,
+        bucket_seconds: int,
+        bucket_count: int,
+        now: datetime,
+    ) -> DashboardSeriesAggregate: ...
 
     async def list_login_history(
         self,
@@ -1555,6 +1594,160 @@ class GuestRepository:
             if avg_duration is not None
             else None,
             total_bandwidth_bytes=int(total_bandwidth or 0),
+        )
+
+    async def get_dashboard_series(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        first_bucket_start: datetime,
+        bucket_seconds: int,
+        bucket_count: int,
+        now: datetime,
+    ) -> DashboardSeriesAggregate:
+        """Four bounded SQL aggregates for one location's ``[start, end)``.
+
+        Tenant scope is ``organization_id`` AND ``location_id`` on every
+        statement, so a location id belonging to another organization simply
+        matches no rows.
+
+        Buckets are fixed-width (``bucket_seconds``) from
+        ``first_bucket_start``, so a timestamp's bucket index is integer
+        arithmetic on its epoch offset. That lets the *online* series expand
+        each session into only the bucket indexes it actually spans
+        (``generate_series(i_min, i_max)`` per session) instead of
+        cross-joining every session against every bucket: rows produced are
+        proportional to session-bucket overlaps, not sessions x buckets.
+        Every returned row set is at most ``bucket_count`` rows (or six, for
+        the OS breakdown) -- no per-session rows ever reach Python.
+
+        Semantics, bucket ``i`` clipped to the window as
+        ``[lo_i, hi_i) = [max(bucket_start_i, start), min(bucket_end_i, end))``:
+
+        * arrival: ``lo_i <= started_at < hi_i``;
+        * online: ``started_at < hi_i AND coalesce(ended_at, now) > lo_i`` --
+          an open session is treated as ending ``now``, so it is never counted
+          in a bucket that starts at or after ``now``.
+
+        ``i_min`` is the bucket holding ``max(started_at, start)``; ``i_max`` is
+        the last bucket whose start is strictly before the effective end
+        (``ceil(offset / width) - 1``), capped at the final bucket.
+        """
+        first = literal(first_bucket_start, DateTime(timezone=True))
+        width = literal(bucket_seconds, Integer)
+        start_ts = literal(start, DateTime(timezone=True))
+        end_ts = literal(end, DateTime(timezone=True))
+        now_ts = literal(now, DateTime(timezone=True))
+
+        def bucket_index(timestamp, rounding) -> object:
+            offset_seconds = func.extract("epoch", timestamp - first)
+            return cast(rounding(offset_seconds / width), Integer)
+
+        tenant = (
+            GuestSession.organization_id == organization_id,
+            GuestSession.location_id == location_id,
+            GuestSession.is_deleted.is_(False),
+        )
+        started_in_window = (
+            *tenant,
+            GuestSession.started_at >= start_ts,
+            GuestSession.started_at < end_ts,
+        )
+        effective_end = func.coalesce(GuestSession.ended_at, now_ts)
+
+        # -- totals over sessions started in the window ----------------------
+        measured_end = func.coalesce(GuestSession.ended_at, func.least(now_ts, end_ts))
+        duration_seconds = func.greatest(
+            func.extract("epoch", measured_end - GuestSession.started_at), 0
+        )
+        totals_statement = select(
+            func.count(GuestSession.id),
+            func.count(
+                func.distinct(
+                    func.coalesce(GuestSession.guest_id, GuestSession.device_id)
+                )
+            ),
+            func.avg(duration_seconds),
+        ).where(*started_in_window)
+        sessions, guests, avg_duration = (
+            await self.session.execute(totals_statement)
+        ).one()
+
+        # -- arrivals per bucket ----------------------------------------------
+        arrivals_subquery = (
+            select(bucket_index(GuestSession.started_at, func.floor).label("i"))
+            .where(*started_in_window)
+            .subquery()
+        )
+        arrivals_statement = select(arrivals_subquery.c.i, func.count()).group_by(
+            arrivals_subquery.c.i
+        )
+        arrivals_rows = (await self.session.execute(arrivals_statement)).all()
+
+        # -- online per bucket ------------------------------------------------
+        spans_subquery = (
+            select(
+                bucket_index(
+                    func.greatest(GuestSession.started_at, start_ts), func.floor
+                ).label("i_min"),
+                func.least(
+                    bucket_index(effective_end, func.ceil) - 1,
+                    literal(bucket_count - 1, Integer),
+                ).label("i_max"),
+            )
+            .where(
+                *tenant,
+                GuestSession.started_at < end_ts,
+                effective_end > start_ts,
+            )
+            .subquery()
+        )
+        bucket_indexes = (
+            func.generate_series(spans_subquery.c.i_min, spans_subquery.c.i_max)
+            .table_valued("i")
+            .render_derived(name="spanned")
+            .lateral()
+        )
+        online_statement = (
+            select(bucket_indexes.c.i, func.count())
+            .select_from(spans_subquery)
+            .join(bucket_indexes, true())
+            .group_by(bucket_indexes.c.i)
+        )
+        online_rows = (await self.session.execute(online_statement)).all()
+
+        # -- OS breakdown over sessions started in the window -----------------
+        # Must stay identical to validators.classify_dashboard_os.
+        ua = func.lower(func.coalesce(GuestSession.user_agent, ""))
+        os_name = case(
+            (
+                or_(ua.contains("iphone"), ua.contains("ipad"), ua.contains("ios")),
+                "iOS",
+            ),
+            (ua.contains("android"), "Android"),
+            (ua.contains("windows"), "Windows"),
+            (or_(ua.contains("mac os"), ua.contains("macintosh")), "macOS"),
+            (ua.contains("linux"), "Linux"),
+            else_="Other",
+        )
+        os_subquery = select(os_name.label("name")).where(*started_in_window).subquery()
+        os_statement = select(os_subquery.c.name, func.count()).group_by(
+            os_subquery.c.name
+        )
+        os_rows = (await self.session.execute(os_statement)).all()
+
+        return DashboardSeriesAggregate(
+            guests=int(guests or 0),
+            sessions=int(sessions or 0),
+            avg_session_seconds=float(avg_duration)
+            if avg_duration is not None
+            else None,
+            arrivals_by_bucket={int(i): int(n) for i, n in arrivals_rows},
+            online_by_bucket={int(i): int(n) for i, n in online_rows},
+            os_counts={str(name): int(n) for name, n in os_rows},
         )
 
 

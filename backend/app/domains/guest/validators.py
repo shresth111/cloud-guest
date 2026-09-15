@@ -12,14 +12,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .constants import (
     BYTES_PER_MB,
+    DASHBOARD_SERIES_BUCKET_SECONDS,
     GUEST_SESSION_STATUS_TRANSITIONS,
+    MAX_DASHBOARD_SERIES_WINDOW_DAYS,
     NAS_STATUS_TRANSITIONS,
+    DashboardSeriesBucket,
     GuestSessionStatus,
     NasStatus,
     QuotaPeriodType,
 )
 from .exceptions import (
     InvalidAnalyticsDateRangeError,
+    InvalidDashboardSeriesRangeError,
     InvalidExtensionMinutesError,
     InvalidNasStatusTransitionError,
     InvalidSessionStatusTransitionError,
@@ -192,6 +196,71 @@ def validate_date_range(start: datetime, end: datetime) -> None:
     reaches a SQL aggregate."""
     if start > end:
         raise InvalidAnalyticsDateRangeError()
+
+
+def as_utc(value: datetime) -> datetime:
+    """A timezone-naive query datetime is taken to be UTC; an aware one is
+    converted to UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def validate_dashboard_series_window(start: datetime, end: datetime) -> None:
+    """The dashboard series window is half-open ``[start, end)``: it must be
+    non-empty and at most ``MAX_DASHBOARD_SERIES_WINDOW_DAYS`` long."""
+    if end <= start:
+        raise InvalidDashboardSeriesRangeError("end_date must be after start_date")
+    if end - start > timedelta(days=MAX_DASHBOARD_SERIES_WINDOW_DAYS):
+        raise InvalidDashboardSeriesRangeError(
+            f"date range must not exceed {MAX_DASHBOARD_SERIES_WINDOW_DAYS} days"
+        )
+
+
+def dashboard_series_bucket_starts(
+    *,
+    start: datetime,
+    end: datetime,
+    bucket: DashboardSeriesBucket,
+    tz_offset_minutes: int,
+) -> list[datetime]:
+    """Every bucket start (UTC) covering ``[start, end)``, ascending.
+
+    Buckets align to the caller's *local* hour/midnight for a fixed UTC offset
+    (IST = 330): shift into local wall-clock, floor, shift back. If ``start``
+    is not itself on a boundary, the first bucket starts before it -- that
+    bucket's counts are still clipped to the window by the repository."""
+    offset = timedelta(minutes=tz_offset_minutes)
+    local_start = start + offset
+    if bucket is DashboardSeriesBucket.HOUR:
+        floored = local_start.replace(minute=0, second=0, microsecond=0)
+    else:
+        floored = local_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    step = timedelta(seconds=DASHBOARD_SERIES_BUCKET_SECONDS[bucket])
+    current = floored - offset
+    starts: list[datetime] = []
+    while current < end:
+        starts.append(current)
+        current += step
+    return starts
+
+
+def classify_dashboard_os(user_agent: str | None) -> str:
+    """Python statement of the OS precedence the repository's SQL ``CASE``
+    implements (``GuestRepository.get_dashboard_series``); the two are held
+    together by a parity test. Lowercase substring matching, first hit wins."""
+    ua = (user_agent or "").lower()
+    if "iphone" in ua or "ipad" in ua or "ios" in ua:
+        return "iOS"
+    if "android" in ua:
+        return "Android"
+    if "windows" in ua:
+        return "Windows"
+    if "mac os" in ua or "macintosh" in ua:
+        return "macOS"
+    if "linux" in ua:
+        return "Linux"
+    return "Other"
 
 
 def is_concurrent_session_limit_reached(*, active_count: int, limit: int) -> bool:
