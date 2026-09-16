@@ -40,6 +40,7 @@ from app.domains.guest.router import (
     _guest_response,
     _resolve_session_guest_identifiers,
     _resolve_session_macs,
+    _resolve_session_presence,
     _session_responses,
 )
 from app.domains.guest.schemas import (
@@ -239,6 +240,113 @@ class TestSessionResponseCarriesMac:
         [payload] = [r.model_dump() for r in _session_responses([session], {})]
 
         assert payload["ip_address"] == REAL_IP
+
+
+class TestSessionPresence:
+    """``is_online`` is presence, not the session's own status.
+
+    A session row stays ``active`` until something ends it, so a guest whose
+    device had dropped off the network used to keep reading "Online" on every
+    surface that asked -- and a session with no ``session_timeout_minutes``
+    is never reached by the timeout sweep at all, so it read that way
+    forever. See ``GuestSessionResponse.is_online``."""
+
+    def test_a_device_the_network_dropped_is_not_online(self) -> None:
+        session = _session()
+
+        [payload] = [
+            r.model_dump()
+            for r in _session_responses(
+                [session],
+                {str(session.device_id): REAL_MAC},
+                presence={str(session.id): False},
+            )
+        ]
+
+        # The session is untouched -- only presence changed.
+        assert payload["status"] == "active"
+        assert payload["device_online"] is False
+        assert payload["is_online"] is False
+
+    def test_no_observation_leaves_the_session_deciding(self) -> None:
+        """``None`` is "this platform has no observation to make", which is a
+        different answer from "gone"."""
+        session = _session()
+
+        [payload] = [
+            r.model_dump()
+            for r in _session_responses(
+                [session],
+                {str(session.device_id): REAL_MAC},
+                presence={str(session.id): None},
+            )
+        ]
+
+        assert payload["device_online"] is None
+        assert payload["is_online"] is True
+
+    def test_an_ended_session_is_never_online(self) -> None:
+        session = _session(status="disconnected")
+
+        [payload] = [
+            r.model_dump()
+            for r in _session_responses(
+                [session],
+                {str(session.device_id): REAL_MAC},
+                presence={str(session.id): True},
+            )
+        ]
+
+        assert payload["is_online"] is False
+
+
+class TestSessionPresenceResolution:
+    async def test_one_query_resolves_a_whole_page(self) -> None:
+        calls: list[list[tuple[uuid.UUID, str]]] = []
+
+        class _Service:
+            async def list_device_presence(self, *, router_mac_pairs):
+                calls.append(list(router_mac_pairs))
+                return {pair: True for pair in router_mac_pairs}
+
+        session = _session()
+        result = await _resolve_session_presence(
+            [session], {str(session.device_id): REAL_MAC}, service=_Service()
+        )
+
+        assert len(calls) == 1
+        assert result == {str(session.id): True}
+
+    async def test_the_pair_is_router_and_mac_not_mac_alone(self) -> None:
+        """The same phone can be on two venues' networks and only one of them
+        has seen it, so the question has to name the router -- a MAC-only key
+        would answer for the wrong network."""
+        first = _session()
+        second = _session(device_id=first.device_id)
+        asked: list[tuple[uuid.UUID, str]] = []
+
+        class _Service:
+            async def list_device_presence(self, *, router_mac_pairs):
+                asked.extend(router_mac_pairs)
+                return {}
+
+        await _resolve_session_presence(
+            [first, second], {str(first.device_id): REAL_MAC}, service=_Service()
+        )
+
+        assert sorted(asked) == sorted(
+            {(first.router_id, REAL_MAC), (second.router_id, REAL_MAC)}
+        )
+
+    async def test_a_session_with_no_device_asks_about_nothing(self) -> None:
+        class _Service:
+            async def list_device_presence(self, **_):
+                raise AssertionError("must not query when no session has a device")
+
+        session = _session(device_id=None)
+        result = await _resolve_session_presence([session], {}, service=_Service())
+
+        assert result == {str(session.id): None}
 
 
 class TestSessionMacResolutionIsNotAnNPlusOne:

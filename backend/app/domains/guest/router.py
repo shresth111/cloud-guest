@@ -326,15 +326,24 @@ def _session_response(
     device_mac: str | None = None,
     guest_identifier: str | None = None,
     router_name: str | None = None,
+    device_online: bool | None = None,
 ) -> GuestSessionResponse:
-    """``device_mac``, ``guest_identifier`` and ``router_name`` are passed
-    in, never looked up here, because the only correct way to resolve any of
-    them for a *list* of sessions is one bulk query for the whole page -- see
-    ``_resolve_session_macs`` / ``_resolve_session_guest_identifiers`` /
-    ``_resolve_router_names`` below. A helper that fetched its own device,
-    guest or router would turn every list endpoint into an N+1, which is the
-    exact cost ``constants.MAX_BULK_DEVICE_LOOKUP_IDS`` was written to
-    avoid."""
+    """``device_mac``, ``guest_identifier``, ``router_name`` and
+    ``device_online`` are passed in, never looked up here, because the only
+    correct way to resolve any of them for a *list* of sessions is one bulk
+    query for the whole page -- see ``_resolve_session_macs`` /
+    ``_resolve_session_guest_identifiers`` / ``_resolve_router_names`` /
+    ``_resolve_session_presence`` below. A helper that fetched its own
+    device, guest or router would turn every list endpoint into an N+1,
+    which is the exact cost ``constants.MAX_BULK_DEVICE_LOOKUP_IDS`` was
+    written to avoid.
+
+    ``is_online`` is derived here, once, so no surface has to decide for
+    itself what "Online" means: a guest is on the network when their session
+    is still ``active`` **and** their device has not been observed as gone.
+    ``device_online is None`` (no device on record, or no sync has ever seen
+    it) leaves the session's own state deciding it -- an absence of
+    observation is not an observation of absence."""
     return GuestSessionResponse(
         id=str(session.id),
         guest_id=str(session.guest_id),
@@ -348,6 +357,11 @@ def _session_response(
         auth_method=session.auth_method,
         voucher_id=str(session.voucher_id) if session.voucher_id else None,
         status=session.status,
+        device_online=device_online,
+        is_online=(
+            session.status == GuestSessionStatus.ACTIVE.value
+            and device_online is not False
+        ),
         started_at=session.started_at,
         ended_at=session.ended_at,
         last_activity_at=session.last_activity_at,
@@ -508,11 +522,53 @@ async def _resolve_router_names(
     return {str(rid): name for rid, name in names.items()}
 
 
+async def _resolve_session_presence(
+    sessions: Sequence[GuestSession],
+    macs: dict[str, str],
+    *,
+    service: GuestService,
+) -> dict[str, bool | None]:
+    """Whether the venue's network is still seeing each session's device,
+    keyed by *session* id -- backs ``GuestSessionResponse.device_online``,
+    and through it "Online".
+
+    Takes the already-resolved ``macs`` map rather than resolving ids again:
+    the caller has it, and a second device lookup would be the N+1 this
+    module exists to avoid.
+
+    The lookup is keyed on ``(router_id, mac_address)``, not on the MAC
+    alone, because the same phone can be on two venues' networks and only
+    one of them has seen it.
+
+    ``None`` is "this platform has no observation to make" -- no device on
+    the session, or a router that has never synced one. That is deliberately
+    not the same answer as ``False``, and the schema documents it as such."""
+    pairs = [
+        (session.router_id, macs[str(session.device_id)])
+        for session in sessions
+        if session.device_id is not None and str(session.device_id) in macs
+    ]
+    seen: dict[tuple[uuid.UUID, str], bool] = {}
+    unique_pairs = list(dict.fromkeys(pairs))
+    for start in range(0, len(unique_pairs), MAX_BULK_DEVICE_LOOKUP_IDS):
+        chunk = unique_pairs[start : start + MAX_BULK_DEVICE_LOOKUP_IDS]
+        seen.update(await service.list_device_presence(router_mac_pairs=chunk))
+
+    presence: dict[str, bool | None] = {}
+    for session in sessions:
+        mac = macs.get(str(session.device_id)) if session.device_id else None
+        presence[str(session.id)] = (
+            seen.get((session.router_id, mac)) if mac else None
+        )
+    return presence
+
+
 def _session_responses(
     sessions: Sequence[GuestSession],
     macs: dict[str, str],
     identifiers: dict[str, str] | None = None,
     router_names: dict[str, str] | None = None,
+    presence: dict[str, bool | None] | None = None,
 ) -> list[GuestSessionResponse]:
     """Zip a page of sessions with already-resolved MAC, guest-identifier and
     router-name maps. A session whose device is absent from ``macs`` (no
@@ -520,15 +576,21 @@ def _session_responses(
     ``None`` -- an honest "no device on record", never a fabricated or
     borrowed address. ``guest_identifier`` (against ``identifiers``) and
     ``router_name`` (against ``router_names``) follow the same rule: an
-    absent id yields ``None``, never a fabricated label."""
+    absent id yields ``None``, never a fabricated label.
+
+    ``presence`` is keyed by *session* id (see ``_resolve_session_presence``)
+    because the fact it carries -- is the venue's network still seeing this
+    session's device -- is about this session's own ``(router, MAC)`` pair."""
     identifiers = identifiers or {}
     router_names = router_names or {}
+    presence = presence or {}
     return [
         _session_response(
             s,
             device_mac=macs.get(str(s.device_id)) if s.device_id else None,
             guest_identifier=identifiers.get(str(s.guest_id)),
             router_name=router_names.get(str(s.router_id)),
+            device_online=presence.get(str(s.id)),
         )
         for s in sessions
     ]
@@ -564,11 +626,15 @@ async def _session_response_resolved(
         requesting_organization_id=requesting_organization_id,
     )
     router_names = await _resolve_router_names([session], service=service)
+    presence = await _resolve_session_presence(
+        [session], macs, service=service
+    )
     return _session_response(
         session,
         device_mac=macs.get(str(session.device_id)) if session.device_id else None,
         guest_identifier=identifiers.get(str(session.guest_id)),
         router_name=router_names.get(str(session.router_id)),
+        device_online=presence.get(str(session.id)),
     )
 
 
@@ -1149,10 +1215,13 @@ async def get_guest(
         requesting_organization_id=requesting_organization_id,
     )
     router_names = await _resolve_router_names(sessions, service=service)
+    presence = await _resolve_session_presence(sessions, macs, service=service)
     guest_payload = _guest_response(guest, devices=devices_by_guest.get(guest.id, []))
     payload = GuestDetailResponse(
         **guest_payload.model_dump(),
-        sessions=_session_responses(sessions, macs, identifiers, router_names),
+        sessions=_session_responses(
+            sessions, macs, identifiers, router_names, presence
+        ),
     )
     return build_response(
         success=True,
@@ -1297,8 +1366,11 @@ async def list_guest_sessions(
         requesting_organization_id=requesting_organization_id,
     )
     router_names = await _resolve_router_names(sessions, service=service)
+    presence = await _resolve_session_presence(sessions, macs, service=service)
     payload = GuestSessionListResponse(
-        items=_session_responses(sessions, macs, identifiers, router_names),
+        items=_session_responses(
+            sessions, macs, identifiers, router_names, presence
+        ),
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,

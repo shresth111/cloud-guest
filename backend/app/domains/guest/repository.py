@@ -35,10 +35,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.connected_devices.models import ConnectedDevice
+from app.domains.guest_access.validators import identifier_match_terms
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.router.fleet_scope import agent_managed_only
@@ -162,6 +165,36 @@ class QuotaUsageWithOrgTimezone:
     organization_timezone: str
 
 
+def guest_identifier_clause(
+    *, organization_id: uuid.UUID, identifier: str
+) -> ColumnElement[bool]:
+    """The ``WHERE`` clause ``GuestRepository.get_guest_by_identifier``
+    matches on: this organization's guests whose identifier is any spelling
+    of ``identifier`` that ``identifier_match_terms`` accepts.
+
+    Exposed as its own function so a test can compile it and assert which
+    spellings it accepts **without a database** -- this repo's guest tests
+    are in-memory fakes with no shared Postgres, so a widening that lived
+    only inside an executed method would be a widening nothing could pin.
+    Same division of labour ``app.domains.guest_access.validators
+    .identifiers_match`` performs for the rule side, where only one of the
+    two forms can be run without a database and the other exists so the two
+    cannot drift in silence.
+    """
+    terms = identifier_match_terms(identifier)
+    return and_(
+        Guest.organization_id == organization_id,
+        Guest.is_deleted.is_(False),
+        or_(
+            Guest.identifier.in_(terms.exact),
+            *(
+                Guest.identifier.like(pattern)
+                for pattern in terms.prefix_patterns
+            ),
+        ),
+    )
+
+
 class GuestRepositoryProtocol(Protocol):
     # -- guests ----------------------------------------------------------------
     async def create_guest(self, **fields: object) -> Guest: ...
@@ -229,6 +262,10 @@ class GuestRepositoryProtocol(Protocol):
         device_ids: Sequence[uuid.UUID],
         organization_id: uuid.UUID | None,
     ) -> list[GuestDevice]: ...
+
+    async def list_device_presence(
+        self, *, router_mac_pairs: Sequence[tuple[uuid.UUID, str]]
+    ) -> dict[tuple[uuid.UUID, str], bool]: ...
 
     async def list_voucher_redemptions(
         self,
@@ -531,11 +568,64 @@ class GuestRepository:
     async def get_guest_by_identifier(
         self, organization_id: uuid.UUID, identifier: str
     ) -> Guest | None:
-        results = await self.guests.get_all(
-            filters={"organization_id": organization_id, "identifier": identifier},
-            limit=1,
+        """The guest this identifier belongs to -- **matched across phone
+        spellings, not by exact string equality.**
+
+        ## Why this widens
+
+        This used to be ``identifier == identifier``, and the widening it now
+        does already existed one domain over:
+        ``guest_access.validators.identifier_match_terms`` has matched rules
+        across "same digits, ignoring a leading ``+`` and up to 3 leading
+        digits" since the 2026-09 fix, for the documented reason that every
+        row written before that form fix is still in bare national digits and
+        there is no safe migration for them. Identity did not follow.
+
+        The cost of that gap: a guest who signs in as ``9876543210`` once and
+        ``+919876543210`` later gets **two ``Guest`` rows for one person** --
+        their visit count, session history and reports split, and a rule
+        written against one spelling only ever catches half of them. That is
+        what "mapping by mobile" failing actually looks like.
+
+        ## What this deliberately does not do
+
+        No canonicalisation of the stored value: ``canonicalize_rule_identifier``
+        refuses to invent a country code (``CountryCodeRequiredError``), and
+        rewriting guest identifiers is a data decision, not a lookup one.
+        Nothing here merges rows that are *already* split.
+
+        Emails are unaffected -- ``identifier_match_terms`` returns a single
+        exact term for anything it cannot prove is a phone number, and
+        ``canonicalize_rule_identifier`` returns email addresses exactly as
+        they arrive, case preserved.
+
+        ## The trade-off, named rather than discovered later
+
+        The equivalence is deliberately loose: two numbers in one organization
+        could in principle collide (one being the other minus a 1-3 digit
+        prefix), which for *identity* means two people's histories appear as
+        one. That is the same bounded risk ``identifier_match_terms``' own
+        docstring already accepts for access rules, and it shrinks as rows are
+        written in E.164.
+
+        Ties resolve to the exact spelling first, then the **oldest** row --
+        the identity the person has been carrying, not the newest spelling of
+        it."""
+        statement = (
+            select(Guest)
+            .where(
+                guest_identifier_clause(
+                    organization_id=organization_id, identifier=identifier
+                )
+            )
+            .order_by(
+                (Guest.identifier != identifier).asc(),
+                Guest.created_at.asc(),
+            )
+            .limit(1)
         )
-        return results[0] if results else None
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
 
     async def update_guest(self, guest: Guest, data: dict[str, object]) -> Guest:
         return await self.guests.update(guest, data)
@@ -773,6 +863,51 @@ class GuestRepository:
             statement = select(GuestDevice).where(*conditions)
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def list_device_presence(
+        self, *, router_mac_pairs: Sequence[tuple[uuid.UUID, str]]
+    ) -> dict[tuple[uuid.UUID, str], bool]:
+        """Whether the network is still seeing each ``(router, MAC)`` -- backs
+        ``GuestSessionResponse.device_online``.
+
+        ## Why this reads another domain's table
+
+        A ``GuestDevice`` row records that a device *did* log in; it carries
+        no liveness at all (``first_seen_at``/``last_seen_at`` are bumped by
+        portal activity, so an idle-but-connected guest would read as gone).
+        The only thing in this platform that knows whether a MAC is on the
+        venue's network *right now* is ``connected_devices``, which the
+        DHCP/ARP sync flips. That is the fact "Online" needs, so it is read
+        from where it actually lives.
+
+        The import is a model, not the other domain's service or repository,
+        which is the same shape ``app.domains.connected_devices.repository``
+        already uses to read ``Router`` -- and the direction is safe:
+        ``connected_devices.models`` imports nothing from this domain.
+
+        One query for the whole page, keyed by ``(router_id, mac_address)``
+        -- the pair, not the MAC alone, because the same phone can be on two
+        venues' networks and only one of them has seen it. A pair with no row
+        is simply absent from the result, which the caller reads as "this
+        platform has no observation", never as ``False``."""
+        if not router_mac_pairs:
+            return {}
+        router_ids = {router_id for router_id, _ in router_mac_pairs}
+        mac_addresses = {mac for _, mac in router_mac_pairs}
+        statement = select(
+            ConnectedDevice.router_id,
+            ConnectedDevice.mac_address,
+            ConnectedDevice.is_active,
+        ).where(
+            ConnectedDevice.router_id.in_(router_ids),
+            ConnectedDevice.mac_address.in_(mac_addresses),
+            ConnectedDevice.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        return {
+            (router_id, mac_address): is_active
+            for router_id, mac_address, is_active in result.all()
+        }
 
     async def list_voucher_redemptions(
         self,

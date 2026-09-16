@@ -515,6 +515,23 @@ class GuestSessionResponse(BaseModel):
     auth_method: str
     voucher_id: str | None
     status: str
+    #: Whether the venue's network is still seeing this session's device.
+    #:
+    #: ``None`` means this platform has no observation to make -- the session
+    #: carries no ``device_id`` (a MAC-less login), or the router has never
+    #: synced a ``connected_devices`` row for it. That is a real absence and
+    #: must not be rendered as "offline".
+    device_online: bool | None = None
+    #: Is this guest on the network *now* -- the question "Online" asks.
+    #:
+    #: Deliberately not the same thing as ``status``: a session row stays
+    #: ``active`` until something ends it, and a guest whose device has
+    #: dropped off the network keeps an ``active`` session until the timeout
+    #: sweep reaches it (which, for a session with no
+    #: ``session_timeout_minutes``, is never). Equals "the session is active
+    #: and the device has not been observed as gone", so a surface can label
+    #: presence and session state apart instead of showing one as the other.
+    is_online: bool = False
     started_at: datetime
     ended_at: datetime | None
     last_activity_at: datetime
