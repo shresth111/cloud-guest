@@ -149,16 +149,19 @@ def guest_identifier_clause(
     cannot drift in silence.
     """
     terms = identifier_match_terms(identifier)
-    return and_(
-        Guest.organization_id == organization_id,
-        Guest.is_deleted.is_(False),
-        or_(
-            Guest.identifier.in_(terms.exact),
-            *(
-                Guest.identifier.like(pattern)
-                for pattern in terms.prefix_patterns
-            ),
-        ),
+    # Built with the `|` / `&` operator overloads rather than `or_()`/`and_()`
+    # so this clause needs no name from the module's SQLAlchemy import list.
+    # That list is not the same on every branch this lands on -- the staging
+    # branch predates `and_`/`or_` being imported here at all -- and a helper
+    # that silently depends on it fails only where it is deployed, never
+    # where it was written.
+    spelling = Guest.identifier.in_(terms.exact)
+    for pattern in terms.prefix_patterns:
+        spelling = spelling | Guest.identifier.like(pattern)
+    return (
+        (Guest.organization_id == organization_id)
+        & Guest.is_deleted.is_(False)
+        & spelling
     )
 
 
