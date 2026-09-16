@@ -27,6 +27,7 @@ from app.database.session import get_db_session
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest_access.dependencies import get_guest_access_service
+from app.domains.guest_access.enforcement import LiveSessionTerminator
 from app.domains.guest_access.service import GuestAccessService
 from app.domains.guest_teams.quota import SharedQuotaResolver
 from app.domains.guest_teams.repository import GuestTeamRepository
@@ -163,7 +164,18 @@ def get_guest_service(
     ``queue_assignment_hook`` whenever one is wired, and it is wired here,
     so no real guest request performs the router connect itself.
     ``queue_assignment_hook`` stays wired because the voucher path still
-    uses it directly."""
+    uses it directly.
+
+    Session end addition: wires a real ``LiveSessionTerminator`` in as
+    ``GuestService``'s ``session_end_hook``. This is the one DI-wiring edit
+    required for ending or killing a session to actually take the guest off
+    the venue's WiFi: until it existed, every session end moved a row and
+    left the guest online, because the only transport wired up (an RFC 5176
+    Disconnect-Request over UDP) has never once reached a router in this
+    deployment. The terminator is built from the ``RouterService`` and
+    ``GuestRepository`` already injected here rather than through another
+    ``Depends`` -- both are exactly what it needs, and ``GuestRepository``
+    already satisfies ``DeviceLookupProtocol``."""
     from .tasks import enqueue_guest_queue_assignment
 
     return GuestService(
@@ -177,6 +189,9 @@ def get_guest_service(
         access_control_hook=guest_access_service,
         queue_assignment_hook=queue_management_service,
         queue_assignment_dispatcher=enqueue_guest_queue_assignment,
+        session_end_hook=LiveSessionTerminator(
+            router_lookup=router_service, device_lookup=repository
+        ),
         policy_lookup=policy_service,
         mac_authorization_hook=mac_authorization_service,
         team_quota_hook=team_quota_resolver,

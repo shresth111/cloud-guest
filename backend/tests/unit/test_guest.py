@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -4378,10 +4378,57 @@ class TestPauseResumeExtend:
         assert extended.status == GuestSessionStatus.PAUSED.value
 
 
+@dataclass
+class _FakeSessionEndAdapter:
+    """Stands in for ``MikroTikGuestAccessAdapter``.
+
+    Records what the terminator asked a device to do, and returns what a real
+    router would: an ``/ip hotspot active`` table that no longer (or still)
+    lists the guest. The real adapter opens a socket; this one does not."""
+
+    still_active: int = 0
+    raises: Exception | None = None
+    calls: list[dict] = field(default_factory=list)
+
+    async def end_sessions(self, credentials, *, mac_address, username):
+        from app.domains.guest_access.device_adapters import (
+            SessionControlSnapshot,
+            SessionEndOutcome,
+        )
+
+        self.calls.append(
+            {
+                "host": credentials.host,
+                "api_username": credentials.username,
+                "identifier": username,
+                "mac_address": mac_address,
+            }
+        )
+        if self.raises is not None:
+            raise self.raises
+        return SessionEndOutcome(
+            control=SessionControlSnapshot(
+                hotspot_servers=1, coa_accept=True, coa_port=3799
+            ),
+            matched=1,
+            removed=0 if self.still_active else 1,
+            still_active=self.still_active,
+        )
+
+
 class TestLiveDisconnect:
-    async def _login_with_registered_nas(
-        self, fx: Fixture, *, ip_address: str | None = "203.0.113.10"
-    ) -> GuestSession:
+    """Ending a session must take the guest off the venue's router.
+
+    These drive the real ``LiveSessionTerminator`` against a fake device
+    adapter -- the same shape ``test_guest_access_block_enforcement`` uses --
+    so they cover the whole chain (guest service -> terminator -> adapter),
+    including that the router is addressed with the guest's own identifier.
+
+    The path replaced by this ran over UDP instead and had never once reached
+    a router in this deployment; see ``issue_live_disconnect``'s docstring.
+    """
+
+    async def _login(self, fx: Fixture) -> GuestSession:
         result = await fx.guest_service.login_via_otp(
             identifier="+15551113000",
             code="GOOD",
@@ -4390,156 +4437,144 @@ class TestLiveDisconnect:
             location_id=fx.location_id,
             router_id=fx.router.id,
         )
-        await fx.radius_service.register_nas(
-            actor_user_id=uuid.uuid4(),
-            router_id=fx.router.id,
-            nas_identifier="nas-live-disconnect",
-            shared_secret="s3cr3t-value",
-            ip_address=ip_address,
-        )
+        # ``FakeRouterService.add`` builds a router with no credentials and no
+        # address by default, and some paths depend on that refusal. The
+        # terminator has to build real ``GuestAccessCredentials``, so this
+        # class supplies them explicitly.
+        fx.router.api_username = "cloudguest-api"
+        fx.router.api_credentials_encrypted = "encrypted-placeholder"
+        fx.router.management_ip_address = "10.20.0.29"
         return result.session
 
-    async def test_no_op_when_no_nas_is_registered_for_the_router(self) -> None:
-        fx = make_fixture()
-        session = await fx.guest_service.login_via_otp(
-            identifier="+15551114000",
-            code="GOOD",
-            auth_method=GuestAuthMethod.OTP_SMS,
-            organization_id=None,
-            location_id=fx.location_id,
-            router_id=fx.router.id,
+    def _terminator(self, fx: Fixture, adapter: _FakeSessionEndAdapter):
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+
+        return LiveSessionTerminator(
+            router_lookup=fx.router_service,
+            device_lookup=fx.repository,
+            adapter_factory=lambda vendor: adapter,
         )
-        result = await issue_live_disconnect(fx.repository, session=session.session)
-        assert result is None
 
-    async def test_no_op_when_the_registered_nas_has_no_ip_address(self) -> None:
+    async def test_a_confirmed_end_asks_the_router_and_records_true(self) -> None:
         fx = make_fixture()
-        session = await self._login_with_registered_nas(fx, ip_address=None)
-        result = await issue_live_disconnect(fx.repository, session=session)
-        assert result is None
+        session = await self._login(fx)
+        adapter = _FakeSessionEndAdapter()
 
-    async def test_returns_true_once_a_real_disconnect_ack_comes_back(
-        self, monkeypatch
-    ) -> None:
-        from app.domains.guest import service as service_module
-        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_ACK
+        result = await issue_live_disconnect(
+            fx.repository, session=session, terminator=self._terminator(fx, adapter)
+        )
 
-        fx = make_fixture()
-        session = await self._login_with_registered_nas(fx)
-
-        sent: dict[str, object] = {}
-
-        def _fake_send_packet(packet: bytes, *, host: str, **kwargs: object):
-            sent["packet"] = packet
-            sent["host"] = host
-            return bytes([RADIUS_CODE_DISCONNECT_ACK])
-
-        monkeypatch.setattr(service_module, "send_packet", _fake_send_packet)
-
-        result = await issue_live_disconnect(fx.repository, session=session)
         assert result is True
-        assert sent["host"] == "203.0.113.10"
+        assert adapter.calls == [
+            {
+                "host": "10.20.0.29",
+                "api_username": "cloudguest-api",
+                "identifier": "+15551113000",
+                "mac_address": None,
+            }
+        ]
+        assert session.disconnect_enforced is True
 
-    async def test_returns_false_on_a_disconnect_nak(self, monkeypatch) -> None:
-        from app.domains.guest import service as service_module
-        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_NAK
-
+    async def test_a_guest_still_on_the_router_is_recorded_as_not_enforced(
+        self,
+    ) -> None:
+        """The terminator raises when the router's own table still lists the
+        guest. Recording that as enforced is exactly the lie this column
+        exists to prevent."""
         fx = make_fixture()
-        session = await self._login_with_registered_nas(fx)
+        session = await self._login(fx)
+        adapter = _FakeSessionEndAdapter(still_active=1)
 
-        monkeypatch.setattr(
-            service_module,
-            "send_packet",
-            lambda packet, *, host, **kwargs: bytes([RADIUS_CODE_DISCONNECT_NAK]),
+        result = await issue_live_disconnect(
+            fx.repository, session=session, terminator=self._terminator(fx, adapter)
         )
 
-        result = await issue_live_disconnect(fx.repository, session=session)
         assert result is False
+        assert session.disconnect_enforced is False
 
-    async def test_returns_none_on_a_timeout(self, monkeypatch) -> None:
-        """Mirrors ``radius_coa.send_packet``'s own real "no live NAS
-        listening" outcome -- a timeout, surfaced as ``None``, never an
-        exception."""
-        from app.domains.guest import service as service_module
-
+    async def test_an_unreachable_router_never_raises(self) -> None:
+        """The contract every session-ending path relies on: the status
+        transition has already committed, so a dead router must not turn an
+        operator's "Terminate" into a 500."""
         fx = make_fixture()
-        session = await self._login_with_registered_nas(fx)
+        session = await self._login(fx)
+        adapter = _FakeSessionEndAdapter(raises=OSError("no route to host"))
 
-        monkeypatch.setattr(
-            service_module, "send_packet", lambda packet, *, host, **kwargs: None
+        result = await issue_live_disconnect(
+            fx.repository, session=session, terminator=self._terminator(fx, adapter)
         )
 
-        result = await issue_live_disconnect(fx.repository, session=session)
-        assert result is None
+        assert result is False
+        assert session.disconnect_enforced is False
 
-    async def test_never_raises_when_the_send_itself_explodes(
-        self, monkeypatch
-    ) -> None:
-        from app.domains.guest import service as service_module
-
+    async def test_no_terminator_wired_touches_nothing(self) -> None:
         fx = make_fixture()
-        session = await self._login_with_registered_nas(fx)
+        session = await self._login(fx)
 
-        def _exploding_send_packet(packet: bytes, *, host: str, **kwargs: object):
-            raise OSError("network unreachable")
+        assert await issue_live_disconnect(fx.repository, session=session) is None
+        assert session.disconnect_enforced is False
 
-        monkeypatch.setattr(service_module, "send_packet", _exploding_send_packet)
-
-        result = await issue_live_disconnect(fx.repository, session=session)
-        assert result is None
-
-    async def test_disconnect_session_attempts_a_live_disconnect(
-        self, monkeypatch
-    ) -> None:
-        """Integration-level proof that ``disconnect_session`` itself
-        (not just ``issue_live_disconnect`` called directly) triggers the
-        real send."""
-        from app.domains.guest import service as service_module
-        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_ACK
-
+    async def test_disconnect_session_cuts_the_guest_off_the_router(self) -> None:
+        """Integration-level proof that ``disconnect_session`` itself -- not
+        just ``issue_live_disconnect`` called directly -- reaches the device.
+        This is the operator's "Kill session"."""
         fx = make_fixture()
-        session = await self._login_with_registered_nas(fx)
-
-        calls: list[str] = []
-
-        def _fake_send_packet(packet: bytes, *, host: str, **kwargs: object):
-            calls.append(host)
-            return bytes([RADIUS_CODE_DISCONNECT_ACK])
-
-        monkeypatch.setattr(service_module, "send_packet", _fake_send_packet)
+        session = await self._login(fx)
+        adapter = _FakeSessionEndAdapter()
+        fx.guest_service.session_end_hook = self._terminator(fx, adapter)
 
         updated = await fx.guest_service.disconnect_session(session_id=session.id)
+
         assert updated.status == GuestSessionStatus.DISCONNECTED.value
-        assert calls == ["203.0.113.10"]
+        assert [c["identifier"] for c in adapter.calls] == ["+15551113000"]
 
-    async def test_guest_self_disconnect_attempts_a_live_disconnect(
-        self, monkeypatch
-    ) -> None:
-        """Same integration-level proof as
-        ``test_disconnect_session_attempts_a_live_disconnect``, for the
-        guest-initiated path (``disconnect_own_session``) -- a guest
-        tapping "Disconnect" on the captive portal's success screen must
-        actually cut their device off the network, not just flip a status
-        column."""
-        from app.domains.guest import service as service_module
-        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_ACK
-
+    async def test_terminate_session_cuts_the_guest_off_the_router(self) -> None:
         fx = make_fixture()
-        session = await self._login_with_registered_nas(fx)
+        session = await self._login(fx)
+        adapter = _FakeSessionEndAdapter()
+        fx.guest_service.session_end_hook = self._terminator(fx, adapter)
 
-        calls: list[str] = []
+        updated = await fx.guest_service.terminate_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
 
-        def _fake_send_packet(packet: bytes, *, host: str, **kwargs: object):
-            calls.append(host)
-            return bytes([RADIUS_CODE_DISCONNECT_ACK])
+        assert updated.status == GuestSessionStatus.TERMINATED.value
+        assert len(adapter.calls) == 1
 
-        monkeypatch.setattr(service_module, "send_packet", _fake_send_packet)
+    async def test_guest_self_disconnect_cuts_the_guest_off_the_router(self) -> None:
+        """The portal's own "Disconnect" button: a guest tapping it must
+        actually leave the network, not just flip a status column."""
+        fx = make_fixture()
+        session = await self._login(fx)
+        adapter = _FakeSessionEndAdapter()
+        fx.guest_service.session_end_hook = self._terminator(fx, adapter)
 
         updated = await fx.guest_service.disconnect_own_session(
             guest_id=session.guest_id, session_id=session.id
         )
+
         assert updated.status == GuestSessionStatus.DISCONNECTED.value
-        assert calls == ["203.0.113.10"]
+        assert len(adapter.calls) == 1
+
+    async def test_a_stop_the_router_reported_opens_no_connection(self) -> None:
+        """``already_ended_on_device`` is what ``RadiusService.accounting_stop``
+        passes, and it fires on every ordinary guest disconnect. Opening a
+        connection there would be one connect and login per disconnect,
+        fleet-wide, to remove a row the router has already dropped."""
+        fx = make_fixture()
+        session = await self._login(fx)
+        adapter = _FakeSessionEndAdapter()
+        fx.guest_service.session_end_hook = self._terminator(fx, adapter)
+
+        updated = await fx.guest_service.disconnect_session(
+            session_id=session.id,
+            reason="radius_accounting_stop",
+            already_ended_on_device=True,
+        )
+
+        assert updated.status == GuestSessionStatus.DISCONNECTED.value
+        assert adapter.calls == []
+        assert session.disconnect_enforced is None
 
 
 # ============================================================================
@@ -7540,11 +7575,13 @@ class TestRadiusAccountingOnOff:
 
         assert closed == []
 
-    async def test_accounting_on_never_sends_a_live_coa_disconnect(self) -> None:
+    async def test_accounting_on_never_disconnects_the_device(self) -> None:
         """Unlike enforce_session_timeouts/run_fup_time_accrual, closing a
-        session on Accounting-On must never attempt a live RADIUS
-        CoA-Disconnect back to the NAS that just told us it is
-        restarting."""
+        session on Accounting-On must never tell the router to cut anyone
+        off: the NAS has just said it is restarting, so every session it was
+        serving is already gone. (This used to be asserted by patching the
+        RADIUS ``send_packet``; the device call goes through the session-end
+        hook now, so that is what must stay untouched.)"""
         fx = make_fixture()
         await self._register_nas(fx)
         await self._login(fx, "+15550005555")
@@ -7552,13 +7589,19 @@ class TestRadiusAccountingOnOff:
             nas_identifier="nas-1", shared_secret="supersecret123"
         )
 
-        with patch(
-            "app.domains.guest.service.send_packet",
-            new_callable=AsyncMock,
-        ) as mock_send_packet:
-            await fx.radius_service.accounting_on(nas_client=nas_client)
+        called: list[str] = []
 
-        mock_send_packet.assert_not_called()
+        class _SpyTerminator:
+            async def end_on_router(
+                self, *, session, identifier, organization_id=None
+            ):
+                called.append(identifier)
+
+        fx.guest_service.session_end_hook = _SpyTerminator()
+
+        await fx.radius_service.accounting_on(nas_client=nas_client)
+
+        assert called == []
 
 
 class TestRadiusAccountingRequestSchema:

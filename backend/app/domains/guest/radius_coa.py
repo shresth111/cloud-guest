@@ -3,6 +3,26 @@ packet construction and sending -- Phase 1 BhaiFi-parity (#16), replacing
 ``service.py``'s previously-documented "nothing in this module ever issues
 a live CoA-Disconnect packet" sandbox no-op.
 
+## Currently unwired: nothing in this application sends one any more
+
+As of 2026-09-16 ``service.issue_live_disconnect`` no longer calls this
+module. It built and sent a correct Disconnect-Request on every session
+end, and the packet never once reached a router: the app server has no
+route into the hub's ``10.20.0.0/24`` tunnel subnet, so every one left by
+the default gateway and was dropped. Measured on production before the
+change, ``guest_sessions.disconnect_enforced`` stood at 584 NULL, 32 false
+and **zero true** across the whole fleet's history -- the platform had
+never disconnected a single guest this way.
+
+Session end now goes through the RouterOS API on port 8728
+(``app.domains.guest_access.enforcement.LiveSessionTerminator``), the only
+transport that answers from the app server and the one block enforcement
+already removes guests with. This module is kept, and tested, because it is
+a correct RFC 5176 implementation and the right transport the moment that
+tunnel becomes routable from the app server -- at which point
+``issue_live_disconnect`` can call it again (preferring it, or falling back
+to 8728, whichever the reachability work concludes).
+
 ## What's real here, and what this sandbox still cannot verify
 
 The packet this module builds is a genuine, wire-correct RFC 2865/5176
