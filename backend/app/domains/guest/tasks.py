@@ -76,10 +76,12 @@ from .constants import (
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
+    TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
 )
 from .repository import GuestRepository
 from .service import (
     enforce_session_timeouts,
+    enforce_whitelist_only_online_guests,
     reconcile_sessions_with_router_presence,
     run_fup_time_accrual,
     run_quota_reset,
@@ -217,6 +219,108 @@ def run_quota_reset_sweep() -> dict[str, object]:
     result = run_celery_task(_run_quota_reset_sweep_async())
     logger.info("guest_task_run_quota_reset_sweep_completed", extra=result)
     return result
+
+
+# ============================================================================
+# Only Allowed enforcement sweep -- the sessions a whitelist-only property
+# has already stopped admitting
+# ============================================================================
+
+
+def _build_access_decision_service(session: AsyncSession):
+    """A real ``GuestAccessService`` for a caller that only ever *asks*
+    whether a rule applies -- the same object
+    ``app.domains.guest_access.dependencies.get_access_decision_service``
+    builds for the router agent's poll, and for the same reason it exists
+    there: no enforcer and no audit writer, so this sweep can never open a
+    router connection or write an audit row on a once-every-five-minutes
+    path.
+
+    Imported inside the function to match ``_build_session_terminator``
+    below, which imports the same domain for the same reason."""
+    from app.domains.guest_access.repository import GuestAccessRepository
+    from app.domains.guest_access.service import GuestAccessService
+
+    return GuestAccessService(GuestAccessRepository(session), block_enforcer=None)
+
+
+def _build_mac_authorization_service(session: AsyncSession):
+    """A real ``MacAuthorizationService`` with only its repository wired --
+    enough for ``is_mac_authorized``, which is the one method this sweep
+    needs. ``audit_writer``/``router_lookup`` are the other two optional
+    constructor arguments and are only used by the entry-management and
+    config-generation paths, neither of which runs here."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+
+    return MacAuthorizationService(MacAuthorizationRepository(session))
+
+
+def _build_captive_portal_service(session: AsyncSession):
+    """Constructs a real ``CaptivePortalService`` the way
+    ``app.domains.captive_portal.dependencies`` would via ``Depends`` -- the
+    identical hand-built composition ``_build_policy_service`` above already
+    performs, against the same live ``OrganizationService``/``LocationService``
+    pair.
+
+    ``resolve_cache`` is deliberately left unwired: inside a task there is no
+    request-scoped cache to share, and the service degrades to an uncached
+    resolve. That costs one query per location that has guests online, once
+    per sweep -- not one per guest, which is what the sweep's own
+    ``configs_by_location`` memo prevents."""
+    from app.domains.captive_portal.repository import CaptivePortalRepository
+    from app.domains.captive_portal.service import CaptivePortalService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    return CaptivePortalService(
+        CaptivePortalRepository(session), organization_service, location_service
+    )
+
+
+async def _run_whitelist_only_enforcement_sweep_async() -> int:
+    """The actual async work behind ``run_whitelist_only_enforcement_sweep``
+    -- a fresh session per task run, mirroring every other sweep in this
+    module. Returns the number of sessions flipped to ``TERMINATED``."""
+    async with SessionLocal() as session:
+        try:
+            repository = GuestRepository(session)
+            ended = await enforce_whitelist_only_online_guests(
+                repository,
+                captive_portal_lookup=_build_captive_portal_service(session),
+                access_control_hook=_build_access_decision_service(session),
+                mac_authorization_hook=_build_mac_authorization_service(session),
+                terminator=_build_session_terminator(session, repository),
+            )
+            await session.commit()
+            return len(ended)
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP)
+def run_whitelist_only_enforcement_sweep() -> dict[str, object]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``).
+
+    Ends the session of every guest a property with
+    ``whitelist_only_enabled`` would now refuse, at the device as well as in
+    this platform's records (``service.issue_live_disconnect``). Before this
+    task, that flag was answered once at sign-in and never re-asked, so
+    switching it on stopped admitting *new* guests while leaving every guest
+    already online exactly where they were."""
+    ended_count = run_celery_task(_run_whitelist_only_enforcement_sweep_async())
+    logger.info(
+        "guest_task_run_whitelist_only_enforcement_sweep_completed",
+        extra={"ended_count": ended_count},
+    )
+    return {"ended_count": ended_count}
 
 
 # ============================================================================

@@ -535,6 +535,30 @@ TASK_RUN_QUOTA_RESET_SWEEP = "app.domains.guest.tasks.run_quota_reset_sweep"
 
 QUOTA_RESET_SWEEP_INTERVAL_SECONDS = 3600.0
 
+
+# ============================================================================
+# Only Allowed enforcement sweep -- Celery Beat task wiring.
+# ============================================================================
+# ``whitelist_only_enabled`` is answered once, at sign-in
+# (``service.GuestService._enforce_access_control``, reached from every login
+# method and from the OTP-request gate). Nothing re-asked it afterwards, so a
+# venue that switched it on kept serving every guest who was *already* online
+# -- and the guests it exists to refuse are the ones with a session in hand.
+# Founder QA: "Always allowed not working" / "turning it on doesn't cut off
+# guests already online".
+#
+# Same 5-minute cadence as the other guest sweeps in this module: a venue
+# closing its doors wants the venue empty promptly, and five minutes is the
+# cadence this fleet already treats as "promptly" for a session that should
+# have ended (see ``SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS``).
+# ============================================================================
+
+TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP = (
+    "app.domains.guest.tasks.run_whitelist_only_enforcement_sweep"
+)
+
+WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS = 300.0
+
 # ============================================================================
 # Dynamic bandwidth-queue assignment, off the login request path
 # ============================================================================
@@ -738,6 +762,8 @@ __all__ = [
     "TASK_RUN_FUP_TIME_ACCRUAL_SWEEP",
     "FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_QUOTA_RESET_SWEEP",
+    "TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP",
+    "WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
     "TASK_ASSIGN_GUEST_QUEUE",
     "ASSIGN_GUEST_QUEUE_MAX_RETRIES",
     "ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS",

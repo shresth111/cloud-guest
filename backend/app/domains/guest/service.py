@@ -600,6 +600,287 @@ async def enforce_session_timeouts(
     return expired
 
 
+async def whitelist_only_refusal_stands(
+    mac_authorization_hook: MacAuthorizationLookupProtocol | None,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+    device_mac: str | None,
+    device_mac_already_authorized: bool = False,
+) -> tuple[bool, bool]:
+    """Given "a whitelist-only property matched nothing for this guest", does
+    the refusal stand -- or does a Trusted Devices entry admit them anyway?
+
+    Returns ``(refusal_stands, trusted_device_consulted)``.
+
+    This is the half of ``GuestService._enforce_access_control`` that decides
+    whether an operator has to keep the same device in two tables. It is
+    module scope rather than a method because there are now two callers that
+    must agree: the login gate, and
+    ``enforce_whitelist_only_online_guests`` below, which cuts off a session
+    that was admitted before the property switched this on. A trusted device
+    that the login gate admits and the sweep then terminates would be the
+    worst of both -- an operator's own front-desk tablet, taken off the WiFi
+    every five minutes, by a rule that reads the table they filled in.
+
+    The truth table is exactly the inline block it replaced, including the
+    case that looks like an oversight and is not: a device whose MAC is
+    missing, malformed, or unaccompanied by a wired hook is *not* consulted
+    (``trusted_device_consulted`` stays False, so the refusal event does not
+    claim a lookup that never happened) and the refusal stands. Only a real
+    ``mac_authorization_entries`` hit -- normalized first, because the NAS's
+    spelling and the stored one differ -- lets the guest through.
+    """
+    if device_mac is None:
+        return True, False
+    if device_mac_already_authorized:
+        # ``login_via_mac_whitelist`` has just performed this identical check
+        # for its own reasons and passes the answer down rather than paying
+        # for a second lookup inside the same request.
+        return False, False
+    if mac_authorization_hook is None:
+        return True, False
+    try:
+        normalized = normalize_whitelist_mac_address(device_mac)
+    except MacAuthorizationError:
+        # Not MAC-shaped at all -- nothing to reconcile against, and never a
+        # reason to admit someone.
+        return True, False
+    if normalized is None:
+        return True, False
+    admitted = await mac_authorization_hook.is_mac_authorized(
+        normalized, organization_id=organization_id, location_id=location_id
+    )
+    return (not admitted), True
+
+
+async def _session_mac_address(
+    repository: GuestRepositoryProtocol, session: GuestSession
+) -> str | None:
+    """The MAC this session's device is using, or ``None`` -- the same
+    device-row lookup ``GuestService.is_session_blocklisted`` performs, for
+    the same reason: a session carries ``device_id``, not the address."""
+    if session.device_id is None:
+        return None
+    device = await repository.get_device_by_id(session.device_id)
+    return device.mac_address if device is not None else None
+
+
+#: The ``disconnect_reason`` literal ``enforce_whitelist_only_online_guests``
+#: writes. Deliberately *not* added to the guest-facing reason vocabulary in
+#: ``constants.GuestSessionEndedReason``: ``TERMINATED`` maps to no member
+#: there on purpose, so a guest cut off this way gets an ordinary sign-in page
+#: -- where the property's own ``whitelist_only_denied_message`` is what
+#: explains the situation, in the operator's words, rather than a second
+#: message invented here.
+WHITELIST_ONLY_DISCONNECT_REASON = "whitelist_only"
+
+
+async def enforce_whitelist_only_online_guests(
+    repository: GuestRepositoryProtocol,
+    *,
+    captive_portal_lookup: CaptivePortalLookupProtocol | None,
+    access_control_hook: AccessDecisionProtocol | None,
+    mac_authorization_hook: MacAuthorizationLookupProtocol | None,
+    terminator: LiveSessionTerminatorProtocol | None = None,
+    now: datetime | None = None,
+) -> list[GuestSession]:
+    """End the session of every guest a whitelist-only property would now
+    refuse -- the half of the feature that was missing.
+
+    ``whitelist_only_enabled`` was answered once, at sign-in. Nothing re-asked
+    it, so switching the feature on emptied the venue of *future* guests and
+    left every guest already online exactly where they were: the property
+    believes it is running closed, its dashboard says so, and the people it
+    exists to refuse are the ones with a session in hand. Founder QA: "Always
+    allowed not working" / "turning it on doesn't cut off guests already
+    online".
+
+    **Reads the same decision the login gate reads.** ``check_access`` with
+    ``whitelist_only_enabled=True``, then -- only on a whitelist-only denial
+    -- ``whitelist_only_refusal_stands``, so a device in
+    ``mac_authorization_entries`` survives. A *blocklist* denial found here
+    ends the session too, which is deliberate and free: it is the same
+    ``check_access`` call, and ``guest_access.enforcement`` already
+    terminates a guest the moment a rule is written. What this adds for that
+    case is only the repair path -- a rule whose device-side removal failed
+    leaves ``status`` ACTIVE on purpose, and this is the sweep that retries
+    it.
+
+    ## Failure direction
+
+    Fail open at every step, and say so: a config that will not resolve (skip
+    that location), a guest row that has gone (skip), a decision lookup that
+    raises (skip that guest, log it). This runs unattended against live
+    venues, and the alternative -- stopping a sweep on one bad row -- either
+    kills the sweep for everyone or, worse, is the shape that ends up
+    terminating sessions on a lookup failure. A property whose lookup is
+    failing keeps the guests it has, which is last week's behaviour plus a
+    WARNING.
+
+    ## What it cannot do
+
+    It cannot end a session whose device it cannot reach: ``issue_live_disconnect``
+    is best-effort by its own contract and records ``disconnect_enforced``
+    either way, so a router that is down leaves the guest online with a row
+    that says so. And it writes no ``GuestLoginHistory`` row, so a guest cut
+    off here does not appear in the dashboard's "turned away in the last 24
+    hours" counter -- that counter is a filter on login attempts, and this is
+    not one.
+
+    Returns every session just flipped to ``TERMINATED``.
+    """
+    started = now or datetime.now(UTC)
+    if access_control_hook is None or captive_portal_lookup is None:
+        logger.warning(
+            "whitelist_only_sweep_not_wired",
+            extra={
+                "access_control_hook": access_control_hook is not None,
+                "captive_portal_lookup": captive_portal_lookup is not None,
+                "detail": (
+                    "the Only Allowed enforcement sweep ran with no access "
+                    "decision hook wired, so it made no decision at all "
+                    "(fail-open). Every real request path wires it via "
+                    "dependencies.get_guest_service."
+                ),
+            },
+        )
+        return []
+
+    pairs = await repository.list_active_guest_org_pairs()
+    ended: list[GuestSession] = []
+    # One config resolution per location, not per guest: a venue with forty
+    # guests online resolves its own config once.
+    configs_by_location: dict[uuid.UUID, Any] = {}
+
+    for pair in pairs:
+        location_id = pair.location_id
+        if location_id is None:
+            continue
+        if location_id not in configs_by_location:
+            try:
+                resolved = await captive_portal_lookup.resolve_portal_config(
+                    organization_id=pair.organization_id, location_id=location_id
+                )
+                configs_by_location[location_id] = getattr(resolved, "config", None)
+            except Exception as exc:  # noqa: BLE001 -- see this function's docstring
+                configs_by_location[location_id] = None
+                logger.warning(
+                    "whitelist_only_sweep_config_lookup_failed",
+                    extra={
+                        "organization_id": str(pair.organization_id),
+                        "location_id": str(location_id),
+                        "error": str(exc),
+                    },
+                )
+        config = configs_by_location[location_id]
+        if config is None or not getattr(config, "whitelist_only_enabled", False):
+            continue
+        try:
+            ended.extend(
+                await _end_unlisted_sessions_for_guest(
+                    repository,
+                    access_control_hook=access_control_hook,
+                    mac_authorization_hook=mac_authorization_hook,
+                    terminator=terminator,
+                    organization_id=pair.organization_id,
+                    location_id=location_id,
+                    guest_id=pair.guest_id,
+                    now=started,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- one guest must not stop the rest
+            logger.warning(
+                "whitelist_only_sweep_guest_failed",
+                extra={
+                    "organization_id": str(pair.organization_id),
+                    "location_id": str(location_id),
+                    "guest_id": str(pair.guest_id),
+                    "error": str(exc),
+                },
+            )
+    return ended
+
+
+async def _end_unlisted_sessions_for_guest(
+    repository: GuestRepositoryProtocol,
+    *,
+    access_control_hook: AccessDecisionProtocol,
+    mac_authorization_hook: MacAuthorizationLookupProtocol | None,
+    terminator: LiveSessionTerminatorProtocol | None,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID,
+    guest_id: uuid.UUID,
+    now: datetime,
+) -> list[GuestSession]:
+    """The per-guest half of ``enforce_whitelist_only_online_guests``.
+
+    Decided per **session**, not per guest: the unit of admission at a
+    whitelist-only property is the device. A guest with a trusted tablet and
+    an untrusted laptop is admitted for one and refused for the other, and a
+    single guest-level answer would have to pick one of those and be wrong
+    about the other."""
+    guest = await repository.get_guest_by_id(guest_id)
+    if guest is None:
+        return []
+    sessions = [
+        session
+        for session in await repository.list_active_sessions_for_guest(guest_id)
+        if session.location_id == location_id
+    ]
+    ended: list[GuestSession] = []
+    for session in sessions:
+        mac_address = await _session_mac_address(repository, session)
+        decision = await access_control_hook.check_access(
+            organization_id=organization_id,
+            requesting_organization_id=organization_id,
+            location_id=location_id,
+            identifier=guest.identifier,
+            mac_address=mac_address,
+            whitelist_only_enabled=True,
+        )
+        if decision.allowed:
+            continue
+        if decision.is_whitelist_only_denial:
+            stands, trusted_device_consulted = await whitelist_only_refusal_stands(
+                mac_authorization_hook,
+                organization_id=organization_id,
+                location_id=location_id,
+                device_mac=mac_address,
+            )
+            if not stands:
+                logger.info(
+                    "whitelist_only_sweep_trusted_device_kept_online",
+                    extra={
+                        "session_id": str(session.id),
+                        "organization_id": str(organization_id),
+                        "location_id": str(location_id),
+                        "trusted_device_consulted": trusted_device_consulted,
+                    },
+                )
+                continue
+        updated = await repository.update_session(
+            session,
+            {
+                "status": GuestSessionStatus.TERMINATED.value,
+                "ended_at": now,
+                "disconnect_reason": WHITELIST_ONLY_DISCONNECT_REASON,
+            },
+        )
+        logger.info(
+            "guest_session_ended_whitelist_only",
+            extra={
+                "session_id": str(updated.id),
+                "organization_id": str(organization_id),
+                "location_id": str(location_id),
+                "guest_id": str(guest_id),
+            },
+        )
+        await issue_live_disconnect(repository, session=updated, terminator=terminator)
+        ended.append(updated)
+    return ended
+
+
 async def close_sessions_for_nas_restart(
     repository: GuestRepositoryProtocol,
     *,
@@ -5348,34 +5629,21 @@ class GuestService:
 
         # Whitelist-only, nothing matched. Before refusing, reconcile with
         # Trusted Devices -- see this method's docstring for why operators
-        # must not have to keep the same device in two tables.
-        trusted_device_consulted = False
-        if device_mac is not None:
-            if device_mac_already_authorized:
-                return
-            if self.mac_authorization_hook is not None:
-                try:
-                    # Normalized here rather than handed over raw. A guest
-                    # arrives with whatever spelling their NAS reported
-                    # ("aa-bb-cc-..."), the Trusted Devices table stores one
-                    # canonical form, and a case-sensitive miss here would
-                    # refuse a device the operator can see on their own
-                    # trusted list. The real service normalizes internally
-                    # too; doing it explicitly means the two cannot quietly
-                    # disagree about which spellings match.
-                    normalized = normalize_whitelist_mac_address(device_mac)
-                except MacAuthorizationError:
-                    # Not MAC-shaped at all -- nothing to reconcile
-                    # against, and never a reason to admit someone.
-                    normalized = None
-                if normalized is not None:
-                    trusted_device_consulted = True
-                    if await self.mac_authorization_hook.is_mac_authorized(
-                        normalized,
-                        organization_id=organization_id,
-                        location_id=location_id,
-                    ):
-                        return
+        # must not have to keep the same device in two tables. The decision
+        # itself lives in ``whitelist_only_refusal_stands`` (module scope,
+        # above): ``enforce_whitelist_only_online_guests`` asks the identical
+        # question about a session that is already online and must get the
+        # identical answer, or the login gate would admit a device the sweep
+        # then terminates every five minutes.
+        refusal_stands, trusted_device_consulted = await whitelist_only_refusal_stands(
+            self.mac_authorization_hook,
+            organization_id=organization_id,
+            location_id=location_id,
+            device_mac=device_mac,
+            device_mac_already_authorized=device_mac_already_authorized,
+        )
+        if not refusal_stands:
+            return
 
         event = WhitelistOnlyLoginRefused(
             organization_id=organization_id,

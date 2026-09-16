@@ -849,6 +849,14 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "queue-management-sweep-schedule-transitions",
         "guest-fup-time-accrual-sweep",
         "guest-quota-reset-sweep",
+        # Only Allowed. The flag used to be answered once, at sign-in, and
+        # never re-asked -- so switching it on stopped admitting new guests
+        # and left every guest already online exactly where they were, with
+        # the venue believing it was running closed. Its absence from this
+        # set is a property whose dashboard says "only listed guests can
+        # connect" while the people it exists to refuse keep streaming. See
+        # app.domains.guest.tasks.run_whitelist_only_enforcement_sweep.
+        "guest-whitelist-only-enforcement-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         # Monitored hardware liveness: the fast ping-driven UP/DOWN path
