@@ -46,6 +46,9 @@ from app.domains.dhcp.constants import RogueDhcpAlertState
 from app.domains.isp.constants import HealthStatus as IspHealthStatus
 from app.domains.isp.constants import IspLinkRole, IspLinkType
 from app.domains.isp.device_adapters import PingResult
+from app.domains.monitored_hardware.constants import HardwareStatus
+from app.domains.monitored_hardware.models import MonitoredHardware
+from app.domains.monitored_hardware.service import HardwareWithStatus
 from app.domains.monitoring.constants import (
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
@@ -325,6 +328,7 @@ class FakeRepository:
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         router_id: uuid.UUID | None,
+        subject_id: uuid.UUID | None = None,
     ) -> Alert | None:
         for alert in self.alerts.values():
             if (
@@ -333,6 +337,7 @@ class FakeRepository:
                 and alert.organization_id == organization_id
                 and alert.location_id == location_id
                 and alert.router_id == router_id
+                and alert.subject_id == subject_id
             ):
                 return alert
         return None
@@ -3403,3 +3408,274 @@ async def test_an_unconfigured_mailbox_fails_loudly_rather_than_reporting_succes
         await provider.send("owner@venue.example", "subject", "body")
 
     assert "smtp_from_address does not match" in str(exc_info.value)
+
+
+# ============================================================================
+# The monitored-hardware de-duplication key
+#
+# An AP-down alert existed as a rule, a target and a message long before it
+# could actually reach anyone, and the de-duplication key was the reason: it
+# was (rule, organization, location, router) with no device dimension, and a
+# monitored device's router_id is normally NULL. So every access point at one
+# location shared a single key.
+# ============================================================================
+
+
+class _FakeMonitoredHardwareService:
+    """Only the one method ``AlertService``'s monitored-hardware branch
+    calls. Returns whatever the test set up, for any organization -- the
+    branch filters by ``rule.organization_id`` itself, and these tests use
+    one organization."""
+
+    def __init__(self, items: list[HardwareWithStatus]) -> None:
+        self.items = items
+
+    async def list_all_devices_with_status(self, **_kwargs: object):
+        return list(self.items)
+
+
+def _hardware(
+    name: str, *, organization_id: uuid.UUID, location_id: uuid.UUID
+) -> MonitoredHardware:
+    return MonitoredHardware(
+        **_base_fields(
+            organization_id=organization_id,
+            location_id=location_id,
+            # A monitored device is not a router: this is NULL in practice,
+            # which is the whole reason the key needed another dimension.
+            router_id=None,
+            name=name,
+            mac_address=f"AA:BB:CC:{uuid.uuid4().hex[:2]}:00:01",
+            device_type="access_point",
+            floor=None,
+        )
+    )
+
+
+def _down(device: MonitoredHardware) -> HardwareWithStatus:
+    return HardwareWithStatus(
+        device=device,
+        status=HardwareStatus.DOWN,
+        last_seen_at=None,
+        connected_at=None,
+    )
+
+
+async def _hardware_rule(repo: FakeRepository, org_id: uuid.UUID):
+    return await repo.create_alert_rule(
+        **_alert_rule_fields(
+            organization_id=org_id,
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_MONITORED_HARDWARE,
+            condition_config={"expected_status": "down"},
+            severity=AlertSeverity.WARNING,
+        )
+    )
+
+
+async def test_two_access_points_down_at_one_location_are_two_alerts():
+    """The defect, in one assertion.
+
+    The first AP to go down alerted; the second produced nothing at all --
+    its ``find_active_alert`` found the first's row. And while that first
+    alert stayed open, which for a device that is still down is forever,
+    nothing else at that location could fire either. A venue with five
+    access points got one alert, naming whichever device the evaluation loop
+    happened to see first."""
+    repo = FakeRepository()
+    org_id = uuid.uuid4()
+    location_id = uuid.uuid4()
+    await _hardware_rule(repo, org_id)
+    first = _hardware("AP One", organization_id=org_id, location_id=location_id)
+    second = _hardware("AP Two", organization_id=org_id, location_id=location_id)
+    service = AlertService(
+        repo,
+        monitored_hardware_service=_FakeMonitoredHardwareService(
+            [_down(first), _down(second)]
+        ),
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 2
+    assert {alert.subject_id for alert in result.triggered} == {first.id, second.id}
+    # The message was never the problem -- each alert always named its own
+    # device. It is the row that went missing.
+    assert {alert.message for alert in result.triggered} == {
+        "AP One health status is down",
+        "AP Two health status is down",
+    }
+
+
+async def test_one_access_point_stays_one_alert_across_sweeps():
+    """The de-duplication the key exists for still has to work, per device: a
+    device that is still down on the next 30-second sweep must not get a
+    second alert -- and so a second email."""
+    repo = FakeRepository()
+    org_id = uuid.uuid4()
+    location_id = uuid.uuid4()
+    await _hardware_rule(repo, org_id)
+    device = _hardware("AP One", organization_id=org_id, location_id=location_id)
+    service = AlertService(
+        repo,
+        monitored_hardware_service=_FakeMonitoredHardwareService([_down(device)]),
+    )
+
+    first = await service.evaluate_alert_rules()
+    second = await service.evaluate_alert_rules()
+
+    assert len(first.triggered) == 1
+    assert second.triggered == []
+    assert len(repo.alerts) == 1
+
+
+async def test_recovery_resolves_only_the_device_that_came_back():
+    """Two APs down is two alerts, so one coming back must not clear the
+    other's -- with a shared key it did, which is the same defect seen from
+    the other end."""
+    repo = FakeRepository()
+    org_id = uuid.uuid4()
+    location_id = uuid.uuid4()
+    await _hardware_rule(repo, org_id)
+    back = _hardware("AP One", organization_id=org_id, location_id=location_id)
+    still_down = _hardware("AP Two", organization_id=org_id, location_id=location_id)
+    hardware = _FakeMonitoredHardwareService([_down(back), _down(still_down)])
+    service = AlertService(repo, monitored_hardware_service=hardware)
+
+    await service.evaluate_alert_rules()
+
+    hardware.items = [
+        HardwareWithStatus(
+            device=back,
+            status=HardwareStatus.UP,
+            last_seen_at=_now(),
+            connected_at=_now(),
+        ),
+        _down(still_down),
+    ]
+    resolved = await service.evaluate_alert_rules()
+
+    assert [alert.subject_id for alert in resolved.resolved] == [back.id]
+    open_alerts = [
+        alert
+        for alert in repo.alerts.values()
+        if alert.status != AlertStatus.RESOLVED.value
+    ]
+    assert [alert.subject_id for alert in open_alerts] == [still_down.id]
+
+
+async def test_every_other_target_still_alerts_without_a_subject():
+    """The guard for the branches that must not change. ``subject_id``
+    defaults to None, so router/ISP/controller/rogue-DHCP alerts keep
+    de-duplicating on exactly the key they used before this column existed --
+    and keep recording no subject, which is what makes them group the way
+    they always have."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    router = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Router One",
+        health_status="unhealthy",
+    )
+    repo.routers.append(router)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+
+    triggered = (await service.evaluate_alert_rules()).triggered
+
+    assert len(triggered) == 1
+    assert triggered[0].subject_id is None
+
+
+# ============================================================================
+# Default alerting: a rule with no channel notifies nobody
+# ============================================================================
+
+
+async def test_a_default_rule_that_predates_the_module_gets_a_channel():
+    """The hole that made AP-down alerts silent on production.
+
+    ``ensure_default_alerting`` linked the channel only to rules it
+    *created*. An organization whose default rule already existed -- every
+    organization that predates this module -- kept a rule with no channel
+    forever: the Alert row appears, the dashboard lights up, and
+    ``_dispatch_for_alert`` returns. Three of the eight "Network hardware
+    down" rules on production were in exactly that state, and the two AP-down
+    alerts they fired have zero notification_logs rows."""
+    repo = FakeRepository()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200))
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        notification_service = NotificationService(repo, http_client)
+        service = AlertService(repo, notification_service=notification_service)
+        org_id = uuid.uuid4()
+        await ensure_default_alerting(
+            service,
+            notification_service,
+            organization_id=org_id,
+            contact_email="owner@venue.example",
+        )
+
+        hardware_rule = next(
+            rule
+            for rule in repo.alert_rules.values()
+            if rule.target_component == ALERT_TARGET_MONITORED_HARDWARE
+        )
+        # The organization's rule and channel both exist; only the link
+        # between them is missing -- which is precisely what the pre-module
+        # world left behind.
+        repo.rule_channels[hardware_rule.id] = []
+
+        report = await ensure_default_alerting(
+            service,
+            notification_service,
+            organization_id=org_id,
+            contact_email="owner@venue.example",
+        )
+
+    assert "Network hardware down" in report.rules_linked_to_channel
+    assert repo.rule_channels[hardware_rule.id]
+    assert report.notifiable
+
+
+async def test_a_default_rule_pointed_somewhere_else_is_left_alone():
+    """Filling a hole, never overruling a choice: a rule that already points
+    at some channel keeps pointing at exactly that one, whatever it is."""
+    repo = FakeRepository()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200))
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        notification_service = NotificationService(repo, http_client)
+        service = AlertService(repo, notification_service=notification_service)
+        org_id = uuid.uuid4()
+        await ensure_default_alerting(
+            service,
+            notification_service,
+            organization_id=org_id,
+            contact_email="owner@venue.example",
+        )
+
+        hardware_rule = next(
+            rule
+            for rule in repo.alert_rules.values()
+            if rule.target_component == ALERT_TARGET_MONITORED_HARDWARE
+        )
+        chosen_by_the_operator = uuid.uuid4()
+        repo.rule_channels[hardware_rule.id] = [chosen_by_the_operator]
+
+        report = await ensure_default_alerting(
+            service,
+            notification_service,
+            organization_id=org_id,
+            contact_email="owner@venue.example",
+        )
+
+    assert repo.rule_channels[hardware_rule.id] == [chosen_by_the_operator]
+    assert "Network hardware down" not in report.rules_linked_to_channel
