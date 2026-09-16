@@ -141,6 +141,8 @@ from app.domains.guest.constants import (
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
+    TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
+    WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
 )
 from app.domains.hub_reconciliation.constants import (
     HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
@@ -479,6 +481,19 @@ celery_app.conf.update(
         "guest-quota-reset-sweep": {
             "task": TASK_RUN_QUOTA_RESET_SWEEP,
             "schedule": QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
+        },
+        # Only Allowed: ends the session of every guest a property with
+        # ``whitelist_only_enabled`` would now refuse. That flag used to be
+        # answered once, at sign-in, and never re-asked -- so switching it on
+        # stopped admitting new guests and left everyone already online
+        # exactly where they were. Every 5 minutes, the same "promptly" tier
+        # as the timeout sweep above. See ``app.domains.guest.tasks
+        # .run_whitelist_only_enforcement_sweep``'s own docstring and
+        # ``app.domains.guest.constants
+        # .WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``.
+        "guest-whitelist-only-enforcement-sweep": {
+            "task": TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
+            "schedule": WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
         },
         # Provisioning Engine: drains the real "Postgres row + Redis
         # wake-up signal" queue app.domains.provisioning_engine
