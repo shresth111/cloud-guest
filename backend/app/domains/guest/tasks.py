@@ -110,7 +110,9 @@ async def _run_session_timeout_sweep_async() -> int:
     async with SessionLocal() as session:
         try:
             repository = GuestRepository(session)
-            expired = await enforce_session_timeouts(repository)
+            expired = await enforce_session_timeouts(
+                repository, _build_session_terminator(session, repository)
+            )
             await session.commit()
             return len(expired)
         except Exception:
@@ -149,7 +151,10 @@ async def _run_fup_time_accrual_sweep_async() -> dict[str, int]:
             repository = GuestRepository(session)
             policy_service = _build_policy_service(session)
             result = await run_fup_time_accrual(
-                repository, policy_service, now=datetime.now(UTC)
+                repository,
+                policy_service,
+                now=datetime.now(UTC),
+                terminator=_build_session_terminator(session, repository),
             )
             await session.commit()
             return result
@@ -240,6 +245,41 @@ def _build_queue_management_service(session: AsyncSession):
         router_service,
         _build_policy_service(session),
         audit_writer=RBACRepository(session),
+    )
+
+
+def _build_session_terminator(session: AsyncSession, repository: GuestRepository):
+    """Constructs a real ``LiveSessionTerminator`` -- the device half of a
+    session end -- the way ``app.domains.guest_access.dependencies`` would
+    through FastAPI's ``Depends`` chain. The same hand-built composition as
+    ``_build_queue_management_service`` above, and imported inside the
+    function for the same stated reason: the router domain pulls in a large
+    dependency graph, and this module is imported by the API process too,
+    where none of it is needed.
+
+    ``repository`` doubles as the terminator's device lookup: it is the same
+    ``GuestRepository`` the sweep already has open, and it satisfies
+    ``DeviceLookupProtocol``.
+
+    Without this, a timeout or FUP sweep expires sessions in this
+    platform's records and leaves every one of those guests online on the
+    venue's router -- which is the whole bug this wiring exists to close.
+    """
+    from app.domains.guest_access.enforcement import LiveSessionTerminator
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    router_service = RouterService(
+        RouterRepository(session), organization_service, location_service
+    )
+    return LiveSessionTerminator(
+        router_lookup=router_service, device_lookup=repository
     )
 
 

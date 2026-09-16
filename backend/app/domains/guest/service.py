@@ -234,7 +234,6 @@ replacement for it.
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import logging
 import math
@@ -388,14 +387,6 @@ from .nas_number_generator import (
     NasCodeCounterRepositoryProtocol,
     generate_nas_code,
     generate_shared_secret,
-)
-from .radius_coa import (
-    RADIUS_CODE_DISCONNECT_ACK,
-    RADIUS_CODE_DISCONNECT_REQUEST,
-    build_packet,
-    build_session_identifier_attributes,
-    parse_response_code,
-    send_packet,
 )
 from .repository import (
     DeviceSessionCount,
@@ -552,6 +543,7 @@ def _event_extra(event: object) -> dict[str, object]:
 
 async def enforce_session_timeouts(
     repository: GuestRepositoryProtocol,
+    terminator: LiveSessionTerminatorProtocol | None = None,
 ) -> list[GuestSession]:
     """Guest Session Engine (Phase 1): the actual idle/session-timeout
     sweep, pulled out of ``GuestService.enforce_timeouts`` to module scope
@@ -585,7 +577,7 @@ async def enforce_session_timeouts(
         )
         event = GuestSessionExpired(session_id=updated.id)
         logger.info("guest_session_expired_timeout", extra=_event_extra(event))
-        await issue_live_disconnect(repository, session=updated)
+        await issue_live_disconnect(repository, session=updated, terminator=terminator)
         expired.append(updated)
     return expired
 
@@ -936,6 +928,32 @@ class TeamQuotaLookupProtocol(Protocol):
     async def is_over_shared_quota(self, guest_id: uuid.UUID) -> bool: ...
 
 
+class LiveSessionTerminatorProtocol(Protocol):
+    """The one method ``GuestService``'s optional ``session_end_hook``
+    needs -- satisfied by ``app.domains.guest_access.enforcement
+    .LiveSessionTerminator``.
+
+    Ending a session in this platform's records is not the same as ending
+    it on the venue's router, and only the second one takes a guest off
+    the WiFi. That device work -- remove them from ``/ip hotspot active``
+    over the RouterOS API, read the table back, report what it says -- is
+    the same work block enforcement does, so it is composed from there
+    rather than reimplemented here.
+
+    Additive and ``None``-by-default, like every other hook on this
+    service: see ``issue_live_disconnect``'s own docstring for why a
+    missing or failing hook can never fail the session-end it is called
+    from."""
+
+    async def end_on_router(
+        self,
+        *,
+        session: object,
+        identifier: str,
+        organization_id: uuid.UUID | None = None,
+    ) -> object: ...
+
+
 class QueueAssignmentProtocol(Protocol):
     """The methods ``GuestService``'s optional ``queue_assignment_hook``
     needs from the real ``app.domains.queue_management.service
@@ -1051,6 +1069,7 @@ async def run_fup_time_accrual(
     policy_lookup: PolicyLookupProtocol,
     *,
     now: datetime,
+    terminator: LiveSessionTerminatorProtocol | None = None,
 ) -> dict[str, int]:
     """Guest-level FUP time-quota accrual + enforcement, pulled out to
     module scope for the exact same reason ``enforce_session_timeouts``
@@ -1181,7 +1200,9 @@ async def run_fup_time_accrual(
                         "disconnect_reason": reason,
                     },
                 )
-                await issue_live_disconnect(repository, session=updated_session)
+                await issue_live_disconnect(
+                    repository, session=updated_session, terminator=terminator
+                )
                 expired_sessions += 1
     return {"accrued_rows": accrued_rows, "expired_sessions": expired_sessions}
 
@@ -1225,48 +1246,56 @@ async def run_quota_reset(
 
 
 async def issue_live_disconnect(
-    repository: GuestRepositoryProtocol, *, session: GuestSession
+    repository: GuestRepositoryProtocol,
+    *,
+    session: GuestSession,
+    terminator: LiveSessionTerminatorProtocol | None = None,
+    already_ended_on_device: bool = False,
 ) -> bool | None:
-    """Phase 1 BhaiFi-parity (#16): a real RFC 2865/5176 Disconnect-Request,
-    sent whenever ``session`` ends (``disconnect_session``/
-    ``terminate_session``/``pause_session``, and the two system-driven
-    sweeps -- ``enforce_session_timeouts``/``run_fup_time_accrual``) --
-    replaces this module's previously-documented "nothing ... ever issues a
-    live CoA-Disconnect packet" sandbox no-op. Pulled to module scope for
+    """Take this guest off the venue's router, and say honestly whether it
+    happened -- called whenever ``session`` ends (``disconnect_session``/
+    ``terminate_session``/``pause_session``, the guest's own logout, and
+    the system-driven sweeps ``enforce_session_timeouts``/
+    ``run_fup_time_accrual``/``record_usage``). Pulled to module scope for
     the identical "Celery sweep + service method + test suite share one
     real implementation" reason ``get_or_reset_quota_usage``/
     ``run_fup_time_accrual`` were.
 
-    Best-effort and never raises: a live network send is a real-world
+    **The transport is the RouterOS API on port 8728**, through the
+    ``terminator`` passed in. It used to be an RFC 5176 Disconnect-Request
+    sent to the NAS over UDP 3799, and that has never once worked in this
+    deployment: the packet is correctly built and sent, but the app server
+    has no route into the hub's ``10.20.0.0/24`` tunnel range, so it leaves
+    by the default gateway and is dropped. Measured on production
+    2026-09-16 -- ``guest_sessions.disconnect_enforced`` stood at 584 NULL,
+    32 false and **zero true**: not one guest had ever been disconnected by
+    it. Port 8728 is the only one that answers from the app server, it is
+    the transport every other device write on this platform already uses,
+    and it is what ``guest_access``'s block enforcement removes guests
+    with. ``radius_coa`` is kept for the day that tunnel becomes routable;
+    nothing here sends it any more.
+
+    Because the transport no longer runs through the NAS, the registered
+    ``RadiusNasClient`` row is no longer consulted -- the router's own API
+    credentials are what this needs.
+
+    Best-effort and never raises: a live network call is a real-world
     addition on top of the DB-level status transition that has *already*
-    committed by the time this is called (see every call site below),
-    never a gate on it -- an unreachable/misconfigured NAS must never
-    prevent an admin (or the system) from ending a session in this
-    platform's own records. Returns ``True``/``False`` once a real
-    Disconnect-ACK/NAK comes back, or ``None`` when there is no registered
-    ``RadiusNasClient`` for ``session.router_id``, that NAS has no
-    ``ip_address`` on record, or the send itself failed/timed out.
+    committed by the time this is called (see every call site below), never
+    a gate on it -- an unreachable router must never prevent an admin (or
+    the system) from ending a session in this platform's own records.
+    Returns ``True`` only once the router confirms the guest is gone from
+    its own ``/ip hotspot active`` table, ``False`` when an attempt was made
+    and failed, and ``None`` when nothing was attempted (no guest row, no
+    terminator wired, or ``already_ended_on_device``).
 
-    **A ``None`` return means the guest was NOT actually disconnected**, and
-    every path that produces one now says so at WARNING with
-    ``enforcement_delivered: False``. That used to be understated: the old
-    docstring called a timeout "the expected outcome in this sandbox", and
-    two of the three ``None`` paths logged nothing at all. It is not a
-    sandbox and it is not expected -- measured on production 2026-09-11, the
-    app server has **no route to the tunnel range at all**
-    (``ip route show`` has no ``10.20.0.0/24``, there is no WireGuard
-    interface, and ``ping 10.20.0.19`` is 100% loss), so every
-    Disconnect-Request leaves via the default gateway and is dropped.
-
+    **Anything but ``True`` means the guest may still be online**, and every
+    such path says so at WARNING with ``enforcement_delivered: False``.
     That matters because this is the *only* enforcement mechanism behind
-    the data-cap and FUP-quota paths as well as the operator's own
-    "Terminate session": the row is flipped to ``EXPIRED``/``TERMINATED``
-    **before** this is called and this never raises, so without a loud log
-    the platform reports an enforcement action it did not perform. Making
-    the failure visible does not fix it -- the transport has to change (the
-    adapter in ``guest_access.device_adapters`` reaches fleet routers on
-    8728, which is the only port that answers) or the tunnel has to be
-    routable from the app server. This only stops it being invisible."""
+    the data cap, the FUP quota and the operator's own "Terminate session":
+    the row is flipped to ``EXPIRED``/``TERMINATED`` **before** this is
+    called and this never raises, so without a loud log the platform
+    reports an enforcement action it did not perform."""
     async def _record(enforced: bool) -> None:
         """Persist the outcome on the row itself.
 
@@ -1284,32 +1313,16 @@ async def issue_live_disconnect(
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
 
-    nas_client = await repository.get_nas_client_by_router(session.router_id)
-    if nas_client is None:
-        #  Previously a bare `return None`. A session-ending path that cannot
-        #  even find a NAS silently performed no enforcement at all.
-        logger.warning(
-            "guest_live_disconnect_no_nas",
-            extra={
-                "session_id": str(session.id),
-                "router_id": str(session.router_id),
-                "enforcement_delivered": False,
-            },
-        )
-        await _record(False)
+    if already_ended_on_device:
+        #  The NAS itself reported this session over -- a RADIUS
+        #  Accounting-Stop, or its own Session-/Idle-Timeout -- so the guest
+        #  is off the device by definition: the router said so. A device
+        #  call here would be one TCP connect and login, for every ordinary
+        #  guest disconnect, fleet-wide, to remove a row that is already
+        #  gone. Left unwritten (NULL) rather than recorded as enforced:
+        #  this platform did not do it, and the column means "did we".
         return None
-    if not nas_client.ip_address:
-        logger.warning(
-            "guest_live_disconnect_nas_has_no_address",
-            extra={
-                "session_id": str(session.id),
-                "router_id": str(session.router_id),
-                "nas_identifier": nas_client.nas_identifier,
-                "enforcement_delivered": False,
-            },
-        )
-        await _record(False)
-        return None
+
     guest = await repository.get_guest_by_id(session.guest_id)
     if guest is None:
         logger.warning(
@@ -1322,62 +1335,49 @@ async def issue_live_disconnect(
         )
         await _record(False)
         return None
+    if terminator is None:
+        #  No device work is possible at all: the hook was not wired (a
+        #  test, or a deployment without guest_access). Distinct from a
+        #  failure -- nothing was attempted -- but recorded as
+        #  not-enforced all the same, because that is what it is.
+        logger.warning(
+            "guest_live_disconnect_no_terminator",
+            extra={
+                "session_id": str(session.id),
+                "router_id": str(session.router_id),
+                "enforcement_delivered": False,
+            },
+        )
+        await _record(False)
+        return None
     try:
-        shared_secret = decrypt_secret(nas_client.shared_secret_encrypted)
-        attributes = build_session_identifier_attributes(
-            username=guest.identifier,
-            acct_session_id=str(session.id),
-            nas_ip_address=nas_client.ip_address,
-            framed_ip_address=session.ip_address,
-        )
-        packet = build_packet(
-            code=RADIUS_CODE_DISCONNECT_REQUEST,
-            attributes=attributes,
-            shared_secret=shared_secret,
-        )
-        response = await asyncio.to_thread(
-            send_packet, packet, host=nas_client.ip_address
+        await terminator.end_on_router(
+            session=session,
+            identifier=guest.identifier,
+            organization_id=session.organization_id,
         )
     except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
         logger.warning(
             "guest_live_disconnect_failed",
             extra={
                 "session_id": str(session.id),
+                "router_id": str(session.router_id),
                 "error": str(exc),
                 "enforcement_delivered": False,
             },
         )
         await _record(False)
-        return None
-    if response is None:
-        #  WARNING, not INFO. This is a silent no-op on the only enforcement
-        #  path the platform has, and on the current estate it is what
-        #  *always* happens -- the app server has no route to 10.20.0.0/24.
-        #  At INFO it sat below the threshold anyone reads.
-        logger.warning(
-            "guest_live_disconnect_no_response",
-            extra={
-                "session_id": str(session.id),
-                "router_id": str(session.router_id),
-                "nas_ip": nas_client.ip_address,
-                "enforcement_delivered": False,
-            },
-        )
-        await _record(False)
-        return None
-    acknowledged = parse_response_code(response) == RADIUS_CODE_DISCONNECT_ACK
-    #  A NAK is a real answer from a real NAS and is still a failure to
-    #  enforce, so `enforcement_delivered` tracks the ACK, not the reply.
+        return False
     logger.info(
-        "guest_live_disconnect_response",
+        "guest_live_disconnect_enforced",
         extra={
             "session_id": str(session.id),
-            "acknowledged": acknowledged,
-            "enforcement_delivered": acknowledged,
+            "router_id": str(session.router_id),
+            "enforcement_delivered": True,
         },
     )
-    await _record(acknowledged)
-    return acknowledged
+    await _record(True)
+    return True
 
 
 # ============================================================================
@@ -1749,6 +1749,7 @@ class GuestService:
         access_control_hook: AccessDecisionProtocol | None = None,
         queue_assignment_hook: QueueAssignmentProtocol | None = None,
         queue_assignment_dispatcher: QueueAssignmentDispatcherProtocol | None = None,
+        session_end_hook: LiveSessionTerminatorProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
         team_quota_hook: TeamQuotaLookupProtocol | None = None,
@@ -1765,6 +1766,7 @@ class GuestService:
         self.access_control_hook = access_control_hook
         self.queue_assignment_hook = queue_assignment_hook
         self.queue_assignment_dispatcher = queue_assignment_dispatcher
+        self.session_end_hook = session_end_hook
         self.policy_lookup = policy_lookup
         # Request-scoped memo for _resolve_session_policy_rules -- see its
         # own docstring. GuestService is constructed per request by
@@ -3431,7 +3433,9 @@ class GuestService:
         )
         event = GuestSessionDisconnected(session_id=updated.id, reason=reason)
         logger.info("guest_session_disconnected", extra=_event_extra(event))
-        await issue_live_disconnect(self.repository, session=updated)
+        await issue_live_disconnect(
+            self.repository, session=updated, terminator=self.session_end_hook
+        )
         return updated
 
     async def record_consent(
@@ -4249,12 +4253,20 @@ class GuestService:
         requesting_organization_id: uuid.UUID | None = None,
         actor_user_id: uuid.UUID | None = None,
         reason: str | None = None,
+        already_ended_on_device: bool = False,
     ) -> GuestSession:
         """Normal, non-punitive end of use -- see module docstring for the
         distinction from ``terminate_session``. Audited only when
         admin-initiated (``actor_user_id`` supplied); a system-initiated
         disconnect (RADIUS Accounting-Stop, ``enforce_timeouts``) is logged
-        but not audited."""
+        but not audited.
+
+        ``already_ended_on_device=True`` is for the callers whose session
+        end was reported *by the NAS itself* -- ``RadiusService
+        .accounting_stop``, which fires on every ordinary guest
+        disconnect. The router has already dropped the guest, so
+        ``issue_live_disconnect`` is told not to open a connection to
+        remove a row that is already gone; see its own docstring."""
         session = await self.get_session(
             session_id, requesting_organization_id=requesting_organization_id
         )
@@ -4284,7 +4296,12 @@ class GuestService:
                 organization_id=updated.organization_id,
                 location_id=updated.location_id,
             )
-        await issue_live_disconnect(self.repository, session=updated)
+        await issue_live_disconnect(
+            self.repository,
+            session=updated,
+            terminator=self.session_end_hook,
+            already_ended_on_device=already_ended_on_device,
+        )
         return updated
 
     async def terminate_session(
@@ -4333,7 +4350,9 @@ class GuestService:
             organization_id=updated.organization_id,
             location_id=updated.location_id,
         )
-        await issue_live_disconnect(self.repository, session=updated)
+        await issue_live_disconnect(
+            self.repository, session=updated, terminator=self.session_end_hook
+        )
         return updated
 
     async def pause_session(
@@ -4377,7 +4396,9 @@ class GuestService:
             organization_id=updated.organization_id,
             location_id=updated.location_id,
         )
-        await issue_live_disconnect(self.repository, session=updated)
+        await issue_live_disconnect(
+            self.repository, session=updated, terminator=self.session_end_hook
+        )
         return updated
 
     async def resume_session(
@@ -4635,7 +4656,9 @@ class GuestService:
             )
             event = GuestSessionExpired(session_id=updated.id)
             logger.info("guest_session_expired_quota", extra=_event_extra(event))
-            await issue_live_disconnect(self.repository, session=updated)
+            await issue_live_disconnect(
+                self.repository, session=updated, terminator=self.session_end_hook
+            )
             return updated
         if violated_fup_period is not None:
             reason = f"fup_data_quota_exceeded_{violated_fup_period}"
@@ -4649,7 +4672,9 @@ class GuestService:
             )
             event = GuestSessionExpired(session_id=updated.id)
             logger.info("guest_session_expired_fup_quota", extra=_event_extra(event))
-            await issue_live_disconnect(self.repository, session=updated)
+            await issue_live_disconnect(
+                self.repository, session=updated, terminator=self.session_end_hook
+            )
         return updated
 
     def check_quota_exceeded(self, session: GuestSession) -> bool:
@@ -4664,7 +4689,9 @@ class GuestService:
         (including this module's own pre-existing test suite) keeps working
         unchanged. See that function's own docstring for why the real logic
         was pulled out to module scope."""
-        return await enforce_session_timeouts(self.repository)
+        return await enforce_session_timeouts(
+            self.repository, self.session_end_hook
+        )
 
     async def check_portal_admission(
         self,
@@ -7142,6 +7169,12 @@ class RadiusService:
         return await self.guest_service.disconnect_session(
             session_id=session.id,
             reason=disconnect_reason or "radius_accounting_stop",
+            # The router just told us it stopped accounting for this guest,
+            # so the guest is already off the device. Sending it a request
+            # to remove them would be one TCP connect and login per ordinary
+            # disconnect, fleet-wide, for a row that is already gone -- see
+            # ``issue_live_disconnect``'s own docstring.
+            already_ended_on_device=True,
         )
 
     async def accounting_on(self, *, nas_client: RadiusNasClient) -> list[GuestSession]:

@@ -187,6 +187,21 @@ class RouterLookupProtocol(Protocol):
     def get_decrypted_api_secret(self, router: BlockRouterRow) -> str | None: ...
 
 
+class DeviceLookupProtocol(Protocol):
+    """The one lookup ending a session needs beyond router credentials:
+    which MAC the guest is holding, when this platform knows it.
+
+    Narrower than ``LiveSessionLookupProtocol`` deliberately -- the guest
+    side of this module composes the terminator below with nothing but a
+    repository that can answer this one question.
+    """
+
+    async def get_device_by_id(
+        self, device_id: uuid.UUID
+    ) -> BlockedDeviceRow | None: ...
+
+
+
 # ============================================================================
 # Result
 # ============================================================================
@@ -216,6 +231,120 @@ _NOTHING_TO_DO = BlockEnforcementReport(
 
 
 # ============================================================================
+# The device half, shared by both callers
+# ============================================================================
+
+
+class LiveSessionTerminator:
+    """Ends one live guest session on its own router, over the RouterOS API.
+
+    There are two reasons a session has to stop being real on the device,
+    and they are the same work: an admin blocks the guest
+    (``BlocklistEnforcer`` below), or a session ends or is killed for any
+    other reason (``app.domains.guest.service.issue_live_disconnect``,
+    whose callers are the operator's "Terminate session", the guest's own
+    logout, and the timeout/FUP/data-cap sweeps). Both mean "remove this
+    guest from ``/ip hotspot active``, then read the table back and say
+    whether they are actually gone", so both go through here.
+
+    Small on purpose: it owns no policy about *why* a session is ending,
+    writes no session row, and decides nothing about status transitions.
+    It opens a connection, removes rows, reads back, and reports.
+
+    Raises rather than returning a quiet failure, because
+    ``BlocklistEnforcer`` must be able to refuse a block that did not
+    happen. The session-end caller is the one that swallows -- it runs
+    after a status transition that has already committed and must never be
+    the thing that fails an operator's disconnect; see that function's own
+    docstring.
+    """
+
+    def __init__(
+        self,
+        *,
+        router_lookup: RouterLookupProtocol,
+        device_lookup: DeviceLookupProtocol,
+        adapter_factory: object = None,
+    ) -> None:
+        self.router_lookup = router_lookup
+        self.device_lookup = device_lookup
+        self._adapter_factory = adapter_factory or get_guest_access_adapter
+
+    async def end_on_router(
+        self,
+        *,
+        session: LiveSessionRow,
+        identifier: str,
+        organization_id: uuid.UUID | None = None,
+    ) -> SessionEndOutcome:
+        """Ends every live session on this router belonging to ``identifier``.
+
+        ``identifier`` is the portal ``user`` the router knows the guest
+        by -- ``Guest.identifier``, not whatever a rule or a caller happens
+        to spell it as.
+
+        Raises :class:`~.exceptions.RouterHasNoHotspotError`,
+        :class:`~.exceptions.SessionStillActiveOnDeviceError`,
+        :class:`~.exceptions.BlockEnforcementMissingCredentialsError`,
+        :class:`~.exceptions.GuestAccessDeviceConnectionError`,
+        :class:`~.exceptions.GuestAccessDeviceOperationError` or
+        :class:`~.exceptions.UnsupportedGuestAccessVendorError`. The
+        hotspot check happens *after* the call, not before, so it costs no
+        extra connection: the adapter reads ``/ip hotspot`` on the same
+        socket it uses for the removal.
+        """
+        router = await self.router_lookup.get_router(
+            session.router_id, requesting_organization_id=organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter: BaseGuestAccessAdapter = self._adapter_factory(router.vendor)
+
+        mac_address = await self._session_mac_address(session)
+        outcome = await adapter.end_sessions(
+            credentials, mac_address=mac_address, username=identifier
+        )
+
+        if not outcome.control.runs_hotspot:
+            raise RouterHasNoHotspotError(router.id, credentials.host)
+        if not outcome.ended_cleanly:
+            raise SessionStillActiveOnDeviceError(
+                identifier=identifier,
+                host=credentials.host,
+                still_active=outcome.still_active,
+                coa_accept=outcome.control.coa_accept,
+                coa_port=outcome.control.coa_port,
+            )
+        return outcome
+
+    async def _session_mac_address(self, session: LiveSessionRow) -> str | None:
+        """The MAC the guest is on, when this platform knows it.
+
+        Best-effort by design, and its absence is not a failure: the
+        adapter also matches on the portal ``user``, which is this
+        identifier, so a session with no recorded device is still found.
+        Passing a MAC as well matters for the case the RADIUS incident of
+        2026-08-18 turned up -- a live session whose ``user`` on the device
+        does not match what this platform stored.
+        """
+        if session.device_id is None:
+            return None
+        device = await self.device_lookup.get_device_by_id(session.device_id)
+        return device.mac_address if device is not None else None
+
+    def _resolve_device_credentials(
+        self, router: BlockRouterRow
+    ) -> GuestAccessCredentials:
+        """Raise rather than guess -- mirrors ``VlanService``/``qos``."""
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise BlockEnforcementMissingCredentialsError(router.id)
+        return GuestAccessCredentials(
+            host=host, username=router.api_username, password=secret
+        )
+
+
+# ============================================================================
 # Enforcer
 # ============================================================================
 
@@ -242,6 +371,13 @@ class BlocklistEnforcer:
         # why the guest domain's own enum may not be imported here.
         self.terminated_session_status = terminated_session_status
         self._adapter_factory = adapter_factory or get_guest_access_adapter
+        # ``session_lookup`` is a ``GuestRepository``, which satisfies
+        # ``DeviceLookupProtocol`` as well -- see that Protocol's own note.
+        self.terminator = LiveSessionTerminator(
+            router_lookup=router_lookup,
+            device_lookup=session_lookup,
+            adapter_factory=adapter_factory,
+        )
 
     async def enforce(
         self,
@@ -296,7 +432,7 @@ class BlocklistEnforcer:
         coa_available: bool | None = None
 
         for session in sessions:
-            outcome = await self._end_on_device(
+            outcome = await self.terminator.end_on_router(
                 session=session,
                 organization_id=organization_id,
                 # The guest's own stored identifier, not the rule's --
@@ -392,65 +528,13 @@ class BlocklistEnforcer:
                 return guest
         return None
 
-    async def _end_on_device(
-        self,
-        *,
-        session: LiveSessionRow,
-        organization_id: uuid.UUID,
-        identifier: str,
-    ) -> SessionEndOutcome:
-        router = await self.router_lookup.get_router(
-            session.router_id, requesting_organization_id=organization_id
-        )
-        credentials = self._resolve_device_credentials(router)
-        adapter: BaseGuestAccessAdapter = self._adapter_factory(router.vendor)
 
-        mac_address = await self._session_mac_address(session)
-        outcome = await adapter.end_sessions(
-            credentials, mac_address=mac_address, username=identifier
-        )
-
-        if not outcome.control.runs_hotspot:
-            # Checked after the call, not before, so it costs no extra
-            # connection: the adapter reads ``/ip hotspot`` on the same
-            # socket it uses for the removal.
-            raise RouterHasNoHotspotError(router.id, credentials.host)
-        if not outcome.ended_cleanly:
-            raise SessionStillActiveOnDeviceError(
-                identifier=identifier,
-                host=credentials.host,
-                still_active=outcome.still_active,
-                coa_accept=outcome.control.coa_accept,
-                coa_port=outcome.control.coa_port,
-            )
-        return outcome
-
-    async def _session_mac_address(self, session: LiveSessionRow) -> str | None:
-        """The MAC the guest is on, when this platform knows it.
-
-        Best-effort by design, and its absence is not a failure: the
-        adapter also matches on the portal ``user``, which is this
-        identifier, so a session with no recorded device is still found.
-        Passing a MAC as well matters for the case the RADIUS incident of
-        2026-08-18 turned up -- a live session whose ``user`` on the device
-        does not match what this platform stored.
-        """
-        if session.device_id is None:
-            return None
-        device = await self.session_lookup.get_device_by_id(session.device_id)
-        return device.mac_address if device is not None else None
-
-    def _resolve_device_credentials(
-        self, router: BlockRouterRow
-    ) -> GuestAccessCredentials:
-        """Raise rather than guess -- mirrors ``VlanService``/``qos``."""
-        host = router.management_ip_address or router.public_ip_address
-        secret = self.router_lookup.get_decrypted_api_secret(router)
-        if not host or not router.api_username or not secret:
-            raise BlockEnforcementMissingCredentialsError(router.id)
-        return GuestAccessCredentials(
-            host=host, username=router.api_username, password=secret
-        )
+# ``BlocklistEnforcer`` used to carry ``_end_on_device`` /
+# ``_session_mac_address`` / ``_resolve_device_credentials`` itself. They
+# moved to ``LiveSessionTerminator`` above, unchanged, when the ordinary
+# session-end path needed the same device work -- the terminator is now
+# the only place in this codebase that removes a guest from a router's
+# ``/ip hotspot active`` table.
 
 
 __all__ = [
@@ -459,7 +543,9 @@ __all__ = [
     "BlockedDeviceRow",
     "BlockedGuestRow",
     "BlocklistEnforcer",
+    "DeviceLookupProtocol",
     "LiveSessionLookupProtocol",
     "LiveSessionRow",
+    "LiveSessionTerminator",
     "RouterLookupProtocol",
 ]
