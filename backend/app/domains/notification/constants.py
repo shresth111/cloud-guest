@@ -62,6 +62,23 @@ MAIL_IDENTITY_BY_EVENT_TYPE: Mapping[NotificationEventType, MailIdentity] = (
             # addressed to a person using the product.
             NotificationEventType.PASSWORD_RESET: MailIdentity.ADMIN,
             NotificationEventType.LOCATION_WELCOME_EMAIL: MailIdentity.ADMIN,
+            # Subscription renewal/expiry reminders are operational mail to
+            # the venue's own staff about their own account -- the same
+            # "person using the product" class as PASSWORD_RESET above, not
+            # a commercial conversation. They used to fall through the
+            # table's DEFAULT and arrive from the sales mailbox, which made
+            # a billing alert read like a sales pitch (bug report: "ye
+            # alert sales wali mail se jaata hai, wo admin se jaana
+            # chahiye" -- the monitoring alert half of that report is fixed
+            # in app.domains.monitoring.email_provider by defaulting that
+            # resolver to MailIdentity.ADMIN; these two events are the
+            # outbox-encoded half of the same split).
+            NotificationEventType.SUBSCRIPTION_RENEWAL_REMINDER: (
+                MailIdentity.ADMIN
+            ),
+            NotificationEventType.SUBSCRIPTION_EXPIRY_REMINDER: (
+                MailIdentity.ADMIN
+            ),
             # sales@wyfyguest.com -- a commercial lead landing in the
             # mailbox that should reply to it. This is the identity it
             # already used; it is listed explicitly so the sales half of

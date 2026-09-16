@@ -44,6 +44,9 @@ from app.core.config import Settings
 from app.domains.channel_partner.dependencies import (
     _resolve_email_provider as resolve_channel_partner_email_provider,
 )
+from app.domains.monitoring.email_provider import (
+    resolve_email_provider as resolve_alert_email_provider,
+)
 from app.domains.notification.constants import (
     MAIL_IDENTITY_BY_EVENT_TYPE,
     NotificationChannelType,
@@ -299,8 +302,8 @@ class TestSixFlowsResolveToTheRightMailbox:
             is MailIdentity.DEFAULT
         )
 
-    def test_only_the_two_moved_events_are_routed_to_admin(self) -> None:
-        """Nothing moves by accident. Every outbox event other than the two
+    def test_only_the_moved_events_are_routed_to_admin(self) -> None:
+        """Nothing moves by accident. Every outbox event other than the
         deliberately moved ones must still resolve to the identity it used
         before this split existed."""
         moved = {
@@ -309,8 +312,15 @@ class TestSixFlowsResolveToTheRightMailbox:
             if identity is MailIdentity.ADMIN
         }
         assert moved == {
+            # Account-security and onboarding mail addressed to a person
+            # using the product.
             NotificationEventType.PASSWORD_RESET,
             NotificationEventType.LOCATION_WELCOME_EMAIL,
+            # Operational subscription alerts to the venue's own staff --
+            # moved off the sales identity so a billing reminder no longer
+            # reads like a sales pitch (see the table's own comment).
+            NotificationEventType.SUBSCRIPTION_RENEWAL_REMINDER,
+            NotificationEventType.SUBSCRIPTION_EXPIRY_REMINDER,
         }
         for event in NotificationEventType:
             if event in moved:
@@ -338,6 +348,43 @@ class TestSixFlowsResolveToTheRightMailbox:
 
         assert len(sales.sent) == 1
         assert admin.sent == []
+
+
+# ============================================================================
+# 1b. Monitoring-alert mail comes from the admin mailbox, not the sales one
+# ============================================================================
+
+
+class TestAlertMailIdentity:
+    def test_alert_email_provider_resolves_to_the_admin_mailbox(self) -> None:
+        """Regression: a monitoring alert (AP down, router unreachable,
+        site offline) used to leave from the shared DEFAULT identity --
+        ``sales@wyfyguest.com`` in production -- because the alert resolver
+        never asked for another one. A venue owner receiving an alert saw
+        it arrive from the same mailbox that sends demo requests and
+        quotations, which reads as sales mail regardless of the subject
+        (bug report: "ye alert sales wali mail se jaata hai, wo admin se
+        jaana chahiye"). The resolver now defaults to MailIdentity.ADMIN,
+        so alerts leave from the administrative mailbox with the
+        password-reset and venue-welcome mail."""
+        provider = resolve_alert_email_provider(_settings())
+        assert isinstance(provider, SmtpEmailProvider)
+        assert provider.from_address == ADMIN
+        assert provider.username == ADMIN
+
+    def test_alert_email_provider_falls_back_loudly_when_unconfigured(self) -> None:
+        """The misconfiguration must stay visible (a FAILED notification
+        row) rather than silently degrading to log-only -- see
+        ``monitoring/email_provider.py``'s own module docstring for why
+        that silent fallback is the worst possible outcome."""
+        from app.domains.monitoring.email_provider import (
+            UnconfiguredEmailProvider,
+        )
+
+        provider = resolve_alert_email_provider(
+            _settings(email_delivery_provider="smtp", smtp_host="", admin_smtp_host="")
+        )
+        assert isinstance(provider, UnconfiguredEmailProvider)
 
 
 # ============================================================================
