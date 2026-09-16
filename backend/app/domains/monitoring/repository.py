@@ -226,6 +226,7 @@ class MonitoringRepositoryProtocol(Protocol):
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         router_id: uuid.UUID | None,
+        subject_id: uuid.UUID | None = None,
     ) -> Alert | None: ...
 
     async def find_alert_by_related_event(
@@ -778,11 +779,21 @@ class MonitoringRepository:
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         router_id: uuid.UUID | None,
+        subject_id: uuid.UUID | None = None,
     ) -> Alert | None:
         """The de-duplication lookup: is there already an open (not
         ``RESOLVED``) ``Alert`` for this exact rule+target? See
         ``service.AlertService.evaluate_alert_rules``'s module docstring for
-        the full de-duplication-key write-up."""
+        the full de-duplication-key write-up.
+
+        ``subject_id`` is the fifth, optional dimension -- see
+        ``models.Alert.subject_id``. It defaults to ``None`` so every target
+        that identifies its subject by router/location alone (all of them but
+        ``ALERT_TARGET_MONITORED_HARDWARE``) keeps the exact key it had, and
+        only the branch that needs it passes one. Matching is by equality on
+        all five, including a NULL subject: an alert created before the
+        column existed still groups with a new NULL-subject alert for the same
+        rule+target, which is precisely the old behaviour."""
         statement = (
             select(Alert)
             .where(
@@ -798,6 +809,9 @@ class MonitoringRepository:
                 Alert.router_id.is_(router_id)
                 if router_id is None
                 else Alert.router_id == router_id,
+                Alert.subject_id.is_(subject_id)
+                if subject_id is None
+                else Alert.subject_id == subject_id,
             )
             .order_by(Alert.triggered_at.desc())
             .limit(1)
