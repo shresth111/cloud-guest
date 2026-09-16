@@ -311,23 +311,40 @@ class QueueManagementService:
         "seed idempotently" ``ConfigVariable`` pattern. Used by
         ``resolve_and_assign_queue`` when no organization/location has a
         published ``PolicyType.BANDWIDTH`` policy -- never fabricates an
-        ephemeral, unpersisted rate."""
-        profiles, _meta = await self.repository.list_profiles(
-            requesting_organization_id=None, page=1, page_size=100
-        )
-        for candidate in profiles:
-            if (
-                candidate.is_system_profile
-                and candidate.download_rate_kbps == download_rate_kbps
-                and candidate.upload_rate_kbps == upload_rate_kbps
-            ):
-                return candidate
+        ephemeral, unpersisted rate.
+
+        Two things this had to stop doing. It scanned ``page=1,
+        page_size=100`` of every profile on the platform, so once more than
+        a page existed it could no longer see a profile it already had and
+        quietly created another on each call;
+        ``list_system_profiles_by_rates`` asks the question directly
+        instead. And "look, then create" is a read-then-write, so two
+        concurrent logins racing on a rate the platform had never used both
+        created one -- production carried two ``System 40960k/40960k`` rows
+        and two ``System 81920k/81920k`` rows for exactly this reason. The
+        rate-pair lock closes that.
+
+        The duplicates already in the table are deliberately left alone:
+        assignments reference them and ``queue_profile_id`` is
+        ``ON DELETE SET NULL``, so deleting one would silently unrate live
+        guests. They are harmless once creation stops racing."""
         name = (
             _SYSTEM_UNLIMITED_PROFILE_NAME
             if download_rate_kbps == UNLIMITED_RATE_KBPS
             and upload_rate_kbps == UNLIMITED_RATE_KBPS
             else f"System {download_rate_kbps}k/{upload_rate_kbps}k"
         )
+        # Serialize per rate pair before looking -- see docstring.
+        await self.repository.acquire_profile_rate_lock(
+            download_rate_kbps=download_rate_kbps,
+            upload_rate_kbps=upload_rate_kbps,
+        )
+        existing = await self.repository.list_system_profiles_by_rates(
+            download_rate_kbps=download_rate_kbps,
+            upload_rate_kbps=upload_rate_kbps,
+        )
+        if existing:
+            return existing[0]
         return await self.create_profile(
             actor_user_id=None,
             requesting_organization_id=None,
@@ -1079,7 +1096,31 @@ class QueueManagementService:
         (idempotent, never an ephemeral unpersisted rate), and either
         creates a fresh :class:`~.models.QueueAssignment` for this target
         or -- if one already exists with a *different* profile -- moves
-        it, exactly like an admin-driven "Move Queue" would."""
+        it, exactly like an admin-driven "Move Queue" would.
+
+        **Idempotent sequentially, serialized concurrently.** The
+        find-or-create above is a read-then-write, so "there is no existing
+        assignment" is not a fact two concurrent callers can both rely on.
+        This method therefore takes a per-target advisory lock first
+        (``repository.acquire_assignment_target_lock``), and -- because a
+        duplicate may already exist from before that lock did, and because
+        a reused guest IP can leave a previous holder's row naming the same
+        address -- it retires every competing row before applying anything
+        (``_retire_superseded_assignments``). Without that, the rate
+        resolved here is not the rate the guest gets: RouterOS applies the
+        first matching ``/queue simple`` for an address, so a stale sibling
+        wins silently."""
+        # Serialize per target *before* asking whether one already exists.
+        # Everything below is a read-then-write -- "is there a live
+        # assignment for this target? no -> create one" -- and two callers
+        # that ask at the same moment both get "no". That is not
+        # theoretical: production carried two ACTIVE rows, and two
+        # `/queue simple` entries, for a single guest session, created
+        # 204 ms apart. See `repository._acquire_advisory_lock`.
+        await self.repository.acquire_assignment_target_lock(
+            target_type=target_type.value, target_id=target_id
+        )
+
         resolved = await self.policy_lookup.resolve_effective_policy(
             policy_type=PolicyType.BANDWIDTH,
             organization_id=requesting_organization_id,
@@ -1101,6 +1142,21 @@ class QueueManagementService:
         existing = await self.repository.get_active_assignment_for_target(
             target_type=target_type.value, target_id=target_id
         )
+
+        # Retire every *other* live row competing for this same device-side
+        # target before anything is applied. A competing row is not merely
+        # untidy -- it silently overrides the rate resolved above. See
+        # `_retire_superseded_assignments`.
+        await self._retire_superseded_assignments(
+            keep_id=existing.id if existing is not None else None,
+            target_type=target_type,
+            target_id=target_id,
+            router_id=router_id,
+            device_target=device_target,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+
         if existing is None:
             new_assignment = await self.create_assignment(
                 actor_user_id=actor_user_id,
@@ -1219,6 +1275,82 @@ class QueueManagementService:
     # ========================================================================
     # Internal helpers
     # ========================================================================
+
+    async def _retire_superseded_assignments(
+        self,
+        *,
+        keep_id: uuid.UUID | None,
+        target_type: QueueTargetType,
+        target_id: uuid.UUID,
+        router_id: uuid.UUID,
+        device_target: str | None,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> int:
+        """Retire every live assignment competing for the same device-side
+        queue as the one about to be applied; returns how many were retired.
+
+        Two kinds of row compete, and ``get_active_assignment_for_target``
+        can see neither:
+
+        * **A duplicate for this exact target** -- two rows for one session,
+          left behind by the read-then-write race
+          ``acquire_assignment_target_lock`` now closes. Each owns its own
+          device queue.
+        * **A previous holder of this address** -- a row naming the same
+          ``device_target`` on the same router whose session has since
+          ended. Guest IPs are reused, so the next guest handed that
+          address inherits a rate nobody configured for them.
+
+        This is not tidiness. A ``/queue simple`` entry matches one concrete
+        IP, and RouterOS applies the **first matching entry in list order**
+        (creation order). A competing row therefore does not merely sit
+        there: it silently overrides the rate this call just resolved, and
+        the limit the venue saved has no effect on the guest. Retiring them
+        is what makes the applied rate the guest's actual rate.
+
+        Only rows of the same ``target_type`` are retired. An
+        admin-created router/guest/voucher/device assignment is an explicit
+        instruction, not a stale automatic one, and a login is not the place
+        to revoke it.
+
+        One row's device failure is logged and skipped, never aborting the
+        others nor the assignment this runs inside -- mirrors
+        ``reapply_active_sessions_for_location``'s own per-item isolation.
+        """
+        rivals: dict[uuid.UUID, QueueAssignment] = {}
+        for row in await self.repository.list_assignments_for_target(
+            target_type=target_type.value, target_id=target_id
+        ):
+            if row.id != keep_id:
+                rivals[row.id] = row
+        if device_target:
+            for row in await self.repository.list_assignments_for_device_target(
+                router_id=router_id, device_target=device_target
+            ):
+                if (
+                    row.id != keep_id
+                    and row.target_type == target_type.value
+                    and row.target_id != target_id
+                ):
+                    rivals[row.id] = row
+
+        retired = 0
+        for row in rivals.values():
+            try:
+                await self.expire_assignment(
+                    row.id,
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                    reason="superseded by a queue assignment for the same address",
+                )
+                retired += 1
+            except Exception as exc:  # noqa: BLE001 -- see docstring
+                logger.warning(
+                    "queue_assignment_supersede_failed",
+                    extra={"assignment_id": str(row.id), "error": str(exc)},
+                )
+        return retired
 
     def _resolve_device_credentials(self, router: Router) -> QueueCredentials:
         host = router.management_ip_address or router.public_ip_address
