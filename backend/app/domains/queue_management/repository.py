@@ -15,14 +15,16 @@ retryable background job.
 from __future__ import annotations
 
 import uuid
+import zlib
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
+from .constants import QueueStatus
 from .models import QueueAssignment, QueueProfile, QueueSchedule, QueueTemplate
 
 
@@ -115,6 +117,26 @@ class QueueManagementRepositoryProtocol(Protocol):
         self, *, target_type: str, target_id: uuid.UUID | None
     ) -> QueueAssignment | None: ...
 
+    async def list_assignments_for_target(
+        self, *, target_type: str, target_id: uuid.UUID | None
+    ) -> list[QueueAssignment]: ...
+
+    async def list_assignments_for_device_target(
+        self, *, router_id: uuid.UUID, device_target: str
+    ) -> list[QueueAssignment]: ...
+
+    async def list_system_profiles_by_rates(
+        self, *, download_rate_kbps: int, upload_rate_kbps: int
+    ) -> list[QueueProfile]: ...
+
+    async def acquire_assignment_target_lock(
+        self, *, target_type: str, target_id: uuid.UUID | None
+    ) -> None: ...
+
+    async def acquire_profile_rate_lock(
+        self, *, download_rate_kbps: int, upload_rate_kbps: int
+    ) -> None: ...
+
 
 async def _paginate_org_or_system(
     session,  # noqa: ANN001
@@ -147,6 +169,37 @@ async def _paginate_org_or_system(
     result = await session.execute(paginate(statement, params))
     rows = list(result.scalars().all())
     return rows, PaginationMeta.from_total(params, total_items)
+
+
+async def _acquire_advisory_lock(
+    session,  # noqa: ANN001
+    *,
+    namespace: bytes,
+    key: str,
+) -> None:
+    """Transaction-scoped Postgres advisory lock on one logical key.
+
+    ``resolve_and_assign_queue`` is a read-then-write: it asks "is there
+    already a live assignment for this target?" and, when the answer is no,
+    creates one. Two callers that ask that question at the same time both
+    get "no" and both create -- which is exactly the duplicate this lock
+    exists to stop (see that method's own docstring). The row is committed
+    inside the same transaction the lock is held in, so the second waiter
+    sees the first caller's row the moment it acquires the lock.
+
+    ``pg_advisory_xact_lock(int4, int4)`` is used rather than the
+    ``text``-keyed overload because the two-integer form is the documented
+    one, and both halves are computed here with ``crc32`` rather than
+    handed to Postgres' undocumented internal ``hashtext``. The locks are
+    released by the surrounding COMMIT/ROLLBACK, never explicitly.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:first, :second)"),
+        {
+            "first": zlib.crc32(namespace) & 0x7FFFFFFF,
+            "second": zlib.crc32(key.encode()) & 0x7FFFFFFF,
+        },
+    )
 
 
 class QueueManagementRepository:
@@ -273,19 +326,99 @@ class QueueManagementRepository:
             sort_order=sort_order,
         )
 
+    async def list_assignments_for_target(
+        self, *, target_type: str, target_id: uuid.UUID | None
+    ) -> list[QueueAssignment]:
+        """Every live (non-``EXPIRED``, non-deleted) assignment for one
+        target, **newest first** -- the whole set, not just the newest.
+
+        ``get_active_assignment_for_target`` below deliberately collapses
+        this to one row, which is correct for "is there a live assignment
+        here to supersede?" but hides a duplicate: two rows created for one
+        target (see ``acquire_assignment_target_lock``'s own docstring for
+        how that happened) both own their own ``/queue simple`` entry on the
+        device, and RouterOS applies the *first matching* one. Returning the
+        full set is what lets the service see and retire the others."""
+        candidates = await self.assignments.get_all(
+            filters={"target_type": target_type, "target_id": target_id}
+        )
+        live = [
+            c
+            for c in candidates
+            if c.status != QueueStatus.EXPIRED.value and not c.is_deleted
+        ]
+        return sorted(live, key=lambda a: a.created_at, reverse=True)
+
+    async def list_assignments_for_device_target(
+        self, *, router_id: uuid.UUID, device_target: str
+    ) -> list[QueueAssignment]:
+        """Every live assignment on one router naming this exact
+        ``device_target`` (the RouterOS ``target`` -- one concrete IP).
+
+        Only one guest can hold an IP at a time, but several assignments can
+        name it: the previous holder's, left behind when their session
+        ended, and the current holder's. A ``/queue simple`` matches on one
+        IP and RouterOS applies the first match in list order, so the stale
+        entry silently wins and the new guest inherits a rate nobody
+        configured for them. This is the lookup that makes those visible."""
+        candidates = await self.assignments.get_all(
+            filters={"router_id": router_id, "device_target": device_target}
+        )
+        return [
+            c
+            for c in candidates
+            if c.status != QueueStatus.EXPIRED.value and not c.is_deleted
+        ]
+
+    async def list_system_profiles_by_rates(
+        self, *, download_rate_kbps: int, upload_rate_kbps: int
+    ) -> list[QueueProfile]:
+        """Platform-wide (``organization_id IS NULL``) system profiles
+        carrying exactly these rates. Replaces the ``page=1,
+        page_size=100`` scan ``_get_or_create_system_profile`` used to do,
+        which silently stopped finding an existing profile once the system
+        kept more than a page of them -- and then quietly created another
+        one on every call."""
+        return await self.profiles.get_all(
+            filters={
+                "is_system_profile": True,
+                "download_rate_kbps": download_rate_kbps,
+                "upload_rate_kbps": upload_rate_kbps,
+            }
+        )
+
+    async def acquire_assignment_target_lock(
+        self, *, target_type: str, target_id: uuid.UUID | None
+    ) -> None:
+        """Serializes ``resolve_and_assign_queue`` per target -- see
+        ``_acquire_advisory_lock``."""
+        await _acquire_advisory_lock(
+            self.session,
+            namespace=b"queue_assignment",
+            key=f"{target_type}:{target_id}",
+        )
+
+    async def acquire_profile_rate_lock(
+        self, *, download_rate_kbps: int, upload_rate_kbps: int
+    ) -> None:
+        """Serializes ``_get_or_create_system_profile`` per rate pair --
+        see ``_acquire_advisory_lock``."""
+        await _acquire_advisory_lock(
+            self.session,
+            namespace=b"queue_profile",
+            key=f"{download_rate_kbps}:{upload_rate_kbps}",
+        )
+
     async def get_active_assignment_for_target(
         self, *, target_type: str, target_id: uuid.UUID | None
     ) -> QueueAssignment | None:
         """The current (non-superseded, non-expired) assignment for one
         target -- what ``move_queue``/dynamic resolution consults to decide
         "is there already a live assignment here to supersede?"."""
-        candidates = await self.assignments.get_all(
-            filters={"target_type": target_type, "target_id": target_id}
+        live = await self.list_assignments_for_target(
+            target_type=target_type, target_id=target_id
         )
-        active = [c for c in candidates if c.status != "expired" and not c.is_deleted]
-        if not active:
-            return None
-        return max(active, key=lambda a: a.created_at)
+        return live[0] if live else None
 
     async def list_assignments_by_status(
         self, *, status: str

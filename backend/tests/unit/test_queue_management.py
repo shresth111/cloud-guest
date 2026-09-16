@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -129,6 +129,11 @@ class FakeQueueManagementRepository:
     schedules: dict[uuid.UUID, QueueSchedule] = field(default_factory=dict)
     templates: dict[uuid.UUID, QueueTemplate] = field(default_factory=dict)
     assignments: dict[uuid.UUID, QueueAssignment] = field(default_factory=dict)
+    # Recorded so a test can assert the service serialized before reading --
+    # the real methods take Postgres advisory locks, which an in-memory fake
+    # has no equivalent of (see repository._acquire_advisory_lock).
+    assignment_target_locks: list[str] = field(default_factory=list)
+    profile_rate_locks: list[str] = field(default_factory=list)
 
     async def create_profile(self, **fields: object) -> QueueProfile:
         profile = QueueProfile(**_base_fields(**fields))
@@ -266,10 +271,10 @@ class FakeQueueManagementRepository:
         paged = values[params.offset : params.offset + params.page_size]
         return paged, PaginationMeta.from_total(params, len(values))
 
-    async def get_active_assignment_for_target(
+    async def list_assignments_for_target(
         self, *, target_type: str, target_id: uuid.UUID | None
-    ) -> QueueAssignment | None:
-        candidates = [
+    ) -> list[QueueAssignment]:
+        live = [
             a
             for a in self.assignments.values()
             if a.target_type == target_type
@@ -277,9 +282,51 @@ class FakeQueueManagementRepository:
             and a.status != QueueStatus.EXPIRED.value
             and not a.is_deleted
         ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda a: a.created_at)
+        return sorted(live, key=lambda a: a.created_at, reverse=True)
+
+    async def list_assignments_for_device_target(
+        self, *, router_id: uuid.UUID, device_target: str
+    ) -> list[QueueAssignment]:
+        return [
+            a
+            for a in self.assignments.values()
+            if a.router_id == router_id
+            and a.device_target == device_target
+            and a.status != QueueStatus.EXPIRED.value
+            and not a.is_deleted
+        ]
+
+    async def list_system_profiles_by_rates(
+        self, *, download_rate_kbps: int, upload_rate_kbps: int
+    ) -> list[QueueProfile]:
+        return [
+            p
+            for p in self.profiles.values()
+            if p.is_system_profile
+            and p.download_rate_kbps == download_rate_kbps
+            and p.upload_rate_kbps == upload_rate_kbps
+            and not p.is_deleted
+        ]
+
+    async def acquire_assignment_target_lock(
+        self, *, target_type: str, target_id: uuid.UUID | None
+    ) -> None:
+        self.assignment_target_locks.append(f"{target_type}:{target_id}")
+
+    async def acquire_profile_rate_lock(
+        self, *, download_rate_kbps: int, upload_rate_kbps: int
+    ) -> None:
+        self.profile_rate_locks.append(f"{download_rate_kbps}:{upload_rate_kbps}")
+
+    async def get_active_assignment_for_target(
+        self, *, target_type: str, target_id: uuid.UUID | None
+    ) -> QueueAssignment | None:
+        """Mirrors the real repository exactly -- newest of the live rows,
+        via the non-collapsing list method above."""
+        live = await self.list_assignments_for_target(
+            target_type=target_type, target_id=target_id
+        )
+        return live[0] if live else None
 
     async def list_assignments_by_status(
         self, *, status: str
@@ -1391,6 +1438,275 @@ class TestResolveFollowsTheGuestsCurrentAddress:
         assert len(h.device_adapter.created_calls) == 1
         assert h.device_adapter.updated_calls == []
         assert h.device_adapter.removed_ids == []
+
+
+def _seed_assignment(
+    h: Harness,
+    *,
+    router: Router,
+    target_id: uuid.UUID,
+    device_target: str,
+    queue_profile_id: uuid.UUID,
+    device_queue_id: str | None = None,
+    status: str = QueueStatus.ACTIVE.value,
+    created_at: datetime | None = None,
+) -> QueueAssignment:
+    """Puts an already-live assignment straight into the fake repository.
+
+    ``resolve_and_assign_queue`` is not the only way a row exists -- the
+    duplicates and the previous-holder rows this file's
+    ``TestOneQueuePerAddress`` covers were written by *earlier* code, so
+    they have to be seeded rather than produced."""
+    assignment = QueueAssignment(
+        **_base_fields(
+            organization_id=router.organization_id,
+            location_id=router.location_id,
+            router_id=router.id,
+            target_type=QueueTargetType.SESSION.value,
+            target_id=target_id,
+            device_target=device_target,
+            device_queue_id=device_queue_id,
+            queue_profile_id=queue_profile_id,
+            queue_schedule_id=None,
+            status=status,
+            priority_override=None,
+            applied_at=None,
+            expires_at=None,
+            error_message=None,
+            superseded_by_assignment_id=None,
+            created_by_user_id=None,
+            created_at=created_at or _now(),
+        )
+    )
+    h.repository.assignments[assignment.id] = assignment
+    return assignment
+
+
+class TestOneQueuePerAddress:
+    """A ``/queue simple`` entry matches one concrete IP, and RouterOS
+    applies the **first matching entry in list order** -- creation order.
+    So more than one live assignment naming an address is not redundant
+    bookkeeping: the older row decides the guest's actual rate and the rate
+    the venue just saved has no effect at all.
+
+    Two ways that happened in production, both covered here: a duplicate
+    created by the read-then-write race in ``resolve_and_assign_queue``, and
+    a previous holder's row left behind when a guest IP was handed to the
+    next guest."""
+
+    async def _resolved_rate(
+        self,
+        h: Harness,
+        router: Router,
+        *,
+        download_kbps: int = 40960,
+        upload_kbps: int = 40960,
+    ) -> QueueProfile:
+        """Configures the location's bandwidth policy *and* creates the
+        system profile that rate resolves to.
+
+        Both halves matter: a seeded row has to name the same profile the
+        pipeline will resolve, or the pipeline would legitimately move the
+        queue instead and the test would be measuring something else."""
+        h.policy_lookup.rules_by_scope[
+            (router.organization_id, router.location_id)
+        ] = {
+            "download_rate_kbps": download_kbps,
+            "upload_rate_kbps": upload_kbps,
+            "burst_download_kbps": None,
+            "burst_upload_kbps": None,
+            "burst_threshold_kbps": None,
+            "burst_time_seconds": None,
+            "priority": None,
+        }
+        return await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            name=f"System {download_kbps}k/{upload_kbps}k",
+            download_rate_kbps=download_kbps,
+            upload_rate_kbps=upload_kbps,
+            is_system_profile=True,
+        )
+
+    async def _resolve(
+        self, h: Harness, router: Router, *, target_id: uuid.UUID, address: str
+    ) -> QueueAssignment:
+        return await h.service.resolve_and_assign_queue(
+            requesting_organization_id=router.organization_id,
+            location_id=router.location_id,
+            router_id=router.id,
+            target_type=QueueTargetType.SESSION,
+            target_id=target_id,
+            device_target=address,
+        )
+
+    async def test_a_duplicate_for_the_same_target_is_retired(self) -> None:
+        """Two ACTIVE rows for one session -- what the race left in
+        production -- must converge on one, and the loser's device queue
+        must actually be pulled, not just marked."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        target_id = uuid.uuid4()
+        profile = await self._resolved_rate(h, router)
+
+        older = _seed_assignment(
+            h,
+            router=router,
+            target_id=target_id,
+            device_target="10.0.0.5",
+            queue_profile_id=profile.id,
+            device_queue_id="*1",
+            created_at=_now() - timedelta(seconds=5),
+        )
+        newer = _seed_assignment(
+            h,
+            router=router,
+            target_id=target_id,
+            device_target="10.0.0.5",
+            queue_profile_id=profile.id,
+            device_queue_id="*2",
+        )
+
+        surviving = await self._resolve(
+            h, router, target_id=target_id, address="10.0.0.5"
+        )
+
+        # Newest wins, and it is returned untouched -- same profile, same
+        # address, so nothing about this guest's rate changed.
+        assert surviving.id == newer.id
+        assert len(h.device_adapter.created_calls) == 0
+        assert h.repository.assignments[newer.id].device_queue_id == "*2"
+
+        retired = await h.repository.get_assignment_by_id(older.id)
+        assert retired.status == QueueStatus.EXPIRED.value
+        assert "*1" in h.device_adapter.removed_ids
+
+        # No third row for the same target.
+        assert len(h.repository.assignments) == 2
+
+    async def test_an_address_reused_by_a_new_session_drops_the_old_holders_queue(
+        self,
+    ) -> None:
+        """The previous holder's row names a different session, so nothing
+        keyed on this target would ever find it -- only the address ties
+        them together."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        previous_session = uuid.uuid4()
+        new_session = uuid.uuid4()
+        profile = await self._resolved_rate(h, router)
+
+        previous = _seed_assignment(
+            h,
+            router=router,
+            target_id=previous_session,
+            device_target="10.0.0.5",
+            queue_profile_id=profile.id,
+            device_queue_id="*7",
+            created_at=_now() - timedelta(minutes=30),
+        )
+
+        assigned = await self._resolve(
+            h, router, target_id=new_session, address="10.0.0.5"
+        )
+
+        retired = await h.repository.get_assignment_by_id(previous.id)
+        assert retired.status == QueueStatus.EXPIRED.value
+        assert "*7" in h.device_adapter.removed_ids
+        assert assigned.status == QueueStatus.ACTIVE.value
+        assert assigned.device_queue_id is not None
+
+        live_on_address = [
+            a
+            for a in h.repository.assignments.values()
+            if a.device_target == "10.0.0.5"
+            and a.status != QueueStatus.EXPIRED.value
+        ]
+        assert [a.id for a in live_on_address] == [assigned.id]
+
+    async def test_a_queue_on_a_different_address_is_left_alone(self) -> None:
+        """Retirement is scoped to the address, not to the guest or the
+        router: another live queue on another IP is not competing and must
+        survive."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        profile = await self._resolved_rate(h, router)
+        other = _seed_assignment(
+            h,
+            router=router,
+            target_id=uuid.uuid4(),
+            device_target="10.0.0.99",
+            queue_profile_id=profile.id,
+            device_queue_id="*9",
+        )
+
+        await self._resolve(h, router, target_id=uuid.uuid4(), address="10.0.0.5")
+
+        assert h.repository.assignments[other.id].status == QueueStatus.ACTIVE.value
+        assert "*9" not in h.device_adapter.removed_ids
+
+    async def test_the_target_is_locked_before_the_existing_row_is_read(
+        self,
+    ) -> None:
+        """The read-then-write can only be safe if the read is inside a lock
+        keyed on the target -- that is the whole fix for the duplicate."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        target_id = uuid.uuid4()
+
+        await self._resolve(h, router, target_id=target_id, address="10.0.0.5")
+
+        assert h.repository.assignment_target_locks == [
+            f"{QueueTargetType.SESSION.value}:{target_id}"
+        ]
+        # The profile find-or-create is serialized on the rate pair too.
+        assert h.repository.profile_rate_locks == ["0:0"]
+
+    async def test_a_duplicate_system_profile_is_reused_not_tripled(self) -> None:
+        """``_get_or_create_system_profile`` was itself a read-then-create,
+        which is why production carries two ``System 40960k/40960k`` rows.
+        Resolution must settle on one of them and stop creating."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        h.policy_lookup.rules_by_scope[
+            (router.organization_id, router.location_id)
+        ] = {
+            "download_rate_kbps": 40960,
+            "upload_rate_kbps": 40960,
+            "burst_download_kbps": None,
+            "burst_upload_kbps": None,
+            "burst_threshold_kbps": None,
+            "burst_time_seconds": None,
+            "priority": None,
+        }
+        first = await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            name="System 40960k/40960k",
+            download_rate_kbps=40960,
+            upload_rate_kbps=40960,
+            is_system_profile=True,
+        )
+        second = await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=None,
+            name="System 40960k/40960k",
+            download_rate_kbps=40960,
+            upload_rate_kbps=40960,
+            is_system_profile=True,
+        )
+
+        assigned = await self._resolve(
+            h, router, target_id=uuid.uuid4(), address="10.0.0.5"
+        )
+
+        assert assigned.queue_profile_id in {first.id, second.id}
+        same_rate = [
+            p
+            for p in h.repository.profiles.values()
+            if p.is_system_profile and p.download_rate_kbps == 40960
+        ]
+        assert len(same_rate) == 2
 
 
 # ============================================================================
