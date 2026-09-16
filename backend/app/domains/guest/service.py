@@ -3831,6 +3831,26 @@ class GuestService:
             device_ids=device_ids, organization_id=requesting_organization_id
         )
 
+    async def list_device_presence(
+        self, *, router_mac_pairs: list[tuple[uuid.UUID, str]]
+    ) -> dict[tuple[uuid.UUID, str], bool]:
+        """Whether the venue's network is still seeing each ``(router, MAC)``
+        -- backs ``GuestSessionResponse.device_online``, and through it the
+        "Online" indicator.
+
+        Bounded like ``list_devices_for_session_ids`` above, and for the same
+        reason: the router chunks at ``MAX_BULK_DEVICE_LOOKUP_IDS`` before
+        calling, so this raises only if a future caller forgets to. See
+        ``GuestRepository.list_device_presence`` for why this reads
+        ``connected_devices`` at all."""
+        if len(router_mac_pairs) > MAX_BULK_DEVICE_LOOKUP_IDS:
+            raise TooManyDeviceIdsError(
+                requested=len(router_mac_pairs), limit=MAX_BULK_DEVICE_LOOKUP_IDS
+            )
+        return await self.repository.list_device_presence(
+            router_mac_pairs=router_mac_pairs
+        )
+
     async def list_router_names_for_ids(
         self, router_ids: Sequence[uuid.UUID]
     ) -> dict[uuid.UUID, str]:
