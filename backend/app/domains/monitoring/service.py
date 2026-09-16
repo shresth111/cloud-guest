@@ -1271,8 +1271,9 @@ class AlertService:
 
     An open (``TRIGGERED``/``ACKNOWLEDGED``) ``Alert`` is never spammed a
     second time for a condition that is already firing. The de-duplication
-    key is **(rule_id, organization_id, location_id, router_id)** -- the
-    exact tuple identifying "this rule, watching this specific target"
+    key is **(rule_id, organization_id, location_id, router_id,
+    subject_id)** -- the exact tuple identifying "this rule, watching this
+    specific target"
     (``organization_id``/``location_id``/``router_id`` are each ``NULL``
     for a platform-wide ``HEALTH_STATUS_CHANGE`` rule watching a
     ``ServiceHealth`` component, and populated per-router for a
@@ -1284,10 +1285,19 @@ class AlertService:
     is always part of the key too). See
     ``repository.MonitoringRepository.find_active_alert``.
 
-    Note what the key does **not** contain: anything below a router. An
-    ``ALERT_TARGET_ROGUE_DHCP_GUARD`` rule watches state the detector
-    persists per ``(router, interface)``, so its branch groups those rows
-    per router before evaluating them -- evaluating per interface would
+    ``subject_id`` is the fifth dimension, and only one branch passes it:
+    ``ALERT_TARGET_MONITORED_HARDWARE`` sets it to the device's own id.
+    Without it, that branch's key was ``(rule, organization, location,
+    NULL)`` for **every** access point at a venue -- a monitored device is
+    not a router -- so the second AP to go down produced no alert at all,
+    and an open alert for a device that was still down blocked every other
+    device at that location. Every other branch passes ``None`` and
+    de-duplicates on exactly the key it always used.
+
+    Note what the key does **not** contain elsewhere: anything below a
+    router. An ``ALERT_TARGET_ROGUE_DHCP_GUARD`` rule watches state the
+    detector persists per ``(router, interface)``, so its branch groups those
+    rows per router before evaluating them -- evaluating per interface would
     address two different findings to one key and silently lose the second.
     ``_evaluate_rogue_dhcp_guard_rule`` also answers the key from one bulk
     ``list_open_alerts_for_rule`` read rather than a ``find_active_alert``
@@ -1433,6 +1443,21 @@ class AlertService:
                 rule.id, notification_channel_ids
             )
         return updated
+
+    async def list_alert_rule_channel_ids(
+        self, rule_id: uuid.UUID
+    ) -> list[uuid.UUID]:
+        """The notification channels this rule currently notifies, if any.
+
+        Backs ``default_alerting``'s "is this rule silent?" check: a rule with
+        zero linked channels fires alerts that reach nobody -- the ``Alert``
+        row appears, the dashboard lights up, and ``_dispatch_for_alert``
+        returns. This is the same repository call ``_dispatch_to_rule_channels``
+        makes at send time, exposed so the question can be asked *before* an
+        alert exists rather than only after one fails to arrive."""
+        return await self.repository.list_notification_channel_ids_for_rule(
+            rule_id
+        )
 
     async def delete_alert_rule(
         self,
@@ -1830,6 +1855,13 @@ class AlertService:
                     organization_id=item.device.organization_id,
                     location_id=item.device.location_id,
                     router_id=item.device.router_id,
+                    # The device is the subject. Without it this key is
+                    # (rule, org, location, router) and a monitored device's
+                    # router_id is normally NULL -- so every AP at one location
+                    # shared one key, only the first ever alerted, and an open
+                    # alert for a device that is still down blocked every other
+                    # device there. See models.Alert.subject_id.
+                    subject_id=item.device.id,
                 )
                 if condition_met and existing is None:
                     alert = await self._create_alert(
@@ -1837,6 +1869,7 @@ class AlertService:
                         organization_id=item.device.organization_id,
                         location_id=item.device.location_id,
                         router_id=item.device.router_id,
+                        subject_id=item.device.id,
                         message=_health_status_message(
                             item.device.name, item.status.value
                         ),
@@ -2322,6 +2355,7 @@ class AlertService:
         message: str,
         related_event_id: uuid.UUID | None = None,
         related_health_check_id: uuid.UUID | None = None,
+        subject_id: uuid.UUID | None = None,
     ) -> Alert:
         alert = await self.repository.create_alert(
             rule_id=rule.id,
@@ -2333,6 +2367,7 @@ class AlertService:
             organization_id=organization_id,
             location_id=location_id,
             router_id=router_id,
+            subject_id=subject_id,
             message=message,
             related_health_check_id=related_health_check_id,
             related_event_id=related_event_id,

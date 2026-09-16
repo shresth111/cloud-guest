@@ -474,6 +474,32 @@ class Alert(BaseModel):
         ForeignKey("routers.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # WHAT this alert is about, when the rule's target is a *class* of thing
+    # rather than a router/location pair -- the polymorphic half of the
+    # de-duplication key ``AlertRepository.find_active_alert`` matches on.
+    #
+    # Added for ``ALERT_TARGET_MONITORED_HARDWARE``. A monitored device's
+    # ``router_id`` is normally NULL, and the key had no other dimension, so
+    # **every access point at one location shared a single key**: the second
+    # AP to go down never produced an alert at all, and while the first alert
+    # was open -- which, for a device that is still down, is forever --
+    # nothing else at that location could fire. A venue with five APs got one
+    # alert, naming whichever device the evaluation loop happened to see
+    # first. Now the device id is part of the key.
+    #
+    # Deliberately nullable and deliberately without a ``ForeignKey``:
+    #
+    #  * ``NULL`` means "no subject dimension", which is what every row
+    #    predating this column is, and what every *other* target still passes
+    #    -- ``router``, ``router_reachability``, ``isp_link``,
+    #    ``rogue_dhcp_guard`` and the three controller targets keep
+    #    de-duplicating on exactly the key they used before.
+    #  * The subject is polymorphic -- today a ``monitored_hardware.id`` --
+    #    so a constraint to that one table would both misstate the column and
+    #    block the next target that needs a subject of its own.
+    subject_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     message: Mapped[str] = mapped_column(Text, nullable=False)
     related_health_check_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -493,6 +519,7 @@ class Alert(BaseModel):
         Index("ix_alerts_organization_id", "organization_id"),
         Index("ix_alerts_location_id", "location_id"),
         Index("ix_alerts_router_id", "router_id"),
+        Index("ix_alerts_subject_id", "subject_id"),
         Index("ix_alerts_triggered_at", "triggered_at"),
         Index("ix_alerts_severity", "severity"),
     )

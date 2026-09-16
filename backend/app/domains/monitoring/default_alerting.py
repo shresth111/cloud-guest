@@ -315,10 +315,51 @@ async def ensure_default_alerting(
         name = str(spec["name"])
         existing = existing_by_target.get(target)
         if existing is not None:
-            # Left completely alone, including its channel links. An
-            # operator who pointed this rule somewhere else, retuned it or
-            # switched it off meant to, and a backfill must not argue.
             report.rules_already_present.append(name)
+            # Left alone, *except* for one hole: a rule with no channel at all
+            # notifies nobody. That is the exact failure this module was
+            # written to end ("Rules without channels notify nobody" -- the
+            # Alert row appears, the dashboard lights up, and
+            # `_dispatch_for_alert` returns), and it came back through the
+            # idempotency rule above: the channel is linked only to rules this
+            # function *creates*, so every organization whose default rule
+            # predates this module kept a permanently silent rule. Live
+            # evidence on production: three of the eight "Network hardware
+            # down" rules had no channel, and the AP-down alerts they fired
+            # have zero notification_logs rows.
+            #
+            # Still not an argument with the operator: a rule that already
+            # points at *some* channel is untouched, whatever it points at.
+            # This fills a hole; it never overrules a choice.
+            if channel_id is not None and not await (
+                alert_service.list_alert_rule_channel_ids(existing.id)
+            ):
+                try:
+                    await alert_service.update_alert_rule(
+                        existing.id,
+                        data={},
+                        notification_channel_ids=[channel_id],
+                        requesting_organization_id=organization_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "default_alert_rule_channel_link_failed",
+                        extra={
+                            "organization_id": str(organization_id),
+                            "rule_id": str(existing.id),
+                            "target_component": target,
+                        },
+                    )
+                    continue
+                report.rules_linked_to_channel.append(name)
+                logger.info(
+                    "default_alert_rule_linked_to_channel",
+                    extra={
+                        "organization_id": str(organization_id),
+                        "rule_id": str(existing.id),
+                        "target_component": target,
+                    },
+                )
             continue
         try:
             created = await alert_service.create_alert_rule(
