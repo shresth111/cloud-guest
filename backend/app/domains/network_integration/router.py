@@ -144,6 +144,8 @@ from .schemas import (
     PlatformTestConnectionResponse,
     PortalAuthorizeRequest,
     PortalAuthorizeResponse,
+    PortalRadiusAuthorizeRequest,
+    PortalRadiusAuthorizeResponse,
     TestConnectionRequest,
     TestConnectionResponse,
 )
@@ -2051,6 +2053,97 @@ async def authorize_portal_client(
             "Guest authorized on the network controller"
             if outcome.authorized
             else "The network controller declined the authorization"
+        ),
+        data=response.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@portal_router.post(
+    "/portal/radius-authorize",
+    response_model=ApiResponse[PortalRadiusAuthorizeResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def authorize_portal_client_via_radius(
+    request: Request,
+    payload: PortalRadiusAuthorizeRequest,
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Authorize a guest at a venue on the **RADIUS** captive-portal contract.
+
+    **Public and unauthenticated, for exactly the same reason and with
+    exactly the same substitute** as ``POST /portal/authorize`` immediately
+    above: a guest joining WiFi holds no login and no grants, and what
+    stands in for a permission check is proof of a genuine ``GuestSession``
+    -- ACTIVE, its own organization *and* location matching the body, its
+    bound device's MAC matching the MAC being authorized, and the
+    integration resolved from the session's venue rather than the body's.
+    That check is literally the same code
+    (``NetworkIntegrationService._resolve_portal_session``), not a second
+    implementation of it.
+
+    This is a **separate route rather than a mode of that one** because it
+    is a separate contract: the ``authType 2`` redirect carries no ``site``
+    and no ``t`` (both required there) and adds ``target``/``targetPort``/
+    ``scheme``/``originUrl`` (meaningless there). Each route refuses an
+    integration whose stored ``portal_mode`` belongs to the other, so the
+    live external-portal venue cannot be reached through this one.
+
+    ## Why the call is here and not in the guest's browser
+
+    The guest's browser used to form-POST the controller's own
+    ``/portal/radius/browserauth``. That target is the controller's HTTPS
+    portal port with a self-signed ``CN=localhost`` certificate, and
+    **Android refuses it** -- measured on a real phone. Every self-hosted
+    controller has its own such certificate, so nothing about that scales.
+    The controller does not care who sends the request (verified on
+    hardware: a third machine's curl, carrying the guest's MAC, opened the
+    gate), so the platform sends it instead.
+
+    The guest's browser therefore never talks to the controller and never
+    sees its raw JSON error body, which is what it used to be shown on a
+    rejection.
+
+    Same two rate-limit layers as the sibling route: per client IP in
+    ``app.middleware.rate_limit``, per guest session in this domain's
+    service.
+    """
+    outcome = await service.authorize_portal_client_via_radius(
+        session_id=uuid.UUID(payload.session_id),
+        organization_id=uuid.UUID(payload.organization_id),
+        location_id=uuid.UUID(payload.location_id),
+        provider=payload.provider,
+        client_mac=payload.client_mac,
+        # CR-004, as on the sibling route: whatever ``clientIp`` the
+        # controller's own redirect carried, and never ``request.client.host``
+        # or an ``X-Forwarded-For`` hop.
+        client_ip=payload.client_ip,
+        ap_mac=payload.ap_mac,
+        ssid_name=payload.ssid_name,
+        radio_id=payload.radio_id,
+        gateway_mac=payload.gateway_mac,
+        vid=payload.vid,
+        origin_url=payload.origin_url,
+        # Passed through ONLY to be checked against the integration's stored
+        # controller address. The service builds no URL from them -- see its
+        # SSRF section. Not defaulted from anything here either: a value this
+        # layer invented would be a value that always matched.
+        target=payload.target,
+        target_port=payload.target_port,
+        scheme=payload.scheme,
+    )
+    response = PortalRadiusAuthorizeResponse(
+        authorized=outcome.authorized,
+        provider=outcome.provider,
+        redirect_url=outcome.redirect_url,
+        failure=outcome.failure,
+    )
+    return build_response(
+        success=outcome.authorized,
+        message=(
+            "Guest authorized on the network controller"
+            if outcome.authorized
+            else "The network controller did not authorize this guest"
         ),
         data=response.model_dump(),
         request_id=_request_id(request),

@@ -108,6 +108,8 @@ __all__ = [
     "PlatformTestConnectionResponse",
     "PortalAuthorizeRequest",
     "PortalAuthorizeResponse",
+    "PortalRadiusAuthorizeRequest",
+    "PortalRadiusAuthorizeResponse",
     "TestConnectionRequest",
     "TestConnectionResponse",
 ]
@@ -1022,6 +1024,92 @@ class PortalAuthorizeResponse(BaseModel):
     # own redirect in the first place. Treating it as a URL this backend
     # would follow is what would make it an SSRF vector; it is not one.
     redirect_url: str | None = None
+
+
+class PortalRadiusAuthorizeRequest(BaseModel):
+    """The captive-portal enforcement call for a **RADIUS-mode** venue.
+
+    ## Why this is a second request model and not three optional fields
+
+    Because it is a second *contract*, not a variant of the first. Measured
+    on hardware and recorded in ``RADIUS-PORTAL-MODE.md`` §1.2: the
+    ``authType 2`` redirect carries **no** ``site`` and **no** ``t`` -- the
+    two values ``PortalAuthorizeRequest`` requires and validates -- and adds
+    ``target``/``targetPort``/``scheme``/``originUrl``, which mean nothing on
+    the other path. Merging them would have meant making ``site`` optional
+    on the endpoint a live venue depends on, which is exactly how a required
+    check quietly stops being one.
+
+    ``PortalAuthorizeRequest`` and this model therefore stay separate, and
+    the *stored* ``portal_mode`` still decides which one a venue may use --
+    each endpoint refuses an integration on the other contract.
+
+    ## The three fields that exist only to be refused
+
+    ``target``, ``target_port`` and ``scheme`` are the controller's own claim
+    about where the submit should go, relayed here through the guest's
+    browser. **The server does not build a URL from them.** It builds one
+    from the integration's stored controller address and compares; a
+    disagreement is refused and nothing is sent. Send them if the redirect
+    carried them -- a mismatch is a real signal an operator needs -- but
+    omitting them changes nothing about where the request goes.
+
+    ``origin_url`` is where the controller should send the browser once the
+    gate is open, and it comes back on the response as ``redirect_url``. The
+    caller should send its own post-login destination here rather than
+    echoing the controller's captured ``originUrl``: that is what the
+    MikroTik path does with ``link-orig``, and dropping a guest on a plain
+    website with no session page is the alternative.
+
+    ``client_ip`` is the same CR-004 pass-through as on the other request:
+    captured from the controller's redirect, never derived from the HTTP
+    peer, and absent means absent.
+
+    Note what is NOT here: the guest's identifier. It is the credential this
+    contract submits, and the server resolves it from the session rather
+    than accepting it -- see ``service.authorize_portal_client_via_radius``.
+    """
+
+    session_id: str
+    organization_id: str
+    location_id: str
+    provider: _Provider = "omada"
+    client_mac: str = Field(min_length=12, max_length=32)
+    client_ip: str | None = Field(default=None, max_length=45)
+    ap_mac: str | None = Field(default=None, max_length=32)
+    gateway_mac: str | None = Field(default=None, max_length=32)
+    ssid_name: str | None = Field(default=None, max_length=255)
+    radio_id: int | None = Field(default=None, ge=0, le=16)
+    vid: int | None = Field(default=None, ge=0, le=4094)
+    origin_url: str | None = Field(default=None, max_length=2048)
+    # Cross-check only. See the class docstring.
+    target: str | None = Field(default=None, max_length=255)
+    target_port: int | None = Field(default=None, ge=1, le=65535)
+    scheme: str | None = Field(default=None, max_length=8)
+
+
+class PortalRadiusAuthorizeResponse(BaseModel):
+    """Whether the gate opened, and -- when it did not -- one renderable word.
+
+    ``failure`` is one of ``constants.RadiusPortalFailure`` and is the ONLY
+    thing about a refusal that reaches the guest. The controller's raw
+    ``errorCode`` and its own message are recorded against the integration
+    for the operator and deliberately never returned: the entire reason this
+    call moved server-side is that the browser-submitted version answered a
+    rejected guest by rendering the controller's raw JSON at them.
+
+    ``redirect_url`` is the controller's own ``Location`` on success, handed
+    to the browser to navigate to. This platform never fetches it.
+
+    ``expires_at`` is absent, and its absence is the honest answer: on this
+    contract the controller grants the session from its own RADIUS
+    Access-Accept and never tells us for how long.
+    """
+
+    authorized: bool
+    provider: str
+    redirect_url: str | None = None
+    failure: str | None = None
 
 
 class NetworkIntegrationDisconnectGuestRequest(BaseModel):

@@ -104,6 +104,23 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "per client IP in app.middleware.rate_limit, per guest session in "
         "that service."
     ),
+    ("POST", "/api/v1/network-integrations/portal/radius-authorize"): (
+        "The same captive-portal network enforcement as the entry above, "
+        "for a venue on the RADIUS portal contract (TP-Link authType 2) "
+        "instead of the external portal one. Public and unauthenticated for "
+        "the identical reason -- a guest joining WiFi has no login and no "
+        "grants -- and standing behind the identical substitute: "
+        "NetworkIntegrationService._resolve_portal_session, the SAME method "
+        "the other route uses, requiring an ACTIVE GuestSession whose "
+        "organization AND location match the body and whose bound device is "
+        "the MAC being authorized, with the integration resolved from the "
+        "session's venue. A separate route because it is a separate "
+        "contract (no site/t on the redirect; target/targetPort/scheme "
+        "instead), and each route refuses an integration on the other "
+        "contract. The claimed controller address is never used to build a "
+        "URL -- it is compared against the integration's stored address and "
+        "a mismatch is refused. Rate limited on both the same layers."
+    ),
     # -- Auth: pre-identity flows by definition --------------------------
     ("POST", "/api/v1/auth/register"): "Self-registration -- no account exists yet.",
     ("POST", "/api/v1/auth/login"): "Login -- no session exists yet.",

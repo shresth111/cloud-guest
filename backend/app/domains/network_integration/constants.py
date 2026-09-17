@@ -87,6 +87,8 @@ __all__ = [
     "NetworkProviderKind",
     "PORTAL_READINESS_GAP_LABELS",
     "PortalReadinessGap",
+    "RADIUS_PORTAL_METADATA_PORT_KEY",
+    "RadiusPortalFailure",
     "ROUTER_VENDOR_BY_PROVIDER",
     "FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER",
     "GUEST_OPERATOR_CREDENTIAL_FIELDS",
@@ -233,6 +235,69 @@ class PortalAuthMode(StrEnum):
 # migration's backfill and the "is this venue on the proven path" checks
 # cannot drift apart.
 DEFAULT_PORTAL_AUTH_MODE: PortalAuthMode = PortalAuthMode.EXTERNAL_PORTAL
+
+
+class RadiusPortalFailure(StrEnum):
+    """Why a RADIUS-mode authorization did not open the gate.
+
+    **This enum is an API contract with the guest portal**, which renders a
+    message per value. Every value is therefore guest-safe by construction:
+    no vendor name, no error number, no controller prose, nothing that
+    distinguishes one venue's misconfiguration from another's. The
+    controller's raw ``errorCode`` and its own message are recorded in the
+    integration's event feed, where an operator can see them, and are never
+    put in the response -- the whole reason this call moved server-side is
+    that the guest used to be shown the controller's raw JSON.
+
+    Coarser than the vendor's numbering on purpose. A guest can act on
+    exactly three things -- try again, wait, or ask staff -- so a fourth and
+    fifth distinction would be a distinction the page cannot use. Where two
+    vendor codes lead to the same advice they get the same value here, and
+    the event feed keeps the difference.
+    """
+
+    #: The RADIUS server answered and refused. On this platform that means
+    #: the guest's session is gone (our RADIUS authorizes by session lookup
+    #: and never checks the password), so the honest guest-facing advice is
+    #: "sign in again", not "check your password".
+    REJECTED = "rejected"
+    #: The controller could not reach this platform's RADIUS server at all.
+    #: Nothing the guest did is wrong and retrying will not help until
+    #: somebody fixes the network path.
+    RADIUS_UNREACHABLE = "radius_unreachable"
+    #: This platform could not reach the venue's controller -- timeout,
+    #: refused connection, or a certificate this integration will not trust.
+    #: Explicitly NOT a 500: the call was made, it failed, and the page has
+    #: something true to say.
+    CONTROLLER_UNREACHABLE = "controller_unreachable"
+    #: The controller answered and refused for a reason it did not name, or
+    #: named with a code this platform does not map. A retry is reasonable.
+    CONTROLLER_REFUSED = "controller_refused"
+    #: The controller rejected the shape of the request (HTTP 400). Always
+    #: this platform's bug, never the guest's, and the value exists so that
+    #: it shows up as itself in logs instead of hiding inside "refused".
+    BAD_REQUEST = "bad_request"
+
+
+
+# The vendor's own ``errorCode`` numbering is deliberately NOT mapped here.
+# That translation is the one part of this flow that knows a vendor's wire
+# format, so it lives with the vendor -- see
+# ``providers/omada.py``'s ``_RADIUS_FAILURE_BY_PROVIDER_CODE``.
+
+# WHERE THE PORTAL SUBMIT PORT IS OVERRIDDEN, WHEN IT HAS TO BE.
+#
+# `provider_metadata` rather than a column, so this needs no migration and
+# so an override that is never set costs nothing. Absent (the normal case)
+# means "use the provider's documented default for the stored scheme", which
+# is resolved inside the provider because a port number is vendor knowledge.
+#
+# It is deliberately an INTEGRATION field and not a request field. The
+# controller's redirect does name a submit port, and that name reaches this
+# platform through the guest's browser; honouring it would mean a caller
+# choosing where this platform's HTTP client connects. See
+# `service.authorize_portal_client_via_radius`'s SSRF section.
+RADIUS_PORTAL_METADATA_PORT_KEY = "radius_portal_port"
 
 
 class ControllerAuthMode(StrEnum):
@@ -632,6 +697,24 @@ class ErrorCode(StrEnum):
     # not wrong about the operation, only about which integration to run it
     # on, and the frontend hides the control rather than explaining it.
     GUEST_OPERATOR_REQUIRED = "NETWORK_INTEGRATION_GUEST_OPERATOR_REQUIRED"
+    # A RADIUS-mode authorize request claimed a submit address that is not
+    # the one the integration holds. The claim reaches this platform through
+    # the guest's browser, so this is an SSRF refusal, not a typo report:
+    # the request is refused and the stored address is never overridden. Its
+    # own code because "somebody is pointing us at an address we do not
+    # own" and "the controller said no" are not the same incident, and only
+    # the first one is worth waking anybody for. Never returned to the
+    # guest -- the endpoint answers the same opaque 403 as every other
+    # refusal -- it is what the integration's event feed records.
+    RADIUS_PORTAL_ADDRESS_MISMATCH = (
+        "NETWORK_INTEGRATION_RADIUS_PORTAL_ADDRESS_MISMATCH"
+    )
+    # The RADIUS-mode submit reached the controller and did not open the
+    # gate. The accompanying event context carries the vendor's own raw
+    # ``errorCode`` and the guest-safe ``RadiusPortalFailure`` it mapped to;
+    # this code says only "the call was made and the guest is not online",
+    # which is the thing an operator greps for.
+    RADIUS_PORTAL_NOT_AUTHORIZED = "NETWORK_INTEGRATION_RADIUS_PORTAL_NOT_AUTHORIZED"
 
     AUTH_FAILED = "OMADA_AUTH_FAILED"
     CONNECTION_FAILED = "OMADA_CONNECTION_FAILED"

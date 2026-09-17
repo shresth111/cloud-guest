@@ -1768,6 +1768,24 @@ class Settings(BaseSettings):
             "where an unbounded wait is a guest staring at a spinner."
         ),
     )
+    radius_portal_submit_password: str = Field(
+        default="welcome123",
+        min_length=1,
+        max_length=128,
+        description=(
+            "The password sent alongside the guest's identifier when this "
+            "platform submits an Omada RADIUS-mode captive-portal "
+            "authorization (POST /portal/radius/browserauth). It is a "
+            "PLACEHOLDER, not a secret, and the default is deliberately the "
+            "same literal the MikroTik hotspot path has always sent: this "
+            "product's FreeRADIUS authorizes by guest-session lookup and "
+            "never checks the password (see GuestService.authorize), while "
+            "the controller's form API rejects a body with the field "
+            "missing. Settable only so that a deployment whose RADIUS "
+            "server DOES check it can say so; there is no code path in "
+            "which changing it grants or denies anybody access here."
+        ),
+    )
     omada_sync_interval_seconds: int = Field(
         default=300,
         ge=60,
