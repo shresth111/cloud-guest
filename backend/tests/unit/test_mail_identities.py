@@ -1,7 +1,7 @@
 """Unit tests for the per-mailbox outgoing-mail split.
 
-Outgoing mail is deliberately split across five real Zoho mailboxes, each
-with its own credentials in the server's ``.env``:
+Outgoing mail is deliberately split across five real mailboxes, each with
+its own credentials in the server's ``.env``:
 
     admin@wyfyguest.com    guest OTP, password reset, new-location welcome
     demo@wyfyguest.com     the whole Book-a-Demo conversation
@@ -12,6 +12,13 @@ with its own credentials in the server's ``.env``:
     support@wyfyguest.com  nothing yet: configured so the mailbox is
                            addressable, awaiting the first flow that sends
                            as it
+
+The mailboxes are Google Workspace accounts, reached over
+``smtp.gmail.com``. That matters for more than the hostname: Google does not
+accept an account password over SMTP, so each mailbox needs an App Password
+(2-Step Verification on) or OAuth2 -- see ``SmtpIdentity``'s own note. This
+suite pins routing and the From/credentials pairing, which are the same
+either way; the credential *kind* is a deployment concern.
 
 These tests assert three separate things, because they fail in three
 separate ways:
@@ -86,11 +93,12 @@ ADMIN_PASSWORD = "placeholder-admin-password"
 SALES_PASSWORD = "placeholder-sales-password"
 DEMO_PASSWORD = "placeholder-demo-password"
 ALERT_PASSWORD = "placeholder-alert-password"
-#: Every mailbox this deployment sends as lives on the same Zoho India
-#: account, which is why one host serves all of them -- see
+#: Every mailbox this deployment sends as lives on the same Google
+#: Workspace domain, which is why one host serves all of them -- see
 #: ``SmtpIdentity``'s mismatch guard for what happens when a block is
 #: pointed at a different account than its credentials authenticate to.
-ZOHO_HOST = "smtp.zoho.in"
+#: Port 587 with STARTTLS; Google also offers 465 implicit-TLS.
+MAIL_HOST = "smtp.gmail.com"
 
 
 @pytest.fixture(autouse=True)
@@ -113,25 +121,25 @@ def _settings(**overrides: object) -> Settings:
     """Every mailbox fully configured, as production is meant to be."""
     base: dict[str, object] = {
         "email_delivery_provider": "smtp",
-        "smtp_host": ZOHO_HOST,
+        "smtp_host": MAIL_HOST,
         "smtp_port": 587,
         "smtp_username": SALES,
         "smtp_password": SALES_PASSWORD,
         "smtp_use_tls": True,
         "smtp_from_address": SALES,
-        "admin_smtp_host": ZOHO_HOST,
+        "admin_smtp_host": MAIL_HOST,
         "admin_smtp_port": 587,
         "admin_smtp_username": ADMIN,
         "admin_smtp_password": ADMIN_PASSWORD,
         "admin_smtp_use_tls": True,
         "admin_smtp_from_address": ADMIN,
-        "demo_smtp_host": ZOHO_HOST,
+        "demo_smtp_host": MAIL_HOST,
         "demo_smtp_port": 587,
         "demo_smtp_username": DEMO,
         "demo_smtp_password": DEMO_PASSWORD,
         "demo_smtp_use_tls": True,
         "demo_smtp_from_address": DEMO,
-        "alert_smtp_host": ZOHO_HOST,
+        "alert_smtp_host": MAIL_HOST,
         "alert_smtp_port": 587,
         "alert_smtp_username": ALERT,
         "alert_smtp_password": ALERT_PASSWORD,
@@ -610,7 +618,7 @@ class TestEachIdentityHasItsOwnBlock:
         block is not decorative: with a host set, the identity resolves to
         its own mailbox with no code change."""
         settings = _settings(
-            support_smtp_host=ZOHO_HOST,
+            support_smtp_host=MAIL_HOST,
             support_smtp_username=SUPPORT,
             support_smtp_password="placeholder-support-password",
             support_smtp_from_address=SUPPORT,
@@ -635,7 +643,7 @@ class TestIdentityCannotMixAccounts:
     ) -> None:
         with pytest.raises(MailIdentityMismatchError) as excinfo:
             SmtpIdentity.from_settings_block(
-                host="smtp.zoho.in",
+                host="smtp.gmail.com",
                 port=587,
                 username=ADMIN,
                 password=ADMIN_PASSWORD,
@@ -649,7 +657,7 @@ class TestIdentityCannotMixAccounts:
         self,
     ) -> None:
         identity = SmtpIdentity.from_settings_block(
-            host="smtp.zoho.in",
+            host="smtp.gmail.com",
             port=587,
             username=ADMIN,
             password=ADMIN_PASSWORD,
@@ -665,7 +673,7 @@ class TestIdentityCannotMixAccounts:
         at any call site -- it is not a discipline anyone has to remember."""
         with pytest.raises(TypeError):
             SmtpEmailProvider(  # type: ignore[call-arg]
-                host="smtp.zoho.in",
+                host="smtp.gmail.com",
                 port=587,
                 username=ADMIN,
                 password=ADMIN_PASSWORD,
@@ -676,7 +684,7 @@ class TestIdentityCannotMixAccounts:
     def test_from_address_cannot_be_reassigned_after_construction(self) -> None:
         provider = SmtpEmailProvider(
             SmtpIdentity.from_settings_block(
-                host="smtp.zoho.in",
+                host="smtp.gmail.com",
                 port=587,
                 username=ADMIN,
                 password=ADMIN_PASSWORD,
@@ -775,7 +783,7 @@ class TestIdentityCannotMixAccounts:
         from app.domains.billing.router import _get_invoice_email_provider
 
         settings = _settings(
-            invoice_smtp_host="smtp.zoho.in",
+            invoice_smtp_host="smtp.gmail.com",
             invoice_smtp_username="accounts@wyfyguest.com",
             invoice_smtp_password="placeholder-accounts-password",
             invoice_smtp_from_address=SALES,

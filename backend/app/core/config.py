@@ -1243,8 +1243,8 @@ class Settings(BaseSettings):
             "admin_smtp_username -- an identity always sends as the account "
             "it authenticated as unless deliberately told otherwise, and "
             "SmtpIdentity rejects a From that belongs to a different "
-            "account (Zoho answers that mismatch with '553 Sender is not "
-            "allowed to relay emails')."
+            "account (Google Workspace answers that mismatch with '550 "
+            "Sender address rejected')."
         ),
     )
 
