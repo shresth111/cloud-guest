@@ -394,6 +394,7 @@ from .nas_number_generator import (
     generate_shared_secret,
 )
 from .repository import (
+    ActiveGuestOrgPair,
     DashboardSeriesAggregate,
     DeviceSessionCount,
     GuestRepositoryProtocol,
@@ -747,33 +748,16 @@ async def enforce_whitelist_only_online_guests(
         )
         return []
 
-    pairs = await repository.list_active_guest_org_pairs()
+    pairs, configs_by_location = await _live_venues_with_configs(
+        repository, captive_portal_lookup
+    )
     ended: list[GuestSession] = []
-    # One config resolution per location, not per guest: a venue with forty
-    # guests online resolves its own config once.
-    configs_by_location: dict[uuid.UUID, Any] = {}
 
     for pair in pairs:
         location_id = pair.location_id
         if location_id is None:
             continue
-        if location_id not in configs_by_location:
-            try:
-                resolved = await captive_portal_lookup.resolve_portal_config(
-                    organization_id=pair.organization_id, location_id=location_id
-                )
-                configs_by_location[location_id] = getattr(resolved, "config", None)
-            except Exception as exc:  # noqa: BLE001 -- see this function's docstring
-                configs_by_location[location_id] = None
-                logger.warning(
-                    "whitelist_only_sweep_config_lookup_failed",
-                    extra={
-                        "organization_id": str(pair.organization_id),
-                        "location_id": str(location_id),
-                        "error": str(exc),
-                    },
-                )
-        config = configs_by_location[location_id]
+        config = configs_by_location.get(location_id)
         if config is None or not getattr(config, "whitelist_only_enabled", False):
             continue
         try:
@@ -800,6 +784,51 @@ async def enforce_whitelist_only_online_guests(
                 },
             )
     return ended
+
+
+async def _live_venues_with_configs(
+    repository: GuestRepositoryProtocol,
+    captive_portal_lookup: CaptivePortalLookupProtocol,
+) -> tuple[list[ActiveGuestOrgPair], dict[uuid.UUID, Any]]:
+    """Every ``(guest, organization, location)`` triple holding an ``ACTIVE``
+    session, plus each of those venues' resolved captive-portal config keyed
+    by location id.
+
+    Two sweeps need exactly this -- ``enforce_whitelist_only_online_guests``
+    asks it per guest, ``enforce_open_hours_online_guests`` per venue -- and
+    the part that must not diverge is the resolution: **once per venue, never
+    once per guest**, so a venue with forty guests online pays one resolve,
+    not forty.
+
+    A venue whose config will not resolve maps to ``None`` and is skipped by
+    both callers, with a WARNING. That is each sweep's own documented
+    fail-open posture and it is stated once, here, because both sweeps run
+    unattended against live venues: a lookup that hiccups keeps the guests
+    that venue has (last week's behaviour) rather than emptying it.
+    """
+    pairs = await repository.list_active_guest_org_pairs()
+    resolved: dict[uuid.UUID, Any] = {}
+    skipped: set[uuid.UUID] = set()
+    for pair in pairs:
+        location_id = pair.location_id
+        if location_id is None or location_id in resolved or location_id in skipped:
+            continue
+        try:
+            venue = await captive_portal_lookup.resolve_portal_config(
+                organization_id=pair.organization_id, location_id=location_id
+            )
+            resolved[location_id] = getattr(venue, "config", None)
+        except Exception as exc:  # noqa: BLE001 -- see this function's docstring
+            skipped.add(location_id)
+            logger.warning(
+                "guest_enforcement_sweep_config_lookup_failed",
+                extra={
+                    "organization_id": str(pair.organization_id),
+                    "location_id": str(location_id),
+                    "error": str(exc),
+                },
+            )
+    return pairs, resolved
 
 
 async def _end_unlisted_sessions_for_guest(
@@ -874,6 +903,153 @@ async def _end_unlisted_sessions_for_guest(
                 "organization_id": str(organization_id),
                 "location_id": str(location_id),
                 "guest_id": str(guest_id),
+            },
+        )
+        await issue_live_disconnect(repository, session=updated, terminator=terminator)
+        ended.append(updated)
+    return ended
+
+
+#: The ``disconnect_reason`` literal ``enforce_open_hours_online_guests``
+#: writes. Like ``WHITELIST_ONLY_DISCONNECT_REASON`` above this is deliberately
+#: not part of the guest-facing vocabulary in
+#: ``constants.GuestSessionEndedReason``: the venue is closed, so the portal's
+#: own closed screen (``portal.closed.tsx``, reached because ``is_open_now``
+#: reads false on the guest's next resolve) is what explains it -- in the
+#: operator's own words, rather than a second message invented here.
+OPEN_HOURS_DISCONNECT_REASON = "venue_closed"
+
+
+async def enforce_open_hours_online_guests(
+    repository: GuestRepositoryProtocol,
+    *,
+    captive_portal_lookup: CaptivePortalLookupProtocol | None,
+    terminator: LiveSessionTerminatorProtocol | None = None,
+    now: datetime | None = None,
+) -> list[GuestSession]:
+    """End every session still online at a venue whose own Open Hours say it
+    is closed right now.
+
+    Open Hours was a *sign-in* gate only: ``GuestService._require_venue_open``
+    refuses a login outside the schedule, and nothing revisited a guest who
+    was already connected. So a venue that closes at 22:00 stops admitting
+    anyone at 22:00 and keeps serving everyone who was already on -- which,
+    from the venue's side, is the feature not working. Founder QA: "Open
+    Hours not working, internet still working".
+
+    **Reads the same predicate the login gate reads**, through the same
+    helper: ``captive_portal.validators.is_open_now``, passed
+    ``business_hours_enabled``/``business_hours_timezone``/
+    ``business_hours_schedule`` off the resolved config, exactly as
+    ``_require_venue_open`` does. Its forgiving directions come with it, and
+    they matter here because this sweep *acts* on the answer rather than
+    merely reporting it: enforcement off is always open, a malformed stored
+    timezone degrades to "open" rather than raising, and only an explicit
+    ``business_hours_enabled`` with a real schedule can close a venue.
+
+    ## What "closed" means here, precisely
+
+    The venue's own stored configuration, nothing else. A day absent from the
+    schedule, or present with ``open: false``, is closed -- that is the
+    documented meaning of the column, and an operator who switched
+    enforcement on and configured nothing has said "closed" in the only way
+    the feature offers. It is the same answer ``_require_venue_open`` already
+    gives that same venue's logins, so this cannot disagree with the screen a
+    guest is about to land on.
+
+    ## Failure direction
+
+    Fail open and say so, identically to its sibling sweep: a config that
+    will not resolve skips that venue (``_live_venues_with_configs`` logs
+    it), and this function never raises. A sweep that acted on a failed
+    lookup would empty venues on a database hiccup; one that skips keeps the
+    guests it has, which is last week's behaviour plus a WARNING.
+
+    Returns every session just flipped to ``TERMINATED``.
+    """
+    started = now or datetime.now(UTC)
+    if captive_portal_lookup is None:
+        logger.warning(
+            "open_hours_sweep_not_wired",
+            extra={
+                "detail": (
+                    "the Open Hours enforcement sweep ran with no captive "
+                    "portal lookup wired, so it could not read a single "
+                    "venue's schedule (fail-open)."
+                )
+            },
+        )
+        return []
+
+    _pairs, configs_by_location = await _live_venues_with_configs(
+        repository, captive_portal_lookup
+    )
+    ended: list[GuestSession] = []
+
+    for location_id, config in configs_by_location.items():
+        if config is None or not getattr(config, "business_hours_enabled", False):
+            continue
+        if is_open_now(
+            enabled=config.business_hours_enabled,
+            timezone=config.business_hours_timezone,
+            schedule=config.business_hours_schedule,
+        ):
+            continue
+        try:
+            ended.extend(
+                await _end_sessions_at_location(
+                    repository,
+                    terminator=terminator,
+                    location_id=location_id,
+                    organization_id=config.organization_id,
+                    now=started,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- one venue must not stop the rest
+            logger.warning(
+                "open_hours_sweep_venue_failed",
+                extra={
+                    "organization_id": str(config.organization_id),
+                    "location_id": str(location_id),
+                    "error": str(exc),
+                },
+            )
+    return ended
+
+
+async def _end_sessions_at_location(
+    repository: GuestRepositoryProtocol,
+    *,
+    terminator: LiveSessionTerminatorProtocol | None,
+    location_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    now: datetime,
+) -> list[GuestSession]:
+    """Every still-``ACTIVE`` session at one venue, ended.
+
+    Deliberately not per guest: being closed is a property of the venue, and
+    everyone at it is in the same position. (Its sibling sweep has to go
+    guest by guest -- "is *this* person on the list" is a per-person
+    question.)"""
+    ended: list[GuestSession] = []
+    for session in await repository.list_active_sessions_for_location(
+        organization_id=organization_id, location_id=location_id
+    ):
+        updated = await repository.update_session(
+            session,
+            {
+                "status": GuestSessionStatus.TERMINATED.value,
+                "ended_at": now,
+                "disconnect_reason": OPEN_HOURS_DISCONNECT_REASON,
+            },
+        )
+        logger.info(
+            "guest_session_ended_venue_closed",
+            extra={
+                "session_id": str(updated.id),
+                "organization_id": str(organization_id),
+                "location_id": str(location_id),
+                "guest_id": str(updated.guest_id),
             },
         )
         await issue_live_disconnect(repository, session=updated, terminator=terminator)
@@ -5017,6 +5193,67 @@ class GuestService:
             reference_time = prior.ended_at or prior.last_activity_at
             if now - reference_time > timedelta(minutes=RECONNECT_GRACE_MINUTES):
                 raise NoReconnectableSessionError(guest.id)
+
+        # The two venue gates every login path runs, run here too.
+        #
+        # `reconnect` creates a real, new ACTIVE session. It is the guest's
+        # second door into the venue and it had neither gate: a guest turned
+        # away at sign-in -- not on a whitelist-only property's list, or
+        # outside its Open Hours -- could walk straight back in through this
+        # one and stay online, with the sign-in screen they had just failed on
+        # being merely one of two ways in. It is also the door a guest reaches
+        # without any credentials at all, which is why it is worth closing even
+        # though the sweeps now exist: those take up to five minutes, and this
+        # is immediate.
+        #
+        # Deliberately *after* the idempotent return above. A guest who is
+        # already ACTIVE is already online, and "you are already connected" is
+        # the honest answer to hand back; ending that session is the sweeps'
+        # job, not this method's. What is refused here is a *new* grant.
+        # Deliberately *before* the router lookup below for the plain reason
+        # that there is no point resolving an eligible router for a guest
+        # about to be refused.
+        #
+        # The gates themselves are the existing helpers, not copies: the same
+        # `_require_venue_open` the login path calls, and the same
+        # `_enforce_access_control` -- which is what keeps "refused at sign-in"
+        # and "refused on reconnect" from ever being two different rules.
+        # `prior.auth_method` rather than a synthetic one: a refusal here
+        # writes a real `GuestLoginHistory` row, and the method this guest
+        # actually signed in with is the only honest value for its column.
+        try:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=guest.organization_id, location_id=location_id
+            )
+        except Exception as exc:  # noqa: BLE001 -- see below
+            # No portal config to read a flag or a schedule from, or a lookup
+            # that failed outright. Both fail open, identically to
+            # `check_portal_admission`'s own documented posture: a venue whose
+            # config is mid-setup or briefly unreachable must not lose the
+            # sessions it already granted, and the login path is where a
+            # genuinely unconfigured venue is refused.
+            logger.warning(
+                "guest_reconnect_venue_gates_skipped",
+                extra={
+                    "guest_id": str(guest.id),
+                    "location_id": str(location_id),
+                    "error": str(exc),
+                },
+            )
+        else:
+            config = resolved.config
+            self._require_venue_open(config)
+            await self._enforce_access_control(
+                organization_id=config.organization_id,
+                location_id=location_id,
+                identifier=guest.identifier,
+                device_mac=device_mac,
+                auth_method=GuestAuthMethod(prior.auth_method),
+                guest=guest,
+                ip_address=ip_address,
+                whitelist_only_enabled=config.whitelist_only_enabled,
+                whitelist_only_denied_message=config.whitelist_only_denied_message,
+            )
 
         router = await self._get_eligible_router(router_id)
         device: GuestDevice | None = None

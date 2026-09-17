@@ -559,6 +559,28 @@ TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP = (
 
 WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS = 300.0
 
+
+# ============================================================================
+# Open Hours enforcement sweep -- Celery Beat task wiring.
+# ============================================================================
+# Open Hours was a *sign-in* gate only. ``_require_venue_open`` refuses a
+# login outside the venue's own schedule, and nothing ever revisited a guest
+# who was already connected -- so a venue that closes at 22:00 stops admitting
+# anyone at 22:00 and keeps serving everyone who was already online. From the
+# venue's side that is the feature not working. Founder QA: "Open Hours not
+# working, internet still working".
+#
+# Same 5-minute cadence as the other guest sweeps: a venue closing its doors
+# wants the venue empty promptly, and this fleet already treats five minutes
+# as "promptly" for a session that should have ended.
+# ============================================================================
+
+TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP = (
+    "app.domains.guest.tasks.run_open_hours_enforcement_sweep"
+)
+
+OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS = 300.0
+
 # ============================================================================
 # Dynamic bandwidth-queue assignment, off the login request path
 # ============================================================================
@@ -764,6 +786,8 @@ __all__ = [
     "TASK_RUN_QUOTA_RESET_SWEEP",
     "TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP",
     "WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP",
+    "OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
     "TASK_ASSIGN_GUEST_QUEUE",
     "ASSIGN_GUEST_QUEUE_MAX_RETRIES",
     "ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS",

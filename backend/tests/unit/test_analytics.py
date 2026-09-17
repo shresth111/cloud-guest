@@ -857,6 +857,13 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # connect" while the people it exists to refuse keep streaming. See
         # app.domains.guest.tasks.run_whitelist_only_enforcement_sweep.
         "guest-whitelist-only-enforcement-sweep",
+        # Open Hours. It was a sign-in gate only, so a venue that closes at
+        # 22:00 stopped admitting anyone at 22:00 and kept serving everyone
+        # who was already online -- the feature appearing not to work. Its
+        # absence from this set is a venue whose advertised closing time does
+        # not close anything. See
+        # app.domains.guest.tasks.run_open_hours_enforcement_sweep.
+        "guest-open-hours-enforcement-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         # Monitored hardware liveness: the fast ping-driven UP/DOWN path

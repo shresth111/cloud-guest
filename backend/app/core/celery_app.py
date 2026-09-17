@@ -134,10 +134,12 @@ from app.domains.dhcp.constants import (
 )
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
+    OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
     QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
     SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS,
     SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
@@ -494,6 +496,18 @@ celery_app.conf.update(
         "guest-whitelist-only-enforcement-sweep": {
             "task": TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
             "schedule": WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
+        },
+        # Open Hours: ends the session of every guest still online at a venue
+        # whose own schedule says it is closed right now. Open Hours used to
+        # refuse new sign-ins only, so a venue that closes at 22:00 kept
+        # serving everyone already connected -- the feature appearing not to
+        # work. Same 5-minute tier as the timeout sweep above. See
+        # ``app.domains.guest.tasks.run_open_hours_enforcement_sweep``'s own
+        # docstring and ``app.domains.guest.constants
+        # .OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``.
+        "guest-open-hours-enforcement-sweep": {
+            "task": TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
+            "schedule": OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
         },
         # Provisioning Engine: drains the real "Postgres row + Redis
         # wake-up signal" queue app.domains.provisioning_engine
