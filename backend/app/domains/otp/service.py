@@ -121,8 +121,10 @@ import json
 import logging
 import secrets
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Protocol
 
 from redis.asyncio import Redis
@@ -399,19 +401,44 @@ class MailIdentity(StrEnum):
 
     ``DEFAULT``
         The general ``Settings.smtp_*`` block. ``sales@wyfyguest.com`` in
-        production, which is where quotations, channel-partner welcomes and
-        demo-request notifications should come from -- and also, unchanged,
-        every other sender in this codebase that never asked for a specific
-        identity (monitoring alerts, user invites, voucher exports,
-        subscription reminders).
+        production, which is where quotations and channel-partner welcomes
+        come from -- and also, unchanged, every other sender in this
+        codebase that never asked for a specific identity (user invites,
+        voucher exports, subscription reminders, scheduled reports).
 
     ``ADMIN``
         The ``Settings.admin_smtp_*`` block. ``admin@wyfyguest.com`` in
-        production: guest OTP, password reset, new-location welcome. Falls
-        back to ``DEFAULT`` -- loudly, see
-        :func:`get_configured_email_provider` -- when that block is not
-        configured, so an unconfigured second mailbox degrades to exactly
-        today's behavior rather than failing.
+        production: guest OTP, password reset, new-location welcome.
+
+    ``DEMO``
+        The ``Settings.demo_smtp_*`` block. ``demo@wyfyguest.com`` in
+        production: every demo-flow message (a public "Book a Demo"
+        submission, and the booking confirmations and cancellations that
+        follow it). Split out of ``DEFAULT`` because a demo enquiry is its
+        own conversation with its own mailbox -- see
+        ``app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE``
+        for the routing.
+
+    ``SUPPORT``
+        The ``Settings.support_smtp_*`` block.
+        ``support@wyfyguest.com`` in production. Configured here so the
+        mailbox is addressable, but **nothing sends as it yet**: the
+        support-tickets domain (``app.domains.support_tickets``) sends no
+        mail at all today, and neither does the Help Center's contact form.
+        The first flow that does should name this identity.
+
+    ``ALERT``
+        The ``Settings.alert_smtp_*`` block. ``alert@wyfyguest.com`` in
+        production: platform and controller alerting
+        (``app.domains.monitoring``). Split out of ``DEFAULT`` because an
+        alert routinely wants to be filtered, forwarded and never
+        auto-replied to, and mixing it into the commercial mailbox is what
+        makes that impossible.
+
+    Every member falls back to ``DEFAULT`` -- loudly, see
+    :func:`get_configured_email_provider` -- when its block is not
+    configured, so an unconfigured second mailbox degrades to exactly
+    today's behavior rather than failing.
 
     Note there is no ``INVOICE`` member: invoice mail has its own
     long-standing ``Settings.invoice_smtp_*`` block and its own selection
@@ -419,10 +446,42 @@ class MailIdentity(StrEnum):
     same :class:`SmtpIdentity` value object, so it gets the same
     From/credentials guarantee, but it is not part of this routing table
     and nothing here changes it.
+
+    Which ``Settings`` block backs a member is decided in exactly one
+    place -- ``_SETTINGS_BLOCK_BY_IDENTITY`` below -- so "where does
+    identity X's server come from" has one answer rather than one per
+    helper.
     """
 
     DEFAULT = "default"
     ADMIN = "admin"
+    DEMO = "demo"
+    SUPPORT = "support"
+    ALERT = "alert"
+
+
+#: The ``Settings`` block behind each identity. One table: the answer to
+#: "which mailbox does this member send as", in one place, with nothing
+#: else in the codebase re-stating it. Adding a member without a row here
+#: is a ``KeyError`` at the first send -- and ``test_mail_identities``
+#: asserts every member has a row, so it is a failing test rather than a
+#: production surprise.
+_SETTINGS_BLOCK_BY_IDENTITY: Mapping[MailIdentity, str] = MappingProxyType(
+    {
+        MailIdentity.DEFAULT: "smtp",
+        MailIdentity.ADMIN: "admin_smtp",
+        MailIdentity.DEMO: "demo_smtp",
+        MailIdentity.SUPPORT: "support_smtp",
+        MailIdentity.ALERT: "alert_smtp",
+    }
+)
+
+
+def settings_block_for(identity: MailIdentity) -> str:
+    """The ``Settings`` field prefix backing ``identity`` -- ``"smtp"``,
+    ``"admin_smtp"``, ... Every field of one block is read through this one
+    prefix, which is what keeps a cross-mailbox mixture unrepresentable."""
+    return _SETTINGS_BLOCK_BY_IDENTITY[identity]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -507,9 +566,7 @@ def smtp_host_setting_for(settings: Settings, identity: MailIdentity) -> str:
     """The ``*_smtp_host`` setting backing ``identity`` -- the one field
     that answers "was this mailbox configured at all?", as distinct from
     "was it configured correctly?"."""
-    if identity is MailIdentity.ADMIN:
-        return settings.admin_smtp_host
-    return settings.smtp_host
+    return getattr(settings, f"{settings_block_for(identity)}_host")
 
 
 def resolve_smtp_identity(
@@ -521,42 +578,36 @@ def resolve_smtp_identity(
     mailbox that cannot legally send as itself. The caller decides what
     falling back means.
 
-    Each branch reads six fields from a single block and nothing else, so
-    a cross-mailbox mixture is not expressible here either.
+    The block comes from :func:`settings_block_for` and all six fields are
+    read through that one prefix, so a cross-mailbox mixture is not
+    expressible here either -- and adding a mailbox is a row in
+    ``_SETTINGS_BLOCK_BY_IDENTITY`` plus that mailbox's ``Settings`` block,
+    not another branch of an if-chain that has to be kept in step with its
+    sibling in :func:`smtp_host_setting_for`.
 
     A :class:`MailIdentityMismatchError` is caught and turned into
     ``None``+ERROR rather than propagating: a hand-edited ``.env`` that
     pairs ``admin@``'s username with ``sales@``'s From must not take down
-    guest OTP with a 500. Unusable means unusable; ADMIN then degrades to
-    the DEFAULT mailbox (which works) and DEFAULT raises
+    guest OTP with a 500. Unusable means unusable; a named identity then
+    degrades to the DEFAULT mailbox (which works) and DEFAULT raises
     ``EmailProviderNotConfiguredError`` exactly as an empty ``smtp_host``
     already does. Either way the misconfiguration is logged at ERROR with
     the offending block named, and no mail is ever sent from a mailbox we
     did not authenticate as.
     """
     try:
-        if identity is MailIdentity.ADMIN:
-            if not settings.admin_smtp_host:
-                return None
-            return SmtpIdentity.from_settings_block(
-                host=settings.admin_smtp_host,
-                port=settings.admin_smtp_port,
-                username=settings.admin_smtp_username,
-                password=settings.admin_smtp_password,
-                use_tls=settings.admin_smtp_use_tls,
-                from_address=settings.admin_smtp_from_address,
-                label="admin_smtp",
-            )
-        if not settings.smtp_host:
+        block = settings_block_for(identity)
+        host = getattr(settings, f"{block}_host")
+        if not host:
             return None
         return SmtpIdentity.from_settings_block(
-            host=settings.smtp_host,
-            port=settings.smtp_port,
-            username=settings.smtp_username,
-            password=settings.smtp_password,
-            use_tls=settings.smtp_use_tls,
-            from_address=settings.smtp_from_address,
-            label="smtp",
+            host=host,
+            port=getattr(settings, f"{block}_port"),
+            username=getattr(settings, f"{block}_username"),
+            password=getattr(settings, f"{block}_password"),
+            use_tls=getattr(settings, f"{block}_use_tls"),
+            from_address=getattr(settings, f"{block}_from_address"),
+            label=block,
         )
     except MailIdentityMismatchError as exc:
         logger.error(

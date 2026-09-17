@@ -47,6 +47,7 @@ from app.core.logging import get_logger
 from app.domains.otp.service import (
     EmailProviderNotConfiguredError,
     EmailProviderProtocol,
+    MailIdentity,
     get_configured_email_provider,
 )
 
@@ -78,9 +79,19 @@ class UnconfiguredEmailProvider:
 
 def resolve_email_provider(settings: Settings) -> EmailProviderProtocol:
     """``get_configured_email_provider``, except that a misconfiguration can
-    no longer abort whatever was being constructed around it."""
+    no longer abort whatever was being constructed around it.
+
+    Sends as ``MailIdentity.ALERT`` -- ``alert@wyfyguest.com`` in
+    production. Alerting used to be the DEFAULT identity, which meant every
+    "controller unreachable" landed in the same mailbox as quotations and
+    channel-partner welcomes; an alert needs to be filterable, forwardable
+    and never auto-replied to, and none of that is possible while it shares
+    a mailbox with a commercial conversation. Unconfigured degrades to
+    DEFAULT and logs ``email_identity_fallback``, exactly like every other
+    named identity, so this cannot make alerting quieter than it is today.
+    """
     try:
-        return get_configured_email_provider(settings)
+        return get_configured_email_provider(settings, identity=MailIdentity.ALERT)
     except EmailProviderNotConfiguredError as exc:
         logger.error(
             "alert_email_provider_unconfigured",

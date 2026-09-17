@@ -1182,23 +1182,36 @@ class Settings(BaseSettings):
     invoice_smtp_from_address: str = Field(default="")
 
     # ------------------------------------------------------------------
-    # Second named sending identity: the admin mailbox
+    # Named sending identities: one mailbox per job
     # ------------------------------------------------------------------
-    # Outgoing mail is deliberately split across two real mailboxes:
+    # Outgoing mail is deliberately split across real mailboxes:
     #
-    #   admin@wyfyguest.com  -- guest OTP, password reset, new-location
-    #                           welcome  (this `admin_smtp_*` block,
-    #                           `MailIdentity.ADMIN`)
-    #   sales@wyfyguest.com  -- demo-request notifications, channel-partner
-    #                           welcome, quotations  (the general `smtp_*`
-    #                           block above, `MailIdentity.DEFAULT`, which
-    #                           is also what every other sender -- alerts,
-    #                           invites, voucher exports -- keeps using)
+    #   admin@wyfyguest.com    -- guest OTP, password reset, new-location
+    #                             welcome  (this `admin_smtp_*` block,
+    #                             `MailIdentity.ADMIN`)
+    #   demo@wyfyguest.com     -- the whole Book-a-Demo conversation
+    #                             (`demo_smtp_*`, `MailIdentity.DEMO`)
+    #   alert@wyfyguest.com    -- platform and controller alerting
+    #                             (`alert_smtp_*`, `MailIdentity.ALERT`)
+    #   support@wyfyguest.com  -- nothing yet; the block exists so the
+    #                             mailbox is addressable (`support_smtp_*`,
+    #                             `MailIdentity.SUPPORT`)
+    #   sales@wyfyguest.com    -- everything else: quotations,
+    #                             channel-partner welcome, user invites,
+    #                             voucher exports, reminders (the general
+    #                             `smtp_*` block above,
+    #                             `MailIdentity.DEFAULT`)
+    #
+    # A demo enquiry and a quotation want different replies, and an alert
+    # wants to be filterable and never auto-replied to; sharing one mailbox
+    # between them is what makes all three impossible.
     #
     # The routing table that decides which flow gets which identity is
-    # `app.domains.otp.service.MailIdentity` plus
-    # `app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE`;
-    # read those two to answer "which mailbox does X come from?".
+    # `app.domains.otp.service.MailIdentity` (which block backs which
+    # member) plus
+    # `app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE`
+    # (which outbox event is sent as whom); read those two to answer "which
+    # mailbox does X come from?".
     #
     # This is a NEW, separately named block rather than a reuse of
     # `invoice_smtp_*` above on purpose: `invoice_smtp_*` means "the
@@ -1232,6 +1245,71 @@ class Settings(BaseSettings):
             "SmtpIdentity rejects a From that belongs to a different "
             "account (Zoho answers that mismatch with '553 Sender is not "
             "allowed to relay emails')."
+        ),
+    )
+
+    demo_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server hostname for the demo@ sending identity (every "
+            "public 'Book a Demo' submission, and the booking "
+            "confirmations/cancellations that follow it). Empty = fall back "
+            "to the general smtp_* identity."
+        ),
+    )
+    demo_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    demo_smtp_username: str = Field(default="")
+    demo_smtp_password: str = Field(default="")
+    demo_smtp_use_tls: bool = Field(default=True)
+    demo_smtp_from_address: str = Field(
+        default="",
+        description=(
+            "From address for the demo@ identity. Empty defaults to "
+            "demo_smtp_username -- see admin_smtp_from_address for why a "
+            "different mailbox here is rejected rather than honoured."
+        ),
+    )
+
+    support_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server hostname for the support@ sending identity. "
+            "Configured so the mailbox is addressable from day one, but "
+            "nothing sends as it yet -- app.domains.support_tickets sends "
+            "no mail at all today (see otp.service.MailIdentity.SUPPORT). "
+            "Empty = fall back to the general smtp_* identity."
+        ),
+    )
+    support_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    support_smtp_username: str = Field(default="")
+    support_smtp_password: str = Field(default="")
+    support_smtp_use_tls: bool = Field(default=True)
+    support_smtp_from_address: str = Field(
+        default="",
+        description=(
+            "From address for the support@ identity. Empty defaults to "
+            "support_smtp_username."
+        ),
+    )
+
+    alert_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server hostname for the alert@ sending identity "
+            "(platform and WiFi-controller alerting, "
+            "app.domains.monitoring). Empty = fall back to the general "
+            "smtp_* identity."
+        ),
+    )
+    alert_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    alert_smtp_username: str = Field(default="")
+    alert_smtp_password: str = Field(default="")
+    alert_smtp_use_tls: bool = Field(default=True)
+    alert_smtp_from_address: str = Field(
+        default="",
+        description=(
+            "From address for the alert@ identity. Empty defaults to "
+            "alert_smtp_username."
         ),
     )
 

@@ -8,8 +8,9 @@ wyfyguest.com.
 
 **A booked demo is still a lead.** The 15 rows already in ``demo_requests``
 came from the free-text "Book a Demo" form, sales works that queue every
-day, and ``DemoRequestService._notify_team`` already emails
-``sales@wyfyguest.com`` on every new one. None of that may regress. So a
+day, and ``DemoRequestService._notify_team`` already emails the demo mailbox
+(``Settings.demo_request_notify_email``, ``demo@wyfyguest.com`` in
+production) on every new one. None of that may regress. So a
 booking does not *replace* a demo request -- it is layered on top of one:
 
 * ``DemoBookingService.book_slot`` writes a ``DemoRequest`` row exactly
