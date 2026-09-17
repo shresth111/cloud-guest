@@ -610,7 +610,16 @@ class AuthService:
             raise InvalidCredentialsError("User is not active")
 
         tokens = JWTManager.create_token_pair(str(user.id), user.email)
-        await self.repository.rotate_refresh_token(session_row, tokens["refresh_jti"])
+        rotated = await self.repository.rotate_refresh_token(
+            session_row,
+            tokens["refresh_jti"],
+            expected_refresh_jti=jti,
+        )
+        if not rotated:
+            logger.warning(
+                "invalid_refresh_token_attempt", extra={"user_id": str(user.id)}
+            )
+            raise InvalidTokenError("Refresh token is invalid or has been revoked")
 
         logger.info("access_token_refreshed", extra={"user_id": str(user.id)})
         return _token_pair_from_dict(tokens)
@@ -701,7 +710,19 @@ class AuthService:
             )
 
     async def reset_password(self, reset_token: str, new_password: str) -> None:
-        user_id = await self._consume_cache_token(_RESET_TOKEN_KEY, reset_token)
+        """Set a new password from a link mailed by ``initiate_password_reset``.
+
+        The token is *read* first and only *spent* once ``new_password`` has
+        passed both the reuse and the strength checks. Consuming it up front --
+        what this method used to do -- burned a still-valid link on any
+        rejected password: the caller saw a 400, the token was already gone,
+        and a retry seconds later answered 401 "invalid or expired", leaving
+        them nowhere to go but a fresh "forgot password" email. Spending it at
+        the end keeps the link strictly single-use all the same -- two
+        concurrent submits cannot both be applied, because whichever one loses
+        the race is the one that fails.
+        """
+        user_id = await self._peek_cache_token(_RESET_TOKEN_KEY, reset_token)
         if not user_id:
             raise InvalidTokenError("Reset token is invalid or expired")
 
@@ -715,6 +736,10 @@ class AuthService:
             new_hash = PasswordManager.hash(new_password)
         except PasswordStrengthError as exc:
             raise PasswordTooWeakError(str(exc)) from exc
+
+        if not await self._consume_cache_token(_RESET_TOKEN_KEY, reset_token):
+            raise InvalidTokenError("Reset token is invalid or expired")
+
         await self.repository.update_user(
             user,
             password_hash=new_hash,
@@ -991,6 +1016,20 @@ class AuthService:
             ex=int(ttl.total_seconds()),
         )
         return token
+
+    async def _peek_cache_token(
+        self, key_template: str, token: str
+    ) -> uuid.UUID | None:
+        """Read a cache token's payload without consuming it.
+
+        The read-only half of :meth:`_consume_cache_token`, for the one caller
+        that has to validate what it is about to do *before* spending the
+        token -- ``reset_password`` above. Not a substitute for consuming it:
+        a caller that peeks and never consumes leaves the token usable.
+        """
+        key = key_template.format(token=_hash_token(token))
+        raw_user_id = await self.redis.get(key)
+        return uuid.UUID(raw_user_id) if raw_user_id else None
 
     async def _consume_cache_token(
         self, key_template: str, token: str
