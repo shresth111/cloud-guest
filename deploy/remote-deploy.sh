@@ -285,6 +285,12 @@ PY
   log "mail.env: ${summary:-nothing written -- see the warning above}"
 }
 
+compose_up() {
+  # --no-deps so postgres/redis are never recreated by an app deploy; they hold
+  # the only stateful thing here and have no business bouncing for a code push.
+  docker compose --env-file "$ENV_FILE" up -d --no-deps "${TARGETS[@]}"
+}
+
 wait_healthy() {
   local deadline=$(( SECONDS + HEALTH_TIMEOUT )) name status
   while (( SECONDS < deadline )); do
