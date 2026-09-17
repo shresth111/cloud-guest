@@ -373,12 +373,15 @@ class MailIdentityMismatchError(Exception):
     authenticate as.
 
     This is not a theoretical guard. This platform has twice shipped a
-    configuration that authenticated as one Zoho mailbox while claiming to
-    send as another; Zoho answers that with ``553 Sender is not allowed to
-    relay emails``, which reads at a glance like a credential problem and
-    costs an evening to find. An identity is a username, a password and a
-    From address *together* -- so the only way to build one is through this
-    class, and this class refuses to hold a mismatched pair."""
+    configuration that authenticated as one mailbox while claiming to send
+    as another. The first time, on Zoho, that produced ``553 Sender is not
+    allowed to relay emails``; the mailboxes now live on Google Workspace,
+    which refuses the same pairing with its own ``550``/``Sender address
+    rejected``. Whichever the provider, the message reads at a glance like a
+    credential problem and costs an evening to find. An identity is a
+    username, a password and a From address *together* -- so the only way to
+    build one is through this class, and this class refuses to hold a
+    mismatched pair."""
 
 
 class MailIdentity(StrEnum):
@@ -499,6 +502,19 @@ class SmtpIdentity:
 
     Build one with :meth:`from_settings_block`, never field-by-field from
     scattered settings reads.
+
+    ## The password is a deployment concern, and it is not always the
+    ## account's own
+
+    ``password`` is whatever the provider accepts over SMTP AUTH, which is
+    not always the account password. The mailboxes here are Google Workspace
+    accounts: Google refuses an account password on ``smtp.gmail.com``
+    (``535-5.7.8 Username and Password not accepted``) and requires either
+    an **App Password** -- which needs 2-Step Verification enabled on that
+    account, and is then a 16-character value that is *not* the login
+    password -- or OAuth2. This class cannot tell the two apart, by design:
+    a wrong password is a 535 from the server, not a shape this module can
+    recognise. See ``.env.example`` for where the value comes from.
     """
 
     host: str
@@ -520,9 +536,10 @@ class SmtpIdentity:
                 f"{self.label}: refusing to send as {self.from_address!r} "
                 f"while authenticating as {self.username!r}. A From address "
                 "must belong to the account whose credentials are used; "
-                "Zoho rejects the mismatch with '553 Sender is not allowed "
-                "to relay emails'. Configure both halves of one mailbox, or "
-                "leave the From empty to default to the username."
+                "providers reject the mismatch (Zoho with '553 Sender is not "
+                "allowed to relay emails', Google Workspace with '550 "
+                "Sender address rejected'). Configure both halves of one "
+                "mailbox, or leave the From empty to default to the username."
             )
         if not self.from_address:
             raise MailIdentityMismatchError(
