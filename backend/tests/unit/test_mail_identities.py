@@ -1,23 +1,29 @@
-"""Unit tests for the two-mailbox outgoing-mail split.
+"""Unit tests for the per-mailbox outgoing-mail split.
 
-Outgoing mail is deliberately split across two real Zoho mailboxes:
+Outgoing mail is deliberately split across five real Zoho mailboxes, each
+with its own credentials in the server's ``.env``:
 
-    admin@wyfyguest.com  guest OTP, password reset, new-location welcome
-    sales@wyfyguest.com  demo-request notifications, channel-partner
-                         welcome, quotations
+    admin@wyfyguest.com    guest OTP, password reset, new-location welcome
+    demo@wyfyguest.com     the whole Book-a-Demo conversation
+    alert@wyfyguest.com    platform and controller alerting
+    sales@wyfyguest.com    everything else (quotations, partner welcomes,
+                           user invites, exports, reminders) -- the
+                           ``DEFAULT`` identity
+    support@wyfyguest.com  nothing yet: configured so the mailbox is
+                           addressable, awaiting the first flow that sends
+                           as it
 
 These tests assert three separate things, because they fail in three
 separate ways:
 
-1. **Routing** -- each of the six flows resolves to the mailbox it is
-   supposed to. Asserted at the real wiring points (the actual
-   ``dependencies.py`` functions and the real outbox dispatch), not against
-   the routing table in isolation, so a correct table wired to the wrong
-   provider still fails.
-2. **Fallback** -- with the second mailbox unconfigured, the admin@ flows
-   degrade to the general identity (exactly today's behavior, which works)
-   and say so in a log. An unconfigured mailbox must never crash guest
-   login and must never be silent.
+1. **Routing** -- each flow resolves to the mailbox it is supposed to.
+   Asserted at the real wiring points (the actual ``dependencies.py``
+   functions and the real outbox dispatch), not against the routing table
+   in isolation, so a correct table wired to the wrong provider still fails.
+2. **Fallback** -- with a mailbox unconfigured, its flows degrade to the
+   general identity (exactly today's behavior, which works) and say so in a
+   log. An unconfigured mailbox must never crash guest login and must never
+   be silent.
 3. **Never send as a mailbox you did not authenticate as** -- the failure
    that produced ``553 Sender is not allowed to relay emails`` in
    production. Asserted structurally: a ``From`` cannot be paired with
@@ -64,6 +70,7 @@ from app.domains.otp.service import (
     get_configured_email_provider,
     get_configured_email_providers_by_identity,
     resolve_smtp_identity,
+    settings_block_for,
     warn_email_identity_fallback,
 )
 from app.domains.quotation.dependencies import (
@@ -72,8 +79,18 @@ from app.domains.quotation.dependencies import (
 
 ADMIN = "admin@wyfyguest.com"
 SALES = "sales@wyfyguest.com"
+DEMO = "demo@wyfyguest.com"
+SUPPORT = "support@wyfyguest.com"
+ALERT = "alert@wyfyguest.com"
 ADMIN_PASSWORD = "placeholder-admin-password"
 SALES_PASSWORD = "placeholder-sales-password"
+DEMO_PASSWORD = "placeholder-demo-password"
+ALERT_PASSWORD = "placeholder-alert-password"
+#: Every mailbox this deployment sends as lives on the same Zoho India
+#: account, which is why one host serves all of them -- see
+#: ``SmtpIdentity``'s mismatch guard for what happens when a block is
+#: pointed at a different account than its credentials authenticate to.
+ZOHO_HOST = "smtp.zoho.in"
 
 
 @pytest.fixture(autouse=True)
@@ -93,21 +110,37 @@ def _rearm_fallback_warning() -> None:
 
 
 def _settings(**overrides: object) -> Settings:
-    """Both mailboxes fully configured, as production is meant to be."""
+    """Every mailbox fully configured, as production is meant to be."""
     base: dict[str, object] = {
         "email_delivery_provider": "smtp",
-        "smtp_host": "smtp.zoho.in",
+        "smtp_host": ZOHO_HOST,
         "smtp_port": 587,
         "smtp_username": SALES,
         "smtp_password": SALES_PASSWORD,
         "smtp_use_tls": True,
         "smtp_from_address": SALES,
-        "admin_smtp_host": "smtp.zoho.in",
+        "admin_smtp_host": ZOHO_HOST,
         "admin_smtp_port": 587,
         "admin_smtp_username": ADMIN,
         "admin_smtp_password": ADMIN_PASSWORD,
         "admin_smtp_use_tls": True,
         "admin_smtp_from_address": ADMIN,
+        "demo_smtp_host": ZOHO_HOST,
+        "demo_smtp_port": 587,
+        "demo_smtp_username": DEMO,
+        "demo_smtp_password": DEMO_PASSWORD,
+        "demo_smtp_use_tls": True,
+        "demo_smtp_from_address": DEMO,
+        "alert_smtp_host": ZOHO_HOST,
+        "alert_smtp_port": 587,
+        "alert_smtp_username": ALERT,
+        "alert_smtp_password": ALERT_PASSWORD,
+        "alert_smtp_use_tls": True,
+        "alert_smtp_from_address": ALERT,
+        # support_smtp_* is deliberately left unconfigured, because that is
+        # what production is: no flow sends as SUPPORT yet, so the block
+        # exists to be filled in rather than to be used. Its fallback is
+        # asserted like every other unconfigured identity's.
     }
     base.update(overrides)
     return Settings(**base)
@@ -191,19 +224,24 @@ class RecordingEmailProvider:
 def _outbox_service(
     delivery: NotificationDelivery,
 ) -> tuple[
-    NotificationService, RecordingEmailProvider, RecordingEmailProvider
+    NotificationService,
+    RecordingEmailProvider,
+    RecordingEmailProvider,
+    RecordingEmailProvider,
 ]:
     admin = RecordingEmailProvider(ADMIN)
     sales = RecordingEmailProvider(SALES)
+    demo = RecordingEmailProvider(DEMO)
     service = NotificationService(
         FakeDeliveryRepository(due=[delivery]),
         email_provider=sales,
         email_providers_by_identity={
             MailIdentity.DEFAULT: sales,
             MailIdentity.ADMIN: admin,
+            MailIdentity.DEMO: demo,
         },
     )
-    return service, admin, sales
+    return service, admin, sales, demo
 
 
 # ============================================================================
@@ -242,7 +280,7 @@ class TestSixFlowsResolveToTheRightMailbox:
 
     async def test_password_reset_sends_from_admin(self) -> None:
         delivery = _make_delivery(NotificationEventType.PASSWORD_RESET.value)
-        service, admin, sales = _outbox_service(delivery)
+        service, admin, sales, demo = _outbox_service(delivery)
 
         await service.dispatch_pending()
 
@@ -251,33 +289,73 @@ class TestSixFlowsResolveToTheRightMailbox:
 
     async def test_location_welcome_email_sends_from_admin(self) -> None:
         delivery = _make_delivery(NotificationEventType.LOCATION_WELCOME_EMAIL.value)
-        service, admin, sales = _outbox_service(delivery)
+        service, admin, sales, demo = _outbox_service(delivery)
 
         await service.dispatch_pending()
 
         assert len(admin.sent) == 1
         assert sales.sent == []
 
-    async def test_demo_request_notification_sends_from_sales(self) -> None:
+    async def test_demo_request_notification_sends_from_demo(self) -> None:
+        """The demo conversation moved off sales@ and onto its own mailbox.
+        Before this, every "Book a Demo" landed in the same inbox as
+        quotations and channel-partner welcomes -- two different jobs
+        wanting two different replies, one mailbox between them."""
         delivery = _make_delivery(NotificationEventType.DEMO_REQUEST_RECEIVED.value)
-        service, admin, sales = _outbox_service(delivery)
+        service, admin, sales, demo = _outbox_service(delivery)
 
         await service.dispatch_pending()
 
-        assert len(sales.sent) == 1
+        assert len(demo.sent) == 1
         assert admin.sent == []
+        assert sales.sent == []
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            NotificationEventType.DEMO_BOOKING_CONFIRMED,
+            NotificationEventType.DEMO_BOOKING_TEAM_NOTIFICATION,
+            NotificationEventType.DEMO_BOOKING_CANCELLED,
+        ],
+    )
+    async def test_every_booking_message_rides_the_same_demo_thread(
+        self, event_type: NotificationEventType
+    ) -> None:
+        """The confirmation, the internal heads-up and the cancellation are
+        one conversation with one guest, so they must not be split across
+        mailboxes -- a reply to the confirmation that lands somewhere else
+        is exactly the confusion this routing removes."""
+        delivery = _make_delivery(event_type.value)
+        service, admin, sales, demo = _outbox_service(delivery)
+
+        await service.dispatch_pending()
+
+        assert len(demo.sent) == 1
+        assert admin.sent == []
+        assert sales.sent == []
 
     def test_quotation_sends_from_sales(self) -> None:
         provider = resolve_quotation_email_provider(_settings())
         assert isinstance(provider, SmtpEmailProvider)
         assert provider.from_address == SALES
 
+    def test_alert_email_sends_from_alert(self) -> None:
+        """Monitoring used to depend on the DEFAULT identity, so every
+        "controller unreachable" arrived in the commercial mailbox. That is
+        not a mailbox an alert can be filtered, forwarded, or kept out of
+        somebody's reply-all in."""
+        from app.domains.monitoring.email_provider import resolve_email_provider
+
+        provider = resolve_email_provider(_settings())
+        assert isinstance(provider, SmtpEmailProvider)
+        assert provider.from_address == ALERT
+
     def test_channel_partner_welcome_sends_from_sales(self) -> None:
         provider = resolve_channel_partner_email_provider(_settings())
         assert isinstance(provider, SmtpEmailProvider)
         assert provider.from_address == SALES
 
-    def test_password_reset_and_welcome_resolve_to_admin_in_the_routing_table(
+    def test_the_routing_table_is_the_answer_a_reader_gets(
         self,
     ) -> None:
         """The table itself, so a reader's one-lookup answer to "which
@@ -296,24 +374,31 @@ class TestSixFlowsResolveToTheRightMailbox:
             mail_identity_for_event(
                 NotificationEventType.DEMO_REQUEST_RECEIVED.value
             )
-            is MailIdentity.DEFAULT
+            is MailIdentity.DEMO
         )
 
-    def test_only_the_two_moved_events_are_routed_to_admin(self) -> None:
-        """Nothing moves by accident. Every outbox event other than the two
-        deliberately moved ones must still resolve to the identity it used
-        before this split existed."""
-        moved = {
-            event
+    def test_only_the_six_routed_events_leave_the_general_identity(self) -> None:
+        """Nothing moves by accident. Every outbox event other than the ones
+        deliberately routed must still resolve to the identity it used
+        before this table existed -- and the routed set is exactly the two
+        admin@ flows plus the four demo@ ones, so adding a row is a
+        deliberate, test-breaking act."""
+        routed = {
+            event: identity
             for event, identity in MAIL_IDENTITY_BY_EVENT_TYPE.items()
-            if identity is MailIdentity.ADMIN
         }
-        assert moved == {
-            NotificationEventType.PASSWORD_RESET,
-            NotificationEventType.LOCATION_WELCOME_EMAIL,
+        assert routed == {
+            NotificationEventType.PASSWORD_RESET: MailIdentity.ADMIN,
+            NotificationEventType.LOCATION_WELCOME_EMAIL: MailIdentity.ADMIN,
+            NotificationEventType.DEMO_REQUEST_RECEIVED: MailIdentity.DEMO,
+            NotificationEventType.DEMO_BOOKING_CONFIRMED: MailIdentity.DEMO,
+            NotificationEventType.DEMO_BOOKING_TEAM_NOTIFICATION: (
+                MailIdentity.DEMO
+            ),
+            NotificationEventType.DEMO_BOOKING_CANCELLED: MailIdentity.DEMO,
         }
         for event in NotificationEventType:
-            if event in moved:
+            if event in routed:
                 continue
             assert mail_identity_for_event(event.value) is MailIdentity.DEFAULT
 
@@ -332,7 +417,7 @@ class TestSixFlowsResolveToTheRightMailbox:
         explicitly moved must not change" -- a user invite is not part of
         the split and must still leave from the general mailbox."""
         delivery = _make_delivery(NotificationEventType.USER_INVITED.value)
-        service, admin, sales = _outbox_service(delivery)
+        service, admin, sales, demo = _outbox_service(delivery)
 
         await service.dispatch_pending()
 
@@ -462,6 +547,81 @@ class TestFallbackWhenAdminMailboxUnset:
         assert set(providers) == set(MailIdentity)
         assert providers[MailIdentity.ADMIN].from_address == SALES
         assert providers[MailIdentity.DEFAULT].from_address == SALES
+
+
+# ============================================================================
+# 2b. Every member names a real mailbox, and every member has a block
+# ============================================================================
+
+
+class TestEachIdentityHasItsOwnBlock:
+    def test_every_identity_member_has_a_settings_block(self) -> None:
+        """``_SETTINGS_BLOCK_BY_IDENTITY`` is the one place that decides
+        which block backs which mailbox. A member added without a row would
+        otherwise be a ``KeyError`` at the first send, inside a mail path,
+        on a worker -- caught here instead."""
+        for member in MailIdentity:
+            assert isinstance(settings_block_for(member), str)
+
+    @pytest.mark.parametrize(
+        ("identity", "address"),
+        [
+            (MailIdentity.DEFAULT, SALES),
+            (MailIdentity.ADMIN, ADMIN),
+            (MailIdentity.DEMO, DEMO),
+            (MailIdentity.ALERT, ALERT),
+        ],
+    )
+    def test_a_configured_identity_sends_as_its_own_mailbox(
+        self, identity: MailIdentity, address: str
+    ) -> None:
+        """Both the From and the authenticated username, because the whole
+        point of splitting the mailboxes is that a reply reaches the
+        mailbox that sent it."""
+        provider = get_configured_email_provider(_settings(), identity=identity)
+        assert isinstance(provider, SmtpEmailProvider)
+        assert provider.from_address == address
+        assert provider.username == address
+
+    def test_an_unconfigured_identity_falls_back_and_says_why(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """SUPPORT ships configured-but-unused: no flow sends as it yet, so
+        production has an empty ``support_smtp_host``. That must behave
+        exactly like any other unconfigured mailbox -- the general identity,
+        plus a WARNING naming the empty field -- and not like a broken
+        setting nobody can see."""
+        caplog.set_level(logging.WARNING, logger="app.domains.otp.service")
+
+        provider = get_configured_email_provider(
+            _settings(), identity=MailIdentity.SUPPORT
+        )
+
+        assert isinstance(provider, SmtpEmailProvider)
+        assert provider.from_address == SALES
+        [record] = [
+            r for r in caplog.records if r.message == "email_identity_fallback"
+        ]
+        assert record.requested_identity == MailIdentity.SUPPORT.value
+        assert "support_smtp_host is empty" in record.reason
+
+    def test_the_support_block_is_inert_but_configurable(self) -> None:
+        """Filling it in must work the moment a flow names SUPPORT, so the
+        block is not decorative: with a host set, the identity resolves to
+        its own mailbox with no code change."""
+        settings = _settings(
+            support_smtp_host=ZOHO_HOST,
+            support_smtp_username=SUPPORT,
+            support_smtp_password="placeholder-support-password",
+            support_smtp_from_address=SUPPORT,
+        )
+
+        provider = get_configured_email_provider(
+            settings, identity=MailIdentity.SUPPORT
+        )
+
+        assert isinstance(provider, SmtpEmailProvider)
+        assert provider.from_address == SUPPORT
 
 
 # ============================================================================
@@ -644,7 +804,7 @@ class TestIdentityCannotMixAccounts:
 class TestFailedSendIsNeverReportedAsSent:
     async def test_admin_mailbox_failure_is_recorded_as_a_failure(self) -> None:
         delivery = _make_delivery(NotificationEventType.PASSWORD_RESET.value)
-        service, admin, sales = _outbox_service(delivery)
+        service, admin, sales, demo = _outbox_service(delivery)
         admin.should_fail = True
 
         summary = await service.dispatch_pending()
