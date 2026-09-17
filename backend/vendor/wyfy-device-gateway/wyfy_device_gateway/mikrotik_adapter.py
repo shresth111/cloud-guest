@@ -107,6 +107,7 @@ from .contract import (
     IpAddressInfo,
     NatRuleConfig,
     NetworkSnapshot,
+    ArpPingResult,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
@@ -1869,6 +1870,56 @@ class MikroTikAdapter:
             packet_loss_percentage=packet_loss,
             avg_rtt_ms=avg_rtt_ms,
         )
+
+    async def arp_ping(
+        self, creds: DeviceCredentials, *, target: str, interface: str, count: int
+    ) -> ArpPingResult:
+        """``/tool/ping arp-ping=yes interface=...``: an L2 probe that any
+        live IP host must answer, whatever its firewall does with ICMP.
+
+        Exists for monitored-hardware liveness. Measured 2026-09-17 on a
+        hEX lite (RouterOS 7.23.3) against a TP-Link TL-WR845N used as a
+        venue AP: ICMP 0/2 (the WR845N drops ping on its WAN port by
+        default), ARP ping 3/3 with ``host`` = the AP's own MAC, and an
+        unused address on the same bridge 0/3. So a device that ignores
+        ICMP read DOWN forever while serving guests.
+
+        ``interface`` must be the L3 interface the target's subnet lives on
+        (``bridge``), not the bridge port. ``replied_macs`` carries every
+        ``host`` MAC seen, so the caller can check the answer came from the
+        device it means rather than something else holding that IP."""
+        return await asyncio.to_thread(
+            self._arp_ping_sync, creds, target, interface, count
+        )
+
+    def _arp_ping_sync(
+        self, creds: DeviceCredentials, target: str, interface: str, count: int
+    ) -> ArpPingResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(
+                    api(
+                        "/tool/ping",
+                        address=target,
+                        count=str(count),
+                        **{"arp-ping": "yes", "interface": interface},
+                    )
+                )
+            except (LibRouterosError, OSError) as exc:
+                # Same OSError reasoning as _ping_sync.
+                raise MikroTikDeviceError(
+                    creds.host, f"arp ping failed: {_describe_exception(exc)}"
+                ) from exc
+        finally:
+            api.close()
+        sent, received, _loss, _rtt = _parse_ping_rows(rows, requested_count=count)
+        # A timed-out row carries the target IP in ``host``, not a MAC;
+        # normalize_mac_address drops it.
+        replied_macs = frozenset(
+            mac for row in rows if (mac := normalize_mac_address(row.get("host")))
+        )
+        return ArpPingResult(sent=sent, received=received, replied_macs=replied_macs)
 
     async def traceroute(
         self,

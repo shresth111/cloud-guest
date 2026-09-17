@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from app.domains.connected_devices.device_adapters import (
+    ArpPingResult,
     DiscoveredDevice,
     PingResult,
 )
@@ -189,6 +190,9 @@ class FakePingAdapter:
     #: What the router's own lease/ARP read returns right now.
     discovered: list[DiscoveredDevice] = field(default_factory=list)
     discover_calls: int = 0
+    #: target IP -> MACs that answer an ARP ping there.
+    arp_replies: dict[str, frozenset[str]] = field(default_factory=dict)
+    arp_ping_calls: list[dict[str, object]] = field(default_factory=list)
 
     async def ping(self, credentials, *, target: str, count: int) -> PingResult:
         self.ping_calls.append({"target": target, "count": count})
@@ -199,6 +203,15 @@ class FakePingAdapter:
     async def discover_devices(self, credentials) -> list[DiscoveredDevice]:
         self.discover_calls += 1
         return list(self.discovered)
+
+    async def arp_ping(
+        self, credentials, *, target: str, interface: str, count: int
+    ) -> ArpPingResult:
+        self.arp_ping_calls.append({"target": target, "interface": interface})
+        macs = self.arp_replies.get(target, frozenset())
+        return ArpPingResult(
+            sent=count, received=count if macs else 0, replied_macs=macs
+        )
 
 
 # ============================================================================
@@ -547,3 +560,107 @@ class TestLivenessSweepFollowsTheMacNotTheIp:
         )
 
         assert adapter.discover_calls == 0
+
+
+class TestLivenessSweepSurvivesDevicesThatDropIcmp:
+    """Measured 2026-09-17 on router-floor-4: the monitored TL-WR845N at
+    192.168.88.253 answered ICMP 0/2 and ARP ping 3/3 (from its own MAC);
+    an unused address on the same bridge answered ARP 0/3."""
+
+    def _setup(self, **device_overrides: object):
+        router_lookup = FakeLivenessRouterLookup()
+        router = router_lookup.add(_make_router())
+        fields: dict[str, object] = {
+            "mac_address": "A8:29:48:A9:36:3A",
+            "ip_address": "192.168.88.253",
+            "is_active": False,
+            "last_seen_at": _now() - timedelta(days=2),
+        }
+        fields.update(device_overrides)
+        device = _make_device(router, **fields)
+        repository = FakeLivenessRepository(
+            targets=[(device, _make_monitored(router, mac_address=device.mac_address))]
+        )
+        return router_lookup, repository, device
+
+    async def test_icmp_silent_ap_that_answers_arp_is_up(self) -> None:
+        router_lookup, repository, device = self._setup()
+        adapter = FakePingAdapter(
+            result=_SILENT,
+            discovered=[_discovered(device.mac_address, "192.168.88.253")],
+            arp_replies={"192.168.88.253": frozenset({"A8:29:48:A9:36:3A"})},
+        )
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_up == 1
+        assert device.is_active is True
+        assert device.last_seen_at > _now() - timedelta(minutes=1)
+        assert adapter.arp_ping_calls == [
+            {"target": "192.168.88.253", "interface": "bridge"}
+        ]
+
+    async def test_arp_reply_from_a_different_mac_is_not_this_device(self) -> None:
+        """Something else now holds the AP's old IP: that is not the AP."""
+        router_lookup, repository, device = self._setup(is_active=True)
+        adapter = FakePingAdapter(
+            result=_SILENT,
+            arp_replies={"192.168.88.253": frozenset({"11:22:33:44:55:66"})},
+        )
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_down == 1
+        assert device.is_active is False
+
+    async def test_nothing_answers_arp_either_is_down(self) -> None:
+        router_lookup, repository, device = self._setup(is_active=True)
+        adapter = FakePingAdapter(result=_SILENT)
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_down == 1
+        assert device.is_active is False
+
+    async def test_arp_ping_goes_to_the_freshly_resolved_ip(self) -> None:
+        router_lookup, repository, device = self._setup()
+        adapter = FakePingAdapter(
+            result=_SILENT,
+            discovered=[_discovered(device.mac_address, "192.168.88.240")],
+            arp_replies={"192.168.88.240": frozenset({"A8:29:48:A9:36:3A"})},
+        )
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_up == 1
+        assert adapter.arp_ping_calls[0]["target"] == "192.168.88.240"
+
+    async def test_no_known_interface_skips_arp_ping(self) -> None:
+        router_lookup, repository, device = self._setup(is_active=True)
+        device.interface = None
+        adapter = FakePingAdapter(result=_SILENT)
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_down == 1
+        assert adapter.arp_ping_calls == []
+
+    async def test_icmp_answer_never_costs_an_arp_ping(self) -> None:
+        router_lookup, repository, device = self._setup()
+        adapter = FakePingAdapter(result=_ANSWERS)
+
+        await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert adapter.arp_ping_calls == []

@@ -811,6 +811,12 @@ async def run_monitored_hardware_liveness_sweep(
     existing derived UP/DOWN within one sweep tick (~30s) of a real power
     loss -- no waiting out the lease.
 
+    ICMP is only the first probe. When it goes unanswered the sweep asks
+    the router where the MAC lives now (the stored IP can be stale) and,
+    failing that, ARP-pings it on its own interface; a reply from the
+    device's own MAC counts as alive. Devices that drop ICMP (a TP-Link
+    TL-WR845N does, on its WAN port) otherwise read DOWN forever.
+
     ## Per-router isolation, and why a router failure skips not downs
 
     Each router's probe batch is independent: an unreachable/misconfigured
@@ -884,12 +890,32 @@ async def run_monitored_hardware_liveness_sweep(
                             for found in await adapter.discover_devices(credentials)
                         }
                     fresh_ip = current_ips.get(device.mac_address.upper())
+                    target_ip = device.ip_address
                     if fresh_ip and fresh_ip != device.ip_address:
                         await repository.update_device(device, {"ip_address": fresh_ip})
+                        target_ip = fresh_ip
                         result = await adapter.ping(
                             credentials, target=fresh_ip, count=ping_count
                         )
-                if result.received > 0:
+                    alive = result.received > 0
+                    if not alive and device.interface:
+                        # ICMP silence is not death. A TP-Link TL-WR845N
+                        # used as a venue AP drops ping on its WAN port by
+                        # default, so it read DOWN for two days while
+                        # serving guests -- yet answered ARP ping 3/3 from
+                        # the same router (an unused IP: 0/3). ARP has to
+                        # be answered by anything on the LAN, and the reply
+                        # must come from this device's own MAC.
+                        arp = await adapter.arp_ping(
+                            credentials,
+                            target=target_ip,
+                            interface=device.interface,
+                            count=ping_count,
+                        )
+                        alive = device.mac_address.upper() in arp.replied_macs
+                else:
+                    alive = True
+                if alive:
                     was_inactive = not device.is_active
                     await repository.update_device(
                         device,
