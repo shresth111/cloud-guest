@@ -65,6 +65,12 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-300}"   # api runs `alembic upgrade head` befo
                                           # uvicorn binds, so first-byte can be slow
 BACKUP_BUCKET="${BACKUP_BUCKET:-wyfy-guest-app-storage-1787805585}"
 DB_BACKUP="${DB_BACKUP:-1}"
+# The outgoing-mail mailboxes live in Secrets Manager, not in the box's .env
+# (the repositories are public, so a credential in git is a leaked credential
+# -- see this file's own header). MAIL_SECRET_ID empty disables the fetch
+# entirely and leaves today's behaviour untouched.
+MAIL_SECRET_ID="${MAIL_SECRET_ID:-cloudguest/prod/mail}"
+MAIL_ENV_FILE="$DEPLOY_DIR/mail.env"
 
 case "$SERVICE" in
   api)      VAR=API_IMAGE;      TARGETS=(api celery-worker celery-beat) ;;
@@ -188,10 +194,95 @@ set_var() {
   mv "$tmp" "$ENV_FILE"
 }
 
-compose_up() {
-  # --no-deps so postgres/redis are never recreated by an app deploy; they hold
-  # the only stateful thing here and have no business bouncing for a code push.
-  docker compose --env-file "$ENV_FILE" up -d --no-deps "${TARGETS[@]}"
+# --- mail.env, from Secrets Manager ---------------------------------------
+# The outgoing-mail mailboxes are read from Secrets Manager on every deploy and
+# written to a file compose loads *after* the base env_file, so these keys
+# override the box's .env for exactly these keys and nothing else. Two
+# deliberate properties:
+#
+#   * A mailbox is spliced in only when its `*_SMTP_PASSWORD` is non-empty. The
+#     secret ships with the host/username/from filled and the passwords blank
+#     (they are Google App Passwords, minted per mailbox in the admin console),
+#     so a half-filled secret must NOT put a host in front of the app with no
+#     password to authenticate it -- that turns "not configured yet" into "tries
+#     and fails on every send". Blank password = that mailbox is left exactly as
+#     the box has it today.
+#   * Every failure is fail-open: a missing secret, a denied GetSecretValue, a
+#     broken JSON or a box without python3 all log a WARNING and write an empty
+#     file. Mail configuration is not what a deploy is for, and a deploy that
+#     refuses to ship an image because a secret could not be read is a worse
+#     outage than an unfilled mailbox.
+#
+# Nothing here prints a value: the log names how many keys were written and
+# which mailboxes they belong to, never what they contain.
+materialise_mail_env() {
+  if [[ -z "$MAIL_SECRET_ID" ]]; then
+    log "MAIL_SECRET_ID is empty -- leaving $MAIL_ENV_FILE alone"
+    return 0
+  fi
+  : > "$MAIL_ENV_FILE"; chmod 600 "$MAIL_ENV_FILE"
+
+  local raw summary
+  if ! raw="$(aws secretsmanager get-secret-value --region "$REGION" \
+                --secret-id "$MAIL_SECRET_ID" --query SecretString --output text 2>&1)"; then
+    log "WARNING: could not read secret '$MAIL_SECRET_ID' ($raw)"
+    log "WARNING: continuing with no mail overrides -- mail behaviour is unchanged"
+    return 0
+  fi
+
+  # The JSON arrives on STDIN, so the program cannot also come from stdin
+  # (`python3 -` would consume it and hand json.load an empty string -- the
+  # failure is a "not valid JSON" warning and an empty mail.env, i.e. silently
+  # no mail config at all). Hence a temp file for the program.
+  local py summary
+  py="$(mktemp)"
+  cat > "$py" <<'PY'
+import json, sys
+
+target = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception as exc:  # noqa: BLE001 -- any unreadable secret means "no overrides"
+    print(f"WARNING: secret is not valid JSON ({exc})", file=sys.stderr)
+    sys.exit(0)
+if not isinstance(data, dict):
+    print("WARNING: secret is not a JSON object", file=sys.stderr)
+    sys.exit(0)
+
+# One mailbox at a time: the whole block, or none of it.
+out, mailboxes = {}, []
+for prefix in ("", "ADMIN_", "DEMO_", "ALERT_", "SUPPORT_", "INVOICE_"):
+    password = str(data.get(f"CLOUDGUEST_{prefix}SMTP_PASSWORD") or "").strip()
+    if not password:
+        continue
+    mailboxes.append(prefix.rstrip("_").lower() or "default")
+    for key, value in data.items():
+        if key.startswith(f"CLOUDGUEST_{prefix}SMTP_") and str(value).strip():
+            out[key] = str(value)
+
+# Keys that are not a mailbox and carry no password of their own.
+for key in (
+    "CLOUDGUEST_EMAIL_DELIVERY_PROVIDER",
+    "CLOUDGUEST_DEMO_REQUEST_NOTIFY_EMAIL",
+):
+    value = data.get(key)
+    if value is not None and str(value).strip():
+        out[key] = str(value)
+
+with open(target, "w", encoding="utf-8") as handle:
+    for key in sorted(out):
+        handle.write(f"{key}={out[key]}\n")
+
+print(f"{len(out)} keys written, mailboxes: {', '.join(mailboxes) or 'none filled yet'}")
+PY
+
+  if ! summary="$(printf '%s' "$raw" | python3 "$py" "$MAIL_ENV_FILE")"; then
+    rm -f "$py"
+    log "WARNING: python3 could not build $MAIL_ENV_FILE -- continuing with no mail overrides"
+    return 0
+  fi
+  rm -f "$py"
+  log "mail.env: ${summary:-nothing written -- see the warning above}"
 }
 
 wait_healthy() {
@@ -222,6 +313,12 @@ report() {
 
 log "switching $VAR -> $IMAGE"
 set_var "$VAR" "$IMAGE"
+
+# Before the swap, and only for the backend: the frontend service reads no mail
+# keys, so a frontend deploy has no business touching this file at all.
+if [[ "$SERVICE" == "api" ]]; then
+  materialise_mail_env
+fi
 
 if ! compose_up; then
   log "compose up failed; rolling back to $PREVIOUS"
