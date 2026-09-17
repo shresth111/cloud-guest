@@ -621,6 +621,38 @@ class TestSyncRouter:
         assert ap.connected_at == original_connected_at
         assert ap.last_seen_at == original_last_seen_at
 
+    async def test_monitored_ap_missing_from_leases_is_not_flipped_down(
+        self,
+    ) -> None:
+        """The ping sweep owns a monitored row's liveness in both directions:
+        a MAC absent from leases/ARP is not a ping verdict, so the discovery
+        sync must not mark a monitored AP inactive either."""
+        adapter = FakeConnectedDeviceAdapter(
+            discovered=[
+                DiscoveredDevice(
+                    mac_address="B8:27:EB:00:00:BB",
+                    ip_address="192.168.1.70",
+                    hostname="floor-ap",
+                    interface="ether3",
+                    is_wireless=None,
+                    signal_strength_dbm=None,
+                ),
+            ]
+        )
+        h = make_harness(adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await h.service.sync_router(router.id)
+        h.repository.monitored_macs.add("B8:27:EB:00:00:BB")
+
+        adapter.discovered = []
+        summary = await h.service.sync_router(router.id)
+
+        assert summary.disconnected == 0
+        devices, _ = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        assert devices[0].is_active is True
+
     async def test_missing_credentials_raises(self) -> None:
         h = make_harness()
         router = h.router_lookup.add(_make_router(), secret=None)

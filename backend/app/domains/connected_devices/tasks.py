@@ -293,6 +293,13 @@ async def _run_monitored_hardware_liveness_sweep_async() -> dict[str, int]:
         except Exception:
             await session.rollback()
             raise
+        finally:
+            # Explicit release, exactly as the discovery sweep's coordinator
+            # does. Without it the lock only ever expired through its 120s
+            # ``ex`` backstop, so a sweep Beat fires every 30s ran once per
+            # ~2.5 minutes: prod on 2026-09-17 logged 55 skipped_locked runs
+            # to 35 real ones in three hours.
+            await redis.delete(MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY)
     finally:
         await redis.aclose()
 

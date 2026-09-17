@@ -828,6 +828,17 @@ class PingResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ArpPingResult:
+    """Result of an ARP ping (``/tool/ping arp-ping=yes``) -- see
+    ``MikroTikAdapter.arp_ping``. ``replied_macs`` is every MAC that
+    answered, normalized; empty when nothing did."""
+
+    sent: int
+    received: int
+    replied_macs: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class TracerouteHop:
     """One hop's own final, cumulative state from a ``/tool/traceroute``
     execution. ``address`` is ``None`` for a hop that never responded.
@@ -1812,6 +1823,7 @@ __all__ = [
     "HotspotCertificatePushResult",
     "ProvisionResult",
     "SpeedTestResult",
+    "ArpPingResult",
     "PingResult",
     "TracerouteHop",
     "TracerouteResult",
