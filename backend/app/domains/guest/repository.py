@@ -346,6 +346,10 @@ class GuestRepositoryProtocol(Protocol):
         self, router_id: uuid.UUID
     ) -> list[GuestSession]: ...
 
+    async def list_active_sessions_for_location(
+        self, *, organization_id: uuid.UUID, location_id: uuid.UUID
+    ) -> list[GuestSession]: ...
+
     async def list_routers_with_active_sessions(self) -> list[Router]: ...
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]: ...
@@ -1290,6 +1294,35 @@ class GuestRepository:
         return await self.sessions.get_all(
             filters={"router_id": router_id, "status": GuestSessionStatus.ACTIVE.value}
         )
+
+    async def list_active_sessions_for_location(
+        self, *, organization_id: uuid.UUID, location_id: uuid.UUID
+    ) -> list[GuestSession]:
+        """Every currently ``ACTIVE`` session at one venue -- the Open Hours
+        sweep's entire working set (``service.enforce_open_hours_online_guests``).
+
+        Scoped by ``organization_id`` as well as ``location_id`` rather than by
+        location alone. Both columns are denormalized onto ``guest_sessions``
+        (see that model's own note), so neither costs a join; matching a
+        location id without its tenant is the shape a cross-tenant read takes
+        the day a location id is wrong or reused, and this is a query whose
+        result gets *terminated*, so it is worth the second predicate.
+
+        Ordered by ``started_at`` so a sweep over a venue reads its guests in
+        the order they arrived -- a stable order costs nothing and makes the
+        log lines from one run line up with the next."""
+        statement = (
+            select(GuestSession)
+            .where(
+                GuestSession.organization_id == organization_id,
+                GuestSession.location_id == location_id,
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+                GuestSession.is_deleted.is_(False),
+            )
+            .order_by(GuestSession.started_at)
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def list_routers_with_active_sessions(self) -> list[Router]:
         """Every agent-managed, non-deleted router that currently has at

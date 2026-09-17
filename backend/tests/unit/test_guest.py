@@ -85,6 +85,7 @@ from app.domains.guest.exceptions import (
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
+    VenueClosedError,
 )
 from app.domains.guest.models import (
     Guest,
@@ -322,6 +323,16 @@ class FakeCaptivePortalService:
         collect_guest_email: bool = True,
         whitelist_only_enabled: bool = False,
         whitelist_only_denied_message: str | None = None,
+        # Open Hours. Set explicitly for the same reason
+        # `whitelist_only_enabled` is spelled out below: a
+        # `CaptivePortalConfig` constructed in memory never sees a column's
+        # server default, so an attribute left unset is `None` -- which is
+        # falsy and would let a venue read as "hours off" for the wrong
+        # reason. `is_open_now` treats a disabled schedule as always-open, so
+        # these defaults describe a venue that is open around the clock.
+        business_hours_enabled: bool = False,
+        business_hours_timezone: str = "UTC",
+        business_hours_schedule: dict[str, dict[str, object]] | None = None,
     ) -> CaptivePortalConfig:
         config = CaptivePortalConfig(
             **_base_fields(
@@ -368,6 +379,13 @@ class FakeCaptivePortalService:
                 # reason.
                 whitelist_only_enabled=whitelist_only_enabled,
                 whitelist_only_denied_message=whitelist_only_denied_message,
+                business_hours_enabled=business_hours_enabled,
+                business_hours_timezone=business_hours_timezone,
+                business_hours_schedule=(
+                    business_hours_schedule
+                    if business_hours_schedule is not None
+                    else {}
+                ),
             )
         )
         self.configs_by_org[organization_id] = config
@@ -1641,6 +1659,9 @@ def make_fixture(
     collect_guest_email: bool = True,
     whitelist_only_enabled: bool = False,
     whitelist_only_denied_message: str | None = None,
+    business_hours_enabled: bool = False,
+    business_hours_timezone: str = "UTC",
+    business_hours_schedule: dict[str, dict[str, object]] | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -1665,6 +1686,9 @@ def make_fixture(
         collect_guest_email=collect_guest_email,
         whitelist_only_enabled=whitelist_only_enabled,
         whitelist_only_denied_message=whitelist_only_denied_message,
+        business_hours_enabled=business_hours_enabled,
+        business_hours_timezone=business_hours_timezone,
+        business_hours_schedule=business_hours_schedule,
     )
     captive_portal_service.add_location(location_id, organization_id)
     router = router_service.add(organization_id=organization_id, status=router_status)
@@ -2038,9 +2062,10 @@ class TestConcurrentSessionCreationRace:
             self._reuse(fx, guest=guest, device=device),
         )
 
-        assert {first[1], second[1]} == {True, False}, (
-            "exactly one of the two concurrent logins may create a session"
-        )
+        assert {first[1], second[1]} == {
+            True,
+            False,
+        }, "exactly one of the two concurrent logins may create a session"
         assert first[0].id == second[0].id
         assert len(fx.repository.sessions) == 1
         (only_session,) = fx.repository.sessions.values()
@@ -3175,7 +3200,6 @@ class TestMacWhitelistLogin:
         assert resolved.config.username_password_enabled is True
 
 
-
 class TestGuestQueueAssignmentIsOffTheRequestPath:
     """Design spec §5 S9. ``_assign_guest_queue`` opened a fresh TCP
     connection to the venue's MikroTik -- no pooling, 10-second timeout --
@@ -3593,9 +3617,7 @@ class TestFupQuotaReadsAreBatched:
         """A period nothing limits was skipped by the old loop too --
         batching must not turn it into a row this path writes."""
         fx = make_fixture(
-            policy_lookup=FakeFupPolicyLookup(
-                fup_rules={"daily_data_limit_mb": 1000}
-            )
+            policy_lookup=FakeFupPolicyLookup(fup_rules={"daily_data_limit_mb": 1000})
         )
         batched: list[list[str]] = []
         original = fx.repository.get_quota_usages
@@ -4078,6 +4100,43 @@ class TestBulkDeviceLookup:
 # ============================================================================
 
 
+_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+#: Every weekday closed, and every weekday 00:00-23:59. The only two spellings
+#: of "definitely closed" / "definitely open" that do not depend on which day
+#: the suite happens to run on -- `is_open_now` reads the *current* weekday's
+#: entry, so a schedule with one closed day in it would pass on a Tuesday and
+#: fail on a Wednesday.
+_ALWAYS_CLOSED_SCHEDULE: dict[str, dict[str, object]] = {
+    day: {"open": False} for day in _WEEKDAYS
+}
+_ALWAYS_OPEN_SCHEDULE: dict[str, dict[str, object]] = {
+    day: {"open": True, "start": "00:00", "end": "23:59"} for day in _WEEKDAYS
+}
+
+
+def _shut_the_venue(fx: Fixture) -> None:
+    """Close this venue's own Open Hours, after the fact.
+
+    Mutating the resolved config rather than building the fixture closed is
+    deliberate: a venue that is already shut refuses the *login* these tests
+    need in order to have a prior session to reconnect from (``login_via_otp``
+    -> ``_require_method_enabled`` -> ``_require_venue_open``). "The venue
+    closed while the guest was online" is also the shape that actually
+    happens, and the one the sweeps exist for."""
+    config = fx.captive_portal_service.configs_by_org[fx.organization_id]
+    config.business_hours_enabled = True
+    config.business_hours_schedule = _ALWAYS_CLOSED_SCHEDULE
+
+
 class TestSessionLifecycle:
     async def _login(
         self, fx: Fixture, identifier: str = "+15551110000"
@@ -4213,6 +4272,126 @@ class TestSessionLifecycle:
         terminated.ended_at = _now() - timedelta(
             minutes=TERMINATION_RECONNECT_COOLDOWN_MINUTES + 1
         )
+        reconnected = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert reconnected.status == GuestSessionStatus.ACTIVE.value
+
+    # -- the venue gates, re-checked on the second door in ------------------
+    #
+    # `reconnect` creates a real, new ACTIVE session, and it had neither of
+    # the gates every login path runs. So a guest refused at sign-in -- not on
+    # a whitelist-only property's list, or outside its Open Hours -- could
+    # walk straight back in through it and stay online. It is also the one
+    # door reachable without credentials.
+
+    async def test_reconnect_is_refused_at_a_venue_that_is_closed(self) -> None:
+        fx = make_fixture(
+            business_hours_enabled=True,
+            business_hours_schedule=_ALWAYS_OPEN_SCHEDULE,
+        )
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+        _shut_the_venue(fx)
+
+        with pytest.raises(VenueClosedError):
+            await fx.guest_service.reconnect(
+                guest_id=session.guest_id,
+                router_id=fx.router.id,
+                location_id=fx.location_id,
+            )
+        # Refused before the new session existed, and the prior one was not
+        # disturbed by the attempt.
+        assert len(fx.repository.sessions) == 1
+
+    async def test_reconnect_still_works_outside_a_closed_venue(self) -> None:
+        """The gate must not become a second way to strand a guest: a venue
+        whose hours are on but which is open right now reconnects exactly as
+        it always did."""
+        fx = make_fixture(
+            business_hours_enabled=True,
+            business_hours_schedule=_ALWAYS_OPEN_SCHEDULE,
+        )
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+
+        reconnected = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert reconnected.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_reconnect_is_refused_for_a_guest_not_on_a_whitelist_only_list(
+        self,
+    ) -> None:
+        """The hook is attached *after* the login, on purpose: the login is
+        what creates the prior session this test reconnects from, and a
+        property that turned the list on while a guest was online is exactly
+        the real-world shape being pinned."""
+        fx = make_fixture(whitelist_only_enabled=True)
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+
+        hook = FakeAccessControlHook()
+        fx.guest_service.access_control_hook = hook
+
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.reconnect(
+                guest_id=session.guest_id,
+                router_id=fx.router.id,
+                location_id=fx.location_id,
+            )
+        assert hook.calls[0]["whitelist_only_enabled"] is True
+
+    async def test_reconnect_is_allowed_for_a_guest_on_the_list(self) -> None:
+        fx = make_fixture(whitelist_only_enabled=True)
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+
+        hook = FakeAccessControlHook()
+        hook.allow(identifier="+15551110000")
+        fx.guest_service.access_control_hook = hook
+
+        reconnected = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert reconnected.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_reconnect_an_already_active_session_is_answered_not_refused(
+        self,
+    ) -> None:
+        """The gate sits *after* the idempotent return, deliberately: a guest
+        who is already online is already online, and handing back that same
+        session is the honest reply. Ending it is the sweeps' job."""
+        fx = make_fixture(
+            business_hours_enabled=True,
+            business_hours_schedule=_ALWAYS_OPEN_SCHEDULE,
+        )
+        session = await self._login(fx)
+        _shut_the_venue(fx)
+
+        returned = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert returned.id == session.id
+        assert len(fx.repository.sessions) == 1
+
+    async def test_reconnect_fails_open_when_no_portal_config_resolves(self) -> None:
+        """A venue mid-setup has no config to read a flag or a schedule from.
+        Fail open, as the OTP-request gate already does -- the login path is
+        where a genuinely unconfigured venue gets refused."""
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+        fx.captive_portal_service.configs_by_org.clear()
+
         reconnected = await fx.guest_service.reconnect(
             guest_id=session.guest_id,
             router_id=fx.router.id,
@@ -5845,6 +6024,7 @@ class TestRecordUsageFupTracking:
 # desynchronize it from the sessions the fixtures create at the real clock.
 _FUP_NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
 
+
 class TestRunFupTimeAccrual:
     async def test_the_sweep_resolves_with_the_guests_real_location(self) -> None:
         """The sweep used to resolve with a hardcoded ``location_id=None``,
@@ -5996,9 +6176,7 @@ class TestRunFupTimeAccrual:
             router_id=fx.router.id,
         )
         policy_lookup = FakeFupPolicyLookup(fup_rules={})
-        summary = await run_fup_time_accrual(
-            fx.repository, policy_lookup, now=_FUP_NOW
-        )
+        summary = await run_fup_time_accrual(fx.repository, policy_lookup, now=_FUP_NOW)
         assert summary == {"accrued_rows": 0, "expired_sessions": 0}
         assert (
             await fx.repository.get_quota_usage(
@@ -6353,7 +6531,7 @@ class TestWhitelistOnlyLoginGate:
         assert result.session.status == GuestSessionStatus.ACTIVE.value
 
     async def test_the_refusal_is_not_the_blocklist_error(self) -> None:
-        """"You are barred" and "this venue admits only listed guests" are
+        """ "You are barred" and "this venue admits only listed guests" are
         different facts and must not raise the same exception -- the portal
         has to be able to say different things.
 
@@ -6636,10 +6814,7 @@ class TestWhitelistOnlyRefusalsAreRecorded:
                 location_id=fx.location_id,
                 router_id=fx.router.id,
             )
-        assert (
-            fx.repository.login_history[0].failure_reason
-            != "GuestAccessDeniedError"
-        )
+        assert fx.repository.login_history[0].failure_reason != "GuestAccessDeniedError"
         assert (
             fx.repository.login_history[0].failure_reason
             == WhitelistOnlyAccessDeniedError.__name__
@@ -6648,9 +6823,7 @@ class TestWhitelistOnlyRefusalsAreRecorded:
     async def test_an_admitted_guest_writes_no_refusal(self) -> None:
         access_hook = FakeAccessControlHook()
         access_hook.allow(identifier="+15559994003")
-        fx = make_fixture(
-            access_control_hook=access_hook, whitelist_only_enabled=True
-        )
+        fx = make_fixture(access_control_hook=access_hook, whitelist_only_enabled=True)
         await fx.guest_service.login_via_otp(
             identifier="+15559994003",
             code="GOOD",
@@ -7592,9 +7765,7 @@ class TestRadiusAccountingOnOff:
         called: list[str] = []
 
         class _SpyTerminator:
-            async def end_on_router(
-                self, *, session, identifier, organization_id=None
-            ):
+            async def end_on_router(self, *, session, identifier, organization_id=None):
                 called.append(identifier)
 
         fx.guest_service.session_end_hook = _SpyTerminator()
@@ -8124,9 +8295,9 @@ class TestNasLifecycle:
         reintroduce the defect by simply not thinking about the hub."""
         import inspect
 
-        param = inspect.signature(
-            RadiusService.regenerate_secret
-        ).parameters["push_secret"]
+        param = inspect.signature(RadiusService.regenerate_secret).parameters[
+            "push_secret"
+        ]
         assert param.default is inspect.Parameter.empty
         assert param.kind is inspect.Parameter.KEYWORD_ONLY
 

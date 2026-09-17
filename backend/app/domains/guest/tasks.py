@@ -73,6 +73,7 @@ from .constants import (
     TASK_ASSIGN_GUEST_QUEUE,
     TASK_RECONCILE_ROUTER_SESSION_PRESENCE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
@@ -80,6 +81,7 @@ from .constants import (
 )
 from .repository import GuestRepository
 from .service import (
+    enforce_open_hours_online_guests,
     enforce_session_timeouts,
     enforce_whitelist_only_online_guests,
     reconcile_sessions_with_router_presence,
@@ -318,6 +320,44 @@ def run_whitelist_only_enforcement_sweep() -> dict[str, object]:
     ended_count = run_celery_task(_run_whitelist_only_enforcement_sweep_async())
     logger.info(
         "guest_task_run_whitelist_only_enforcement_sweep_completed",
+        extra={"ended_count": ended_count},
+    )
+    return {"ended_count": ended_count}
+
+
+async def _run_open_hours_enforcement_sweep_async() -> int:
+    """The actual async work behind ``run_open_hours_enforcement_sweep`` -- a
+    fresh session per task run, mirroring every other sweep in this module.
+    Returns the number of sessions flipped to ``TERMINATED``."""
+    async with SessionLocal() as session:
+        try:
+            repository = GuestRepository(session)
+            ended = await enforce_open_hours_online_guests(
+                repository,
+                captive_portal_lookup=_build_captive_portal_service(session),
+                terminator=_build_session_terminator(session, repository),
+            )
+            await session.commit()
+            return len(ended)
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP)
+def run_open_hours_enforcement_sweep() -> dict[str, object]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``).
+
+    Ends the session of every guest still online at a venue whose own Open
+    Hours say it is closed right now, at the device as well as in this
+    platform's records. Before this task, Open Hours refused new sign-ins and
+    left everyone already connected exactly where they were -- so a venue
+    that closes at 22:00 kept serving the guests it was closing to keep out."""
+    ended_count = run_celery_task(_run_open_hours_enforcement_sweep_async())
+    logger.info(
+        "guest_task_run_open_hours_enforcement_sweep_completed",
         extra={"ended_count": ended_count},
     )
     return {"ended_count": ended_count}
