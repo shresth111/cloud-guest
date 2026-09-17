@@ -20,7 +20,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from app.domains.connected_devices.device_adapters import PingResult
+from app.domains.connected_devices.device_adapters import (
+    DiscoveredDevice,
+    PingResult,
+)
 from app.domains.connected_devices.exceptions import ConnectedDeviceConnectionError
 from app.domains.connected_devices.models import ConnectedDevice
 from app.domains.connected_devices.service import (
@@ -180,12 +183,22 @@ class FakePingAdapter:
     #: Targets whose ping simulates an unreachable uplink router -- lets a
     #: test make one router's whole batch fail while another succeeds.
     connection_error_targets: set[str] = field(default_factory=set)
+    #: Per-target overrides of ``result`` -- lets a test make the old IP
+    #: silent and the new one answer.
+    results_by_target: dict[str, PingResult] = field(default_factory=dict)
+    #: What the router's own lease/ARP read returns right now.
+    discovered: list[DiscoveredDevice] = field(default_factory=list)
+    discover_calls: int = 0
 
     async def ping(self, credentials, *, target: str, count: int) -> PingResult:
         self.ping_calls.append({"target": target, "count": count})
         if self.raise_connection_error or target in self.connection_error_targets:
             raise ConnectedDeviceConnectionError(credentials.host, "down in test")
-        return self.result
+        return self.results_by_target.get(target, self.result)
+
+    async def discover_devices(self, credentials) -> list[DiscoveredDevice]:
+        self.discover_calls += 1
+        return list(self.discovered)
 
 
 # ============================================================================
@@ -412,3 +425,125 @@ class TestMonitoredHardwareLivenessSweep:
         assert summary.skipped == 1
         assert adapter.ping_calls == []
         assert repository.update_log == []
+
+
+def _discovered(mac_address: str, ip_address: str | None) -> DiscoveredDevice:
+    return DiscoveredDevice(
+        mac_address=mac_address,
+        ip_address=ip_address,
+        hostname=None,
+        interface="ether2",
+        is_wireless=None,
+        signal_strength_dbm=None,
+    )
+
+
+_SILENT = PingResult(sent=2, received=0, packet_loss_percentage=100.0, avg_rtt_ms=None)
+_ANSWERS = PingResult(sent=2, received=2, packet_loss_percentage=0.0, avg_rtt_ms=1.0)
+
+
+class TestLivenessSweepFollowsTheMacNotTheIp:
+    """Reported 2026-09-17: "Access Point status is not updating, if down
+    then always showing down even when it is up". The sweep pinged the IP
+    stored at discovery time; an AP that came back on a different DHCP
+    address answered nobody, so it read DOWN on every tick while live."""
+
+    async def test_ap_on_a_new_ip_comes_back_up_and_the_ip_is_saved(self) -> None:
+        router_lookup = FakeLivenessRouterLookup()
+        router = router_lookup.add(_make_router())
+        device = _make_device(
+            router,
+            mac_address="A8:29:48:A9:36:3A",
+            ip_address="192.168.88.253",
+            is_active=False,
+            connected_at=None,
+            last_seen_at=_now() - timedelta(days=2),
+        )
+        repository = FakeLivenessRepository(
+            targets=[(device, _make_monitored(router, mac_address=device.mac_address))]
+        )
+        adapter = FakePingAdapter(
+            result=_SILENT,
+            results_by_target={"10.5.50.23": _ANSWERS},
+            # RouterOS reports MACs in whatever case; match regardless.
+            discovered=[_discovered("a8:29:48:a9:36:3a", "10.5.50.23")],
+        )
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_up == 1
+        assert summary.devices_down == 0
+        assert device.is_active is True
+        assert device.ip_address == "10.5.50.23"
+        assert [c["target"] for c in adapter.ping_calls] == [
+            "192.168.88.253",
+            "10.5.50.23",
+        ]
+
+    async def test_ap_that_is_really_off_stays_down(self) -> None:
+        """The re-lookup must not turn into a way to call a dead AP UP: the
+        router still holds its lease at the new address, but nothing there
+        answers."""
+        router_lookup = FakeLivenessRouterLookup()
+        router = router_lookup.add(_make_router())
+        device = _make_device(
+            router, mac_address="A8:29:48:A9:36:3B", ip_address="10.5.50.10"
+        )
+        repository = FakeLivenessRepository(
+            targets=[(device, _make_monitored(router, mac_address=device.mac_address))]
+        )
+        adapter = FakePingAdapter(
+            result=_SILENT, discovered=[_discovered(device.mac_address, "10.5.50.11")]
+        )
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_down == 1
+        assert device.is_active is False
+
+    async def test_same_ip_or_mac_gone_is_not_pinged_twice(self) -> None:
+        router_lookup = FakeLivenessRouterLookup()
+        router = router_lookup.add(_make_router())
+        same_ip = _make_device(
+            router, mac_address="A8:29:48:A9:36:3C", ip_address="10.5.50.12"
+        )
+        gone = _make_device(
+            router, mac_address="A8:29:48:A9:36:3D", ip_address="10.5.50.13"
+        )
+        repository = FakeLivenessRepository(
+            targets=[
+                (same_ip, _make_monitored(router, mac_address=same_ip.mac_address)),
+                (gone, _make_monitored(router, mac_address=gone.mac_address)),
+            ]
+        )
+        adapter = FakePingAdapter(
+            result=_SILENT, discovered=[_discovered(same_ip.mac_address, "10.5.50.12")]
+        )
+
+        summary = await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert summary.devices_down == 2
+        assert len(adapter.ping_calls) == 2
+        # One lease/ARP read per router, not one per silent device.
+        assert adapter.discover_calls == 1
+
+    async def test_answering_devices_never_trigger_a_router_read(self) -> None:
+        router_lookup = FakeLivenessRouterLookup()
+        router = router_lookup.add(_make_router())
+        device = _make_device(router, mac_address="A8:29:48:A9:36:3E")
+        repository = FakeLivenessRepository(
+            targets=[(device, _make_monitored(router, mac_address=device.mac_address))]
+        )
+        adapter = FakePingAdapter(result=_ANSWERS)
+
+        await run_monitored_hardware_liveness_sweep(
+            repository, router_lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+
+        assert adapter.discover_calls == 0

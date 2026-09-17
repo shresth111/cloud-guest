@@ -399,7 +399,15 @@ class ConnectedDeviceService:
 
         disconnected_count = 0
         for mac_address, row in existing_by_mac.items():
-            if mac_address not in seen_macs and row.is_active:
+            # Monitored rows are exempt here too, for the same reason as the
+            # update branch above: a MAC missing from leases/ARP is not a
+            # ping verdict, and flipping it here made the dashboard read
+            # DOWN until the ping sweep's next tick overwrote it.
+            if (
+                mac_address not in seen_macs
+                and row.is_active
+                and mac_address not in monitored_macs
+            ):
                 await self.repository.update_device(row, {"is_active": False})
                 disconnected_count += 1
 
@@ -854,6 +862,9 @@ async def run_monitored_hardware_liveness_sweep(
             )
             continue
         try:
+            # MAC -> the IP the router holds for it right now, read at most
+            # once per router and only when a ping has already failed.
+            current_ips: dict[str, str | None] | None = None
             for device in devices:
                 if not device.ip_address:
                     skipped += 1
@@ -861,6 +872,23 @@ async def run_monitored_hardware_liveness_sweep(
                 result = await adapter.ping(
                     credentials, target=device.ip_address, count=ping_count
                 )
+                if result.received == 0:
+                    # The stored IP is only as fresh as the last discovery
+                    # sync (15 min), and an AP that rebooted onto a new DHCP
+                    # address kept being pinged at its old one -- DOWN on
+                    # every tick while it was serving guests. Before calling
+                    # it DOWN, ask the router where that MAC lives now.
+                    if current_ips is None:
+                        current_ips = {
+                            found.mac_address.upper(): found.ip_address
+                            for found in await adapter.discover_devices(credentials)
+                        }
+                    fresh_ip = current_ips.get(device.mac_address.upper())
+                    if fresh_ip and fresh_ip != device.ip_address:
+                        await repository.update_device(device, {"ip_address": fresh_ip})
+                        result = await adapter.ping(
+                            credentials, target=fresh_ip, count=ping_count
+                        )
                 if result.received > 0:
                     was_inactive = not device.is_active
                     await repository.update_device(
