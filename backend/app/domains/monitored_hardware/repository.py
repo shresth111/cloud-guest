@@ -13,18 +13,30 @@ Also owns the one cross-domain read this whole feature is built on --
 honest status (see ``__init__.py``'s own module docstring). This never
 writes to that table -- ``connected_devices``' own sync sweep remains the
 only writer.
+
+Also owns one read of the ``routers`` table --
+``router_vendors_for_locations`` -- which exists solely to ask the vendor
+question (see ``app.domains.router.vendor_capabilities``) so the service
+layer can tell a status it measured from one it never could. It is
+deliberately NOT narrowed to agent-managed rows: narrowing it would make a
+controller-managed venue indistinguishable from a venue with no router at
+all, which is the exact distinction it was added to draw. See
+``tests/unit/test_router_read_vendor_coverage.py``'s entry for it.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from typing import Protocol
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
 from app.domains.connected_devices.models import ConnectedDevice
+from app.domains.router.models import Router
 
 from .models import MonitoredHardware
 
@@ -56,6 +68,10 @@ class MonitoredHardwareRepositoryProtocol(Protocol):
     async def get_connected_device_by_mac(
         self, location_id: uuid.UUID, mac_address: str
     ) -> ConnectedDevice | None: ...
+
+    async def router_vendors_for_locations(
+        self, location_ids: Iterable[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[uuid.UUID, str]]: ...
 
 
 class MonitoredHardwareRepository:
@@ -114,6 +130,36 @@ class MonitoredHardwareRepository:
             limit=1,
         )
         return results[0] if results else None
+
+    async def router_vendors_for_locations(
+        self, location_ids: Iterable[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[uuid.UUID, str]]:
+        """``{location_id: {router_id: vendor}}`` for the given locations.
+
+        Vendor strings only -- no row is returned, judged, dialled or
+        configured. The service layer asks
+        ``vendor_capabilities.is_agent_managed`` of them and nothing else.
+
+        Batched over locations rather than offered one at a time because
+        ``list_devices`` renders a page of hardware that may span several of
+        them, and a per-row lookup would turn one list into N queries.
+
+        A location absent from the result has no non-deleted router at all,
+        which is a third answer distinct from "has one, and it is a
+        controller" -- keeping them apart is the whole point of this read.
+        """
+        wanted = {location_id for location_id in location_ids}
+        if not wanted:
+            return {}
+        statement = select(Router.location_id, Router.id, Router.vendor).where(
+            Router.location_id.in_(wanted),
+            Router.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        vendors: dict[uuid.UUID, dict[uuid.UUID, str]] = {}
+        for location_id, router_id, vendor in result.all():
+            vendors.setdefault(location_id, {})[router_id] = vendor
+        return vendors
 
 
 __all__ = ["MonitoredHardwareRepositoryProtocol", "MonitoredHardwareRepository"]

@@ -26,6 +26,7 @@ fail a whole sync.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -182,6 +183,83 @@ def parse_envelope(payload: object) -> OmadaEnvelope:
         msg=raw_msg if isinstance(raw_msg, str) else None,
         result=payload.get("result"),
     )
+
+
+#: The unit suffixes an Omada uptime string uses, in seconds. ``day``/``days``
+#: as well as ``d`` because TP-Link's own documentation renders the field as
+#: ``"2day(s) 3h 4m"`` while this controller's device list renders it as
+#: ``"8h 26m 42s"``, and both have to parse.
+_DURATION_UNIT_SECONDS: dict[str, int] = {
+    "d": 86400,
+    "day": 86400,
+    "days": 86400,
+    "h": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+}
+
+_DURATION_TERM = re.compile(r"(\d+)\s*([A-Za-z()]+)")
+
+
+def coerce_duration_seconds(value: object) -> int | None:
+    """Seconds from an Omada duration string, or ``None`` if it is not one.
+
+    ## Why this exists rather than a wider ``coerce_int``
+
+    ``uptime`` is an integer number of seconds on the controller-internal v2
+    device list, and TP-Link's Open API spec types the same field as a
+    **string**. Measured on an Omada Software Controller 5.15.24.19 on
+    2026-09-18, that string is ``"8h 26m 42s"``; TP-Link's own docs render
+    it as ``"2day(s) 3h 4m"``. ``coerce_int`` returns ``None`` for both, so
+    an AP inventory built on the Open API showed a blank uptime for every
+    device -- which the surrounding module was right to prefer over a
+    guess, and which is still a field the customer asked for.
+
+    ## Why it refuses rather than guesses
+
+    Every term must be ``<digits><known unit>`` and the whole string must be
+    consumed by such terms. A bare number is NOT accepted here
+    (``coerce_int`` already owns that case, and a bare number whose unit we
+    have not been told is exactly the 1000x-wrong reading ``devices.py``'s
+    docstring warns about). Anything else -- a date, a localized word, an
+    unfamiliar unit -- returns ``None``, and a blank uptime is the honest
+    outcome.
+
+    ``day(s)`` is matched by normalising the parenthetical rather than by a
+    special case, so ``hour(s)`` and ``min(s)`` work too without being
+    enumerated.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    total = 0
+    terms = 0
+    for match in _DURATION_TERM.finditer(text):
+        unit = match.group(2).replace("(s)", "s").lower()
+        if unit not in _DURATION_UNIT_SECONDS:
+            return None
+        total += int(match.group(1)) * _DURATION_UNIT_SECONDS[unit]
+        terms += 1
+    if terms == 0:
+        return None
+    # Everything outside a term must be separator whitespace or commas --
+    # otherwise the string is something else that happens to contain a
+    # duration, and reading an uptime out of it would be an invention.
+    if _DURATION_TERM.sub("", text).strip(" \t,"):
+        return None
+    return total
 
 
 def coerce_int(value: object) -> int | None:
@@ -418,6 +496,7 @@ __all__ = [
     "SESSION_EXPIRED_ERROR_CODES",
     "OmadaEnvelope",
     "coerce_bool",
+    "coerce_duration_seconds",
     "coerce_int",
     "coerce_str",
     "epoch_to_utc",
