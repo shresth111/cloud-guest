@@ -71,6 +71,8 @@ def _device_response(item: HardwareWithStatus) -> MonitoredHardwareResponse:
         status=item.status.value,
         last_seen_at=item.last_seen_at,
         connected_at=item.connected_at,
+        status_source=item.status_source.value,
+        status_reason=item.status_reason.value,
         created_at=device.created_at,
     )
 

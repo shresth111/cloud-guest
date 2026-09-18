@@ -80,10 +80,6 @@ class ConnectedDeviceRepositoryProtocol(Protocol):
         self, router_id: uuid.UUID
     ) -> set[str]: ...
 
-    async def list_routers_with_monitored_hardware(
-        self,
-    ) -> list[Router]: ...
-
 
 class ConnectedDeviceRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -184,24 +180,57 @@ class ConnectedDeviceRepository:
         self,
     ) -> list[tuple[ConnectedDevice, MonitoredHardware]]:
         """Every registered (non-deleted) monitored device that the device
-        sync has ever observed, paired with its ``ConnectedDevice`` row --
-        the liveness sweep's target list. The join is deliberately on
-        ``location_id + mac_address`` (the same key
-        ``MonitoredHardwareService.with_status`` resolves status through),
-        not on ``router_id``: ``MonitoredHardware.router_id`` is the
-        *intended* uplink, which is nullable and can drift from where the
-        device actually showed up, whereas the ``ConnectedDevice`` row's
+        sync has ever observed **through an agent-managed uplink**, paired
+        with its ``ConnectedDevice`` row -- the liveness sweep's target
+        list. The join is deliberately on ``location_id + mac_address`` (the
+        same key ``MonitoredHardwareService.with_status`` resolves status
+        through), not on ``router_id``: ``MonitoredHardware.router_id`` is
+        the *intended* uplink, which is nullable and can drift from where
+        the device actually showed up, whereas the ``ConnectedDevice`` row's
         own ``router_id`` is the router that genuinely saw it -- and that
-        same router is where the device's management IP lives, which is
-        the address a ping must target."""
-        statement = (
+        same router is where the device's management IP lives, which is the
+        address a ping must target.
+
+        ## Why the vendor gate is here and not left implicit
+
+        It was correct before this filter existed, and only by accident.
+        ``ConnectedDevice`` rows are written by ``sync_router``, which is
+        dispatched from ``list_routers_for_sync`` -- already
+        ``agent_managed_only`` -- so a controller-managed row could not
+        acquire connected devices, so it could not appear here. That is a
+        argument about a *different* function's WHERE clause, holding up a
+        sweep that opens RouterOS sessions and writes UP/DOWN verdicts. Any
+        future writer of ``ConnectedDevice`` (a controller-sourced client
+        list is an obvious candidate, and the Omada provider already reads
+        one) would silently hand this sweep rows it must not probe, and the
+        only thing between that and a false DOWN on a customer's dashboard
+        is ``run_monitored_hardware_liveness_sweep``'s generic
+        ``except`` -- which is error handling, not a decision.
+
+        So the gate is stated where the rows are selected. ``ConnectedDevice
+        .router_id`` is the router the sweep will dial for this row, so it
+        is that router's vendor the filter asks about. Label-based
+        (``agent_managed_only``), exactly as ``list_routers_for_sync`` is,
+        so the prober and ``MonitoredHardwareService.with_status`` -- which
+        asks the same label question to decide whether to report a status as
+        measured -- can never disagree about which rows are probed.
+
+        This filter also carries the guarantee that used to be written on
+        ``list_routers_with_monitored_hardware``, a fan-out list nothing
+        called; see that deletion's own note in the PR.
+        """
+        statement = agent_managed_only(
             select(ConnectedDevice, MonitoredHardware)
             .join(
                 MonitoredHardware,
                 (MonitoredHardware.location_id == ConnectedDevice.location_id)
                 & (MonitoredHardware.mac_address == ConnectedDevice.mac_address),
             )
-            .where(MonitoredHardware.is_deleted.is_(False))
+            .join(Router, Router.id == ConnectedDevice.router_id)
+            .where(
+                MonitoredHardware.is_deleted.is_(False),
+                Router.is_deleted.is_(False),
+            )
         )
         result = await self.session.execute(statement)
         return [(device, hardware) for device, hardware in result.all()]
@@ -224,35 +253,6 @@ class ConnectedDeviceRepository:
         )
         result = await self.session.execute(statement)
         return set(result.scalars().all())
-
-    async def list_routers_with_monitored_hardware(
-        self,
-    ) -> list[Router]:
-        """Agent-managed routers whose own location has at least one
-        non-deleted monitored device -- the liveness sweep's fan-out list
-        (a router with nothing to probe is skipped entirely, mirroring how
-        ``list_routers_for_sync``'s callers skip nothing because every
-        router has guests).
-
-        ``agent_managed_only`` for the same reason as
-        ``list_routers_for_sync`` above, and one sharper: this sweep's
-        target list is built by joining on ``location_id``, so a
-        controller-managed row would be handed *another vendor's* monitored
-        hardware to ping through a RouterOS session it can never open."""
-        statement = agent_managed_only(
-            select(Router)
-            .join(
-                MonitoredHardware,
-                MonitoredHardware.location_id == Router.location_id,
-            )
-            .where(
-                Router.is_deleted.is_(False),
-                MonitoredHardware.is_deleted.is_(False),
-            )
-            .distinct()
-        )
-        result = await self.session.execute(statement)
-        return list(result.scalars().all())
 
 
 __all__ = ["ConnectedDeviceRepositoryProtocol", "ConnectedDeviceRepository"]

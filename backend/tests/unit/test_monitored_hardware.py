@@ -20,7 +20,11 @@ from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.connected_devices.models import ConnectedDevice
 from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.location.models import Location
-from app.domains.monitored_hardware.constants import HardwareStatus
+from app.domains.monitored_hardware.constants import (
+    HardwareStatus,
+    StatusReason,
+    StatusSource,
+)
 from app.domains.monitored_hardware.exceptions import (
     DuplicateMonitoredHardwareError,
     InvalidMacAddressError,
@@ -81,7 +85,10 @@ def _make_location(*, organization_id: uuid.UUID | None = None) -> Location:
 
 
 def _make_router(
-    *, organization_id: uuid.UUID | None = None, location_id: uuid.UUID | None = None
+    *,
+    organization_id: uuid.UUID | None = None,
+    location_id: uuid.UUID | None = None,
+    vendor: str = "mikrotik",
 ) -> Router:
     return Router(
         **_base_fields(
@@ -91,7 +98,7 @@ def _make_router(
             serial_number=f"SN-{uuid.uuid4().hex[:8]}",
             mac_address="AA:BB:CC:DD:EE:FF",
             model="RB4011",
-            vendor="mikrotik",
+            vendor=vendor,
             routeros_version=None,
             management_ip_address="10.0.0.1",
             public_ip_address=None,
@@ -146,6 +153,11 @@ def _make_connected_device(
 class FakeMonitoredHardwareRepository:
     devices: dict[uuid.UUID, MonitoredHardware] = field(default_factory=dict)
     connected_devices: list[ConnectedDevice] = field(default_factory=list)
+    # Fleet rows, for the one read that asks the vendor question. Left empty
+    # by every pre-existing test on purpose: "this venue has no fleet row at
+    # all" is the case that must keep behaving exactly as it did before
+    # `status_source` existed.
+    routers: list[Router] = field(default_factory=list)
 
     async def create_device(self, **fields: object) -> MonitoredHardware:
         device = MonitoredHardware(**_base_fields(**fields))
@@ -204,6 +216,16 @@ class FakeMonitoredHardwareRepository:
             if cd.location_id == location_id and cd.mac_address == mac_address:
                 return cd
         return None
+
+    async def router_vendors_for_locations(
+        self, location_ids
+    ) -> dict[uuid.UUID, dict[uuid.UUID, str]]:
+        wanted = set(location_ids)
+        vendors: dict[uuid.UUID, dict[uuid.UUID, str]] = {}
+        for router in self.routers:
+            if router.location_id in wanted and not router.is_deleted:
+                vendors.setdefault(router.location_id, {})[router.id] = router.vendor
+        return vendors
 
 
 @dataclass
@@ -582,6 +604,217 @@ class TestDerivedStatus:
         statuses = {item.device.id: item.status for item in items}
         assert statuses[up_device.id] == HardwareStatus.UP
         assert statuses[unknown_device.id] == HardwareStatus.UNKNOWN
+
+
+# ============================================================================
+# Honest status source -- measured vs. never measurable
+# ============================================================================
+
+
+class TestStatusSourceIsHonest:
+    """`unknown` on a controller-managed venue is not the same fact as
+    `unknown` on a MikroTik venue, and the API must be able to say which.
+
+    A monitored-hardware UP/DOWN comes from a `ConnectedDevice` row, and
+    both writers of that row open a RouterOS session against the venue's
+    uplink. A TP-Link Omada controller has no RouterOS, so at a venue whose
+    only fleet row is a controller nothing ever probes the device -- the row
+    sits at `unknown` forever, and a screen reads that as "we looked and
+    never saw it". These tests pin the distinction, and pin that an
+    agent-managed venue's answer did not move.
+    """
+
+    async def test_agent_managed_venue_is_measured(self) -> None:
+        """The pre-existing behaviour, now stated out loud: a MikroTik venue
+        reports UP from a probe, and says the status was measured."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        router = _make_router(
+            organization_id=location.organization_id, location_id=location.id
+        )
+        h.repository.routers.append(router)
+        device = await _register_device(
+            h, location, mac_address="aa:bb:cc:dd:ee:20"
+        )
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                router_id=router.id,
+                mac_address=device.mac_address,
+                is_active=True,
+            )
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.UP
+        assert item.status_source == StatusSource.MEASURED
+        assert item.status_reason == StatusReason.LIVENESS_PROBE
+
+    async def test_agent_managed_venue_never_observed_is_still_measurable(
+        self,
+    ) -> None:
+        """A freshly registered row at a MikroTik venue: unknown, because
+        nothing has seen it *yet*. A probe path exists, so this is NOT the
+        controller case -- the two must not collapse into one another."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        h.repository.routers.append(
+            _make_router(
+                organization_id=location.organization_id, location_id=location.id
+            )
+        )
+        device = await _register_device(
+            h, location, mac_address="aa:bb:cc:dd:ee:21"
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.UNKNOWN
+        assert item.status_source == StatusSource.MEASURED
+        assert item.status_reason == StatusReason.NEVER_OBSERVED
+
+    async def test_controller_managed_venue_is_unmeasured(self) -> None:
+        """The defect. An AP registered at an Omada venue can never be
+        pinged: the sweep's target list is narrowed to agent-managed uplinks
+        in SQL, so this row is never dialled. It must not report as a device
+        that was looked for and not found."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        h.repository.routers.append(
+            _make_router(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                vendor="tplink_omada",
+            )
+        )
+        device = await _register_device(
+            h, location, mac_address="aa:bb:cc:dd:ee:22"
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.UNKNOWN
+        assert item.status_source == StatusSource.UNMEASURED
+        assert item.status_reason == StatusReason.CONTROLLER_MANAGED
+
+    async def test_controller_uplink_never_reports_up(self) -> None:
+        """Even with an `is_active` ConnectedDevice row against a controller
+        uplink, the answer is unmeasured -- nothing refreshes that row, so
+        UP would be a claim about a reading no sweep is taking."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        controller = _make_router(
+            organization_id=location.organization_id,
+            location_id=location.id,
+            vendor="tplink_omada",
+        )
+        h.repository.routers.append(controller)
+        device = await _register_device(
+            h, location, mac_address="aa:bb:cc:dd:ee:23"
+        )
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                router_id=controller.id,
+                mac_address=device.mac_address,
+                is_active=True,
+            )
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.UNKNOWN
+        assert item.status_source == StatusSource.UNMEASURED
+        assert item.status_reason == StatusReason.CONTROLLER_MANAGED
+
+    async def test_mixed_venue_keeps_its_agent_managed_answer(self) -> None:
+        """A venue running both a MikroTik and an Omada controller still has
+        a probe path, and a device seen through the MikroTik is measured.
+        The controller's presence must not demote its neighbour."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        mikrotik = _make_router(
+            organization_id=location.organization_id, location_id=location.id
+        )
+        h.repository.routers.extend(
+            [
+                mikrotik,
+                _make_router(
+                    organization_id=location.organization_id,
+                    location_id=location.id,
+                    vendor="tplink_omada",
+                ),
+            ]
+        )
+        device = await _register_device(
+            h, location, mac_address="aa:bb:cc:dd:ee:24"
+        )
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                router_id=mikrotik.id,
+                mac_address=device.mac_address,
+                is_active=False,
+            )
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.DOWN
+        assert item.status_source == StatusSource.MEASURED
+        assert item.status_reason == StatusReason.LIVENESS_PROBE
+
+    async def test_unresolvable_uplink_reads_as_agent_managed(self) -> None:
+        """A sighting whose router row is gone (soft-deleted) falls back to
+        the column's own `mikrotik` default, exactly as `vendor_of` does --
+        so no agent-managed venue's answer can change because a row was
+        tidied up."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        device = await _register_device(
+            h, location, mac_address="aa:bb:cc:dd:ee:25"
+        )
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                mac_address=device.mac_address,
+                is_active=True,
+            )
+        )
+        item = await h.service.with_status(device)
+        assert item.status == HardwareStatus.UP
+        assert item.status_source == StatusSource.MEASURED
+
+    async def test_list_devices_reports_the_source_per_row(self) -> None:
+        """The list path batches the vendor read; it must reach the same
+        verdict the single-row path does."""
+        h = make_harness()
+        agent_location = h.location_lookup.add(_make_location())
+        controller_location = h.location_lookup.add(
+            _make_location(organization_id=agent_location.organization_id)
+        )
+        h.repository.routers.extend(
+            [
+                _make_router(
+                    organization_id=agent_location.organization_id,
+                    location_id=agent_location.id,
+                ),
+                _make_router(
+                    organization_id=agent_location.organization_id,
+                    location_id=controller_location.id,
+                    vendor="tplink_omada",
+                ),
+            ]
+        )
+        agent_device = await _register_device(
+            h, agent_location, mac_address="aa:bb:cc:dd:ee:26"
+        )
+        controller_device = await _register_device(
+            h, controller_location, mac_address="aa:bb:cc:dd:ee:27"
+        )
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=agent_location.organization_id,
+            page=1,
+            page_size=25,
+        )
+        sources = {item.device.id: item.status_source for item in items}
+        assert sources[agent_device.id] == StatusSource.MEASURED
+        assert sources[controller_device.id] == StatusSource.UNMEASURED
 
 
 # ============================================================================

@@ -107,12 +107,22 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "isolation into a `routers_failed` count and a warning log."
     ),
     "app/domains/connected_devices/repository.py::"
-    "ConnectedDeviceRepository.list_routers_with_monitored_hardware": (
-        "The monitored-hardware liveness sweep's fan-out list. Same "
-        "device-I/O reason as `list_routers_for_sync`, and worse in one "
-        "respect: the target list is built by joining on `location_id`, so "
-        "a controller-managed row at a shared site would be handed another "
-        "vendor's hardware to ping through a session it can never open."
+    "ConnectedDeviceRepository.list_monitored_targets": (
+        "The monitored-hardware liveness sweep's actual target list -- the "
+        "one the sweep really calls. Each row is dialled: the sweep opens a "
+        "RouterOS session against `ConnectedDevice.router_id` and pings the "
+        "device's management IP through it, then writes an UP/DOWN verdict "
+        "to the customer's dashboard. So the filter asks about that "
+        "router's vendor, and the row is never loaded rather than skipped "
+        "later. It was previously safe only as a consequence of "
+        "`list_routers_for_sync`'s filter (no sync, so no `ConnectedDevice` "
+        "rows for a controller, so nothing to join) -- an argument about a "
+        "different function's WHERE clause, and one that any future "
+        "controller-sourced writer of `connected_devices` would quietly "
+        "invalidate. Label-based, matching `list_routers_for_sync` and "
+        "matching the question `MonitoredHardwareService.with_status` asks "
+        "to decide whether to call a status measured, so the prober and the "
+        "reporter can never disagree about which rows are probed."
     ),
     "app/domains/dashboard/repository.py::"
     "DashboardFleetRepository.count_agent_managed_routers": (
@@ -353,6 +363,21 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "`location_id`; the query returns MAC addresses. Its caller "
         "reached it through `sync_router`, which the gated "
         "`list_routers_for_sync` no longer dispatches for a controller."
+    ),
+    # -- monitored hardware -------------------------------------------------
+    "app/domains/monitored_hardware/repository.py::"
+    "MonitoredHardwareRepository.router_vendors_for_locations": (
+        "This read IS the vendor question, so it cannot be narrowed by the "
+        "answer to it. It returns `{location_id: {router_id: vendor}}` -- "
+        "vendor strings, never a row, and nothing is dialled, judged or "
+        "configured off the result. `with_status` uses it to tell three "
+        "genuinely different venues apart: one with an agent-managed uplink "
+        "(status is measured), one whose only fleet rows are controllers "
+        "(nothing probes this device, and the row must say so instead of "
+        "letting `unknown` read as 'we looked and never saw it'), and one "
+        "with no fleet row at all (absent from the result entirely). "
+        "`agent_managed_only` here would collapse the last two into each "
+        "other and re-create the exact lie the field was added to remove."
     ),
     # -- network integration ------------------------------------------------
     "app/domains/network_integration/repository.py::"

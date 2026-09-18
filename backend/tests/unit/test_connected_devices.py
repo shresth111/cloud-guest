@@ -190,9 +190,6 @@ class FakeConnectedDeviceRepository:
     async def list_monitored_targets(self) -> list:
         return []
 
-    async def list_routers_with_monitored_hardware(self) -> list[Router]:
-        return []
-
 
 @dataclass
 class FakeRouterLookup:

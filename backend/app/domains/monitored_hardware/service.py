@@ -24,8 +24,14 @@ from app.domains.rbac.location_scope import (
     enforce_entity_location,
 )
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_agent_managed
 
-from .constants import STALE_SIGHTING_AFTER_SECONDS, HardwareStatus
+from .constants import (
+    STALE_SIGHTING_AFTER_SECONDS,
+    HardwareStatus,
+    StatusReason,
+    StatusSource,
+)
 from .events import MonitoredHardwareDeleted, MonitoredHardwareRegistered
 from .exceptions import DuplicateMonitoredHardwareError, MonitoredHardwareNotFoundError
 from .models import MonitoredHardware
@@ -91,6 +97,16 @@ class HardwareWithStatus:
     status: HardwareStatus
     last_seen_at: datetime | None
     connected_at: datetime | None
+    #: Whether anything on this platform measures this device at all, and
+    #: why the status reads as it does. See ``constants.StatusSource`` for
+    #: the full argument; in short, a controller-managed venue has no
+    #: RouterOS session to probe through, so its rows are UNKNOWN forever
+    #: and must say so rather than letting ``unknown`` be read as "we
+    #: looked and never saw it". Defaulted so every existing construction
+    #: of this dataclass -- and every test double -- keeps the pre-existing
+    #: agent-managed meaning without being rewritten.
+    status_source: StatusSource = StatusSource.MEASURED
+    status_reason: StatusReason = StatusReason.LIVENESS_PROBE
 
 
 class MonitoredHardwareService:
@@ -195,16 +211,105 @@ class MonitoredHardwareService:
         )
         return device
 
-    async def with_status(self, device: MonitoredHardware) -> HardwareWithStatus:
+    async def _router_vendors_at(
+        self,
+        location_id: uuid.UUID,
+        cached: dict[uuid.UUID, dict[uuid.UUID, str]] | None,
+    ) -> dict[uuid.UUID, str]:
+        """``{router_id: vendor}`` for one location, from a batch the caller
+        already fetched or from a fresh read for this location alone."""
+        if cached is not None:
+            return cached.get(location_id, {})
+        fetched = await self.repository.router_vendors_for_locations([location_id])
+        return fetched.get(location_id, {})
+
+    async def with_status(
+        self,
+        device: MonitoredHardware,
+        *,
+        router_vendors: dict[uuid.UUID, dict[uuid.UUID, str]] | None = None,
+    ) -> HardwareWithStatus:
+        """This row's derived status, and -- new -- whether it was derived
+        from a measurement at all.
+
+        ## Why the vendor question is asked here
+
+        Every UP/DOWN this method can return traces back to a
+        ``ConnectedDevice`` row, and that row has exactly two writers:
+        ``connected_devices``' DHCP-lease discovery sync and its ICMP/ARP
+        liveness sweep. Both reach the venue by opening a RouterOS API
+        session against the uplink router. A TP-Link Omada controller is a
+        ``Router`` row with NULL credentials and no RouterOS at all
+        (``app.domains.router.vendor_capabilities``), so at a venue whose
+        only fleet row is a controller, neither writer ever runs: there is
+        no ``ConnectedDevice`` row, the status is ``unknown``, and it will be
+        ``unknown`` for as long as the venue exists.
+
+        ``unknown`` on its own is read by the screen -- and by the person
+        reading the screen -- as *we looked and never saw it*. Nothing here
+        ever looked, and the difference matters: the first is a device to go
+        and check, the second is a device this platform simply does not
+        monitor, whose real inventory is the one its controller reports.
+
+        ## The label, deliberately, and not the evidence
+
+        ``is_agent_managed`` (the vendor label) rather than
+        ``is_agent_managed_row`` (label + agent evidence), because this
+        method must agree with what the sweep actually does, and the sweep's
+        target list is narrowed in SQL by
+        ``fleet_scope.agent_managed_only`` -- a label filter, as
+        ``list_routers_for_sync`` has always been. Asking a different
+        question here than the prober asks would reintroduce the exact
+        defect in miniature: a row nothing probes, reported as measured.
+
+        A vendor we cannot resolve reads as agent-managed, matching
+        ``vendor_of``'s own choice that a missing vendor is the column's
+        ``mikrotik`` default. That keeps every agent-managed venue's answer
+        byte-identical to what it was before this field existed, including
+        for a row whose uplink router has since been deleted.
+        """
+        vendors = await self._router_vendors_at(device.location_id, router_vendors)
         connected = await self.repository.get_connected_device_by_mac(
             device.location_id, device.mac_address
         )
         if connected is None:
+            # No sighting. Either a probe path exists and has not produced
+            # one yet (a MikroTik venue's freshly registered row -- the
+            # pre-existing meaning of `unknown`), or the venue has fleet
+            # rows and every one of them is a controller, in which case no
+            # probe path exists and never will.
+            venue_is_probeable = not vendors or any(
+                is_agent_managed(vendor) for vendor in vendors.values()
+            )
             return HardwareWithStatus(
                 device=device,
                 status=HardwareStatus.UNKNOWN,
                 last_seen_at=None,
                 connected_at=None,
+                status_source=(
+                    StatusSource.MEASURED
+                    if venue_is_probeable
+                    else StatusSource.UNMEASURED
+                ),
+                status_reason=(
+                    StatusReason.NEVER_OBSERVED
+                    if venue_is_probeable
+                    else StatusReason.CONTROLLER_MANAGED
+                ),
+            )
+        # A sighting exists -- but a stale one is not a measurement if the
+        # router that would refresh it is a controller. `ConnectedDevice
+        # .router_id` is the router that genuinely observed this MAC, which
+        # is the same row the liveness sweep would dial, so it is the one
+        # whose vendor decides this.
+        if not is_agent_managed(vendors.get(connected.router_id)):
+            return HardwareWithStatus(
+                device=device,
+                status=HardwareStatus.UNKNOWN,
+                last_seen_at=connected.last_seen_at,
+                connected_at=None,
+                status_source=StatusSource.UNMEASURED,
+                status_reason=StatusReason.CONTROLLER_MANAGED,
             )
         # An ``is_active`` row whose last sighting is older than the stale
         # window is not a live device -- it is a row the device-sync sweep
@@ -251,7 +356,15 @@ class MonitoredHardwareService:
             page=page,
             page_size=page_size,
         )
-        return [await self.with_status(d) for d in devices], meta
+        # One vendor read for the whole page rather than one per row: a
+        # page can span several locations (the org-wide call from the
+        # location picker's cross-location summary does exactly that).
+        router_vendors = await self.repository.router_vendors_for_locations(
+            {d.location_id for d in devices}
+        )
+        return [
+            await self.with_status(d, router_vendors=router_vendors) for d in devices
+        ], meta
 
     async def list_all_devices_with_status(
         self, *, organization_id: uuid.UUID
