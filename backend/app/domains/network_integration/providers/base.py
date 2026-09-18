@@ -269,11 +269,12 @@ class ProviderClientCapabilities:
 
 @dataclass(frozen=True, slots=True)
 class ProviderClientRateLimit:
-    """A per-client rate limit, as the controller actually holds it.
+    """A per-client rate limit, as the controller was **told** to hold it.
 
     Returned by set/clear rather than echoing the request, because the two
     can differ: a vendor that expresses limits as a bounded number plus a
-    unit cannot hold every kbps value, so 1500 kbps may be applied as 2 Mbps.
+    unit cannot hold every kbps value, so 1500 kbps may be applied as 1 Mbps
+    (rounded down -- a cap must never exceed what was asked for).
     ``requested_down_kbps``/``requested_up_kbps`` keep what was asked for, the
     ``applied_*`` fields say what the controller was given, and ``clamped``
     says the two differ -- so a console can show the real number rather than
@@ -281,6 +282,16 @@ class ProviderClientRateLimit:
 
     ``None`` on a direction means unlimited in that direction. It is not
     zero and it is not "unknown".
+
+    ``read_back`` is the difference between "we sent this" and "the
+    controller reports this", and it is ``False`` on every Omada path
+    because that controller's Open API exposes a rate-limit write and no
+    matching read (``GET/PATCH .../clients/{mac}`` answers 405; the route
+    that carries ``rateLimit{}`` is the internal v2 tree, which needs an
+    admin session this platform does not hold). This class used to describe
+    itself as what the controller "actually holds", which nothing here ever
+    asked it. While ``read_back`` is ``False`` the ``applied_*`` numbers are
+    the encoded request, and no surface may present them as a measurement.
     """
 
     enabled: bool
@@ -289,6 +300,7 @@ class ProviderClientRateLimit:
     requested_down_kbps: int | None = None
     requested_up_kbps: int | None = None
     clamped: bool = False
+    read_back: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -101,15 +101,22 @@ def encode_rate(rate_kbps: int) -> tuple[int, int, bool]:
     The range 1-1024 applies to the *number*, not to the bandwidth, so the
     unit is chosen to keep the number inside it: anything up to 1024 kbps is
     sent as-is in the Kbps unit, and anything above is converted to Mbps and
-    rounded to the nearest whole Mbps.
+    **rounded down** to a whole Mbps.
 
-    **Rounding is lossy and the caller is told.** 1500 kbps becomes 2 Mbps,
-    which is more than was asked for. That is reported through the third
-    element and through :class:`~..controller_contract.ClientRateLimit`'s
-    own applied values, so a UI can show what the controller was actually
-    given rather than what the operator typed. Silently applying a different
-    number than the one on the screen is the failure mode this exists to
-    avoid.
+    **Down, never up, and that direction is the point.** This used to round
+    to nearest, so 1500 kbps became 2 Mbps -- a 2000 kbps cap for a venue
+    that asked for 1500, a 33% over-grant, reachable from any saved
+    ``QueueProfile`` whose number is not a whole Mbps. A cap that exceeds
+    what was asked for is not a cap: the operator set a ceiling and the
+    guest got more than it. Under-granting is the honest failure of a
+    coarse encoding -- the guest gets no more than was authorized, and the
+    shortfall is reported rather than hidden. So 1500 kbps is applied as
+    1 Mbps and ``was_clamped`` says so.
+
+    The floor is :data:`MIN_LIMIT` in the Kbps unit: a positive request can
+    never encode to "no limit", because 0 is not a value this encoding may
+    send (see :data:`CLEAR_RATE_LIMIT_VALUE`) and "unlimited" is a
+    different call.
 
     ``was_clamped`` is ``True`` whenever the value that goes on the wire is
     not the value that came in -- whether from the 1024 Mbps ceiling, the
@@ -128,7 +135,10 @@ def encode_rate(rate_kbps: int) -> tuple[int, int, bool]:
         return UNIT_KBPS, requested, False
 
     clamped = min(requested, MAX_RATE_KBPS)
-    mbps = round(clamped / KBPS_PER_MBPS)
+    # Floor division, not ``round``: see the docstring. Anything between
+    # 1025 and 1999 kbps lands on 1 Mbps, which is below what was asked and
+    # never above it.
+    mbps = clamped // KBPS_PER_MBPS
     limit = max(MIN_LIMIT, min(MAX_LIMIT, mbps))
     effective_kbps = limit * KBPS_PER_MBPS
     return UNIT_MBPS, limit, effective_kbps != requested
@@ -193,6 +203,9 @@ def build_rate_limit_body(
         down_kbps=applied_down,
         up_kbps=applied_up,
         clamped=clamped,
+        # Computed from the arguments, not read off the controller. The Open
+        # API has no rate-limit read for a client; see ``ClientRateLimit``.
+        read_back=False,
     )
 
 
@@ -315,7 +328,19 @@ async def clear_client_rate_limit(
         ),
         json=_ratelimit_request(dict(CLEAR_RATE_LIMIT_BODY)),
     )
-    return ClientRateLimit(enabled=False, down_kbps=None, up_kbps=None, clamped=False)
+    return ClientRateLimit(
+        enabled=False,
+        down_kbps=None,
+        up_kbps=None,
+        clamped=False,
+        # Not read back -- and here the gap is wider than a number. The
+        # controller keeps ``rateLimit.enable: true`` after this call (see
+        # above), so even a re-read would not agree with ``enabled=False``;
+        # what this reports is the *effect* (nothing is throttled), which is
+        # a conclusion drawn from the measured behaviour of this endpoint,
+        # not a field anybody fetched.
+        read_back=False,
+    )
 
 
 async def block_client(
