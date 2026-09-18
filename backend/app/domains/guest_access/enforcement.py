@@ -653,7 +653,26 @@ class LiveSessionTerminator:
             # The controller's disconnect either succeeded or raised -- there
             # is no partial outcome to report, and `disconnect_client_at_
             # location` raises on a controller failure rather than returning
-            # a quiet False. So reaching this line means the session ended.
+            # a quiet False.
+            #
+            # KNOWN GAP, and it is the reason this comment is longer than the
+            # code. The gateway's `omada.deauth.deauthorize_client` returns
+            # True for "the MAC is not authorized afterwards -- INCLUDING the
+            # case where it never was", so `removed=1` here is a claim the
+            # vendor boolean does not actually support: a MAC that held no
+            # valid authorization is indistinguishable, at this layer, from
+            # one whose authorization we just ended. `issue_live_disconnect`
+            # consequently still records `disconnect_enforced = true` for a
+            # controller call that removed nothing, which is the same
+            # unearned `true` this change removes from the RouterOS branch.
+            # Closing it means carrying the count `find_valid_authorizations`
+            # already computes out through `deauthorize_guest`'s bool, in the
+            # gateway, the controller contract, `NetworkProvider`, the Omada
+            # provider and `client_hooks.terminate` -- and the bool must keep
+            # reading truthy for the nothing-to-do case or `BlocklistEnforcer`
+            # stops being idempotent for an offline guest. That is its own
+            # change with its own blast radius, deliberately not smuggled in
+            # here.
             still_active=0,
         )
 

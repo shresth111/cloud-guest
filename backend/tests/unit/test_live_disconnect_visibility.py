@@ -67,8 +67,17 @@ class _Terminator:
     ``issue_live_disconnect``'s job, which is what makes it worth asserting
     both halves separately."""
 
-    def __init__(self, *, fail: Exception | None = None):
+    _DEFAULT = object()
+
+    def __init__(self, *, fail: Exception | None = None, outcome=_DEFAULT):
         self._fail = fail
+        #  Defaults to the real shape a confirmed removal has, so every test
+        #  written before the outcome mattered keeps meaning what it meant.
+        self._outcome = (
+            SimpleNamespace(matched=1, removed=1, still_active=0)
+            if outcome is self._DEFAULT
+            else outcome
+        )
         self.calls: list[dict] = []
 
     async def end_on_router(self, *, session, identifier, organization_id=None):
@@ -81,7 +90,7 @@ class _Terminator:
         )
         if self._fail is not None:
             raise self._fail
-        return SimpleNamespace(removed=1, still_active=0)
+        return self._outcome
 
 
 def _session():
@@ -291,8 +300,13 @@ class _TerminatorWithRelease(_Terminator):
     """A terminator that also knows how to release the venue's speed limit,
     which is what the real one does at a controller-managed venue."""
 
-    def __init__(self, *, fail: Exception | None = None):
-        super().__init__(fail=fail)
+    #  Forwards rather than re-declaring its base's keywords, so a release
+    #  test can also pin an outcome as ``_Terminator`` grows knobs. Every
+    #  test below drives the ``already_ended_on_device`` branch, where
+    #  ``end_on_router`` is never reached at all -- the default outcome is
+    #  simply never consulted.
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.released: list[dict] = []
 
     async def release_rate_limit(self, *, session, organization_id=None):
@@ -372,3 +386,185 @@ async def test_a_terminator_without_a_release_is_not_a_failure():
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# a call that removed nothing is not an enforcement
+# ---------------------------------------------------------------------------
+#
+# The adapter contract is explicit that ending sessions for a guest who has
+# none "matches nothing, removes nothing, and raises nothing" -- that is what
+# makes blocking idempotent. ``issue_live_disconnect`` used to infer
+# enforcement from the absence of an exception, so every one of those wrote
+# ``disconnect_enforced = true``: the platform claiming it took a guest off
+# the WiFi by a call that took nobody off anything. The column means "did we",
+# and the honest answer there is the same NULL an ``already_ended_on_device``
+# stop already writes.
+
+
+@pytest.mark.asyncio
+async def test_a_device_call_that_removed_nothing_is_left_null(caplog):
+    """The regression test. No exception, and no removal either."""
+    session = _session()
+    terminator = _Terminator(outcome=SimpleNamespace(matched=0, removed=0,
+                                                     still_active=0))
+    repo = _Repo(guest=SimpleNamespace(identifier="g@example.com"))
+
+    with caplog.at_level(logging.WARNING):
+        result = await issue_live_disconnect(
+            repo, session=session, terminator=terminator
+        )
+
+    #  The call still happened -- this is not a short-circuit.
+    assert len(terminator.calls) == 1
+    assert result is None
+    assert repo.updates == []
+    assert session.disconnect_enforced is None
+    record = next(
+        r
+        for r in caplog.records
+        if r.message == "guest_live_disconnect_nothing_removed"
+    )
+    assert record.levelno == logging.WARNING
+    assert record.enforcement_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_removing_nothing_is_recorded_exactly_like_a_nas_reported_stop():
+    """Both are "the device had no live session and we ended nothing". They
+    must not be recorded two different ways -- the deliberate NULL of the
+    ``already_ended_on_device`` branch is the precedent this follows."""
+    nas_reported, removed_nothing = _session(), _session()
+    repo = _Repo(guest=SimpleNamespace(identifier="g@example.com"))
+
+    await issue_live_disconnect(
+        repo,
+        session=nas_reported,
+        terminator=_Terminator(),
+        already_ended_on_device=True,
+    )
+    await issue_live_disconnect(
+        repo,
+        session=removed_nothing,
+        terminator=_Terminator(
+            outcome=SimpleNamespace(matched=0, removed=0, still_active=0)
+        ),
+    )
+
+    assert nas_reported.disconnect_enforced is None
+    assert removed_nothing.disconnect_enforced is None
+    assert repo.updates == []
+
+
+@pytest.mark.asyncio
+async def test_rows_removed_but_the_guest_still_on_the_device_is_not_enforcement():
+    """``still_active`` beats ``removed``: rows can go and the guest remain,
+    which is the entire reason ``SessionEndOutcome`` takes a second read of
+    the active table after the removals."""
+    session = _session()
+    terminator = _Terminator(
+        outcome=SimpleNamespace(matched=1, removed=1, still_active=1)
+    )
+    repo = _Repo(guest=SimpleNamespace(identifier="g@example.com"))
+
+    assert (
+        await issue_live_disconnect(repo, session=session, terminator=terminator)
+        is None
+    )
+    assert session.disconnect_enforced is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [None, True, "ok", SimpleNamespace()])
+async def test_a_terminator_that_reports_no_counters_is_not_believed(answer):
+    """``LiveSessionTerminatorProtocol.end_on_router`` is typed ``-> object``.
+    A hook that returns something without the counters has not shown us a
+    removal, and this column may not be filled in from an absence of
+    contradiction."""
+    session = _session()
+    terminator = _Terminator(outcome=answer)
+    repo = _Repo(guest=SimpleNamespace(identifier="g@example.com"))
+
+    assert (
+        await issue_live_disconnect(repo, session=session, terminator=terminator)
+        is None
+    )
+    assert session.disconnect_enforced is None
+
+
+# ---------------------------------------------------------------------------
+# ...proven against the real terminator, wired the way the app wires it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_real_terminator_on_a_mikrotik_with_nobody_online_writes_null():
+    """A ``SimpleNamespace`` can be made to say anything. This constructs the
+    actual ``LiveSessionTerminator`` the sweeps build -- real
+    ``SessionEndOutcome``, real MikroTik branch, real ``end_on_router`` --
+    against an adapter returning precisely the idempotent no-op its own
+    contract documents, and asserts the row is left NULL.
+
+    It is also the MikroTik non-regression test for the rest of that path:
+    the adapter is still asked, with the guest's identifier and the session's
+    MAC, and ``ended_cleanly`` still keeps it from raising."""
+    from app.domains.guest_access.device_adapters import (
+        SessionControlSnapshot,
+        SessionEndOutcome,
+    )
+    from app.domains.guest_access.enforcement import LiveSessionTerminator
+
+    asked: list[dict] = []
+
+    class _Adapter:
+        vendor = "mikrotik"
+
+        async def end_sessions(self, credentials, *, mac_address, username):
+            asked.append({"mac_address": mac_address, "username": username})
+            #  "a guest with no live session matches nothing, removes
+            #  nothing, and raises nothing" -- BaseGuestAccessAdapter.
+            return SessionEndOutcome(
+                control=SessionControlSnapshot(
+                    hotspot_servers=1, coa_accept=False, coa_port=None
+                ),
+                matched=0,
+                removed=0,
+                still_active=0,
+            )
+
+    class _RouterLookup:
+        async def get_router(self, router_id, *, requesting_organization_id=None):
+            return SimpleNamespace(
+                id=router_id,
+                vendor="mikrotik",
+                management_ip_address="10.5.50.1",
+                public_ip_address=None,
+                api_username="admin",
+            )
+
+        def get_decrypted_api_secret(self, router):
+            return "s3cret"
+
+    class _DeviceLookup:
+        async def get_device_by_id(self, device_id):
+            return SimpleNamespace(mac_address="AA:BB:CC:DD:EE:FF")
+
+    session = _session()
+    session.device_id = uuid.uuid4()
+    terminator = LiveSessionTerminator(
+        router_lookup=_RouterLookup(),
+        device_lookup=_DeviceLookup(),
+        adapter_factory=lambda vendor: _Adapter(),
+    )
+    repo = _Repo(guest=SimpleNamespace(identifier="+919315074877"))
+
+    result = await issue_live_disconnect(
+        repo, session=session, terminator=terminator
+    )
+
+    assert asked == [
+        {"mac_address": "AA:BB:CC:DD:EE:FF", "username": "+919315074877"}
+    ]
+    assert result is None
+    assert repo.updates == []
+    assert session.disconnect_enforced is None
