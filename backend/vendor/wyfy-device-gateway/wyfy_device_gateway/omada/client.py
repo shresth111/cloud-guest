@@ -80,6 +80,7 @@ from .auth import (
 from .errors import (
     OmadaAuthError,
     OmadaAuthorizationError,
+    OmadaClientNotFoundError,
     OmadaConnectionError,
     OmadaInvalidControllerError,
     OmadaPermissionDeniedError,
@@ -707,6 +708,7 @@ class OmadaHttpClient:
         """
         from .errors import OmadaError  # local import: avoids a cycle at import time
         from .types import (
+            CLIENT_NOT_FOUND_ERROR_CODES,
             OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND,
             OPENAPI_ERROR_OPERATION_UNSUPPORTED,
             PERMISSION_DENIED_ERROR_CODES,
@@ -741,6 +743,14 @@ class OmadaHttpClient:
             )
         if code == OPENAPI_ERROR_OPERATION_UNSUPPORTED:
             return OmadaUnsupportedApiError(provider_code=code)
+        if code in CLIENT_NOT_FOUND_ERROR_CODES:
+            # The controller answered and said it has no record of that MAC
+            # on this site. Distinct from a transport failure, and distinct
+            # from a refusal: there is nothing to act on, which is exactly
+            # what ``OmadaClientNotFoundError`` means. See
+            # ``types.CLIENT_NOT_FOUND_ERROR_CODES`` for the three measured
+            # codes and why they are three.
+            return OmadaClientNotFoundError(provider_code=code)
         if code in PERMISSION_DENIED_ERROR_CODES:
             # The controller answered and named the problem: this credential
             # may not do that. Without this branch it fell through to the

@@ -288,6 +288,27 @@ class ControllerClient:
 
 
 @dataclass(frozen=True, slots=True)
+class ClientRateLimit:
+    """A per-client rate limit as this platform means it, in kbps.
+
+    Returned by a set/clear call rather than echoed from the request, because
+    the two are not always the same number: Omada expresses a limit as a unit
+    (Kbps or Mbps) plus a value the spec bounds at 1-1024, so a request for
+    1500 kbps is applied as 2 Mbps. ``down_kbps``/``up_kbps`` are what the
+    controller was actually given, converted back, and ``clamped`` says
+    whether that differs from what was asked for.
+
+    ``None`` on a direction means that direction is unlimited -- not zero, and
+    not unknown. ``enabled`` is ``False`` when no limit is in force at all.
+    """
+
+    enabled: bool
+    down_kbps: int | None = None
+    up_kbps: int | None = None
+    clamped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class PortalAuthContext:
     """Exactly the values Omada itself put on the portal redirect.
 
@@ -538,9 +559,64 @@ class ControllerAdapter(Protocol):
         """
         ...
 
+    # -- per-client control -----------------------------------------------
+
+    async def set_client_rate_limit(
+        self,
+        creds: ControllerCredentials,
+        site_id: str,
+        client_mac: str,
+        *,
+        down_kbps: int | None = None,
+        up_kbps: int | None = None,
+    ) -> ClientRateLimit:
+        """Apply a per-client rate limit at runtime, and report what was
+        actually applied.
+
+        Distinct from ``authorize_guest``'s ``down_kbps``/``up_kbps``, which
+        ride on the authorization body and are therefore fixed for the life
+        of that grant. This one is a standalone write against the client
+        record: it can be changed or removed at any time, on a client that is
+        already online -- or on one that is offline.
+
+        A controller that cannot do this for the given credentials must raise
+        ``OmadaUnsupportedApiError``, never return an unlimited result. The
+        caller has to be able to tell "the limit is off" from "this venue
+        cannot have limits", because only the second one changes what it may
+        truthfully show an operator.
+        """
+        ...
+
+    async def clear_client_rate_limit(
+        self, creds: ControllerCredentials, site_id: str, client_mac: str
+    ) -> ClientRateLimit:
+        """Remove a per-client rate limit. Idempotent."""
+        ...
+
+    async def block_client(
+        self, creds: ControllerCredentials, site_id: str, client_mac: str
+    ) -> bool:
+        """Deny one MAC on one site until an operator clears it.
+
+        Per-site and per-MAC, and the flag lives on the known-client record
+        rather than on a live association -- so it survives a reconnect, and
+        an offline MAC can be blocked. It is also only as durable as the MAC:
+        a phone that randomizes per SSID gets a new one by forgetting the
+        network. Callers must describe it as a nuisance control, not as
+        enforcement.
+        """
+        ...
+
+    async def unblock_client(
+        self, creds: ControllerCredentials, site_id: str, client_mac: str
+    ) -> bool:
+        """Clear a block. Idempotent."""
+        ...
+
 
 __all__ = [
     "AuthorizationResult",
+    "ClientRateLimit",
     "ControllerAdapter",
     "ControllerAuthMode",
     "ControllerClient",

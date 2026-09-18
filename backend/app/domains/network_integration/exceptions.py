@@ -56,6 +56,8 @@ __all__ = [
     "GuestSsidNotFoundError",
     "NetworkIntegrationAlreadyExistsError",
     "NetworkIntegrationCredentialsRequiredError",
+    "ClientActionUnavailableError",
+    "LocationHasNoControllerError",
     "NetworkIntegrationDeauthorizationUnsupportedError",
     "NetworkIntegrationDisabledError",
     "NetworkIntegrationEncryptionKeyNotConfiguredError",
@@ -505,6 +507,66 @@ class NetworkIntegrationInventoryRequiresOpenApiError(NetworkIntegrationError):
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             code=ErrorCode.API_UNSUPPORTED,
             data={"capability": capability, "requires_auth_mode": "openapi"},
+        )
+
+
+class LocationHasNoControllerError(NetworkIntegrationError):
+    """A client-management action named a location with no live Omada
+    integration behind it -- **or a location that is not the caller's**.
+
+    One error for both, on purpose, and it is the whole tenancy story of the
+    customer-facing client routes. The integration is resolved by a query that
+    carries the caller's organization *and* the location id in its WHERE
+    clause (``repository.get_omada_integration_for_location``), so a location
+    belonging to another tenant produces no row -- indistinguishable, here and
+    in the response, from a location of the caller's own that simply has no
+    controller. There is no second code path in which a cross-tenant id is
+    read and then refused, which is precisely the defect class this codebase
+    has found fourteen times: the permission check reads the organization from
+    the header while the handler reads the id from the path.
+
+    The message therefore says nothing that would let a caller probe for
+    another tenant's locations. It names no organization, no controller and no
+    device, and it reads identically whichever of the two situations produced
+    it.
+
+    404, and the same 404 either way.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This location has no network controller connected, so there is "
+            "nothing here to manage devices on.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            code=ErrorCode.NOT_FOUND,
+        )
+
+
+class ClientActionUnavailableError(NetworkIntegrationError):
+    """The venue's controller cannot perform this client action.
+
+    Raised from the capability declaration
+    (``providers.base.ProviderClientCapabilities``) **before** any call goes
+    out, so a venue whose controller is connected with a hotspot operator
+    login is told what would be needed rather than shown a failure that looks
+    like a network problem.
+
+    ``reason`` comes from the provider and is written for the person looking
+    at the disabled control. It is carried in ``data`` as well as in the
+    message so a console can render it beside the control without parsing
+    prose.
+
+    501, matching ``NetworkIntegrationInventoryRequiresOpenApiError``: the
+    request is well-formed and the credentials are correct; the capability is
+    not available for this credential type.
+    """
+
+    def __init__(self, action: str, reason: str) -> None:
+        super().__init__(
+            reason,
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            code=ErrorCode.API_UNSUPPORTED,
+            data={"action": action, "reason": reason},
         )
 
 

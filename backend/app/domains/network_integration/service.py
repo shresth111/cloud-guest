@@ -134,6 +134,7 @@ from .crypto import (
 )
 from .crypto import decrypt_credentials as _decrypt_credentials
 from .exceptions import (
+    ClientActionUnavailableError,
     ControllerSetupPreconditionsError,
     ControllerSiteSharedError,
     CrossLocationNetworkIntegrationAccessError,
@@ -143,6 +144,7 @@ from .exceptions import (
     GuestSsidAmbiguousError,
     GuestSsidInUseError,
     GuestSsidNotFoundError,
+    LocationHasNoControllerError,
     NetworkIntegrationAlreadyExistsError,
     NetworkIntegrationCredentialsRequiredError,
     NetworkIntegrationDeauthorizationUnsupportedError,
@@ -170,6 +172,8 @@ from .providers.base import (
     NetworkProvider,
     ProviderAuthorizationResult,
     ProviderClient,
+    ProviderClientCapabilities,
+    ProviderClientRateLimit,
     ProviderConnectionConfig,
     ProviderControllerInfo,
     ProviderControllerSetupBlock,
@@ -692,6 +696,25 @@ def build_portal_authorize_diagnostics(
 # ============================================================================
 # Service
 # ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class ClientActionResult:
+    """What one client-management action actually achieved.
+
+    ``performed`` is the controller's own answer, never an assumption. A
+    caller rendering "Blocked" must read it.
+
+    ``rate_limit`` is present only for the speed actions and carries what the
+    controller was *given*, which is not always what was asked for: a vendor
+    that expresses limits as a bounded number plus a unit cannot hold every
+    kbps value. A console must show the applied figure, not the typed one.
+    """
+
+    action: str
+    performed: bool
+    client_mac: str
+    rate_limit: ProviderClientRateLimit | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -4630,6 +4653,398 @@ class NetworkIntegrationService:
             )
         )
         return event_context
+
+    # =====================================================================
+    # Customer-facing per-client management
+    # =====================================================================
+    #
+    # Everything in this block is reached by *location*, never by integration
+    # id, and that is the tenancy design rather than a convenience. See
+    # ``_resolve_location_controller``.
+
+    async def _resolve_location_controller(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> tuple[NetworkIntegration, NetworkProvider, ProviderConnectionConfig]:
+        """The one chokepoint every customer-facing client action goes
+        through, and the reason none of them can leak across tenants.
+
+        **The caller supplies a location id and a MAC. Nothing else.** No
+        integration id, no site id, no controller address. The integration is
+        resolved by a query carrying the caller's own organization *and* the
+        location (``repository.get_omada_integration_for_location``), and the
+        controller site the action is then performed against comes from that
+        row -- so a MAC belonging to another tenant's guest is simply a string
+        this venue's controller has never heard of, and a location id
+        belonging to another tenant resolves to nothing at all.
+
+        That is a structural property, not a check that a future handler
+        could forget: there is no parameter on any of these methods through
+        which a caller could name another tenant's controller. It is the
+        deliberate opposite of the defect class this codebase has now found in
+        fourteen endpoints, where the permission dependency reads the
+        organization from the request header while the handler reads the id
+        from the path and the two are never compared.
+
+        A missing row and a row belonging to somebody else raise the same
+        :class:`~.exceptions.LocationHasNoControllerError`, with the same
+        message, so the response cannot be used to probe for another tenant's
+        locations.
+        """
+        integration = (
+            await self.repository.get_omada_integration_for_location(
+                location_id=location_id, organization_id=organization_id
+            )
+            if organization_id is not None
+            else None
+        )
+        if integration is None:
+            raise LocationHasNoControllerError()
+        # Belt and braces. The organization is already in the query above, so
+        # this cannot fire on the org axis -- it is here for the *location*
+        # confinement a location-scoped staff user carries, which the query
+        # does not express.
+        self._enforce_tenant_scope(integration, organization_id)
+        if not integration.external_site_id:
+            raise NetworkIntegrationSiteNotSelectedError()
+        provider_impl = self._provider(integration.provider)
+        config = self._connection_config(
+            integration, self._credentials_for(integration)
+        )
+        return integration, provider_impl, config
+
+    async def get_client_capabilities(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> dict[str, dict[str, object]]:
+        """What this venue's controller can do to one of its clients.
+
+        Contacts nothing: the answer is computed from the integration's own
+        auth mode. It exists so a console can render an honestly disabled
+        control with the reason beside it, rather than an enabled one that
+        fails when somebody clicks it.
+        """
+        _, provider_impl, config = await self._resolve_location_controller(
+            location_id=location_id, organization_id=organization_id
+        )
+        capabilities = provider_impl.client_capabilities(config)
+        return {
+            name: {
+                "supported": capability.supported,
+                "reason": capability.reason,
+            }
+            for name, capability in (
+                ("set_rate_limit", capabilities.set_rate_limit),
+                ("clear_rate_limit", capabilities.clear_rate_limit),
+                ("block", capabilities.block),
+                ("unblock", capabilities.unblock),
+                ("list_blocked", capabilities.list_blocked),
+                ("disconnect", capabilities.disconnect),
+                ("client_stats", capabilities.client_stats),
+            )
+        }
+
+    @staticmethod
+    def _require_capability(
+        capabilities: ProviderClientCapabilities, action: str
+    ) -> None:
+        """Refuse before the call, with the provider's own reason.
+
+        Asked *before* anything goes to the controller so that a venue whose
+        credentials cannot do this gets a sentence naming what would be
+        needed, instead of a controller error that reads like a network
+        fault.
+        """
+        capability = getattr(capabilities, action)
+        if not capability.supported:
+            raise ClientActionUnavailableError(
+                action, capability.reason or "This action is not available here."
+            )
+
+    async def _client_action(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        action: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> tuple[NetworkIntegration, NetworkProvider, ProviderConnectionConfig, str]:
+        """Resolve, gate on the declared capability, normalize the MAC."""
+        integration, provider_impl, config = await self._resolve_location_controller(
+            location_id=location_id, organization_id=organization_id
+        )
+        self._require_capability(provider_impl.client_capabilities(config), action)
+        try:
+            normalized = normalize_client_mac(client_mac)
+        except ValueError as exc:
+            raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
+        logger.info(
+            "network_integration_client_action_requested",
+            extra={
+                "integration_id": str(integration.id),
+                "action": action,
+                "actor_user_id": str(actor_user_id) if actor_user_id else None,
+            },
+        )
+        return integration, provider_impl, config, normalized
+
+    async def _record_client_action(
+        self,
+        integration: NetworkIntegration,
+        *,
+        action: str,
+        client_mac: str,
+        error: ProviderError | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Append the attempt to the integration's own operational feed.
+
+        Both outcomes, deliberately. A silent success is exactly what the
+        brief for this work forbids: an operator who sets a speed limit and
+        sees a green tick has no other way to learn that the controller
+        refused it. The MAC is written through the same ``redact_context``
+        path every other event uses.
+        """
+        if error is None:
+            await self._record_event(
+                integration,
+                event_type=IntegrationEventType.CLIENT_MANAGED,
+                status=IntegrationEventStatus.OK,
+                message=f"Client {action} succeeded",
+                context={"action": action, "client_mac": client_mac, **(context or {})},
+            )
+            return
+        await self._record_failure(
+            integration,
+            error,
+            event_type=IntegrationEventType.CLIENT_MANAGED,
+            during_sync=False,
+        )
+
+    async def block_client(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> ClientActionResult:
+        """Block one device on this venue's controller.
+
+        **This is the device-side half only.** It is not this platform's
+        blocklist: ``guest_access``'s ``BLOCKLIST`` rules and
+        ``guests.is_blocked`` are vendor-neutral, are consulted at every
+        login and by the RADIUS authorize path, and are what actually refuses
+        a returning guest. This call stops the device associating; the
+        platform rule stops the person signing in. An operator generally
+        wants both, and the console should say so.
+
+        Two things this must never be described as doing. It is **not**
+        durable against a phone that randomizes its MAC per SSID -- the flag
+        is keyed on the MAC, and forgetting the network produces a new one.
+        And what it does to a guest holding a live portal authorization right
+        now is **unmeasured**: the authorization record and the block flag are
+        separate objects with separate lifecycles, so the expectation is that
+        the grant survives while the device can no longer associate, but
+        nobody has watched it happen.
+        """
+        integration, provider_impl, config, mac = await self._client_action(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+            action="block",
+            actor_user_id=actor_user_id,
+        )
+        try:
+            performed = await provider_impl.block_client(
+                config, str(integration.external_site_id), mac
+            )
+        except ProviderError as error:
+            await self._record_client_action(
+                integration, action="block", client_mac=mac, error=error
+            )
+            raise
+        await self._record_client_action(integration, action="block", client_mac=mac)
+        return ClientActionResult(
+            action="block", performed=bool(performed), client_mac=mac
+        )
+
+    async def unblock_client(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> ClientActionResult:
+        """Clear a controller-side block. Idempotent on the controller."""
+        integration, provider_impl, config, mac = await self._client_action(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+            action="unblock",
+            actor_user_id=actor_user_id,
+        )
+        try:
+            performed = await provider_impl.unblock_client(
+                config, str(integration.external_site_id), mac
+            )
+        except ProviderError as error:
+            await self._record_client_action(
+                integration, action="unblock", client_mac=mac, error=error
+            )
+            raise
+        await self._record_client_action(integration, action="unblock", client_mac=mac)
+        return ClientActionResult(
+            action="unblock", performed=bool(performed), client_mac=mac
+        )
+
+    async def set_client_speed(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        down_kbps: int | None,
+        up_kbps: int | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> ClientActionResult:
+        """Throttle one device, at runtime, on this venue's controller.
+
+        Rates are kbps -- ``queue_management.QueueProfile``'s own vocabulary,
+        so a speed profile's numbers pass through unchanged -- and ``0`` or
+        ``None`` on a direction means "do not limit that direction".
+
+        **This is not a RADIUS reply attribute and cannot be one.** The
+        controller honours no bandwidth attribute of any vendor: its own API
+        specification contains no occurrence of WISPr, of vendor 11863, of
+        ``Bandwidth-Max`` or of any sibling of the VLAN assignment toggle that
+        is the single reply-attribute behaviour it does expose. So the
+        ``Mikrotik-Rate-Limit`` this platform returns for RouterOS venues is
+        simply ignored here, and bandwidth arrives as this separate
+        control-plane call after authentication instead. The two vendors
+        genuinely cannot share code at the "put the limit in the
+        Access-Accept" layer, and a console must not imply that they do.
+
+        **And the enforcement claim is bounded.** What has been measured is
+        that the controller accepts the limit, stores it and reads it back.
+        Nobody has measured a client's throughput before and after. Until that
+        test exists this is a control-plane claim, and the applied figure in
+        the result is what the controller holds, not what an access point was
+        observed to deliver.
+        """
+        integration, provider_impl, config, mac = await self._client_action(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+            action="set_rate_limit",
+            actor_user_id=actor_user_id,
+        )
+        try:
+            applied = await provider_impl.set_client_rate_limit(
+                config,
+                str(integration.external_site_id),
+                mac,
+                down_kbps=down_kbps,
+                up_kbps=up_kbps,
+            )
+        except ProviderError as error:
+            await self._record_client_action(
+                integration, action="set_rate_limit", client_mac=mac, error=error
+            )
+            raise
+        await self._record_client_action(
+            integration,
+            action="set_rate_limit",
+            client_mac=mac,
+            context={
+                "requested_down_kbps": down_kbps,
+                "requested_up_kbps": up_kbps,
+                "applied_down_kbps": applied.applied_down_kbps,
+                "applied_up_kbps": applied.applied_up_kbps,
+                "clamped": applied.clamped,
+            },
+        )
+        return ClientActionResult(
+            action="set_rate_limit",
+            performed=True,
+            client_mac=mac,
+            rate_limit=applied,
+        )
+
+    async def clear_client_speed(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> ClientActionResult:
+        """Remove a per-device speed limit. Idempotent on the controller."""
+        integration, provider_impl, config, mac = await self._client_action(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+            action="clear_rate_limit",
+            actor_user_id=actor_user_id,
+        )
+        try:
+            applied = await provider_impl.clear_client_rate_limit(
+                config, str(integration.external_site_id), mac
+            )
+        except ProviderError as error:
+            await self._record_client_action(
+                integration, action="clear_rate_limit", client_mac=mac, error=error
+            )
+            raise
+        await self._record_client_action(
+            integration, action="clear_rate_limit", client_mac=mac
+        )
+        return ClientActionResult(
+            action="clear_rate_limit",
+            performed=True,
+            client_mac=mac,
+            rate_limit=applied,
+        )
+
+    async def disconnect_client_at_location(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        actor_user_id: uuid.UUID | None,
+        reason: str | None = None,
+    ) -> GuestDisconnectOutcome:
+        """The venue-admin route into the disconnect that already ships.
+
+        Deliberately a thin adapter over :meth:`disconnect_guest` rather than
+        a second implementation: the controller call, the authorization-row
+        bookkeeping and the guest-session ending are all one story and having
+        two of them is how they drift. All this adds is the location-scoped,
+        organization-in-the-query resolution the customer surface needs --
+        :meth:`disconnect_guest` itself is reached by integration id, which is
+        right for the Master console and wrong here.
+
+        What it achieves is unchanged and is less than "kick them off for
+        good": it ends the controller-side authorization, which is what stops
+        the device forwarding now, and the platform session is ended so the
+        next portal hit does not silently re-admit them. It does not prevent
+        the guest signing in again with a fresh OTP. Blocking is the separate
+        action for that.
+        """
+        integration, provider_impl, config = await self._resolve_location_controller(
+            location_id=location_id, organization_id=organization_id
+        )
+        self._require_capability(
+            provider_impl.client_capabilities(config), "disconnect"
+        )
+        return await self.disconnect_guest(
+            integration.id,
+            client_mac=client_mac,
+            reason=reason,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=organization_id,
+        )
 
     async def disconnect_guest(
         self,

@@ -607,6 +607,12 @@ class IntegrationEventType(StrEnum):
     SYNC = "sync"
     PORTAL_AUTHORIZE = "portal_authorize"
     PORTAL_DEAUTHORIZE = "portal_deauthorize"
+    # One row per per-client action a venue admin took: block, unblock,
+    # speed set, speed cleared. Its own member rather than reusing
+    # PORTAL_DEAUTHORIZE, which names a different thing: a speed limit is
+    # not a deauthorization, and a feed that called it one would mislead
+    # whoever reads the venue's timeline to work out what happened.
+    CLIENT_MANAGED = "client_managed"
     # One row per real (non-dry) "Configure controller automatically" run,
     # carrying the per-step report. A dry run writes nothing, this included.
     CONTROLLER_CONFIGURED = "controller_configured"

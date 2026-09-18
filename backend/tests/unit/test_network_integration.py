@@ -324,6 +324,30 @@ class FakeRepository:
             return None
         return integration
 
+    async def get_omada_integration_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None:
+        """Both filters in the "query", exactly as the real one does.
+
+        The organization is matched here, not checked by the caller
+        afterwards, because that is the property the customer-facing client
+        routes depend on: another tenant's location must resolve to nothing
+        rather than to a row somebody later declines to use. A fake that
+        matched on location alone would make every tenancy test pass while
+        the real isolation went untested.
+        """
+        for integration in self.integrations.values():
+            if integration.is_deleted or not integration.is_enabled:
+                continue
+            if integration.provider != NetworkProviderKind.OMADA.value:
+                continue
+            if integration.organization_id != organization_id:
+                continue
+            if getattr(integration, "location_id", None) != location_id:
+                continue
+            return integration
+        return None
+
     async def update_integration(
         self, integration: NetworkIntegration, data: dict[str, object]
     ) -> NetworkIntegration:
@@ -500,6 +524,11 @@ class FakeProvider:
     # vendor it is not allowed to know.
     fleet_device_vendor: str = "tplink_omada"
     raise_on: dict[str, Exception] = field(default_factory=dict)
+    #: (method, site_id, client_mac) per per-client write. Separate from
+    #: calls because these tests assert on the *arguments* -- above all
+    #: that the site id came from the resolved integration and not from the
+    #: caller -- which a list of method names cannot show.
+    client_actions: list[tuple[str, str, str]] = field(default_factory=list)
     calls: list[str] = field(default_factory=list)
     authorize_result: ProviderAuthorizationResult | None = None
     clients: list[ProviderClient] = field(default_factory=list)
@@ -633,6 +662,79 @@ class FakeProvider:
     async def deauthorize_guest(self, config, site_id, client_mac) -> bool:
         self._maybe_raise("deauthorize_guest")
         return True
+
+    # -- per-client management (Protocol members since client management
+    # landed). The capability answer mirrors the real provider's: it is a
+    # function of ``config.auth_mode``, so a legacy-mode config gets the same
+    # refusal here that it would from a real controller.
+
+    def client_capabilities(self, config):
+        from app.domains.network_integration.constants import ControllerAuthMode
+        from app.domains.network_integration.providers.base import (
+            ProviderCapability,
+            ProviderClientCapabilities,
+        )
+
+        openapi = config.auth_mode == ControllerAuthMode.OPENAPI.value
+        available = ProviderCapability(supported=True)
+        refused = ProviderCapability(
+            supported=False, reason="Needs Open API credentials."
+        )
+        gated = available if openapi else refused
+        return ProviderClientCapabilities(
+            set_rate_limit=gated,
+            clear_rate_limit=gated,
+            block=gated,
+            unblock=gated,
+            list_blocked=ProviderCapability(
+                supported=False, reason="No blocked-client list on this surface."
+            ),
+            disconnect=available,
+            client_stats=gated,
+        )
+
+    async def set_client_rate_limit(
+        self, config, site_id, client_mac, *, down_kbps=None, up_kbps=None
+    ):
+        from app.domains.network_integration.providers.base import (
+            ProviderClientRateLimit,
+        )
+
+        self._maybe_raise("set_client_rate_limit")
+        self.client_actions.append(("set_client_rate_limit", site_id, client_mac))
+        return ProviderClientRateLimit(
+            enabled=True,
+            applied_down_kbps=down_kbps,
+            applied_up_kbps=up_kbps,
+            requested_down_kbps=down_kbps,
+            requested_up_kbps=up_kbps,
+        )
+
+    async def clear_client_rate_limit(self, config, site_id, client_mac):
+        from app.domains.network_integration.providers.base import (
+            ProviderClientRateLimit,
+        )
+
+        self._maybe_raise("clear_client_rate_limit")
+        self.client_actions.append(("clear_client_rate_limit", site_id, client_mac))
+        return ProviderClientRateLimit(enabled=False)
+
+    async def block_client(self, config, site_id, client_mac) -> bool:
+        self._maybe_raise("block_client")
+        self.client_actions.append(("block_client", site_id, client_mac))
+        return True
+
+    async def unblock_client(self, config, site_id, client_mac) -> bool:
+        self._maybe_raise("unblock_client")
+        self.client_actions.append(("unblock_client", site_id, client_mac))
+        return True
+
+    async def list_blocked_clients(self, config, site_id):
+        from app.domains.network_integration.exceptions import (
+            ProviderUnsupportedApiError,
+        )
+
+        raise ProviderUnsupportedApiError("No blocked-client list.")
 
     async def configure_controller(self, config, request):
         # Part of the Protocol since automatic controller setup landed. Its

@@ -73,6 +73,12 @@ ExternalSiteId = Annotated[
 ]
 
 __all__ = [
+    "ClientActionResponse",
+    "ClientCapabilitiesResponse",
+    "ClientCapabilityView",
+    "ClientMacRequest",
+    "ClientRateLimitView",
+    "ClientSpeedRequest",
     "ControllerConfigureRequest",
     "ControllerConfigureResponse",
     "ControllerConfigureStepResponse",
@@ -1295,6 +1301,118 @@ class ControllerDeviceView(BaseModel):
     firmware_version: str | None = None
     uptime_seconds: int | None = None
     client_count: int | None = None
+
+
+class ClientCapabilityView(BaseModel):
+    """One client action, and whether this venue can perform it.
+
+    ``reason`` is populated only when ``supported`` is ``False``, and is
+    written for the person looking at the disabled control -- a console should
+    render it beside the control rather than paraphrasing it.
+    """
+
+    supported: bool
+    reason: str | None = None
+
+
+class ClientCapabilitiesResponse(BaseModel):
+    """Every client action's availability at one location.
+
+    Answered without contacting the controller, from the integration's own
+    auth mode, so a console can decide what to enable before any live call.
+    ``list_blocked`` is always ``False`` -- see the provider's own note: the
+    block flag is not readable through the connection this platform holds, and
+    an empty list would be a false statement about the venue.
+    """
+
+    set_rate_limit: ClientCapabilityView
+    clear_rate_limit: ClientCapabilityView
+    block: ClientCapabilityView
+    unblock: ClientCapabilityView
+    list_blocked: ClientCapabilityView
+    disconnect: ClientCapabilityView
+    client_stats: ClientCapabilityView
+
+
+class ClientMacRequest(BaseModel):
+    """The device a client action names.
+
+    Plain ``str`` on the way in and ``MaskedMac`` on the way out, the same
+    asymmetry every other MAC field in this module carries -- see the module
+    docstring.
+    """
+
+    client_mac: str = Field(min_length=12, max_length=32)
+
+
+class ClientSpeedRequest(ClientMacRequest):
+    """A per-device speed limit, in kbps.
+
+    kbps because that is ``queue_management.QueueProfile``'s own unit, so a
+    speed profile's numbers reach the controller unchanged.
+
+    ``0`` means "do not limit that direction", matching RouterOS's
+    ``max-limit`` semantics that this platform's kbps vocabulary comes from;
+    omitting a direction means the same. Sending both as ``0`` is not a way to
+    clear a limit -- ``DELETE`` the speed is.
+
+    ``queue_profile_id`` is the other way to say the same thing: name a speed
+    profile and its rates are read from the profile instead. The two are
+    mutually exclusive and one of them is required.
+    """
+
+    down_kbps: int | None = Field(default=None, ge=0)
+    up_kbps: int | None = Field(default=None, ge=0)
+    queue_profile_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> ClientSpeedRequest:
+        named_profile = self.queue_profile_id is not None
+        named_rates = self.down_kbps is not None or self.up_kbps is not None
+        if named_profile and named_rates:
+            raise ValueError(
+                "Give either a speed profile or explicit rates, not both."
+            )
+        if not named_profile and not named_rates:
+            raise ValueError(
+                "Give a speed profile, or a download and/or upload rate."
+            )
+        return self
+
+
+class ClientRateLimitView(BaseModel):
+    """What the controller was actually given.
+
+    ``applied_*`` and ``requested_*`` are separate because they can differ: a
+    controller that holds a limit as a bounded number plus a Kbps/Mbps unit
+    cannot express every kbps value, so 1500 kbps is applied as 2 Mbps.
+    ``clamped`` says so explicitly. A console must show the applied figure --
+    echoing the typed one back would be this platform asserting a limit that
+    is not in force.
+
+    ``None`` on a direction means unlimited in that direction; it is not zero
+    and it is not unknown.
+    """
+
+    enabled: bool
+    applied_down_kbps: int | None = None
+    applied_up_kbps: int | None = None
+    requested_down_kbps: int | None = None
+    requested_up_kbps: int | None = None
+    clamped: bool = False
+
+
+class ClientActionResponse(BaseModel):
+    """The outcome of one client action.
+
+    ``performed`` is the controller's own answer. ``rate_limit`` is present
+    only for the speed actions.
+    """
+
+    action: str
+    performed: bool
+    client_mac: MaskedMac
+    rate_limit: ClientRateLimitView | None = None
 
 
 class ControllerInventoryResponse(BaseModel):

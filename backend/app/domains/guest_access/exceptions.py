@@ -14,6 +14,7 @@ from fastapi import status
 from app.common.exceptions import CloudGuestError
 
 __all__ = [
+    "ControllerSessionTerminationUnavailableError",
     "GuestAccessError",
     "AccessRuleNotFoundError",
     "CrossOrganizationAccessRuleError",
@@ -370,6 +371,33 @@ class UnsupportedGuestAccessVendorError(GuestAccessError):
         super().__init__(
             f"No guest access device adapter is registered for vendor '{vendor}'",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ControllerSessionTerminationUnavailableError(GuestAccessError):
+    """A controller-managed venue's session could not be ended because the
+    controller path is not wired, or the row has no location.
+
+    Deliberately *not* ``BlockEnforcementMissingCredentialsError``. That
+    error is what a controller-managed row used to get, and it was wrong in
+    the way that matters: it told a venue admin to supply device connection
+    credentials for a device that has none and needs none, so the suggested
+    fix was impossible and the real cause was invisible. This one says what
+    is actually true -- this venue is reached through its controller, and
+    that path is unavailable right now.
+
+    502 rather than 400: the caller's request was correct and there is
+    nothing for them to change.
+    """
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            "This venue's network is run from a controller, and this "
+            "platform could not reach it to end the session. The guest is "
+            "blocked from signing in again; they may still be online right "
+            "now.",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            data={"router_id": str(router_id)},
         )
 
 

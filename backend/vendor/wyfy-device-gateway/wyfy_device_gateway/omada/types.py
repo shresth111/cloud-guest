@@ -113,6 +113,33 @@ PORTAL_AUTHORIZATION_ERROR_CODES: frozenset[int] = frozenset(
     }
 )
 
+# --- Per-client control error codes ----------------------------------------
+# MEASURED against Omada Software Controller 5.15.24.19 on 2026-09-17
+# (CAPABILITY-MATRIX.md 4.1) by probing each verb with a MAC that does not
+# exist on the site. Three DIFFERENT codes came back for config / block /
+# unblock, which is the evidence that these are three separate handlers and
+# not one aliased route:
+#
+#   -41011  GET and PATCH .../clients/{mac}      "This client does not exist."
+#   -41002  POST .../cmd/clients/{mac}/block     "This client does not exist."
+#   -41004  POST .../cmd/clients/{mac}/unblock   "This client does not exist."
+#
+# All three mean the same thing to us -- the site has no known-client record
+# for that MAC -- so they are mapped to ``OmadaClientNotFoundError`` rather
+# than to the generic fallback, whose normalized ``OMADA_ERROR`` the backend
+# files under "could not reach the network controller". The controller
+# answered; it simply does not know that MAC.
+CLIENT_ERROR_NOT_FOUND = -41011
+CLIENT_ERROR_BLOCK_NOT_FOUND = -41002
+CLIENT_ERROR_UNBLOCK_NOT_FOUND = -41004
+CLIENT_NOT_FOUND_ERROR_CODES: frozenset[int] = frozenset(
+    {
+        CLIENT_ERROR_NOT_FOUND,
+        CLIENT_ERROR_BLOCK_NOT_FOUND,
+        CLIENT_ERROR_UNBLOCK_NOT_FOUND,
+    }
+)
+
 #: Codes that mean "your token is no good any more, get another one". These
 #: drive the single automatic re-login.
 SESSION_EXPIRED_ERROR_CODES: frozenset[int] = frozenset(
@@ -406,6 +433,10 @@ def extract_total_rows(result: object) -> int | None:
 
 
 __all__ = [
+    "CLIENT_ERROR_BLOCK_NOT_FOUND",
+    "CLIENT_ERROR_NOT_FOUND",
+    "CLIENT_ERROR_UNBLOCK_NOT_FOUND",
+    "CLIENT_NOT_FOUND_ERROR_CODES",
     "ERROR_CODE_SUCCESS",
     "OPENAPI_ERROR_ACCESS_TOKEN_EXPIRED",
     "OPENAPI_ERROR_ACCESS_TOKEN_INVALID",

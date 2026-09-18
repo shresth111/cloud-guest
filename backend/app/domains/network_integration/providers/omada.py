@@ -159,7 +159,10 @@ from ..exceptions import (
 from ..validators import validate_controller_url
 from .base import (
     ProviderAuthorizationResult,
+    ProviderCapability,
     ProviderClient,
+    ProviderClientCapabilities,
+    ProviderClientRateLimit,
     ProviderConnectionConfig,
     ProviderControllerInfo,
     ProviderControllerSetupBlock,
@@ -888,6 +891,157 @@ class OmadaProvider:
         """
         result = await self._call(config, "deauthorize_guest", site_id, client_mac)
         return bool(result)
+
+    # -- per-client management ---------------------------------------------
+    #
+    # Provenance, because it is not uniform and the difference matters when
+    # somebody writes customer-facing copy (CAPABILITY-MATRIX.md, 2026-09-17):
+    #
+    #   * the *capability* is MEASURED. A full set -> read back -> change ->
+    #     restore cycle for the rate limit, and a block -> idempotent block ->
+    #     unblock -> idempotent unblock cycle, both ran against controller
+    #     5.15.24.19 with verbatim responses recorded, and the block was
+    #     accepted for an *offline* MAC, which is what proves it survives a
+    #     reconnect;
+    #   * the *surface* below is the Open API twin of those calls, which is
+    #     documented in that controller's own /v3/api-docs and has never been
+    #     executed, because this deployment holds no Open API app credential
+    #     on it.
+    #
+    # And one thing is UNMEASURED outright: what a block does to a client
+    # that currently holds a portal authorization. The data model says the
+    # authorization record and the block flag are separate objects with
+    # separate lifecycles, so the *inference* is that the grant survives
+    # while the device can no longer associate -- but that is inference.
+    # Nothing in this platform may tell an operator that blocking cuts off a
+    # guest who is online right now.
+
+    #: Why a ``legacy`` integration gets none of this. Not a configuration
+    #: mistake and not a version problem: a hotspot-operator session reaches
+    #: the portal tree and nothing else, and the client record lives in the
+    #: site tree. There is no fallback to degrade to.
+    _LEGACY_REASON = (
+        "This venue's controller is connected with a hotspot operator login, "
+        "which can let guests on and disconnect them but cannot change a "
+        "device's settings. Add Open API credentials to the controller "
+        "(Settings > Platform Integration > Open API) to turn this on."
+    )
+
+    #: Why "show me every blocked device" is not offered, on either mode.
+    #: The block flag lives on the known-client record and is exposed by the
+    #: controller's *internal* v2 insight endpoint, which this platform does
+    #: not speak; its own ``filters.blocked`` parameter was measured to be
+    #: silently ignored (it returned all six rows, every one unblocked), and
+    #: the Open API client grid carries no block field at all. An empty list
+    #: would be a false statement about the venue, so none is returned.
+    _BLOCKED_LIST_REASON = (
+        "The controller does not offer a list of blocked devices through the "
+        "connection we hold. Blocked guests are listed under Blocked Guests, "
+        "which is this platform's own record and is what actually refuses "
+        "them when they try to sign in again."
+    )
+
+    def client_capabilities(
+        self, config: ProviderConnectionConfig
+    ) -> ProviderClientCapabilities:
+        """Computed from ``auth_mode``, which is the fact that decides it.
+
+        ``disconnect`` is the odd one out and is deliberately reported
+        supported in *both* modes: it runs through
+        :meth:`deauthorize_guest`, whose transport is the hotspot operator
+        session, so it is the one action a ``legacy`` venue keeps. Its own
+        precondition -- that the integration carries operator credentials at
+        all -- is checked by the gateway at call time, because credentials
+        are not on this config in a form this method may inspect.
+        """
+        openapi = config.auth_mode == ControllerAuthMode.OPENAPI.value
+        legacy = ProviderCapability(supported=False, reason=self._LEGACY_REASON)
+        available = ProviderCapability(supported=True)
+        gated = available if openapi else legacy
+        return ProviderClientCapabilities(
+            set_rate_limit=gated,
+            clear_rate_limit=gated,
+            block=gated,
+            unblock=gated,
+            list_blocked=ProviderCapability(
+                supported=False, reason=self._BLOCKED_LIST_REASON
+            ),
+            # Rides the operator session, so it survives legacy mode.
+            disconnect=available,
+            client_stats=gated,
+        )
+
+    async def set_client_rate_limit(
+        self,
+        config: ProviderConnectionConfig,
+        site_id: str,
+        client_mac: str,
+        *,
+        down_kbps: int | None = None,
+        up_kbps: int | None = None,
+    ) -> ProviderClientRateLimit:
+        applied = await self._call(
+            config,
+            "set_client_rate_limit",
+            site_id,
+            client_mac,
+            down_kbps=down_kbps,
+            up_kbps=up_kbps,
+        )
+        return self._rate_limit(
+            applied, requested_down_kbps=down_kbps, requested_up_kbps=up_kbps
+        )
+
+    async def clear_client_rate_limit(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> ProviderClientRateLimit:
+        applied = await self._call(
+            config, "clear_client_rate_limit", site_id, client_mac
+        )
+        return self._rate_limit(
+            applied, requested_down_kbps=None, requested_up_kbps=None
+        )
+
+    async def block_client(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> bool:
+        return bool(await self._call(config, "block_client", site_id, client_mac))
+
+    async def unblock_client(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> bool:
+        return bool(await self._call(config, "unblock_client", site_id, client_mac))
+
+    async def list_blocked_clients(
+        self, config: ProviderConnectionConfig, site_id: str
+    ) -> list[ProviderClient]:
+        """Always raises. See ``_BLOCKED_LIST_REASON``.
+
+        Raising rather than returning ``[]`` is the whole contract of this
+        method (``base.py``): an empty list here would be this platform
+        asserting that the venue has blocked nobody, on the strength of a
+        question it was never able to ask.
+        """
+        raise ProviderUnsupportedApiError(self._BLOCKED_LIST_REASON)
+
+    @staticmethod
+    def _rate_limit(
+        applied: Any,
+        *,
+        requested_down_kbps: int | None,
+        requested_up_kbps: int | None,
+    ) -> ProviderClientRateLimit:
+        """Gateway ``ClientRateLimit`` -> this domain's shape, carrying the
+        requested values alongside the applied ones so a caller can see the
+        clamp rather than infer it."""
+        return ProviderClientRateLimit(
+            enabled=bool(getattr(applied, "enabled", False)),
+            applied_down_kbps=getattr(applied, "down_kbps", None),
+            applied_up_kbps=getattr(applied, "up_kbps", None),
+            requested_down_kbps=requested_down_kbps,
+            requested_up_kbps=requested_up_kbps,
+            clamped=bool(getattr(applied, "clamped", False)),
+        )
 
     async def configure_controller(
         self,
