@@ -189,34 +189,31 @@ class TestWhichEndingsAGuestIsToldAbout:
         assert result is not None
         assert result.reason is GuestSessionEndedReason.DISCONNECTED
 
-    @pytest.mark.parametrize(
-        "disconnect_reason",
-        [
-            "data_limit_exceeded",
-            "fup_data_quota_exceeded_daily",
-            "fup_data_quota_exceeded_weekly",
-            "fup_data_quota_exceeded_monthly",
-        ],
-    )
-    async def test_data_quota_exhaustion_is_not_reported_as_a_timeout(
+    @pytest.mark.parametrize("disconnect_reason", ["data_limit_exceeded"])
+    async def test_a_spent_per_session_allowance_is_not_reported_at_all(
         self, disconnect_reason: str
     ) -> None:
         """``EXPIRED`` is written for several different things, and only
         some of them are about time. A guest who has used up their DATA
-        allowance has not run out of *time*, and telling them to sign in
-        again sends them round a loop that ends the same way. They get
-        the ordinary sign-in page, where the quota is enforced and
-        explained properly.
+        allowance has not run out of *time*, which is why the mapping
+        matches ``inactivity_timeout`` exactly rather than keying off the
+        status alone.
 
-        This is why the mapping matches ``inactivity_timeout`` exactly
-        rather than keying off the status alone.
+        ``data_limit_exceeded`` is the per-session allowance copied off a
+        redeemed voucher batch (``GuestSession.data_limit_mb``), and it
+        stays silent. Nothing refuses this guest's next login, so the
+        ordinary sign-in page is the correct screen for them -- and the
+        two reasons a portal message would exist (explain the stop,
+        suppress a button that cannot work) are both absent.
 
         The three ``fup_time_quota_exceeded_*`` reasons used to be in this
-        list and now have their own test below. They left because they
-        became tellable -- a daily time limit is now a real, enforced
-        setting with a true sentence to say about it. These four stayed
-        because a data limit still is not: the "Add a data limit" control
-        remains unenforced and still says so on its face."""
+        list and now have their own test below, because a daily time limit
+        became a real, enforced setting with a true sentence to say about
+        it. The three ``fup_data_quota_exceeded_*`` reasons have now
+        followed them, for the same reason and one release later: the
+        dashboard's "Add a data limit" control writes the FUP policy the
+        enforcement reads, so that ending is reachable from a screen and
+        has something true to say."""
         fx = make_fixture()
         login = await _login(fx)
         await _end(
@@ -280,6 +277,51 @@ class TestWhichEndingsAGuestIsToldAbout:
 
         assert result is not None
         assert result.reason is GuestSessionEndedReason.TIME_LIMIT_REACHED
+        assert result.reason is not GuestSessionEndedReason.TIMED_OUT
+
+    @pytest.mark.parametrize(
+        "disconnect_reason",
+        [
+            "fup_data_quota_exceeded_daily",
+            "fup_data_quota_exceeded_weekly",
+            "fup_data_quota_exceeded_monthly",
+        ],
+    )
+    async def test_a_spent_data_allowance_has_its_own_ending(
+        self, disconnect_reason: str
+    ) -> None:
+        """A guest cut off by the venue's data cap gets their own reason,
+        not the time-limit one and not silence.
+
+        Silence was correct while no screen could set a data cap -- copy
+        for an unreachable state is a guess. It stopped being correct when
+        "Add a data limit" was wired to the FUP policy the enforcement
+        reads, because now a venue can produce this ending on purpose and
+        the guest meets it with no explanation and a sign-in button that
+        ``_enforce_fup_quota`` will refuse.
+
+        Asserted as "not TIME_LIMIT_REACHED" as well as "is
+        DATA_LIMIT_REACHED", because folding the two together is the
+        tempting shortcut and the wrong one: they need the same button
+        treatment and opposite sentences. Telling a guest who watched ten
+        minutes of video that they have used today's WiFi *time* is a
+        confident lie about their own afternoon."""
+        fx = make_fixture()
+        login = await _login(fx)
+        await _end(
+            fx,
+            login.session,
+            status=GuestSessionStatus.EXPIRED.value,
+            disconnect_reason=disconnect_reason,
+        )
+
+        result = await fx.guest_service.get_last_ended_session_for_device(
+            router_id=fx.router.id, device_mac=_MAC
+        )
+
+        assert result is not None
+        assert result.reason is GuestSessionEndedReason.DATA_LIMIT_REACHED
+        assert result.reason is not GuestSessionEndedReason.TIME_LIMIT_REACHED
         assert result.reason is not GuestSessionEndedReason.TIMED_OUT
 
     async def test_an_unknown_future_expired_reason_is_not_reported(self) -> None:
@@ -639,22 +681,23 @@ class TestItTellsAStrangerNothingAboutTheGuest:
         assert "ended_at" not in payload
         assert "started_at" not in payload
 
-    async def test_the_reason_is_one_of_four_closed_values(self) -> None:
+    async def test_the_reason_is_one_of_five_closed_values(self) -> None:
         """No caller-, operator- or NAS-authored string can travel
         through ``reason``, because the only values it can hold are the
-        four written in this repository's own source.
+        five written in this repository's own source.
 
-        Was two. The vocabulary grew, and the guarantee this test exists
-        to defend did not change with it: ``reason`` is still *derived*
-        by comparing ``disconnect_reason`` against literals owned by this
-        repository, and the column's own free-text contents still never
-        reach a guest. Pinned as an exact set so that adding a member is
-        a deliberate edit here, with that argument re-made, rather than
-        something a mapping change can do on its own."""
+        Was two, then four. The vocabulary grew, and the guarantee this
+        test exists to defend did not change with it: ``reason`` is still
+        *derived* by comparing ``disconnect_reason`` against literals
+        owned by this repository, and the column's own free-text contents
+        still never reach a guest. Pinned as an exact set so that adding a
+        member is a deliberate edit here, with that argument re-made,
+        rather than something a mapping change can do on its own."""
         assert {r.value for r in GuestSessionEndedReason} == {
             "timed_out",
             "idle_timed_out",
             "time_limit_reached",
+            "data_limit_reached",
             "disconnected",
         }
 

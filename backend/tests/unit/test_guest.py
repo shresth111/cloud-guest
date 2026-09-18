@@ -5982,6 +5982,96 @@ class TestRecordUsageFupTracking:
         assert updated.status == GuestSessionStatus.EXPIRED.value
         assert updated.disconnect_reason == "fup_data_quota_exceeded_weekly"
 
+    async def test_the_mid_session_cap_resolves_with_the_sessions_location(
+        self,
+    ) -> None:
+        """Mid-session data tracking used to resolve with a hardcoded
+        ``location_id=None`` -- the third sighting of the defect
+        ``_enforce_fup_quota`` and ``run_fup_time_accrual`` each already
+        carry a docstring about.
+
+        LOCATION is the only scope the dashboard's Guest WiFi Limits
+        screen can produce, so a venue that sets "2 GB per guest" there
+        got a cap that no interim update could see. And this is the half
+        that decides whether the feature does anything a guest notices:
+        ``_enforce_fup_quota`` only gates the NEXT login, so a cap
+        resolved there and not here lets a guest keep browsing on the
+        session they already hold, indefinitely, until they happen to
+        sign in again. The screen would show a live limit and no session
+        would ever end.
+
+        Asserts on the argument, not only the outcome: a cap that
+        happened to resolve through an organization-scoped policy would
+        satisfy an outcome-only test and still leave every
+        location-scoped venue broken."""
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_data_limit_mb": 1}
+        )
+        fx = make_fixture(policy_lookup=policy_lookup)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990034",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup.location_ids_seen.clear()
+
+        updated = await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=BYTES_PER_MB,
+            bytes_downloaded_delta=0,
+        )
+
+        assert policy_lookup.location_ids_seen == [fx.location_id]
+        assert updated.status == GuestSessionStatus.EXPIRED.value
+        assert updated.disconnect_reason == "fup_data_quota_exceeded_daily"
+
+    async def test_a_location_scoped_cap_also_ends_the_session_on_the_device(
+        self,
+    ) -> None:
+        """The other half of #274's lesson: expiring the row is not
+        disconnecting the guest.
+
+        A data cap that flips ``status`` to ``EXPIRED`` and stops there
+        leaves the guest browsing -- that is exactly what #274 had to fix
+        for the Omada sweep. Now that a venue can set a data cap from the
+        dashboard, that failure is reachable by a supported path rather
+        than only by a hand-written policy, so it gets its own assertion:
+        the live disconnect is issued, and the session records that it
+        really was enforced."""
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_data_limit_mb": 1}
+        )
+        fx = make_fixture(policy_lookup=policy_lookup)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990035",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+        ended: list[str] = []
+
+        class _SpyTerminator:
+            async def end_on_router(self, *, session, identifier, organization_id=None):
+                ended.append(identifier)
+
+        fx.guest_service.session_end_hook = _SpyTerminator()
+
+        updated = await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=BYTES_PER_MB,
+            bytes_downloaded_delta=0,
+        )
+
+        assert updated.status == GuestSessionStatus.EXPIRED.value
+        assert ended == ["+15559990035"]
+        assert updated.disconnect_enforced is True
+
     async def test_never_raises_when_the_policy_lookup_itself_fails(self) -> None:
         class ExplodingPolicyLookup:
             async def resolve_effective_policy(self, **kwargs: object):
