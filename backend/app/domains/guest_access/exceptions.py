@@ -17,7 +17,11 @@ __all__ = [
     "ControllerSessionTerminationUnavailableError",
     "GuestAccessError",
     "AccessRuleNotFoundError",
+    "CrossLocationAccessRuleError",
     "CrossOrganizationAccessRuleError",
+    "InvalidAccessRuleLocationError",
+    "OrganizationWideRuleScopeError",
+    "AccessRuleLocationUnverifiableError",
     "TemporaryRuleRequiresExpiryError",
     "InvalidRuleExpiryError",
     "InvalidGuestIdentifierError",
@@ -67,6 +71,90 @@ class CrossLocationAccessRuleError(GuestAccessError):
         super().__init__(
             "Cannot access an access rule at a location outside your own scope",
             status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class InvalidAccessRuleLocationError(GuestAccessError):
+    """The ``location_id`` a rule was written against is not a location of
+    the rule's own organization.
+
+    **One error for two different facts, deliberately.** The lookup behind
+    this (``LocationService.get_location``) distinguishes "no such location"
+    (``LocationNotFoundError``, 404) from "a location belonging to another
+    tenant" (``CrossOrganizationLocationAccessError``, 403). Letting those
+    two out separately would hand any authenticated caller a location
+    enumeration oracle for *every other organization on the platform*: guess
+    a UUID, read the status code, and 403-vs-404 tells you whether that id
+    names a real venue somewhere else. Both are therefore collapsed into
+    this single 400, whose message says only that the caller's own request
+    was wrong. Same posture, same reasoning, as
+    ``app.domains.support_tickets.exceptions.InvalidTicketLocationError``.
+
+    Why refuse at all rather than store the row: a rule's location is
+    matched by equality (``repository.list_matching_guest_rules`` ORs
+    ``location_id IS NULL`` against ``location_id == <the venue>``), so a
+    rule at a location that does not exist can never match anybody. It is
+    stored, listed, and shown to the operator as an active block that
+    silently blocks nobody.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "location_id does not belong to this organization",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class OrganizationWideRuleScopeError(GuestAccessError):
+    """A caller confined to particular sites tried to write a rule with no
+    ``location_id`` at all.
+
+    A rule with ``location_id = NULL`` is not "a rule with no location" --
+    ``repository.list_matching_guest_rules`` matches it **at every venue in
+    the organization**. It is the broadest rule this domain can express, so
+    writing one is an organization-level act and needs an organization-level
+    grant. A front-desk account holding one venue asking for an org-wide
+    block is asking to ban somebody from properties it cannot even see.
+
+    That is not a hypothetical: a dashboard defect that dropped
+    ``location_id`` from the Blocked Guests form turned single-venue blocks
+    into account-wide bans under a control that named one venue
+    (cloudguest-foundation#330 fixed the form). This is the server-side half,
+    and it is the half that holds for a caller who is not our own UI.
+
+    Deliberately **not** folded into
+    ``app.domains.rbac.location_scope.enforce_entity_location``: that helper
+    treats ``entity_location_id is None`` as a pass-through, which is right
+    for every *read* -- an org-wide rule does apply at your site, so you must
+    be able to see it -- and wrong only for writes. Twenty-odd domains share
+    that helper's read behaviour; the write rule lives here.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "An organization-wide rule applies at every location, so writing "
+            "one requires organization-level access; name a location instead",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class AccessRuleLocationUnverifiableError(GuestAccessError):
+    """A rule naming a location was written through a ``GuestAccessService``
+    constructed without a ``location_lookup``.
+
+    A wiring error, not a caller error, which is why it is a 500 and why it
+    raises rather than skipping the check. The read-only constructions
+    (``dependencies.get_access_decision_service``, the Celery sweeps) pass
+    ``location_lookup=None`` on purpose because they never write a rule; if
+    one ever starts to, this says so loudly instead of quietly storing rules
+    nobody verified. Silently degrading to "no check" is precisely how the
+    defect this class exists to prevent stayed invisible.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Access rule locations cannot be verified on this code path",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
 

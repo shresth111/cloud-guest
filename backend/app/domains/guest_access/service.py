@@ -100,6 +100,7 @@ from typing import Protocol
 
 from app.common.spreadsheet_safety import sanitize_spreadsheet_cell
 from app.database.utils.pagination import PaginationMeta
+from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
@@ -124,15 +125,18 @@ from .events import (
     WhitelistOnlyAccessDenied,
 )
 from .exceptions import (
+    AccessRuleLocationUnverifiableError,
     AccessRuleNotFoundError,
     CountryCodeRequiredError,
     CrossLocationAccessRuleError,
     CrossOrganizationAccessRuleError,
     GuestAccessError,
+    InvalidAccessRuleLocationError,
     InvalidGuestIdentifierError,
     InvalidImportCellError,
     InvalidRuleExpiryError,
     OrganizationRequiredError,
+    OrganizationWideRuleScopeError,
     RuleTypeNotImportableError,
     TemporaryRuleRequiresExpiryError,
 )
@@ -437,6 +441,10 @@ _IMPORT_REJECTION_CODES: dict[type[Exception], GuestRuleImportRejectionCode] = {
     TemporaryRuleRequiresExpiryError: GuestRuleImportRejectionCode.INVALID_EXPIRY,
     InvalidRuleExpiryError: GuestRuleImportRejectionCode.INVALID_EXPIRY,
     CrossLocationAccessRuleError: (GuestRuleImportRejectionCode.LOCATION_OUT_OF_SCOPE),
+    InvalidAccessRuleLocationError: (GuestRuleImportRejectionCode.UNKNOWN_LOCATION),
+    OrganizationWideRuleScopeError: (
+        GuestRuleImportRejectionCode.ORGANIZATION_WIDE_NOT_PERMITTED
+    ),
 }
 
 # ``InvalidImportCellError`` is one exception covering several columns, so
@@ -528,6 +536,28 @@ def _import_rejection_code(exc: Exception) -> GuestRuleImportRejectionCode:
     )
 
 
+class LocationLookupProtocol(Protocol):
+    """The subset of ``app.domains.location.service.LocationService`` this
+    module needs to establish that a rule's ``location_id`` names a real
+    location of the rule's own organization.
+
+    A narrow duck-typed protocol rather than a concrete import, the same
+    composition-over-duplication shape ``app.domains.support_tickets.service``
+    and ``app.domains.campaigns.service`` already use for this identical
+    need -- resolved to the real ``LocationService`` at the DI layer (see
+    ``dependencies.py``). This module still imports nothing from
+    ``app.domains.location`` but that domain's leaf exception module.
+    """
+
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> object: ...
+
+
 class BlockEnforcerProtocol(Protocol):
     """What this service needs to make a ``BLOCKLIST`` rule true on the
     device -- satisfied by ``enforcement.BlocklistEnforcer``.
@@ -561,12 +591,25 @@ class GuestAccessService:
         repository: GuestAccessRepositoryProtocol,
         *,
         block_enforcer: BlockEnforcerProtocol | None,
+        location_lookup: LocationLookupProtocol | None,
         audit_writer: AuditLogWriter | None = None,
         caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
+        # Keyword-only and **without a default**, for exactly the reason
+        # ``block_enforcer`` is: a default of ``None`` is how the defect
+        # this closes would come back. An unverified ``location_id`` does
+        # not fail loudly -- it writes a rule that matches nobody and looks
+        # identical to one that works -- so a mis-wired construction must
+        # be impossible to produce by omission. Passing ``None`` is still
+        # allowed for the read-only constructions (the router agent's
+        # decision service, the Celery sweeps), but it has to be written
+        # down at the call site, and a write attempted through one raises
+        # ``AccessRuleLocationUnverifiableError`` rather than skipping the
+        # check.
+        self.location_lookup = location_lookup
         # Keyword-only and **without a default**, deliberately. A default
         # of ``None`` is how the original defect would come back: a
         # mis-wired construction would silently create blocks that end no
@@ -578,6 +621,92 @@ class GuestAccessService:
         self.block_enforcer = block_enforcer
         self.audit_writer = audit_writer
         self.resolver = AccessDecisionResolver()
+
+    # -- the write-path location gate ----------------------------------------
+
+    async def _enforce_write_location(
+        self,
+        *,
+        location_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        verified: set[uuid.UUID] | None = None,
+    ) -> None:
+        """May this caller write a rule scoped to ``location_id``, and is
+        ``location_id`` somewhere a rule can actually apply?
+
+        Every path that *creates* a rule goes through here -- both create
+        methods and every row of an import. The read paths (``get_guest_rule``,
+        ``get_device_rule``, ``_may_export``) deliberately do not: they call
+        ``enforce_entity_location`` directly, because what a caller may
+        **see** and what a caller may **write** are different questions, and
+        this method answers only the second.
+
+        ## Why the org-wide case needs its own answer
+
+        ``enforce_entity_location`` treats ``entity_location_id is None`` as
+        a pass-through. For a read that is correct and must stay correct: a
+        rule with no location applies at every venue in the organization, so
+        it applies at *yours*, and you must be able to see it. Roughly twenty
+        domains depend on that behaviour, which is why the write rule is
+        expressed here rather than by changing the shared helper.
+
+        For a write it is the opposite. ``location_id = NULL`` is not "no
+        location"; ``repository.list_matching_guest_rules`` ORs
+        ``location_id IS NULL`` against the venue being matched, so a NULL
+        rule is the **broadest** rule this domain can express. Writing one
+        is an organization-level act:
+
+        * ``caller_location_scope is None`` -- the caller holds a GLOBAL or
+          ORGANIZATION role (see ``app.domains.rbac.location_scope``). They
+          are entitled to every venue already, so an org-wide rule grants
+          them nothing they did not have. Allowed.
+        * ``caller_location_scope`` is a set -- the caller holds nothing
+          broader than a location. An org-wide rule would reach venues they
+          cannot see, list or administer. Refused
+          (``OrganizationWideRuleScopeError``).
+
+        That was previously implicit -- nothing said it either way -- and
+        implicit is how it hid: a dashboard defect that dropped
+        ``location_id`` turned single-venue blocks into account-wide bans
+        and no server-side check noticed.
+
+        ## Order: scope first, existence second
+
+        Deliberate, and it is what keeps this from being an enumeration
+        oracle. A confined caller is refused by scope before any lookup runs,
+        so every id outside their grants answers identically whether or not
+        it exists. Only a caller already entitled to the whole organization
+        reaches the existence check, and that check collapses "no such
+        location" and "another tenant's location" into one
+        ``InvalidAccessRuleLocationError`` -- so no caller, confined or not,
+        learns anything about location ids belonging to other organizations.
+
+        ``verified`` lets an import amortise the lookup across a batch:
+        a 200-row upload naming one venue is one query, not two hundred.
+        """
+        if location_id is None:
+            if self.caller_location_scope is not None:
+                raise OrganizationWideRuleScopeError()
+            return
+
+        enforce_entity_location(
+            entity_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAccessRuleError(),
+        )
+
+        if verified is not None and location_id in verified:
+            return
+        if self.location_lookup is None:
+            raise AccessRuleLocationUnverifiableError()
+        try:
+            location = await self.location_lookup.get_location(location_id)
+        except LocationNotFoundError as exc:
+            raise InvalidAccessRuleLocationError() from exc
+        if getattr(location, "organization_id", None) != organization_id:
+            raise InvalidAccessRuleLocationError()
+        if verified is not None:
+            verified.add(location_id)
 
     # -- guest (identifier-keyed) rules --------------------------------------
 
@@ -595,6 +724,13 @@ class GuestAccessService:
         actor_user_id: uuid.UUID | None,
     ) -> GuestAccessRule:
         self._enforce_tenant_scope(organization_id, requesting_organization_id)
+        # The organization half alone is not tenancy. Before this, a caller
+        # confined to one venue could name another venue's id -- or no venue
+        # at all, which is every venue -- and the write succeeded. See
+        # ``_enforce_write_location``.
+        await self._enforce_write_location(
+            location_id=location_id, organization_id=organization_id
+        )
         # Canonicalize before validating, and store what was validated --
         # this is the write half of the 2026-09 "Always Allowed matches
         # nobody" fix. A phone number lands in the table as E.164 or does
@@ -998,6 +1134,12 @@ class GuestAccessService:
         imported_ids: list[uuid.UUID] = []
         updated_ids: list[uuid.UUID] = []
         rejected: list[RejectedGuestRuleImportRow] = []
+        # Location ids already established as this organization's, for this
+        # batch only. A 200-room upload naming one venue costs one lookup
+        # rather than two hundred. Scoped to the call, never to the
+        # instance: a cache that outlived the request would answer for a
+        # location deleted in between.
+        verified_locations: set[uuid.UUID] = set()
 
         for row_number, raw in enumerate(rows, start=1):
             raw_identifier = str(raw.get("identifier") or "")
@@ -1041,10 +1183,14 @@ class GuestAccessService:
                 # write another site's list, and checking the *effective*
                 # location per row (rather than once against the batch
                 # default) is what stops row 137 from smuggling one there.
-                enforce_entity_location(
-                    entity_location_id=location_id,
-                    caller_location_scope=self.caller_location_scope,
-                    error=CrossLocationAccessRuleError(),
+                # The same gate the single-rule creates use, so an upload
+                # cannot reach past what the form can: a row naming a
+                # location that does not exist, or resolving to no location
+                # at all (every location), is refused here too.
+                await self._enforce_write_location(
+                    location_id=location_id,
+                    organization_id=organization_id,
+                    verified=verified_locations,
                 )
             except (GuestAccessError, ValueError) as exc:
                 rejected.append(
@@ -1285,6 +1431,13 @@ class GuestAccessService:
         actor_user_id: uuid.UUID | None,
     ) -> DeviceAccessRule:
         self._enforce_tenant_scope(organization_id, requesting_organization_id)
+        # Both entities in this domain are written, not only read, so both
+        # writes gate. Gating the guest rule and not the device rule would
+        # be the `voucher` mistake in the other direction -- a MAC-keyed
+        # block is the same account-wide ban by another key.
+        await self._enforce_write_location(
+            location_id=location_id, organization_id=organization_id
+        )
         mac_address = normalize_mac_address(mac_address)
         now = datetime.now(UTC)
         validate_rule_expiry(rule_type=rule_type, expires_at=expires_at, now=now)

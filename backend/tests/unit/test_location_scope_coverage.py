@@ -168,7 +168,16 @@ LOCATION_SCOPED: dict[str, str] = {
         "have been the `voucher` mistake. Uses the anonymous-tolerant "
         "dependency because this service is composed into `get_guest_service` "
         "as `access_control_hook`, so the strict one would have 401'd guest "
-        "login -- the composition hazard, not a route in this domain."
+        "login -- the composition hazard, not a route in this domain. "
+        "WRITES are enforced too, and separately: a rule carries the "
+        "location it will apply at, so a create is not reached by an id but "
+        "*names* one, and the getters never see it. Both creates and every "
+        "import row pass `_enforce_write_location`, which additionally "
+        "refuses a location-confined caller an org-wide (`location_id = "
+        "NULL`) rule -- that row applies at every venue, so writing one "
+        "needs an organization-level grant. `enforce_entity_location` alone "
+        "cannot express that: its `entity_location_id is None` pass-through "
+        "is correct for reads and deliberately unchanged."
     ),
     "guest_teams": (
         "One entity, `GuestTeam`, addressed by `{team_id}` on the detail, "

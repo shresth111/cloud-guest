@@ -23,6 +23,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -329,7 +330,10 @@ def _build(
         else None
     )
     service = GuestAccessService(
-        repository, block_enforcer=enforcer, audit_writer=audit
+        repository,
+        block_enforcer=enforcer,
+        location_lookup=_AnyLocationOfThisOrg(organization_id),
+        audit_writer=audit,
     )
     return Fixture(
         service=service,
@@ -343,6 +347,30 @@ def _build(
         guest_id=guest_id,
         identifier=identifier,
     )
+
+
+class _AnyLocationOfThisOrg:
+    """Every location id is a real location of ``organization_id``.
+
+    This suite is about what a block does to a *device and a session*, not
+    about who may write one -- the venues it invents with ``uuid.uuid4()``
+    stand for real venues. Whether an unknown or out-of-scope location is
+    refused is covered where it belongs, in
+    ``test_guest_access.TestWhoMayWriteARule``, against a fake that really
+    does refuse.
+    """
+
+    def __init__(self, organization_id: uuid.UUID) -> None:
+        self.organization_id = organization_id
+
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> object:
+        return SimpleNamespace(id=location_id, organization_id=self.organization_id)
 
 
 async def _block(fx: Fixture, **overrides: object) -> GuestAccessRule:
