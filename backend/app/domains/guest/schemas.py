@@ -983,6 +983,18 @@ class RadiusAccountingRequest(BaseModel):
     username-based lookup ``RadiusService.authorize`` already uses is what
     actually finds the session.
 
+    ``username`` alone is **not** enough to name a session, though, and
+    ``calling_station_id`` is what completes it. One guest can hold two
+    concurrent sessions on one router -- two phones, or one phone whose
+    per-SSID randomized MAC changed between logins -- and resolving by
+    identifier alone hands every Accounting-Request to whichever of them
+    started last. Measured on production 2026-09-18: the hub's accounting
+    detail file reported exactly one session, ``26-79-94-B5-24-D9``, for
+    1,181,973,763 bytes, and that figure landed to the byte on the guest's
+    *other* session, whose device MAC appears nowhere in that file. The
+    venue's data cap then counted 2.36 GB against 1.18 GB actually moved, on
+    the wrong device.
+
     ``username``/``session_id`` are optional (unlike the original
     three-status-type shape) because Accounting-On/Accounting-Off (RFC
     2866 §5.13) are NAS-level events, not session-level ones -- the real
@@ -1009,6 +1021,14 @@ class RadiusAccountingRequest(BaseModel):
         "NAS-originated string (e.g. RouterOS's own internal counter), "
         "kept only for logging/correlation. Never this platform's "
         "GuestSession id, and never used to look one up.",
+    )
+    calling_station_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="The device's MAC (RADIUS Calling-Station-Id, RFC 2865 "
+        "s5.31) -- which of this guest's devices these octets belong to. "
+        "Optional so a NAS or hub that does not send it keeps resolving by "
+        "username alone, exactly as before.",
     )
     bytes_uploaded_delta: int = Field(default=0, ge=0)
     bytes_downloaded_delta: int = Field(default=0, ge=0)

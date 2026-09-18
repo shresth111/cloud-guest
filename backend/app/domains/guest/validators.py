@@ -88,6 +88,39 @@ def normalize_mac_address(mac_address: str) -> str:
     return mac_address.strip().upper()
 
 
+def canonical_mac_key(raw: str | None) -> str | None:
+    """Bare uppercase hex (``"AABBCCDDEEFF"``), or ``None`` when ``raw`` is
+    not a six-octet MAC.
+
+    A *comparison* key, never a stored value -- which is why it is separate
+    from ``normalize_mac_address`` above (which preserves the caller's
+    separator) and from ``mac_authorization.validators.normalize_mac_address``
+    (which returns the canonical colon form and raises on anything else).
+    Neither can answer "are these two spellings the same device", and that is
+    the only question this answers.
+
+    It has to be separator-agnostic because the two sides genuinely differ:
+    ``GuestDevice.mac_address`` keeps whatever the captive-portal login
+    submitted (dashes from an Omada portal redirect, colons from a MikroTik
+    one), while RADIUS ``Calling-Station-Id`` arrives in whatever form the NAS
+    writes -- ``26-79-94-B5-24-D9`` from the hub's own accounting detail file.
+
+    Returns ``None`` rather than a partial or best-effort string, so an
+    unparseable value fails to match instead of matching the wrong device.
+    Deliberately the same rule as ``network_integration.usage_tasks
+    ._canonical_mac``, restated here rather than imported: ``guest`` must not
+    take a dependency on ``network_integration``, which already depends on it.
+    """
+    if not raw:
+        return None
+    hex_only = raw.strip().upper().replace(":", "").replace("-", "").replace(".", "")
+    if len(hex_only) != 12:
+        return None
+    if any(ch not in "0123456789ABCDEF" for ch in hex_only):
+        return None
+    return hex_only
+
+
 def normalize_identifier(identifier: str) -> str:
     """Strips surrounding whitespace -- mirrors
     ``app.domains.voucher.validators.normalize_redeemed_identifier``'s

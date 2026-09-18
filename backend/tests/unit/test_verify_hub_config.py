@@ -173,7 +173,7 @@ rest {
 		uri = "${..connect_uri}/radius/accounting"
 		method = 'post'
 		body = 'json'
-		data = "{\\"status_type\\": \\"%{control:Tmp-String-0}\\", \\"bytes_uploaded_total\\": %{control:Tmp-Integer64-0}, \\"bytes_downloaded_total\\": %{control:Tmp-Integer64-1}}"
+		data = "{\\"status_type\\": \\"%{control:Tmp-String-0}\\", \\"calling_station_id\\": \\"%{Calling-Station-Id}\\", \\"bytes_uploaded_total\\": %{control:Tmp-Integer64-0}, \\"bytes_downloaded_total\\": %{control:Tmp-Integer64-1}}"
 	}
 }
 """
@@ -291,6 +291,43 @@ def test_delta_mapped_octet_counters_are_caught(broken_tree):
     finding = _by_name(verify.check_tree(broken_tree), "totals, not deltas")
     assert finding.status == verify.FAIL
     assert "quadratically" in finding.detail
+
+
+def test_accounting_that_never_names_the_device_is_caught(broken_tree):
+    """``User-Name`` names a person. One person routinely holds two sessions
+    on one router -- two phones, or one phone whose per-SSID randomized MAC
+    changed between logins -- so a payload carrying no ``Calling-Station-Id``
+    leaves the backend resolving by identifier alone and crediting every
+    packet to whichever session started last. Measured on production
+    2026-09-18: 1,181,973,763 bytes reported for ``26-79-94-B5-24-D9``
+    landed to the byte on the guest's *other* session."""
+    finding = _by_name(verify.check_tree(broken_tree), "names the device")
+    assert finding.status == verify.FAIL
+    assert "wrong device" in finding.detail
+
+
+def test_the_rest_conf_this_repo_ships_names_the_device(tmp_path):
+    """The checker and the config it checks must not drift, so this reads
+    ``ops/freeradius/rest.conf`` off disk rather than a fixture literal: the
+    file an operator actually applies to the hub is the one under test.
+
+    It pins the *shape* of the accounting payload, not just its numbers --
+    that ``Calling-Station-Id`` is present, spelled as the backend's
+    ``calling_station_id`` field, and that the totals-not-deltas invariant
+    beside it still holds."""
+    tree = _tree(
+        tmp_path,
+        site=FIXED_SITE,
+        rest=(_OPS / "rest.conf").read_text(),
+        clients=CLEAN_CLIENTS,
+        symlink_site=True,
+        name="repo-3.0",
+    )
+    findings = verify.check_tree(tree)
+    assert _by_name(findings, "names the device").status == verify.PASS
+    assert _by_name(findings, "totals, not deltas").status == verify.PASS
+    body = (_OPS / "rest.conf").read_text()
+    assert '\\"calling_station_id\\": \\"%{Calling-Station-Id}\\"' in body
 
 
 def test_missing_gigawords_reassembly_is_caught(broken_tree):

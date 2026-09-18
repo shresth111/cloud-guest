@@ -2674,7 +2674,9 @@ async def radius_accounting(
     # for every status_type reachable below.
     if payload.status_type == RADIUS_ACCT_STATUS_START:
         session = await service.accounting_start(
-            nas_client=nas_client, username=payload.username
+            nas_client=nas_client,
+            username=payload.username,
+            calling_station_id=payload.calling_station_id,
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_INTERIM_UPDATE:
         session = await service.accounting_interim_update(
@@ -2688,6 +2690,12 @@ async def radius_accounting(
             # already use them; totals win when both are present.
             bytes_uploaded_total=payload.bytes_uploaded_total,
             bytes_downloaded_total=payload.bytes_downloaded_total,
+            # Which of this guest's devices these octets belong to. Without
+            # it a guest holding two concurrent sessions has every packet
+            # credited to whichever started last -- see
+            # ``RadiusAccountingRequest``'s own docstring for the production
+            # measurement.
+            calling_station_id=payload.calling_station_id,
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_STOP:
         session = await service.accounting_stop(
@@ -2696,6 +2704,7 @@ async def radius_accounting(
             bytes_uploaded_total=payload.bytes_uploaded_total,
             bytes_downloaded_total=payload.bytes_downloaded_total,
             disconnect_reason=payload.disconnect_reason,
+            calling_station_id=payload.calling_station_id,
         )
     else:
         # Previously: silently treated as "stop". Any status_type this

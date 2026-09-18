@@ -301,6 +301,7 @@ from .constants import (
     PIN_LOCKOUT_MINUTES,
     PIN_MAX_ATTEMPTS,
     PIN_STALE_AFTER_DAYS,
+    RADIUS_ACCOUNTING_DEVICE_MATCH_SCAN_LIMIT,
     RECONNECT_GRACE_MINUTES,
     SESSION_PRESENCE_DISCONNECT_REASON,
     SESSION_PRESENCE_GRACE_MINUTES,
@@ -404,6 +405,7 @@ from .repository import (
 )
 from .validators import (
     as_utc,
+    canonical_mac_key,
     compute_period_start,
     dashboard_series_bucket_starts,
     has_session_reached_time_limit,
@@ -8034,11 +8036,17 @@ class RadiusService:
             return None
 
     async def accounting_start(
-        self, *, nas_client: RadiusNasClient, username: str
+        self,
+        *,
+        nas_client: RadiusNasClient,
+        username: str,
+        calling_station_id: str | None = None,
     ) -> GuestSession:
         """See module docstring for why this confirms an existing session
         rather than fabricating one."""
-        session = await self._get_session_for_nas(nas_client, username)
+        session = await self._get_session_for_nas(
+            nas_client, username, calling_station_id=calling_station_id
+        )
         return session
 
     async def accounting_interim_update(
@@ -8050,6 +8058,7 @@ class RadiusService:
         bytes_downloaded_delta: int,
         bytes_uploaded_total: int | None = None,
         bytes_downloaded_total: int | None = None,
+        calling_station_id: str | None = None,
     ) -> GuestSession:
         """Prefers the NAS's cumulative counters over caller-supplied
         deltas, converting them to a delta against what this session has
@@ -8081,7 +8090,9 @@ class RadiusService:
         crediting a guest back their quota, which is the safer direction
         to be wrong in for a cap that exists to be enforced.
         """
-        session = await self._get_session_for_nas(nas_client, username)
+        session = await self._get_session_for_nas(
+            nas_client, username, calling_station_id=calling_station_id
+        )
         if bytes_uploaded_total is not None:
             bytes_uploaded_delta = max(0, bytes_uploaded_total - session.bytes_uploaded)
         if bytes_downloaded_total is not None:
@@ -8102,8 +8113,11 @@ class RadiusService:
         bytes_uploaded_total: int | None = None,
         bytes_downloaded_total: int | None = None,
         disconnect_reason: str | None = None,
+        calling_station_id: str | None = None,
     ) -> GuestSession:
-        session = await self._get_session_for_nas(nas_client, username)
+        session = await self._get_session_for_nas(
+            nas_client, username, calling_station_id=calling_station_id
+        )
 
         if bytes_uploaded_total is not None or bytes_downloaded_total is not None:
             update_data: dict[str, object] = {}
@@ -8156,23 +8170,55 @@ class RadiusService:
         )
 
     async def _get_session_for_nas(
-        self, nas_client: RadiusNasClient, username: str
+        self,
+        nas_client: RadiusNasClient,
+        username: str,
+        *,
+        calling_station_id: str | None = None,
     ) -> GuestSession:
-        """Resolves accounting's target session by ``username`` against
-        this NAS's own router -- never by treating the NAS's own
-        Acct-Session-Id as this platform's ``GuestSession.id``. See
-        ``RadiusAccountingRequest``'s own docstring for why: a real
-        MikroTik hotspot originates its Acct-Session-Id locally and has
-        no way to echo back a caller-supplied UUID.
+        """Resolves accounting's target session by ``username`` **and, when
+        the NAS says which device it is reporting on, by that device** --
+        never by treating the NAS's own Acct-Session-Id as this platform's
+        ``GuestSession.id``. See ``RadiusAccountingRequest``'s own docstring
+        for why the latter is impossible: a real MikroTik hotspot originates
+        its Acct-Session-Id locally and has no way to echo back a
+        caller-supplied UUID.
 
         Deliberately not ``_find_active_session_for_identifier`` (which
         ``authorize`` uses) -- that only ever returns an ACTIVE session,
         but Accounting-Stop for an already-disconnected session (e.g. a
         RADIUS retransmit, or this platform closing the session first via
-        a different path) must still resolve it and no-op, not 404. This
-        matches the latest session for the identifier on this router
-        regardless of status, same as ``_find_active_session_for_identifier``
-        minus its ``is_active()`` filter."""
+        a different path) must still resolve it and no-op, not 404.
+
+        ## Why the device, and not the identifier alone
+
+        ``username`` names a *person*; ``Calling-Station-Id`` names the
+        *device whose octets these are*. One guest routinely holds two
+        concurrent sessions on one router -- two phones, or one phone whose
+        per-SSID randomized MAC changed between logins -- and the identifier
+        cannot tell them apart. Resolving by identifier alone therefore hands
+        every Accounting-Request to whichever session started last, which is
+        not a tie-break: it is a coin toss that decides whose data cap fires.
+
+        Measured on production 2026-09-18 (guest ``+919315074877``, router
+        ``QA Omada Controller``): the hub's accounting detail file reported
+        exactly one session, ``26-79-94-B5-24-D9``, totalling 1,181,973,763
+        bytes. Those octets landed to the byte on the guest's *other*,
+        later-started session, whose device ``86-25-FE-F0-D7-D9`` appears
+        nowhere in that file -- so the venue recorded 2.36 GB against the
+        1.18 GB actually moved, and the cap that now really ends sessions
+        would have fired at half the allowance, on the wrong device.
+
+        ## Why this cannot change a single-device venue
+
+        The fallback is the previous behaviour, unchanged and reached by the
+        identical condition: the guest's latest session, on this router, in
+        any status. The device match only ever *narrows* that, and only when
+        the NAS supplied a parseable MAC that one of this guest's devices
+        actually owns. A guest with one device has exactly one candidate, so
+        the match and the fallback are the same row; a NAS or hub that sends
+        no ``Calling-Station-Id`` gets byte-identical behaviour to before.
+        """
         router = await self.router_lookup.get_router(
             nas_client.router_id, include_deleted=True
         )
@@ -8182,8 +8228,58 @@ class RadiusService:
         if guest is not None and not guest.is_blocked:
             candidate = await self.repository.get_latest_session_for_guest(guest.id)
             if candidate is not None and candidate.router_id == router.id:
-                return candidate
+                by_device = await self._session_for_calling_station(
+                    guest_id=guest.id,
+                    organization_id=router.organization_id,
+                    router_id=router.id,
+                    calling_station_id=calling_station_id,
+                )
+                return by_device if by_device is not None else candidate
         raise GuestSessionNotFoundError(username)
+
+    async def _session_for_calling_station(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        router_id: uuid.UUID,
+        calling_station_id: str | None,
+    ) -> GuestSession | None:
+        """This guest's most recent session on this router whose device is
+        the one the NAS named, or ``None``.
+
+        ``None`` for every "cannot say": no MAC on the packet, a MAC this
+        platform cannot parse, a MAC belonging to no device of this guest's,
+        or no session of theirs on this router bound to it. The caller falls
+        back to the identifier-only lookup in all of them, which is what
+        keeps a venue whose NAS sends no ``Calling-Station-Id`` on exactly
+        the behaviour it had before.
+
+        Scans a bounded window of the guest's recent sessions rather than
+        querying per device: ``list_sessions_for_guest`` is already ordered
+        newest-first, the same ordering ``get_latest_session_for_guest``
+        rests on, so the first hit *is* the most recent one.
+        """
+        wanted = canonical_mac_key(calling_station_id)
+        if wanted is None:
+            return None
+        devices = await self.repository.list_devices_for_guest_ids(
+            guest_ids=[guest_id], organization_id=organization_id
+        )
+        device_ids = {
+            device.id
+            for device in devices
+            if canonical_mac_key(device.mac_address) == wanted
+        }
+        if not device_ids:
+            return None
+        sessions = await self.repository.list_sessions_for_guest(
+            guest_id, limit=RADIUS_ACCOUNTING_DEVICE_MATCH_SCAN_LIMIT
+        )
+        for session in sessions:
+            if session.router_id == router_id and session.device_id in device_ids:
+                return session
+        return None
 
 
 # ============================================================================
