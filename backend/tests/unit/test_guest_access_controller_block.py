@@ -57,6 +57,7 @@ from app.domains.guest_access.enforcement import (
 from app.domains.guest_access.models import GuestAccessRule
 from app.domains.guest_access.service import GuestAccessService
 
+from .test_guest_access import FakeLocationLookup
 from .test_guest_access_block_enforcement import (
     TERMINATED,
     FakeDevice,
@@ -263,6 +264,15 @@ def _build(
         blocker.controller_locations.add(location_id)
 
     repository = FakeGuestAccessRepository()
+    # `location_lookup` became required on `GuestAccessService` in the PR
+    # that stopped a venue-confined admin writing a rule outside their
+    # scope. This file's fixtures predate it: both PRs were green alone
+    # and red together, which is what a required keyword-only argument
+    # is for -- it fails loudly at construction instead of writing an
+    # unscoped rule. The lookup knows this fixture's own venue.
+    location_lookup = FakeLocationLookup()
+    location_lookup.add(location_id, organization_id)
+    location_lookup.add(other_location_id, organization_id)
     enforcer = BlocklistEnforcer(
         session_lookup=session_lookup,
         router_lookup=FakeRouterLookup(routers={router_id: FakeRouter(id=router_id)}),
@@ -271,7 +281,9 @@ def _build(
         device_blocker=blocker,
     )
     return Fixture(
-        service=GuestAccessService(repository, block_enforcer=enforcer),
+        service=GuestAccessService(
+            repository, block_enforcer=enforcer, location_lookup=location_lookup
+        ),
         repository=repository,
         session_lookup=session_lookup,
         blocker=blocker,
