@@ -126,7 +126,9 @@ async def _run_session_timeout_sweep_async() -> int:
         try:
             repository = GuestRepository(session)
             expired = await enforce_session_timeouts(
-                repository, _build_session_terminator(session, repository)
+                repository,
+                _build_session_terminator(session, repository),
+                _build_activity_reporting_lookup(session),
             )
             await session.commit()
             return len(expired)
@@ -430,6 +432,36 @@ def _build_queue_management_service(session: AsyncSession):
         audit_writer=RBACRepository(session),
         controller_speed_hook=build_controller_speed_hook(session),
     )
+
+
+def _build_activity_reporting_lookup(session: AsyncSession):
+    """The venue half of the session-timeout sweep: can this venue report
+    that its guests are still using the network?
+
+    Satisfies ``service.VenueActivityReportingProtocol``. Imported inside
+    the function for the same reason ``_build_session_terminator`` below
+    does it -- this module is imported by the API process too, and the
+    network-integration domain is not needed there.
+
+    Without it, ``enforce_session_timeouts`` measures ``now -
+    last_activity_at`` at a venue where nothing ever moves
+    ``last_activity_at``, and expires guests who are actively browsing. An
+    Omada integration in ``legacy`` (hotspot-operator) auth mode is exactly
+    that venue: the Open-API usage sweep that feeds the column skips it (it
+    selects ``auth_mode == openapi``) and no RADIUS accounting arrives, so
+    the column is frozen at the value the login wrote and "idle for 35
+    minutes" just means "logged in 35 minutes ago".
+
+    This is a real hook against the real repository rather than a flag on
+    the task, so the answer comes from the venue's own integration row
+    through the provider's own capability gate -- the same gate the speed
+    and block hooks already consult -- and cannot drift from it.
+    """
+    from app.domains.network_integration.client_hooks import (
+        build_controller_activity_reporting_lookup,
+    )
+
+    return build_controller_activity_reporting_lookup(session)
 
 
 def _build_session_terminator(session: AsyncSession, repository: GuestRepository):
