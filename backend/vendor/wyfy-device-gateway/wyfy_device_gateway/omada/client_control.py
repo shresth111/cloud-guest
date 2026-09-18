@@ -201,14 +201,23 @@ def build_rate_limit_body(
 #: or not it is in use (an untouched client reads back
 #: ``{"enable": false, ..., "downLimit": 0}``), so "no limit" is a state of
 #: the object, not its absence.
+#: The limit values a disabled rate limit carries. **Not zero**, though zero
+#: is what an untouched client reads back: the Open API validates the range
+#: before it looks at ``enable``, so a body carrying ``0`` is refused with
+#: ``-1001 "Value of down limit is from 1 to 1024."`` even when the limit is
+#: being switched off. Measured on 5.15.24.19 -- zeros refused, ones
+#: accepted, and omitting the fields entirely answers ``-1 General error``.
+#: The number is inert; ``enable: false`` is what makes it not a limit.
+CLEAR_RATE_LIMIT_VALUE = 1
+
 CLEAR_RATE_LIMIT_BODY: dict[str, Any] = {
     "enable": False,
     "upEnable": False,
-    "upUnit": UNIT_KBPS,
-    "upLimit": 0,
+    "upUnit": UNIT_MBPS,
+    "upLimit": CLEAR_RATE_LIMIT_VALUE,
     "downEnable": False,
-    "downUnit": UNIT_KBPS,
-    "downLimit": 0,
+    "downUnit": UNIT_MBPS,
+    "downLimit": CLEAR_RATE_LIMIT_VALUE,
 }
 
 

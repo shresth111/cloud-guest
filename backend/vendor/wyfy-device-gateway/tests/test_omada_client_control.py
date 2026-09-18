@@ -153,6 +153,12 @@ async def test_clearing_a_rate_limit_sends_the_off_state():
     limits = body["customRateLimit"]
     assert limits["enable"] is False
     assert limits["downEnable"] is False and limits["upEnable"] is False
+    # Not zero, though an untouched client reads back zero. The Open API
+    # validates the 1..1024 range BEFORE it looks at `enable`, so a clear
+    # carrying 0 is refused with -1001 "Value of down limit is from 1 to
+    # 1024." -- measured. The number is inert; `enable: false` is what makes
+    # it not a limit.
+    assert limits["downLimit"] >= 1 and limits["upLimit"] >= 1
     assert applied.enabled is False
     assert applied.down_kbps is None
 
