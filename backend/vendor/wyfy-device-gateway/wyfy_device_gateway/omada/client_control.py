@@ -284,7 +284,30 @@ async def clear_client_rate_limit(
     client: OmadaHttpClient, omadac_id: str, site_id: str, client_mac: str
 ) -> ClientRateLimit:
     """Remove a per-client rate limit. Idempotent by construction: the body
-    is the same "off" state whether or not a limit was in place."""
+    is the same "off" state whether or not a limit was in place.
+
+    **The controller keeps ``rateLimit.enable: true`` afterwards, and there
+    is no Open API call that clears it.** Both directions come back
+    ``upEnable: false`` / ``downEnable: false``, so nothing is throttled --
+    which is why :class:`ClientRateLimit` reports ``enabled=False``, a true
+    statement about the *effect*. But a pristine client reads back
+    ``enable: false``, so a cleared one is distinguishable from an untouched
+    one in the venue's own Omada UI, where it may read as "rate limited"
+    while limiting nothing.
+
+    Measured 2026-09-18 on 5.15.24.19, six bodies across three endpoints:
+    ``…/clients/{mac}/ratelimit`` with Mbps units, with Kbps units, with
+    ``mode: 1``, and with no ``customRateLimit``; the batch
+    ``…/clients/config`` with ``rateLimit`` and with ``mode`` +
+    ``customRateLimit``; and ``PATCH …/clients/{mac}`` (405 -- Open API does
+    not expose it). Every accepted body left the flag on. The controller's
+    **internal v2** ``PATCH /api/v2/sites/{siteId}/clients/{mac}`` does clear
+    it, and this platform deliberately does not hold the admin session that
+    endpoint needs.
+
+    So this is a controller behaviour to state plainly, not a bug to keep
+    hunting: do not "fix" it by asking for admin credentials.
+    """
     await client.request(
         "PATCH",
         RATE_LIMIT_PATH.format(
