@@ -56,6 +56,36 @@ pytestmark = pytest.mark.asyncio
 
 CLIENT_MAC = "AA:BB:CC:DD:EE:FF"
 
+#: What ``Guest.identifier`` actually is for nearly every guest on this
+#: platform: the phone number they signed in with. Used deliberately in the
+#: controller tests below, because a MAC-shaped identifier is what let the
+#: identifier-vs-MAC defect ship.
+GUEST_IDENTIFIER = "+919876543210"
+
+
+def _mac_only_controller_terminator(reached: list[dict], *, ended: bool = True):
+    """A fake controller terminator that refuses what the real one refuses.
+
+    ``client_hooks.terminate`` runs ``normalize_client_mac`` on whatever it
+    is handed and returns ``False`` for anything that is not MAC-shaped. A
+    fake that accepts any string is precisely how the defect this guards
+    shipped green: the old tests passed ``identifier=CLIENT_MAC``, so the
+    wrong argument happened to look right, and production -- where the
+    identifier is a phone number -- refused every disconnect.
+
+    So this asserts the shape. A caller that reverts to passing the
+    identifier fails here, loudly, instead of passing and failing at a
+    venue.
+    """
+    from app.domains.network_integration.validators import normalize_client_mac
+
+    async def terminator(**kwargs):
+        normalize_client_mac(kwargs.get("client_mac"))
+        reached.append(kwargs)
+        return ended
+
+    return terminator
+
 
 def _config(auth_mode: str) -> ProviderConnectionConfig:
     return ProviderConnectionConfig(
@@ -234,7 +264,7 @@ class TestAVenueAdminCannotReachAnotherTenant:
     async def test_the_refusal_is_the_same_as_for_a_location_with_no_controller(
         self, action: str
     ) -> None:
-        """"Not yours" and "does not exist" must be indistinguishable. If
+        """ "Not yours" and "does not exist" must be indistinguishable. If
         these two messages ever diverge, the response becomes an oracle for
         enumerating another tenant's locations."""
         service, owner_org, location_id = _venue()
@@ -320,9 +350,20 @@ class _RouterLookup:
 
 
 @dataclass
+class _Device:
+    mac_address: str
+
+
+@dataclass
 class _DeviceLookup:
+    """``mac`` defaults to ``None`` -- the "this platform never learned the
+    guest's MAC" case, which the RouterOS branch tolerates (it also matches
+    on the portal ``user``) and the controller branch cannot."""
+
+    mac: str | None = None
+
     async def get_device_by_id(self, device_id):
-        return None
+        return _Device(mac_address=self.mac) if self.mac else None
 
 
 @dataclass
@@ -375,10 +416,6 @@ class TestEndOnRouterAsksTheVendorFirst:
 
         reached: list[dict] = []
 
-        async def controller_terminator(**kwargs):
-            reached.append(kwargs)
-            return True
-
         router = _Router(
             vendor="tplink_omada",
             api_username=None,
@@ -386,21 +423,19 @@ class TestEndOnRouterAsksTheVendorFirst:
         )
         terminator = LiveSessionTerminator(
             router_lookup=_RouterLookup(router),
-            device_lookup=_DeviceLookup(),
-            controller_terminator=controller_terminator,
+            device_lookup=_DeviceLookup(mac=CLIENT_MAC),
+            controller_terminator=_mac_only_controller_terminator(reached),
         )
 
         organization_id = uuid.uuid4()
         try:
             outcome = await terminator.end_on_router(
-                session=_Session(),
-                identifier=CLIENT_MAC,
+                session=_Session(device_id=uuid.uuid4()),
+                identifier=GUEST_IDENTIFIER,
                 organization_id=organization_id,
             )
         except BlockEnforcementMissingCredentialsError:  # pragma: no cover
-            pytest.fail(
-                "the credential question was asked before the vendor question"
-            )
+            pytest.fail("the credential question was asked before the vendor question")
 
         assert outcome.ended_cleanly is True
         assert reached == [
@@ -422,9 +457,6 @@ class TestEndOnRouterAsksTheVendorFirst:
             ControllerSessionTerminationUnavailableError,
         )
 
-        async def controller_terminator(**_kwargs):
-            return False
-
         terminator = LiveSessionTerminator(
             router_lookup=_RouterLookup(
                 _Router(
@@ -433,12 +465,14 @@ class TestEndOnRouterAsksTheVendorFirst:
                     management_ip_address=None,
                 )
             ),
-            device_lookup=_DeviceLookup(),
-            controller_terminator=controller_terminator,
+            device_lookup=_DeviceLookup(mac=CLIENT_MAC),
+            controller_terminator=_mac_only_controller_terminator([], ended=False),
         )
         with pytest.raises(ControllerSessionTerminationUnavailableError):
             await terminator.end_on_router(
-                session=_Session(), identifier=CLIENT_MAC, organization_id=uuid.uuid4()
+                session=_Session(device_id=uuid.uuid4()),
+                identifier=GUEST_IDENTIFIER,
+                organization_id=uuid.uuid4(),
             )
 
     async def test_an_unwired_controller_path_says_so_rather_than_naming_credentials(
@@ -457,13 +491,95 @@ class TestEndOnRouterAsksTheVendorFirst:
                     management_ip_address=None,
                 )
             ),
-            device_lookup=_DeviceLookup(),
+            device_lookup=_DeviceLookup(mac=CLIENT_MAC),
         )
         with pytest.raises(ControllerSessionTerminationUnavailableError) as excinfo:
             await terminator.end_on_router(
-                session=_Session(), identifier=CLIENT_MAC, organization_id=uuid.uuid4()
+                session=_Session(device_id=uuid.uuid4()),
+                identifier=GUEST_IDENTIFIER,
+                organization_id=uuid.uuid4(),
             )
         assert "credential" not in str(excinfo.value).lower()
+
+
+class TestTheControllerIsAddressedByMacNotIdentifier:
+    """The defect this class exists for was live in production.
+
+    ``_end_on_controller`` passed ``client_mac=identifier``. For an OTP
+    guest that is a phone number, ``normalize_client_mac`` rejects it, the
+    terminator returns ``False``, and every controller-side disconnect at an
+    Omada venue failed -- session timeout, the FUP daily limit and block
+    enforcement all lost their device half while the platform's own records
+    said the guest was gone.
+    """
+
+    async def test_the_session_mac_is_what_reaches_the_controller(self) -> None:
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+
+        reached: list[dict] = []
+        router = _Router(
+            vendor="tplink_omada",
+            api_username=None,
+            management_ip_address=None,
+        )
+        terminator = LiveSessionTerminator(
+            router_lookup=_RouterLookup(router),
+            device_lookup=_DeviceLookup(mac=CLIENT_MAC),
+            controller_terminator=_mac_only_controller_terminator(reached),
+        )
+
+        organization_id = uuid.uuid4()
+        outcome = await terminator.end_on_router(
+            session=_Session(device_id=uuid.uuid4()),
+            identifier=GUEST_IDENTIFIER,
+            organization_id=organization_id,
+        )
+
+        assert outcome.ended_cleanly is True
+        assert reached == [
+            {
+                "location_id": router.location_id,
+                "organization_id": organization_id,
+                "client_mac": CLIENT_MAC,
+            }
+        ]
+        # The point, stated as an assertion rather than left to the reader:
+        # the guest's identifier is NOT what the controller was addressed
+        # with, however MAC-shaped some other guest's identifier might be.
+        assert reached[0]["client_mac"] != GUEST_IDENTIFIER
+
+    async def test_a_session_with_no_known_mac_refuses_instead_of_guessing(
+        self,
+    ) -> None:
+        """A login that carried no ``device_mac`` leaves nothing to address
+        the controller with. The honest answer is the same "may still be
+        online" refusal the unreachable-controller case gets -- not a call
+        with the identifier in the MAC's place, which is what shipped."""
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+        from app.domains.guest_access.exceptions import (
+            ControllerSessionTerminationUnavailableError,
+        )
+
+        reached: list[dict] = []
+        terminator = LiveSessionTerminator(
+            router_lookup=_RouterLookup(
+                _Router(
+                    vendor="tplink_omada",
+                    api_username=None,
+                    management_ip_address=None,
+                )
+            ),
+            device_lookup=_DeviceLookup(mac=None),
+            controller_terminator=_mac_only_controller_terminator(reached),
+        )
+
+        with pytest.raises(ControllerSessionTerminationUnavailableError):
+            await terminator.end_on_router(
+                session=_Session(device_id=None),
+                identifier=GUEST_IDENTIFIER,
+                organization_id=uuid.uuid4(),
+            )
+        assert reached == [], "the controller must not be called with no MAC"
 
 
 class TestMikroTikPathIsUnchanged:
@@ -550,9 +666,7 @@ class _SpeedHook:
     ):
         if self.error is not None:
             raise self.error
-        self.calls.append(
-            ("set", location_id, client_mac, down_kbps, up_kbps)
-        )
+        self.calls.append(("set", location_id, client_mac, down_kbps, up_kbps))
         return object()
 
     async def clear_client_speed(
