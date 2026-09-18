@@ -196,6 +196,7 @@ from .validators import (
     normalize_client_mac,
     portal_readiness_gaps,
     portal_redirect_timestamp_age_seconds,
+    resolve_authorization_duration_seconds,
     summarize_redirect_url,
     synthesize_fleet_identity,
     validate_auth_mode_credentials,
@@ -586,6 +587,7 @@ def build_portal_authorize_diagnostics(
     request_snapshot: dict[str, Any] | None = None,
     provider_code: int | None = None,
     now: datetime | None = None,
+    requested_duration_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Everything a support engineer needs to diff a failed authorization.
 
@@ -687,7 +689,17 @@ def build_portal_authorize_diagnostics(
                 if age_seconds is None
                 else age_seconds > PORTAL_REDIRECT_STALE_AFTER_SECONDS
             ),
-            "requested_duration_seconds": integration.session_duration_seconds,
+            # The duration this call actually asked for, which since the
+            # authorization duration started coming from the guest's own
+            # session is not necessarily the integration's stored default.
+            # Reporting the column here would hand a support engineer the
+            # wrong number for the one field this record exists to let them
+            # diff.
+            "requested_duration_seconds": (
+                integration.session_duration_seconds
+                if requested_duration_seconds is None
+                else requested_duration_seconds
+            ),
         },
         "controller": {"provider_code": provider_code},
     }
@@ -3525,6 +3537,18 @@ class NetworkIntegrationService:
                 str(integration.router_id),
             ),
             pre_auth_host=pre_auth_host,
+            # THE PORTAL'S OWN DEFAULT, and deliberately still the stored
+            # column rather than the venue's SESSION policy.
+            #
+            # This is a one-off write of the controller's portal object at
+            # setup time, and it governs only authorizations this platform
+            # did not make -- every guest we authorize carries an explicit
+            # per-call duration derived from their own session (see
+            # ``authorize_portal_client``). Deriving it from the policy
+            # would mean re-writing the controller's portal every time a
+            # venue edits a policy, which is a live controller write on a
+            # settings save, and it would still be a snapshot the moment
+            # after. Named as a gap rather than closed.
             auth_timeout_minutes=max(
                 1, -(-integration.session_duration_seconds // 60)
             ),
@@ -4138,11 +4162,34 @@ class NetworkIntegrationService:
         credentials = self._credentials_for(integration)
         provider_impl = self._provider(integration.provider)
         config = self._connection_config(integration, credentials)
+        # HOW LONG THE CONTROLLER IS TOLD TO HOLD THIS GUEST.
+        #
+        # From the guest's own session, not from the integration's stored
+        # default. ``GuestSession.session_timeout_minutes`` is the venue's
+        # ``PolicyType.SESSION`` rule as it was resolved for this guest at
+        # login, and it is the number this platform's own sweep will end the
+        # session on. Passing the column instead meant a venue that set 30
+        # minutes got a 60-minute controller-side authorization -- the
+        # platform stopped the session at 30 and the controller kept
+        # forwarding the client for another half hour, with the venue's
+        # setting honoured on exactly one of the two systems.
+        #
+        # Taking the session's snapshot rather than re-resolving the policy
+        # here is the stronger guarantee: the two systems are then reading
+        # the *same recorded number*, so they cannot disagree even if the
+        # policy is edited between login and this call. See
+        # ``validators.resolve_authorization_duration_seconds``.
+        duration_seconds = resolve_authorization_duration_seconds(
+            session_timeout_minutes=getattr(
+                session, "session_timeout_minutes", None
+            ),
+            fallback_seconds=integration.session_duration_seconds,
+        )
         try:
             result = await provider_impl.authorize_guest(
                 config,
                 context,
-                duration_seconds=integration.session_duration_seconds,
+                duration_seconds=duration_seconds,
             )
         except ProviderError as error:
             await self._record_authorization(
@@ -4168,6 +4215,7 @@ class NetworkIntegrationService:
                             integration=integration,
                             request_snapshot=error.request_snapshot,
                             provider_code=error.provider_code,
+                            requested_duration_seconds=duration_seconds,
                         )
                     )
                 },
@@ -4202,6 +4250,7 @@ class NetworkIntegrationService:
                 normalized_client_mac=normalized_mac,
                 integration=integration,
                 result=result,
+                requested_duration_seconds=duration_seconds,
             ),
         )
         return PortalAuthorizationOutcome(
@@ -4618,6 +4667,7 @@ class NetworkIntegrationService:
         normalized_client_mac: str,
         integration: NetworkIntegration,
         result: ProviderAuthorizationResult,
+        requested_duration_seconds: int | None = None,
     ) -> dict[str, Any]:
         """The event context for a call the controller actually answered.
 
@@ -4650,6 +4700,7 @@ class NetworkIntegrationService:
                 normalized_client_mac=normalized_client_mac,
                 integration=integration,
                 request_snapshot=result.request_snapshot,
+                requested_duration_seconds=requested_duration_seconds,
             )
         )
         return event_context

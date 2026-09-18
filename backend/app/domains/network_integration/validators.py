@@ -120,6 +120,7 @@ __all__ = [
     "is_omada_site_id",
     "validate_external_site_id",
     "portal_redirect_timestamp_age_seconds",
+    "resolve_authorization_duration_seconds",
     "summarize_redirect_url",
     "synthesize_fleet_identity",
     "validate_auth_mode_credentials",
@@ -550,6 +551,62 @@ def validate_session_duration_seconds(value: int) -> int:
             f"{MIN_SESSION_DURATION_SECONDS} and {MAX_SESSION_DURATION_SECONDS}"
         )
     return value
+
+
+def resolve_authorization_duration_seconds(
+    *,
+    session_timeout_minutes: int | None,
+    fallback_seconds: int,
+) -> int:
+    """How long the controller should hold one guest authorized, derived
+    from the guest's own session rather than from a stored default.
+
+    ## What was wrong
+
+    ``NetworkIntegration.session_duration_seconds`` defaults to 3600 and was
+    never derived from anything. A venue whose SESSION policy says 30
+    minutes got a 60-minute controller-side authorization: this platform's
+    sweep ended the session at 30 and the controller went on forwarding the
+    client for another half hour. Two systems holding different beliefs
+    about the same guest, with the venue's own setting honoured by exactly
+    one of them.
+
+    ## Why the session row is the resolved policy
+
+    ``GuestSession.session_timeout_minutes`` is written at login by
+    ``GuestService._resolve_session_timeout_minutes``, which resolves
+    ``PolicyType.SESSION`` for that organization/location/guest and falls
+    back to the platform default. It is not a copy of the policy that might
+    be stale -- it *is* the resolved answer for this guest, and it is the
+    number the platform's own sweep will enforce against.
+
+    Deriving from it rather than re-resolving the policy at authorize time
+    is the stronger guarantee, not the lazier one: re-resolving could
+    disagree with the session row if the policy changed in the seconds
+    between login and authorize, and then the two systems would be out of
+    step again for the life of that session. Taking the snapshot makes
+    agreement structural.
+
+    ## The fallback
+
+    ``session_timeout_minutes`` is nullable -- an unlimited grant, or a row
+    written before the resolver existed. There is no honest duration to
+    derive from "no limit", and the controller's call requires a number, so
+    the integration's stored ``session_duration_seconds`` remains the
+    fallback. That is exactly today's behaviour for exactly those sessions.
+
+    The result is clamped into the range the column itself accepts
+    (``validate_session_duration_seconds``), because a session timeout is
+    validated against different bounds (minutes, its own range) and a value
+    the controller would reject outright is worse than a clamped one: the
+    guest would simply not get online.
+    """
+    if session_timeout_minutes is None or session_timeout_minutes <= 0:
+        return fallback_seconds
+    seconds = session_timeout_minutes * 60
+    return max(
+        MIN_SESSION_DURATION_SECONDS, min(seconds, MAX_SESSION_DURATION_SECONDS)
+    )
 
 
 def validate_sync_interval_seconds(value: int) -> int:
