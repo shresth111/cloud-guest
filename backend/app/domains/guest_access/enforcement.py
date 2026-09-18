@@ -357,15 +357,47 @@ class LiveSessionTerminator:
         # this is the eighth. Asking the vendor first costs nothing on the
         # MikroTik path, which reaches the same two lines in the same order
         # one branch later, with the same adapter and the same credentials.
+        mac_address = await self._session_mac_address(session)
+
         if is_controller_managed(router):
+            # THE MAC, NOT THE IDENTIFIER.
+            #
+            # This passed ``identifier`` -- the portal ``user``, which is a
+            # phone number for an OTP guest and an email for a password one --
+            # into a parameter the controller hook immediately runs through
+            # ``normalize_client_mac``. That raises on anything that is not
+            # six hex octets, the hook returns False, and
+            # ``_end_on_controller`` turns False into
+            # ``ControllerSessionTerminationUnavailableError``, which
+            # ``issue_live_disconnect`` swallows into
+            # ``disconnect_enforced: False``.
+            #
+            # So every platform-initiated disconnect at an Omada venue failed
+            # for every guest whose identifier was not MAC-shaped, which is
+            # essentially all of them: session timeout, the idle sweep, the
+            # FUP time and data caps, the per-session data cap, an operator
+            # pressing Terminate, the whitelist-only sweep and the open-hours
+            # sweep. The row said EXPIRED and the guest stayed forwarded.
+            #
+            # ``_session_mac_address`` was sitting three lines below, used
+            # only by the RouterOS branch. Hoisted above the fork so both
+            # halves resolve the device the same way, once.
+            #
+            # ``None`` is still passed through rather than guessed at: the
+            # hook rejects it, the outcome is recorded as not enforced, and
+            # that is the truth for a session this platform has no device row
+            # for. The MikroTik path is untouched -- it always took this
+            # value, and it additionally matches on ``username``.
             return await self._end_on_controller(
-                router, identifier=identifier, organization_id=organization_id
+                router,
+                identifier=identifier,
+                client_mac=mac_address,
+                organization_id=organization_id,
             )
 
         credentials = self._resolve_device_credentials(router)
         adapter: BaseGuestAccessAdapter = self._adapter_factory(router.vendor)
 
-        mac_address = await self._session_mac_address(session)
         outcome = await adapter.end_sessions(
             credentials, mac_address=mac_address, username=identifier
         )
@@ -387,10 +419,17 @@ class LiveSessionTerminator:
         router: BlockRouterRow,
         *,
         identifier: str,
+        client_mac: str | None,
         organization_id: uuid.UUID | None,
     ) -> SessionEndOutcome:
         """End the session through the venue's controller instead of through
         a connection to this row.
+
+        ``client_mac`` is what the controller is addressed by and
+        ``identifier`` is kept only for the error path, which names the guest
+        rather than their hardware. They are separate parameters because they
+        were once the same one, and the confusion silently defeated every
+        platform-initiated disconnect at an Omada venue -- see the caller.
 
         Reached only for a controller-managed router, where there is no host
         to open a socket to. The controller is asked to drop the client, and
@@ -420,10 +459,17 @@ class LiveSessionTerminator:
         location_id = getattr(router, "location_id", None)
         if location_id is None:
             raise ControllerSessionTerminationUnavailableError(router.id)
+        # No device row for this session means no MAC, and a controller
+        # cannot be asked to drop a client it has not been told the identity
+        # of. Refusing here rather than sending the identifier keeps the
+        # outcome honest -- `enforcement_delivered: False` -- instead of
+        # spending a controller round-trip to be told the same thing.
+        if not client_mac:
+            raise ControllerSessionTerminationUnavailableError(router.id)
         ended = await self.controller_terminator(
             location_id=location_id,
             organization_id=organization_id,
-            client_mac=identifier,
+            client_mac=client_mac,
         )
         if not ended:
             # The controller was never reached, or this identifier is not

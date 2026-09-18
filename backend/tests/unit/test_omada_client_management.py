@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -234,7 +235,7 @@ class TestAVenueAdminCannotReachAnotherTenant:
     async def test_the_refusal_is_the_same_as_for_a_location_with_no_controller(
         self, action: str
     ) -> None:
-        """"Not yours" and "does not exist" must be indistinguishable. If
+        """ "Not yours" and "does not exist" must be indistinguishable. If
         these two messages ever diverge, the response becomes an oracle for
         enumerating another tenant's locations."""
         service, owner_org, location_id = _venue()
@@ -321,8 +322,20 @@ class _RouterLookup:
 
 @dataclass
 class _DeviceLookup:
+    """The device row a session points at, or nothing.
+
+    ``mac_address`` is what a controller is addressed by. It used to return
+    ``None`` unconditionally, which was invisible while the controller path
+    forwarded the portal identifier instead -- the tests passed a MAC as the
+    identifier and never noticed the device lookup was dead weight.
+    """
+
+    mac_address: str | None = CLIENT_MAC
+
     async def get_device_by_id(self, device_id):
-        return None
+        if self.mac_address is None:
+            return None
+        return SimpleNamespace(mac_address=self.mac_address)
 
 
 @dataclass
@@ -330,7 +343,9 @@ class _Session:
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     router_id: uuid.UUID = field(default_factory=uuid.uuid4)
     organization_id: uuid.UUID = field(default_factory=uuid.uuid4)
-    device_id: uuid.UUID | None = None
+    # Defaults to a real device, because a guest on the WiFi has one. The
+    # no-device case is a named exception now, exercised on its own below.
+    device_id: uuid.UUID | None = field(default_factory=uuid.uuid4)
 
 
 @dataclass
@@ -398,11 +413,13 @@ class TestEndOnRouterAsksTheVendorFirst:
                 organization_id=organization_id,
             )
         except BlockEnforcementMissingCredentialsError:  # pragma: no cover
-            pytest.fail(
-                "the credential question was asked before the vendor question"
-            )
+            pytest.fail("the credential question was asked before the vendor question")
 
         assert outcome.ended_cleanly is True
+        # The controller is addressed by the SESSION'S DEVICE MAC. This used
+        # to assert `identifier` arrived here, and the assertion held only
+        # because this test hands `identifier=CLIENT_MAC` -- a shape almost no
+        # real guest has. See the regression test directly below.
         assert reached == [
             {
                 "location_id": router.location_id,
@@ -410,6 +427,85 @@ class TestEndOnRouterAsksTheVendorFirst:
                 "client_mac": CLIENT_MAC,
             }
         ]
+
+    async def test_a_phone_number_identifier_still_reaches_the_controller(
+        self,
+    ) -> None:
+        """THE DEFECT, PINNED.
+
+        `_end_on_controller` forwarded `identifier` -- the portal `user`,
+        which is a phone number for an OTP guest and an email for a password
+        one -- into a parameter the controller hook runs through
+        `normalize_client_mac`. That raises on anything that is not six hex
+        octets, the hook returns False, and the caller records
+        `disconnect_enforced: False`.
+
+        So every platform-initiated disconnect at an Omada venue failed for
+        every guest whose identifier was not MAC-shaped, which is nearly all
+        of them: session timeout, the idle sweep, the FUP time and data caps,
+        an operator pressing Terminate, the whitelist-only and open-hours
+        sweeps. The row said EXPIRED and the guest stayed forwarded.
+
+        The old test suite could not catch it: every controller case passed a
+        MAC as the identifier.
+        """
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+
+        reached: list[dict] = []
+
+        async def controller_terminator(**kwargs):
+            reached.append(kwargs)
+            return True
+
+        terminator = LiveSessionTerminator(
+            router_lookup=_RouterLookup(
+                _Router(
+                    vendor="tplink_omada",
+                    api_username=None,
+                    management_ip_address=None,
+                )
+            ),
+            device_lookup=_DeviceLookup(mac_address=CLIENT_MAC),
+            controller_terminator=controller_terminator,
+        )
+        outcome = await terminator.end_on_router(
+            session=_Session(),
+            identifier="+919999999999",
+            organization_id=uuid.uuid4(),
+        )
+        assert outcome.ended_cleanly is True
+        assert [call["client_mac"] for call in reached] == [CLIENT_MAC]
+
+    async def test_a_session_with_no_device_is_not_reported_as_enforced(
+        self,
+    ) -> None:
+        """A controller cannot be asked to drop a client it has not been told
+        the identity of. Refusing here keeps the outcome honest -- the caller
+        records `enforcement_delivered: False` -- rather than spending a
+        round-trip to be told the same thing, or, worse, sending the portal
+        identifier and having it look like it worked."""
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+        from app.domains.guest_access.exceptions import (
+            ControllerSessionTerminationUnavailableError,
+        )
+
+        terminator = LiveSessionTerminator(
+            router_lookup=_RouterLookup(
+                _Router(
+                    vendor="tplink_omada",
+                    api_username=None,
+                    management_ip_address=None,
+                )
+            ),
+            device_lookup=_DeviceLookup(mac_address=None),
+            controller_terminator=_unreachable_controller,
+        )
+        with pytest.raises(ControllerSessionTerminationUnavailableError):
+            await terminator.end_on_router(
+                session=_Session(device_id=None),
+                identifier="+919999999999",
+                organization_id=uuid.uuid4(),
+            )
 
     async def test_a_controller_that_could_not_be_reached_is_not_reported_as_success(
         self,
@@ -550,9 +646,7 @@ class _SpeedHook:
     ):
         if self.error is not None:
             raise self.error
-        self.calls.append(
-            ("set", location_id, client_mac, down_kbps, up_kbps)
-        )
+        self.calls.append(("set", location_id, client_mac, down_kbps, up_kbps))
         return object()
 
     async def clear_client_speed(
