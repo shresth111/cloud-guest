@@ -201,6 +201,16 @@ TERMINATION_RECONNECT_COOLDOWN_MINUTES = 60
 # and its honest scope limitation around voucher re-validation.
 RECONNECT_GRACE_MINUTES = 30
 
+#: How many of a guest's most recent sessions RADIUS accounting scans when
+#: the NAS names the device it is reporting on (``Calling-Station-Id``). It
+#: only has to cover the sessions a guest can hold at once on one router --
+#: ``DEFAULT_MAX_DEVICES_PER_GUEST`` plus the recently-ended rows a
+#: retransmitted Accounting-Stop can still legitimately land on -- so 20 is
+#: generous. Bounded rather than unbounded because this runs on every
+#: accounting packet from every venue, and an unbounded scan of a regular's
+#: whole session history is a cost that grows with loyalty.
+RADIUS_ACCOUNTING_DEVICE_MATCH_SCAN_LIMIT = 20
+
 BYTES_PER_MB = 1024 * 1024
 
 # How long, after an OTP-authenticated ``GuestSession`` is created, its
