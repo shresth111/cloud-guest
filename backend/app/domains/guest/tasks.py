@@ -243,7 +243,15 @@ def _build_access_decision_service(session: AsyncSession):
     from app.domains.guest_access.repository import GuestAccessRepository
     from app.domains.guest_access.service import GuestAccessService
 
-    return GuestAccessService(GuestAccessRepository(session), block_enforcer=None)
+    return GuestAccessService(
+        GuestAccessRepository(session),
+        block_enforcer=None,
+        # Read-only sweep: it expires rules, it never creates one, so there
+        # is no ``location_id`` to verify. Stated rather than defaulted --
+        # the constructor has no default, so a future write added here
+        # cannot silently skip the check.
+        location_lookup=None,
+    )
 
 
 def _build_mac_authorization_service(session: AsyncSession):

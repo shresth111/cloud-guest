@@ -187,6 +187,18 @@ class GuestRuleImportRejectionCode(StrEnum):
     INVALID_LOCATION_ID = "invalid_location_id"
     #: The row named a location the caller is not confined to.
     LOCATION_OUT_OF_SCOPE = "location_out_of_scope"
+    #: The row named a well-formed UUID that is not a location of this
+    #: organization. Distinct from ``INVALID_LOCATION_ID`` (not a UUID at
+    #: all) because the operator's fix differs: one is a malformed cell,
+    #: the other is the wrong venue pasted in. Deliberately does not
+    #: distinguish "no such location" from "another tenant's location" --
+    #: see ``exceptions.InvalidAccessRuleLocationError``.
+    UNKNOWN_LOCATION = "unknown_location"
+    #: The row resolved to no location at all -- an organization-wide rule,
+    #: which applies at every venue -- and the caller holds only
+    #: location-level access. See
+    #: ``exceptions.OrganizationWideRuleScopeError``.
+    ORGANIZATION_WIDE_NOT_PERMITTED = "organization_wide_not_permitted"
     #: The optional contact ``email`` column is not email-shaped. Rejected
     #: rather than dropped: half-storing a row someone typed is how the
     #: dashboard's Whitelist form used to lose the email it collected.

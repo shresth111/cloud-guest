@@ -43,6 +43,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.session import get_db_session
 from app.domains.guest.constants import GuestSessionStatus
 from app.domains.guest.repository import GuestRepository
+from app.domains.location.dependencies import get_location_service
+from app.domains.location.service import LocationService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.location_scope import (
     LocationScope,
@@ -106,12 +108,24 @@ def get_block_enforcer(
 def get_guest_access_service(
     repository: GuestAccessRepositoryProtocol = Depends(get_guest_access_repository),
     block_enforcer: BlockEnforcerProtocol = Depends(get_block_enforcer),
+    location_service: LocationService = Depends(get_location_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> GuestAccessService:
+    """The write-capable service the API routes use.
+
+    ``location_lookup`` is composed from the Location domain's own
+    already-wired provider rather than a second parallel graph -- the same
+    thing ``app.domains.support_tickets.dependencies`` does for its own
+    identical ``location_id``-belongs-to-``organization_id`` check, and the
+    same reason this module composes ``get_router_service`` rather than
+    rebuilding it. ``app.domains.location`` imports nothing from this
+    domain, so no cycle is closed.
+    """
     return GuestAccessService(
         repository,
         block_enforcer=block_enforcer,
+        location_lookup=location_service,
         audit_writer=audit_repository,
         caller_location_scope=caller_location_scope,
     )
@@ -125,8 +139,14 @@ def get_access_decision_service(
     ``/agent/authorized-macs`` poll. No enforcer, no audit writer, no
     caller location scope: the caller is a router, not a user, and this
     path must not open a router connection or pull in the whole
-    ``RouterService`` graph on a once-a-minute, per-router request."""
-    return GuestAccessService(repository, block_enforcer=None)
+    ``RouterService`` graph on a once-a-minute, per-router request.
+
+    ``location_lookup=None`` is stated rather than defaulted (the
+    constructor has no default -- see ``GuestAccessService.__init__``):
+    this service only reads, so it needs no location verification, and a
+    write attempted through it raises rather than storing a rule nobody
+    checked."""
+    return GuestAccessService(repository, block_enforcer=None, location_lookup=None)
 
 
 __all__ = [

@@ -78,16 +78,25 @@ from .service import (
 logger = logging.getLogger(__name__)
 
 
-def _build_router_service(session) -> RouterService:  # noqa: ANN001
+def _build_location_service(session) -> LocationService:  # noqa: ANN001
+    """One builder, two consumers: ``RouterService`` below and the
+    ``GuestAccessService`` this module's sweep composes, which needs it to
+    verify the ``location_id`` a device rule is written against (see
+    ``app.domains.guest_access.service.GuestAccessService
+    ._enforce_write_location``)."""
     organization_service = OrganizationService(OrganizationRepository(session))
-    location_service = LocationService(
+    return LocationService(
         LocationRepository(session),
         organization_service,
         location_code_counter=LocationCodeCounterRepository(session),
     )
+
+
+def _build_router_service(session) -> RouterService:  # noqa: ANN001
+    organization_service = OrganizationService(OrganizationRepository(session))
     return RouterService(
         RouterRepository(session),
-        location_service,
+        _build_location_service(session),
         organization_service,
         audit_writer=RBACRepository(session),
     )
@@ -190,6 +199,11 @@ async def _sync_single_router_devices_async(
                 # visible: those rows record ``UNENFORCED`` rather than
                 # silently ending no sessions.
                 block_enforcer=None,
+                # A real lookup, not ``None``: this sweep's protocol surface
+                # includes ``create_device_rule``, and a write path without
+                # one refuses outright rather than storing a rule at an
+                # unverified location.
+                location_lookup=_build_location_service(session),
                 audit_writer=RBACRepository(session),
             )
             guest_repository = GuestRepository(session)

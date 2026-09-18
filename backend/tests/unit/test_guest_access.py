@@ -29,12 +29,16 @@ from app.domains.guest_access.constants import (
     GuestRuleImportRejectionCode,
 )
 from app.domains.guest_access.exceptions import (
+    AccessRuleLocationUnverifiableError,
     AccessRuleNotFoundError,
     CountryCodeRequiredError,
+    CrossLocationAccessRuleError,
     CrossOrganizationAccessRuleError,
+    InvalidAccessRuleLocationError,
     InvalidGuestIdentifierError,
     InvalidRuleExpiryError,
     OrganizationRequiredError,
+    OrganizationWideRuleScopeError,
     TemporaryRuleRequiresExpiryError,
 )
 from app.domains.guest_access.models import DeviceAccessRule, GuestAccessRule
@@ -54,6 +58,7 @@ from app.domains.guest_access.validators import (
     validate_identifier_shape,
     validate_rule_expiry,
 )
+from app.domains.location.exceptions import LocationNotFoundError
 
 # ============================================================================
 # Test doubles
@@ -272,10 +277,48 @@ class FakeGuestAccessRepository:
 
 
 @dataclass
+class _FakeLocation:
+    id: uuid.UUID
+    organization_id: uuid.UUID
+
+
+class FakeLocationLookup:
+    """Stands in for ``app.domains.location.service.LocationService``'s
+    ``get_location`` -- the one method ``GuestAccessService`` composes.
+
+    Raises the *real* ``LocationNotFoundError`` for an unknown id rather
+    than returning ``None``, because that is the branch the service catches
+    and collapses into ``InvalidAccessRuleLocationError``. A fake that
+    returned ``None`` would exercise a path the real service never takes.
+    """
+
+    def __init__(self) -> None:
+        self.locations: dict[uuid.UUID, _FakeLocation] = {}
+        self.lookups: list[uuid.UUID] = []
+
+    def add(self, location_id: uuid.UUID, organization_id: uuid.UUID) -> None:
+        self.locations[location_id] = _FakeLocation(location_id, organization_id)
+
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> object:
+        self.lookups.append(location_id)
+        location = self.locations.get(location_id)
+        if location is None:
+            raise LocationNotFoundError(location_id)
+        return location
+
+
+@dataclass
 class Fixture:
     repository: FakeGuestAccessRepository
     audit_writer: FakeAuditLogWriter
     service: GuestAccessService
+    location_lookup: FakeLocationLookup
     organization_id: uuid.UUID
     location_id: uuid.UUID
     actor_user_id: uuid.UUID
@@ -291,15 +334,26 @@ def make_fixture() -> Fixture:
     # ``test_guest_access_block_enforcement.py``, including a test that a
     # ``None`` enforcer records ``UNENFORCED`` rather than pretending the
     # block reached a router.
+    organization_id = uuid.uuid4()
+    location_id = uuid.uuid4()
+    location_lookup = FakeLocationLookup()
+    # The fixture's own location is a real one of the fixture's own
+    # organization, so every pre-existing test that names it keeps writing
+    # exactly the rules it wrote before.
+    location_lookup.add(location_id, organization_id)
     service = GuestAccessService(
-        repository, block_enforcer=None, audit_writer=audit_writer
+        repository,
+        block_enforcer=None,
+        location_lookup=location_lookup,
+        audit_writer=audit_writer,
     )
     return Fixture(
         repository=repository,
         audit_writer=audit_writer,
         service=service,
-        organization_id=uuid.uuid4(),
-        location_id=uuid.uuid4(),
+        location_lookup=location_lookup,
+        organization_id=organization_id,
+        location_id=location_id,
         actor_user_id=uuid.uuid4(),
     )
 
@@ -1782,3 +1836,567 @@ class TestARefusalNeverCarriesTheOperatorsNote:
             WhitelistOnlyAccessDeniedError("   ").message
             == DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE
         )
+
+
+# ============================================================================
+# Who may write a rule, and where
+# ============================================================================
+
+
+def _confined(f: Fixture, *locations: uuid.UUID) -> None:
+    """Make the fixture's caller a location-confined one.
+
+    Mirrors how the real thing arrives: `CallerLocationScope` resolves the
+    caller's grants to a frozenset and the DI provider hands it to the
+    constructor. A caller holding a GLOBAL or ORGANIZATION role resolves to
+    `None` instead, which is what `make_fixture` leaves in place.
+    """
+    f.service.caller_location_scope = frozenset(locations or (f.location_id,))
+
+
+class TestWhoMayWriteARule:
+    """The write half of location scoping.
+
+    The read half (`get_guest_rule`, `get_device_rule`, export) was already
+    enforced; create was not, so a caller holding one venue could write a
+    rule naming another venue -- or naming none, which is every venue.
+    """
+
+    async def test_confined_caller_cannot_create_a_rule_at_another_venue(
+        self,
+    ) -> None:
+        f = make_fixture()
+        other_venue = uuid.uuid4()
+        f.location_lookup.add(other_venue, f.organization_id)
+        _confined(f)
+
+        with pytest.raises(CrossLocationAccessRuleError):
+            await f.service.create_guest_rule(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=other_venue,
+                identifier="+919876543210",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason="not their venue to block at",
+                expires_at=None,
+                actor_user_id=f.actor_user_id,
+            )
+        assert f.repository.guest_rules == {}
+
+    async def test_confined_caller_cannot_create_a_device_rule_elsewhere(
+        self,
+    ) -> None:
+        """Both entities, not just the identifier-keyed one -- a MAC-keyed
+        block is the same ban by another key."""
+        f = make_fixture()
+        other_venue = uuid.uuid4()
+        f.location_lookup.add(other_venue, f.organization_id)
+        _confined(f)
+
+        with pytest.raises(CrossLocationAccessRuleError):
+            await f.service.create_device_rule(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=other_venue,
+                mac_address="AA:BB:CC:DD:EE:FF",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=f.actor_user_id,
+            )
+        assert f.repository.device_rules == {}
+
+    async def test_confined_caller_may_create_at_its_own_venue(self) -> None:
+        """The control that must not over-fire. A venue manager blocking
+        somebody at their own venue is the ordinary case, and refusing it
+        would be a worse outage than the hole."""
+        f = make_fixture()
+        _confined(f)
+
+        rule = await f.service.create_guest_rule(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=f.location_id,
+            identifier="+919876543210",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="theirs to block",
+            expires_at=None,
+            actor_user_id=f.actor_user_id,
+        )
+        assert rule.location_id == f.location_id
+
+    async def test_confined_caller_cannot_write_an_org_wide_rule(self) -> None:
+        """`location_id = NULL` is not "no location" -- the matching query
+        ORs `location_id IS NULL` in at every venue, so it is the broadest
+        rule this domain can express. This is the case the dashboard defect
+        produced: a form that named one venue, submitted without its
+        `location_id`, banning somebody account-wide.
+        """
+        f = make_fixture()
+        _confined(f)
+
+        with pytest.raises(OrganizationWideRuleScopeError):
+            await f.service.create_guest_rule(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=None,
+                identifier="+919876543210",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason="every venue, from a caller holding one",
+                expires_at=None,
+                actor_user_id=f.actor_user_id,
+            )
+        assert f.repository.guest_rules == {}
+
+    async def test_confined_caller_cannot_write_an_org_wide_device_rule(
+        self,
+    ) -> None:
+        f = make_fixture()
+        _confined(f)
+
+        with pytest.raises(OrganizationWideRuleScopeError):
+            await f.service.create_device_rule(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=None,
+                mac_address="AA:BB:CC:DD:EE:FF",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=f.actor_user_id,
+            )
+        assert f.repository.device_rules == {}
+
+    async def test_an_unconfined_caller_still_writes_org_wide_rules(self) -> None:
+        """The decision, stated as a test: an org-wide rule is legitimate,
+        and the people who may write one are those holding a GLOBAL or
+        ORGANIZATION role -- exactly the callers `CallerLocationScope`
+        resolves to `None`. Chain-wide blocklists are a real product
+        feature and this must not take them away.
+        """
+        f = make_fixture()
+        assert f.service.caller_location_scope is None
+
+        rule = await f.service.create_guest_rule(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="chain-wide, from an org admin",
+            expires_at=None,
+            actor_user_id=f.actor_user_id,
+        )
+        assert rule.location_id is None
+        # And it does what an org-wide rule is for: it bites everywhere.
+        decision = await f.service.check_access(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=uuid.uuid4(),
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.allowed is False
+
+
+class TestARuleMustNameARealPlace:
+    async def test_unknown_location_is_refused_not_stored(self) -> None:
+        """Stored, such a rule is listed, shown as active, and matches
+        nobody -- `list_matching_guest_rules` only ever ORs `IS NULL`
+        against an exact id. A block that blocks nobody is worse than a
+        refusal, because the operator believes it worked.
+        """
+        f = make_fixture()
+
+        with pytest.raises(InvalidAccessRuleLocationError):
+            await f.service.create_guest_rule(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=uuid.uuid4(),
+                identifier="+919876543210",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=f.actor_user_id,
+            )
+        assert f.repository.guest_rules == {}
+
+    async def test_unknown_device_rule_location_is_refused_too(self) -> None:
+        f = make_fixture()
+
+        with pytest.raises(InvalidAccessRuleLocationError):
+            await f.service.create_device_rule(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=uuid.uuid4(),
+                mac_address="AA:BB:CC:DD:EE:FF",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=f.actor_user_id,
+            )
+        assert f.repository.device_rules == {}
+
+    async def test_another_tenants_location_is_refused_identically(self) -> None:
+        """The anti-enumeration property, asserted rather than assumed.
+
+        A location that exists but belongs to another organization must be
+        indistinguishable from one that does not exist at all -- same
+        exception type, same status code, same message. Otherwise any
+        authenticated caller can probe UUIDs and read the difference to map
+        other tenants' venues.
+        """
+        f = make_fixture()
+        someone_elses = uuid.uuid4()
+        f.location_lookup.add(someone_elses, uuid.uuid4())
+
+        async def _create(location_id: uuid.UUID) -> Exception:
+            with pytest.raises(InvalidAccessRuleLocationError) as caught:
+                await f.service.create_guest_rule(
+                    organization_id=f.organization_id,
+                    requesting_organization_id=f.organization_id,
+                    location_id=location_id,
+                    identifier="+919876543210",
+                    rule_type=AccessRuleType.BLOCKLIST,
+                    reason=None,
+                    expires_at=None,
+                    actor_user_id=f.actor_user_id,
+                )
+            return caught.value
+
+        nonexistent = await _create(uuid.uuid4())
+        foreign = await _create(someone_elses)
+
+        assert type(nonexistent) is type(foreign)
+        assert nonexistent.status_code == foreign.status_code == 400
+        assert nonexistent.message == foreign.message
+        # And the message names neither the id nor the other organization.
+        assert str(someone_elses) not in foreign.message
+
+    async def test_a_confined_caller_learns_nothing_from_existence(self) -> None:
+        """The other half of the oracle: scope is checked *before* the
+        lookup, so a confined caller gets the same 403 for a venue that
+        exists in their own organization as for a UUID that exists nowhere.
+        They cannot use this endpoint to test whether an id is real.
+        """
+        f = make_fixture()
+        real_other_venue = uuid.uuid4()
+        f.location_lookup.add(real_other_venue, f.organization_id)
+        _confined(f)
+
+        for location_id in (real_other_venue, uuid.uuid4()):
+            with pytest.raises(CrossLocationAccessRuleError):
+                await f.service.create_guest_rule(
+                    organization_id=f.organization_id,
+                    requesting_organization_id=f.organization_id,
+                    location_id=location_id,
+                    identifier="+919876543210",
+                    rule_type=AccessRuleType.BLOCKLIST,
+                    reason=None,
+                    expires_at=None,
+                    actor_user_id=f.actor_user_id,
+                )
+        # Not one lookup ran: the refusal never reached the Location domain.
+        assert f.location_lookup.lookups == []
+
+    async def test_a_write_path_without_a_lookup_refuses_rather_than_skips(
+        self,
+    ) -> None:
+        """`location_lookup=None` is legitimate on the read-only
+        constructions. What must never happen is that it silently degrades
+        into "no check" -- the exact shape of the defect being closed.
+        """
+        f = make_fixture()
+        f.service.location_lookup = None
+
+        with pytest.raises(AccessRuleLocationUnverifiableError):
+            await f.service.create_guest_rule(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=f.location_id,
+                identifier="+919876543210",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=f.actor_user_id,
+            )
+        assert f.repository.guest_rules == {}
+
+
+class TestImportUsesTheSameGate:
+    """An upload must not reach past what the form can."""
+
+    async def test_unknown_location_row_is_rejected_with_its_own_code(self) -> None:
+        f = make_fixture()
+        result = await _import(
+            f,
+            [
+                {"identifier": "+919876543210", "location_id": f.location_id},
+                {"identifier": "+919876543211", "location_id": uuid.uuid4()},
+            ],
+        )
+        assert result.imported_count == 1
+        assert result.rejected[0].code == GuestRuleImportRejectionCode.UNKNOWN_LOCATION
+
+    async def test_confined_caller_cannot_import_org_wide_rows(self) -> None:
+        f = make_fixture()
+        _confined(f)
+        result = await _import(
+            f,
+            [
+                {"identifier": "+919876543210", "location_id": f.location_id},
+                {"identifier": "+919876543211"},  # falls back to the batch
+            ],
+            default_location_id=None,
+        )
+        assert result.imported_count == 1
+        assert (
+            result.rejected[0].code
+            == GuestRuleImportRejectionCode.ORGANIZATION_WIDE_NOT_PERMITTED
+        )
+
+    async def test_a_batch_naming_one_venue_costs_one_lookup(self) -> None:
+        """Per-row correctness without per-row cost: a 200-room upload must
+        not become 200 location queries."""
+        f = make_fixture()
+        result = await _import(
+            f,
+            [
+                {"identifier": f"+91987654{n:04d}", "location_id": f.location_id}
+                for n in range(25)
+            ],
+        )
+        assert result.imported_count == 25
+        assert f.location_lookup.lookups == [f.location_id]
+
+
+class TestTheWiringIsTheOneTheAppBuilds:
+    """Constructed the way the DI layer constructs it, not the way a test
+    finds convenient. A control that is only ever exercised against a
+    hand-built object proves nothing about the object the app serves.
+    """
+
+    def test_the_api_provider_asks_fastapi_for_the_real_location_service(
+        self,
+    ) -> None:
+        """The provider must declare the Location domain's own already-wired
+        `get_location_service` as its dependency -- not build a second
+        parallel graph, and not leave the parameter off, which would make
+        every create refuse with `AccessRuleLocationUnverifiableError` the
+        moment it deployed.
+        """
+        import inspect
+
+        from app.domains.guest_access.dependencies import get_guest_access_service
+        from app.domains.location.dependencies import get_location_service
+
+        parameters = inspect.signature(get_guest_access_service).parameters
+        assert "location_service" in parameters
+        assert parameters["location_service"].default.dependency is (
+            get_location_service
+        )
+
+    async def test_the_provider_builds_a_service_that_really_verifies(self) -> None:
+        """Call the provider itself, with the collaborators FastAPI would
+        have resolved, and then write a rule through what comes out.
+
+        This is the test the standing rule asks for: the gate is exercised
+        on the object the app actually serves, assembled by the app's own
+        provider, rather than on one this module hand-built.
+        """
+        from app.domains.guest_access.dependencies import get_guest_access_service
+
+        repository = FakeGuestAccessRepository()
+        organization_id = uuid.uuid4()
+        location_lookup = FakeLocationLookup()
+
+        service = get_guest_access_service(
+            repository=repository,
+            block_enforcer=None,
+            location_service=location_lookup,  # type: ignore[arg-type]
+            audit_repository=None,  # type: ignore[arg-type]
+            caller_location_scope=None,
+        )
+        assert service.location_lookup is location_lookup
+
+        with pytest.raises(InvalidAccessRuleLocationError):
+            await service.create_guest_rule(
+                organization_id=organization_id,
+                requesting_organization_id=organization_id,
+                location_id=uuid.uuid4(),
+                identifier="+919876543210",
+                rule_type=AccessRuleType.WHITELIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=uuid.uuid4(),
+            )
+        assert repository.guest_rules == {}
+
+    def test_the_constructor_has_no_default_to_forget(self) -> None:
+        """A defaulted `location_lookup=None` is how this comes back: a new
+        construction site omits it and every rule it writes goes unverified.
+        Same posture as `block_enforcer`, for the same reason.
+        """
+        import inspect
+
+        parameter = inspect.signature(GuestAccessService.__init__).parameters[
+            "location_lookup"
+        ]
+        assert parameter.default is inspect.Parameter.empty
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_the_real_location_service_satisfies_the_protocol(self) -> None:
+        """The fakes above are only as good as their resemblance to the
+        real collaborator -- so check the real one's `get_location` actually
+        accepts the call this domain makes."""
+        import inspect
+
+        from app.domains.location.service import LocationService
+
+        signature = inspect.signature(LocationService.get_location)
+        signature.bind(object(), uuid.uuid4())
+
+    def test_every_provider_states_its_lookup_explicitly(self) -> None:
+        """The read-only constructions may pass `None`; what they may not
+        do is omit it. Enforced against the real call sites' source so a
+        new one cannot be added by copy-paste without deciding.
+        """
+        import inspect
+
+        from app.domains.guest_access import dependencies
+
+        source = inspect.getsource(dependencies)
+        for construction in source.split("GuestAccessService(")[1:]:
+            assert "location_lookup" in construction.split(")")[0] + ")", (
+                "a GuestAccessService construction in guest_access."
+                "dependencies does not state its location_lookup"
+            )
+
+
+class TestMatchingIsUntouched:
+    """This change is about who may *write* a rule. How a written rule is
+    *applied* must be bit-for-bit what it was, because a subtle change here
+    would quietly stop refusing blocked people -- and nothing in production
+    would say so.
+
+    The pre-existing coverage that pins this is `TestCheckAccess`,
+    `TestAccessDecisionResolver`, `TestWhitelistOnlyDefault`,
+    `TestLegacyIdentifierMatching` and `TestMatchTermsAndSqlAgree`; all of
+    them still pass unmodified. What follows pins the specific property the
+    new write gate could plausibly have disturbed.
+    """
+
+    async def test_an_org_wide_rule_written_by_an_admin_still_bites_everywhere(
+        self,
+    ) -> None:
+        f = make_fixture()
+        await f.service.create_guest_rule(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=None,
+            identifier="blocked@example.com",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="fraud",
+            expires_at=None,
+            actor_user_id=f.actor_user_id,
+        )
+        for venue in (f.location_id, uuid.uuid4(), None):
+            decision = await f.service.check_access(
+                organization_id=f.organization_id,
+                requesting_organization_id=f.organization_id,
+                location_id=venue,
+                identifier="blocked@example.com",
+                mac_address=None,
+            )
+            assert decision.allowed is False, venue
+
+    async def test_a_confined_reader_is_still_refused_by_an_org_wide_block(
+        self,
+    ) -> None:
+        """`enforce_entity_location`'s `entity_location_id is None`
+        pass-through is load-bearing for reads and was deliberately left
+        alone. An org-wide block must keep applying to -- and keep being
+        visible to -- a venue-confined caller.
+        """
+        f = make_fixture()
+        rule = await f.service.create_guest_rule(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=None,
+            identifier="blocked@example.com",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="fraud",
+            expires_at=None,
+            actor_user_id=f.actor_user_id,
+        )
+        _confined(f)
+
+        fetched = await f.service.get_guest_rule(
+            rule.id, requesting_organization_id=f.organization_id
+        )
+        assert fetched.id == rule.id
+
+        decision = await f.service.check_access(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=f.location_id,
+            identifier="blocked@example.com",
+            mac_address=None,
+        )
+        assert decision.allowed is False
+
+    async def test_check_access_never_consults_the_location_lookup(self) -> None:
+        """The decision path is a hot path -- it runs on every OTP, voucher
+        and MAC login, and for the router agent's once-a-minute poll on a
+        service built with no lookup at all. It must not have acquired a
+        query.
+        """
+        f = make_fixture()
+        await f.service.create_guest_rule(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=f.location_id,
+            identifier="blocked@example.com",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="fraud",
+            expires_at=None,
+            actor_user_id=f.actor_user_id,
+        )
+        f.location_lookup.lookups.clear()
+
+        await f.service.check_access(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=f.location_id,
+            identifier="blocked@example.com",
+            mac_address=None,
+        )
+        assert f.location_lookup.lookups == []
+
+    async def test_the_read_only_decision_service_still_decides(self) -> None:
+        """Built exactly as `dependencies.get_access_decision_service`
+        builds it -- no enforcer, no lookup, no confinement. The router
+        agent's poll must keep working with the write gate in place.
+        """
+        f = make_fixture()
+        await f.service.create_guest_rule(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=f.location_id,
+            identifier="blocked@example.com",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="fraud",
+            expires_at=None,
+            actor_user_id=f.actor_user_id,
+        )
+        agent_service = GuestAccessService(
+            f.repository, block_enforcer=None, location_lookup=None
+        )
+        decision = await agent_service.check_access(
+            organization_id=f.organization_id,
+            requesting_organization_id=f.organization_id,
+            location_id=f.location_id,
+            identifier="blocked@example.com",
+            mac_address=None,
+        )
+        assert decision.allowed is False
