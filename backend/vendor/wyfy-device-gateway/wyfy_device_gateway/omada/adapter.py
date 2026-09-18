@@ -129,6 +129,7 @@ from . import deauth as deauth_module
 from . import devices as devices_module
 from . import portal as portal_module
 from . import portal_setup as portal_setup_module
+from . import radius_portal as radius_portal_module
 from . import sites as sites_module
 from .auth import SessionCache
 from .client import OmadaHttpClient, SleepFn
@@ -424,6 +425,50 @@ class OmadaControllerAdapter:
                 up_kbps=up_kbps,
                 now=self._clock() if self._clock else None,
             )
+
+    async def authorize_guest_via_radius_portal(
+        self,
+        creds: ControllerCredentials,
+        ctx: radius_portal_module.RadiusPortalContext,
+        *,
+        username: str,
+        password: str,
+        portal_port: int | None = None,
+    ) -> radius_portal_module.RadiusBrowserAuthResult:
+        """The ``authType 2`` gate-opener: form-POST ``browserauth``.
+
+        A different contract from :meth:`authorize_guest`, not a variant of
+        it -- see ``radius_portal.py``. In particular it needs **no
+        credential of ours at all**: no operator login, no Open API secret,
+        no session. ``username`` is the guest's own identifier, which this
+        product's RADIUS server authorizes by session lookup.
+
+        ``creds.base_url`` is the controller's *management* address as
+        stored on the integration. The portal listener is a different port,
+        and this method is where that is resolved -- from the stored scheme
+        plus ``portal_port`` (an explicit operator override) or the
+        documented default. It is never taken from the request that
+        triggered the call; :func:`radius_portal.resolve_portal_origin` is
+        the SSRF boundary and says why at length.
+
+        Everything else about trust is inherited untouched: the credentials
+        are re-pointed at the portal origin and handed to the same
+        ``tls.py`` machinery every other call uses, so ``tls_mode`` and
+        ``tls_pinned_sha256`` mean exactly what they mean everywhere else.
+        """
+        portal_creds = replace(
+            creds,
+            base_url=radius_portal_module.resolve_portal_origin(
+                creds.base_url, portal_port
+            ),
+        )
+        return await radius_portal_module.submit_browserauth(
+            portal_creds,
+            ctx,
+            username=username,
+            password=password,
+            transport=self._transport,
+        )
 
     async def deauthorize_guest(
         self, creds: ControllerCredentials, site_id: str, client_mac: str

@@ -491,6 +491,15 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "confined `_load_owned_integration`. Unconfined is correct here "
         "because the caller is a guest acting on their own session."
     ),
+    ("POST", "/api/v1/network-integrations/portal/radius-authorize"): (
+        "The same guest, the same substitute for a permission check, on the "
+        "other captive-portal contract. It shares the sibling route's "
+        "`_resolve_portal_session`, so the integration is resolved from the "
+        "SESSION's (organization, location) -- never from the caller and "
+        "never from the body -- and the confined `_load_owned_integration` "
+        "is not on this path. Unconfined is correct because the caller is a "
+        "guest acting on their own session."
+    ),
     ("POST", "/api/v1/vouchers/redeem"): (
         "A guest redeeming or checking a code handed to them at a front desk -- the "
         "whole point is that they have no account. They hold no roles, so there is no "

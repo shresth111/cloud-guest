@@ -136,18 +136,22 @@ and is not papered over here.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..constants import (
     ROUTER_VENDOR_BY_PROVIDER,
     ControllerAuthMode,
     ControllerTlsMode,
     NetworkProviderKind,
+    RadiusPortalFailure,
 )
 from ..exceptions import (
     PROVIDER_ERRORS_BY_CODE,
     ProviderConnectionFailedError,
+    ProviderControllerAddressMismatchError,
     ProviderError,
     ProviderTlsPinMismatchError,
     ProviderUnsupportedApiError,
@@ -164,6 +168,8 @@ from .base import (
     ProviderControllerSetupStep,
     ProviderDevice,
     ProviderPortalContext,
+    ProviderRadiusAuthorizationResult,
+    ProviderRadiusPortalContext,
     ProviderSite,
     ProviderSsid,
     ProviderTlsObservation,
@@ -327,6 +333,44 @@ def _describe_certificate(
     except Exception:  # noqa: BLE001 -- display-only, never fatal
         logger.warning("network_integration_certificate_parse_failed")
         return None, None, None
+
+
+#: Omada ``errorCode`` -> this platform's guest-safe failure vocabulary.
+#:
+#: VERIFIED on Omada Software Controller 5.15.24.19, 2026-09-17 (see
+#: ``/Users/shresth/wyfy-omada/RADIUS-PORTAL-MODE.md`` §1.4)::
+#:
+#:        0   Success.                            (never reaches this table:
+#:                                                 success is a 302, not a body)
+#:   -41501   Failed to authenticate.             generic; also what a
+#:                                                 wrongly-configured RADIUS
+#:                                                 profile returns
+#:   -41529   Incorrect username or password.     a genuine Access-Reject
+#:   -41530   Connecting to the RADIUS server times out.
+#:
+#: This table is in the *provider*, not in ``constants.py``, because reading
+#: a vendor's error numbering is exactly the knowledge the seam exists to
+#: confine. A code that is not here becomes ``CONTROLLER_REFUSED`` -- a
+#: wrong-but-safe classification, with the raw integer carried alongside so
+#: the gap is findable in the event feed rather than invisible.
+_RADIUS_FAILURE_BY_PROVIDER_CODE: dict[int, RadiusPortalFailure] = {
+    -41501: RadiusPortalFailure.CONTROLLER_REFUSED,
+    -41529: RadiusPortalFailure.REJECTED,
+    -41530: RadiusPortalFailure.RADIUS_UNREACHABLE,
+}
+
+#: Which port an Omada controller's captive-portal listener answers on, by
+#: scheme. VERIFIED on 5.15.24.19: ``8843`` https / ``8088`` http, both
+#: distinct from the management API's ``8043``.
+#:
+#: Duplicated from the gateway's own table on purpose. The gateway is a lazy
+#: import that may be absent entirely (see this module's docstring), and the
+#: address check below has to be able to refuse a request *without* it --
+#: refusing only when the gateway happens to be installed would be a
+#: security control with an availability condition on it. The two are
+#: asserted equal in ``tests/unit/test_network_integration_radius_portal.py``
+#: so the duplication cannot drift silently.
+_RADIUS_PORTAL_PORTS: dict[str, int] = {"https": 8843, "http": 8088}
 
 
 def _is_gateway_error(exc: Exception) -> bool:
@@ -594,6 +638,169 @@ class OmadaProvider:
             provider_code=getattr(result, "provider_code", None),
             request_snapshot=snapshot,
         )
+
+    # -- RADIUS portal contract (authType 2) -------------------------------
+
+    @staticmethod
+    def _radius_portal_origin(
+        config: ProviderConnectionConfig, context: ProviderRadiusPortalContext
+    ) -> tuple[str, str, str, int]:
+        """``(base_url, scheme, host, port)`` for the portal submit.
+
+        ## THIS IS THE SSRF BOUNDARY. Read before changing anything here.
+
+        On the RADIUS contract the controller puts ``target``, ``targetPort``
+        and ``scheme`` on the redirect it sends the *guest's browser*, and
+        the guest's browser is what hands them back to this platform. They
+        are therefore attacker-controlled input on an unauthenticated
+        endpoint, and they name the address this platform is about to open a
+        connection to -- carrying this integration's TLS trust decision,
+        which for a self-signed controller means "do not check the chain".
+        Building the URL from them would let any caller aim that at anything
+        the backend can reach.
+
+        So the URL is built from the integration row and only from it:
+
+        * **host and scheme** come from ``config.base_url``, the stored,
+          already-normalized controller address;
+        * **port** comes from the operator's explicit override on the
+          integration, or from :data:`_RADIUS_PORTAL_PORTS`. The vendor's
+          portal listener is on a different port from its management API,
+          which is the *only* reason this method exists rather than the
+          stored ``base_url`` being used verbatim.
+
+        The caller's three claimed values are then compared against what was
+        built, and a disagreement raises. Ignoring them silently was the
+        other option and is worse in both directions: it hides a venue whose
+        controller genuinely moved (the operator sees "guests cannot get
+        online" and nothing else), and it hands a prober a free oracle --
+        every target they try behaves identically, so they learn nothing
+        from a refusal and nothing from a success either, which is only
+        comforting until you notice the request still went somewhere.
+        """
+        parts = urlsplit(config.base_url)
+        scheme = (parts.scheme or "https").lower()
+        host = parts.hostname
+        if not host:
+            raise ProviderControllerAddressMismatchError(
+                "This integration has no usable controller address recorded."
+            )
+        port = context.portal_port or _RADIUS_PORTAL_PORTS.get(scheme)
+        if port is None:
+            raise ProviderControllerAddressMismatchError(
+                "This integration's controller address uses a scheme with no "
+                "known captive-portal port. Record the portal port on the "
+                "integration."
+            )
+
+        claimed_host = (context.advertised_target or "").strip().lower()
+        if claimed_host and claimed_host.strip("[]") != host:
+            raise ProviderControllerAddressMismatchError()
+        claimed_scheme = (context.advertised_scheme or "").strip().lower()
+        if claimed_scheme and claimed_scheme != scheme:
+            raise ProviderControllerAddressMismatchError()
+        if context.advertised_port is not None and context.advertised_port != port:
+            raise ProviderControllerAddressMismatchError()
+
+        rendered = f"[{host}]" if ":" in host else host
+        return f"{scheme}://{rendered}:{port}", scheme, host, port
+
+    async def authorize_guest_via_radius_portal(
+        self,
+        config: ProviderConnectionConfig,
+        context: ProviderRadiusPortalContext,
+    ) -> ProviderRadiusAuthorizationResult:
+        """Form-POST the controller's ``browserauth`` endpoint.
+
+        Everything vendor-shaped about this call is here or in the gateway:
+        the endpoint path, the form encoding, the ``authType 2`` constant,
+        the port, and the meaning of a ``302``. ``service.py`` sees a context
+        in, a result out.
+
+        **Trust is inherited, not re-decided.** The config handed down is the
+        integration's own, with ``base_url`` re-pointed at the portal origin,
+        so ``tls_mode`` and ``tls_pinned_sha256`` apply exactly as they do to
+        every other call -- including :meth:`_creds`' re-validation of the
+        address against the SSRF rules immediately before the socket opens,
+        which is what closes DNS rebinding between the row being written and
+        this request. There is deliberately no "verify off" path here; a
+        venue that needs one already has ``insecure`` recorded on the row,
+        where somebody had to choose it and the audit log says who.
+
+        The one honest caveat, stated rather than buried: a pin captured
+        against the management port is being checked against the portal
+        port. They are the same certificate on the controller measured, and
+        if some deployment ever differs this fails closed with a pin
+        mismatch rather than connecting anyway.
+        """
+        portal_base_url, _scheme, _host, port = self._radius_portal_origin(
+            config, context
+        )
+        portal_config = replace(config, base_url=portal_base_url)
+
+        from wyfy_device_gateway.omada.radius_portal import (  # noqa: PLC0415
+            RadiusPortalContext,
+        )
+
+        gateway_context = RadiusPortalContext(
+            client_mac=context.client_mac,
+            client_ip=context.client_ip,
+            ap_mac=context.ap_mac,
+            gateway_mac=context.gateway_mac,
+            ssid_name=context.ssid_name,
+            radio_id=context.radio_id,
+            vid=context.vid,
+            origin_url=context.origin_url,
+        )
+        result = await self._call(
+            portal_config,
+            "authorize_guest_via_radius_portal",
+            gateway_context,
+            username=context.username,
+            password=context.password,
+            portal_port=port,
+        )
+
+        authorized = bool(getattr(result, "authorized", False))
+        provider_code = getattr(result, "provider_code", None)
+        if not isinstance(provider_code, int) or isinstance(provider_code, bool):
+            provider_code = None
+        http_status = getattr(result, "http_status", None)
+        if authorized:
+            return ProviderRadiusAuthorizationResult(
+                authorized=True,
+                landing_url=getattr(result, "landing_url", None),
+                provider_code=provider_code,
+                http_status=http_status,
+            )
+        return ProviderRadiusAuthorizationResult(
+            authorized=False,
+            failure=self._radius_failure(provider_code, http_status),
+            provider_code=provider_code,
+            http_status=http_status,
+        )
+
+    @staticmethod
+    def _radius_failure(provider_code: int | None, http_status: int | None) -> str:
+        """Vendor answer -> one of ``constants.RadiusPortalFailure``.
+
+        ``400`` outranks the error code: the controller is saying the body
+        was malformed, which is this platform's bug and not a verdict about
+        the guest, and reporting it as "rejected" would send an operator to
+        look at a RADIUS server that is working fine.
+        """
+        if http_status == 400:
+            return RadiusPortalFailure.BAD_REQUEST.value
+        if provider_code is None:
+            return RadiusPortalFailure.CONTROLLER_REFUSED.value
+        mapped = _RADIUS_FAILURE_BY_PROVIDER_CODE.get(provider_code)
+        if mapped is None:
+            logger.warning(
+                "network_integration_unmapped_radius_portal_code",
+                extra={"provider_error_code": provider_code},
+            )
+            return RadiusPortalFailure.CONTROLLER_REFUSED.value
+        return mapped.value
 
     @staticmethod
     def _authorize_snapshot(

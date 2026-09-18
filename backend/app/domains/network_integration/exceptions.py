@@ -77,6 +77,7 @@ __all__ = [
     "ProviderAuthorizationFailedError",
     "ProviderClientNotFoundError",
     "ProviderConnectionFailedError",
+    "ProviderControllerAddressMismatchError",
     "ProviderError",
     "ProviderInvalidControllerError",
     "ProviderPermissionDeniedError",
@@ -904,6 +905,40 @@ class ProviderSessionExpiredError(ProviderError):
         super().__init__(
             message or "The controller session expired and could not be renewed.",
             code=ErrorCode.SESSION_EXPIRED,
+        )
+
+
+class ProviderControllerAddressMismatchError(ProviderError):
+    """A request claimed a controller address that is not the stored one.
+
+    **This is the SSRF refusal**, and it is a ``ProviderError`` only so that
+    ``service.py``'s existing one-branch handling of provider failures picks
+    it up unchanged. Nothing about it came from a controller: no socket was
+    opened, and that is the entire point.
+
+    It exists because the RADIUS portal contract relays the controller's own
+    ``target``/``targetPort``/``scheme`` back to this platform *through the
+    guest's browser*. The URL is therefore built from the integration row
+    and never from those values -- but a request whose claim disagrees with
+    the row is still refused rather than quietly corrected. Quiet correction
+    would work perfectly for the attacker who is probing to find out which
+    address we actually use, and would hide the one honest cause (a venue
+    whose controller moved) from the operator who needs to see it.
+
+    ``400``, not ``502``: the caller's request is what is wrong. The
+    guest-facing route does not surface this -- it answers the same opaque
+    403 as every other portal refusal -- so the status matters only for the
+    operator-facing surfaces.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "This authorization request named a controller address that "
+            "does not match the one recorded for this venue. Nothing was "
+            "sent to it.",
+            code=ErrorCode.RADIUS_PORTAL_ADDRESS_MISMATCH,
+            status_code=status.HTTP_400_BAD_REQUEST,
         )
 
 

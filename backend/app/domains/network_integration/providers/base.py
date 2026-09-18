@@ -66,6 +66,8 @@ __all__ = [
     "ProviderControllerSetupStep",
     "ProviderDevice",
     "ProviderPortalContext",
+    "ProviderRadiusAuthorizationResult",
+    "ProviderRadiusPortalContext",
     "ProviderSite",
     "ProviderSsid",
     "ProviderTlsObservation",
@@ -273,6 +275,80 @@ class ProviderAuthorizationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderRadiusPortalContext:
+    """The redirect values for the **RADIUS** captive-portal contract.
+
+    A second context type rather than more optional fields on
+    :class:`ProviderPortalContext`, because the two redirects genuinely carry
+    different things and folding them together would make every field of
+    both optional -- at which point neither shape can be validated at all.
+    What this one carries and the other does not:
+
+    * ``origin_url`` -- where the controller sends the browser once the gate
+      is open. The platform learns the authorization succeeded *by* being
+      handed this back as a redirect target, so it is not decoration.
+    * ``advertised_*`` -- the controller's own claim about where the submit
+      should go, relayed through the guest's browser. **These are never used
+      to build a URL.** They exist so the provider can refuse a request whose
+      claimed target disagrees with the integration's stored address, which
+      is a signal worth refusing on rather than silently ignoring. See
+      ``providers/omada.py``'s address check and ``service.py``'s own.
+
+    And what it does *not* carry, because the redirect does not: ``site`` and
+    ``t``. On this contract the controller sends nothing that identifies the
+    venue, which is why the venue is resolved from the guest's session.
+
+    ``portal_port`` is the operator's explicit override of the port the
+    venue's portal listener answers on, or ``None`` for the provider's
+    documented default. It comes from the integration row, never from a
+    request.
+    """
+
+    client_mac: str
+    client_ip: str | None = None
+    ap_mac: str | None = None
+    gateway_mac: str | None = None
+    ssid_name: str | None = None
+    radio_id: int | None = None
+    vid: int | None = None
+    origin_url: str | None = None
+    #: The guest's own identifier, resolved server-side from the session.
+    #: Never accepted from a request body -- see ``service.py``.
+    username: str = ""
+    #: A placeholder this product's RADIUS server never checks (it authorizes
+    #: by session lookup). ``repr=False`` anyway: it is spelled like a
+    #: credential and would otherwise show up in every traceback.
+    password: str = field(default="", repr=False)
+    portal_port: int | None = None
+    advertised_target: str | None = None
+    advertised_port: int | None = None
+    advertised_scheme: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRadiusAuthorizationResult:
+    """What the controller answered to one ``browserauth`` submit.
+
+    ``authorized`` is the whole verdict. ``landing_url`` is the destination
+    the controller named when it opened the gate, which the caller hands
+    back to the guest's browser and never fetches itself.
+
+    ``failure`` is a **stable, vendor-neutral** reason -- one of
+    ``constants.RadiusPortalFailure`` -- and is the only thing about a
+    refusal that ever reaches a guest. ``provider_code`` is the vendor's raw
+    integer for the operator-facing event feed; it is deliberately not the
+    same value, because a vendor's error numbering is not a contract this
+    platform's frontend should be built on.
+    """
+
+    authorized: bool
+    landing_url: str | None = None
+    failure: str | None = None
+    provider_code: int | None = None
+    http_status: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderControllerSetupRequest:
     """What "Configure controller automatically" should make true on one
     controller site, for one integration.
@@ -455,6 +531,38 @@ class NetworkProvider(Protocol):
         ``constants.MAX_SESSION_DURATION_SECONDS`` bounds it at 7 days,
         which is a policy bound on an unattended grant rather than a
         technical limit or tidiness.
+        """
+        ...
+
+    async def authorize_guest_via_radius_portal(
+        self,
+        config: ProviderConnectionConfig,
+        context: ProviderRadiusPortalContext,
+    ) -> ProviderRadiusAuthorizationResult:
+        """Open the gate on a venue running the **RADIUS** portal contract.
+
+        Separate from :meth:`authorize_guest` because it is a separate
+        contract, not a mode of one: a different endpoint, a different
+        encoding, no credential of ours on the wire, and a success signal
+        that is an HTTP redirect rather than a response body. A provider
+        whose vendor has no such contract must raise
+        ``ProviderUnsupportedApiError``, never return ``authorized=False``
+        -- the caller has to be able to tell "the controller said no" from
+        "this vendor cannot do this", because only the first is something a
+        guest can retry.
+
+        **Two refusals belong to the provider, not the controller**, and
+        both must raise rather than return:
+
+        * the request's claimed submit address disagrees with the
+          integration's stored controller address
+          (``ProviderControllerAddressMismatchError``) -- the SSRF boundary;
+        * the integration's TLS trust cannot be honoured
+          (``ProviderTlsPinMismatchError``).
+
+        Everything the controller itself answers -- accept, RADIUS reject,
+        RADIUS timeout, malformed body -- comes back as a *result* with a
+        ``failure`` code, because those are outcomes of a call that worked.
         """
         ...
 

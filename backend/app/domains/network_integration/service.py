@@ -108,6 +108,7 @@ from .constants import (
     PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE,
     PORTAL_AUTHORIZE_WINDOW_SECONDS,
     PORTAL_REDIRECT_STALE_AFTER_SECONDS,
+    RADIUS_PORTAL_METADATA_PORT_KEY,
     REDACTED_CONTEXT_KEYS,
     REDACTION_PLACEHOLDER,
     SYNC_BACKOFF_CAP_MULTIPLIER,
@@ -123,6 +124,7 @@ from .constants import (
     NetworkIntegrationAuditAction,
     NetworkProviderKind,
     PortalAuthMode,
+    RadiusPortalFailure,
     SyncStatus,
 )
 from .crypto import (
@@ -157,6 +159,7 @@ from .exceptions import (
     NetworkIntegrationUrlRejectedError,
     PortalConflictError,
     ProviderAuthFailedError,
+    ProviderControllerAddressMismatchError,
     ProviderError,
     ProviderSiteNotFoundError,
     UnsupportedNetworkProviderError,
@@ -174,6 +177,7 @@ from .providers.base import (
     ProviderControllerSetupStep,
     ProviderDevice,
     ProviderPortalContext,
+    ProviderRadiusPortalContext,
     ProviderSite,
     ProviderSsid,
     ProviderTlsObservation,
@@ -207,6 +211,7 @@ __all__ = [
     "GuestSessionTerminatorProtocol",
     "NetworkIntegrationService",
     "PortalAuthorizationOutcome",
+    "RadiusPortalAuthorizationOutcome",
     "SyncOutcome",
     "SyncSweepSummary",
     "redact_context",
@@ -313,6 +318,15 @@ class GuestSessionLookupProtocol(Protocol):
     # method costs no new wiring.
     async def get_device_by_id(self, device_id: uuid.UUID) -> Any: ...
 
+    # Needed only by the RADIUS portal contract, where the credential
+    # submitted to the controller IS the guest's identifier. Resolved from
+    # the session rather than accepted from the request body: the body is
+    # unauthenticated, and a caller who could name the username would be
+    # asking this platform to authorize somebody else's identity on a
+    # session it proved it holds. Satisfied as-is by
+    # `GuestRepository.get_guest_by_id`.
+    async def get_guest_by_id(self, guest_id: uuid.UUID) -> Any: ...
+
 
 class GuestSessionTerminatorProtocol(Protocol):
     """How this domain *ends* a ``GuestSession``. One method.
@@ -380,6 +394,58 @@ class PortalAuthorizationOutcome:
     provider: str
     expires_at: datetime | None = None
     redirect_url: str | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RadiusPortalAuthorizationOutcome:
+    """What the RADIUS-mode gate-opening call achieved, for the guest page.
+
+    Deliberately NOT ``PortalAuthorizationOutcome``. Two fields differ in
+    kind, not in spelling:
+
+    * there is no ``expires_at``, and inventing one would be a lie. On this
+      contract the controller grants the session off its own RADIUS
+      Access-Accept, using its own reply attributes; this platform never
+      names a duration and has nothing to claim one from.
+    * ``failure`` exists, because a refusal here is a normal outcome that
+      the guest's page renders, not an exception. One of
+      ``constants.RadiusPortalFailure`` -- a closed, guest-safe vocabulary.
+      ``None`` when ``authorized``.
+
+    ``redirect_url`` is the destination the controller itself named when it
+    opened the gate (the ``Location`` of its ``302``). Handed to the guest's
+    browser to navigate to and never fetched by this platform, exactly as
+    the other contract's is.
+    """
+
+    authorized: bool
+    provider: str
+    redirect_url: str | None = None
+    failure: str | None = None
+
+
+#: Provider failure -> the guest-safe vocabulary the portal page renders.
+#:
+#: These are the failures where the call never got an answer *from* the
+#: controller: a timeout, a refused connection, a certificate this
+#: integration will not trust, an adapter that is not installed. To a guest
+#: they are one situation -- the venue's controller could not be reached --
+#: and pretending otherwise would be inventing distinctions the page cannot
+#: act on. The difference between them is preserved exactly where it is
+#: useful, on the integration's event row, which carries the real
+#: ``ErrorCode``.
+#:
+#: Anything not listed falls back to ``CONTROLLER_UNREACHABLE``: the
+#: conservative reading, since every remaining member of ``ErrorCode``
+#: describes a call that did not result in an authorization.
+_RADIUS_FAILURE_BY_PROVIDER_ERROR: dict[ErrorCode, RadiusPortalFailure] = {
+    ErrorCode.TIMEOUT: RadiusPortalFailure.CONTROLLER_UNREACHABLE,
+    ErrorCode.CONNECTION_FAILED: RadiusPortalFailure.CONTROLLER_UNREACHABLE,
+    ErrorCode.TLS_UNTRUSTED: RadiusPortalFailure.CONTROLLER_UNREACHABLE,
+    ErrorCode.TLS_PIN_MISMATCH: RadiusPortalFailure.CONTROLLER_UNREACHABLE,
+    ErrorCode.API_UNSUPPORTED: RadiusPortalFailure.CONTROLLER_UNREACHABLE,
+    ErrorCode.AUTHORIZATION_FAILED: RadiusPortalFailure.CONTROLLER_REFUSED,
+}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -3769,7 +3835,7 @@ class NetworkIntegrationService:
                 "network_integration_portal_rate_limit_unavailable", exc_info=True
             )
 
-    async def authorize_portal_client(
+    async def _resolve_portal_session(
         self,
         *,
         session_id: uuid.UUID,
@@ -3777,49 +3843,19 @@ class NetworkIntegrationService:
         location_id: uuid.UUID,
         provider: str,
         client_mac: str,
-        site: str,
-        ap_mac: str | None = None,
-        ssid_name: str | None = None,
-        radio_id: int | None = None,
-        gateway_mac: str | None = None,
-        vid: int | None = None,
-        t: str | None = None,
-        redirect_url: str | None = None,
-        client_ip: str | None = None,
-    ) -> PortalAuthorizationOutcome:
-        """Authorize one guest device on the venue's controller.
+    ) -> tuple[Any, str]:
+        """The proof-of-session gate both portal contracts stand behind.
 
-        **This authenticates nobody.** By the time it is called,
-        ``app.domains.guest`` has already decided the guest may go online
-        (OTP, voucher, consent) and has issued a ``GuestSession``. This is
-        the network-enforcement step that follows -- the Omada equivalent
-        of the existing MikroTik ``link-login-only`` POST.
+        Extracted verbatim from :meth:`authorize_portal_client`, whose
+        docstring still carries the full reasoning for each check, because
+        the RADIUS contract needs *exactly* these checks and needed them to
+        stay the same ones. A second copy would have been a second place to
+        forget the ``TERMINATED`` case or the device binding, and the two
+        copies would have drifted the first time either was tightened.
 
-        Every argument arrives from an unauthenticated request body, so
-        every one of them is treated as a claim:
-
-        1. **The session must exist and be ``ACTIVE``.** A
-           ``DISCONNECTED``/``EXPIRED``/``TERMINATED`` session is refused
-           -- particularly ``TERMINATED``, which is the punitive kill an
-           admin used to throw an abusive guest off the network. Honouring
-           it here would hand that guest a fresh controller authorization.
-        2. **The session's own ``organization_id`` and ``location_id`` must
-           match the body.** Both, not either. This is what stops a caller
-           pairing a session id they somehow learned with a *different*
-           venue's ids to get authorized on that venue's controller.
-        3. **The integration is resolved by (organization, location,
-           provider)** -- from the *session's* venue, not from the body's,
-           so even a body that lied consistently cannot select a foreign
-           integration.
-        4. **The redirect's ``site`` must match the integration's stored
-           site.** A mismatch means the redirect came from a controller
-           this integration is not configured for.
-
-        Failures are recorded server-side (an event row where an
-        integration was resolved) but the response is a single
-        indistinguishable 403 -- see
-        ``exceptions.GuestSessionNotActiveError`` for why this endpoint
-        must not be an oracle.
+        Returns ``(session, normalized_client_mac)``. Every failure is the
+        same opaque ``GuestSessionNotActiveError`` -- see that exception for
+        why an unauthenticated endpoint must not become an oracle.
         """
         if provider not in {kind.value for kind in NetworkProviderKind}:
             raise UnsupportedNetworkProviderError(provider)
@@ -3895,6 +3931,67 @@ class NetworkIntegrationService:
                 },
             )
             raise GuestSessionNotActiveError()
+        return session, normalized_mac
+
+    async def authorize_portal_client(
+        self,
+        *,
+        session_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        provider: str,
+        client_mac: str,
+        site: str,
+        ap_mac: str | None = None,
+        ssid_name: str | None = None,
+        radio_id: int | None = None,
+        gateway_mac: str | None = None,
+        vid: int | None = None,
+        t: str | None = None,
+        redirect_url: str | None = None,
+        client_ip: str | None = None,
+    ) -> PortalAuthorizationOutcome:
+        """Authorize one guest device on the venue's controller.
+
+        **This authenticates nobody.** By the time it is called,
+        ``app.domains.guest`` has already decided the guest may go online
+        (OTP, voucher, consent) and has issued a ``GuestSession``. This is
+        the network-enforcement step that follows -- the Omada equivalent
+        of the existing MikroTik ``link-login-only`` POST.
+
+        Every argument arrives from an unauthenticated request body, so
+        every one of them is treated as a claim:
+
+        1. **The session must exist and be ``ACTIVE``.** A
+           ``DISCONNECTED``/``EXPIRED``/``TERMINATED`` session is refused
+           -- particularly ``TERMINATED``, which is the punitive kill an
+           admin used to throw an abusive guest off the network. Honouring
+           it here would hand that guest a fresh controller authorization.
+        2. **The session's own ``organization_id`` and ``location_id`` must
+           match the body.** Both, not either. This is what stops a caller
+           pairing a session id they somehow learned with a *different*
+           venue's ids to get authorized on that venue's controller.
+        3. **The integration is resolved by (organization, location,
+           provider)** -- from the *session's* venue, not from the body's,
+           so even a body that lied consistently cannot select a foreign
+           integration.
+        4. **The redirect's ``site`` must match the integration's stored
+           site.** A mismatch means the redirect came from a controller
+           this integration is not configured for.
+
+        Failures are recorded server-side (an event row where an
+        integration was resolved) but the response is a single
+        indistinguishable 403 -- see
+        ``exceptions.GuestSessionNotActiveError`` for why this endpoint
+        must not be an oracle.
+        """
+        session, normalized_mac = await self._resolve_portal_session(
+            session_id=session_id,
+            organization_id=organization_id,
+            location_id=location_id,
+            provider=provider,
+            client_mac=client_mac,
+        )
 
         integration = await self.repository.find_enabled_integration_for_location(
             organization_id=session.organization_id,
@@ -3906,16 +4003,20 @@ class NetworkIntegrationService:
                 f"no enabled {provider} integration for this location"
             )
         if integration.portal_mode == PortalAuthMode.RADIUS.value:
-            # THIS PLATFORM IS NOT IN THE AUTHORIZATION PATH AT THIS VENUE.
+            # WRONG CONTRACT'S ENDPOINT. Still refused, and deliberately so.
             #
-            # On the RADIUS contract the guest's browser submits to the
-            # controller's own `POST /portal/radius/browserauth`, the
-            # controller sends an Access-Request to this platform's
-            # FreeRADIUS, and the controller opens the gate on the
-            # Access-Accept. Nothing here can authorize anybody, and an
-            # `extPortal/auth` call made anyway would either fail against a
-            # portal configured for `authType 2` or -- worse -- succeed and
-            # produce an authorization nobody asked for.
+            # This platform IS now in the RADIUS venue's authorization path
+            # -- see `authorize_portal_client_via_radius`, which performs the
+            # controller's `browserauth` submit server-side. What it is not
+            # in is *this* path: `extPortal/auth` is the `authType 4`
+            # contract, and a portal configured for `authType 2` would
+            # either refuse it or -- worse -- accept it and produce an
+            # authorization on a contract nobody is enforcing.
+            #
+            # So this branch is not dead code that the new method
+            # superseded. It is the guard that stops the two contracts being
+            # mixed, and the new method has the mirror-image guard for a
+            # RADIUS call arriving at an `external_portal` venue.
             #
             # A call arriving here therefore means one of two things, and
             # both are configuration rather than abuse: a guest is using a
@@ -4086,6 +4187,405 @@ class NetworkIntegrationService:
             expires_at=result.expires_at,
             # Echoed back from the request. This platform never fetches it.
             redirect_url=redirect_url,
+        )
+
+    async def authorize_portal_client_via_radius(
+        self,
+        *,
+        session_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        provider: str,
+        client_mac: str,
+        client_ip: str | None = None,
+        ap_mac: str | None = None,
+        ssid_name: str | None = None,
+        radio_id: int | None = None,
+        gateway_mac: str | None = None,
+        vid: int | None = None,
+        origin_url: str | None = None,
+        target: str | None = None,
+        target_port: int | None = None,
+        scheme: str | None = None,
+    ) -> RadiusPortalAuthorizationOutcome:
+        """Open the gate at a venue on the **RADIUS** portal contract.
+
+        ## Why this is a server call at all, when it used to be the browser's
+
+        Because the browser's version does not work on Android, and cannot
+        be made to. On this contract the controller tells the guest's page to
+        form-POST its own ``browserauth`` endpoint, which answers on the
+        controller's HTTPS portal port with a self-signed ``CN=localhost``
+        certificate. Android refuses it -- measured on a real phone,
+        2026-09-17. It is not one venue's misconfiguration either: every
+        self-hosted controller ships its own such certificate, so there is
+        no per-venue fix that scales. The only way out is to take the
+        browser off that leg.
+
+        That is possible because the controller does not care who sends the
+        request. **Measured on hardware the same day**: a request from an
+        unrelated third machine, carrying the guest's real ``clientMac`` and
+        ``clientIp`` and a username with an ACTIVE session, returned ``302
+        Location: ...`` and the controller then showed that client as
+        ``authStatus 2 / authType 2``. The controller identifies the client
+        by the MAC in the body, not by the peer address of the connection.
+
+        Read that sentence again, because it is also the threat model: the
+        controller authenticates the requester **not at all**. Everything
+        that stops this endpoint authorizing a stranger's device is in this
+        method, and nothing is in the controller.
+
+        ## What stands in for authentication
+
+        The identical gate the ``external_portal`` contract stands behind,
+        by construction rather than by resemblance -- ``_resolve_portal_session``
+        is literally the same code: an ``ACTIVE`` ``GuestSession`` whose own
+        organization *and* location match the body, whose bound device's MAC
+        is the MAC being authorized, and an integration resolved from the
+        **session's** venue rather than the body's. Every failure is the same
+        opaque 403.
+
+        Two things this contract adds, because it has to:
+
+        * **The username is not accepted from the caller.** It is the guest's
+          own identifier, resolved from the session's ``Guest`` row -- and
+          the username is the whole credential here, since this platform's
+          RADIUS server authorizes by session lookup and never checks the
+          password. A caller-supplied username would be a request to
+          authorize an identity the caller did not prove they hold, on a
+          session they did.
+        * **The controller's address is not accepted from the caller
+          either.** See below; it is the SSRF boundary and it is the reason
+          this method takes ``target``/``target_port``/``scheme`` only to
+          refuse them.
+
+        ## THE SSRF BOUNDARY
+
+        The redirect that starts this flow carries ``target``, ``targetPort``
+        and ``scheme`` -- the controller telling the *guest's page* where to
+        submit. Those values reach this method through the guest's browser
+        on an unauthenticated request body. They are **never** used to build
+        a URL. The provider constructs the submit address from the
+        integration's stored controller address and from the port the
+        integration holds (or the provider's documented default), and the
+        caller's three values are compared against the result: a
+        disagreement refuses, and nothing is sent anywhere.
+
+        Why refuse rather than ignore: ignoring is *safe* but silent, and
+        the honest cause -- a venue whose controller address changed -- then
+        presents to an operator as "guests cannot get online" with no
+        record. The refusal is recorded against the integration with
+        ``ErrorCode.RADIUS_PORTAL_ADDRESS_MISMATCH`` and answered to the
+        caller as the same indistinguishable 403 as everything else, so it
+        informs the operator without becoming an oracle for the guest.
+
+        ## TLS
+
+        Nothing new is decided here. The provider is handed this
+        integration's own ``ProviderConnectionConfig`` -- the same
+        ``tls_mode`` (``strict``/``pinned``/``insecure``) and the same
+        stored SHA-256 pin every other call to this controller uses -- and
+        re-points only the address at the portal port. There is deliberately
+        no "verify off for this one call" path: a venue that needs one
+        already has ``insecure`` on its row, chosen by a human whose name is
+        in the audit log.
+
+        ## What is not recorded, and why
+
+        No ``network_integration_authorizations`` row. This platform did not
+        issue this authorization -- the controller did, off an Access-Accept
+        from this platform's FreeRADIUS -- and a row here would claim a
+        grant and an expiry that neither this method nor the controller
+        agreed on. ``disconnect_guest``'s RADIUS branch documents at length
+        that no such row exists in this mode; writing a half-true one would
+        make that branch's promise false rather than making it stronger.
+        The integration's **event feed** records every attempt, which is the
+        surface an operator actually reads.
+        """
+        if provider not in {kind.value for kind in NetworkProviderKind}:
+            raise UnsupportedNetworkProviderError(provider)
+        await self._check_portal_rate_limit(str(session_id))
+
+        session, normalized_mac = await self._resolve_portal_session(
+            session_id=session_id,
+            organization_id=organization_id,
+            location_id=location_id,
+            provider=provider,
+            client_mac=client_mac,
+        )
+
+        integration = await self.repository.find_enabled_integration_for_location(
+            organization_id=session.organization_id,
+            location_id=session.location_id,
+            provider=provider,
+        )
+        if integration is None:
+            raise NetworkIntegrationNotFoundError(
+                f"no enabled {provider} integration for this location"
+            )
+        if integration.portal_mode != PortalAuthMode.RADIUS.value:
+            # The mirror image of `authorize_portal_client`'s own refusal,
+            # and it matters just as much. This venue is on the external
+            # portal contract, where the authorization is an operator-
+            # authenticated `extPortal/auth` call this platform makes itself
+            # -- a `browserauth` submit against it would be answered by a
+            # portal configured for the other `authType`, and the guest would
+            # be no more online for it.
+            #
+            # Refusing here is also what keeps the live external-portal
+            # venue safe from this change: there is no input to this method
+            # that can make it act on such an integration.
+            await self._record_event(
+                integration,
+                event_type=IntegrationEventType.PORTAL_AUTHORIZE,
+                status=IntegrationEventStatus.ERROR,
+                error_code=ErrorCode.PORTAL_MODE_MISMATCH.value,
+                message=(
+                    "A guest portal called the RADIUS authorize endpoint for "
+                    "a venue configured for the external portal contract"
+                ),
+                context={"portal_mode": integration.portal_mode},
+            )
+            raise GuestSessionNotActiveError()
+
+        username = await self._guest_identifier_for_session(session)
+        if not username:
+            # The credential this contract submits IS the identifier, so a
+            # session whose guest cannot be resolved has nothing to submit.
+            # Refused rather than sent with an empty username, which the
+            # controller would answer with a 400 or -- worse -- a reject
+            # that reads to an operator as "our RADIUS said no".
+            logger.warning(
+                "network_integration_radius_portal_no_identifier",
+                extra={
+                    "integration_id": str(integration.id),
+                    "client_mac": normalized_mac,
+                },
+            )
+            raise GuestSessionNotActiveError()
+
+        context = ProviderRadiusPortalContext(
+            client_mac=client_mac,
+            # CR-004, same rule as the other contract: carried from the
+            # controller's own redirect, never derived from the HTTP peer.
+            client_ip=client_ip,
+            ap_mac=ap_mac,
+            gateway_mac=gateway_mac,
+            ssid_name=ssid_name,
+            radio_id=radio_id,
+            vid=vid,
+            origin_url=origin_url,
+            username=username,
+            password=self.settings.radius_portal_submit_password,
+            # From the INTEGRATION, never from the request -- see the SSRF
+            # section. `None` means "the provider's documented default".
+            portal_port=self._radius_portal_port(integration),
+            # Carried only to be checked against the address built from the
+            # row above. Never used to build one.
+            advertised_target=target,
+            advertised_port=target_port,
+            advertised_scheme=scheme,
+        )
+
+        provider_impl = self._provider(integration.provider)
+        config = self._connection_config(
+            integration, self._credentials_for(integration)
+        )
+        try:
+            result = await provider_impl.authorize_guest_via_radius_portal(
+                config, context
+            )
+        except ProviderControllerAddressMismatchError as error:
+            # THE SSRF REFUSAL. Not a rendered outcome, on purpose.
+            #
+            # Every other failure on this path becomes something the guest's
+            # page can say, because every other failure is a thing that
+            # happened to an honest request. This one is a request naming an
+            # address this platform does not hold, and the *only* audiences
+            # for it are the venue's operator (who may have moved their
+            # controller) and this platform's own logs. A caller learns
+            # nothing: they get the same opaque 403 as a nonexistent session,
+            # so the endpoint cannot be walked to discover which addresses
+            # this platform will and will not connect to.
+            logger.warning(
+                "network_integration_radius_portal_address_rejected",
+                extra={
+                    "integration_id": str(integration.id),
+                    "client_mac": normalized_mac,
+                    # The CLAIM, not the stored address: the stored one is
+                    # already on the row, and the claimed one is the whole
+                    # content of the incident.
+                    "claimed_target": target,
+                    "claimed_port": target_port,
+                    "claimed_scheme": scheme,
+                },
+            )
+            await self._record_event(
+                integration,
+                event_type=IntegrationEventType.PORTAL_AUTHORIZE,
+                status=IntegrationEventStatus.ERROR,
+                error_code=ErrorCode.RADIUS_PORTAL_ADDRESS_MISMATCH.value,
+                message=error.message,
+                context={
+                    "portal_mode": integration.portal_mode,
+                    "claimed_target": target,
+                    "claimed_port": target_port,
+                    "claimed_scheme": scheme,
+                },
+            )
+            raise GuestSessionNotActiveError() from None
+        except ProviderError as error:
+            # Every provider failure becomes a *rendered outcome*, not a 5xx.
+            # A guest staring at a spinner is the failure mode this whole
+            # change exists to remove, and "the controller timed out" is
+            # something the page can say truthfully. The operator-facing
+            # detail goes to the event feed, which is where it belongs.
+            failure = _RADIUS_FAILURE_BY_PROVIDER_ERROR.get(
+                error.code, RadiusPortalFailure.CONTROLLER_UNREACHABLE
+            )
+            await self._record_radius_portal_attempt(
+                integration,
+                client_mac=normalized_mac,
+                ssid_name=ssid_name,
+                authorized=False,
+                failure=failure.value,
+                error_code=error.code.value,
+                message=error.message,
+                provider_code=error.provider_code,
+            )
+            return RadiusPortalAuthorizationOutcome(
+                authorized=False,
+                provider=integration.provider,
+                failure=failure.value,
+            )
+
+        await self._record_radius_portal_attempt(
+            integration,
+            client_mac=normalized_mac,
+            ssid_name=ssid_name,
+            authorized=result.authorized,
+            failure=result.failure,
+            error_code=(
+                None
+                if result.authorized
+                else ErrorCode.RADIUS_PORTAL_NOT_AUTHORIZED.value
+            ),
+            message=(
+                "Guest authorized on the controller through RADIUS"
+                if result.authorized
+                else "The controller declined the RADIUS authorization"
+            ),
+            provider_code=result.provider_code,
+            http_status=result.http_status,
+        )
+        return RadiusPortalAuthorizationOutcome(
+            authorized=result.authorized,
+            provider=integration.provider,
+            # The controller's own `Location`, handed to the guest's browser.
+            # Never fetched here -- see `PortalAuthorizeResponse.redirect_url`
+            # for why that distinction is what keeps it from being an SSRF.
+            redirect_url=result.landing_url if result.authorized else None,
+            failure=result.failure,
+        )
+
+    async def _guest_identifier_for_session(self, session: Any) -> str | None:
+        """The guest's own identifier, from the session. Never from a body.
+
+        ``None`` when the session names no guest or the guest row is gone,
+        which the caller treats as a refusal rather than as an empty string
+        to submit.
+        """
+        guest_id = getattr(session, "guest_id", None)
+        if guest_id is None:
+            return None
+        if self.guest_session_lookup is None:  # pragma: no cover - defensive
+            return None
+        getter = getattr(self.guest_session_lookup, "get_guest_by_id", None)
+        if getter is None:  # pragma: no cover - defensive
+            return None
+        guest = await getter(guest_id)
+        identifier = getattr(guest, "identifier", None)
+        return identifier or None
+
+    @staticmethod
+    def _radius_portal_port(integration: NetworkIntegration) -> int | None:
+        """The operator's explicit portal-port override, or ``None``.
+
+        ``None`` means "let the provider use its documented default", which
+        is the normal case -- the port is vendor knowledge and does not
+        belong in this module. Anything that is not a plausible port is
+        treated as absent rather than passed on: a junk value in a JSONB
+        column should fall back to the working default, not refuse every
+        guest at the venue.
+        """
+        metadata = getattr(integration, "provider_metadata", None) or {}
+        raw = metadata.get(RADIUS_PORTAL_METADATA_PORT_KEY)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        return raw if 1 <= raw <= 65535 else None
+
+    async def _record_radius_portal_attempt(
+        self,
+        integration: NetworkIntegration,
+        *,
+        client_mac: str,
+        ssid_name: str | None,
+        authorized: bool,
+        failure: str | None,
+        error_code: str | None,
+        message: str,
+        provider_code: int | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        """One structured log line and one event row, per attempt.
+
+        Both, not either. They have different readers and different
+        retention: the log line is what an engineer greps at 2am with a
+        single MAC in hand (**there was nothing to grep before this**, which
+        is how the browser-side version of this call could fail silently for
+        every Android guest at a venue and produce no record anywhere), and
+        the event row is what the venue's own operator sees in the
+        integration feed.
+
+        The MAC is logged in full and unmasked, on purpose: a masked MAC
+        cannot be matched against the one an operator read off a guest's
+        phone, which is the only thing this line is for. It is a device
+        identifier at a venue the operator runs, in a log this platform
+        already scopes; the *credential* on this path -- the guest's
+        identifier -- is deliberately not logged.
+        """
+        logger.info(
+            "network_integration_radius_portal_authorize",
+            extra={
+                "integration_id": str(integration.id),
+                "organization_id": str(integration.organization_id),
+                "client_mac": client_mac,
+                "authorized": authorized,
+                "outcome": failure or "authorized",
+                "provider_error_code": provider_code,
+                "http_status": http_status,
+            },
+        )
+        context: dict[str, Any] = {
+            "ssid_name": ssid_name,
+            "portal_mode": integration.portal_mode,
+            "radius_portal_failure": failure,
+        }
+        if provider_code is not None:
+            context["provider_error_code"] = provider_code
+        if http_status is not None:
+            context["http_status"] = http_status
+        await self._record_event(
+            integration,
+            event_type=IntegrationEventType.PORTAL_AUTHORIZE,
+            status=(
+                IntegrationEventStatus.OK
+                if authorized
+                else IntegrationEventStatus.ERROR
+            ),
+            error_code=error_code,
+            message=message,
+            context=context,
         )
 
     @staticmethod
