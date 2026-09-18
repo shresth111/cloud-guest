@@ -395,11 +395,29 @@ def _build_queue_management_service(session: AsyncSession):
     router_service = RouterService(
         RouterRepository(session), organization_service, location_service
     )
+    from app.domains.network_integration.client_hooks import (
+        build_controller_speed_hook,
+    )
+
     return QueueManagementService(
         QueueManagementRepository(session),
         router_service,
         _build_policy_service(session),
         audit_writer=RBACRepository(session),
+        # The controller half, and without it #270's controller routing is
+        # unreachable from the ONLY path that ever applies a venue's Bandwidth
+        # policy. `_assign_guest_queue` hands every login to this worker, the
+        # worker built the service without a hook, and `_controller_speed`
+        # opens with `if self.controller_speed_hook is None: raise` -- so a
+        # venue's configured guest speed reached an Omada controller exactly
+        # never, while the FastAPI builder three doors down
+        # (`queue_management.dependencies`) had been wiring it all along.
+        #
+        # The sibling builder below already had its equivalent
+        # (`controller_terminator=`), which is what makes this an omission
+        # rather than a policy: two halves of the same idea, one of them
+        # wired.
+        controller_speed_hook=build_controller_speed_hook(session),
     )
 
 

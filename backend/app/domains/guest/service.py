@@ -282,6 +282,7 @@ from app.domains.router.crypto import (
 )
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_controller_managed
 from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
@@ -1874,6 +1875,7 @@ async def issue_live_disconnect(
     the row is flipped to ``EXPIRED``/``TERMINATED`` **before** this is
     called and this never raises, so without a loud log the platform
     reports an enforcement action it did not perform."""
+
     async def _record(enforced: bool) -> None:
         """Persist the outcome on the row itself.
 
@@ -2477,7 +2479,34 @@ class GuestService:
         it creates a fresh VOUCHER-targeted assignment on every call with
         no find-or-reuse step, so running it per login would accumulate
         duplicate assignments rather than converge on one."""
-        if not session.ip_address:
+        # WHAT THIS VENUE'S DEVICE LAYER ADDRESSES A CLIENT BY.
+        #
+        # ``device_target`` is one column serving two meanings, and until now
+        # it only ever carried the RouterOS one. A ``/queue simple`` row is
+        # tied to a concrete IP, so an IP is right there. A controller holds
+        # the limit as a field on the client's own record, keyed by MAC -- and
+        # ``_controller_speed`` passes ``assignment.device_target`` straight
+        # into ``normalize_client_mac``, which raises on anything that is not
+        # six hex octets. So every controller push was rejected for naming an
+        # IP, underneath the missing hook that stopped it being attempted at
+        # all. Fixing either one alone turns a silent no-op into a logged 502
+        # on every Omada guest login, which is why they move together.
+        #
+        # Resolved HERE rather than inside ``_controller_speed`` so the
+        # assignment row records the identifier that was actually used. A row
+        # reading "we limited 192.168.1.50" when the write went out against a
+        # MAC is the same class of untruth as the speed that never arrived.
+        controller_venue = is_controller_managed(router)
+        device_target = (
+            await self._queue_client_mac(session)
+            if controller_venue
+            else session.ip_address
+        )
+        # The guard follows the same split. A controller venue with no IP is
+        # perfectly serviceable -- the IP is not what it is addressed by --
+        # and returning on its absence was a second way the speed never left
+        # this method.
+        if not device_target:
             return
 
         # Design spec §5 S9. Applying the queue means opening a fresh TCP
@@ -2495,7 +2524,7 @@ class GuestService:
                 location_id=location_id,
                 router_id=router.id,
                 session_id=session.id,
-                device_target=session.ip_address,
+                device_target=device_target,
                 guest_id=session.guest_id,
             )
             return
@@ -2516,7 +2545,7 @@ class GuestService:
                 router_id=router.id,
                 target_type=QueueTargetType.SESSION,
                 target_id=session.id,
-                device_target=session.ip_address,
+                device_target=device_target,
                 guest_id=session.guest_id,
             )
         except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
@@ -2524,6 +2553,26 @@ class GuestService:
                 "guest_queue_assignment_failed",
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
+
+    async def _queue_client_mac(self, session: GuestSession) -> str | None:
+        """The MAC a controller-managed venue addresses this session's device
+        by, or ``None`` when this platform does not know it.
+
+        ``None`` is a real answer and the callers treat it as "do not try":
+        a controller cannot be asked to limit a client it cannot be told the
+        identity of, and inventing one -- the IP, the portal identifier --
+        is what produced the rejected writes this method exists to end.
+
+        Deliberately the same shape as
+        ``LiveSessionTerminator._session_mac_address``, which answers the
+        same question for the disconnect half. The two are not shared
+        because they read different repositories from different domains; if
+        a third caller appears, that is the moment to lift them.
+        """
+        if session.device_id is None:
+            return None
+        device = await self.repository.get_device_by_id(session.device_id)
+        return device.mac_address if device is not None else None
 
     async def _assign_voucher_queue(
         self,
@@ -2564,11 +2613,17 @@ class GuestService:
         when ``session.ip_address`` is unknown (mirrors
         ``_assign_guest_queue``'s identical "no known device IP" no-op).
         Never raises."""
-        if (
-            self.queue_assignment_hook is None
-            or voucher.plan_id is None
-            or not session.ip_address
-        ):
+        # Same vendor split as ``_assign_guest_queue`` -- a voucher's speed
+        # travels the identical ``apply_queue`` path and was rejected at a
+        # controller venue for the identical reason.
+        if self.queue_assignment_hook is None or voucher.plan_id is None:
+            return
+        device_target = (
+            await self._queue_client_mac(session)
+            if is_controller_managed(router)
+            else session.ip_address
+        )
+        if not device_target:
             return
         try:
             queue_profile_id = await self.voucher_service.get_plan_queue_profile_id(
@@ -2583,7 +2638,7 @@ class GuestService:
                 target_id=voucher.id,
                 router_id=router.id,
                 location_id=location_id,
-                device_target=session.ip_address,
+                device_target=device_target,
                 queue_profile_id=queue_profile_id,
             )
             await self.queue_assignment_hook.apply_queue(
@@ -5375,9 +5430,7 @@ class GuestService:
         (including this module's own pre-existing test suite) keeps working
         unchanged. See that function's own docstring for why the real logic
         was pulled out to module scope."""
-        return await enforce_session_timeouts(
-            self.repository, self.session_end_hook
-        )
+        return await enforce_session_timeouts(self.repository, self.session_end_hook)
 
     async def check_portal_admission(
         self,

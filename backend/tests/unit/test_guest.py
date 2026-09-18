@@ -9217,3 +9217,91 @@ class TestNasSecretRotationIsPlatformOnly:
         action = fields["device_action"].default
         assert "DOWN" in action
         assert "router" in action.lower()
+
+
+class TestAControllerVenueIsAddressedByTheThingItUnderstands:
+    """A venue's Bandwidth policy never reached an Omada controller, and it
+    failed twice over -- once silently, once loudly, and the loud one only
+    became reachable when the silent one was fixed.
+
+    1. The Celery worker built ``QueueManagementService`` without a
+       ``controller_speed_hook``. ``_assign_guest_queue`` hands every login
+       to that worker, and ``_controller_speed`` opens with
+       ``if self.controller_speed_hook is None: raise`` -- so #270's
+       controller routing was unreachable from the only path that ever
+       applies a venue's configured speed. The FastAPI builder had been
+       wiring it the whole time.
+    2. ``device_target`` carried ``session.ip_address``. That is right for
+       RouterOS, where a ``/queue simple`` row is tied to an address, and
+       wrong for a controller, which holds the limit on the client record
+       keyed by MAC. ``_controller_speed`` passes the value straight into
+       ``normalize_client_mac``, which raises on anything that is not six
+       hex octets.
+
+    Fixing either alone turns a silent no-op into a logged 502 on every
+    Omada guest login, which is why they moved together and are pinned
+    together.
+    """
+
+    @staticmethod
+    def _dispatcher(record: list[dict]):
+        async def _dispatch(**kwargs):
+            record.append(kwargs)
+
+        return _dispatch
+
+    async def _dispatch_for(self, vendor: str) -> dict:
+        dispatched: list[dict] = []
+        fx = make_fixture()
+        fx.router.vendor = vendor
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+        result = await fx.guest_service.login_via_otp(
+            identifier="guest@example.com",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:FF",
+            ip_address="10.0.0.5",
+        )
+        assert result.session is not None
+        assert len(dispatched) == 1
+        return dispatched[0]
+
+    async def test_a_controller_venue_dispatches_something_the_controller_accepts(
+        self,
+    ) -> None:
+        """The assertion is deliberately the controller's own validator
+        rather than a literal string: what broke was not "the wrong text",
+        it was that the value could not survive the one function every
+        controller write puts it through."""
+        from app.domains.network_integration.validators import normalize_client_mac
+
+        dispatched = await self._dispatch_for("tplink_omada")
+
+        assert dispatched["device_target"] != "10.0.0.5"
+        # Raises ValueError on anything that is not six hex octets -- which
+        # is precisely what an IP address is not.
+        assert normalize_client_mac(dispatched["device_target"])
+
+    async def test_a_mikrotik_venue_still_dispatches_the_ip(self) -> None:
+        """The other half of the split, and the one that must not move: a
+        ``/queue simple`` row is tied to a concrete address, and a MAC would
+        be as useless there as the IP was on the controller."""
+        dispatched = await self._dispatch_for("mikrotik")
+
+        assert dispatched["device_target"] == "10.0.0.5"
+
+    async def test_the_worker_wires_the_controller_speed_hook(self) -> None:
+        """Same shape as the dispatcher-wiring assertion above, and for the
+        same reason: the composition IS the behaviour, there is no DI
+        container inside a Celery task to inspect at runtime, and its
+        absence produced no error anywhere -- only a speed that never
+        arrived."""
+        import inspect
+
+        from app.domains.guest import tasks as guest_tasks
+
+        source = inspect.getsource(guest_tasks._build_queue_management_service)
+        assert "controller_speed_hook=build_controller_speed_hook(session)" in source
