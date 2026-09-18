@@ -538,6 +538,12 @@ class FakeProvider:
     # pass on -- an assertion on the outcome cannot tell a carried
     # `client_ip` from a dropped one.
     contexts: list[ProviderPortalContext] = field(default_factory=list)
+    # Every `duration_seconds` this fake was asked to authorize for, in
+    # order. Recorded because the number is the controller's whole belief
+    # about how long the guest stays on, and an assertion on the outcome
+    # cannot see it -- which is how a hardcoded 3600 sat next to a venue's
+    # 30-minute policy without any test noticing.
+    authorize_durations: list[int] = field(default_factory=list)
     # The RADIUS contract's own seam. Separate lists, not a shared one: the
     # two contexts are different types carrying different fields, and a test
     # asserting "the stored address was used, not the claimed one" needs the
@@ -627,6 +633,7 @@ class FakeProvider:
         self, config, context, *, duration_seconds, down_kbps=None, up_kbps=None
     ) -> ProviderAuthorizationResult:
         self.contexts.append(context)
+        self.authorize_durations.append(duration_seconds)
         self._maybe_raise("authorize_guest")
         return self.authorize_result or ProviderAuthorizationResult(
             authorized=True,
@@ -779,6 +786,12 @@ class FakeGuestSession:
         default_factory=lambda: uuid.uuid5(uuid.NAMESPACE_OID, "guest")
     )
     guest_identifier: str | None = "+919876543210"
+    # The venue's SESSION policy as it was resolved for this guest at login
+    # (`GuestService._resolve_session_timeout_minutes`), snapshotted on the
+    # row. `None` -- the default here -- is an unlimited grant or a row
+    # written before the resolver existed, and is what keeps every existing
+    # case on the integration's stored duration.
+    session_timeout_minutes: int | None = None
 
     @property
     def device_id(self):  # noqa: ANN201
