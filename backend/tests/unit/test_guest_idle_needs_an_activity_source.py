@@ -32,13 +32,14 @@ Nothing about a RouterOS venue changes: see ``TestMikrotikIsUntouched``.
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 
 from app.domains.guest.constants import (
     SESSION_ACTIVITY_GRACE_MINUTES,
+    VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
     GuestAuthMethod,
     GuestSessionStatus,
 )
@@ -270,11 +271,50 @@ def _install_integration(monkeypatch: pytest.MonkeyPatch, integration) -> None:
     )
 
 
+def _install_observed_activity(
+    monkeypatch: pytest.MonkeyPatch, *, reported: bool
+) -> list[dict]:
+    """Stand in for the one query that answers "is anything reporting here".
+
+    Patched on the guest repository module rather than on ``client_hooks``
+    because the lookup imports it at call time; the name is resolved off the
+    module either way. Returns the list of calls, so a test can assert the
+    question was asked at all -- an implementation that answers from the
+    integration row alone would leave it empty, which is exactly the defect.
+    """
+    import app.domains.guest.repository as guest_repository
+
+    asked: list[dict] = []
+
+    class _GuestRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def venue_activity_was_reported_since(
+            self, *, organization_id, location_id, since
+        ) -> bool:
+            asked.append(
+                {
+                    "organization_id": organization_id,
+                    "location_id": location_id,
+                    "since": since,
+                }
+            )
+            return reported
+
+    monkeypatch.setattr(guest_repository, "GuestRepository", _GuestRepository)
+    return asked
+
+
 class TestTheAnswerComesFromTheExistingCapabilityGate:
     """Deliberately driven through the **real** Omada provider rather than a
     fake one: the thing under test is that the sweep's question and the
     console's disabled-button question are answered by the same gate, so they
     cannot drift into disagreeing about the same venue.
+
+    The capability gate is only half of it now -- see
+    ``TestACapabilityIsNotAnObservation`` below for why, and for the tests
+    that would have caught the guard being inert.
     """
 
     async def _ask(self, session=None) -> bool:
@@ -293,15 +333,17 @@ class TestTheAnswerComesFromTheExistingCapabilityGate:
         )
         assert await self._ask() is False
 
-    async def test_an_openapi_venue_can(
+    async def test_an_openapi_venue_can_and_is(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Because the usage sweep polls it -- ``client_stats`` supported and
         ``list_omada_openapi_for_usage_sync`` selecting it are the same fact
-        about the same venue."""
+        about the same venue -- **and** because something has actually
+        reported here lately."""
         _install_integration(
             monkeypatch, _Integration(ControllerAuthMode.OPENAPI.value)
         )
+        _install_observed_activity(monkeypatch, reported=True)
         assert await self._ask() is True
 
     async def test_a_venue_with_no_controller_at_all_can(
@@ -345,6 +387,81 @@ class TestTheAnswerComesFromTheExistingCapabilityGate:
 
         monkeypatch.setattr(client_hooks, "decrypt_credentials", _boom)
         assert await self._ask() is False
+
+
+class TestACapabilityIsNotAnObservation:
+    """The test that would have caught the guard being inert.
+
+    The first version of this lookup ended at
+    ``client_capabilities(config).client_stats.supported``, which is computed
+    from ``auth_mode`` and contacts nothing. So every ``openapi`` venue
+    answered ``True`` whether its controller was alive, unreachable or
+    switched off -- and the guard read as working while guests went on being
+    expired on a clock nothing was advancing. Measured at the real venue on
+    2026-09-18: zero Interim-Updates that day, four of five expiries still
+    written as ``inactivity_timeout``.
+
+    Every test here pins the same distinction: *can* is not *does*.
+    """
+
+    async def _ask(self) -> bool:
+        lookup = client_hooks.build_controller_activity_reporting_lookup(MagicMock())
+        return await lookup.venue_reports_guest_activity(
+            organization_id=uuid.uuid4(), location_id=uuid.uuid4()
+        )
+
+    async def test_a_capable_controller_that_reports_nothing_answers_no(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ``openapi`` venue -- every capability supported, by
+        construction -- whose column nothing has moved inside the window.
+        The old implementation said ``True`` here."""
+        _install_integration(
+            monkeypatch, _Integration(ControllerAuthMode.OPENAPI.value)
+        )
+        _install_observed_activity(monkeypatch, reported=False)
+        assert await self._ask() is False
+
+    async def test_the_observation_is_actually_made(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not just that the answer is right, but that it came from looking.
+        An implementation that reads the integration row and stops asks
+        nothing here, and this is the assertion it fails."""
+        _install_integration(
+            monkeypatch, _Integration(ControllerAuthMode.OPENAPI.value)
+        )
+        asked = _install_observed_activity(monkeypatch, reported=True)
+        await self._ask()
+        assert len(asked) == 1
+
+    async def test_the_window_is_the_one_the_producers_report_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both producers report every 300 s, so the window has to be wide
+        enough for a missed tick and narrow enough that a controller that
+        died an hour ago is not still counted as reporting."""
+        _install_integration(
+            monkeypatch, _Integration(ControllerAuthMode.OPENAPI.value)
+        )
+        asked = _install_observed_activity(monkeypatch, reported=True)
+        await self._ask()
+        age = datetime.now(UTC) - asked[0]["since"]
+        assert abs(
+            age - timedelta(minutes=VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES)
+        ) < timedelta(seconds=5)
+
+    async def test_a_legacy_venue_is_still_refused_without_a_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Question one still short-circuits. A venue that provably cannot
+        report is not worth observing, and the observation is a query."""
+        _install_integration(
+            monkeypatch, _Integration(ControllerAuthMode.LEGACY.value)
+        )
+        asked = _install_observed_activity(monkeypatch, reported=True)
+        assert await self._ask() is False
+        assert asked == []
 
 
 class TestTheSweepIsWiredTheWayTheAppBuildsIt:

@@ -421,6 +421,29 @@ SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS = 300.0
 # never arrives.
 SESSION_ACTIVITY_GRACE_MINUTES = 10
 
+# How far back the sweep looks for *evidence that this venue is reported on
+# at all* before it is willing to measure a guest's idleness.
+#
+# Not the same question as the grace above, which asks how late one venue's
+# next update may be. This one asks whether any update is arriving here, and
+# is answered by ``GuestRepository.venue_activity_was_reported_since``: has
+# anything moved ``last_activity_at`` past ``started_at`` at this venue
+# inside this window. Both producers report every 300s (RADIUS
+# ``Acct-Interim-Interval``, and the Omada usage poll's
+# ``OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS``), so three intervals tolerates
+# two consecutive misses before a venue is treated as unreported -- and
+# being treated as unreported is not a failure state: it only drops the
+# idle half of the rule, leaving the absolute ``session_timeout_minutes``
+# ceiling, which is measured from ``started_at`` and needs no reporting to
+# be true.
+#
+# Erring long is the safe direction here. A window that is too short calls
+# a healthy venue unreported and lets its idle guests linger until the
+# ceiling; a window that is too long resumes expiring guests for inactivity
+# on the strength of accounting that stopped arriving, which is the defect
+# this exists to close.
+VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES = 15
+
 # ============================================================================
 # Session presence reconciliation -- closes ``ACTIVE`` sessions whose device
 # is no longer on the router at all. See ``service
@@ -773,6 +796,7 @@ __all__ = [
     "QuotaPeriodType",
     "TASK_RUN_SESSION_TIMEOUT_SWEEP",
     "SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS",
+    "VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES",
     "TASK_RUN_SESSION_PRESENCE_SWEEP",
     "TASK_RECONCILE_ROUTER_SESSION_PRESENCE",
     "SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS",

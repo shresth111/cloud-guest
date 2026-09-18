@@ -76,6 +76,7 @@ __all__ = [
     "ClientActionResponse",
     "ClientCapabilitiesResponse",
     "ClientCapabilityView",
+    "ControllerLivenessView",
     "ClientMacRequest",
     "ClientRateLimitView",
     "ClientSpeedRequest",
@@ -1315,14 +1316,51 @@ class ClientCapabilityView(BaseModel):
     reason: str | None = None
 
 
-class ClientCapabilitiesResponse(BaseModel):
-    """Every client action's availability at one location.
+class ControllerLivenessView(BaseModel):
+    """Whether this venue's controller is answering, as of the last time
+    anything looked.
 
-    Answered without contacting the controller, from the integration's own
-    auth mode, so a console can decide what to enable before any live call.
-    ``list_blocked`` is always ``False`` -- see the provider's own note: the
-    block flag is not readable through the connection this platform holds, and
-    an empty list would be a false statement about the venue.
+    A different question from the capabilities beside it, and the reason
+    this field exists: a capability says what a venue is *configured* to be
+    able to do and stays true while its controller is unplugged. This says
+    whether a real call got through recently.
+
+    ``reachable`` is tri-state and a console should enable a
+    controller-dependent control only on ``True``:
+
+    * ``true`` -- a recent check reached the controller and worked.
+    * ``false`` -- a recent check did not get through.
+    * ``null`` -- nothing has checked recently enough to say. Not the same
+      claim as ``false``, and it degrades the control the same way.
+
+    ``checked_at`` is when that check ran (``null`` if none ever has), and
+    ``reason`` carries a sentence for the person looking at the degraded
+    control whenever ``reachable`` is not ``true``. No live call is made to
+    answer this -- the value is the cached result of the background sync
+    that already polls each controller on its own interval.
+    """
+
+    reachable: bool | None = None
+    checked_at: datetime | None = None
+    reason: str | None = None
+
+
+class ClientCapabilitiesResponse(BaseModel):
+    """Every client action's availability at one location, and separately,
+    whether the controller behind them is answering.
+
+    The per-action entries are answered without contacting the controller,
+    from the integration's own auth mode, so a console can decide what to
+    enable before any live call. ``list_blocked`` is always ``False`` -- see
+    the provider's own note: the block flag is not readable through the
+    connection this platform holds, and an empty list would be a false
+    statement about the venue.
+
+    ``controller`` is the second half and must not be folded into the first.
+    "This venue can set guest speeds" and "this venue's controller is up" are
+    different facts with different lifetimes, and a console that reads only
+    the first renders a fully enabled Bandwidth control at a venue whose
+    controller has been dark for a day. Gate on both.
     """
 
     set_rate_limit: ClientCapabilityView
@@ -1332,6 +1370,7 @@ class ClientCapabilitiesResponse(BaseModel):
     list_blocked: ClientCapabilityView
     disconnect: ClientCapabilityView
     client_stats: ClientCapabilityView
+    controller: ControllerLivenessView = ControllerLivenessView()
 
 
 class ClientMacRequest(BaseModel):
@@ -1385,13 +1424,21 @@ class ClientRateLimitView(BaseModel):
 
     ``applied_*`` and ``requested_*`` are separate because they can differ: a
     controller that holds a limit as a bounded number plus a Kbps/Mbps unit
-    cannot express every kbps value, so 1500 kbps is applied as 2 Mbps.
-    ``clamped`` says so explicitly. A console must show the applied figure --
-    echoing the typed one back would be this platform asserting a limit that
-    is not in force.
+    cannot express every kbps value, so 1500 kbps is sent as 1 Mbps -- always
+    rounded **down**, because a cap that came back larger than the one the
+    operator typed is not a cap. ``clamped`` says so explicitly. A console
+    must show the applied figure -- echoing the typed one back would be this
+    platform asserting a limit that is not in force.
 
     ``None`` on a direction means unlimited in that direction; it is not zero
     and it is not unknown.
+
+    ``read_back`` is what stops ``applied_*`` being over-read. ``False``
+    means these numbers are the request as this platform encoded it and sent
+    it, not a value fetched back from the controller afterwards -- which on
+    Omada it never is, because that controller's Open API offers a
+    per-client rate-limit write and no matching read. A console rendering
+    these while ``read_back`` is ``False`` should word them as what was sent.
     """
 
     enabled: bool
@@ -1400,6 +1447,7 @@ class ClientRateLimitView(BaseModel):
     requested_down_kbps: int | None = None
     requested_up_kbps: int | None = None
     clamped: bool = False
+    read_back: bool = False
 
 
 class ClientActionResponse(BaseModel):

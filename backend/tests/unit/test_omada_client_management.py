@@ -29,11 +29,16 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
-from app.domains.network_integration.constants import ControllerAuthMode
+from app.domains.network_integration.constants import (
+    CONTROLLER_LIVENESS_STALE_INTERVALS,
+    ControllerAuthMode,
+    SyncStatus,
+)
 from app.domains.network_integration.exceptions import (
     ClientActionUnavailableError,
     LocationHasNoControllerError,
@@ -198,6 +203,165 @@ class TestCapabilitiesAreDeclaredNotDiscovered:
         documented contract is 1-1024 and nothing shows an access point
         honours more, so this platform's ceiling is the documented one."""
         assert CONTROLLER_RATE_LIMIT_MAX_KBPS == 1024 * 1000
+
+
+class TestTheSpeedApiOnlySaysWhatItChecked:
+    """``ClientActionResult.performed`` documents itself as "the controller's
+    own answer, never an assumption", and both speed paths returned a
+    hardcoded ``True``. The literal meant "the HTTP call did not raise",
+    which is a weaker fact and sometimes a different one.
+    """
+
+    async def test_performed_comes_from_the_provider_not_from_the_literal(
+        self,
+    ) -> None:
+        """A set that limits neither direction reaches the controller, is
+        accepted, and throttles nothing -- the controller is left holding an
+        enabled-but-empty limit, which its own UI renders as "rate limited".
+        The old hardcode reported that as a speed limit applied."""
+
+        class _LimitsNothing(FakeProvider):
+            async def set_client_rate_limit(
+                self, config, site_id, client_mac, *, down_kbps=None, up_kbps=None
+            ):
+                from app.domains.network_integration.providers.base import (
+                    ProviderClientRateLimit,
+                )
+
+                self.client_actions.append(
+                    ("set_client_rate_limit", site_id, client_mac)
+                )
+                return ProviderClientRateLimit(enabled=False)
+
+        service, organization_id, location_id = _venue(provider=_LimitsNothing())
+        result = await service.set_client_speed(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=CLIENT_MAC,
+            down_kbps=0,
+            up_kbps=0,
+            actor_user_id=None,
+        )
+        assert result.performed is False
+
+    async def test_a_real_limit_is_still_reported_as_performed(self) -> None:
+        """The negative test above is worthless if the ordinary case broke."""
+        service, organization_id, location_id = _venue()
+        result = await service.set_client_speed(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=CLIENT_MAC,
+            down_kbps=5_000,
+            up_kbps=1_000,
+            actor_user_id=None,
+        )
+        assert result.performed is True
+
+    async def test_a_clear_is_performed_when_no_limit_is_left_in_force(
+        self,
+    ) -> None:
+        service, organization_id, location_id = _venue()
+        result = await service.clear_client_speed(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=CLIENT_MAC,
+            actor_user_id=None,
+        )
+        assert result.performed is True
+        assert result.rate_limit is not None
+        assert result.rate_limit.enabled is False
+
+    def test_the_applied_figures_do_not_claim_to_be_a_read_back(self) -> None:
+        """``applied_*`` is the request as this platform encoded it, not a
+        value fetched back: the Open API exposes a per-client rate-limit
+        write and no matching read (``.../clients/{mac}`` answers 405).
+        ``read_back`` is what stops a console wording it as confirmed."""
+        from app.domains.network_integration.providers.base import (
+            ProviderClientRateLimit,
+        )
+
+        assert ProviderClientRateLimit(enabled=True).read_back is False
+
+
+# ===========================================================================
+# Controller liveness: a capability is not an observation
+# ===========================================================================
+
+
+class TestCapabilityAndLivenessAreSeparateAnswers:
+    """``client_capabilities`` is computed from ``auth_mode`` and contacts
+    nothing, which is right for "can this venue ever do X" and cannot answer
+    "is this venue's controller working right now". It was being read as the
+    second, so a console rendered a fully enabled Bandwidth control at a
+    venue whose controller was dark.
+    """
+
+    async def test_capabilities_still_answer_from_the_auth_mode(self) -> None:
+        service, organization_id, location_id = _venue()
+        report = await service.get_client_capabilities(
+            location_id=location_id, organization_id=organization_id
+        )
+        assert report.capabilities["set_rate_limit"]["supported"] is True
+
+    async def test_a_controller_nobody_has_checked_is_not_called_reachable(
+        self,
+    ) -> None:
+        """``last_sync_status`` is ``never`` on a freshly created row. Not
+        ``False`` either -- "we have not looked" and "we looked and it was
+        down" are different claims, and only one of them is measured."""
+        service, organization_id, location_id = _venue()
+        report = await service.get_client_capabilities(
+            location_id=location_id, organization_id=organization_id
+        )
+        assert report.controller.reachable is None
+        assert report.controller.reason
+
+    async def test_a_failing_sync_makes_the_controller_unreachable(self) -> None:
+        service, organization_id, location_id = _venue()
+        integration = next(iter(service.repository.integrations.values()))
+        integration.last_sync_at = datetime.now(UTC)
+        integration.last_sync_status = SyncStatus.ERROR.value
+
+        report = await service.get_client_capabilities(
+            location_id=location_id, organization_id=organization_id
+        )
+        # Capabilities unchanged -- the venue is still configured to be able
+        # to do this. What changed is whether it will work if clicked.
+        assert report.capabilities["set_rate_limit"]["supported"] is True
+        assert report.controller.reachable is False
+        assert report.controller.reason
+
+    async def test_a_recent_successful_sync_is_reachable(self) -> None:
+        service, organization_id, location_id = _venue()
+        integration = next(iter(service.repository.integrations.values()))
+        integration.last_sync_at = datetime.now(UTC)
+        integration.last_sync_status = SyncStatus.OK.value
+
+        report = await service.get_client_capabilities(
+            location_id=location_id, organization_id=organization_id
+        )
+        assert report.controller.reachable is True
+        assert report.controller.reason is None
+
+    async def test_a_sync_that_stopped_running_stops_counting_as_an_answer(
+        self,
+    ) -> None:
+        """A success from four hours ago is not a statement about now. It
+        degrades to ``None`` rather than ``False``, because nothing has
+        measured a failure -- but a console treats both the same way."""
+        service, organization_id, location_id = _venue()
+        integration = next(iter(service.repository.integrations.values()))
+        integration.last_sync_at = datetime.now(UTC) - timedelta(
+            seconds=integration.sync_interval_seconds
+            * (CONTROLLER_LIVENESS_STALE_INTERVALS + 1)
+        )
+        integration.last_sync_status = SyncStatus.OK.value
+
+        report = await service.get_client_capabilities(
+            location_id=location_id, organization_id=organization_id
+        )
+        assert report.controller.reachable is None
+        assert report.controller.reason
 
 
 # ===========================================================================

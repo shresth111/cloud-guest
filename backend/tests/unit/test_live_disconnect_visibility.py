@@ -280,3 +280,95 @@ def test_operator_message_is_unchanged_when_nothing_was_attempted():
         _session_end_message(untouched, action="disconnected")
         == "Guest session disconnected"
     )
+
+
+# ---------------------------------------------------------------------------
+# the speed limit comes off whether or not we ended the session
+# ---------------------------------------------------------------------------
+
+
+class _TerminatorWithRelease(_Terminator):
+    """A terminator that also knows how to release the venue's speed limit,
+    which is what the real one does at a controller-managed venue."""
+
+    def __init__(self, *, fail: Exception | None = None):
+        super().__init__(fail=fail)
+        self.released: list[dict] = []
+
+    async def release_rate_limit(self, *, session, organization_id=None):
+        self.released.append(
+            {"session_id": session.id, "organization_id": organization_id}
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_nas_reported_stop_still_releases_the_speed_limit():
+    """The defect, as a test.
+
+    ``already_ended_on_device`` returns early -- correctly, there is no
+    authorization left to remove -- and it used to take the rate-limit
+    release with it. At a RADIUS-mode venue an Accounting-Stop is the
+    *ordinary* ending, so the limit was set once and never removed, on a
+    controller record keyed by MAC that outlives the session. The next
+    device to hold that MAC inherited a cap nobody configured for it: the
+    ``/queue simple`` accumulation defect, reborn on a different vendor.
+    """
+    session = _session()
+    terminator = _TerminatorWithRelease()
+    repo = _Repo(guest=SimpleNamespace(identifier="g@example.com"))
+
+    await issue_live_disconnect(
+        repo,
+        session=session,
+        terminator=terminator,
+        already_ended_on_device=True,
+    )
+
+    # Still no device call and still no claim of enforcement...
+    assert terminator.calls == []
+    assert session.disconnect_enforced is None
+    # ...but the limit is taken off.
+    assert [r["session_id"] for r in terminator.released] == [session.id]
+    assert terminator.released[0]["organization_id"] == session.organization_id
+
+
+@pytest.mark.asyncio
+async def test_a_release_that_fails_does_not_break_the_session_end(caplog):
+    """Same contract as everything else on this path: the status transition
+    has already committed, so a venue's controller must not be able to turn
+    a completed disconnect into an exception."""
+    session = _session()
+
+    class _Boom(_TerminatorWithRelease):
+        async def release_rate_limit(self, *, session, organization_id=None):
+            raise RuntimeError("controller is unreachable")
+
+    assert (
+        await issue_live_disconnect(
+            _Repo(guest=SimpleNamespace(identifier="g@example.com")),
+            session=session,
+            terminator=_Boom(),
+            already_ended_on_device=True,
+        )
+        is None
+    )
+    assert any(
+        r.message == "guest_live_rate_limit_release_failed" for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_terminator_without_a_release_is_not_a_failure():
+    """A RouterOS-only wiring, or a test's own fake. There is no controller
+    limit to release, and the absence must not log an enforcement failure or
+    raise."""
+    session = _session()
+    assert (
+        await issue_live_disconnect(
+            _Repo(guest=SimpleNamespace(identifier="g@example.com")),
+            session=session,
+            terminator=_Terminator(),
+            already_ended_on_device=True,
+        )
+        is None
+    )

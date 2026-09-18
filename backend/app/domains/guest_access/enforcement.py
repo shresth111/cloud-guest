@@ -657,6 +657,65 @@ class LiveSessionTerminator:
             still_active=0,
         )
 
+    async def release_rate_limit(
+        self,
+        *,
+        session: LiveSessionRow,
+        organization_id: uuid.UUID | None = None,
+    ) -> None:
+        """Take this platform's per-device speed limit back off the MAC this
+        session used. Ends nothing.
+
+        Called by ``guest.service.issue_live_disconnect`` on **every** way a
+        session ends, including the one where the device ended it itself and
+        no disconnect is issued. That is the whole point: a controller's
+        per-client limit is a field on the known-client record with no
+        session lifetime, so if the release rides on this platform issuing a
+        disconnect, then at a RADIUS-mode venue -- where an Accounting-Stop
+        is the normal ending -- it is never issued and the limit stays on
+        the record for whatever device next holds that MAC.
+
+        **A RouterOS venue is untouched.** The vendor question is asked
+        first and this returns immediately for a non-controller router: no
+        connection, no credential resolution, no ``/queue simple`` write.
+        Queue-row cleanup on RouterOS is a real and separate problem; this
+        method is not a quiet start on it.
+
+        Never raises, for the same reason the session-end call path never
+        does: it runs after a status transition that has already committed,
+        and a venue's equipment must not be able to fail an operator's
+        disconnect. A limit that could not be released is recorded in the
+        integration's own event feed by the layer that tried.
+        """
+        release = getattr(self.controller_terminator, "release_rate_limit", None)
+        if release is None:
+            # No controller half wired (a deployment without the network
+            # integration domain, or a test). Nothing to release, and
+            # nothing to report -- this is not a failure to enforce.
+            return
+        try:
+            router = await self.router_lookup.get_router(
+                session.router_id, requesting_organization_id=organization_id
+            )
+            if not is_controller_managed(router):
+                return
+            location_id = getattr(router, "location_id", None)
+            client_mac = await self._session_mac_address(session)
+            if location_id is None or not client_mac:
+                # Nothing to address the controller with. The limit, if any,
+                # was set against a MAC this row no longer carries.
+                return
+            await release(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "guest_rate_limit_release_failed",
+                extra={"error": str(exc)},
+            )
+
     async def _session_mac_address(self, session: LiveSessionRow) -> str | None:
         """The MAC the guest is on, when this platform knows it.
 

@@ -453,9 +453,12 @@ def _build_activity_reporting_lookup(session: AsyncSession):
     minutes" just means "logged in 35 minutes ago".
 
     This is a real hook against the real repository rather than a flag on
-    the task, so the answer comes from the venue's own integration row
-    through the provider's own capability gate -- the same gate the speed
-    and block hooks already consult -- and cannot drift from it.
+    the task. It asks two things in order: can this venue's controller
+    report at all (the provider's own capability gate, the same one the
+    speed and block hooks consult), and *has* anything reported here
+    lately. The second question is the one that matters at an ``openapi``
+    venue, where the first is always yes by construction and stayed yes
+    through a day on which the controller sent nothing at all.
     """
     from app.domains.network_integration.client_hooks import (
         build_controller_activity_reporting_lookup,

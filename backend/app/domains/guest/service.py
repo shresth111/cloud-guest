@@ -566,8 +566,16 @@ class VenueActivityReportingProtocol(Protocol):
 
     Satisfied as-is by
     ``network_integration.client_hooks.build_controller_activity_reporting_lookup``.
-    ``True`` means some producer feeds ``last_activity_at`` for sessions at
-    this venue; ``False`` means provably none does.
+    ``True`` means some producer **is observed to be feeding**
+    ``last_activity_at`` for sessions at this venue; ``False`` means none is.
+
+    "Is observed to be", not "could be". The distinction is the whole
+    reason this Protocol's one method is phrased as a question about the
+    venue rather than about its equipment: a controller's declared
+    capability answers whether a venue is *able* to report, which is a
+    different fact and was being spent as though it were this one. An
+    implementation that answers from a configuration column alone does not
+    satisfy this contract, however plausible its answer.
     """
 
     async def venue_reports_guest_activity(
@@ -620,7 +628,16 @@ async def enforce_session_timeouts(
     such venue.
 
     So the venue is asked first. ``activity_reporting`` answers, per venue,
-    whether any producer exists; where the answer is ``False`` the idle
+    whether any producer **is reporting** -- an observation of the column
+    itself, not a capability read off the integration row. That distinction
+    is not pedantry: the first version of this guard asked the controller
+    provider's ``client_stats`` capability, which is computed from
+    ``auth_mode`` and contacts nothing, so every ``openapi`` venue answered
+    ``True`` whether or not its controller was alive. Measured 2026-09-18:
+    zero Interim-Updates that day, four of five expiries still written as
+    ``inactivity_timeout``. The guard was inert and read as working.
+
+    Where the answer is ``False`` the idle
     half is dropped and only the absolute ``session_timeout_minutes``
     ceiling applies -- measured from ``started_at``, which needs no
     reporting to be true -- and the row is ended with its own
@@ -1624,6 +1641,24 @@ class LiveSessionTerminatorProtocol(Protocol):
         organization_id: uuid.UUID | None = None,
     ) -> object: ...
 
+    #: Optional second method, read by ``getattr`` rather than declared
+    #: required here: take this platform's per-device speed limit off the
+    #: MAC this session used, without ending anything.
+    #:
+    #: Separate from ``end_on_router`` because the two answer to different
+    #: events. A controller's per-client limit has no session lifetime, so
+    #: it has to come off on *every* way a session ends -- including the
+    #: ones where the device ended it itself and no disconnect is issued,
+    #: which at a RADIUS-mode venue is the ordinary case and is exactly
+    #: where the limit was being left behind.
+    #:
+    #: A terminator without it is fine: there is nothing to release at a
+    #: RouterOS venue.
+    #:
+    #: async def release_rate_limit(
+    #:     self, *, session: object, organization_id: uuid.UUID | None = None
+    #: ) -> None: ...
+
 
 class QueueAssignmentProtocol(Protocol):
     """The methods ``GuestService``'s optional ``queue_assignment_hook``
@@ -1916,6 +1951,36 @@ async def run_quota_reset(
     return {"reset_count": reset_count}
 
 
+async def _release_rate_limit(
+    session: GuestSession, terminator: LiveSessionTerminatorProtocol | None
+) -> None:
+    """Ask the terminator to take this platform's speed limit off the MAC
+    this session used, if it has a way to.
+
+    Optional by ``getattr`` rather than by a required Protocol method,
+    because every existing hook on this service is additive and a terminator
+    that predates this one must keep working -- see
+    ``LiveSessionTerminatorProtocol``. A terminator without it is not a
+    degradation to report: a RouterOS venue has no controller limit to
+    release, and that is the majority of the fleet.
+
+    Never raises. The callers are session ends whose row has already been
+    written.
+    """
+    if terminator is None:
+        return
+    release = getattr(terminator, "release_rate_limit", None)
+    if release is None:
+        return
+    try:
+        await release(session=session, organization_id=session.organization_id)
+    except Exception as exc:  # noqa: BLE001 -- a session end cannot fail here
+        logger.warning(
+            "guest_live_rate_limit_release_failed",
+            extra={"session_id": str(session.id), "error": str(exc)},
+        )
+
+
 async def issue_live_disconnect(
     repository: GuestRepositoryProtocol,
     *,
@@ -1960,6 +2025,17 @@ async def issue_live_disconnect(
     and failed, and ``None`` when nothing was attempted (no guest row, no
     terminator wired, or ``already_ended_on_device``).
 
+    **It also releases the venue's per-device speed limit, on every path,
+    including the ones that attempt no disconnect.** That is deliberately
+    not gated on the return value above: a controller's per-client rate
+    limit is a field on the known-client record keyed by MAC, with no
+    session lifetime and nothing on the controller to remove it, so the
+    release cannot depend on this platform having been the one to end the
+    session. It is a no-op at a RouterOS venue -- the terminator asks the
+    vendor question before it does anything -- and see
+    ``network_integration.client_hooks._release_rate_limit`` for what
+    happens when the device has already left the controller's client list.
+
     **Anything but ``True`` means the guest may still be online**, and every
     such path says so at WARNING with ``enforcement_delivered: False``.
     That matters because this is the *only* enforcement mechanism behind
@@ -1992,6 +2068,16 @@ async def issue_live_disconnect(
         #  guest disconnect, fleet-wide, to remove a row that is already
         #  gone. Left unwritten (NULL) rather than recorded as enforced:
         #  this platform did not do it, and the column means "did we".
+        #
+        #  The speed limit is a different object with a different lifetime
+        #  and does not get to ride on that reasoning. It lives on the
+        #  controller's known-client record, keyed by MAC, outlives the
+        #  authorization that caused it, and nothing on the controller ever
+        #  removes it -- so "the session is already over on the device" is
+        #  not a reason to leave it standing, it is the reason it would be
+        #  left standing forever. At a RADIUS-mode venue this branch is the
+        #  *normal* ending, which is why the limit was never coming off.
+        await _release_rate_limit(session, terminator)
         return None
 
     guest = await repository.get_guest_by_id(session.guest_id)

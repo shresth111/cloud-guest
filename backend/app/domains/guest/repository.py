@@ -27,6 +27,7 @@ from sqlalchemy import (
     and_,
     case,
     cast,
+    exists,
     func,
     literal,
     or_,
@@ -337,6 +338,14 @@ class GuestRepositoryProtocol(Protocol):
     ) -> GuestSession | None: ...
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]: ...
+
+    async def venue_activity_was_reported_since(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        since: datetime,
+    ) -> bool: ...
 
     async def list_active_sessions_for_guest(
         self, guest_id: uuid.UUID
@@ -1270,6 +1279,53 @@ class GuestRepository:
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def venue_activity_was_reported_since(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        since: datetime,
+    ) -> bool:
+        """Has anything actually moved ``last_activity_at`` at this venue
+        since ``since``? One indexed EXISTS, no network call.
+
+        **This is an observation, not a declaration**, and the difference is
+        the whole point. ``client_capabilities`` can say a venue's controller
+        is *able* to report per-client traffic; it cannot say anything is
+        reporting, because it contacts nothing. This can: the idle half of
+        the timeout sweep reads ``now - last_activity_at``, so the honest
+        precondition for applying it is that something writes that column
+        here.
+
+        ``last_activity_at > started_at`` is the discriminator and it is
+        load-bearing. The column is *initialised* to ``now`` when a session
+        is created, so "recent ``last_activity_at``" on its own is satisfied
+        by a login and proves nothing. Only a later write moves it past
+        ``started_at``, and the writers are the two producers the sweep
+        depends on -- RADIUS accounting Interim-Updates and the Omada
+        Open-API usage poll, both through ``GuestService.record_usage``,
+        which bumps the column on every interim regardless of byte deltas,
+        so this measures *reporting* rather than how busy the guests are.
+        (``resume_session``/``extend_session`` also touch it; an operator
+        extending a session at this venue in the last few minutes is a
+        false positive, and a rare, bounded and self-clearing one -- it can
+        only make the sweep behave as it did before this existed.)
+
+        Ended sessions count. A venue whose guests all left ten minutes ago
+        was still being reported on, and excluding them would make a quiet
+        venue look unreported.
+        """
+        statement = select(
+            exists().where(
+                GuestSession.organization_id == organization_id,
+                GuestSession.location_id == location_id,
+                GuestSession.is_deleted.is_(False),
+                GuestSession.last_activity_at >= since,
+                GuestSession.last_activity_at > GuestSession.started_at,
+            )
+        )
+        return bool(await self.session.scalar(statement))
 
     async def list_active_sessions_for_guest(
         self, guest_id: uuid.UUID
