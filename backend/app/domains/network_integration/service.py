@@ -95,13 +95,16 @@ from app.domains.rbac.location_scope import LocationScope, enforce_entity_locati
 
 from .constants import (
     AUDIT_ENTITY_TYPE,
+    CONTROLLER_LIVENESS_STALE_INTERVALS,
     CONTROLLER_SETUP_OPERATOR_PREFIX,
     CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH,
     CONTROLLER_SETUP_PORTAL_NAME_PREFIX,
     DEFAULT_CONTROLLER_TLS_MODE,
     DEFAULT_PORTAL_AUTH_MODE,
+    DEFAULT_SYNC_INTERVAL_SECONDS,
     FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER,
     GUEST_OPERATOR_CREDENTIAL_FIELDS,
+    MIN_SYNC_INTERVAL_SECONDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
     PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS,
     PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW,
@@ -717,16 +720,67 @@ class ClientActionResult:
     ``performed`` is the controller's own answer, never an assumption. A
     caller rendering "Blocked" must read it.
 
+    That sentence used to be false on the two speed actions, which returned a
+    hardcoded ``True``: the literal said "we did it" on the strength of an
+    HTTP call not raising, which is a weaker fact and sometimes a different
+    one -- a set that limits neither direction reaches the controller, is
+    accepted, and limits nothing. Both now read the provider's own
+    :class:`~.providers.base.ProviderClientRateLimit`, so "a limit is in
+    force" and "the call did not error" cannot drift apart again.
+
     ``rate_limit`` is present only for the speed actions and carries what the
     controller was *given*, which is not always what was asked for: a vendor
     that expresses limits as a bounded number plus a unit cannot hold every
-    kbps value. A console must show the applied figure, not the typed one.
+    kbps value. A console must show the applied figure, not the typed one --
+    and must call it *requested* rather than *applied* unless
+    ``rate_limit.read_back`` is ``True``, because on Omada it never is: that
+    controller offers a rate-limit write and no matching read.
     """
 
     action: str
     performed: bool
     client_mac: str
     rate_limit: ProviderClientRateLimit | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerLiveness:
+    """Whether this venue's controller is answering, as far as anything has
+    recently looked -- **not** what it is capable of.
+
+    Deliberately a separate object from
+    :class:`~.providers.base.ProviderClientCapabilities` rather than another
+    flag on it, because the two are answered by different things and one of
+    them was standing in for the other. A capability is computed from the
+    integration row and is true for as long as the venue is configured that
+    way; this is an observation with a timestamp on it, and it goes stale.
+
+    ``reachable`` is tri-state. ``True``: a real call reached this
+    controller recently and worked. ``False``: one reached for it recently
+    and did not. ``None``: nobody has looked recently enough for either
+    statement to be honest. A caller deciding whether to enable something
+    that needs the controller should require ``True``; the other two are
+    both "we cannot promise this will work", which is a different sentence
+    from "this venue cannot do this at all" and must not be rendered as one.
+
+    ``reason`` is written for the person looking at the degraded control and
+    is populated whenever ``reachable`` is not ``True``.
+    """
+
+    reachable: bool | None
+    checked_at: datetime | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClientCapabilitiesReport:
+    """The two answers :meth:`NetworkIntegrationService
+    .get_client_capabilities` gives, kept apart so neither can be read as
+    the other: what this venue can ever do, and whether its controller is
+    answering right now."""
+
+    capabilities: dict[str, dict[str, object]]
+    controller: ControllerLiveness
 
 
 @dataclass(frozen=True, slots=True)
@@ -4765,33 +4819,110 @@ class NetworkIntegrationService:
 
     async def get_client_capabilities(
         self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
-    ) -> dict[str, dict[str, object]]:
-        """What this venue's controller can do to one of its clients.
+    ) -> ClientCapabilitiesReport:
+        """What this venue's controller **can ever** do to one of its
+        clients, and separately, whether it is **answering right now**.
 
-        Contacts nothing: the answer is computed from the integration's own
-        auth mode. It exists so a console can render an honestly disabled
-        control with the reason beside it, rather than an enabled one that
-        fails when somebody clicks it.
+        Two questions, named apart on purpose, because one answer was being
+        spent on both. ``capabilities`` is computed from the integration's
+        own auth mode and contacts nothing -- which is right for "can this
+        venue ever do X", and is exactly why it cannot answer "is X going to
+        work if I click it": a venue in ``openapi`` mode reports every action
+        supported whether its controller is alive, unplugged or gone. A
+        console reading only that renders a fully enabled Bandwidth control
+        at a venue whose controller has been dark for a day.
+
+        ``controller`` is the second answer and it is **still not a live
+        call**: this endpoint is rendered constantly, and a controller round
+        trip per render is not a thing to add to a paint path. It reads the
+        cached result of the background sync that already polls this
+        controller every ``sync_interval_seconds`` (300 by default) and
+        records the outcome on the row. That is a recent probe, taken by
+        something whose job is to take it.
+
+        A console should gate a controller-dependent control on
+        ``capabilities`` **and** ``controller.reachable is True`` -- anything
+        else (``False`` for a failing sync, ``None`` for one that has never
+        run or has stopped running) degrades the control rather than
+        asserting it.
         """
-        _, provider_impl, config = await self._resolve_location_controller(
+        integration, provider_impl, config = await self._resolve_location_controller(
             location_id=location_id, organization_id=organization_id
         )
         capabilities = provider_impl.client_capabilities(config)
-        return {
-            name: {
-                "supported": capability.supported,
-                "reason": capability.reason,
-            }
-            for name, capability in (
-                ("set_rate_limit", capabilities.set_rate_limit),
-                ("clear_rate_limit", capabilities.clear_rate_limit),
-                ("block", capabilities.block),
-                ("unblock", capabilities.unblock),
-                ("list_blocked", capabilities.list_blocked),
-                ("disconnect", capabilities.disconnect),
-                ("client_stats", capabilities.client_stats),
+        return ClientCapabilitiesReport(
+            capabilities={
+                name: {
+                    "supported": capability.supported,
+                    "reason": capability.reason,
+                }
+                for name, capability in (
+                    ("set_rate_limit", capabilities.set_rate_limit),
+                    ("clear_rate_limit", capabilities.clear_rate_limit),
+                    ("block", capabilities.block),
+                    ("unblock", capabilities.unblock),
+                    ("list_blocked", capabilities.list_blocked),
+                    ("disconnect", capabilities.disconnect),
+                    ("client_stats", capabilities.client_stats),
+                )
+            },
+            controller=self._controller_liveness(integration),
+        )
+
+    @staticmethod
+    def _controller_liveness(integration: NetworkIntegration) -> ControllerLiveness:
+        """The cached answer to "is this controller answering", from the
+        background sync's own record. No network call.
+
+        Tri-state, and the third state is not padding. ``None`` means the
+        probe has not run recently enough to be worth quoting -- it has
+        never run, or it has stopped running -- and that is genuinely
+        different from a probe that ran and failed. Collapsing them would
+        make a stalled sweep look like a healthy controller, which is the
+        family of bug this whole change is about.
+
+        Stale is measured at three sync intervals so one or two missed ticks
+        do not flap a venue's console. The interval is the integration's own,
+        not a constant here, because an operator who widened it to an hour
+        did not thereby make their controller stale.
+        """
+        last_at = integration.last_sync_at
+        status = integration.last_sync_status
+        if last_at is None or status == SyncStatus.NEVER.value:
+            return ControllerLiveness(
+                reachable=None,
+                checked_at=None,
+                reason=(
+                    "This venue's controller has not been checked yet, so we "
+                    "cannot say whether it is reachable."
+                ),
             )
-        }
+        if status == SyncStatus.ERROR.value:
+            return ControllerLiveness(
+                reachable=False,
+                checked_at=last_at,
+                reason=(
+                    "The last check of this venue's controller did not get "
+                    "through, so anything that needs the controller may not "
+                    "work until it is reachable again."
+                ),
+            )
+        interval = max(
+            int(integration.sync_interval_seconds or DEFAULT_SYNC_INTERVAL_SECONDS),
+            MIN_SYNC_INTERVAL_SECONDS,
+        )
+        age = (datetime.now(UTC) - last_at).total_seconds()
+        if age > interval * CONTROLLER_LIVENESS_STALE_INTERVALS:
+            return ControllerLiveness(
+                reachable=None,
+                checked_at=last_at,
+                reason=(
+                    "This venue's controller was reachable when it was last "
+                    "checked, but that check is old enough that we cannot "
+                    "call it current."
+                ),
+            )
+        return ControllerLiveness(reachable=True, checked_at=last_at, reason=None)
 
     @staticmethod
     def _require_capability(
@@ -5016,8 +5147,12 @@ class NetworkIntegrationService:
             },
         )
         return ClientActionResult(
+            # The provider's answer, not this layer's. ``enabled`` is
+            # ``False`` when the request limited neither direction -- a call
+            # the controller accepts and which throttles nothing, and which
+            # the old hardcoded ``True`` reported as a speed limit applied.
+            performed=bool(applied.enabled),
             action="set_rate_limit",
-            performed=True,
             client_mac=mac,
             rate_limit=applied,
         )
@@ -5051,8 +5186,13 @@ class NetworkIntegrationService:
             integration, action="clear_rate_limit", client_mac=mac
         )
         return ClientActionResult(
+            # Again the provider's answer: a clear "happened" when no limit
+            # is in force afterwards. Always ``True`` on Omada today, which
+            # is the point -- it is true *because the provider says so*, so a
+            # provider whose clear left a limit standing would report that
+            # instead of inheriting this layer's optimism.
+            performed=not applied.enabled,
             action="clear_rate_limit",
-            performed=True,
             client_mac=mac,
             rate_limit=applied,
         )

@@ -81,6 +81,7 @@ __all__ = [
     "MAX_SYNC_INTERVAL_SECONDS",
     "MIN_SESSION_DURATION_SECONDS",
     "MIN_SYNC_INTERVAL_SECONDS",
+    "CONTROLLER_LIVENESS_STALE_INTERVALS",
     "NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS",
     "OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN",
     "OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS",
@@ -844,6 +845,19 @@ DEFAULT_SYNC_INTERVAL_SECONDS = 300
 # them point this platform at their own hardware as a load generator.
 MIN_SYNC_INTERVAL_SECONDS = 60
 MAX_SYNC_INTERVAL_SECONDS = 86_400
+
+# How many of an integration's own sync intervals may pass before its last
+# successful sync stops counting as an answer to "is this controller
+# reachable right now" (``service.NetworkIntegrationService
+# ._controller_liveness``).
+#
+# Three, so a venue's console does not flap on one or two missed ticks --
+# a Beat worker restart, a sync that ran long, a controller that was busy.
+# Past that the honest answer is ``None``: not "unreachable", which would
+# be a claim nothing measured, but "nobody has looked recently enough to
+# say". A caller that needs the controller treats both the same way and
+# degrades; only a fresh success enables the control.
+CONTROLLER_LIVENESS_STALE_INTERVALS = 3
 
 # Controller ports this platform will connect to. Software controller
 # HTTPS is 8043; OC-series hardware controllers answer on 443; 8843/8088

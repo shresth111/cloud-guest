@@ -81,6 +81,7 @@ from .schemas import (
     ClientSpeedRequest,
     ControllerDeviceView,
     ControllerInventoryResponse,
+    ControllerLivenessView,
 )
 from .service import ClientActionResult, NetworkIntegrationService
 
@@ -166,6 +167,7 @@ def _client_action_response(
             requested_down_kbps=result.rate_limit.requested_down_kbps,
             requested_up_kbps=result.rate_limit.requested_up_kbps,
             clamped=result.rate_limit.clamped,
+            read_back=result.rate_limit.read_back,
         )
     )
     payload = ClientActionResponse(
@@ -195,20 +197,30 @@ async def get_location_client_capabilities(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NetworkIntegrationService = Depends(get_network_integration_service),
 ) -> ApiResponse[ClientCapabilitiesResponse]:
-    """What this venue's controller can do to one of its devices.
+    """What this venue's controller can do to one of its devices, and
+    whether it is answering.
 
-    Contacts nothing -- the answer comes from the integration's own auth
-    mode -- so a console can call it while rendering and show an honestly
+    Contacts nothing -- the per-action answers come from the integration's
+    own auth mode and ``controller`` from the background sync's cached
+    result -- so a console can call it while rendering and show an honestly
     disabled control with the reason beside it, instead of an enabled one
     that fails when somebody clicks it.
+
+    **Read both.** The per-action flags answer "can this venue ever do X"
+    and are true for as long as the venue is configured that way; they say
+    nothing about whether the controller is up, because nothing here asked
+    it. ``controller.reachable`` is that second answer. A control that needs
+    the controller should require a supported capability *and*
+    ``reachable is True``.
 
     ``locations.read`` because the question is about the location's own
     equipment and answers with no guest data; the actions themselves carry
     the heavier permissions.
     """
-    capabilities = await service.get_client_capabilities(
+    report = await service.get_client_capabilities(
         location_id=location_id, organization_id=requesting_organization_id
     )
+    capabilities = report.capabilities
     payload = ClientCapabilitiesResponse(
         set_rate_limit=_capability_view(capabilities["set_rate_limit"]),
         clear_rate_limit=_capability_view(capabilities["clear_rate_limit"]),
@@ -217,6 +229,11 @@ async def get_location_client_capabilities(
         list_blocked=_capability_view(capabilities["list_blocked"]),
         disconnect=_capability_view(capabilities["disconnect"]),
         client_stats=_capability_view(capabilities["client_stats"]),
+        controller=ControllerLivenessView(
+            reachable=report.controller.reachable,
+            checked_at=report.controller.checked_at,
+            reason=report.controller.reason,
+        ),
     )
     return build_response(
         success=True,
@@ -373,8 +390,11 @@ async def set_location_client_speed(
     separate call after the guest is already on. And what has been measured is
     that the controller accepts, stores and returns the limit -- not that an
     access point was observed to deliver it. ``applied_down_kbps`` is what the
-    controller holds; show that number, not the one that was typed, because
-    they differ whenever ``clamped`` is true.
+    controller was *sent* -- not what it reports holding, which nothing here
+    asks it (``read_back`` is ``False``; the Open API has no per-client
+    rate-limit read). Show that number rather than the one that was typed,
+    because they differ whenever ``clamped`` is true, and word it as the rate
+    that was set rather than as one that was confirmed.
     """
     down_kbps = payload.down_kbps
     up_kbps = payload.up_kbps

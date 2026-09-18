@@ -28,6 +28,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -481,6 +482,7 @@ class _FakeProvider:
     reason: str | None = None
     set_error: Exception | None = None
     clear_error: Exception | None = None
+    deauthorize_error: Exception | None = None
     calls: list[tuple] = field(default_factory=list)
     applied: ProviderClientRateLimit | None = None
 
@@ -527,6 +529,8 @@ class _FakeProvider:
         )
 
     async def deauthorize_guest(self, _config, _site_id, _client_mac):
+        if self.deauthorize_error is not None:
+            raise self.deauthorize_error
         self.calls.append(("deauthorize", _site_id, _client_mac, None, None))
         return True
 
@@ -710,6 +714,89 @@ class TestSessionEndClearsTheLimit:
         assert [e["status"] for e in events.events] == ["error"]
 
 
+class TestTheReleaseDoesNotDependOnUsEndingTheSession:
+    """The defect, at the hook layer.
+
+    The release used to live only after a successful ``deauthorize_guest``
+    inside ``terminate``, which made it conditional on this platform being
+    the one that ended the session on the device. At a RADIUS-mode venue it
+    normally is not: the NAS sends an Accounting-Stop, ``issue_live_disconnect``
+    correctly declines to open a controller connection for an authorization
+    that is already gone, and the limit stayed on the client record forever.
+    """
+
+    async def test_there_is_a_release_that_ends_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The entry point for a session the device ended itself. It clears
+        the limit and issues no disconnect -- there is nothing to disconnect."""
+        provider = _FakeProvider()
+        _install_controller(monkeypatch, provider)
+        terminate = client_hooks.build_controller_session_terminator(MagicMock())
+
+        await terminate.release_rate_limit(
+            location_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            client_mac=CLIENT_MAC,
+        )
+        assert [call[0] for call in provider.calls] == ["clear"]
+
+    async def test_a_failed_disconnect_still_releases_the_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half. A disconnect that raised is exactly when the limit
+        is most likely to be left standing, and it used to skip the clear."""
+        provider = _FakeProvider(
+            deauthorize_error=ProviderConnectionFailedError("controller unreachable")
+        )
+        _install_controller(monkeypatch, provider)
+        terminate = client_hooks.build_controller_session_terminator(MagicMock())
+
+        with pytest.raises(ProviderConnectionFailedError):
+            await terminate(
+                location_id=uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                client_mac=CLIENT_MAC,
+            )
+        assert [call[0] for call in provider.calls] == ["clear"]
+
+    async def test_a_client_that_left_the_controller_leaves_a_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Measured: once the device is off the controller's client list, the
+        Open API answers ``CLIENT_NOT_FOUND`` and the limit is stranded on a
+        record nothing can address. That is not swallowed -- it goes in the
+        venue's own feed with the MAC on it, which is precisely what the
+        RouterOS version of this defect never had."""
+        provider = _FakeProvider(
+            clear_error=ProviderClientNotFoundError("client not on the controller")
+        )
+        events = _install_controller(monkeypatch, provider)
+        terminate = client_hooks.build_controller_session_terminator(MagicMock())
+
+        await terminate.release_rate_limit(
+            location_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            client_mac=CLIENT_MAC,
+        )
+        assert [e["status"] for e in events.events] == ["error"]
+        assert events.events[0]["context"]["action"] == "clear_rate_limit"
+
+    async def test_a_legacy_venue_is_still_not_asked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = _FakeProvider(supported=False, reason="operator login")
+        _install_controller(monkeypatch, provider)
+        terminate = client_hooks.build_controller_session_terminator(MagicMock())
+
+        await terminate.release_rate_limit(
+            location_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            client_mac=CLIENT_MAC,
+        )
+        assert provider.calls == []
+
+
 # ============================================================================
 # 6. MikroTik is untouched
 # ============================================================================
@@ -788,3 +875,81 @@ class TestMikrotikIsUntouched:
             )
         )
         assert format_mikrotik_rate_limit(profile) == "1000k/5000k"
+
+
+# ============================================================================
+# 7. The release asks the vendor question first
+# ============================================================================
+
+
+class TestTheReleaseAsksTheVendorQuestionFirst:
+    """``LiveSessionTerminator.release_rate_limit`` is reached on every way a
+    session ends, fleet-wide. The proof obligation for this change is that a
+    RouterOS venue reaching it does nothing at all -- no connection, no
+    credential resolution, no ``/queue simple`` write. Queue-row cleanup on
+    RouterOS is a real and separate problem; this is not a quiet start on it.
+    """
+
+    @staticmethod
+    def _terminator(vendor: str, released: list[dict]):
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+
+        router = SimpleNamespace(
+            id=uuid.uuid4(), vendor=vendor, location_id=uuid.uuid4()
+        )
+
+        class _RouterLookup:
+            async def get_router(self, router_id, *, requesting_organization_id=None):
+                return router
+
+        class _DeviceLookup:
+            async def get_device_by_id(self, device_id):
+                return SimpleNamespace(mac_address=CLIENT_MAC)
+
+        async def _release(*, location_id, organization_id, client_mac):
+            released.append({"location_id": location_id, "client_mac": client_mac})
+
+        controller_terminator = MagicMock()
+        controller_terminator.release_rate_limit = _release
+        return (
+            LiveSessionTerminator(
+                router_lookup=_RouterLookup(),
+                device_lookup=_DeviceLookup(),
+                controller_terminator=controller_terminator,
+            ),
+            router,
+        )
+
+    async def test_a_mikrotik_venue_releases_nothing(self) -> None:
+        released: list[dict] = []
+        terminator, router = self._terminator("mikrotik", released)
+
+        await terminator.release_rate_limit(
+            session=SimpleNamespace(router_id=router.id, device_id=uuid.uuid4()),
+            organization_id=uuid.uuid4(),
+        )
+        assert released == []
+
+    async def test_a_controller_venue_releases_by_mac(self) -> None:
+        released: list[dict] = []
+        terminator, router = self._terminator("tplink_omada", released)
+
+        await terminator.release_rate_limit(
+            session=SimpleNamespace(router_id=router.id, device_id=uuid.uuid4()),
+            organization_id=uuid.uuid4(),
+        )
+        assert [r["client_mac"] for r in released] == [CLIENT_MAC]
+        assert released[0]["location_id"] == router.location_id
+
+    async def test_a_session_with_no_recorded_device_releases_nothing(self) -> None:
+        """A controller is addressed by MAC and only by MAC. A session that
+        carries no device has nothing to name, which is a no-op rather than a
+        guess."""
+        released: list[dict] = []
+        terminator, router = self._terminator("tplink_omada", released)
+
+        await terminator.release_rate_limit(
+            session=SimpleNamespace(router_id=router.id, device_id=None),
+            organization_id=uuid.uuid4(),
+        )
+        assert released == []

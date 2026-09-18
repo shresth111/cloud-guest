@@ -58,6 +58,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -650,6 +651,15 @@ def build_controller_session_terminator(session: AsyncSession):
     session once, at wiring time, and the terminator's own signature stays
     free of it -- ``LiveSessionTerminator`` has no session and should not grow
     one.
+
+    The returned callable also carries a ``release_rate_limit`` attribute:
+    a second, independently callable operation, hung on the function rather
+    than given its own builder so that what is returned is still exactly the
+    callable ``ControllerSessionTerminatorProtocol`` describes and every
+    existing caller and wiring site is untouched. It exists because
+    releasing this platform's speed limit and ending the session are **not**
+    the same event and must not share a fate -- see
+    :func:`_release_rate_limit`.
     """
 
     async def terminate(
@@ -708,11 +718,47 @@ def build_controller_session_terminator(session: AsyncSession):
                     "enforcement_delivered": False,
                 },
             )
+            # Still take the limit off. A deauthorize that failed is exactly
+            # the case where the limit is most likely to be left standing,
+            # and the release is not conditional on this platform having
+            # been the one to end the session -- see ``_release_rate_limit``.
+            await _release_rate_limit(session, resolved, client_mac=normalized)
             raise
 
         await _release_rate_limit(session, resolved, client_mac=normalized)
         return ended
 
+    async def release_rate_limit(
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+    ) -> None:
+        """Take this platform's speed limit off ``client_mac``, without
+        ending anything.
+
+        The separate entry point for the sessions this platform did not end
+        on the device: a RADIUS Accounting-Stop, or the controller's own
+        timeout. Those never reach ``terminate`` -- correctly, since there
+        is nothing left to disconnect -- and used to carry the release with
+        them, so at a RADIUS-mode venue, where an Accounting-Stop is the
+        *ordinary* way a session ends, the limit was never removed at all.
+
+        Silent and non-raising, like the release inside ``terminate``: the
+        caller is a session end that has already committed.
+        """
+        resolved = await _resolve(
+            session, location_id=location_id, organization_id=organization_id
+        )
+        if resolved is None:
+            return
+        try:
+            normalized = normalize_client_mac(client_mac)
+        except ValueError:
+            return
+        await _release_rate_limit(session, resolved, client_mac=normalized)
+
+    terminate.release_rate_limit = release_rate_limit  # type: ignore[attr-defined]
     return terminate
 
 
@@ -736,14 +782,45 @@ async def _release_rate_limit(
     growing list) and strictly worse in one way: a randomized MAC that comes
     back throttled has no row anywhere explaining why.
 
-    This is the one place that needs it, and that is why it is here rather
-    than at the eight call sites that end a session. Every one of them funnels
-    into ``guest.service.issue_live_disconnect`` -> ``LiveSessionTerminator``
-    -> this terminator, and this function is inside the controller branch, so
-    **a RouterOS venue never reaches it**: no new call, no new failure mode,
-    no change to the ``/queue simple`` lifecycle. Removing queue rows at
-    session end on RouterOS may well be right too, but it is a different
-    change with a different blast radius and is deliberately not made here.
+    This function is inside the controller branch, so **a RouterOS venue
+    never reaches it**: no new call, no new failure mode, no change to the
+    ``/queue simple`` lifecycle. Removing queue rows at session end on
+    RouterOS may well be right too, but it is a different change with a
+    different blast radius and is deliberately not made here.
+
+    ## Why it is not enough to do this where the disconnect happens
+
+    It used to run only after a successful ``deauthorize_guest``, inside
+    ``terminate`` -- which made the release conditional on this platform
+    being the one that ended the session on the device. At a RADIUS-mode
+    venue it is normally not: the NAS reports an Accounting-Stop, the
+    session ends here, and ``issue_live_disconnect`` correctly declines to
+    open a controller connection to remove an authorization that is already
+    gone (``already_ended_on_device``). That early return took the release
+    with it, so at such a venue the limit was set once and never removed --
+    the ``/queue simple`` accumulation defect again, on a record that
+    outlives the session and that nobody can find afterwards.
+
+    So there are now three ways in, and none of them depends on us having
+    ended the session: after a successful disconnect, after a *failed* one,
+    and through ``release_rate_limit`` for the sessions the device ended
+    itself.
+
+    ## When the client has already left the controller's list
+
+    The limit lives on the known-client record and survives the client
+    going offline, but the Open API addresses clients through the
+    *connected* list, so a release attempted after the device has left
+    answers ``CLIENT_NOT_FOUND`` -- measured. That is why the release is
+    issued at session end, at the moment the NAS reports the stop, while the
+    device is usually still associated to the AP: it is the last reliable
+    window, not a convenient one.
+
+    When it is missed anyway, that outcome is recorded rather than
+    swallowed. A ``CLIENT_NOT_FOUND`` gets its own log line and an
+    ``ERROR`` row in the integration's own event feed, so a limit left
+    standing has a record saying so and a MAC to look it up by -- which is
+    precisely what the RouterOS version of this defect never had.
 
     Capability-gated and silent about a refusal it already knows the reason
     for: a venue connected with a hotspot-operator login cannot rate-limit at
@@ -773,10 +850,19 @@ async def _release_rate_limit(
             error=error,
         )
         logger.warning(
-            "network_integration_controller_rate_limit_not_released",
+            # Two log keys, because they are two different situations and
+            # only one of them is fixable by retrying. ``client_gone`` means
+            # the window closed -- the device left the controller's list
+            # before we got here -- and the limit is now stranded on a
+            # record the Open API cannot address. Anything else is an
+            # ordinary controller failure.
+            "network_integration_controller_rate_limit_client_gone"
+            if isinstance(error, ProviderClientNotFoundError)
+            else "network_integration_controller_rate_limit_not_released",
             extra={
                 "integration_id": str(resolved.integration.id),
                 "error_code": getattr(error, "code", None),
+                "rate_limit_left_standing": True,
             },
         )
     else:
@@ -835,14 +921,58 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
       client table and pushes the delta through the same sink. Its
       selection is ``provider == omada AND auth_mode == openapi``, in SQL.
 
-    So for a controller-managed venue the question is exactly "can this
-    platform read this controller's per-client traffic", which is the
-    provider's own ``client_stats`` capability -- the existing gate,
-    computed by the provider from the integration's auth mode, with no
-    vendor branching here. A hotspot-operator (``legacy``) credential
-    provably cannot read the client table (contract CR-002), so it reports
-    ``client_stats`` unsupported, and that is the venue where the idle
-    sweep was firing on guests who were streaming.
+    So for a controller-managed venue there are **two** questions, and
+    conflating them is what shipped:
+
+    1. *Can this venue ever report?* -- the provider's ``client_stats``
+       capability, computed from the integration's auth mode. A
+       hotspot-operator (``legacy``) credential provably cannot read the
+       client table (contract CR-002), so it answers no, and that is the
+       venue where the idle sweep was firing on guests who were streaming.
+    2. *Is anything reporting right now?* -- which ``client_capabilities``
+       cannot answer, because it contacts nothing. It is computed from a
+       column in the integration row, so at an ``openapi`` venue it says
+       "yes" whether the controller is answering, unreachable, or switched
+       off at the wall.
+
+    Only the first was being asked, and its answer was being spent on the
+    second. Measured 2026-09-18: zero Interim-Updates arrived from the
+    controller that day and four of five expiries at that venue were still
+    recorded as ``inactivity_timeout``. The guard read as working because
+    the capability it consulted is always ``True`` there by construction.
+
+    ## The signal for question 2, and why this one
+
+    **Has anything moved ``last_activity_at`` at this venue inside
+    ``VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES``** --
+    ``GuestRepository.venue_activity_was_reported_since``.
+
+    It is the right signal because it is the *same column the idle rule
+    reads*. The sweep's idle branch measures ``now - last_activity_at``;
+    the honest precondition for trusting that arithmetic is that something
+    writes that column here, and this observes exactly that, with no
+    inference in between. The alternatives were weaker. "Did the usage poll
+    return rows" describes one of the two producers and says nothing about
+    a RADIUS venue. "Did accounting arrive" is the same half-answer from
+    the other side. A live probe of the controller was ruled out on sight:
+    a console renders capabilities constantly, and a sweep is not where a
+    network round trip per venue belongs.
+
+    Note what it does **not** measure: how busy the guests are.
+    ``record_usage`` bumps ``last_activity_at`` on every Interim-Update
+    regardless of byte deltas, so a venue full of idle-but-connected guests
+    still reports. See that repository method for why the comparison is
+    against ``started_at`` rather than against the clock alone.
+
+    ## What a venue with no controller integration gets: exactly today
+
+    The whole MikroTik/RADIUS fleet short-circuits to ``True`` above,
+    before any of this, and that is deliberate rather than an oversight to
+    tidy up later. Their premise is documented as known to hold -- the NAS
+    sends Interim-Updates every 300 s -- and the brief for this change was
+    that MikroTik venues must not change behaviour. So the observation is
+    applied only where the over-claim was: to controller-managed venues
+    whose capability said yes.
 
     ## Why an unreadable integration answers ``False``
 
@@ -854,9 +984,10 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
     ceiling still applies to every one of those sessions, so nothing
     becomes immortal; it simply ends for the reason we can evidence.
 
-    Read-only and cheap by design: one tenant-scoped row read, no network
-    call. The capability is a pure function of the row, which is what makes
-    it safe to ask inside a sweep.
+    Read-only and cheap by design: at most two tenant-scoped reads -- the
+    integration row, then one indexed ``EXISTS`` over this venue's sessions
+    -- and no network call on either. That is what makes it safe to ask
+    inside a sweep, and the sweep memoizes it per venue per run on top.
     """
 
     class _ActivityReporting:
@@ -898,6 +1029,40 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
             except Exception:  # noqa: BLE001 -- an unknown provider cannot poll
                 return False
             config = _connection_config(integration, credentials, get_settings())
-            return bool(provider.client_capabilities(config).client_stats.supported)
+            if not provider.client_capabilities(config).client_stats.supported:
+                # Question 1: this venue can never report. No observation
+                # needed, and none would be meaningful.
+                return False
+            # Question 2: it can -- but is it? Imported here rather than at
+            # module scope for the reason this module's own docstring gives
+            # about the direction of the guest edge.
+            from app.domains.guest.constants import (  # noqa: PLC0415
+                VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
+            )
+            from app.domains.guest.repository import GuestRepository  # noqa: PLC0415
+
+            since = datetime.now(UTC) - timedelta(
+                minutes=VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES
+            )
+            reported = await GuestRepository(session).venue_activity_was_reported_since(
+                organization_id=organization_id,
+                location_id=location_id,
+                since=since,
+            )
+            if not reported:
+                # Worth a line: the capability says this controller can be
+                # polled and nothing has arrived from it in the window, which
+                # is either a dead controller or a stopped poll, and both are
+                # things an operator would want to know before wondering why
+                # sessions now run to their full ceiling.
+                logger.warning(
+                    "network_integration_venue_reports_no_guest_activity",
+                    extra={
+                        "integration_id": str(integration.id),
+                        "location_id": str(location_id),
+                        "window_minutes": VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
+                    },
+                )
+            return reported
 
     return _ActivityReporting()
