@@ -212,6 +212,27 @@ CLEAR_RATE_LIMIT_BODY: dict[str, Any] = {
 }
 
 
+#: Rate-limit selector on the Open API request. ``0`` is a custom per-client
+#: limit; ``1`` names a site-wide profile, which
+#: :func:`build_rate_limit_body` deliberately never writes.
+RATE_LIMIT_MODE_CUSTOM = 0
+
+
+def _ratelimit_request(limits: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a rate-limit object for the **Open API** endpoint.
+
+    The two APIs disagree about the envelope and the difference is silent.
+    Internal v2 takes ``PATCH …/clients/{mac}`` with ``{"rateLimit": {...}}``;
+    the Open API's ``…/clients/{mac}/ratelimit`` takes ``mode`` plus
+    ``customRateLimit``, and answers a body in the other shape with
+    ``-1001 "Invalid request parameters."`` -- a 200 with an error code, which
+    is why this looked like a permissions problem for a day. Measured against
+    the 5.15.24.19 controller: flat and ``{"rateLimit": …}`` both refused,
+    ``{"mode": 0, "customRateLimit": …}`` returned ``errorCode 0``.
+    """
+    return {"mode": RATE_LIMIT_MODE_CUSTOM, "customRateLimit": limits}
+
+
 def _mac(client_mac: str) -> str:
     """Omada's own spelling of a MAC: upper-case, hyphen-separated.
 
@@ -245,7 +266,7 @@ async def set_client_rate_limit(
         RATE_LIMIT_PATH.format(
             omadac_id=omadac_id, site_id=site_id, client_mac=_mac(client_mac)
         ),
-        json=body,
+        json=_ratelimit_request(body),
     )
     return applied
 
@@ -260,7 +281,7 @@ async def clear_client_rate_limit(
         RATE_LIMIT_PATH.format(
             omadac_id=omadac_id, site_id=site_id, client_mac=_mac(client_mac)
         ),
-        json=dict(CLEAR_RATE_LIMIT_BODY),
+        json=_ratelimit_request(dict(CLEAR_RATE_LIMIT_BODY)),
     )
     return ClientRateLimit(enabled=False, down_kbps=None, up_kbps=None, clamped=False)
 
