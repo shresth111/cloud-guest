@@ -93,6 +93,7 @@ from .validators import normalize_client_mac
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "build_controller_activity_reporting_lookup",
     "build_controller_device_blocker",
     "build_controller_session_terminator",
     "build_controller_speed_hook",
@@ -806,3 +807,97 @@ def _connection_config(
         tls_pinned_sha256=integration.tls_pinned_sha256,
         timeout_seconds=getattr(settings, "omada_api_timeout_seconds", 15.0),
     )
+
+
+def build_controller_activity_reporting_lookup(session: AsyncSession):
+    """Whether a venue can report that its guests are still using the
+    network, bound to ``session``.
+
+    Satisfies ``guest.service.VenueActivityReportingProtocol``, so the
+    session-timeout sweep can stop measuring idleness at a venue where
+    idleness is not measurable. See that function's ``activity_reporting``
+    section for what goes wrong without it.
+
+    ## What the answer is computed from
+
+    ``last_activity_at`` -- the column the idle half of the sweep reads --
+    is written by ``GuestService.record_usage`` and by nothing else, and
+    ``record_usage`` has exactly two producers:
+
+    * **RADIUS accounting Interim-Updates.** A venue with no controller
+      integration at all is the MikroTik/RADIUS fleet, whose NAS sends
+      them every 300 s (``Acct-Interim-Interval`` on the Access-Accept).
+      That is why "no integration" answers ``True`` here rather than
+      falling into the cautious branch: the premise is not unknown there,
+      it is known to hold.
+    * **The Omada Open-API usage sweep** (``usage_tasks``), which polls
+      ``traffic_up_bytes``/``traffic_down_bytes`` off the controller's
+      client table and pushes the delta through the same sink. Its
+      selection is ``provider == omada AND auth_mode == openapi``, in SQL.
+
+    So for a controller-managed venue the question is exactly "can this
+    platform read this controller's per-client traffic", which is the
+    provider's own ``client_stats`` capability -- the existing gate,
+    computed by the provider from the integration's auth mode, with no
+    vendor branching here. A hotspot-operator (``legacy``) credential
+    provably cannot read the client table (contract CR-002), so it reports
+    ``client_stats`` unsupported, and that is the venue where the idle
+    sweep was firing on guests who were streaming.
+
+    ## Why an unreadable integration answers ``False``
+
+    A row whose credentials will not decrypt, or a provider this build does
+    not know, cannot be polled either -- so no producer exists for it
+    regardless of what its ``auth_mode`` column says. Answering ``True``
+    there would resume ending sessions on evidence we do not have, which is
+    the whole failure this closes. The absolute ``session_timeout_minutes``
+    ceiling still applies to every one of those sessions, so nothing
+    becomes immortal; it simply ends for the reason we can evidence.
+
+    Read-only and cheap by design: one tenant-scoped row read, no network
+    call. The capability is a pure function of the row, which is what makes
+    it safe to ask inside a sweep.
+    """
+
+    class _ActivityReporting:
+        @staticmethod
+        async def venue_reports_guest_activity(
+            *,
+            organization_id: uuid.UUID | None,
+            location_id: uuid.UUID | None,
+        ) -> bool:
+            if organization_id is None or location_id is None:
+                # Nothing to resolve a controller from. Not a controller
+                # venue as far as this lookup can tell, so it is the
+                # RADIUS answer, which is today's behaviour.
+                return True
+            repository = NetworkIntegrationRepository(session)
+            integration = await repository.get_omada_integration_for_location(
+                location_id=location_id, organization_id=organization_id
+            )
+            if integration is None:
+                return True
+            credentials: dict[str, str] = {}
+            if integration.credentials_encrypted:
+                try:
+                    credentials = decrypt_credentials(
+                        integration.credentials_encrypted, settings=get_settings()
+                    )
+                except NetworkIntegrationCredentialDecryptionError:
+                    logger.warning(
+                        "network_integration_activity_reporting_credentials_"
+                        "unreadable",
+                        extra={"integration_id": str(integration.id)},
+                    )
+                    return False
+            else:
+                # No credentials at all: nothing can poll this controller.
+                return False
+            try:
+                provider = get_network_provider(integration.provider)
+            except Exception:  # noqa: BLE001 -- an unknown provider cannot poll
+                return False
+            config = _connection_config(integration, credentials, get_settings())
+            return bool(provider.client_capabilities(config).client_stats.supported)
+
+    return _ActivityReporting()

@@ -553,9 +553,35 @@ def _event_extra(event: object) -> dict[str, object]:
     }
 
 
+class VenueActivityReportingProtocol(Protocol):
+    """Whether one venue can report that its guests are still using the
+    network.
+
+    One method, deliberately -- the same discipline
+    ``LiveSessionTerminatorProtocol`` keeps, and for the same reason: this
+    module must not import the network-integration domain (that direction
+    is a cycle; see ``network_integration.client_hooks``'s own docstring),
+    and a Protocol keeps the dependency one-way and the sweep testable
+    with a two-line fake.
+
+    Satisfied as-is by
+    ``network_integration.client_hooks.build_controller_activity_reporting_lookup``.
+    ``True`` means some producer feeds ``last_activity_at`` for sessions at
+    this venue; ``False`` means provably none does.
+    """
+
+    async def venue_reports_guest_activity(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> bool: ...
+
+
 async def enforce_session_timeouts(
     repository: GuestRepositoryProtocol,
     terminator: LiveSessionTerminatorProtocol | None = None,
+    activity_reporting: VenueActivityReportingProtocol | None = None,
 ) -> list[GuestSession]:
     """Guest Session Engine (Phase 1): the actual idle/session-timeout
     sweep, pulled out of ``GuestService.enforce_timeouts`` to module scope
@@ -580,19 +606,85 @@ async def enforce_session_timeouts(
     ``status == active``. So the rule it applies is what decides how long a
     departed guest keeps showing as online: see
     ``validators.is_session_stale``.
+
+    ## ``activity_reporting``: we do not end a session because we cannot see it
+
+    The idle half of that rule reads ``now - last_activity_at``, and that
+    column is written by one method (``record_usage``) with two producers:
+    RADIUS accounting Interim-Updates, and the Omada Open-API usage sweep.
+    At a venue served by neither -- an Omada integration in ``legacy``
+    (hotspot-operator) auth mode, which provably cannot read the
+    controller's client table at all -- nothing ever moves it, so the
+    elapsed time the idle branch measures is the session's *age*, and it
+    expires a guest who is sitting there streaming. Every time, at every
+    such venue.
+
+    So the venue is asked first. ``activity_reporting`` answers, per venue,
+    whether any producer exists; where the answer is ``False`` the idle
+    half is dropped and only the absolute ``session_timeout_minutes``
+    ceiling applies -- measured from ``started_at``, which needs no
+    reporting to be true -- and the row is ended with its own
+    ``disconnect_reason`` (``SESSION_TIME_LIMIT_DISCONNECT_REASON``) rather
+    than with the word "inactivity", which would be an assertion this
+    platform has no evidence for and which a venue admin would read as a
+    statement about their guest.
+
+    The lookup is asked once per venue per run and memoized: candidates
+    cluster heavily onto a handful of locations, and a controller row read
+    once per expiring session would be a query per row for an answer that
+    cannot change within a tick.
+
+    ``None`` -- the default, and what every caller but the Beat task
+    passes -- means the question is not being asked and every session is
+    treated as observable, i.e. exactly today's behaviour. A venue with no
+    controller integration (the entire MikroTik/RADIUS fleet) also answers
+    ``True``, because for those venues the premise is simply correct: the
+    NAS sends Interim-Updates and ``last_activity_at`` moves.
     """
     now = datetime.now(UTC)
     candidates = await repository.list_timed_out_sessions(now=now)
+    observable_by_venue: dict[
+        tuple[uuid.UUID | None, uuid.UUID | None], bool
+    ] = {}
     expired: list[GuestSession] = []
     for session in candidates:
-        if not is_session_stale(session, now=now):
+        venue = (session.organization_id, session.location_id)
+        if activity_reporting is None:
+            observable = True
+        elif venue in observable_by_venue:
+            observable = observable_by_venue[venue]
+        else:
+            try:
+                observable = await activity_reporting.venue_reports_guest_activity(
+                    organization_id=session.organization_id,
+                    location_id=session.location_id,
+                )
+            except Exception:  # noqa: BLE001 -- see below
+                # The question could not be answered, so it has not been
+                # answered "yes". Ending a session on the strength of a
+                # lookup that failed is the exact move this parameter
+                # exists to stop; the absolute ceiling still applies, so
+                # nothing becomes immortal.
+                logger.warning(
+                    "guest_session_activity_reporting_lookup_failed",
+                    extra={"session_id": str(session.id)},
+                )
+                observable = False
+            observable_by_venue[venue] = observable
+        if not is_session_stale(
+            session, now=now, activity_is_observable=observable
+        ):
             continue  # defensive re-check against the SQL-level filter
         updated = await repository.update_session(
             session,
             {
                 "status": GuestSessionStatus.EXPIRED.value,
                 "ended_at": now,
-                "disconnect_reason": "inactivity_timeout",
+                "disconnect_reason": (
+                    SESSION_TIMEOUT_DISCONNECT_REASON
+                    if observable
+                    else SESSION_TIME_LIMIT_DISCONNECT_REASON
+                ),
             },
         )
         event = GuestSessionExpired(session_id=updated.id)
@@ -1980,6 +2072,24 @@ class GuestLoginResult:
 #: and is deliberately not told to them here at all.
 SESSION_TIMEOUT_DISCONNECT_REASON = "inactivity_timeout"
 
+#: The sibling literal ``enforce_session_timeouts`` writes instead, for a
+#: session at a venue that cannot report guest activity at all (see that
+#: function's ``activity_reporting`` section). Such a session is never
+#: ended for idleness -- there is no idleness to measure -- so when it is
+#: ended it is because it reached its absolute ``session_timeout_minutes``,
+#: and that is what the row says.
+#:
+#: A separate literal rather than reusing ``inactivity_timeout`` because
+#: the two are different claims, and only one of them is supportable here.
+#: ``inactivity_timeout`` on an Omada ``legacy`` venue's row would tell a
+#: venue admin looking at their guest history that the guest stopped using
+#: the network, which this platform has no way of knowing there; what it
+#: knows is that the session ran its full length. The distinction is also
+#: the operator-visible half of the fix: a venue whose sessions all end
+#: with this reason is a venue where per-session activity is not reported,
+#: which is a true and useful thing to be able to see.
+SESSION_TIME_LIMIT_DISCONNECT_REASON = "session_time_limit_reached"
+
 #: RFC 2866 §5.10 ``Acct-Terminate-Cause`` value 5, forwarded verbatim by
 #: FreeRADIUS (``ops/freeradius/rest.conf``) into ``disconnect_reason``
 #: when a NAS stops accounting because its own ``Session-Timeout`` ran
@@ -2103,6 +2213,14 @@ def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | No
         return GuestSessionEndedReason.DISCONNECTED
     if session.status == GuestSessionStatus.EXPIRED.value:
         if session.disconnect_reason == SESSION_TIMEOUT_DISCONNECT_REASON:
+            return GuestSessionEndedReason.TIMED_OUT
+        # Same story to the guest, different evidence behind it: their
+        # session ran its full length. ``TIMED_OUT`` is already the "your
+        # time is up, sign back in" copy, which is exactly right here --
+        # and is why this must not fall through to ``None`` and show a
+        # guest at an Omada legacy venue a blank sign-in page with no
+        # explanation. See SESSION_TIME_LIMIT_DISCONNECT_REASON.
+        if session.disconnect_reason == SESSION_TIME_LIMIT_DISCONNECT_REASON:
             return GuestSessionEndedReason.TIMED_OUT
         # The venue's daily/weekly/monthly connected-time allowance, spent.
         # Separated from TIMED_OUT because the advice differs: a timed-out

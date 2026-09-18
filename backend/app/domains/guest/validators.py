@@ -184,9 +184,41 @@ def has_session_overrun_time_limit(session: GuestSession, *, now: datetime) -> b
     )
 
 
-def is_session_stale(session: GuestSession, *, now: datetime) -> bool:
+def is_session_stale(
+    session: GuestSession, *, now: datetime, activity_is_observable: bool = True
+) -> bool:
     """The stale-session sweep's single predicate: idle past its cutoff, or
-    past its absolute time limit (both with grace)."""
+    past its absolute time limit (both with grace).
+
+    ``activity_is_observable`` is the answer to a question the idle half
+    silently assumed: **can this platform see this guest's activity at
+    all?** ``is_session_timed_out`` measures ``now - last_activity_at``,
+    and that column moves in exactly one place --
+    ``GuestService.record_usage`` -- fed by exactly two producers: RADIUS
+    accounting Interim-Updates, and the Omada Open-API usage sweep
+    (``network_integration.usage_tasks``). A venue served by neither has
+    no producer at all, so ``last_activity_at`` is frozen at the value
+    the login wrote and the elapsed time is simply the session's age. The
+    idle predicate then fires on every guest at that venue, including the
+    one in the middle of a video call, and calls it inactivity.
+
+    Passing ``False`` drops the idle half and leaves the absolute
+    ``session_timeout_minutes`` ceiling, which measures ``started_at`` and
+    needs no reporting to be true. The session still ends -- it is not
+    exempt from the sweep -- it just ends for the reason we can actually
+    evidence.
+
+    Defaults to ``True``, so every caller that does not ask the question
+    (and every venue whose router reports RADIUS accounting, which is the
+    whole MikroTik fleet) keeps today's behaviour exactly.
+
+    The direction of the error matters and is chosen deliberately: a guest
+    who left staying "online" until their session ceiling is a stale row on
+    a dashboard, while a guest cut off mid-call is a venue's guest
+    complaining to a venue's staff. Under-claiming is the safe side.
+    """
+    if not activity_is_observable:
+        return has_session_overrun_time_limit(session, now=now)
     return is_session_timed_out(session, now=now) or has_session_overrun_time_limit(
         session, now=now
     )
