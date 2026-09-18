@@ -62,7 +62,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 
-from .constants import DEFAULT_CONTROLLER_TLS_MODE
+from .constants import (
+    DEFAULT_CONTROLLER_TLS_MODE,
+    IntegrationEventStatus,
+    IntegrationEventType,
+)
 from .crypto import (
     NetworkIntegrationCredentialDecryptionError,
     decrypt_credentials,
@@ -174,13 +178,50 @@ def build_controller_speed_hook(session: AsyncSession):
                 organization_id=organization_id,
                 action="set_rate_limit",
             )
-            return await resolved.provider.set_client_rate_limit(
-                resolved.config,
-                resolved.site_id,
-                _require_mac(client_mac),
-                down_kbps=down_kbps,
-                up_kbps=up_kbps,
+            mac = _require_mac(client_mac)
+            try:
+                applied = await resolved.provider.set_client_rate_limit(
+                    resolved.config,
+                    resolved.site_id,
+                    mac,
+                    down_kbps=down_kbps,
+                    up_kbps=up_kbps,
+                )
+            except ProviderError as error:
+                await _record_speed_failure(
+                    session,
+                    resolved,
+                    action="set_rate_limit",
+                    client_mac=mac,
+                    error=error,
+                    context={
+                        "requested_down_kbps": down_kbps,
+                        "requested_up_kbps": up_kbps,
+                    },
+                )
+                raise
+            await _record_speed_success(
+                session,
+                resolved,
+                action="set_rate_limit",
+                client_mac=mac,
+                context={
+                    "requested_down_kbps": down_kbps,
+                    "requested_up_kbps": up_kbps,
+                    # What the controller was actually given, which is not
+                    # always what was asked for -- its per-client limit is a
+                    # number in 1..1024 plus a Kbps/Mbps unit, so a profile
+                    # above that ceiling, or one that does not land on a whole
+                    # Mbps, is clamped or rounded on the way out. Recording the
+                    # applied figure beside the requested one is what lets a
+                    # venue see the cap it really has rather than the one it
+                    # typed.
+                    "applied_down_kbps": getattr(applied, "applied_down_kbps", None),
+                    "applied_up_kbps": getattr(applied, "applied_up_kbps", None),
+                    "clamped": bool(getattr(applied, "clamped", False)),
+                },
             )
+            return applied
 
         @staticmethod
         async def clear_client_speed(
@@ -196,11 +237,150 @@ def build_controller_speed_hook(session: AsyncSession):
                 organization_id=organization_id,
                 action="clear_rate_limit",
             )
-            return await resolved.provider.clear_client_rate_limit(
-                resolved.config, resolved.site_id, _require_mac(client_mac)
+            mac = _require_mac(client_mac)
+            try:
+                cleared = await resolved.provider.clear_client_rate_limit(
+                    resolved.config, resolved.site_id, mac
+                )
+            except ProviderError as error:
+                await _record_speed_failure(
+                    session,
+                    resolved,
+                    action="clear_rate_limit",
+                    client_mac=mac,
+                    error=error,
+                )
+                raise
+            await _record_speed_success(
+                session, resolved, action="clear_rate_limit", client_mac=mac
             )
+            return cleared
 
     return _SpeedHook()
+
+
+async def _record_speed_success(
+    session: AsyncSession,
+    resolved: _ResolvedController,
+    *,
+    action: str,
+    client_mac: str,
+    context: dict[str, object] | None = None,
+) -> None:
+    """One row in the venue's own integration feed, per automatic write.
+
+    The manual per-client route already records both outcomes through
+    ``NetworkIntegrationService._record_client_action``; this is the same feed
+    and the same event type for the writes *nobody clicked* -- a guest login,
+    a policy publish, a schedule window. Without it the automatic path was the
+    only speed write on the platform that left no trace: the assignment row
+    said ``ACTIVE`` and the venue had no way to see what its controller had
+    actually been told, or that it had been told nothing.
+    """
+    await _create_event(
+        session,
+        resolved,
+        status=IntegrationEventStatus.OK,
+        error_code=None,
+        message=f"Client {action} succeeded",
+        context={"action": action, "client_mac": client_mac, **(context or {})},
+    )
+
+
+async def _record_speed_failure(
+    session: AsyncSession,
+    resolved: _ResolvedController,
+    *,
+    action: str,
+    client_mac: str,
+    error: ProviderError,
+    context: dict[str, object] | None = None,
+) -> None:
+    """The refusal, written down before it is re-raised.
+
+    **The controller cannot rate-limit a client it cannot currently see**, and
+    that is the refusal this path meets most often: a guest whose device has
+    dropped off the site between authenticating and this write has no
+    known-client record to carry a ``rateLimit`` field, and the controller
+    says so. Some of those refusals are named -- the provider maps the
+    measured client-does-not-exist codes onto
+    :class:`ProviderClientNotFoundError` -- and some arrive from a layer in
+    front of the handler, where the only thing this platform is given is the
+    controller's own raw code. So both are recorded: the normalized
+    ``error_code`` *and* ``provider_code``, the integer the controller
+    actually returned.
+
+    That distinction is the point. A refusal this platform cannot yet name is
+    still a refusal, and filing it under a generic "could not reach the
+    controller" is how a venue ends up believing a speed was applied. An
+    unnamed code recorded verbatim can be read off a real venue's feed and
+    turned into a named one; a swallowed one cannot.
+
+    Never the last word on the guest, either. This runs on a best-effort
+    queueing path that has already let the guest online, and the caller
+    re-raises into ``apply_queue``, which writes the message onto the
+    assignment row and leaves it out of ``ACTIVE``. Nothing here decides
+    whether anybody gets internet.
+    """
+    await _create_event(
+        session,
+        resolved,
+        status=IntegrationEventStatus.ERROR,
+        error_code=getattr(error, "code", None),
+        message=str(error) or f"Client {action} failed",
+        context={
+            "action": action,
+            "client_mac": client_mac,
+            "provider_code": getattr(error, "provider_code", None),
+            **(context or {}),
+        },
+    )
+
+
+async def _create_event(
+    session: AsyncSession,
+    resolved: _ResolvedController,
+    *,
+    status: IntegrationEventStatus,
+    error_code: str | None,
+    message: str | None,
+    context: dict[str, object],
+) -> None:
+    """Append to ``network_integration_events``, redacted, never raising.
+
+    Redacted through the same :func:`redact_context` the service uses --
+    these two columns render straight into the customer dashboard, so the
+    redaction is a data-exfiltration control and not a logging nicety.
+
+    Swallows its own failure on purpose. This is bookkeeping wrapped around a
+    device write whose result the caller is about to act on; a feed insert
+    that fails must not convert a successful speed write into an exception, or
+    replace the controller's own refusal with a database error and lose the
+    real reason.
+    """
+    # Imported here, not at module scope: ``service.py`` is the module this
+    # one exists to not import (see the module docstring). A function-scope
+    # import borrows the one pure, dictionary-only helper without taking on
+    # the service's construction graph, and keeps the single definition of
+    # what counts as a secret-shaped key.
+    from .service import redact_context  # noqa: PLC0415
+
+    try:
+        repository = NetworkIntegrationRepository(session)
+        await repository.create_event(
+            integration_id=resolved.integration.id,
+            organization_id=resolved.integration.organization_id,
+            event_type=IntegrationEventType.CLIENT_MANAGED.value,
+            status=status.value,
+            error_code=error_code,
+            message=message,
+            context=redact_context(context),
+        )
+    except Exception:  # noqa: BLE001 -- bookkeeping, see docstring
+        logger.warning(
+            "network_integration_client_hook_event_unrecorded",
+            extra={"integration_id": str(resolved.integration.id)},
+        )
 
 
 async def _require(
@@ -292,7 +472,7 @@ def build_controller_session_terminator(session: AsyncSession):
             return False
 
         try:
-            return bool(
+            ended = bool(
                 await resolved.provider.deauthorize_guest(
                     resolved.config, resolved.site_id, normalized
                 )
@@ -307,7 +487,79 @@ def build_controller_session_terminator(session: AsyncSession):
             )
             raise
 
+        await _release_rate_limit(session, resolved, client_mac=normalized)
+        return ended
+
     return terminate
+
+
+async def _release_rate_limit(
+    session: AsyncSession,
+    resolved: _ResolvedController,
+    *,
+    client_mac: str,
+) -> None:
+    """Take this platform's speed limit back off the MAC the session used.
+
+    **Why session end, and why here.** A controller's per-client limit is a
+    field on the *known-client* record, keyed by MAC within the site. It has
+    no session lifetime: it outlives the authorization that caused it, it
+    survives the client going offline, and nothing on the controller ever
+    removes it. So without this the next device to hold that MAC inherits a
+    cap nobody configured for it -- the same defect RouterOS venues already
+    produced with accumulating ``/queue simple`` rows, where one guest was
+    found running unlimited under a stale ``0/0`` entry left by a previous
+    holder of their address. The controller shape is milder (one field, not a
+    growing list) and strictly worse in one way: a randomized MAC that comes
+    back throttled has no row anywhere explaining why.
+
+    This is the one place that needs it, and that is why it is here rather
+    than at the eight call sites that end a session. Every one of them funnels
+    into ``guest.service.issue_live_disconnect`` -> ``LiveSessionTerminator``
+    -> this terminator, and this function is inside the controller branch, so
+    **a RouterOS venue never reaches it**: no new call, no new failure mode,
+    no change to the ``/queue simple`` lifecycle. Removing queue rows at
+    session end on RouterOS may well be right too, but it is a different
+    change with a different blast radius and is deliberately not made here.
+
+    Capability-gated and silent about a refusal it already knows the reason
+    for: a venue connected with a hotspot-operator login cannot rate-limit at
+    all, so it has no limit to clear, and logging that on every disconnect
+    would be noise about a venue working exactly as documented.
+
+    Never raises. It runs *after* the disconnect has been decided, on a path
+    whose contract is that ending a session in this platform's records can
+    never be blocked by the venue's equipment. A limit that could not be
+    cleared is recorded in the integration's own feed by the failure path and
+    logged here; it is not allowed to turn a successful disconnect into an
+    exception.
+    """
+    capability = resolved.provider.client_capabilities(resolved.config).clear_rate_limit
+    if not capability.supported:
+        return
+    try:
+        await resolved.provider.clear_client_rate_limit(
+            resolved.config, resolved.site_id, client_mac
+        )
+    except ProviderError as error:
+        await _record_speed_failure(
+            session,
+            resolved,
+            action="clear_rate_limit",
+            client_mac=client_mac,
+            error=error,
+        )
+        logger.warning(
+            "network_integration_controller_rate_limit_not_released",
+            extra={
+                "integration_id": str(resolved.integration.id),
+                "error_code": getattr(error, "code", None),
+            },
+        )
+    else:
+        await _record_speed_success(
+            session, resolved, action="clear_rate_limit", client_mac=client_mac
+        )
 
 
 def _connection_config(
