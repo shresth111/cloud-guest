@@ -241,6 +241,54 @@ class GuestAccessRuleImportResponse(BaseModel):
 # ============================================================================
 
 
+class ControllerBlockResponse(BaseModel):
+    """What one venue's controller did about one of a blocked guest's
+    devices.
+
+    ``status`` is a :class:`~.constants.BlockEnforcementStatus` value, the
+    same vocabulary the rule itself uses, and each value has a rendering a
+    console owes the operator:
+
+    * ``enforced`` -- the controller confirmed it. Say so, and say no more
+      than that: a block is per-site and per-MAC, and a phone that
+      randomizes its MAC per SSID gets a new one by forgetting the network.
+      It is a deterrent. The thing that actually refuses the person is the
+      rule, which is vendor-neutral and is consulted at every sign-in.
+    * ``not_applicable`` -- the controller has no record of this device, so
+      there was nothing to block. ``error_code`` carries the vendor's own
+      not-found code. **This is not a failure** and must not be drawn as
+      one.
+    * ``failed`` -- the controller knew the device and would not do it, or
+      could not be reached. ``error_message`` is the reason, and this is the
+      only one of the four an operator can act on.
+    * ``unenforced`` -- nobody could do it here: this venue's integration
+      cannot block at all. ``error_message`` carries the provider's own
+      sentence explaining what the venue would have to change.
+
+    ``cleared_at`` is set once a controller has confirmed the block was
+    released. A row with ``status == "enforced"`` and a null ``cleared_at``
+    is a block this platform believes is still in force on the venue's
+    hardware.
+
+    What a block does to a guest who is holding a live portal authorization
+    at that moment is **unmeasured**, and nothing here should be worded as
+    though it were. Ending the live session is a separate mechanism, and its
+    result is ``enforcement_status``/``sessions_ended`` on the rule.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    location_id: uuid.UUID
+    mac_address: str
+    status: str
+    error_code: str | None = None
+    error_message: str | None = None
+    blocked_at: datetime | None = None
+    cleared_at: datetime | None = None
+    release_error: str | None = None
+
+
 class GuestAccessRuleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -273,6 +321,21 @@ class GuestAccessRuleResponse(BaseModel):
     enforcement_error: str | None = None
     enforced_at: datetime | None = None
     sessions_ended: int | None = None
+    # -- controller-side device blocks -------------------------------------
+    #
+    # One entry per device this platform asked the venue's controller to
+    # block on this rule's behalf. Empty at a venue this platform reaches
+    # over the router API rather than through a controller, and empty for a
+    # rule about somebody with no recorded device -- in both cases because
+    # nothing was asked, which is not the same as nothing being blocked.
+    #
+    # Rendered *beside* ``enforcement_status``, never folded into it. That
+    # field answers "what happened to the sessions this guest was in", which
+    # is what the Blocked Guests form promises; this list answers "and what
+    # about their devices", which is a per-device question with a per-device
+    # answer. A console that summarises these to a tick loses the only
+    # distinction an operator can act on.
+    controller_blocks: list[ControllerBlockResponse] = []
     created_at: datetime
     updated_at: datetime
 

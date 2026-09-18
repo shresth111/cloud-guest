@@ -146,6 +146,10 @@ from app.domains.guest.constants import (
     TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
     WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
 )
+from app.domains.guest_access.constants import (
+    CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP,
+)
 from app.domains.hub_reconciliation.constants import (
     HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_HUB_RECONCILIATION_SWEEP,
@@ -236,6 +240,7 @@ celery_app = Celery(
         "app.domains.connected_devices.tasks",
         "app.domains.dhcp.tasks",
         "app.domains.guest.tasks",
+        "app.domains.guest_access.tasks",
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
         "app.domains.monitoring.tasks",
@@ -339,6 +344,14 @@ celery_app.conf.update(
         # unreachable controller must not starve the pure-DB sweeps sharing
         # the default queue.
         TASK_RUN_OMADA_USAGE_SYNC_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Releasing a controller-side device block is one real outbound
+        # HTTPS write per stranded device to a customer-owned controller --
+        # the same class of I/O as the two sweeps above and on this queue
+        # for the identical reason: one unreachable controller must not
+        # starve the pure-DB sweeps sharing the default queue. It is also
+        # the sweep it matters most to keep unblocked, because every tick it
+        # misses is a customer's own device still refused by their own WiFi.
+        TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
@@ -802,6 +815,18 @@ celery_app.conf.update(
         "omada-usage-sync-sweep": {
             "task": TASK_RUN_OMADA_USAGE_SYNC_SWEEP,
             "schedule": OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS,
+        },
+        # Controller-side block release. The only scheduled thing standing
+        # between a time-bound block and a permanently blocked customer
+        # device: a rule's ``expires_at`` is evaluated lazily at read time,
+        # so nothing fires when it passes, while the block itself is durable
+        # state on the venue's own hardware that nothing on the controller
+        # ever removes. It is also the retry behind the two inline releases
+        # (deactivate and delete), which leave a row open on purpose when
+        # the controller could not be reached at that moment.
+        "guest-access-controller-block-release-sweep": {
+            "task": TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP,
+            "schedule": CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

@@ -88,6 +88,7 @@ def get_block_enforcer(
     behaviour for someone who was just blocked.
     """
     from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_device_blocker,
         build_controller_session_terminator,
     )
 
@@ -102,6 +103,18 @@ def get_block_enforcer(
         # request's own session, so a controller disconnect and the session
         # rows it accompanies commit together.
         controller_terminator=build_controller_session_terminator(db),
+        # The second controller hook, and a different job from the first.
+        # The terminator ends the session the guest is in right now; this
+        # asks the venue's controller to keep their devices from coming
+        # back on. Same session, so the block records and the session rows
+        # they accompany commit together, and same wiring layer, so
+        # ``guest_access`` still learns nothing about which vendor -- or
+        # whether there is one -- at any venue.
+        #
+        # A RouterOS venue reaches this object and stops at its first
+        # question (``controller_present``), which is one indexed query and
+        # no write at all.
+        device_blocker=build_controller_device_blocker(db),
     )
 
 
