@@ -1,8 +1,9 @@
 """Per-client controller writes for callers that cannot hold a
 ``NetworkIntegrationService``.
 
-Two hooks live here -- ending one client's session, and setting or clearing
-one client's speed limit -- and they share one tenant-scoped resolution.
+Three hooks live here -- ending one client's session, setting or clearing one
+client's speed limit, and blocking or unblocking one client's device -- and
+they share one tenant-scoped resolution.
 
 ## Why this is a module and not a method
 
@@ -61,6 +62,11 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.domains.guest_access.constants import BlockEnforcementStatus
+from app.domains.guest_access.enforcement import (
+    ControllerBlockOutcome,
+    ControllerReleaseOutcome,
+)
 
 from .constants import (
     DEFAULT_CONTROLLER_TLS_MODE,
@@ -75,6 +81,7 @@ from .exceptions import (
     ClientActionUnavailableError,
     LocationHasNoControllerError,
     NetworkIntegrationUrlRejectedError,
+    ProviderClientNotFoundError,
     ProviderError,
 )
 from .models import NetworkIntegration
@@ -86,6 +93,7 @@ from .validators import normalize_client_mac
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "build_controller_device_blocker",
     "build_controller_session_terminator",
     "build_controller_speed_hook",
 ]
@@ -188,7 +196,7 @@ def build_controller_speed_hook(session: AsyncSession):
                     up_kbps=up_kbps,
                 )
             except ProviderError as error:
-                await _record_speed_failure(
+                await _record_client_failure(
                     session,
                     resolved,
                     action="set_rate_limit",
@@ -200,7 +208,7 @@ def build_controller_speed_hook(session: AsyncSession):
                     },
                 )
                 raise
-            await _record_speed_success(
+            await _record_client_success(
                 session,
                 resolved,
                 action="set_rate_limit",
@@ -243,7 +251,7 @@ def build_controller_speed_hook(session: AsyncSession):
                     resolved.config, resolved.site_id, mac
                 )
             except ProviderError as error:
-                await _record_speed_failure(
+                await _record_client_failure(
                     session,
                     resolved,
                     action="clear_rate_limit",
@@ -251,7 +259,7 @@ def build_controller_speed_hook(session: AsyncSession):
                     error=error,
                 )
                 raise
-            await _record_speed_success(
+            await _record_client_success(
                 session, resolved, action="clear_rate_limit", client_mac=mac
             )
             return cleared
@@ -259,7 +267,7 @@ def build_controller_speed_hook(session: AsyncSession):
     return _SpeedHook()
 
 
-async def _record_speed_success(
+async def _record_client_success(
     session: AsyncSession,
     resolved: _ResolvedController,
     *,
@@ -268,6 +276,11 @@ async def _record_speed_success(
     context: dict[str, object] | None = None,
 ) -> None:
     """One row in the venue's own integration feed, per automatic write.
+
+    Serves every client hook in this module -- speed, block and unblock --
+    because they are the same fact: this platform wrote to a venue's
+    controller without anybody clicking a button, and the venue must be able
+    to see it.
 
     The manual per-client route already records both outcomes through
     ``NetworkIntegrationService._record_client_action``; this is the same feed
@@ -287,7 +300,7 @@ async def _record_speed_success(
     )
 
 
-async def _record_speed_failure(
+async def _record_client_failure(
     session: AsyncSession,
     resolved: _ResolvedController,
     *,
@@ -296,7 +309,7 @@ async def _record_speed_failure(
     error: ProviderError,
     context: dict[str, object] | None = None,
 ) -> None:
-    """The refusal, written down before it is re-raised.
+    """The refusal, written down before it is re-raised or returned.
 
     **The controller cannot rate-limit a client it cannot currently see**, and
     that is the refusal this path meets most often: a guest whose device has
@@ -417,6 +430,215 @@ def _require_mac(client_mac: str) -> str:
         return normalize_client_mac(client_mac)
     except ValueError as exc:
         raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
+
+
+def build_controller_device_blocker(session: AsyncSession):
+    """Blocking and unblocking one device on a venue's controller, bound to
+    ``session``.
+
+    Satisfies ``guest_access.enforcement.ControllerDeviceBlockerProtocol``,
+    so a ``BLOCKLIST`` rule written on the customer dashboard reaches the
+    venue's controller as well as this platform's own login gate. The caller
+    supplies the database session once, at wiring time; the hook's own
+    signatures stay free of it, and ``BlocklistEnforcer`` -- which has no
+    session and must not grow one -- never sees it.
+
+    ## Why it returns outcomes instead of raising
+
+    Every other write in this module raises, because for those the write is
+    the whole point of the call. Here it is not. The operator asked for a
+    person to be blocked, and that has already happened, vendor-neutrally,
+    in this platform's own tables; the device write is an additional
+    deterrent on top. A controller that refuses to block one of five phones
+    must not turn that into a failed block -- but it must also never be
+    silently dropped, which is why the refusal comes back as a value, with
+    the vendor's own code, and is written to a row the caller keeps.
+
+    ## Tenant-scoped by the query, not by a check afterwards
+
+    Inherited from :func:`_resolve`: the caller's organization and the
+    location are both in the WHERE clause, so a location belonging to
+    another tenant resolves to nothing. The site every write runs against
+    comes from the row that resolved, never from anything a caller named --
+    no customer path anywhere gives this an integration or a site id.
+    """
+
+    class _DeviceBlocker:
+        @staticmethod
+        async def controller_present(
+            *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+        ) -> bool:
+            """One indexed lookup, answered before anything else happens.
+
+            This is what keeps a RouterOS venue out of the whole path: it
+            resolves nothing, decrypts nothing, calls nothing, and the
+            caller stops here.
+            """
+            return (
+                await _resolve(
+                    session,
+                    location_id=location_id,
+                    organization_id=organization_id,
+                )
+                is not None
+            )
+
+        @staticmethod
+        async def block_device(
+            *,
+            location_id: uuid.UUID,
+            organization_id: uuid.UUID | None,
+            client_mac: str,
+        ) -> ControllerBlockOutcome:
+            return await _client_block_action(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="block",
+            )
+
+        @staticmethod
+        async def release_device(
+            *,
+            location_id: uuid.UUID,
+            organization_id: uuid.UUID | None,
+            client_mac: str,
+        ) -> ControllerReleaseOutcome:
+            outcome = await _client_block_action(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="unblock",
+            )
+            # A release aimed at a client the controller has no record of
+            # has nothing left to do, and saying so is not the same as
+            # claiming a write landed: there is no block on that MAC at this
+            # site, which is the state the caller wanted. Anything else --
+            # a refusal, an unreachable controller, a venue that cannot
+            # block at all -- leaves the stored row uncleared so the next
+            # attempt finds it again.
+            released = outcome.status in (
+                BlockEnforcementStatus.ENFORCED.value,
+                BlockEnforcementStatus.NOT_APPLICABLE.value,
+            )
+            return ControllerReleaseOutcome(
+                released=released,
+                error_message=None if released else outcome.error_message,
+            )
+
+    return _DeviceBlocker()
+
+
+async def _client_block_action(
+    session: AsyncSession,
+    *,
+    location_id: uuid.UUID,
+    organization_id: uuid.UUID | None,
+    client_mac: str,
+    action: str,
+) -> ControllerBlockOutcome:
+    """One ``block``/``unblock`` write, reported rather than raised.
+
+    The four answers this can give are the four values of
+    ``BlockEnforcementStatus``, and the distinctions are the point:
+
+    * ``UNENFORCED`` -- there is no controller here, or the one that is
+      here cannot block at all. The second is the hotspot-operator
+      (``legacy``) case, gated on the provider's own declared capability and
+      reported with the provider's own reason. There is no fallback and no
+      second mechanism: a venue connected that way simply cannot do this,
+      and pretending otherwise would put a green tick on a venue where
+      nothing happened.
+    * ``NOT_APPLICABLE`` -- the controller has no record of this device.
+      Nothing to block, nothing refused. Distinguished by the vendor's own
+      normalized not-found code and never folded into the line below.
+    * ``FAILED`` -- the controller knows the device and would not do it, or
+      could not be reached.
+    * ``ENFORCED`` -- the controller confirmed it.
+
+    The MAC is normalized here and only here; a value that is not
+    MAC-shaped is a ``FAILED`` outcome rather than an exception, because the
+    caller is iterating devices and one malformed stored row must not stop
+    the other four.
+    """
+    resolved = await _resolve(
+        session, location_id=location_id, organization_id=organization_id
+    )
+    if resolved is None:
+        return ControllerBlockOutcome(
+            location_id=location_id,
+            mac_address=client_mac,
+            status=BlockEnforcementStatus.UNENFORCED.value,
+            error_message=(
+                "This venue's network is not run from a controller this "
+                "platform is connected to, so there is nothing to block on."
+            ),
+        )
+    capability = getattr(resolved.provider.client_capabilities(resolved.config), action)
+    if not capability.supported:
+        return ControllerBlockOutcome(
+            location_id=location_id,
+            mac_address=client_mac,
+            status=BlockEnforcementStatus.UNENFORCED.value,
+            error_message=capability.reason or "This action is not available here.",
+        )
+    try:
+        mac = normalize_client_mac(client_mac)
+    except ValueError as exc:
+        return ControllerBlockOutcome(
+            location_id=location_id,
+            mac_address=client_mac,
+            status=BlockEnforcementStatus.FAILED.value,
+            error_message=str(exc),
+        )
+
+    call = (
+        resolved.provider.block_client
+        if action == "block"
+        else resolved.provider.unblock_client
+    )
+    try:
+        performed = bool(await call(resolved.config, resolved.site_id, mac))
+    except ProviderClientNotFoundError as error:
+        await _record_client_failure(
+            session, resolved, action=action, client_mac=mac, error=error
+        )
+        return ControllerBlockOutcome(
+            location_id=location_id,
+            mac_address=mac,
+            status=BlockEnforcementStatus.NOT_APPLICABLE.value,
+            error_code=getattr(error.code, "value", None),
+            error_message=str(error),
+        )
+    except ProviderError as error:
+        await _record_client_failure(
+            session, resolved, action=action, client_mac=mac, error=error
+        )
+        return ControllerBlockOutcome(
+            location_id=location_id,
+            mac_address=mac,
+            status=BlockEnforcementStatus.FAILED.value,
+            error_code=getattr(error.code, "value", None),
+            error_message=str(error),
+        )
+    await _record_client_success(session, resolved, action=action, client_mac=mac)
+    if not performed:
+        # The controller answered without an error and without doing it.
+        # Rare, and not something to render as success: "we asked and it
+        # said nothing happened" is a refusal with no reason attached.
+        return ControllerBlockOutcome(
+            location_id=location_id,
+            mac_address=mac,
+            status=BlockEnforcementStatus.FAILED.value,
+            error_message=(f"The controller did not confirm the {action}."),
+        )
+    return ControllerBlockOutcome(
+        location_id=location_id,
+        mac_address=mac,
+        status=BlockEnforcementStatus.ENFORCED.value,
+    )
 
 
 def build_controller_session_terminator(session: AsyncSession):
@@ -542,7 +764,7 @@ async def _release_rate_limit(
             resolved.config, resolved.site_id, client_mac
         )
     except ProviderError as error:
-        await _record_speed_failure(
+        await _record_client_failure(
             session,
             resolved,
             action="clear_rate_limit",
@@ -557,7 +779,7 @@ async def _release_rate_limit(
             },
         )
     else:
-        await _record_speed_success(
+        await _record_client_success(
             session, resolved, action="clear_rate_limit", client_mac=client_mac
         )
 

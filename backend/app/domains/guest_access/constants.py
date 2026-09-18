@@ -193,8 +193,38 @@ class GuestRuleImportRejectionCode(StrEnum):
     INVALID_CONTACT_EMAIL = "invalid_contact_email"
 
 
+# ============================================================================
+# Controller-side device blocks
+# ============================================================================
+
+# The periodic release of controller blocks whose rule has stopped applying.
+# See ``app.domains.guest_access.tasks`` for the full write-up: the short
+# version is that a rule's ``expires_at`` is evaluated lazily at read time,
+# nothing fires when it passes, and a controller block is durable state on a
+# customer's own hardware that nothing on the controller ever removes.
+TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP = (
+    "app.domains.guest_access.tasks.run_controller_block_release_sweep"
+)
+
+# Ten minutes. Slower than the guest session-timeout sweep because nothing
+# here is time-critical in the way a session cut-off is -- a block that
+# lapsed is a block that should go, not one that must go this second -- and
+# because every row costs a real outbound HTTPS round trip to a
+# customer-owned controller. Fast enough that "until Sunday" means Sunday.
+CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS = 600.0
+
+# Bounded per run so one tick cannot run long enough to overlap the next --
+# the same reasoning ``OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN`` carries.
+# Rows are taken oldest first, so a backlog drains in the order devices were
+# stranded rather than at random.
+CONTROLLER_BLOCK_RELEASE_MAX_PER_RUN = 200
+
+
 __all__ = [
     "AccessRuleType",
+    "CONTROLLER_BLOCK_RELEASE_MAX_PER_RUN",
+    "CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP",
     "BlockEnforcementStatus",
     "ACCESS_RULE_TYPE_PRECEDENCE",
     "WHITELIST_ONLY_DENIAL_REASON",

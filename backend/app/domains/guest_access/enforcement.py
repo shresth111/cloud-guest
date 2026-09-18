@@ -66,12 +66,14 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.router.vendor_capabilities import is_controller_managed
 
+from .constants import BlockEnforcementStatus
 from .device_adapters import (
     BaseGuestAccessAdapter,
     GuestAccessCredentials,
@@ -155,6 +157,30 @@ class LiveSessionLookupProtocol(Protocol):
         self, device_id: uuid.UUID
     ) -> BlockedDeviceRow | None: ...
 
+    async def list_devices_for_guest_ids(
+        self,
+        *,
+        guest_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[BlockedDeviceRow]:
+        """Every device this platform has ever recorded for these guests.
+
+        The identifier -> MAC bridge, and the reason it is this lookup
+        rather than a new one: a ``BLOCKLIST`` rule names a person, a
+        controller blocks a MAC, and the only thing that knows which MACs
+        belong to a person is the guest domain's own device table. The
+        session-end path already reaches the same table one row at a time
+        (``get_device_by_id`` above, for the device holding a live
+        session); this is the same fact asked for a whole guest, which is
+        what a block needs -- their *other* phone is exactly the device a
+        block that only looked at the live session would miss.
+
+        Ordered newest-seen first by the repository, so a venue that ever
+        needs to bound the fan-out bounds it at the devices the guest
+        actually uses.
+        """
+        ...
+
     async def update_session(
         self, session: LiveSessionRow, data: dict[str, object]
     ) -> LiveSessionRow: ...
@@ -228,6 +254,152 @@ class ControllerSessionTerminatorProtocol(Protocol):
     ) -> bool: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ControllerBlockOutcome:
+    """What a venue's controller did about **one** device MAC.
+
+    Per device, because the result genuinely is: a rule names a person who
+    may hold five devices, and "three of them are blocked" is not a
+    sentence a single status can say.
+
+    ``status`` reuses :class:`~.constants.BlockEnforcementStatus` rather
+    than inventing a second vocabulary, and each of its values means here
+    what its own docstring says it means:
+
+    * ``ENFORCED`` -- the controller confirmed the block.
+    * ``NOT_APPLICABLE`` -- nothing needed doing: the controller has no
+      record of this device at this venue, so there is nothing there to
+      block. ``error_code`` carries the vendor's own not-found code.
+    * ``FAILED`` -- the controller knows the device and refused, or could
+      not be reached. ``error_code``/``error_message`` say which.
+    * ``UNENFORCED`` -- nobody was there to do it: this venue's
+      integration cannot block at all (a hotspot-operator connection), and
+      ``error_message`` carries the provider's own reason for that.
+
+    **``NOT_APPLICABLE`` and ``FAILED`` must never be collapsed.** A
+    boolean ``performed: false`` conflates "the venue's controller has
+    never seen this phone" with "the venue's controller refused to block
+    this phone", and only the second is something an operator can act on.
+    """
+
+    location_id: uuid.UUID
+    mac_address: str
+    status: str
+    error_code: str | None = None
+    error_message: str | None = None
+
+    @property
+    def blocked(self) -> bool:
+        """Whether a block is now believed to be held on the controller.
+
+        The one predicate that may decide to persist a releasable row --
+        and deliberately narrow: only a confirmed block is releasable,
+        because a release aimed at a MAC the controller never held is a
+        write with no subject.
+        """
+        return self.status == BlockEnforcementStatus.ENFORCED.value
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerReleaseOutcome:
+    """What a venue's controller did about clearing one block.
+
+    ``released`` is the controller's own answer, never an assumption. A
+    release that did not land leaves the stored row **uncleared**, which is
+    the whole point of storing it: the device stays findable and the next
+    sweep tries again. Reporting a release this platform did not get is how
+    a customer's device is stranded with no record that it ever was.
+    """
+
+    released: bool
+    error_message: str | None = None
+
+
+class ControllerDeviceBlockerProtocol(Protocol):
+    """Blocking and unblocking one device MAC on the venue's own
+    controller.
+
+    Injected as a value rather than imported, for exactly the reason
+    :class:`ControllerSessionTerminatorProtocol` above gives:
+    ``guest_access`` may not depend on ``app.domains.network_integration``
+    at import time. The wiring layer supplies an object built by
+    ``network_integration.client_hooks.build_controller_device_blocker``,
+    and this module never learns which vendor is behind it, which venues
+    have one, or what a "site" is.
+
+    ``None`` is a legitimate value -- a deployment without the network
+    integration domain wired, or a test. It means no device is ever asked
+    about, which is reported as no outcomes at all rather than as a set of
+    blocks nobody placed.
+
+    ## What this is, and the four things it is not
+
+    It is a **deterrent**, and the honest description is narrow.
+
+    It is not this platform's blocklist. ``guest_access``'s ``BLOCKLIST``
+    rules are vendor-neutral, are consulted at every login and by the
+    RADIUS authorize path, and remain the thing that actually refuses the
+    person. This stops one *device* associating; the rule stops the
+    *person* signing in.
+
+    It is not durable against a phone that randomizes its MAC per SSID. The
+    flag is keyed on the MAC, and forgetting the network produces a new
+    one.
+
+    It does not roam between venues. A controller block is per-site.
+
+    And what it does to a guest who holds a live portal authorization right
+    now is **unmeasured** (CAPABILITY-MATRIX §4.6): the authorization record
+    and the block flag are separate objects with separate lifecycles, so
+    nothing here claims the block is what cut them off. Ending the live
+    session is a different call, made separately, by
+    :class:`LiveSessionTerminator` above.
+    """
+
+    async def controller_present(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> bool:
+        """Whether this venue's network is run from a controller at all.
+
+        Asked first, and asked before anything else is looked up, so a
+        RouterOS venue costs exactly one indexed query and produces no
+        outcome, no row and no write. That is not an optimization -- it is
+        what makes this change unable to alter MikroTik behaviour.
+        """
+        ...
+
+    async def block_device(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+    ) -> ControllerBlockOutcome: ...
+
+    async def release_device(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+    ) -> ControllerReleaseOutcome: ...
+
+
+class ControllerBlockRecord(Protocol):
+    """The three fields a release needs off a stored block row.
+
+    Satisfied structurally by
+    ``app.domains.guest_access.models.GuestAccessControllerBlock``. Named
+    as a Protocol for symmetry with the rest of this module, not because a
+    second implementation is expected -- it keeps the release path
+    testable without a database.
+    """
+
+    organization_id: uuid.UUID
+    location_id: uuid.UUID
+    mac_address: str
+
+
 class DeviceLookupProtocol(Protocol):
     """The one lookup ending a session needs beyond router credentials:
     which MAC the guest is holding, when this platform knows it.
@@ -263,6 +435,15 @@ class BlockEnforcementReport:
     #: was contacted, because "the guest had no live session" is not
     #: evidence about any router's ``/radius incoming``.
     coa_available: bool | None
+    #: One entry per (controller-managed venue, known device MAC) this
+    #: platform asked the venue's controller to block, carrying what the
+    #: controller said about each. Empty at a RouterOS venue, where nothing
+    #: is asked -- see :class:`ControllerDeviceBlockerProtocol`.
+    #:
+    #: Deliberately not summarised to a count here. "Three of five" needs
+    #: the five, and a caller that wants the count can take the length of
+    #: the ones it cares about.
+    device_blocks: tuple[ControllerBlockOutcome, ...] = ()
 
 
 _NOTHING_TO_DO = BlockEnforcementReport(
@@ -525,6 +706,7 @@ class BlocklistEnforcer:
         terminated_session_status: str,
         adapter_factory: object = None,
         controller_terminator: ControllerSessionTerminatorProtocol | None = None,
+        device_blocker: ControllerDeviceBlockerProtocol | None = None,
     ) -> None:
         self.session_lookup = session_lookup
         self.router_lookup = router_lookup
@@ -546,6 +728,20 @@ class BlocklistEnforcer:
             adapter_factory=adapter_factory,
             controller_terminator=controller_terminator,
         )
+        # The other half of "make the block true on the device", and a
+        # different half from the terminator above. The terminator ends the
+        # session the guest is in *now*; this keeps the device from coming
+        # back on. Only a controller-managed venue has it: on RouterOS the
+        # block is carried entirely by the platform rule and the hotspot
+        # removal, and nothing here writes an address list, an ip-binding
+        # or a filter rule -- see ``TestRetryAndUnblock
+        # .test_unblocking_needs_no_device_work_because_nothing_was_left_there``
+        # for why that absence is load-bearing rather than incidental.
+        #
+        # ``None`` by default, and the default is safe rather than silent:
+        # a caller that wires none gets no ``device_blocks`` at all, which
+        # reads as "nothing was asked", not as "nothing was blocked".
+        self.device_blocker = device_blocker
 
     async def enforce(
         self,
@@ -601,7 +797,29 @@ class BlocklistEnforcer:
             # block the login gate itself would not honour there.
             sessions = [s for s in sessions if s.location_id == location_id]
         if not sessions:
-            return _NOTHING_TO_DO
+            # No live session is no longer the end of the story. A guest
+            # who is offline at this moment still has known devices, and a
+            # controller block lives on the **known-client record**, not on
+            # a live association -- measured on real hardware: a client
+            # that was offline for eight hours was accepted and stored as
+            # blocked (CAPABILITY-MATRIX §4.3). Blocking only the guests
+            # who happen to be online would make the feature depend on the
+            # timing of the operator's click.
+            device_blocks = await self._block_known_devices(
+                organization_id=organization_id,
+                guest=guest,
+                rule_location_id=location_id,
+                session_locations=frozenset(),
+            )
+            if not device_blocks:
+                return _NOTHING_TO_DO
+            return BlockEnforcementReport(
+                sessions_found=0,
+                sessions_ended=0,
+                routers_contacted=0,
+                coa_available=None,
+                device_blocks=device_blocks,
+            )
 
         outcomes: list[tuple[LiveSessionRow, SessionEndOutcome]] = []
         contacted_routers: set[uuid.UUID] = set()
@@ -639,6 +857,19 @@ class BlocklistEnforcer:
                 },
             )
 
+        # Last, and after the session rows are written, deliberately. The
+        # session half is what the dashboard's own copy promises and what
+        # this path must never fail to deliver; the controller block is an
+        # additional deterrent layered on top of it. Ordered the other way
+        # round, a controller that refused a block would have stood between
+        # an operator and the disconnection they actually asked for.
+        device_blocks = await self._block_known_devices(
+            organization_id=organization_id,
+            guest=guest,
+            rule_location_id=location_id,
+            session_locations=frozenset(s.location_id for s in sessions),
+        )
+
         logger.info(
             "guest_access_block_enforced",
             extra={
@@ -647,6 +878,8 @@ class BlocklistEnforcer:
                 "event_sessions_ended": len(outcomes),
                 "event_routers_contacted": len(contacted_routers),
                 "event_coa_available": coa_available,
+                "event_devices_blocked": sum(1 for d in device_blocks if d.blocked),
+                "event_devices_attempted": len(device_blocks),
             },
         )
         return BlockEnforcementReport(
@@ -654,7 +887,155 @@ class BlocklistEnforcer:
             sessions_ended=len(outcomes),
             routers_contacted=len(contacted_routers),
             coa_available=coa_available,
+            device_blocks=device_blocks,
         )
+
+    async def _block_known_devices(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        guest: BlockedGuestRow,
+        rule_location_id: uuid.UUID | None,
+        session_locations: frozenset[uuid.UUID],
+    ) -> tuple[ControllerBlockOutcome, ...]:
+        """Ask each controller-managed venue in scope to block each device
+        this platform associates with the blocked guest.
+
+        ## One rule, several devices
+
+        The rule names a person; the controller blocks a MAC. So the bridge
+        is the guest's own ``GuestDevice`` rows -- every device, not just
+        the one holding a live session, because their *other* phone is
+        precisely what a block that only looked at the live session would
+        miss. Each device is one write and one outcome, so a guest with
+        five devices produces five answers and three of them being
+        ``ENFORCED`` is a fact the caller can record and a console can show.
+
+        A guest with **no** recorded device produces no writes and no
+        outcomes. That is the common, legitimate case for a rule written
+        about somebody who has never connected -- which is exactly what
+        these tables are identifier-keyed to allow (see ``models.py``) --
+        and the platform blocklist still refuses them at sign-in, which is
+        the half that actually matters.
+
+        ## Which venues
+
+        Entirely from the rule's own ``(organization, location)``, and from
+        nothing a caller supplied. A rule scoped to one venue is applied at
+        that venue. An organization-wide rule has no venue of its own, so
+        the venues are the ones the guest's live sessions were on -- the
+        same sessions that were just ended, resolved under the same
+        organization. An org-wide rule for a guest who is offline therefore
+        blocks nothing on any controller, and says so by returning nothing:
+        there is no venue this platform can name, and guessing one would be
+        writing a block into somebody else's site.
+
+        ## A RouterOS venue reaches nothing here
+
+        ``controller_present`` is asked first and is one indexed query. A
+        venue without a controller integration produces no device lookup,
+        no write, no outcome and no stored row -- so a MikroTik block ends
+        the session exactly as it did before this method existed, and its
+        address lists, ip-bindings and filter rules stay untouched.
+        """
+        if self.device_blocker is None:
+            return ()
+        locations = (
+            frozenset({rule_location_id})
+            if rule_location_id is not None
+            else session_locations
+        )
+        if not locations:
+            return ()
+        controller_locations = [
+            location_id
+            for location_id in sorted(locations, key=str)
+            if await self.device_blocker.controller_present(
+                location_id=location_id, organization_id=organization_id
+            )
+        ]
+        if not controller_locations:
+            return ()
+
+        devices = await self.session_lookup.list_devices_for_guest_ids(
+            guest_ids=[guest.id], organization_id=organization_id
+        )
+        # Ordered, de-duplicated, and stable: the repository returns newest
+        # seen first, and one MAC can appear on more than one row only if
+        # the device table is being repaired, in which case blocking it
+        # twice is a wasted call rather than a second block.
+        macs: list[str] = []
+        for device in devices:
+            mac = getattr(device, "mac_address", None)
+            if mac and mac not in macs:
+                macs.append(mac)
+        if not macs:
+            return ()
+
+        outcomes: list[ControllerBlockOutcome] = []
+        for location_id in controller_locations:
+            for mac in macs:
+                outcomes.append(
+                    await self.device_blocker.block_device(
+                        location_id=location_id,
+                        organization_id=organization_id,
+                        client_mac=mac,
+                    )
+                )
+        return tuple(outcomes)
+
+    async def release_devices(
+        self,
+        records: Sequence[ControllerBlockRecord],
+    ) -> list[tuple[ControllerBlockRecord, ControllerReleaseOutcome]]:
+        """Ask each venue's controller to let these devices go again.
+
+        Takes the **stored rows** rather than re-deriving anything, and
+        that is the whole design. The controller offers no readable list of
+        blocked clients through the connection this platform holds
+        (measured -- CAPABILITY-MATRIX §4.4), so what was blocked is
+        knowable only from what was written down at the time. Re-deriving
+        it from the guest's devices would miss a device the guest has since
+        replaced, and that device would stay blocked on a customer's
+        network with nothing left anywhere pointing at it.
+
+        Never raises. A release runs on the back of an operator's unblock,
+        deletion or an expiry sweep, and a controller that cannot be
+        reached must leave the row **uncleared** so the next attempt finds
+        it again -- not abort the unblock the operator actually asked for.
+        The failure is returned, and the caller records it on the row.
+
+        With no blocker wired, nothing is released and nothing is reported
+        as released: every row comes back with its own refusal, which keeps
+        it in the set the next sweep retries.
+        """
+        results: list[tuple[ControllerBlockRecord, ControllerReleaseOutcome]] = []
+        for record in records:
+            if self.device_blocker is None:
+                results.append(
+                    (
+                        record,
+                        ControllerReleaseOutcome(
+                            released=False,
+                            error_message=(
+                                "No controller connection is wired in this "
+                                "process, so the block could not be cleared."
+                            ),
+                        ),
+                    )
+                )
+                continue
+            results.append(
+                (
+                    record,
+                    await self.device_blocker.release_device(
+                        location_id=record.location_id,
+                        organization_id=record.organization_id,
+                        client_mac=record.mac_address,
+                    ),
+                )
+            )
+        return results
 
     # -- internals ---------------------------------------------------------
 

@@ -94,9 +94,10 @@ import io
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, cast
 
 from app.common.spreadsheet_safety import sanitize_spreadsheet_cell
 from app.database.utils.pagination import PaginationMeta
@@ -114,7 +115,11 @@ from .constants import (
     BlockEnforcementStatus,
     GuestRuleImportRejectionCode,
 )
-from .enforcement import BlockEnforcementReport
+from .enforcement import (
+    BlockEnforcementReport,
+    ControllerBlockRecord,
+    ControllerReleaseOutcome,
+)
 from .events import (
     AccessRuleCreated,
     AccessRuleDeactivated,
@@ -136,7 +141,7 @@ from .exceptions import (
     RuleTypeNotImportableError,
     TemporaryRuleRequiresExpiryError,
 )
-from .models import DeviceAccessRule, GuestAccessRule
+from .models import DeviceAccessRule, GuestAccessControllerBlock, GuestAccessRule
 from .repository import GuestAccessRepositoryProtocol
 from .validators import (
     canonicalize_rule_identifier,
@@ -548,6 +553,16 @@ class BlockEnforcerProtocol(Protocol):
         location_id: uuid.UUID | None = None,
     ) -> BlockEnforcementReport: ...
 
+    async def release_devices(
+        self,
+        records: Sequence[ControllerBlockRecord],
+    ) -> list[tuple[ControllerBlockRecord, ControllerReleaseOutcome]]:
+        """Undo the controller-side half. Never raises -- see the
+        implementation's own docstring for why a release that did not land
+        must leave the stored row uncleared rather than fail the unblock the
+        operator asked for."""
+        ...
+
 
 class GuestAccessService:
     """CRUD over both rule tables, plus ``check_access`` (the read path
@@ -780,8 +795,104 @@ class GuestAccessService:
                 "sessions_ended": report.sessions_ended,
             },
         )
+        await self._record_device_blocks(updated, report)
         await self.repository.commit()
         return updated
+
+    async def _record_device_blocks(
+        self, rule: GuestAccessRule, report: BlockEnforcementReport
+    ) -> None:
+        """Write down every device block the controller confirmed, before
+        anybody is told it happened.
+
+        **Why this is not optional bookkeeping.** There is no readable list
+        of blocked clients through the connection this platform holds -- the
+        controller's own blocked filter is silently ignored and the Open API
+        client grid carries no block field at all (measured; see
+        ``network_integration.providers.omada`` and CAPABILITY-MATRIX §4.4).
+        A MAC blocked and not recorded is therefore a device that cannot be
+        found again from either side: not from the controller, which will
+        not list it, and not from here, which never wrote it down. The
+        customer's device stays off their own network with no row anywhere
+        explaining why.
+
+        Only confirmed blocks become releasable rows. The rest are recorded
+        too -- a refusal and a device the controller has never seen are both
+        facts the console must be able to show -- but they are not things to
+        ask a controller to undo later, and
+        ``repository.list_open_controller_blocks`` is what draws that line.
+
+        ``enforcement_status`` on the rule itself is deliberately **not**
+        touched here. It is the ladder the dashboard already reads
+        (``src/lib/block-outcome.ts``), and what it means is "what happened
+        to the sessions this guest was in" -- the promise the Blocked Guests
+        form actually makes. Folding a refused device block into it would
+        make an owner read "we could not take them off the WiFi" about a
+        guest who was taken off the WiFi. The per-device answers travel
+        beside it, in their own rows, where a partial result can be said
+        as one.
+        """
+        if not report.device_blocks:
+            return
+        now = datetime.now(UTC)
+        for outcome in report.device_blocks:
+            await self.repository.record_controller_block(
+                rule,
+                location_id=outcome.location_id,
+                mac_address=outcome.mac_address,
+                organization_id=rule.organization_id,
+                status=outcome.status,
+                error_code=outcome.error_code,
+                error_message=outcome.error_message,
+                blocked_at=now if outcome.blocked else None,
+            )
+
+    async def _release_controller_blocks(
+        self, rule: GuestAccessRule
+    ) -> list[GuestAccessControllerBlock]:
+        """Ask every venue that is still holding a block for this rule to
+        let the device go, and record what came back.
+
+        Runs **before** the rule stops applying, not after, and the ordering
+        is the whole safety property: the rows are found by ``rule_id``, so
+        a release attempted after the rule had been removed would be a
+        release nobody could start. It is also why the delete is a soft
+        delete and why nothing cascades these rows away.
+
+        A release that did not land leaves ``cleared_at`` NULL and writes
+        the reason onto the row. That row stays in the set the expiry sweep
+        retries, which is the only reason a temporarily unreachable
+        controller does not turn into a permanently blocked customer device.
+        """
+        if self.block_enforcer is None:
+            return []
+        open_blocks = await self.repository.list_open_controller_blocks(rule_id=rule.id)
+        if not open_blocks:
+            return []
+        now = datetime.now(UTC)
+        released: list[GuestAccessControllerBlock] = []
+        for record, outcome in await self.block_enforcer.release_devices(open_blocks):
+            block = cast("GuestAccessControllerBlock", record)
+            await self.repository.update_controller_block(
+                block,
+                {
+                    "cleared_at": now if outcome.released else None,
+                    "release_error": (
+                        None if outcome.released else outcome.error_message
+                    ),
+                },
+            )
+            if outcome.released:
+                released.append(block)
+        logger.info(
+            "guest_access_controller_blocks_released",
+            extra={
+                "event_rule_id": str(rule.id),
+                "event_blocks_open": len(open_blocks),
+                "event_blocks_released": len(released),
+            },
+        )
+        return released
 
     async def get_guest_rule(
         self,
@@ -845,11 +956,30 @@ class GuestAccessService:
         rule = await self.get_guest_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        # Before the rule stops applying, not after. An unblock that only
+        # flipped ``is_active`` would let the person sign in again and leave
+        # their phone unable to associate -- a guest who is un-blocked
+        # everywhere this platform can see and still off the WiFi, with the
+        # only record of why sitting in a table nobody would think to read.
+        #
+        # Deliberately unconditional on rule type. A ``WHITELIST`` rule has
+        # no open blocks, so this is one indexed query that finds nothing --
+        # and asking the question of every rule is cheaper than trusting
+        # that no rule ever changed type.
+        await self._release_controller_blocks(rule)
         updated = await self.repository.update_guest_rule(
             rule, {"is_active": False, "updated_by": actor_user_id}
         )
         event = AccessRuleDeactivated(rule_id=updated.id)
         logger.info("guest_access_rule_deactivated", extra=_event_extra(event))
+        # No explicit commit, unlike ``_enforce_block``. That one commits
+        # because it is about to re-raise and ``get_db_session`` rolls back
+        # on any exception, so the failure record would be discarded. Here
+        # there is nothing to lose in the same way: a release that landed on
+        # the controller but rolled back here leaves the row open, and the
+        # sweep retries an unblock the controller treats as idempotent
+        # (measured -- a second unblock returns ``errorCode 0``). Under-
+        # claiming is the safe direction, and it is this one.
         return updated
 
     async def delete_guest_rule(
@@ -862,6 +992,13 @@ class GuestAccessService:
         rule = await self.get_guest_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        # Same ordering as ``deactivate_guest_rule``, and here it is not
+        # merely tidy: the open blocks are found by ``rule_id``, and a rule
+        # that has been removed is a rule nobody can start a release from.
+        # ``delete_guest_rule`` is a soft delete precisely so the row --
+        # and the blocks pointing at it -- survive to be released, including
+        # by the sweep if this attempt does not land.
+        await self._release_controller_blocks(rule)
         await self.repository.delete_guest_rule(rule)
         event = AccessRuleDeleted(rule_id=rule.id)
         logger.info("guest_access_rule_deleted", extra=_event_extra(event))

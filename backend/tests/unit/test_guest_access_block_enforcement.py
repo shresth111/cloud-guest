@@ -39,7 +39,11 @@ from app.domains.guest_access.exceptions import (
     RouterHasNoHotspotError,
     SessionStillActiveOnDeviceError,
 )
-from app.domains.guest_access.models import DeviceAccessRule, GuestAccessRule
+from app.domains.guest_access.models import (
+    DeviceAccessRule,
+    GuestAccessControllerBlock,
+    GuestAccessRule,
+)
 from app.domains.guest_access.service import GuestAccessService
 
 # The value ``dependencies.get_block_enforcer`` injects in the running app.
@@ -83,6 +87,63 @@ class FakeGuestAccessRepository:
     #: a failure record written just before a re-raise is discarded unless
     #: it is committed first.
     commits: int = 0
+    #: Every controller-side device block this repository was asked to
+    #: record. At a MikroTik venue this list must stay empty: that vendor's
+    #: block path writes nothing to any device beyond removing the guest
+    #: from ``/ip hotspot active``, and an empty list here is what proves
+    #: the controller work added alongside it never reaches RouterOS.
+    controller_blocks: list[GuestAccessControllerBlock] = field(default_factory=list)
+
+    async def record_controller_block(
+        self,
+        rule: GuestAccessRule,
+        *,
+        location_id: uuid.UUID,
+        mac_address: str,
+        **fields: object,
+    ) -> GuestAccessControllerBlock:
+        for existing in self.controller_blocks:
+            if (
+                existing.rule_id == rule.id
+                and existing.location_id == location_id
+                and existing.mac_address == mac_address
+            ):
+                for key, value in {
+                    **fields,
+                    "cleared_at": None,
+                    "release_error": None,
+                }.items():
+                    setattr(existing, key, value)
+                return existing
+        block = GuestAccessControllerBlock(
+            **_base_fields(
+                rule_id=rule.id,
+                location_id=location_id,
+                mac_address=mac_address,
+                **fields,
+            )
+        )
+        self.controller_blocks.append(block)
+        rule.controller_blocks.append(block)
+        return block
+
+    async def update_controller_block(
+        self, block: GuestAccessControllerBlock, data: dict[str, object]
+    ) -> GuestAccessControllerBlock:
+        for key, value in data.items():
+            setattr(block, key, value)
+        return block
+
+    async def list_open_controller_blocks(
+        self, *, rule_id: uuid.UUID
+    ) -> list[GuestAccessControllerBlock]:
+        return [
+            block
+            for block in self.controller_blocks
+            if block.rule_id == rule_id
+            and block.status == BlockEnforcementStatus.ENFORCED.value
+            and block.cleared_at is None
+        ]
 
     async def create_guest_rule(self, **fields: object) -> GuestAccessRule:
         rule = GuestAccessRule(**_base_fields(**fields))
@@ -98,6 +159,13 @@ class FakeGuestAccessRepository:
         for key, value in data.items():
             setattr(rule, key, value)
         return rule
+
+    async def delete_guest_rule(self, rule: GuestAccessRule) -> None:
+        # Soft delete, exactly as ``GuestAccessRepository`` does it -- the
+        # row (and the controller blocks pointing at it) has to survive to
+        # be released.
+        rule.is_deleted = True
+        rule.deleted_at = _now()
 
     async def commit(self) -> None:
         self.commits += 1
@@ -786,6 +854,11 @@ class TestRetryAndUnblock:
 
         assert rule.is_active is False
         assert len(fx.adapter.calls) == calls_after_block
+        # And nothing was written for a controller to hold either, so there
+        # is nothing for the release path to go looking for. This is the
+        # MikroTik half of the 2026-09-18 controller-block work: that change
+        # must be invisible here.
+        assert fx.repository.controller_blocks == []
 
     async def test_an_unblocked_guest_is_allowed_again_by_the_decision_path(
         self,

@@ -20,14 +20,19 @@ import uuid
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
 
-from .models import DeviceAccessRule, GuestAccessRule
+from .constants import BlockEnforcementStatus
+from .models import (
+    DeviceAccessRule,
+    GuestAccessControllerBlock,
+    GuestAccessRule,
+)
 from .validators import identifier_match_terms
 
 
@@ -134,6 +139,63 @@ class GuestAccessRepositoryProtocol(Protocol):
         now: datetime,
     ) -> list[DeviceAccessRule]: ...
 
+    # -- controller-side device blocks ---------------------------------------
+    async def record_controller_block(
+        self,
+        rule: GuestAccessRule,
+        *,
+        location_id: uuid.UUID,
+        mac_address: str,
+        **fields: object,
+    ) -> GuestAccessControllerBlock:
+        """One row per (rule, venue, device), created or updated in place.
+
+        Not append-only, deliberately. ``enforce_guest_rule`` is a retry an
+        operator reaches for when a controller was unreachable, and it
+        re-runs the whole enforcement -- so an insert-every-time table would
+        grow a row per click, and a release walking it would ask the same
+        controller to unblock the same MAC once per attempt. The question
+        this table answers is "what is this venue holding for this rule
+        right now", which has one answer per device.
+        """
+        ...
+
+    async def update_controller_block(
+        self, block: GuestAccessControllerBlock, data: dict[str, object]
+    ) -> GuestAccessControllerBlock: ...
+
+    async def list_open_controller_blocks(
+        self, *, rule_id: uuid.UUID
+    ) -> list[GuestAccessControllerBlock]:
+        """Blocks this platform still believes a controller is holding for
+        this rule.
+
+        "Open" is ``status == 'enforced' AND cleared_at IS NULL`` -- a
+        block the controller confirmed and nobody has released. Every other
+        row is a record of something that did not land, and asking a
+        controller to unblock a MAC it never blocked is a write with no
+        subject.
+        """
+        ...
+
+    async def list_open_controller_blocks_for_expired_rules(
+        self, *, now: datetime, limit: int
+    ) -> list[GuestAccessControllerBlock]:
+        """Open blocks whose rule has stopped applying -- expired,
+        deactivated or soft-deleted.
+
+        The sweep's whole query. It exists because a ``BLOCKLIST`` rule may
+        carry an ``expires_at`` (``validators.validate_rule_expiry`` allows
+        one on every rule type, and only *requires* one for ``TEMPORARY``),
+        and expiry on this platform is evaluated lazily at read time --
+        ``check_access`` simply stops matching the row. Nothing fires. That
+        is fine for a rule, which stops refusing the guest the moment it
+        lapses, and is not fine at all for a controller block, which is
+        durable state on somebody else's hardware: without this, a
+        time-bound block would silently become a permanent one.
+        """
+        ...
+
     # -- transaction -----------------------------------------------------------
     async def commit(self) -> None:
         """Commits the current transaction.
@@ -158,6 +220,7 @@ class GuestAccessRepository:
         self.session = session
         self.guest_rules = GenericRepository(GuestAccessRule, session)
         self.device_rules = GenericRepository(DeviceAccessRule, session)
+        self.controller_blocks = GenericRepository(GuestAccessControllerBlock, session)
 
     # -- guest rules -----------------------------------------------------------
 
@@ -174,6 +237,101 @@ class GuestAccessRepository:
 
     async def commit(self) -> None:
         await self.session.commit()
+
+    # -- controller-side device blocks -----------------------------------------
+
+    async def record_controller_block(
+        self,
+        rule: GuestAccessRule,
+        *,
+        location_id: uuid.UUID,
+        mac_address: str,
+        **fields: object,
+    ) -> GuestAccessControllerBlock:
+        """Upsert on (rule, venue, device), and attach a new row to the rule
+        in memory.
+
+        The in-memory append is not decoration. ``GuestAccessRuleResponse``
+        renders ``controller_blocks`` straight off the rule, and the rule
+        object the create endpoint is about to serialize is the one already
+        in this identity map -- so without it the operator who just blocked
+        somebody would get an empty per-device list back on the very
+        response that is supposed to tell them what happened to each device.
+        """
+        existing = await self.session.execute(
+            select(GuestAccessControllerBlock).where(
+                GuestAccessControllerBlock.rule_id == rule.id,
+                GuestAccessControllerBlock.location_id == location_id,
+                GuestAccessControllerBlock.mac_address == mac_address,
+                GuestAccessControllerBlock.is_deleted.is_(False),
+            )
+        )
+        current = existing.scalars().first()
+        if current is not None:
+            # A retry supersedes the previous attempt's answer, and clears
+            # any stale release failure with it: this row is once again a
+            # statement about a block that was just placed.
+            return await self.controller_blocks.update(
+                current, {**fields, "cleared_at": None, "release_error": None}
+            )
+        block = await self.controller_blocks.create(
+            {
+                **fields,
+                "rule_id": rule.id,
+                "location_id": location_id,
+                "mac_address": mac_address,
+            }
+        )
+        rule.controller_blocks.append(block)
+        return block
+
+    async def update_controller_block(
+        self, block: GuestAccessControllerBlock, data: dict[str, object]
+    ) -> GuestAccessControllerBlock:
+        return await self.controller_blocks.update(block, data)
+
+    async def list_open_controller_blocks(
+        self, *, rule_id: uuid.UUID
+    ) -> list[GuestAccessControllerBlock]:
+        statement = select(GuestAccessControllerBlock).where(
+            GuestAccessControllerBlock.rule_id == rule_id,
+            GuestAccessControllerBlock.status == BlockEnforcementStatus.ENFORCED.value,
+            GuestAccessControllerBlock.cleared_at.is_(None),
+            GuestAccessControllerBlock.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_open_controller_blocks_for_expired_rules(
+        self, *, now: datetime, limit: int
+    ) -> list[GuestAccessControllerBlock]:
+        statement = (
+            select(GuestAccessControllerBlock)
+            .join(
+                GuestAccessRule,
+                GuestAccessRule.id == GuestAccessControllerBlock.rule_id,
+            )
+            .where(
+                GuestAccessControllerBlock.status
+                == BlockEnforcementStatus.ENFORCED.value,
+                GuestAccessControllerBlock.cleared_at.is_(None),
+                GuestAccessControllerBlock.is_deleted.is_(False),
+                or_(
+                    GuestAccessRule.is_active.is_(False),
+                    GuestAccessRule.is_deleted.is_(True),
+                    and_(
+                        GuestAccessRule.expires_at.is_not(None),
+                        GuestAccessRule.expires_at <= now,
+                    ),
+                ),
+            )
+            # Oldest first: a block that has been stranded longest is the
+            # one a customer is most likely to be standing next to.
+            .order_by(GuestAccessControllerBlock.created_at.asc())
+            .limit(limit)
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def delete_guest_rule(self, rule: GuestAccessRule) -> None:
         await self.guest_rules.soft_delete(rule)
