@@ -12,7 +12,13 @@ from __future__ import annotations
 import random
 
 import pytest
-
+from omada_support import (
+    OMADAC_ID,
+    FakeOmadaController,
+    envelope,
+    make_creds,
+    no_sleep,
+)
 from wyfy_device_gateway.controller_contract import ControllerAuthMode
 from wyfy_device_gateway.omada.adapter import OmadaControllerAdapter
 from wyfy_device_gateway.omada.client_control import (
@@ -25,14 +31,6 @@ from wyfy_device_gateway.omada.client_control import (
 from wyfy_device_gateway.omada.errors import (
     OmadaClientNotFoundError,
     OmadaUnsupportedApiError,
-)
-
-from omada_support import (
-    OMADAC_ID,
-    FakeOmadaController,
-    envelope,
-    make_creds,
-    no_sleep,
 )
 
 SITE_ID = "site-abc123"
@@ -121,9 +119,18 @@ async def test_setting_a_rate_limit_patches_the_client_ratelimit_path():
     )
     assert controller.request_for("/ratelimit").method == "PATCH"
     body = controller.body_for("/ratelimit")
-    assert body["downUnit"] == UNIT_MBPS
-    assert body["downLimit"] == 10
-    assert body["upLimit"] == 2
+    # The Open API envelope, measured on 5.15.24.19: this endpoint takes
+    # `mode` + `customRateLimit`, NOT the flat object internal v2 takes at
+    # `PATCH .../clients/{mac}`. Sending v2's shape here answers
+    # `200 {"errorCode": -1001, "Invalid request parameters."}` -- an error
+    # inside a success status, which is why it read as a permissions problem
+    # for a day. Assert the envelope, not just the numbers inside it.
+    assert body["mode"] == 0
+    assert set(body) == {"mode", "customRateLimit"}
+    limits = body["customRateLimit"]
+    assert limits["downUnit"] == UNIT_MBPS
+    assert limits["downLimit"] == 10
+    assert limits["upLimit"] == 2
     assert applied.enabled is True
     assert applied.down_kbps == 10_000
 
@@ -142,8 +149,10 @@ async def test_clearing_a_rate_limit_sends_the_off_state():
         make_creds(), SITE_ID, CLIENT_MAC
     )
     body = controller.body_for("/ratelimit")
-    assert body["enable"] is False
-    assert body["downEnable"] is False and body["upEnable"] is False
+    assert body["mode"] == 0
+    limits = body["customRateLimit"]
+    assert limits["enable"] is False
+    assert limits["downEnable"] is False and limits["upEnable"] is False
     assert applied.enabled is False
     assert applied.down_kbps is None
 
@@ -189,7 +198,12 @@ async def test_a_mac_the_site_does_not_know_is_a_client_not_found_error():
 
 @pytest.mark.parametrize(
     "method",
-    ["set_client_rate_limit", "clear_client_rate_limit", "block_client", "unblock_client"],
+    [
+        "set_client_rate_limit",
+        "clear_client_rate_limit",
+        "block_client",
+        "unblock_client",
+    ],
 )
 async def test_a_hotspot_operator_credential_is_refused_before_any_request(method):
     """A ``legacy`` integration can do none of this, and the refusal happens
