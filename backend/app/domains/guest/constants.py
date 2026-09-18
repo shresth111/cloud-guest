@@ -864,7 +864,7 @@ class GuestSessionEndedReason(StrEnum):
     * the portal's own prose (``"guest tapped disconnect"``).
 
     So the mapping keys off ``GuestSessionStatus`` -- an enum this domain
-    owns -- and nothing else. Four members:
+    owns -- and nothing else. Five members:
 
     * ``TIMED_OUT`` -- ``EXPIRED``: ``enforce_session_timeouts`` swept the
       session because ``last_activity_at`` fell further behind than
@@ -882,6 +882,18 @@ class GuestSessionEndedReason(StrEnum):
       allowance. Distinct from ``TIMED_OUT`` because the two need
       opposite advice: one guest can sign straight back in, the other
       cannot until the period rolls over.
+    * ``DATA_LIMIT_REACHED`` -- ``EXPIRED`` carrying one of
+      ``service.FUP_DATA_QUOTA_DISCONNECT_REASONS``: ``record_usage``
+      expired the session because the guest has spent their
+      venue-configured daily/weekly/monthly *data* allowance. Shares
+      ``TIME_LIMIT_REACHED``'s consequence (``_enforce_fup_quota``
+      refuses the next login, so the portal offers no sign-in button)
+      and not its sentence: "you have used today's WiFi time" is simply
+      untrue of a guest who used ten minutes and two gigabytes. Added
+      when the dashboard's "Add a data limit" control was wired to the
+      FUP policy that enforcement actually reads -- before that, no
+      screen could produce this ending, and copy for an unreachable
+      state would have been a guess.
     * ``DISCONNECTED`` -- ``DISCONNECTED``: a normal, non-punitive end.
       The NAS reported an Accounting-Stop, the router rebooted
       (``close_sessions_for_nas_restart``), or the guest tapped
@@ -889,7 +901,7 @@ class GuestSessionEndedReason(StrEnum):
       that could split them is the free text above, and guessing a
       cause from it would be a confident lie rather than a message.
 
-    The two added members do not weaken the "no free text ever reaches a
+    The three added members do not weaken the "no free text ever reaches a
     guest" guarantee that the original two-member vocabulary was built
     on. Both are still *derived*: the mapping compares
     ``disconnect_reason`` against string literals written in this
@@ -907,6 +919,7 @@ class GuestSessionEndedReason(StrEnum):
     TIMED_OUT = "timed_out"
     IDLE_TIMED_OUT = "idle_timed_out"
     TIME_LIMIT_REACHED = "time_limit_reached"
+    DATA_LIMIT_REACHED = "data_limit_reached"
     DISCONNECTED = "disconnected"
 
 

@@ -650,12 +650,20 @@ class GuestLastEndedSessionResponse(BaseModel):
 
     What is left is safe on its own terms:
 
-    * ``reason`` is a closed two-member enum
-      (:class:`~.constants.GuestSessionEndedReason`) derived from
-      ``GuestSession.status``, never the ``disconnect_reason`` string. No
-      operator-, NAS- or guest-authored text can travel through it,
-      because the only values it can hold are the two written in this
-      repository's own source.
+    * ``reason`` is a closed, derived enum
+      (:class:`~.constants.GuestSessionEndedReason`), never the
+      ``disconnect_reason`` string. No operator-, NAS- or guest-authored
+      text can travel through it, because the only values it can hold are
+      the ones written in this repository's own source.
+
+      Deliberately no member count here. This sentence said "two-member"
+      and "the two" for two releases after the vocabulary had grown to
+      four, because a count restated in prose has no reader that can
+      check it. The pinned set lives in one place that fails when it is
+      wrong -- ``test_guest_last_ended_session``'s own
+      ``test_the_reason_is_one_of_five_closed_values`` -- and the
+      guarantee this bullet exists to state is about derivation, which
+      does not change when a member is added.
     * ``session_timeout_minutes`` is venue policy, not guest data: every
       guest at a location gets the same number, so it tells a stranger
       nothing about the guest. It earns its place because it is what

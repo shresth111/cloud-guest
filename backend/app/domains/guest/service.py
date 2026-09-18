@@ -2069,7 +2069,7 @@ class GuestLoginResult:
 #: Matched exactly, never by prefix or substring: the other ``EXPIRED``
 #: reasons (``data_limit_exceeded``, ``fup_data_quota_exceeded_daily``,
 #: ...) are quota exhaustion, which is a different thing to tell a guest
-#: and is deliberately not told to them here at all.
+#: and has its own mapping (see ``FUP_DATA_QUOTA_DISCONNECT_REASONS``).
 SESSION_TIMEOUT_DISCONNECT_REASON = "inactivity_timeout"
 
 #: The sibling literal ``enforce_session_timeouts`` writes instead, for a
@@ -2160,6 +2160,38 @@ FUP_TIME_QUOTA_DISCONNECT_REASONS = frozenset(
     f"fup_time_quota_exceeded_{period.value}" for period in QuotaPeriodType
 )
 
+#: The exact ``disconnect_reason`` literals ``record_usage`` writes when a
+#: guest has spent their venue-configured *data* allowance for a period.
+#: Built from ``QuotaPeriodType``, matched by membership and never by
+#: prefix, for the identical reasons its time-quota sibling directly above
+#: is -- the two stems differ by one word and mean opposite things.
+#:
+#: These three used to map to nothing: a guest cut off by a data cap was
+#: shown the ordinary sign-in page and told why by no one. That was the
+#: right answer for as long as its premise held -- no screen on this
+#: platform could set a data cap, so the only way to have one was to POST
+#: an FUP policy by hand, and inventing guest copy for a state nobody could
+#: reach would have been speculation. The premise stopped holding when the
+#: dashboard's "Add a data limit" control started writing this policy.
+#:
+#: They do not join ``TIMED_OUT``, and they do not join
+#: ``TIME_LIMIT_REACHED`` either. A guest who has used the day's data has
+#: not used the day's *time*, and "you've used today's WiFi time" is the
+#: wrong sentence to hand someone who was watching a video for ten minutes.
+#: What the two endings share is the part that matters operationally --
+#: ``_enforce_fup_quota`` refuses the next login for both -- which is why
+#: the portal suppresses its sign-in button for both.
+#:
+#: ``data_limit_exceeded`` is deliberately NOT in this set. That is the
+#: per-session allowance copied off a redeemed voucher batch
+#: (``GuestSession.data_limit_mb``), not a guest-level FUP cap: nothing
+#: refuses that guest's next login, so telling them an allowance is spent
+#: and hiding the sign-in button would be false in the one direction that
+#: strands somebody.
+FUP_DATA_QUOTA_DISCONNECT_REASONS = frozenset(
+    f"fup_data_quota_exceeded_{period.value}" for period in QuotaPeriodType
+)
+
 #: Which ``FUPPolicyRules`` field carries each period's connected-time cap.
 #: Module scope so ``run_fup_time_accrual`` does not rebuild it once per
 #: guest, and so the mapping is stated once rather than spelled out at each
@@ -2229,6 +2261,13 @@ def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | No
         # again" would send them round a loop that refuses them.
         if session.disconnect_reason in FUP_TIME_QUOTA_DISCONNECT_REASONS:
             return GuestSessionEndedReason.TIME_LIMIT_REACHED
+        # The venue's daily/weekly/monthly DATA allowance, spent. Its own
+        # member rather than a fifth caller of TIME_LIMIT_REACHED: the
+        # advice is the same (do not offer a sign-in that will be refused)
+        # but the sentence is not, and the sentence is the whole product
+        # here. See FUP_DATA_QUOTA_DISCONNECT_REASONS.
+        if session.disconnect_reason in FUP_DATA_QUOTA_DISCONNECT_REASONS:
+            return GuestSessionEndedReason.DATA_LIMIT_REACHED
     return None
 
 
@@ -5487,6 +5526,10 @@ class GuestService:
         violated_fup_period = await self._track_fup_data_usage(
             guest_id=updated.guest_id,
             organization_id=updated.organization_id,
+            # The session's own location, not ``None``. See
+            # ``_track_fup_data_usage``'s own docstring for the third
+            # sighting of this defect and why it is the half that bites.
+            location_id=updated.location_id,
             delta_bytes=total_delta_bytes,
             now=now,
         )
@@ -6500,6 +6543,7 @@ class GuestService:
         *,
         guest_id: uuid.UUID,
         organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
         delta_bytes: int,
         now: datetime,
     ) -> str | None:
@@ -6519,7 +6563,29 @@ class GuestService:
         addition on top of that, not a replacement for it. Returns the
         ``period_type`` value of a data cap this bump just pushed the
         guest's usage to meet or exceed (letting ``record_usage`` decide
-        whether to expire the session), or ``None``."""
+        whether to expire the session), or ``None``.
+
+        ## Resolution passes the session's real location, and used not to
+
+        This resolved with a hardcoded ``location_id=None`` -- the third
+        sighting of the identical defect ``_enforce_fup_quota`` and
+        ``run_fup_time_accrual`` each document in their own docstrings.
+        ``repository.list_candidate_assignments`` only adds its
+        LOCATION-scope predicate when a real ``location_id`` arrives, so a
+        ``PolicyAssignment`` with ``scope_type=location`` on an FUP policy
+        was never a candidate here.
+
+        LOCATION is the only scope the dashboard's Guest WiFi Limits screen
+        can produce, so for a venue that sets a data cap there this was not
+        an edge case, it was the whole feature. And this is the half that
+        bites: ``_enforce_fup_quota`` only gates the *next* login, so a cap
+        resolved there and not here would let a guest keep browsing on the
+        session they already hold until they happened to sign in again --
+        a limit that looks live on the screen and never ends anybody's
+        session. ``GuestSession.location_id`` is non-nullable, so the real
+        value is always available; the parameter keeps a ``None`` default
+        only so a caller that genuinely has no location degrades to
+        organization-scope resolution rather than failing."""
         if self.policy_lookup is None or delta_bytes <= 0:
             return None
         try:
@@ -6527,7 +6593,7 @@ class GuestService:
             resolved = await self.policy_lookup.resolve_effective_policy(
                 policy_type=PolicyType.FUP,
                 organization_id=organization_id,
-                location_id=None,
+                location_id=location_id,
                 guest_id=guest_id,
             )
             data_limits = {
