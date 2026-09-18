@@ -950,3 +950,48 @@ class TestLegacySpellingRules:
         assert enforced.sessions_ended == 0
         assert fx.adapter.active_users == {fx.identifier}
         assert fx.session_lookup.sessions[fx.guest_id][0].status == ACTIVE
+
+
+class TestTheDependencyActuallyConstructs:
+    """The wiring itself, because the wiring is what broke.
+
+    ``get_block_enforcer`` passed ``controller_terminator=`` to
+    ``BlocklistEnforcer``, which did not accept it. Every route that
+    reaches this dependency -- block, unblock, and the whole
+    ``guest_access`` write surface, at **every** venue, MikroTik included
+    -- answered ``500 TypeError`` in production, on an image whose full
+    suite was green.
+
+    It was green because nothing in this suite ever called the factory:
+    each test above constructs ``BlocklistEnforcer`` by hand with
+    hand-picked arguments, which is exactly the reading that cannot see a
+    mismatch between the constructor and its only real caller. The
+    argument list is the contract, and it was tested on one side only.
+    """
+
+    def test_get_block_enforcer_builds_a_real_enforcer(self) -> None:
+        from app.domains.guest_access.dependencies import get_block_enforcer
+
+        enforcer = get_block_enforcer(db=object(), router_service=object())
+
+        assert isinstance(enforcer, BlocklistEnforcer)
+
+    def test_the_controller_terminator_reaches_the_terminator_that_uses_it(
+        self,
+    ) -> None:
+        """Constructing is not enough: the hook has to arrive where the
+        device work happens. ``BlocklistEnforcer`` does none itself -- it
+        delegates to ``LiveSessionTerminator`` -- so a version that
+        accepted the argument and dropped it would construct fine, pass
+        the test above, and still leave a controller venue unable to end
+        anything."""
+        sentinel = object()
+
+        enforcer = BlocklistEnforcer(
+            session_lookup=object(),
+            router_lookup=object(),
+            terminated_session_status=TERMINATED,
+            controller_terminator=sentinel,
+        )
+
+        assert enforcer.terminator.controller_terminator is sentinel

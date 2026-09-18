@@ -242,7 +242,6 @@ class DeviceLookupProtocol(Protocol):
     ) -> BlockedDeviceRow | None: ...
 
 
-
 # ============================================================================
 # Result
 # ============================================================================
@@ -496,6 +495,7 @@ class BlocklistEnforcer:
         router_lookup: RouterLookupProtocol,
         terminated_session_status: str,
         adapter_factory: object = None,
+        controller_terminator: ControllerSessionTerminatorProtocol | None = None,
     ) -> None:
         self.session_lookup = session_lookup
         self.router_lookup = router_lookup
@@ -505,10 +505,17 @@ class BlocklistEnforcer:
         self._adapter_factory = adapter_factory or get_guest_access_adapter
         # ``session_lookup`` is a ``GuestRepository``, which satisfies
         # ``DeviceLookupProtocol`` as well -- see that Protocol's own note.
+        #
+        # ``controller_terminator`` is accepted here only to hand down: this
+        # class does no device work itself, it delegates every session end to
+        # the terminator below. Without the pass-through, blocking a guest at
+        # a controller-managed venue would reach `end_on_router` with no way
+        # to end anything, which is the state that shipped and 500'd.
         self.terminator = LiveSessionTerminator(
             router_lookup=router_lookup,
             device_lookup=session_lookup,
             adapter_factory=adapter_factory,
+            controller_terminator=controller_terminator,
         )
 
     async def enforce(
