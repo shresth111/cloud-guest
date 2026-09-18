@@ -433,8 +433,21 @@ def _build_session_terminator(session: AsyncSession, repository: GuestRepository
     router_service = RouterService(
         RouterRepository(session), organization_service, location_service
     )
+    from app.domains.network_integration.client_hooks import (
+        build_controller_session_terminator,
+    )
+
     return LiveSessionTerminator(
-        router_lookup=router_service, device_lookup=repository
+        router_lookup=router_service,
+        device_lookup=repository,
+        # The controller half, and the reason session timeout means anything
+        # at an Omada venue. That controller honours no RADIUS
+        # ``Session-Timeout`` -- its own API specification contains no
+        # occurrence of the attribute -- so unlike a RouterOS venue, where the
+        # reply attribute makes the NAS end the session itself, *this sweep is
+        # the only thing that ever ends a session there*. Without this line it
+        # would expire the row and leave the guest online.
+        controller_terminator=build_controller_session_terminator(session),
     )
 
 

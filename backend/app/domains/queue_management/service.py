@@ -78,6 +78,7 @@ from app.domains.rbac.location_scope import (
 )
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_controller_managed
 
 from .constants import (
     APPLICABLE_QUEUE_STATUSES,
@@ -91,6 +92,7 @@ from .constants import (
 )
 from .device_adapters import QueueCredentials, get_queue_adapter
 from .exceptions import (
+    ControllerQueueUnavailableError,
     CrossOrganizationQueueAccessError,
     QueueAssignmentNotApplicableError,
     QueueAssignmentNotFoundError,
@@ -110,6 +112,36 @@ _SYSTEM_UNLIMITED_PROFILE_NAME = "Unlimited"
 # ============================================================================
 # Narrow cross-domain protocols (composition, not duplication)
 # ============================================================================
+
+
+class ControllerSpeedHookProtocol(Protocol):
+    """Setting and clearing one client's speed limit on a vendor controller.
+
+    Injected rather than imported: ``network_integration`` composes this
+    domain's service through its own dependency chain, so the module-level
+    import edge runs one way only. Satisfied structurally by
+    ``network_integration.service.NetworkIntegrationService``.
+    """
+
+    async def set_client_speed(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        down_kbps: int | None,
+        up_kbps: int | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> object: ...
+
+    async def clear_client_speed(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> object: ...
 
 
 class RouterLookupProtocol(Protocol):
@@ -177,12 +209,19 @@ class QueueManagementService:
         audit_writer: AuditLogWriter | None = None,
         device_adapter_resolver=get_queue_adapter,
         caller_location_scope: LocationScope = None,
+        controller_speed_hook: ControllerSpeedHookProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.policy_lookup = policy_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
+        # How a speed limit reaches a venue whose network is run from a
+        # vendor controller rather than from a device this platform logs in
+        # to. ``None`` is a real value -- a deployment or a test without the
+        # network-integration domain wired -- and produces a refusal that
+        # names the situation, never a silent success.
+        self.controller_speed_hook = controller_speed_hook
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
 
@@ -510,13 +549,27 @@ class QueueManagementService:
             router = await self.router_lookup.get_router(
                 router_id, requesting_organization_id=requesting_organization_id
             )
-            # Refused here, before a row exists. The adapter registry below would
-            # decline this vendor eventually -- but only on a later `push`, after
-            # this method has returned 201 and the venue has been shown a saved
-            # setting that will never reach any device. See
-            # `app.domains.router.device_domain_gate` for why the message is
-            # written for the venue rather than for the registry.
-            ensure_not_controller_managed(router, feature="Speed Limits")
+            # Refused here, before a row exists -- *unless* this platform can
+            # actually reach the controller, which it now can for a per-client
+            # speed limit.
+            #
+            # The gate's original reasoning still holds for every venue it
+            # still refuses: the adapter registry would decline the vendor
+            # eventually, but only on a later `push`, after this method had
+            # returned 201 and shown the venue a saved setting that would
+            # never reach a device. See `app.domains.router
+            # .device_domain_gate` for why the message is written for the
+            # venue rather than for the registry.
+            #
+            # What changed is only whether the premise is true. With
+            # `controller_speed_hook` wired, `apply_queue` sends this profile's
+            # rates to the controller's own per-client rate limit, so the row
+            # this method writes *is* backed by a real device write and the
+            # refusal would now be the false statement. Without the hook the
+            # premise is unchanged and so is the refusal -- which is why this
+            # is gated on the hook rather than on the vendor.
+            if self.controller_speed_hook is None:
+                ensure_not_controller_managed(router, feature="Speed Limits")
             organization_id = router.organization_id
             resolved_location_id = resolved_location_id or router.location_id
 
@@ -711,6 +764,28 @@ class QueueManagementService:
         router = await self.router_lookup.get_router(
             assignment.router_id, requesting_organization_id=requesting_organization_id
         )
+
+        # The vendor question is asked before the credential question, and
+        # the ordering is the point. A controller-managed row has no host,
+        # no API username and no secret by construction, so resolving
+        # credentials first made an Omada venue fail with "this router is
+        # missing device connection credentials" -- a sentence that asks the
+        # operator to supply something that does not exist and never will.
+        # ``router.device_domain_gate``'s module docstring names this exact
+        # shape in seven domains; this is one of them.
+        #
+        # The RouterOS path below is untouched: same credentials, same
+        # adapter, same `/queue simple` calls, same order, one branch later.
+        if is_controller_managed(router):
+            return await self._apply_queue_on_controller(
+                assignment,
+                profile,
+                router,
+                actor_user_id=actor_user_id,
+                requesting_organization_id=requesting_organization_id,
+                current=current,
+            )
+
         credentials = self._resolve_device_credentials(router)
         adapter = self._get_device_adapter(router.vendor)
 
@@ -787,11 +862,26 @@ class QueueManagementService:
                 assignment.router_id,
                 requesting_organization_id=requesting_organization_id,
             )
-            credentials = self._resolve_device_credentials(router)
-            adapter = self._get_device_adapter(router.vendor)
-            await adapter.remove_queue(
-                credentials, device_queue_id=assignment.device_queue_id
-            )
+            if is_controller_managed(router):
+                # Same ordering fix as ``apply_queue``. Clearing the limit
+                # rather than deleting a queue row: on a controller the limit
+                # is a field on the client's own record, so there is no object
+                # to remove -- which is also why a controller venue is immune
+                # to the accumulating ``/queue simple`` rows that RouterOS
+                # venues need ``_retire_superseded_assignments`` for.
+                await self._controller_speed(
+                    router,
+                    assignment=assignment,
+                    requesting_organization_id=requesting_organization_id,
+                    actor_user_id=actor_user_id,
+                    clear=True,
+                )
+            else:
+                credentials = self._resolve_device_credentials(router)
+                adapter = self._get_device_adapter(router.vendor)
+                await adapter.remove_queue(
+                    credentials, device_queue_id=assignment.device_queue_id
+                )
 
         validate_status_transition(current=current, target=QueueStatus.DISABLED)
         updated = await self.repository.update_assignment(
@@ -808,6 +898,122 @@ class QueueManagementService:
             organization_id=updated.organization_id,
             entity_id=updated.id,
             description=f"Queue assignment {updated.id} removed from device",
+        )
+        return updated
+
+    #: The ``device_queue_id`` written for a controller-managed assignment.
+    #: A marker rather than an id, because there is no object on the
+    #: controller to hold one: the limit is a field on the client's own
+    #: record. Prefixed so nothing mistakes it for a RouterOS queue id and
+    #: tries to address ``/queue simple`` with it.
+    CONTROLLER_QUEUE_MARKER = "controller:client-rate-limit"
+
+    async def _controller_speed(
+        self,
+        router: Router,
+        *,
+        assignment: QueueAssignment,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+        clear: bool,
+        download_rate_kbps: int = 0,
+        upload_rate_kbps: int = 0,
+    ) -> None:
+        """Push (or clear) one client's limit through the controller.
+
+        Raises rather than degrading. A speed limit that this platform
+        recorded and the venue never received is precisely the silent success
+        this work was commissioned to prevent, so an unwired hook, a venue
+        with no location, an assignment that names no device, and a
+        controller that refuses are all loud -- and ``apply_queue``'s
+        existing ``except`` writes the message onto the assignment row before
+        re-raising, so the failure is visible on the record too.
+        """
+        if self.controller_speed_hook is None:
+            raise ControllerQueueUnavailableError(router.id)
+        location_id = getattr(router, "location_id", None)
+        client_mac = assignment.device_target
+        if location_id is None or not client_mac:
+            raise ControllerQueueUnavailableError(router.id)
+        if clear:
+            await self.controller_speed_hook.clear_client_speed(
+                location_id=location_id,
+                organization_id=requesting_organization_id,
+                client_mac=client_mac,
+                actor_user_id=actor_user_id,
+            )
+            return
+        await self.controller_speed_hook.set_client_speed(
+            location_id=location_id,
+            organization_id=requesting_organization_id,
+            client_mac=client_mac,
+            # ``0`` is this platform's "unlimited" (RouterOS `max-limit`
+            # semantics), and the controller has no encoding for an enabled
+            # limit of zero -- so it is passed through as ``None``, which the
+            # provider reads as "do not limit that direction".
+            down_kbps=download_rate_kbps or None,
+            up_kbps=upload_rate_kbps or None,
+            actor_user_id=actor_user_id,
+        )
+
+    async def _apply_queue_on_controller(
+        self,
+        assignment: QueueAssignment,
+        profile: QueueProfile,
+        router: Router,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        current: QueueStatus,
+    ) -> QueueAssignment:
+        """``apply_queue`` for a venue reached through its controller.
+
+        The same ``QueueProfile`` and the same rates -- there is deliberately
+        no Omada-only speed model. What differs is only how the numbers get
+        there: a controller takes a per-client write against the client
+        record, where RouterOS takes a ``/queue simple`` row, and the profile
+        is the same object in both cases.
+
+        Burst and priority are **not** sent, and their absence is not an
+        oversight. The controller's per-client limit is a plain ceiling: it
+        has no burst vocabulary and no priority field, so a profile carrying
+        those is applied for its rates alone. Saying so here rather than
+        quietly dropping them is the difference between a documented
+        limitation and a lie about what the venue is enforcing.
+        """
+        try:
+            await self._controller_speed(
+                router,
+                assignment=assignment,
+                requesting_organization_id=requesting_organization_id,
+                actor_user_id=actor_user_id,
+                clear=False,
+                download_rate_kbps=profile.download_rate_kbps,
+                upload_rate_kbps=profile.upload_rate_kbps,
+            )
+        except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised
+            await self.repository.update_assignment(
+                assignment, {"error_message": str(exc)}
+            )
+            raise
+
+        validate_status_transition(current=current, target=QueueStatus.ACTIVE)
+        updated = await self.repository.update_assignment(
+            assignment,
+            {
+                "status": QueueStatus.ACTIVE.value,
+                "device_queue_id": self.CONTROLLER_QUEUE_MARKER,
+                "applied_at": datetime.now(UTC),
+                "error_message": None,
+                "updated_by": actor_user_id,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.QUEUE_APPLIED,
+            organization_id=updated.organization_id,
+            entity_id=updated.id,
+            description=f"Queue assignment {updated.id} applied via controller",
         )
         return updated
 

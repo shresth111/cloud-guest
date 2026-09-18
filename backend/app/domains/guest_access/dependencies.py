@@ -85,10 +85,21 @@ def get_block_enforcer(
     ``SessionTerminationCooldownError`` enforces, which is the correct
     behaviour for someone who was just blocked.
     """
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_session_terminator,
+    )
+
     return BlocklistEnforcer(
         session_lookup=GuestRepository(db),
         router_lookup=router_service,
         terminated_session_status=GuestSessionStatus.TERMINATED.value,
+        # Imported inside the function, not at module scope, for the same
+        # cycle this module's GuestRepository note describes one paragraph
+        # up: network_integration.dependencies imports
+        # guest.dependencies, which imports this module. Bound to the
+        # request's own session, so a controller disconnect and the session
+        # rows it accompanies commit together.
+        controller_terminator=build_controller_session_terminator(db),
     )
 
 

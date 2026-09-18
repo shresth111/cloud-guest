@@ -41,6 +41,7 @@ def get_queue_management_repository(
 
 
 def get_queue_management_service(
+    db: AsyncSession = Depends(get_db_session),
     repository: QueueManagementRepositoryProtocol = Depends(
         get_queue_management_repository
     ),
@@ -49,12 +50,24 @@ def get_queue_management_service(
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> QueueManagementService:
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
     return QueueManagementService(
         repository,
         router_service,
         policy_service,
         audit_writer=audit_repository,
         caller_location_scope=caller_location_scope,
+        # How a speed profile reaches a venue run from a controller.
+        #
+        # A narrow, session-bound hook rather than `NetworkIntegrationService`
+        # -- and not for tidiness. That service composes `GuestService`, which
+        # composes *this* service, so injecting it here would recurse while
+        # being constructed. The hook holds a session and nothing else.
+        # Imported inside the function for the matching import-time reason.
+        controller_speed_hook=build_controller_speed_hook(db),
     )
 
 

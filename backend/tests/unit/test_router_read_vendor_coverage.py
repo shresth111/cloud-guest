@@ -392,6 +392,19 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "Every integration row it returns genuinely belongs (the caller's own "
         "Omada integration for their own location)."
     ),
+    "app/domains/network_integration/repository.py::"
+    "NetworkIntegrationRepository.get_omada_integration_for_location": (
+        "The auth-mode-agnostic sibling of the read above, and joined to "
+        "Router for the same single reason: to resolve `Router.location_id` "
+        "as a filter key. It returns a `NetworkIntegration` row, not a "
+        "router, and is narrowed to `provider == omada` in the WHERE, so it "
+        "is vendor-scoped by construction and a controller row is precisely "
+        "what it must reach. It deliberately does NOT filter on auth_mode: "
+        "the client-management surface has to be able to tell a venue that "
+        "its hotspot-operator login cannot do this, and it cannot say that "
+        "if a legacy integration is invisible to the query and the venue "
+        "reads as having no controller at all."
+    ),
     # -- the router domain's own accessors (names) -------------------------
     "app/domains/router/repository.py::RouterRepository.names_for_routers": (
         "Resolves a page of router ids the caller already holds to their "

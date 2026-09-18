@@ -70,14 +70,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from app.domains.router.vendor_capabilities import is_controller_managed
+
 from .device_adapters import (
     BaseGuestAccessAdapter,
     GuestAccessCredentials,
+    SessionControlSnapshot,
     SessionEndOutcome,
     get_guest_access_adapter,
 )
 from .exceptions import (
     BlockEnforcementMissingCredentialsError,
+    ControllerSessionTerminationUnavailableError,
     RouterHasNoHotspotError,
     SessionStillActiveOnDeviceError,
 )
@@ -164,6 +168,10 @@ class BlockRouterRow(Protocol):
     api_username: str | None
     management_ip_address: str | None
     public_ip_address: str | None
+    #: Read only on the controller-managed path, where the session is ended
+    #: by location rather than by a connection to this row -- a synthetic
+    #: controller row has no host or credentials to connect to at all.
+    location_id: uuid.UUID | None
 
 
 class RouterLookupProtocol(Protocol):
@@ -186,6 +194,38 @@ class RouterLookupProtocol(Protocol):
     ) -> BlockRouterRow: ...
 
     def get_decrypted_api_secret(self, router: BlockRouterRow) -> str | None: ...
+
+
+class ControllerSessionTerminatorProtocol(Protocol):
+    """Ending a session on a venue whose network is run from a vendor
+    controller rather than from a device this platform logs in to.
+
+    Injected as a value rather than imported, for the reason this module's
+    docstring gives about ``app.domains.guest``: ``guest_access`` may not
+    depend on ``app.domains.network_integration`` at import time -- that
+    domain's own wiring imports ``guest.dependencies``, so the edge only runs
+    one way. The wiring layer supplies a callable built by
+    ``network_integration.client_hooks
+    .build_controller_session_terminator``, and this module never learns
+    which vendor is behind it.
+
+    Deliberately a plain callable rather than a service handle. The service
+    that owns this capability already holds the ``LiveSessionTerminator``
+    itself, so handing the terminator the service would close an object cycle
+    as well as an import one; a bound function closes neither.
+
+    ``None`` is a legitimate value: a deployment without the network
+    integration domain wired, or a test. That is reported as a refusal
+    naming the vendor, never as a silent success.
+    """
+
+    async def __call__(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+    ) -> bool: ...
 
 
 class DeviceLookupProtocol(Protocol):
@@ -266,10 +306,12 @@ class LiveSessionTerminator:
         router_lookup: RouterLookupProtocol,
         device_lookup: DeviceLookupProtocol,
         adapter_factory: object = None,
+        controller_terminator: ControllerSessionTerminatorProtocol | None = None,
     ) -> None:
         self.router_lookup = router_lookup
         self.device_lookup = device_lookup
         self._adapter_factory = adapter_factory or get_guest_access_adapter
+        self.controller_terminator = controller_terminator
 
     async def end_on_router(
         self,
@@ -297,6 +339,30 @@ class LiveSessionTerminator:
         router = await self.router_lookup.get_router(
             session.router_id, requesting_organization_id=organization_id
         )
+
+        # The vendor question is asked FIRST, and the ordering is the fix.
+        #
+        # This used to resolve device credentials before resolving the
+        # adapter. A controller-managed row -- the synthetic ``Router`` an
+        # Omada integration creates for its fleet -- has no host, no API
+        # username and no secret by construction, so it failed on the
+        # credential line and a venue admin blocking a guest got
+        # ``BlockEnforcementMissingCredentialsError``: *"missing device
+        # connection credentials"*, a 400 that reads as "add some and retry".
+        # There is nothing to add. The truth is that this vendor is reached
+        # another way, and nobody could learn that from the error.
+        #
+        # Exactly the failure ``router.device_domain_gate``'s module docstring
+        # describes -- "every one of the seven services resolves device
+        # credentials exactly one line before it resolves the adapter" -- and
+        # this is the eighth. Asking the vendor first costs nothing on the
+        # MikroTik path, which reaches the same two lines in the same order
+        # one branch later, with the same adapter and the same credentials.
+        if is_controller_managed(router):
+            return await self._end_on_controller(
+                router, identifier=identifier, organization_id=organization_id
+            )
+
         credentials = self._resolve_device_credentials(router)
         adapter: BaseGuestAccessAdapter = self._adapter_factory(router.vendor)
 
@@ -316,6 +382,71 @@ class LiveSessionTerminator:
                 coa_port=outcome.control.coa_port,
             )
         return outcome
+
+    async def _end_on_controller(
+        self,
+        router: BlockRouterRow,
+        *,
+        identifier: str,
+        organization_id: uuid.UUID | None,
+    ) -> SessionEndOutcome:
+        """End the session through the venue's controller instead of through
+        a connection to this row.
+
+        Reached only for a controller-managed router, where there is no host
+        to open a socket to. The controller is asked to drop the client, and
+        the outcome is reported in the same shape the RouterOS path reports,
+        so every caller above is unchanged.
+
+        **The snapshot's two numbers are claims, so here is what each one
+        claims.** ``hotspot_servers=1`` says this venue runs captive-portal
+        guest access -- which it does, through the controller's own portal;
+        the caller reads it only to tell "this device runs no hotspot at all"
+        apart from "the guest was not online", and the first is false here.
+        ``coa_accept=False`` says this platform will not end the session by
+        RFC 5176 Disconnect-Request, which is true and is not a statement
+        about the controller: the controller does listen on 3799, but the
+        packet has to reach *into* the venue's NAT and no such route exists,
+        so nothing here sends one.
+
+        **What this achieves, exactly.** The controller ends the client's
+        authorization: the device stops being forwarded now. It does not
+        prevent the person signing in again -- the platform's own blocklist
+        is what does that, it is vendor-neutral, and it is consulted at every
+        login and by the RADIUS authorize path. So a block enforced here is
+        as real as a block enforced on RouterOS, by the same two halves.
+        """
+        if self.controller_terminator is None:
+            raise ControllerSessionTerminationUnavailableError(router.id)
+        location_id = getattr(router, "location_id", None)
+        if location_id is None:
+            raise ControllerSessionTerminationUnavailableError(router.id)
+        ended = await self.controller_terminator(
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=identifier,
+        )
+        if not ended:
+            # The controller was never reached, or this identifier is not
+            # something a controller can be addressed with. Either way the
+            # guest may still be online, and the caller must be able to say
+            # so: `BlocklistEnforcer` refuses a block it did not enforce, and
+            # `issue_live_disconnect` records `enforcement_delivered: False`.
+            # Reporting success here is the exact falsehood this whole module
+            # was written to remove.
+            raise ControllerSessionTerminationUnavailableError(router.id)
+        return SessionEndOutcome(
+            control=SessionControlSnapshot(
+                hotspot_servers=1, coa_accept=False, coa_port=None
+            ),
+            matched=1,
+            removed=1,
+            # The controller's disconnect either succeeded or raised -- there
+            # is no partial outcome to report, and `disconnect_client_at_
+            # location` raises on a controller failure rather than returning
+            # a quiet False. So reaching this line means the session ended.
+            still_active=0,
+        )
 
     async def _session_mac_address(self, session: LiveSessionRow) -> str | None:
         """The MAC the guest is on, when this platform knows it.

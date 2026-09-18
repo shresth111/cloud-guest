@@ -89,6 +89,23 @@ def get_shared_quota_resolver(
     return SharedQuotaResolver(GuestTeamRepository(db), guest_repository)
 
 
+def _controller_session_terminator(db: AsyncSession):
+    """The controller half of a session end, bound to this request's session.
+
+    A function rather than a module-level import because the import edge runs
+    one way: ``network_integration.dependencies`` imports this module (it
+    composes ``GuestService`` to end the platform-side session after a
+    controller disconnect), so importing it back at module scope is a cycle.
+    The same reason ``app.domains.guest_access.dependencies`` gives for
+    constructing ``GuestRepository`` itself.
+    """
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_session_terminator,
+    )
+
+    return build_controller_session_terminator(db)
+
+
 def get_guest_service(
     repository: GuestRepositoryProtocol = Depends(get_guest_repository),
     otp_service: OtpService = Depends(get_otp_service),
@@ -108,6 +125,7 @@ def get_guest_service(
     team_quota_resolver: SharedQuotaResolver = Depends(get_shared_quota_resolver),
     redis: Redis = Depends(get_redis_client),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
+    db: AsyncSession = Depends(get_db_session),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
     ``GuestService``'s optional ``monitoring_hook`` (see that class's own
@@ -190,7 +208,15 @@ def get_guest_service(
         queue_assignment_hook=queue_management_service,
         queue_assignment_dispatcher=enqueue_guest_queue_assignment,
         session_end_hook=LiveSessionTerminator(
-            router_lookup=router_service, device_lookup=repository
+            router_lookup=router_service,
+            device_lookup=repository,
+            # The controller half. Without it a session ending at an Omada
+            # venue -- a timeout sweep, a data cap, an operator's Terminate --
+            # moves a row here and leaves the guest online, which is the exact
+            # bug the RouterOS half of this hook exists to close. Imported
+            # inside the function: network_integration.dependencies
+            # imports this module, so the module-level edge only runs one way.
+            controller_terminator=_controller_session_terminator(db),
         ),
         policy_lookup=policy_service,
         mac_authorization_hook=mac_authorization_service,

@@ -109,6 +109,10 @@ class NetworkIntegrationRepositoryProtocol(Protocol):
         self, *, location_id: uuid.UUID, organization_id: uuid.UUID
     ) -> NetworkIntegration | None: ...
 
+    async def get_omada_integration_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None: ...
+
     async def list_live_integrations_on_controller_site(
         self,
         *,
@@ -282,6 +286,44 @@ class NetworkIntegrationRepository:
                 NetworkIntegration.provider == NetworkProviderKind.OMADA.value,
                 NetworkIntegration.auth_mode == ControllerAuthMode.OPENAPI.value,
                 NetworkIntegration.external_site_id.is_not(None),
+            )
+            .order_by(NetworkIntegration.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(statement)).scalars().first()
+
+    async def get_omada_integration_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None:
+        """The one live Omada integration serving a customer's own location,
+        **whatever its auth mode**.
+
+        The sibling of ``get_omada_openapi_integration_for_location`` and
+        tenant-scoped in exactly the same way -- the organization and the
+        location are both in the WHERE clause, so a location id belonging to
+        another tenant is simply not found rather than read and then refused.
+        That is what makes "not yours" and "does not exist" the same answer
+        here, which is the property this codebase's path-id defect class keeps
+        breaking.
+
+        The auth-mode filter is dropped on purpose, and it is the whole reason
+        this second method exists. The client-management surface must be able
+        to tell a venue "your controller is connected with a hotspot operator
+        login, which cannot do this" -- and it cannot say that if a ``legacy``
+        integration is invisible to the query and the venue reads as having no
+        controller at all. Those are different facts and a venue owner acts on
+        them differently.
+        """
+        from app.domains.router.models import Router
+
+        statement = (
+            self._live()
+            .join(Router, Router.id == NetworkIntegration.router_id)
+            .where(
+                Router.location_id == location_id,
+                NetworkIntegration.organization_id == organization_id,
+                NetworkIntegration.is_enabled.is_(True),
+                NetworkIntegration.provider == NetworkProviderKind.OMADA.value,
             )
             .order_by(NetworkIntegration.created_at.desc())
             .limit(1)
