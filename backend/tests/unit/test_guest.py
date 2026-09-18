@@ -6056,9 +6056,28 @@ class TestRecordUsageFupTracking:
 
         ended: list[str] = []
 
+        from app.domains.guest_access.device_adapters import (
+            SessionControlSnapshot,
+            SessionEndOutcome,
+        )
+
         class _SpyTerminator:
+            """Returns what the real ``LiveSessionTerminator`` returns -- a
+            ``SessionEndOutcome`` reporting the row it removed. A spy that
+            returned ``None`` would no longer make ``disconnect_enforced``
+            true, and correctly so: that column records a removal the device
+            reported, not the absence of an exception."""
+
             async def end_on_router(self, *, session, identifier, organization_id=None):
                 ended.append(identifier)
+                return SessionEndOutcome(
+                    control=SessionControlSnapshot(
+                        hotspot_servers=1, coa_accept=False, coa_port=None
+                    ),
+                    matched=1,
+                    removed=1,
+                    still_active=0,
+                )
 
         fx.guest_service.session_end_hook = _SpyTerminator()
 

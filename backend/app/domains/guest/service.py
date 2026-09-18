@@ -2022,21 +2022,52 @@ async def issue_live_disconnect(
     committed by the time this is called (see every call site below), never
     a gate on it -- an unreachable router must never prevent an admin (or
     the system) from ending a session in this platform's own records.
-    Returns ``True`` only once the router confirms the guest is gone from
-    its own ``/ip hotspot active`` table, ``False`` when an attempt was made
-    and failed, and ``None`` when nothing was attempted (no guest row, no
-    terminator wired, or ``already_ended_on_device``).
+    Returns ``True`` only once the device reports that it removed a live
+    session and that none is left, ``False`` when an attempt was made and
+    failed, and ``None`` when this platform ended nothing -- because nothing
+    was attempted (no guest row, no terminator wired, or
+    ``already_ended_on_device``) **or because the device held no live
+    session to remove**.
 
-    **It also releases the venue's per-device speed limit, on every path,
-    including the ones that attempt no disconnect.** That is deliberately
-    not gated on the return value above: a controller's per-client rate
-    limit is a field on the known-client record keyed by MAC, with no
-    session lifetime and nothing on the controller to remove it, so the
-    release cannot depend on this platform having been the one to end the
-    session. It is a no-op at a RouterOS venue -- the terminator asks the
-    vendor question before it does anything -- and see
+    That last case is not a failure and it is not a success: the adapter
+    contract is explicit that "a guest with no live session matches nothing,
+    removes nothing, and raises nothing" (``device_adapters
+    .BaseGuestAccessAdapter.end_sessions``), which is what makes blocking
+    idempotent. It used to be recorded as ``disconnect_enforced = true``,
+    because this function inferred enforcement from the absence of an
+    exception rather than from the outcome it was already being handed. A
+    sweep that expired a guest who had walked out an hour earlier therefore
+    wrote "we ended it on the device" for a call that ended nothing. It is
+    now recorded exactly like ``already_ended_on_device``: left NULL,
+    because this platform did not do it, and the column means "did we".
+
+    **It also releases the venue's per-device speed limit, including on the
+    path that attempts no disconnect at all.** That is deliberately not
+    gated on the return value above: a controller's per-client rate limit is
+    a field on the known-client record keyed by MAC, with no session
+    lifetime and nothing on the controller to remove it, so the release
+    cannot depend on this platform having been the one to end the session.
+    It is a no-op at a RouterOS venue -- the terminator asks the vendor
+    question before it does anything -- and see
     ``network_integration.client_hooks._release_rate_limit`` for what
     happens when the device has already left the controller's client list.
+
+    The release and the ``disconnect_enforced`` verdict answer different
+    questions, so the early ``return None`` for "the device removed nothing"
+    does not skip one. ``already_ended_on_device`` is the only path that
+    releases *in this function*, because it is the only one that never calls
+    the terminator at all. Every path that does call it releases inside
+    ``client_hooks.terminate``, which runs the release on its success path
+    **and** on its ``ProviderError`` path before re-raising -- so the limit
+    comes off whether the deauthorization worked, failed, or found nothing
+    to do, and before this function has formed any verdict to record.
+
+    Today the removed-nothing branch is reached only at a RouterOS venue,
+    where there is no controller limit to release: the controller branch
+    reports ``removed=1`` unconditionally, which is the known gap written up
+    in ``guest_access.enforcement._end_on_controller``. If that gap is ever
+    closed, this branch starts being reached at a controller venue too, and
+    the release will already have happened for the reason above.
 
     **Anything but ``True`` means the guest may still be online**, and every
     such path says so at WARNING with ``enforcement_delivered: False``.
@@ -2110,7 +2141,7 @@ async def issue_live_disconnect(
         await _record(False)
         return None
     try:
-        await terminator.end_on_router(
+        outcome = await terminator.end_on_router(
             session=session,
             identifier=guest.identifier,
             organization_id=session.organization_id,
@@ -2127,16 +2158,70 @@ async def issue_live_disconnect(
         )
         await _record(False)
         return False
+    removed = _removals_reported(outcome)
+    if removed is None or removed < 1:
+        #  The call ran and did not fail -- and removed nothing. The device
+        #  held no live session for this guest, so this platform ended
+        #  nothing on it. Epistemically identical to the
+        #  ``already_ended_on_device`` branch above, and recorded the same
+        #  way: NULL, because we did not do it. `removed is None` is the
+        #  same verdict for the same reason -- a terminator that cannot say
+        #  what it removed has not shown us a removal, and this column may
+        #  not be filled in from an absence of contradiction.
+        logger.warning(
+            "guest_live_disconnect_nothing_removed",
+            extra={
+                "session_id": str(session.id),
+                "router_id": str(session.router_id),
+                "removals_reported": removed,
+                "enforcement_delivered": False,
+            },
+        )
+        return None
     logger.info(
         "guest_live_disconnect_enforced",
         extra={
             "session_id": str(session.id),
             "router_id": str(session.router_id),
+            "removals_reported": removed,
             "enforcement_delivered": True,
         },
     )
     await _record(True)
     return True
+
+
+def _removals_reported(outcome: object) -> int | None:
+    """How many live sessions the device says it actually removed, or
+    ``None`` when the terminator did not say.
+
+    Read defensively because ``LiveSessionTerminatorProtocol.end_on_router``
+    is typed ``-> object``: the real hook returns a
+    ``guest_access.device_adapters.SessionEndOutcome``, but the Protocol
+    permits anything, and the one value this function must never invent is a
+    confirmed removal. So a hook returning ``None``, a bare ``True``, or an
+    object without the counters yields ``None`` -- "cannot say" -- and the
+    caller writes nothing rather than ``disconnect_enforced = true``.
+
+    ``still_active`` beats ``removed``: rows can be removed and the guest
+    still be on the device (the second read-back is the whole reason
+    ``SessionEndOutcome`` carries that field). Today the RouterOS branch
+    raises ``SessionStillActiveOnDeviceError`` before it could reach here, so
+    this is belt-and-braces rather than a live path -- but it is the
+    difference between a claim resting on one collaborator's behaviour and a
+    claim resting on the numbers themselves.
+    """
+    removed = getattr(outcome, "removed", None)
+    if not isinstance(removed, int) or isinstance(removed, bool):
+        return None
+    still_active = getattr(outcome, "still_active", None)
+    if (
+        isinstance(still_active, int)
+        and not isinstance(still_active, bool)
+        and still_active > 0
+    ):
+        return 0
+    return removed
 
 
 # ============================================================================
