@@ -323,7 +323,9 @@ class LiveSessionTerminator:
 
         ``identifier`` is the portal ``user`` the router knows the guest
         by -- ``Guest.identifier``, not whatever a rule or a caller happens
-        to spell it as.
+        to spell it as. It addresses the RouterOS branch only: a
+        controller-managed venue is addressed by the session's MAC instead,
+        for the reason ``_end_on_controller`` gives at length.
 
         Raises :class:`~.exceptions.RouterHasNoHotspotError`,
         :class:`~.exceptions.SessionStillActiveOnDeviceError`,
@@ -359,7 +361,7 @@ class LiveSessionTerminator:
         # one branch later, with the same adapter and the same credentials.
         if is_controller_managed(router):
             return await self._end_on_controller(
-                router, identifier=identifier, organization_id=organization_id
+                router, session=session, organization_id=organization_id
             )
 
         credentials = self._resolve_device_credentials(router)
@@ -386,7 +388,7 @@ class LiveSessionTerminator:
         self,
         router: BlockRouterRow,
         *,
-        identifier: str,
+        session: LiveSessionRow,
         organization_id: uuid.UUID | None,
     ) -> SessionEndOutcome:
         """End the session through the venue's controller instead of through
@@ -396,6 +398,20 @@ class LiveSessionTerminator:
         to open a socket to. The controller is asked to drop the client, and
         the outcome is reported in the same shape the RouterOS path reports,
         so every caller above is unchanged.
+
+        **A controller is addressed by MAC, and only by MAC.** This takes the
+        whole ``session`` rather than the ``identifier`` the RouterOS branch
+        uses, because the two branches genuinely need different things and
+        that difference is the bug this signature exists to make impossible.
+        RouterOS matches a hotspot row on the portal ``user`` *or* the MAC, so
+        passing ``Guest.identifier`` there is correct and a missing MAC costs
+        nothing. A controller has no equivalent: ``client_hooks.terminate``
+        normalizes what it is given and refuses anything that is not
+        MAC-shaped. ``Guest.identifier`` is a phone number for every OTP guest
+        -- which is nearly all of them -- so it was refused every time, and
+        the sweep that expired the row reported enforcement it had not
+        performed. Measured shape of the failure: the platform's records said
+        the guest was gone and the guest was still online.
 
         **The snapshot's two numbers are claims, so here is what each one
         claims.** ``hotspot_servers=1`` says this venue runs captive-portal
@@ -420,14 +436,27 @@ class LiveSessionTerminator:
         location_id = getattr(router, "location_id", None)
         if location_id is None:
             raise ControllerSessionTerminationUnavailableError(router.id)
+        # Raise rather than send something the controller cannot act on.
+        # A session with no recorded device is a real case (a login that
+        # carried no ``device_mac``; see ``GuestService
+        # .adopt_nas_asserted_device``), and for this branch it means there
+        # is nothing to address -- exactly what the falsy-``ended`` branch
+        # below already treats as "not delivered". Raising here says so one
+        # call earlier, without a pointless round trip to the controller,
+        # and keeps both callers' contracts intact: ``BlocklistEnforcer``
+        # refuses a block it did not enforce, and ``issue_live_disconnect``
+        # records ``disconnect_enforced=False`` and warns.
+        client_mac = await self._session_mac_address(session)
+        if not client_mac:
+            raise ControllerSessionTerminationUnavailableError(router.id)
         ended = await self.controller_terminator(
             location_id=location_id,
             organization_id=organization_id,
-            client_mac=identifier,
+            client_mac=client_mac,
         )
         if not ended:
-            # The controller was never reached, or this identifier is not
-            # something a controller can be addressed with. Either way the
+            # The controller was never reached, or it knows no client at
+            # this MAC (the guest had already gone). Either way the
             # guest may still be online, and the caller must be able to say
             # so: `BlocklistEnforcer` refuses a block it did not enforce, and
             # `issue_live_disconnect` records `enforcement_delivered: False`.
