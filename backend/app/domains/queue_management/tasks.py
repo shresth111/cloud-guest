@@ -53,6 +53,24 @@ from .service import QueueManagementService
 logger = get_logger(__name__)
 
 
+#: Why both task factories below pass ``controller_speed_hook``.
+#:
+#: A Celery task has no ``Depends`` chain, so each of these composes the
+#: service by hand -- and "by hand" is where a composition silently drifts
+#: from the dependency it claims to mirror. Both of these did: the FastAPI
+#: dependency passes the hook and neither of these did, so every
+#: controller-managed venue was refused by *background* work while the same
+#: venue succeeded through a request. The policy-publish reapply is the one
+#: that mattered: it is how a venue's edited speed reaches guests who are
+#: already online, and at a controller venue it reached none of them.
+#:
+#: ``build_controller_speed_hook`` is imported inside each factory rather
+#: than at module scope, mirroring every other cross-domain import here:
+#: ``network_integration.dependencies`` imports ``guest.dependencies``, so a
+#: module-scope import would pull that whole graph into any process that
+#: merely imports this task module.
+
+
 async def _reapply_policy_assignments_async(
     policy_id: str, version_id: str
 ) -> dict[str, int]:
@@ -67,6 +85,10 @@ async def _reapply_policy_assignments_async(
     published policy -- the "a venue just raised their speeds, guests who
     are already connected should get them" hook.
     """
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
     settings = get_settings()
     async with SessionLocal() as session:
         audit_repository = RBACRepository(session)
@@ -97,6 +119,10 @@ async def _reapply_policy_assignments_async(
             router_service,
             policy_service,
             audit_writer=audit_repository,
+            # The same hook ``dependencies.get_queue_management_service``
+            # passes. Without it this task refuses every controller-managed
+            # venue -- see the module-level note above.
+            controller_speed_hook=build_controller_speed_hook(session),
         )
         policy_repository = PolicyRepository(session)
         policy = await policy_repository.get_policy_by_id(uuid.UUID(policy_id))
@@ -166,6 +192,10 @@ async def _sweep_schedule_transitions_async() -> dict[str, int]:
     fresh session per task run, never shared across separate task
     invocations/worker ticks, mirroring ``provisioning_engine.tasks``'s
     identical per-run session discipline."""
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
     settings = get_settings()
     async with SessionLocal() as session:
         audit_repository = RBACRepository(session)
@@ -196,6 +226,10 @@ async def _sweep_schedule_transitions_async() -> dict[str, int]:
             router_service,
             policy_service,
             audit_writer=audit_repository,
+            # The same hook ``dependencies.get_queue_management_service``
+            # passes. Without it this task refuses every controller-managed
+            # venue -- see the module-level note above.
+            controller_speed_hook=build_controller_speed_hook(session),
         )
         result = await service.sweep_schedule_transitions()
         await session.commit()

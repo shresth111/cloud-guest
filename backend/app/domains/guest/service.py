@@ -282,6 +282,7 @@ from app.domains.router.crypto import (
 )
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_controller_managed
 from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
@@ -2477,7 +2478,8 @@ class GuestService:
         it creates a fresh VOUCHER-targeted assignment on every call with
         no find-or-reuse step, so running it per login would accumulate
         duplicate assignments rather than converge on one."""
-        if not session.ip_address:
+        device_target = await self._queue_device_target(session=session, router=router)
+        if not device_target:
             return
 
         # Design spec §5 S9. Applying the queue means opening a fresh TCP
@@ -2495,7 +2497,7 @@ class GuestService:
                 location_id=location_id,
                 router_id=router.id,
                 session_id=session.id,
-                device_target=session.ip_address,
+                device_target=device_target,
                 guest_id=session.guest_id,
             )
             return
@@ -2516,7 +2518,7 @@ class GuestService:
                 router_id=router.id,
                 target_type=QueueTargetType.SESSION,
                 target_id=session.id,
-                device_target=session.ip_address,
+                device_target=device_target,
                 guest_id=session.guest_id,
             )
         except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
@@ -2524,6 +2526,45 @@ class GuestService:
                 "guest_queue_assignment_failed",
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
+
+    async def _queue_device_target(
+        self, *, session: GuestSession, router: Router
+    ) -> str | None:
+        """What the venue's equipment calls this guest's device.
+
+        Two vendors, two vocabularies, one ``QueueAssignment.device_target``
+        column -- and the column has always meant "the string the device-side
+        write addresses", never specifically an IP.
+
+        * **A router this platform logs in to** takes an IP: a
+          ``/queue simple`` entry matches one concrete address, so
+          ``session.ip_address`` is the only correct value and stays the only
+          value. Unchanged, deliberately and completely.
+        * **A venue run from a vendor controller** takes the **client MAC**.
+          Its per-client limit is a field on the client's own record, keyed by
+          MAC within the site; it has no notion of a guest's IP and would not
+          accept one. ``queue_management`` already reads ``device_target`` as
+          the MAC on that path -- what was missing was anybody putting a MAC
+          there on login, which is why a controller venue's saved speed
+          reached nobody.
+
+        Returns ``None`` when this platform does not know the right
+        identifier, and the caller then does nothing at all. That is the
+        honest outcome rather than sending the wrong one: a MAC in a
+        ``/queue simple`` target matches nothing, and an IP in a controller
+        path is rejected as a malformed MAC. Both would look like a speed that
+        was applied.
+
+        The MAC comes from the session's own ``device_id`` row, resolved
+        through this service's existing repository -- no new lookup surface,
+        and it is the same ``GuestDevice`` the login just recorded.
+        """
+        if not is_controller_managed(router):
+            return session.ip_address
+        if session.device_id is None:
+            return None
+        device = await self.repository.get_device_by_id(session.device_id)
+        return getattr(device, "mac_address", None) if device is not None else None
 
     async def _assign_voucher_queue(
         self,

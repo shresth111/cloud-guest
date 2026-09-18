@@ -1024,14 +1024,33 @@ class QueueManagementService:
         ``ACTIVE -> DISABLED`` (an explicit admin action): a schedule-
         driven suspension is expected to self-resume the moment the
         window reopens (see ``sweep_schedule_transitions``), never
-        requiring a manual re-enable."""
+        requiring a manual re-enable.
+
+        The controller branch is the same one ``apply_queue`` and
+        ``remove_queue`` already take, and for the same reason: a
+        controller-managed row holds no device credentials and no
+        ``/queue simple`` id, so resolving credentials first failed it with
+        "this router is missing device connection credentials" -- a sentence
+        asking an operator to supply something that does not exist. Suspending
+        a window at such a venue clears the client's limit; reopening it
+        re-applies through ``apply_queue``. The RouterOS path below is
+        untouched: same credentials, same adapter, one branch later."""
         if assignment.device_queue_id is not None:
             router = await self.router_lookup.get_router(assignment.router_id)
-            credentials = self._resolve_device_credentials(router)
-            adapter = self._get_device_adapter(router.vendor)
-            await adapter.remove_queue(
-                credentials, device_queue_id=assignment.device_queue_id
-            )
+            if is_controller_managed(router):
+                await self._controller_speed(
+                    router,
+                    assignment=assignment,
+                    requesting_organization_id=assignment.organization_id,
+                    actor_user_id=None,
+                    clear=True,
+                )
+            else:
+                credentials = self._resolve_device_credentials(router)
+                adapter = self._get_device_adapter(router.vendor)
+                await adapter.remove_queue(
+                    credentials, device_queue_id=assignment.device_queue_id
+                )
         validate_status_transition(
             current=QueueStatus.ACTIVE, target=QueueStatus.SUSPENDED
         )

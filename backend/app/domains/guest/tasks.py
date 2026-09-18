@@ -379,7 +379,27 @@ def _build_queue_management_service(session: AsyncSession):
     Imported inside the function rather than at module scope: the router
     domain pulls in a large dependency graph, and this task module is
     imported by the API process too (``GuestService`` enqueues through
-    it), where none of that is needed."""
+    it), where none of that is needed.
+
+    **"The way the dependency would" now includes the controller speed
+    hook, and its absence here was the whole bug.** Every guest login on
+    the real API reaches ``resolve_and_assign_queue`` through *this*
+    factory, never through the FastAPI dependency -- the login request
+    enqueues ``assign_guest_queue`` and returns. So a venue whose network
+    runs from a controller had the one speed path it can use left unwired
+    on the one code path guests actually take: ``create_assignment`` saw
+    ``controller_speed_hook is None``, took that as proof the platform
+    cannot reach the device, and refused with "Speed Limits". The venue's
+    saved policy reached nobody, and nothing said so.
+
+    A factory that composes a service differently from the dependency it
+    claims to mirror is exactly the class of defect that took guest login
+    down platform-wide yesterday, so this one is constructed by a test the
+    way the app constructs it (``tests/unit/test_omada_bandwidth_policy``,
+    ``TestEveryFactoryWiresTheControllerHook``)."""
+    from app.domains.network_integration.client_hooks import (
+        build_controller_speed_hook,
+    )
     from app.domains.queue_management.repository import QueueManagementRepository
     from app.domains.queue_management.service import QueueManagementService
     from app.domains.rbac.repository import RBACRepository
@@ -400,6 +420,7 @@ def _build_queue_management_service(session: AsyncSession):
         router_service,
         _build_policy_service(session),
         audit_writer=RBACRepository(session),
+        controller_speed_hook=build_controller_speed_hook(session),
     )
 
 
