@@ -864,6 +864,14 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # not close anything. See
         # app.domains.guest.tasks.run_open_hours_enforcement_sweep.
         "guest-open-hours-enforcement-sweep",
+        # Releasing a controller-side device block when its rule stops
+        # applying. `expires_at` is evaluated lazily at read time and
+        # nothing fires on it, so a rule written as "blocked until
+        # Sunday" simply stops matching while the device stays blocked
+        # on the venue's controller -- and the controller offers no way
+        # to ask what it is holding. Its absence from this set is a
+        # permanent block nobody can find, from a temporary one.
+        "guest-access-controller-block-release-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         # Monitored hardware liveness: the fast ping-driven UP/DOWN path
