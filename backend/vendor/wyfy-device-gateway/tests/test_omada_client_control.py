@@ -26,6 +26,7 @@ from wyfy_device_gateway.omada.client_control import (
     UNIT_KBPS,
     UNIT_MBPS,
     build_rate_limit_body,
+    decode_rate,
     encode_rate,
 )
 from wyfy_device_gateway.omada.errors import (
@@ -57,12 +58,35 @@ def test_a_rate_above_the_kbps_range_switches_to_mbps():
     assert encode_rate(10_000) == (UNIT_MBPS, 10, False)
 
 
-def test_a_rate_mbps_cannot_express_is_rounded_and_says_so():
+def test_a_rate_mbps_cannot_express_is_rounded_down_and_says_so():
     """1500 kbps is not a whole number of Mbps, so the applied limit is not
     the requested one -- and the caller is told, rather than being shown the
-    number they typed while the controller holds a different one."""
+    number they typed while the controller holds a different one.
+
+    It rounds **down**. Rounding to nearest sent 2 Mbps for a 1500 kbps
+    request: a 2000 kbps cap for a venue that asked for 1500, reachable from
+    any saved ``QueueProfile``. A cap is a ceiling, and a ceiling that came
+    back 33% higher than the one that was set is not one.
+    """
     unit, limit, clamped = encode_rate(1_500)
-    assert (unit, limit) == (UNIT_MBPS, 2)
+    assert (unit, limit) == (UNIT_MBPS, 1)
+    assert clamped is True
+
+
+def test_no_rate_ever_encodes_to_more_than_was_asked_for():
+    """The property, not one example: over the whole span where the Mbps
+    unit is in play, what goes on the wire never exceeds the request."""
+    for requested in range(MAX_LIMIT + 1, 40_000, 7):
+        unit, limit, _ = encode_rate(requested)
+        assert decode_rate(unit, limit) <= requested
+
+
+def test_a_rate_just_above_the_kbps_range_floors_to_one_mbps():
+    """1025 kbps cannot be sent as Kbps (the number exceeds 1024) and is not
+    yet 2 Mbps. Flooring puts it at 1 Mbps -- under the request, which is the
+    safe direction, and ``clamped`` says the number moved."""
+    unit, limit, clamped = encode_rate(1_025)
+    assert (unit, limit) == (UNIT_MBPS, 1)
     assert clamped is True
 
 

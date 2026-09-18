@@ -1033,7 +1033,12 @@ class OmadaProvider:
     ) -> ProviderClientRateLimit:
         """Gateway ``ClientRateLimit`` -> this domain's shape, carrying the
         requested values alongside the applied ones so a caller can see the
-        clamp rather than infer it."""
+        clamp rather than infer it.
+
+        ``read_back`` is carried through rather than defaulted here: whether
+        anybody re-read the record is the gateway's fact, and inventing it at
+        this seam is how the claim got made in the first place.
+        """
         return ProviderClientRateLimit(
             enabled=bool(getattr(applied, "enabled", False)),
             applied_down_kbps=getattr(applied, "down_kbps", None),
@@ -1041,6 +1046,7 @@ class OmadaProvider:
             requested_down_kbps=requested_down_kbps,
             requested_up_kbps=requested_up_kbps,
             clamped=bool(getattr(applied, "clamped", False)),
+            read_back=bool(getattr(applied, "read_back", False)),
         )
 
     async def configure_controller(

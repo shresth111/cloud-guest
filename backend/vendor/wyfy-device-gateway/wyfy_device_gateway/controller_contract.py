@@ -294,18 +294,33 @@ class ClientRateLimit:
     Returned by a set/clear call rather than echoed from the request, because
     the two are not always the same number: Omada expresses a limit as a unit
     (Kbps or Mbps) plus a value the spec bounds at 1-1024, so a request for
-    1500 kbps is applied as 2 Mbps. ``down_kbps``/``up_kbps`` are what the
-    controller was actually given, converted back, and ``clamped`` says
-    whether that differs from what was asked for.
+    1500 kbps is sent as 1 Mbps -- rounded **down**, never up; see
+    :func:`~.omada.client_control.encode_rate`. ``down_kbps``/``up_kbps`` are
+    what the controller was actually sent, converted back, and ``clamped``
+    says whether that differs from what was asked for.
 
     ``None`` on a direction means that direction is unlimited -- not zero, and
     not unknown. ``enabled`` is ``False`` when no limit is in force at all.
+
+    ``read_back`` is the honesty flag and it defaults to ``False``. These
+    numbers are what the write *encoded and sent*, computed locally from the
+    arguments; they are only what the controller *holds* if something then
+    went and asked it. On Omada nothing can: the Open API exposes
+    ``PATCH .../clients/{mac}/ratelimit`` and no matching read, and
+    ``GET/PATCH .../clients/{mac}`` -- the route whose response carries
+    ``rateLimit{}`` -- answers **405** there (CAPABILITY-MATRIX, 2026-09-18).
+    The controller's internal v2 tree does expose it and needs an admin
+    session this platform deliberately does not hold. So an adapter sets
+    this ``True`` only when it really re-read the record, and every caller
+    that renders these figures must say "requested" rather than "applied"
+    while it is ``False``.
     """
 
     enabled: bool
     down_kbps: int | None = None
     up_kbps: int | None = None
     clamped: bool = False
+    read_back: bool = False
 
 
 @dataclass(frozen=True, slots=True)
