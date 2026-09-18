@@ -197,7 +197,7 @@ class ConnectedDeviceRepository:
         ``ConnectedDevice`` rows are written by ``sync_router``, which is
         dispatched from ``list_routers_for_sync`` -- already
         ``agent_managed_only`` -- so a controller-managed row could not
-        acquire connected devices, so it could not appear here. That is a
+        acquire connected devices, so it could not appear here. That is an
         argument about a *different* function's WHERE clause, holding up a
         sweep that opens RouterOS sessions and writes UP/DOWN verdicts. Any
         future writer of ``ConnectedDevice`` (a controller-sourced client
