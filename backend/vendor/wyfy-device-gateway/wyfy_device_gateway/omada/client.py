@@ -11,7 +11,12 @@ Both Omada APIs answer HTTP 200 with a failure inside the body. A client that
 trusts the status line reports "connected" for wrong credentials. So the
 success test here is always ``errorCode == 0`` (see ``types.parse_envelope``),
 and the HTTP status is used only for the things a status code genuinely
-carries: 401/403, 429, 5xx, and transport failures.
+carries: 3xx, 401/403, 429, 5xx, and transport failures.
+
+The 3xx is not a formality. A restarted controller answers a call carrying a
+stale session with **302**, not 401 (VERIFIED on hardware 2026-09-20), and
+redirects are not followed -- so a 3xx that is not translated here arrives at
+the envelope parser as a zero-byte body and the re-login never fires.
 
 ## Retry policy, and what is deliberately *not* retried
 
@@ -267,6 +272,7 @@ class OmadaHttpClient:
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         is_auth_request: bool = False,
+        carries_session: bool = False,
     ) -> RawResult:
         """Send one request and parse the envelope. Raises normalized errors.
 
@@ -336,7 +342,12 @@ class OmadaHttpClient:
             status_code=response.status_code,
         )
 
-        self._raise_for_status(response, path=path, is_auth_request=is_auth_request)
+        self._raise_for_status(
+            response,
+            path=path,
+            is_auth_request=is_auth_request,
+            carries_session=carries_session,
+        )
 
         try:
             payload = response.json()
@@ -350,10 +361,47 @@ class OmadaHttpClient:
         return RawResult(envelope=envelope, cookies=dict(response.cookies))
 
     def _raise_for_status(
-        self, response: httpx.Response, *, path: str, is_auth_request: bool
+        self,
+        response: httpx.Response,
+        *,
+        path: str,
+        is_auth_request: bool,
+        carries_session: bool = False,
     ) -> None:
         """Translate an HTTP status into a normalized error, or return."""
         status = response.status_code
+        if 300 <= status < 400:
+            # VERIFIED on hardware 2026-09-20: after a controller restart, a
+            # v2 call made with a stale cookie is answered **302**, not 401 --
+            # and the hotspot surface answers 302 to an unauthenticated
+            # request too, which is the guest portal authorize path. Since
+            # redirects are deliberately not followed (see ``__aenter__``),
+            # nothing below can make sense of the zero-byte body, so a 3xx has
+            # to be decided here.
+            self._log(
+                logging.INFO,
+                "omada_response_redirect",
+                path=path,
+                status_code=status,
+                is_auth_request=is_auth_request,
+            )
+            if is_auth_request:
+                # A redirect *during login* is a different condition -- a
+                # proxy or a captive front end, not an expired session. It
+                # must never reach the re-login path, which would re-enter
+                # login on a login failure.
+                raise OmadaInvalidControllerError(
+                    "The Omada controller redirected the login request "
+                    "instead of answering it. Check the controller address."
+                )
+            if carries_session:
+                raise OmadaSessionExpiredError()
+            # An unauthenticated request (the ``/api/info`` identity probe)
+            # holds no session to expire, so a redirect there says the address
+            # is not an Omada API. Fall through: the empty body fails JSON
+            # parsing and becomes ``OmadaInvalidControllerError``, which is
+            # both the pre-existing behaviour and the right message.
+            return
         if status < 400:
             return
 
@@ -592,10 +640,12 @@ class OmadaHttpClient:
                     params=params,
                     headers=session.headers if session else None,
                     cookies=session.cookies if session else None,
+                    carries_session=session is not None,
                 )
                 envelope = result.envelope
             except OmadaSessionExpiredError as exc:
-                # HTTP-level expiry (401/403 on an authenticated call).
+                # HTTP-level expiry (401/403, or a 3xx, on an authenticated
+                # call).
                 last_error = exc
                 if not authenticated or relogin_used:
                     raise

@@ -18,7 +18,11 @@ from wyfy_device_gateway.omada.auth import (
     session_key,
 )
 from wyfy_device_gateway.omada.client import OmadaHttpClient
-from wyfy_device_gateway.omada.errors import OmadaAuthError, OmadaSessionExpiredError
+from wyfy_device_gateway.omada.errors import (
+    OmadaAuthError,
+    OmadaInvalidControllerError,
+    OmadaSessionExpiredError,
+)
 
 from omada_support import (
     ACCESS_TOKEN,
@@ -295,6 +299,58 @@ async def test_401_at_the_token_endpoint_is_an_auth_error_and_is_not_retried():
         await adapter.list_sites(make_creds(ControllerAuthMode.OPENAPI))
 
     assert calls["n"] == 1
+
+
+# --- HTTP 3xx: what a restarted controller actually answers ---------------
+
+
+async def test_http_302_on_an_authenticated_call_triggers_exactly_one_relogin():
+    """VERIFIED on hardware 2026-09-20, BE-OMADA-MANAGEMENT-API-VERIFICATION
+    §A1.3: after a controller restart, a v2 call carrying a stale session is
+    answered **302 with a zero-byte body**, not 401.
+
+    Redirects are deliberately not followed, so a 3xx that is not read as an
+    expired session recovers only when the cached session's TTL runs out --
+    up to ``LEGACY_SESSION_TTL_SECONDS`` (600 s) of failed guest logins after
+    every controller restart we perform.
+    """
+    controller = FakeOmadaController()
+    controller.redirect_resources = 1  # one restart-shaped 302, then fine
+
+    sites = await _adapter(controller).list_sites(make_creds(ControllerAuthMode.OPENAPI))
+
+    assert sites == []
+    # One initial grant plus exactly one re-login -- the same budget a 401
+    # gets, no more.
+    assert controller.auth_calls == 2
+
+
+async def test_a_302_that_persists_after_the_relogin_fails_without_looping():
+    controller = FakeOmadaController()
+    controller.redirect_resources = 99  # every call redirects, forever
+
+    with pytest.raises(OmadaSessionExpiredError) as excinfo:
+        await _adapter(controller).list_sites(make_creds(ControllerAuthMode.OPENAPI))
+
+    assert excinfo.value.code == "OMADA_SESSION_EXPIRED"
+    assert controller.auth_calls == 2  # one re-login attempted, not a spin
+    # And the resource call itself was made twice, not MAX_ATTEMPTS times and
+    # not endlessly.
+    assert len([p for p in controller.paths() if p.endswith("/sites")]) == 2
+
+
+async def test_a_redirect_on_the_login_request_itself_is_not_a_session_expiry():
+    """A redirect *during* login is a different condition -- a proxy or a
+    captive front end -- and must not re-enter the re-login path."""
+    controller = FakeOmadaController()
+    controller.redirect_auth = True
+
+    with pytest.raises(OmadaInvalidControllerError) as excinfo:
+        await _adapter(controller).list_sites(make_creds(ControllerAuthMode.OPENAPI))
+
+    assert not isinstance(excinfo.value, OmadaSessionExpiredError)
+    assert "redirected" in str(excinfo.value).lower()
+    assert controller.auth_calls == 1  # the login was attempted once
 
 
 async def test_openapi_refresh_token_is_used_before_a_full_relogin():

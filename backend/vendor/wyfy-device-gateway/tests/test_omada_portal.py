@@ -22,6 +22,7 @@ from wyfy_device_gateway.omada.adapter import OmadaControllerAdapter
 from wyfy_device_gateway.omada.errors import (
     OmadaAuthorizationError,
     OmadaError,
+    OmadaInvalidControllerError,
     OmadaUnsupportedApiError,
 )
 from wyfy_device_gateway.omada.portal import MAX_DURATION_SECONDS, build_authorize_body
@@ -259,6 +260,39 @@ async def test_authorize_recovers_from_an_expired_operator_session():
 
     assert result.authorized is True
     assert controller.login_count == 2
+
+
+async def test_authorize_recovers_from_the_302_a_restarted_controller_sends():
+    """The guest-facing half of §A1.3.
+
+    The hotspot surface answers an unauthenticated request with 302, not
+    -1600, and this is the guest portal authorize path. Every controller
+    restart leaves each worker holding a cookie that produces exactly this,
+    so the first authorize after a restart is a guest who cannot get online.
+    """
+    controller = FakeOmadaController()
+    controller.redirect_resources = 1
+
+    result = await _adapter(controller).authorize_guest(
+        make_creds(ControllerAuthMode.LEGACY), EAP_CTX, duration_seconds=600
+    )
+
+    assert result.authorized is True
+    assert controller.login_count == 2  # the stale session was replaced once
+
+
+async def test_a_redirect_on_the_operator_login_is_not_read_as_a_session_expiry():
+    """A redirect during login is a proxy or a captive front end, not an
+    expired session -- re-entering the re-login path there is a loop."""
+    controller = FakeOmadaController()
+    controller.redirect_auth = True
+
+    with pytest.raises(OmadaInvalidControllerError):
+        await _adapter(controller).authorize_guest(
+            make_creds(ControllerAuthMode.LEGACY), EAP_CTX, duration_seconds=600
+        )
+
+    assert controller.login_count == 1
 
 
 # --- deauthorization -------------------------------------------------------

@@ -152,6 +152,17 @@ class FakeOmadaController:
         self.failure_status: int | None = 500
         self.failure_exc: Exception | None = None
 
+        #: How many *resource* calls to answer with a bare HTTP 302 and an
+        #: empty body. That is exactly what a restarted controller sends to a
+        #: call carrying a stale session cookie -- VERIFIED on hardware
+        #: 2026-09-20 -- and it is not a 401, which is the whole bug.
+        self.redirect_resources = 0
+        #: Answer the *login* / token call itself with a redirect. A separate
+        #: knob because a redirect there is a different condition and must
+        #: never be read as an expired session.
+        self.redirect_auth = False
+        self.redirect_status = 302
+
         self.login_count = 0
         self.token_count = 0
         self.refresh_count = 0
@@ -258,8 +269,16 @@ class FakeOmadaController:
             ),
         )
 
+    def _redirect_response(self) -> httpx.Response:
+        """A bare redirect: no body at all, like the real controller sends."""
+        return httpx.Response(
+            self.redirect_status, headers={"Location": "/login"}, content=b""
+        )
+
     def _login_response(self, body: Any) -> httpx.Response:
         self.login_count += 1
+        if self.redirect_auth:
+            return self._redirect_response()
         if self.login_error_code:
             return httpx.Response(
                 200,
@@ -286,6 +305,8 @@ class FakeOmadaController:
             self.refresh_count += 1
         else:
             self.token_count += 1
+        if self.redirect_auth:
+            return self._redirect_response()
         if self.token_error_code:
             return httpx.Response(
                 200,
@@ -306,6 +327,9 @@ class FakeOmadaController:
         )
 
     def _authorize_response(self) -> httpx.Response:
+        if self.redirect_resources > 0:
+            self.redirect_resources -= 1
+            return self._redirect_response()
         if self.expire_sessions > 0:
             self.expire_sessions -= 1
             return httpx.Response(
@@ -325,6 +349,9 @@ class FakeOmadaController:
         return httpx.Response(200, json={"errorCode": 0})
 
     def _resource_response(self, request: httpx.Request, path: str) -> httpx.Response:
+        if self.redirect_resources > 0:
+            self.redirect_resources -= 1
+            return self._redirect_response()
         if self.expire_sessions > 0:
             self.expire_sessions -= 1
             return httpx.Response(
