@@ -1754,6 +1754,72 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Slack: Master-console onboarding status posts
+    # ------------------------------------------------------------------
+    # One incoming-webhook URL, one internal ops channel. This is NOT a
+    # per-tenant setting and deliberately has no database column and no
+    # customer-facing UI: the messages describe Master/GLOBAL-scope
+    # operator work ("we onboarded customer X"), so there is exactly one
+    # destination for all of them and it belongs to the platform, not to
+    # any organization. See
+    # app.domains.notification.onboarding_slack for the full write-up.
+    #
+    # Empty (the default) means the feature is INERT: nothing is enqueued,
+    # nothing is posted, nothing fails. That is the same "empty = honestly
+    # unconfigured" posture stripe_secret_key/razorpay_key_id/
+    # admin_smtp_host above already establish, and it is load-bearing here
+    # -- a deployment with no webhook must still be able to onboard
+    # customers, so "no webhook" can never be an error.
+    #
+    # An incoming-webhook URL is a bearer credential: anyone holding it can
+    # post to the channel. It therefore follows the same route the SMTP
+    # passwords take and for the same reason (these repositories are
+    # public): AWS Secrets Manager -> deploy/remote-deploy.sh's
+    # `materialise_slack_env` -> ~/deploy/slack.env -> compose `env_file`.
+    # It is never committed, never written to the database, and never
+    # logged -- app.domains.notification.slack logs the webhook's host and
+    # path length, never the URL.
+    slack_onboarding_webhook_url: str = Field(
+        default="",
+        description=(
+            "Slack incoming-webhook URL that Master-console customer-"
+            "onboarding status messages are posted to "
+            "(https://hooks.slack.com/services/...). Empty = the feature "
+            "is inert: no NotificationDelivery rows are written and "
+            "onboarding is unaffected. Set via "
+            "CLOUDGUEST_SLACK_ONBOARDING_WEBHOOK_URL, sourced from the "
+            "'cloudguest/prod/slack' Secrets Manager secret in production "
+            "-- never commit it."
+        ),
+    )
+    slack_webhook_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+        description=(
+            "Per-request timeout for the outbound POST to "
+            "slack_onboarding_webhook_url. Matches app.domains.monitoring"
+            ".constants.HTTP_NOTIFICATION_TIMEOUT_SECONDS, for the same "
+            "reason: one slow webhook endpoint must not hold a dispatch "
+            "sweep worker open indefinitely."
+        ),
+    )
+    master_console_base_url: str = Field(
+        default="",
+        description=(
+            "Public origin of the Master console, used to build the "
+            "'open in Master' deep link on an onboarding Slack message. "
+            "Empty (the default) falls back to frontend_base_url, which is "
+            "correct today -- the Master console and the customer "
+            "dashboard are served from the same cloudguest-foundation "
+            "build. It exists as its own field so that splitting them onto "
+            "separate hosts later is a config change, not a code change. "
+            "When neither is set to a real origin the Slack message simply "
+            "carries no link rather than a fabricated one."
+        ),
+    )
+
     # ========================================================================
     # Network integrations (TP-Link Omada)
     # ========================================================================

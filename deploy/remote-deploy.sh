@@ -71,6 +71,28 @@ DB_BACKUP="${DB_BACKUP:-1}"
 # entirely and leaves today's behaviour untouched.
 MAIL_SECRET_ID="${MAIL_SECRET_ID:-cloudguest/prod/mail}"
 MAIL_ENV_FILE="$DEPLOY_DIR/mail.env"
+# The Slack incoming-webhook URL for Master-console onboarding status. Same
+# reasoning as the mail block above -- the repositories are public and a
+# webhook URL is a bearer credential -- and a SEPARATE secret rather than a key
+# inside cloudguest/prod/mail: it is not mail, it is read by a different
+# feature, and keeping them apart means the instance role can be narrowed to
+# one or the other later without untangling a shared blob.
+#
+# SLACK_SECRET_ID empty disables the fetch entirely; so does the secret not
+# existing, which is the state of every environment until someone creates it.
+# In both cases the backend sees no webhook and the feature is inert --
+# onboarding is unaffected either way. See
+# backend/app/domains/notification/onboarding_slack.py.
+#
+# If you would rather not create (and grant the instance role) a second
+# secret, set SLACK_SECRET_ID=cloudguest/prod/mail in ~/deploy/.deploy.env and
+# put CLOUDGUEST_SLACK_ONBOARDING_WEBHOOK_URL in the mail secret instead.
+# materialise_slack_env below selects by key prefix, not by secret name, so
+# that works with no code change and no new IAM statement -- it just writes
+# slack.env from the mail secret. Nothing else in the mail secret matches
+# CLOUDGUEST_SLACK_*, so nothing else moves.
+SLACK_SECRET_ID="${SLACK_SECRET_ID:-cloudguest/prod/slack}"
+SLACK_ENV_FILE="$DEPLOY_DIR/slack.env"
 
 case "$SERVICE" in
   api)      VAR=API_IMAGE;      TARGETS=(api celery-worker celery-beat) ;;
@@ -294,6 +316,73 @@ PY
   log "mail.env: ${summary:-nothing written -- see the warning above}"
 }
 
+# The Slack webhook, materialised exactly the way the mailboxes above are and
+# for the same reason: it is a credential, and these repositories are public.
+#
+# Deliberately narrower than materialise_mail_env: it writes ONLY keys starting
+# with CLOUDGUEST_SLACK_, so a stray key added to the secret cannot become
+# backend configuration by accident.
+#
+# Every failure path is "continue with no webhook", never "fail the deploy". An
+# unreadable secret must not take the API down, and the feature it configures
+# is optional by design.
+#
+# Nothing here prints a value: the log names which keys were written.
+materialise_slack_env() {
+  if [[ -z "$SLACK_SECRET_ID" ]]; then
+    log "SLACK_SECRET_ID is empty -- leaving $SLACK_ENV_FILE alone"
+    return 0
+  fi
+  : > "$SLACK_ENV_FILE"; chmod 600 "$SLACK_ENV_FILE"
+
+  local raw summary
+  if ! raw="$(aws secretsmanager get-secret-value --region "$REGION" \
+                --secret-id "$SLACK_SECRET_ID" --query SecretString --output text 2>&1)"; then
+    log "WARNING: could not read secret '$SLACK_SECRET_ID' ($raw)"
+    log "WARNING: continuing with no webhook -- onboarding notifications stay off"
+    return 0
+  fi
+
+  # Same stdin/temp-file dance as materialise_mail_env, for the same reason
+  # written out there: the JSON arrives on STDIN, so the program cannot also
+  # come from stdin.
+  local py
+  py="$(mktemp)"
+  cat > "$py" <<'SLACKPY'
+import json, sys
+
+target = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception as exc:  # any unreadable secret means "no webhook"
+    print(f"WARNING: secret is not valid JSON ({exc})", file=sys.stderr)
+    sys.exit(0)
+if not isinstance(data, dict):
+    print("WARNING: secret is not a JSON object", file=sys.stderr)
+    sys.exit(0)
+
+out = {
+    key: str(value)
+    for key, value in data.items()
+    if key.startswith("CLOUDGUEST_SLACK_") and str(value).strip()
+}
+
+with open(target, "w", encoding="utf-8") as handle:
+    for key in sorted(out):
+        handle.write(f"{key}={out[key]}\n")
+
+print(f"{len(out)} keys written: {', '.join(sorted(out)) or 'none'}")
+SLACKPY
+
+  if ! summary="$(printf '%s' "$raw" | python3 "$py" "$SLACK_ENV_FILE")"; then
+    rm -f "$py"
+    log "WARNING: python3 could not build $SLACK_ENV_FILE -- continuing with no webhook"
+    return 0
+  fi
+  rm -f "$py"
+  log "slack.env: ${summary:-nothing written -- see the warning above}"
+}
+
 # Wait for ONE container to report healthy. Used to gate the celery services on
 # the migration having finished; see compose_up.
 wait_one_healthy() {
@@ -385,6 +474,7 @@ set_var "$VAR" "$IMAGE"
 # keys, so a frontend deploy has no business touching this file at all.
 if [[ "$SERVICE" == "api" ]]; then
   materialise_mail_env
+  materialise_slack_env
 fi
 
 if ! compose_up; then

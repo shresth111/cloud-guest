@@ -76,6 +76,16 @@ services:
       # The deploy always creates the file (empty when the secret has no
       # mailbox filled in yet), so this path cannot go missing.
       - ${MAIL_ENV_FILE:-./mail.env}
+      # ...and the Slack webhook for Master-console onboarding status,
+      # from cloudguest/prod/slack via the same script's
+      # `materialise_slack_env`. Same ordering rule, same "the deploy
+      # always creates it" guarantee -- but only from the first `api`
+      # deploy that runs the updated script. When applying this compose
+      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # ~/deploy/slack.env` first, or compose refuses to start on a path
+      # that does not exist yet. An empty file is the correct steady
+      # state until a webhook is actually configured.
+      - ${SLACK_ENV_FILE:-./slack.env}
     ports:
       - "8000:8000"
     depends_on:
@@ -108,6 +118,16 @@ services:
       # The deploy always creates the file (empty when the secret has no
       # mailbox filled in yet), so this path cannot go missing.
       - ${MAIL_ENV_FILE:-./mail.env}
+      # ...and the Slack webhook for Master-console onboarding status,
+      # from cloudguest/prod/slack via the same script's
+      # `materialise_slack_env`. Same ordering rule, same "the deploy
+      # always creates it" guarantee -- but only from the first `api`
+      # deploy that runs the updated script. When applying this compose
+      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # ~/deploy/slack.env` first, or compose refuses to start on a path
+      # that does not exist yet. An empty file is the correct steady
+      # state until a webhook is actually configured.
+      - ${SLACK_ENV_FILE:-./slack.env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,6 +166,16 @@ services:
       # The deploy always creates the file (empty when the secret has no
       # mailbox filled in yet), so this path cannot go missing.
       - ${MAIL_ENV_FILE:-./mail.env}
+      # ...and the Slack webhook for Master-console onboarding status,
+      # from cloudguest/prod/slack via the same script's
+      # `materialise_slack_env`. Same ordering rule, same "the deploy
+      # always creates it" guarantee -- but only from the first `api`
+      # deploy that runs the updated script. When applying this compose
+      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # ~/deploy/slack.env` first, or compose refuses to start on a path
+      # that does not exist yet. An empty file is the correct steady
+      # state until a webhook is actually configured.
+      - ${SLACK_ENV_FILE:-./slack.env}
     depends_on:
       postgres:
         condition: service_healthy

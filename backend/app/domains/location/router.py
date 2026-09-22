@@ -27,6 +27,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import Settings, get_settings
 from app.domains.audit.dependencies import get_audit_service
 from app.domains.audit.service import AuditService
 from app.domains.auth.models import AuthUser
@@ -37,6 +38,12 @@ from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.captive_portal.validators import default_splash_headline
 from app.domains.connected_devices.dependencies import get_connected_device_service
 from app.domains.connected_devices.service import ConnectedDeviceService
+from app.domains.notification.dependencies import get_onboarding_slack_notifier
+from app.domains.notification.onboarding_slack import (
+    OnboardingSlackNotifier,
+    location_provisioned_notice,
+)
+from app.domains.notification.tasks import dispatch_onboarding_failure
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -671,10 +678,83 @@ async def provision_location(
     provisioning_service: LocationProvisioningService = Depends(
         get_location_provisioning_service
     ),
+    onboarding_slack: OnboardingSlackNotifier = Depends(get_onboarding_slack_notifier),
+    settings: Settings = Depends(get_settings),
 ):
-    result = await provisioning_service.provision_location(
-        actor_user_id=uuid.UUID(user.id),
-        data=_provision_input(payload),
+    """The Master console's "Smart location provisioning" commit step.
+
+    The Slack notice is composed here rather than inside
+    ``LocationProvisioningService.provision_location``, and that is not a
+    style preference. That method's contract is "no ``try``/``except``
+    anywhere", documented at length, because the absence of one is what
+    makes the single-transaction rollback real; adding an announcement
+    inside it would put the first swallowing handler into the one method
+    that must not have one. The router layer is where this codebase
+    already composes cross-domain concerns onto location creation -- see
+    the ``captive_portal_service.create_config`` call on the plain
+    create-location path above, and its "composed here at the router
+    layer, not inside LocationService itself" comment.
+
+    Success is enqueued on this same request-scoped session, so the outbox
+    row and the whole provisioned customer commit together. Failure is
+    handed to Celery on the way out, because this session is about to be
+    rolled back by ``get_db_session`` and would take the notice with it --
+    which is exactly the case worth paging about. See
+    ``app.domains.notification.onboarding_slack``.
+    """
+    actor_user_id = uuid.UUID(user.id)
+    try:
+        result = await provisioning_service.provision_location(
+            actor_user_id=actor_user_id,
+            data=_provision_input(payload),
+        )
+    except Exception as exc:
+        # `_provision_input` does this same conversion inside the `try`, so
+        # a malformed id is one of the failures that lands here -- redoing
+        # it unguarded would raise a ValueError out of the except block and
+        # replace the caller's real error with a worse one.
+        try:
+            existing_organization_id = (
+                uuid.UUID(payload.existing_organization_id)
+                if payload.existing_organization_id is not None
+                else None
+            )
+        except ValueError:
+            existing_organization_id = None
+        dispatch_onboarding_failure(
+            settings=settings,
+            stage="Location provisioning",
+            # A new customer is named by the operator; an added location
+            # only carries the id, which is what the message then says.
+            organization_name=(
+                payload.new_organization.name
+                if payload.new_organization is not None
+                else f"organization {existing_organization_id}"
+            ),
+            organization_id=existing_organization_id,
+            error=exc,
+            actor_user_id=actor_user_id,
+            request_id=_request_id(request),
+            # The venue name the operator typed, so the message says which
+            # attempt failed. Nothing from `payload.owner` or
+            # `payload.router` -- those carry a person and a device secret.
+            details=[("Location", payload.location.name)],
+        )
+        raise
+    await onboarding_slack.notify(
+        location_provisioned_notice(
+            organization_id=result.organization_id,
+            organization_name=result.organization_name,
+            location_name=result.location_name,
+            location_code=result.location_code,
+            property_type=result.property_type,
+            plan_name=result.plan_name,
+            router_name=result.router_name,
+            # The boolean, not `result.tunnel_ip_address` -- hub-internal
+            # topology is not ops-channel information.
+            tunnel_allocated=result.tunnel_ip_address is not None,
+            actor_user_id=actor_user_id,
+        )
     )
     response = ProvisionLocationResponse(
         organization_id=str(result.organization_id),
