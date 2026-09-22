@@ -1643,8 +1643,34 @@ def generate_permission_matrix_markdown() -> str:
 
 
 async def _main() -> None:
-    """``python -m app.domains.rbac.seed`` entrypoint."""
+    """``python -m app.domains.rbac.seed`` entrypoint.
+
+    The model imports below look unused and are not. ``Role.organization_id``
+    carries a ForeignKey to ``organizations.id``, and SQLAlchemy resolves that
+    target lazily, when a mapper is first configured. Importing this module on
+    its own registers only the RBAC models, so the first write -- in practice
+    ``remove_role_permission`` partway through the reconcile -- fails with::
+
+        Foreign key associated with column 'roles.organization_id' could not
+        find table 'organizations' with which to generate a foreign key to
+        target column 'id'
+
+    i.e. the documented entrypoint could not run standalone at all, and failed
+    late enough to look like a data problem rather than a missing import.
+    ``scripts.seed`` never hit this because it imports the same models (also
+    with ``# noqa: F401``) for the same reason.
+
+    They are imported inside this function rather than at module scope on
+    purpose: they are needed only by this CLI path, and at module scope every
+    importer of ``rbac.seed`` -- the app, the test suite, ``scripts.seed`` --
+    would pull in four unrelated model modules to run a function that does not
+    reference them.
+    """
     from app.database.session import SessionLocal
+    from app.domains.auth.models import User  # noqa: F401
+    from app.domains.location.models import Location  # noqa: F401
+    from app.domains.organization.models import Organization  # noqa: F401
+    from app.domains.router.models import Router  # noqa: F401
 
     async with SessionLocal() as session:
         summary = await seed_rbac(session)
