@@ -35,10 +35,13 @@ __all__ = [
     "AlertResponse",
     "AlertListResponse",
     "AlertEvaluationResponse",
+    "NotificationChannelConfigSummaryResponse",
     "NotificationChannelCreateRequest",
     "NotificationChannelUpdateRequest",
     "NotificationChannelResponse",
     "NotificationChannelListResponse",
+    "NotificationChannelTestResponse",
+    "NotificationDeliveryStatusResponse",
     "NotificationLogResponse",
     "NotificationLogListResponse",
     "IncidentCreateRequest",
@@ -237,12 +240,56 @@ class NotificationChannelCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     config: dict[str, object]
     is_active: bool = True
+    event_categories: list[str] = Field(default_factory=list)
 
 
 class NotificationChannelUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     config: dict[str, object] | None = None
     is_active: bool | None = None
+    event_categories: list[str] | None = None
+
+
+class NotificationChannelConfigSummaryResponse(BaseModel):
+    """The redacted view of one channel's credentials.
+
+    Built **only** by ``app.domains.monitoring.channel_config
+    .summarize_channel_config``, which is an allowlist: it names every
+    field that may leave the process and cannot pass through anything it
+    was not asked for. This model deliberately mirrors that dataclass
+    field for field rather than accepting a free-form dict, so a value
+    added to the config schema in future cannot reach a response by
+    default -- which is precisely how a list endpoint in this codebase
+    once returned plaintext WiFi passwords.
+
+    ``fingerprint`` is a truncated SHA-256 and is ``None`` for channel
+    types whose config is too low-entropy to hash safely (email, SMS,
+    WhatsApp) -- see ``channel_config``'s module docstring.
+    """
+
+    configured: bool
+    target: str
+    fingerprint: str | None
+    has_secret: bool
+    auth_header_name: str | None
+    requirements: list[str]
+
+
+class NotificationDeliveryStatusResponse(BaseModel):
+    """The most recent delivery on one channel.
+
+    ``kind`` matters on this model: a ``"test"`` row proves the credential
+    works, not that the channel has ever carried a real alert, and the
+    console has to be able to say which -- see migration 0129.
+    """
+
+    status: str
+    kind: str
+    sent_at: datetime
+    error_message: str | None
+    response_summary: str | None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class NotificationChannelResponse(BaseModel):
@@ -250,17 +297,43 @@ class NotificationChannelResponse(BaseModel):
     config may hold a Slack/Teams/Discord webhook URL or webhook auth
     header, a bearer-equivalent secret this API never echoes back in the
     clear, mirroring how ``app.domains.router``'s own API never returns a
-    decrypted RouterOS API credential."""
+    decrypted RouterOS API credential.
+
+    ``config_summary`` is not a relaxation of that rule. It carries a
+    masked destination, a fingerprint of the secret and a
+    ``configured`` flag -- enough to tell two channels apart and to tell a
+    configured one from an empty one, which is what an operator needs and
+    is strictly less than the secret.
+    """
 
     id: uuid.UUID
     organization_id: uuid.UUID | None
     channel_type: str
     name: str
     is_active: bool
+    event_categories: list[str]
     created_at: datetime
     updated_at: datetime
+    config_summary: NotificationChannelConfigSummaryResponse | None = None
+    last_delivery: NotificationDeliveryStatusResponse | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class NotificationChannelTestResponse(BaseModel):
+    """The acknowledgement of a queued test send.
+
+    Deliberately not the delivery result: the send is a third-party
+    network call handed to Celery, so this says only that it was accepted
+    and where the outcome will appear. Reporting a result here would mean
+    either blocking the operator's request on someone else's server or
+    inventing an optimistic answer, and an optimistic answer is exactly
+    what a "test connection" button exists to stop anyone relying on.
+    """
+
+    channel_id: uuid.UUID
+    queued: bool
+    detail: str
 
 
 class NotificationChannelListResponse(BaseModel):

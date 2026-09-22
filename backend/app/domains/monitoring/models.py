@@ -92,10 +92,13 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
+
+from .constants import NotificationLogKind
 
 
 class HealthCheck(BaseModel):
@@ -558,6 +561,23 @@ class NotificationChannel(BaseModel):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     config_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Routing for producers that are not an ``AlertRule`` -- see
+    # ``constants.NotificationEventCategory`` for why this sits alongside
+    # ``alert_rule_notification_channels`` rather than replacing it. A list
+    # of that enum's values; empty (the default, and every row that existed
+    # before this column) means "alerts only", i.e. exactly today's
+    # behaviour.
+    #
+    # JSONB rather than a second association table because, unlike an alert
+    # rule, a category is not a row anywhere -- it is a closed enum in this
+    # module. A join table would need a table of categories to point at,
+    # which would be a second source of truth for the enum, and the only
+    # query anyone runs against it is "channels containing category X",
+    # which a GIN-less JSONB containment predicate answers well enough at
+    # this table's size (tens of rows, not millions).
+    event_categories: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=sa_text("'[]'::jsonb"), default=list
+    )
 
     __table_args__ = (
         Index("ix_notification_channels_organization_id", "organization_id"),
@@ -596,12 +616,29 @@ class NotificationLog(BaseModel):
     # e.g. "HTTP 200" for webhook-style channels, or a short honest note for
     # the logging-only WhatsApp placeholder / real SMS/email providers.
     response_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ``constants.NotificationLogKind`` -- what produced this row. Defaults
+    # to ALERT so every pre-existing row keeps exactly the meaning it had.
+    kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default=NotificationLogKind.ALERT.value,
+        default=NotificationLogKind.ALERT.value,
+    )
 
     __table_args__ = (
         Index("ix_notification_logs_channel_id", "channel_id"),
         Index("ix_notification_logs_alert_id", "alert_id"),
         Index("ix_notification_logs_status", "status"),
         Index("ix_notification_logs_sent_at", "sent_at"),
+        # "The latest delivery on each of these channels" -- the master
+        # console's channel list asks it for every row on the page at once,
+        # and without a composite the planner sorts the whole per-channel
+        # history to take one row from each.
+        Index(
+            "ix_notification_logs_channel_id_sent_at",
+            "channel_id",
+            sa_text("sent_at DESC"),
+        ),
     )
 
     def __repr__(self) -> str:

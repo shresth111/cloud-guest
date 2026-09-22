@@ -70,6 +70,8 @@ cross-loop ``RuntimeError``s elsewhere in this codebase.
 
 from __future__ import annotations
 
+import uuid
+
 import httpx
 
 from app.core.async_task_bridge import run_celery_task
@@ -102,6 +104,7 @@ from app.domains.wireguard.service import WireGuardService
 from .constants import (
     TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
     TASK_RUN_HEALTH_CHECK_SWEEP,
+    TASK_SEND_CHANNEL_TEST_NOTIFICATION,
 )
 from .email_provider import resolve_email_provider
 from .repository import MonitoringRepository
@@ -258,4 +261,76 @@ def run_alert_rule_evaluation_sweep() -> dict[str, int]:
     return summary
 
 
-__all__ = ["run_alert_rule_evaluation_sweep"]
+async def _send_channel_test_notification_async(channel_id: uuid.UUID) -> str:
+    """Deliver one test message and persist its ``kind='test'``
+    ``NotificationLog`` row. Returns the row's status.
+
+    Builds its own ``NotificationService`` with the same real collaborators
+    the evaluation sweep above does -- the same "construct real services
+    here, not fake shortcuts" rule -- so a test travels the provider
+    configuration a real alert would, and a deployment whose SMS provider
+    is still ``logging`` gets the same honest outcome from a test that it
+    would from an alert.
+
+    A channel deleted between the operator pressing the button and the
+    worker picking the job up is not an error: there is nothing to deliver
+    and nothing to record against, so it returns rather than raising a
+    retry at an empty row.
+    """
+    settings = get_settings()
+    async with httpx.AsyncClient() as http_client, SessionLocal() as session:
+        repository = MonitoringRepository(session)
+        service = NotificationService(
+            repository,
+            http_client,
+            sms_provider=get_configured_sms_provider(settings),
+            email_provider=resolve_email_provider(settings),
+        )
+        channel = await repository.get_notification_channel(channel_id)
+        if channel is None or channel.is_deleted:
+            logger.info(
+                "notification_channel_test_skipped_missing_channel",
+                extra={"channel_id": str(channel_id)},
+            )
+            return "skipped"
+        try:
+            log = await service.send_test_notification(channel)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        return log.status
+
+
+@celery_app.task(name=TASK_SEND_CHANNEL_TEST_NOTIFICATION)
+def send_channel_test_notification(channel_id: str) -> dict[str, str]:
+    """On-demand (never Beat-scheduled): the "Send test" action on one
+    notification channel.
+
+    Deliberately **no** ``autoretry_for``/``max_retries``. A retry here
+    would re-deliver the message, not re-read a result: a Slack webhook
+    that returned 500 after accepting the POST would be tested three times
+    and post three messages into a real channel. The failure is already
+    durable -- ``send_test_notification`` records a ``FAILED`` row with the
+    real error and never raises -- and the operator, who is watching the
+    screen, is the right thing to decide whether to press it again.
+
+    ``channel_id`` crosses the queue as a ``str`` because Celery's JSON
+    serializer has no UUID type; every other task in this codebase does the
+    same.
+    """
+    status = run_celery_task(
+        _send_channel_test_notification_async(uuid.UUID(channel_id))
+    )
+    logger.info(
+        "monitoring_task_channel_test_completed",
+        extra={"channel_id": channel_id, "status": status},
+    )
+    return {"channel_id": channel_id, "status": status}
+
+
+__all__ = [
+    "run_alert_rule_evaluation_sweep",
+    "run_health_check_sweep",
+    "send_channel_test_notification",
+]
