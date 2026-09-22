@@ -83,6 +83,14 @@ MAIL_ENV_FILE="$DEPLOY_DIR/mail.env"
 # In both cases the backend sees no webhook and the feature is inert --
 # onboarding is unaffected either way. See
 # backend/app/domains/notification/onboarding_slack.py.
+#
+# If you would rather not create (and grant the instance role) a second
+# secret, set SLACK_SECRET_ID=cloudguest/prod/mail in ~/deploy/.deploy.env and
+# put CLOUDGUEST_SLACK_ONBOARDING_WEBHOOK_URL in the mail secret instead.
+# materialise_slack_env below selects by key prefix, not by secret name, so
+# that works with no code change and no new IAM statement -- it just writes
+# slack.env from the mail secret. Nothing else in the mail secret matches
+# CLOUDGUEST_SLACK_*, so nothing else moves.
 SLACK_SECRET_ID="${SLACK_SECRET_ID:-cloudguest/prod/slack}"
 SLACK_ENV_FILE="$DEPLOY_DIR/slack.env"
 

@@ -764,3 +764,56 @@ def test_failure_dispatch_survives_an_unreachable_broker(monkeypatch) -> None:
         actor_user_id=None,
         request_id=None,
     )
+
+
+# ============================================================================
+# Wiring
+# ============================================================================
+
+
+def test_the_dependency_is_disabled_unless_a_webhook_is_configured() -> None:
+    """The routers never test for configuration themselves -- this
+    dependency decides it once. If this were wired wrong, every assertion
+    above about "inert" would be testing a class nothing builds."""
+    from app.domains.notification.dependencies import get_onboarding_slack_notifier
+
+    off = get_onboarding_slack_notifier(
+        notification_service=FakeEnqueuer(),  # type: ignore[arg-type]
+        settings=_settings(),
+    )
+    assert off.enabled is False
+    assert off.master_base_url == ""
+
+    on = get_onboarding_slack_notifier(
+        notification_service=FakeEnqueuer(),  # type: ignore[arg-type]
+        settings=_settings(
+            slack_onboarding_webhook_url=FAKE_WEBHOOK,
+            master_console_base_url="https://master.wyfyguest.example",
+        ),
+    )
+    assert on.enabled is True
+    assert on.master_base_url == "https://master.wyfyguest.example"
+
+
+def test_the_failure_task_is_registered_on_the_celery_app() -> None:
+    """A task the routes call by name must actually exist on the worker,
+    or every failure notice is a silently unrouted message."""
+    from app.core.celery_app import celery_app
+    from app.domains.notification.constants import TASK_RECORD_ONBOARDING_FAILURE
+
+    assert TASK_RECORD_ONBOARDING_FAILURE in celery_app.tasks
+
+
+def test_slack_values_fit_the_columns_they_are_written_to() -> None:
+    """No migration ships with this change, which is only true while the
+    new values fit the existing widths."""
+    for event in (
+        NotificationEventType.ONBOARDING_CUSTOMER_CREATED,
+        NotificationEventType.ONBOARDING_LOCATION_PROVISIONED,
+        NotificationEventType.ONBOARDING_CONTROLLER_ONBOARDED,
+        NotificationEventType.ONBOARDING_FAILED,
+    ):
+        assert len(event.value) <= 50, event
+
+    assert len(NotificationChannelType.SLACK.value) <= 20
+    assert len(SLACK_ONBOARDING_RECIPIENT) <= 255
