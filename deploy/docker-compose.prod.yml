@@ -77,11 +77,12 @@ services:
       # mailbox filled in yet), so this path cannot go missing.
       - ${MAIL_ENV_FILE:-./mail.env}
       # ...and the Slack webhook for Master-console onboarding status,
-      # from cloudguest/prod/slack via the same script's
-      # `materialise_slack_env`. Same ordering rule, same "the deploy
-      # always creates it" guarantee -- but only from the first `api`
-      # deploy that runs the updated script. When applying this compose
-      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # from the same cloudguest/prod/mail secret via that script's
+      # `materialise_slack_env` (it selects a different key prefix; see
+      # its SLACK_SECRET_ID comment). Same ordering rule, same "the
+      # deploy always creates it" guarantee -- but only from the first
+      # `api` deploy that runs the updated script. When applying this
+      # compose change to ~/deploy/docker-compose.yml by hand, `touch
       # ~/deploy/slack.env` first, or compose refuses to start on a path
       # that does not exist yet. An empty file is the correct steady
       # state until a webhook is actually configured.
@@ -119,11 +120,12 @@ services:
       # mailbox filled in yet), so this path cannot go missing.
       - ${MAIL_ENV_FILE:-./mail.env}
       # ...and the Slack webhook for Master-console onboarding status,
-      # from cloudguest/prod/slack via the same script's
-      # `materialise_slack_env`. Same ordering rule, same "the deploy
-      # always creates it" guarantee -- but only from the first `api`
-      # deploy that runs the updated script. When applying this compose
-      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # from the same cloudguest/prod/mail secret via that script's
+      # `materialise_slack_env` (it selects a different key prefix; see
+      # its SLACK_SECRET_ID comment). Same ordering rule, same "the
+      # deploy always creates it" guarantee -- but only from the first
+      # `api` deploy that runs the updated script. When applying this
+      # compose change to ~/deploy/docker-compose.yml by hand, `touch
       # ~/deploy/slack.env` first, or compose refuses to start on a path
       # that does not exist yet. An empty file is the correct steady
       # state until a webhook is actually configured.
@@ -167,11 +169,12 @@ services:
       # mailbox filled in yet), so this path cannot go missing.
       - ${MAIL_ENV_FILE:-./mail.env}
       # ...and the Slack webhook for Master-console onboarding status,
-      # from cloudguest/prod/slack via the same script's
-      # `materialise_slack_env`. Same ordering rule, same "the deploy
-      # always creates it" guarantee -- but only from the first `api`
-      # deploy that runs the updated script. When applying this compose
-      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # from the same cloudguest/prod/mail secret via that script's
+      # `materialise_slack_env` (it selects a different key prefix; see
+      # its SLACK_SECRET_ID comment). Same ordering rule, same "the
+      # deploy always creates it" guarantee -- but only from the first
+      # `api` deploy that runs the updated script. When applying this
+      # compose change to ~/deploy/docker-compose.yml by hand, `touch
       # ~/deploy/slack.env` first, or compose refuses to start on a path
       # that does not exist yet. An empty file is the correct steady
       # state until a webhook is actually configured.
