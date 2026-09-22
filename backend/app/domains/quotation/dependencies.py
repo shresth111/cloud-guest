@@ -18,6 +18,8 @@ from app.domains.otp.service import (
     MailIdentity,
     get_configured_email_provider,
 )
+from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .repository import QuotationRepository, QuotationRepositoryProtocol
 from .service import QuotationService
@@ -55,10 +57,12 @@ def _resolve_email_provider(settings: Settings) -> EmailProviderProtocol | None:
 def get_quotation_service(
     repository: QuotationRepositoryProtocol = Depends(get_quotation_repository),
     settings: Settings = Depends(get_settings),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> QuotationService:
     return QuotationService(
         repository,
         email_provider=_resolve_email_provider(settings),
+        audit_writer=audit_repository,
     )
 
 

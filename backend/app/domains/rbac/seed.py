@@ -489,11 +489,34 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     ),
     # Quotations: CREATE covers the one-shot "generate the PDF + email it"
     # action (there is no separate draft-then-send step), READ covers
-    # list/get/PDF-download, MANAGE is the catch-all for any future
-    # void/resend action -- mirrors DEMO_REQUESTS's own simple shape, plus
-    # CREATE since (unlike a demo request) a quotation is always
-    # operator-initiated, never a public submission.
-    PermissionModule.QUOTATIONS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # list/get/PDF-download, DELETE gates the soft delete, MANAGE is the
+    # catch-all for any future void/resend action -- mirrors
+    # DEMO_REQUESTS's own simple shape, plus CREATE since (unlike a demo
+    # request) a quotation is always operator-initiated, never a public
+    # submission.
+    #
+    # DELETE is its own action rather than more work folded into MANAGE,
+    # even though this module's comment used to call MANAGE "the catch-all
+    # for any future void/resend action". Two reasons. Every other module
+    # in this file that exposes a real delete endpoint gates it on
+    # ``<module>.delete`` (MONITORED_HARDWARE, NETWORK_INTEGRATIONS,
+    # CONTENT_FILTERING...), so reusing MANAGE here would make quotations
+    # the one domain where an operator has to know that "manage" silently
+    # includes destruction. And ``expand_grant_level`` excludes DELETE from
+    # GrantLevel.OPERATE while including everything else -- so as a
+    # separate action, a role granted OPERATE on quotations can generate
+    # and read them but cannot remove them, which is the distinction worth
+    # having and the one MANAGE cannot express.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook -- the identical trap
+    # PermissionModule.CONTENT_FILTERING's own comment above records.
+    # Shipping the DELETE /quotations/{id} endpoint without re-running the
+    # seed gives every operator a 403 on it, and the console's Delete
+    # button (gated on `quotations.delete` via GET /me/permissions) will
+    # not render at all. expand_grant_level already folds DELETE into FULL,
+    # so no role table changes are needed.
+    PermissionModule.QUOTATIONS: (_A.CREATE, _A.READ, _A.DELETE, _A.MANAGE),
     # Router Readiness Checklist: READ covers the checklist itself
     # (auto-detected items are recomputed live on every read, no separate
     # EXECUTE step needed), MANAGE covers confirming/overriding an item by
