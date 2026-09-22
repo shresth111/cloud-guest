@@ -136,7 +136,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 from urllib.parse import quote
@@ -163,11 +163,27 @@ MAX_FIELD_LENGTH = 200
 # exists so that no future field can make a message unbounded.
 MAX_MESSAGE_LENGTH = 2800
 
-# Characters removed from every value before it is rendered. Backticks and
-# asterisks are Slack's own markup (a name containing one would corrupt
-# the message); control characters are stripped because nothing in a name
-# legitimately contains one.
-_STRIPPED_CHARACTERS = frozenset("`*_~<>|\r\n\t")
+# Characters removed from every value before it is rendered, and the list
+# is short on purpose.
+#
+# `<` and `>` are the load-bearing pair: every Slack construct that does
+# something rather than merely look like something needs them -- `<!channel>`,
+# `<!here>`, `<@U123>`, `<#C123>`, and the `<url|label>` link form that can
+# show one destination and go to another. Removing these two is what stops a
+# venue name from paging the channel or smuggling a link.
+#
+# Backtick and asterisk are cosmetic: a stray one would corrupt the layout of
+# the message around it, so they go too.
+#
+# `_`, `~` and `|` are deliberately NOT stripped, and that is a correction.
+# They were, and it was wrong: Organization slugs are normalised by nothing
+# but `strip().lower()` (see `organization.service._normalize_slug`), so
+# `grand_hotel_andheri` is a legal slug, and stripping underscores rendered it
+# as `grandhotelandheri` -- a mangled identifier that an operator might copy
+# out of the message and not find. Once `<`/`>` are gone none of the three can
+# escape into a mention or a link; the worst any of them can now do is render
+# a word in italics. A correct identifier is worth more than that.
+_STRIPPED_CHARACTERS = frozenset("`*<>\r\n\t")
 
 _OUTCOME_SUCCESS = "succeeded"
 _OUTCOME_FAILURE = "failed"
@@ -576,7 +592,6 @@ class OnboardingSlackNotifier:
     notification_service: OutboxEnqueueProtocol
     enabled: bool = False
     master_base_url: str = ""
-    _logged_disabled: bool = field(default=False, init=False, repr=False)
 
     async def notify(self, notice: OnboardingNotice) -> None:
         if not self.enabled:

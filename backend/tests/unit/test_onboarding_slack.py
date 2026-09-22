@@ -817,3 +817,46 @@ def test_slack_values_fit_the_columns_they_are_written_to() -> None:
 
     assert len(NotificationChannelType.SLACK.value) <= 20
     assert len(SLACK_ONBOARDING_RECIPIENT) <= 255
+
+
+def test_identifiers_survive_cleaning_intact() -> None:
+    """Regression. `_` and `~` used to be stripped along with Slack's
+    markup, which silently mangled any identifier containing one --
+    organization slugs are normalised by nothing but `strip().lower()`, so
+    `grand_hotel_andheri` is a legal slug and was rendering as
+    `grandhotelandheri`. An operator copying that out of Slack would not
+    find it."""
+    text = build_slack_text(
+        customer_created_notice(
+            organization_id=uuid.uuid4(),
+            organization_name="Grand Hotel Andheri",
+            organization_slug="grand_hotel_andheri",
+            location_created=True,
+            actor_user_id=None,
+        )
+    )
+    assert "grand_hotel_andheri" in text
+
+
+def test_mention_injection_is_still_impossible() -> None:
+    """The other half of the narrowing above: dropping `_`/`~`/`|` from the
+    strip set must not reopen the thing the strip set exists for. Every
+    Slack construct that *acts* needs `<` and `>`, and those still go."""
+    for hostile in (
+        "<!channel>",
+        "<!here>",
+        "<@U024BE7LH>",
+        "<#C024BE7LV>",
+        "<https://evil.invalid|Open in Master>",
+    ):
+        text = build_slack_text(
+            customer_created_notice(
+                organization_id=uuid.uuid4(),
+                organization_name=f"Acme {hostile}",
+                organization_slug="acme",
+                location_created=False,
+                actor_user_id=None,
+            )
+        )
+        assert "<" not in text
+        assert ">" not in text
