@@ -1508,15 +1508,49 @@ class TestChannelPartnersRbacSeedData:
 
     def test_role_grants_mirror_quotations_role_for_role(self) -> None:
         """The exact invariant this feature's RBAC diff is built on: every
-        system role's resolved grant for CHANNEL_PARTNERS is identical to
-        its resolved grant for QUOTATIONS."""
+        system role treats CHANNEL_PARTNERS exactly the way it treats
+        QUOTATIONS.
+
+        Compared at the GRANT LEVEL, not as expanded action tuples. It used
+        to compare the tuples, which was the same assertion only for as
+        long as the two modules happened to declare the same actions. They
+        no longer do: QUOTATIONS gained ``DELETE`` (it has a real
+        ``DELETE /quotations/{id}`` endpoint) and CHANNEL_PARTNERS has no
+        delete endpoint to gate, so a tuple comparison now fails for Super
+        Admin -- reporting a difference in what the two modules *are*
+        rather than in how the roles *treat* them, which is what this test
+        is for. Making the tuples equal again would mean seeding
+        ``channel_partners.delete``, a permission for an endpoint that does
+        not exist.
+
+        So: the level each role resolves to must match, and each module's
+        own grant must be exactly that level expanded over its own actions.
+        The second half is what keeps this honest -- without it, the test
+        would no longer notice a role whose CHANNEL_PARTNERS grant was
+        tampered with directly.
+        """
+        from app.domains.rbac.seed import expand_grant_level
+
         for role_def in SYSTEM_ROLES:
-            grants = role_def.grants()
-            quotations_grant = grants.get(PermissionModule.QUOTATIONS, ())
-            channel_partners_grant = grants.get(
-                PermissionModule.CHANNEL_PARTNERS, ()
+            quotations_level = role_def.overrides.get(
+                PermissionModule.QUOTATIONS, role_def.default_level
             )
-            assert channel_partners_grant == quotations_grant, role_def.name
+            channel_partners_level = role_def.overrides.get(
+                PermissionModule.CHANNEL_PARTNERS, role_def.default_level
+            )
+            assert channel_partners_level == quotations_level, role_def.name
+
+            grants = role_def.grants()
+            for module in (
+                PermissionModule.QUOTATIONS,
+                PermissionModule.CHANNEL_PARTNERS,
+            ):
+                expected = expand_grant_level(
+                    quotations_level, MODULE_ACTIONS[module]
+                )
+                assert grants.get(module, ()) == expected, (
+                    f"{role_def.name} / {module}"
+                )
 
     def test_only_super_admin_platform_admin_and_platform_support_are_granted(
         self,

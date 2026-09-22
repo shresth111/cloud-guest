@@ -37,6 +37,15 @@ from app.domains.quotation.models import Quotation, QuotationLineItem
 from app.domains.quotation.quotation_pdf import render_quotation_pdf
 from app.domains.quotation.router import _build_quotation_response
 from app.domains.quotation.service import LineItemInput, QuotationService
+from app.domains.rbac.authorization import (
+    AccessValidator,
+    EffectiveGrant,
+    EffectiveGrants,
+    GrantScope,
+    ScopeContext,
+    ScopeResolver,
+)
+from app.domains.rbac.enums import AuditAction, ScopeType
 
 # ============================================================================
 # Test doubles
@@ -91,6 +100,11 @@ class FakeQuotationRepository:
         quotation.version += 1
         return quotation
 
+    async def soft_delete_quotation(self, quotation: Quotation) -> Quotation:
+        quotation.is_deleted = True
+        quotation.deleted_at = _now()
+        return quotation
+
     async def list_quotations(
         self,
         *,
@@ -143,6 +157,19 @@ class FakeEmailProvider:
         )
 
 
+@dataclass
+class FakeAuditWriter:
+    """Records every ``create_audit_log_entry`` call -- the same narrow
+    surface ``service.AuditLogWriter`` declares, with no RBAC repository or
+    database behind it."""
+
+    entries: list[dict[str, object]] = field(default_factory=list)
+
+    async def create_audit_log_entry(self, **fields: object) -> object:
+        self.entries.append(fields)
+        return None
+
+
 def _stub_pdf_renderer(quotation: Quotation, items: list[QuotationLineItem]) -> bytes:
     """Never invokes real ``reportlab`` rendering -- every service-layer
     test below mocks PDF byte generation, per this module's own docstring."""
@@ -165,13 +192,14 @@ def _make_line_items() -> list[LineItemInput]:
 
 
 def _make_service(
-    *, email_provider: object | None = None
+    *, email_provider: object | None = None, audit_writer: object | None = None
 ) -> tuple[QuotationService, FakeQuotationRepository]:
     repository = FakeQuotationRepository()
     service = QuotationService(
         repository,
         email_provider=email_provider,
         pdf_renderer=_stub_pdf_renderer,
+        audit_writer=audit_writer,
     )
     return service, repository
 
@@ -604,3 +632,319 @@ class TestGetAndListQuotations:
         result = await service.list_quotations(search="anderson")
         assert len(result.items) == 1
         assert result.items[0].client_name == "Alice Anderson"
+
+
+# ============================================================================
+# Delete (soft) -- service layer
+# ============================================================================
+
+
+async def _create_one(
+    service: QuotationService, *, client_email: str = "client@example.com"
+) -> Quotation:
+    return await service.create_and_send_quotation(
+        actor_user_id=uuid.uuid4(),
+        client_name="Client Name",
+        client_email=client_email,
+        client_company_name="Client Hotels",
+        line_items=_make_line_items(),
+        tax_percentage=Decimal("0"),
+        currency="USD",
+        valid_until=_now() + timedelta(days=30),
+        notes=None,
+    )
+
+
+class TestDeleteQuotation:
+    async def test_delete_flags_the_row_and_never_removes_it(self) -> None:
+        """Soft, not hard. The row must still be there after a delete --
+        this is the assertion that fails if anybody later swaps
+        ``soft_delete_quotation`` for a real row deletion, which would also
+        take the ``quotation_line_items`` children with it via their
+        ``ON DELETE CASCADE``."""
+        service, repository = _make_service(email_provider=FakeEmailProvider())
+        quotation = await _create_one(service)
+
+        deleted = await service.delete_quotation(
+            quotation.id, actor_user_id=uuid.uuid4()
+        )
+
+        assert deleted.is_deleted is True
+        assert deleted.deleted_at is not None
+        # Still in the store, not dropped.
+        assert quotation.id in repository.quotations
+        # Line items untouched -- the parent flag is what hides them.
+        assert len(await repository.list_items(quotation.id)) == 2
+
+    async def test_deleted_quotation_disappears_from_get_and_list(self) -> None:
+        service, _repository = _make_service(email_provider=FakeEmailProvider())
+        quotation = await _create_one(service)
+        assert len((await service.list_quotations()).items) == 1
+
+        await service.delete_quotation(quotation.id, actor_user_id=uuid.uuid4())
+
+        assert len((await service.list_quotations()).items) == 0
+        with pytest.raises(QuotationNotFoundError):
+            await service.get_quotation(quotation.id)
+
+    async def test_deleting_twice_raises_not_found(self) -> None:
+        """A retried click reports "not found" rather than writing a second
+        ``deleted_at`` and a duplicate audit entry -- ``get_quotation``
+        already treats an ``is_deleted`` row as absent."""
+        audit = FakeAuditWriter()
+        service, _repository = _make_service(
+            email_provider=FakeEmailProvider(), audit_writer=audit
+        )
+        quotation = await _create_one(service)
+
+        await service.delete_quotation(quotation.id, actor_user_id=uuid.uuid4())
+        with pytest.raises(QuotationNotFoundError):
+            await service.delete_quotation(quotation.id, actor_user_id=uuid.uuid4())
+
+        assert len(audit.entries) == 1
+
+    async def test_delete_unknown_id_raises_not_found(self) -> None:
+        service, _repository = _make_service(email_provider=FakeEmailProvider())
+
+        with pytest.raises(QuotationNotFoundError):
+            await service.delete_quotation(uuid.uuid4(), actor_user_id=uuid.uuid4())
+
+    async def test_delete_is_allowed_in_every_status(self) -> None:
+        """There is deliberately no status guard -- ``QuotationStatus`` has
+        no terminal commercial state (no accepted/converted/invoiced
+        transition exists in this domain) and nothing else in the codebase
+        references a quotation row. This test states that choice so that
+        adding such a state later fails here rather than silently."""
+        for status_value in (
+            QuotationStatus.DRAFT.value,
+            QuotationStatus.SENT.value,
+            QuotationStatus.FAILED.value,
+        ):
+            service, repository = _make_service(email_provider=FakeEmailProvider())
+            quotation = await _create_one(service)
+            await repository.update_quotation(quotation, {"status": status_value})
+
+            deleted = await service.delete_quotation(
+                quotation.id, actor_user_id=uuid.uuid4()
+            )
+            assert deleted.is_deleted is True
+
+    async def test_delete_writes_one_audit_entry_naming_the_actor(self) -> None:
+        audit = FakeAuditWriter()
+        service, _repository = _make_service(
+            email_provider=FakeEmailProvider(), audit_writer=audit
+        )
+        quotation = await _create_one(service)
+        actor_id = uuid.uuid4()
+
+        await service.delete_quotation(quotation.id, actor_user_id=actor_id)
+
+        assert len(audit.entries) == 1
+        entry = audit.entries[0]
+        assert entry["action"] == AuditAction.QUOTATION_DELETED.value
+        assert entry["entity_type"] == "quotation"
+        assert entry["entity_id"] == quotation.id
+        assert entry["actor_user_id"] == actor_id
+        # A quotation belongs to no organization or location -- see
+        # app.domains.quotation.models's own module docstring.
+        assert entry["organization_id"] is None
+        assert entry["location_id"] is None
+
+    async def test_delete_without_an_audit_writer_still_deletes(self) -> None:
+        """A missing writer must never be the reason a real operator action
+        fails -- same contract ``ChannelPartnerService``'s own optional
+        writer has."""
+        service, _repository = _make_service(email_provider=FakeEmailProvider())
+        quotation = await _create_one(service)
+
+        deleted = await service.delete_quotation(quotation.id, actor_user_id=None)
+
+        assert deleted.is_deleted is True
+
+
+# ============================================================================
+# Delete -- authorization scoping
+# ============================================================================
+
+
+class TestDeleteQuotationAuthorizationScope:
+    """A quotation carries no ``organization_id`` (see
+    ``app.domains.quotation.models``'s own module docstring), so unlike
+    every org-owned resource in this codebase there is no entity-derived
+    organization for the handler to re-check the caller against. The RBAC
+    check *is* the whole authorization -- which is precisely the shape that
+    goes wrong when the permission is evaluated at whatever scope the
+    caller's own headers imply. These tests pin the two halves that stop
+    that: the route is checked at GLOBAL, and a narrower grant of the same
+    key cannot satisfy a GLOBAL check.
+    """
+
+    def test_delete_route_pins_the_permission_check_to_global_scope(self) -> None:
+        """``RequirePermission`` with no ``scope=`` infers the scope from
+        whichever scope headers the caller sent -- i.e. the caller chooses
+        the level their own permission is evaluated at. The delete route
+        must not do that."""
+        from app.domains.rbac.dependencies import _infer_scope_type  # noqa: F401
+        from app.main import create_app
+
+        app = create_app()
+        delete_routes = [
+            route
+            for route in app.routes
+            if getattr(route, "path", "").endswith("/quotations/{quotation_id}")
+            and "DELETE" in getattr(route, "methods", set())
+        ]
+        assert len(delete_routes) == 1, "DELETE /quotations/{quotation_id} not mounted"
+
+        closure_scopes = [
+            cell.cell_contents
+            for dependency in delete_routes[0].dependant.dependencies
+            for cell in (dependency.call.__closure__ or ())
+            if isinstance(cell.cell_contents, ScopeType)
+        ]
+        assert ScopeType.GLOBAL in closure_scopes, (
+            "DELETE /quotations/{quotation_id} must pass scope=ScopeType.GLOBAL; "
+            "without it the caller's own X-Organization-Id header decides the "
+            "scope the check runs at."
+        )
+
+        closure_keys = [
+            cell.cell_contents
+            for dependency in delete_routes[0].dependant.dependencies
+            for cell in (dependency.call.__closure__ or ())
+            if isinstance(cell.cell_contents, str)
+        ]
+        assert "quotations.delete" in closure_keys
+
+    def test_an_organization_scoped_grant_cannot_satisfy_the_global_check(
+        self,
+    ) -> None:
+        """The cross-tenant case. An operator whose ``quotations.delete``
+        grant is scoped to their own organization -- however they got it,
+        and whatever ``X-Organization-Id`` they send -- is refused, because
+        a grant can never satisfy a check at a broader level than itself.
+        A GLOBAL grant is the only one that passes."""
+        org_id = uuid.uuid4()
+        org_grant = GrantScope(
+            scope_type=ScopeType.ORGANIZATION, organization_id=org_id
+        )
+        requested = ScopeContext(organization_id=org_id)
+
+        assert (
+            ScopeResolver.satisfies(org_grant, ScopeType.GLOBAL, requested) is False
+        )
+        assert (
+            ScopeResolver.satisfies(
+                GrantScope(scope_type=ScopeType.LOCATION, location_id=uuid.uuid4()),
+                ScopeType.GLOBAL,
+                requested,
+            )
+            is False
+        )
+        assert (
+            ScopeResolver.satisfies(
+                GrantScope(scope_type=ScopeType.GLOBAL), ScopeType.GLOBAL, requested
+            )
+            is True
+        )
+
+    async def test_access_validator_denies_an_org_scoped_delete_grant(self) -> None:
+        """The same fact one layer up, through the engine the dependency
+        actually calls: holding ``quotations.delete`` at ORGANIZATION scope
+        is not permission to delete a quotation."""
+        user_id = uuid.uuid4()
+        org_id = uuid.uuid4()
+
+        class _StubValidator(AccessValidator):
+            def __init__(self, grants: EffectiveGrants) -> None:
+                self._grants = grants
+                self.cache = None
+                self.denial_audit_repository = None
+                self.scope_resolver = ScopeResolver()
+
+            async def get_effective_grants(
+                self, _user_id: uuid.UUID
+            ) -> EffectiveGrants:
+                return self._grants
+
+        org_scoped = _StubValidator(
+            EffectiveGrants(
+                allow=(
+                    EffectiveGrant(
+                        permission_key="quotations.delete",
+                        effect="allow",
+                        scope=GrantScope(
+                            scope_type=ScopeType.ORGANIZATION, organization_id=org_id
+                        ),
+                        source="test",
+                    ),
+                ),
+                deny=(),
+            )
+        )
+        assert (
+            await org_scoped.has_permission(
+                user_id,
+                "quotations.delete",
+                scope_type=ScopeType.GLOBAL,
+                scope_context=ScopeContext(organization_id=org_id),
+            )
+            is False
+        )
+
+        global_scoped = _StubValidator(
+            EffectiveGrants(
+                allow=(
+                    EffectiveGrant(
+                        permission_key="quotations.delete",
+                        effect="allow",
+                        scope=GrantScope(scope_type=ScopeType.GLOBAL),
+                        source="test",
+                    ),
+                ),
+                deny=(),
+            )
+        )
+        assert (
+            await global_scoped.has_permission(
+                user_id,
+                "quotations.delete",
+                scope_type=ScopeType.GLOBAL,
+                scope_context=ScopeContext(organization_id=org_id),
+            )
+            is True
+        )
+
+
+class TestQuotationsDeletePermissionIsSeeded:
+    def test_quotations_module_seeds_a_delete_action(self) -> None:
+        """The endpoint is gated on ``quotations.delete``; if that key is
+        not in MODULE_ACTIONS it is never seeded into the ``permissions``
+        table, and the route 403s for everyone with no other signal."""
+        from app.domains.rbac.enums import PermissionAction, PermissionModule
+        from app.domains.rbac.seed import MODULE_ACTIONS
+
+        assert (
+            PermissionAction.DELETE
+            in MODULE_ACTIONS[PermissionModule.QUOTATIONS]
+        )
+
+    def test_operate_level_roles_cannot_delete_quotations(self) -> None:
+        """Why DELETE is its own action rather than folded into MANAGE:
+        ``expand_grant_level`` withholds DELETE from GrantLevel.OPERATE, so
+        a role that may generate and read quotations still cannot remove
+        them."""
+        from app.domains.rbac.enums import PermissionAction, PermissionModule
+        from app.domains.rbac.seed import (
+            MODULE_ACTIONS,
+            GrantLevel,
+            expand_grant_level,
+        )
+
+        actions = MODULE_ACTIONS[PermissionModule.QUOTATIONS]
+        operate = expand_grant_level(GrantLevel.OPERATE, actions)
+        full = expand_grant_level(GrantLevel.FULL, actions)
+
+        assert PermissionAction.DELETE not in operate
+        assert PermissionAction.CREATE in operate
+        assert PermissionAction.DELETE in full

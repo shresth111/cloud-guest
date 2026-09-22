@@ -1027,6 +1027,17 @@ class AuditAction(StrEnum):
     CHANNEL_PARTNER_REVOKED = "channel_partner_revoked"
     CHANNEL_PARTNER_WELCOME_RESENT = "channel_partner_welcome_resent"
 
+    # Quotation domain event -- written through this same table by
+    # ``app.domains.quotation.service.QuotationService`` via the identical
+    # narrow ``AuditLogWriter`` protocol the Channel Partner domain above
+    # uses. Only the destructive transition is audited, not creation: a
+    # quotation's creation is reconstructable from the row's own
+    # ``created_at``/``created_by``, but a soft delete removes it from
+    # every read path in the console, so "who made this disappear, and
+    # when" has no other source. Same split, same reasoning, as
+    # ``CHANNEL_PARTNER_REVOKED`` directly above.
+    QUOTATION_DELETED = "quotation_deleted"
+
     # System Settings domain event -- the platform-wide (GLOBAL-scope)
     # configuration store (``app.domains.system_settings``), written through
     # this same table via the identical narrow ``AuditLogWriter`` protocol
