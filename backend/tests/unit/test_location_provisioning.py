@@ -36,6 +36,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
 from app.domains.auth.service import AuthService, PasswordChangeRequiredError
 from app.domains.billing.constants import PlanFeatureKey, PlanFeatureType, PlanType
@@ -75,6 +76,7 @@ from app.domains.notification.constants import (
     NotificationChannelType,
     NotificationEventType,
 )
+from app.domains.notification.onboarding_slack import OnboardingSlackNotifier
 from app.domains.organization.enums import OrganizationStatus, OrganizationType
 from app.domains.organization.exceptions import (
     DuplicateSlugError,
@@ -1597,6 +1599,15 @@ def _fake_request() -> Any:
     return SimpleNamespace(state=SimpleNamespace())
 
 
+class _UnusedEnqueuer:
+    """Never called: every route test below wires a DISABLED
+    `OnboardingSlackNotifier`, which returns before touching its
+    enqueuer. It exists so the notifier can be constructed at all."""
+
+    async def enqueue(self, **kwargs: object) -> object:  # pragma: no cover
+        raise AssertionError("a disabled notifier must not enqueue")
+
+
 class TestProvisionWithoutRouter:
     """A venue whose WiFi is a TP-Link Omada controller has no MikroTik, so
     ``RouterInput`` (serial, MAC, model) has nothing honest to hold. Before
@@ -1765,6 +1776,15 @@ class TestProvisionWithoutRouter:
             payload=payload,
             user=AuthUser(id=str(uuid.uuid4()), email="admin@wyfy.example.com"),
             provisioning_service=service,
+            # Called directly rather than through FastAPI, so the two
+            # `Depends(...)` defaults have to be supplied by hand. A
+            # disabled notifier is what an unconfigured deployment (and
+            # every test run) actually gets -- see
+            # app.domains.notification.onboarding_slack.
+            onboarding_slack=OnboardingSlackNotifier(
+                notification_service=_UnusedEnqueuer(), enabled=False
+            ),
+            settings=get_settings(),
         )
 
         data = response["data"]
@@ -1798,6 +1818,15 @@ class TestProvisionWithoutRouter:
             payload=payload,
             user=AuthUser(id=str(uuid.uuid4()), email="admin@wyfy.example.com"),
             provisioning_service=service,
+            # Called directly rather than through FastAPI, so the two
+            # `Depends(...)` defaults have to be supplied by hand. A
+            # disabled notifier is what an unconfigured deployment (and
+            # every test run) actually gets -- see
+            # app.domains.notification.onboarding_slack.
+            onboarding_slack=OnboardingSlackNotifier(
+                notification_service=_UnusedEnqueuer(), enabled=False
+            ),
+            settings=get_settings(),
         )
 
         data = response["data"]
