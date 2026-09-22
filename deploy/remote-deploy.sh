@@ -261,9 +261,18 @@ for prefix in ("", "ADMIN_", "DEMO_", "ALERT_", "SUPPORT_", "INVOICE_"):
             out[key] = str(value)
 
 # Keys that are not a mailbox and carry no password of their own.
+#
+# CLOUDGUEST_PLATFORM_ALERT_SLACK_WEBHOOK_URL is here because it is the one
+# alerting destination that is a *credential*: anyone holding that URL can
+# post into the platform-ops channel. Its email counterpart
+# (CLOUDGUEST_PLATFORM_ALERT_EMAILS) is just addresses and lives fine in the
+# box's .env; a bearer token does not. Absent from the secret, nothing is
+# written and whatever the box's .env says still stands -- so adding this
+# key here cannot change a deployment that has not opted in.
 for key in (
     "CLOUDGUEST_EMAIL_DELIVERY_PROVIDER",
     "CLOUDGUEST_DEMO_REQUEST_NOTIFY_EMAIL",
+    "CLOUDGUEST_PLATFORM_ALERT_SLACK_WEBHOOK_URL",
 ):
     value = data.get(key)
     if value is not None and str(value).strip():
