@@ -66,6 +66,14 @@ concurrency:
 permissions:
   id-token: write   # required to mint the OIDC token
   contents: read
+  # Granted at the workflow level because this workflow CALLS ci.yml, and a
+  # reusable workflow's jobs cannot request a permission the caller did not
+  # grant. ci.yml's notify job asks for `actions: read` (it reads the run's
+  # start time to report a duration); without this line every CD run dies with
+  # `startup_failure` before a single job is scheduled -- no logs, no jobs, and
+  # nothing in the UI that names the missing scope. The deploy jobs below do
+  # not use it.
+  actions: read
 
 env:
   AWS_REGION: ap-south-1
