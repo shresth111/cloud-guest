@@ -1394,6 +1394,7 @@ class AlertService:
         monitored_hardware_service: MonitoredHardwareService | None = None,
         caller_location_scope: LocationScope = None,
         platform_alert_emails: Sequence[str] = (),
+        platform_alert_slack_webhook_url: str = "",
     ) -> None:
         self.repository = repository
         self.notification_service = notification_service
@@ -1402,6 +1403,12 @@ class AlertService:
         # Empty (the default, and every existing caller/test) sends nothing
         # extra. See _dispatch_platform_copies.
         self.platform_alert_emails = tuple(platform_alert_emails)
+        # ``Settings.platform_alert_slack_webhook_url`` -- the same copy, to
+        # the team's own Slack channel. Independent of the inboxes above:
+        # either, both or neither may be set, and one being unreachable
+        # never costs the other. Empty (the default, and every existing
+        # caller/test) posts nothing.
+        self.platform_alert_slack_webhook_url = platform_alert_slack_webhook_url
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
         # Real-Time (BE-011 Part 3): optional, additive -- see
@@ -2501,8 +2508,20 @@ class AlertService:
     async def _dispatch_platform_copies(
         self, alert: Alert, *, already_emailed: set[str]
     ) -> None:
-        """Email ``Settings.platform_alert_emails`` about a network-
-        controller alert, naming the organization and venue.
+        """Tell the platform team about a network-controller alert, naming
+        the organization and venue: email ``Settings.platform_alert_emails``
+        and post to ``Settings.platform_alert_slack_webhook_url``.
+
+        ## Two destinations, one copy
+
+        Both carry the same alerts under the same scope, and neither
+        replaces the other or the organization's own channels. Either,
+        both, or neither may be configured. They are dispatched
+        independently and neither can cost the other: a revoked Slack
+        webhook still leaves the email copy, and an unconfigured mailbox
+        still leaves the Slack post (see
+        ``email_provider.UnconfiguredEmailProvider`` for why that case
+        fails per-send rather than at construction).
 
         ## Scope
 
@@ -2522,15 +2541,23 @@ class AlertService:
         failed, a platform address that happens to equal it would otherwise
         lose the only copy anybody got.
 
+        This applies to the email copies only. The Slack post has nothing
+        to de-duplicate against: ``already_emailed`` holds email addresses,
+        and an organization delivering to its own SLACK channel is
+        delivering to its own workspace, not the platform team's.
+
         ## Why no ``notification_logs`` row
 
-        ``notification_logs.channel_id`` is NOT NULL and these recipients
+        ``notification_logs.channel_id`` is NOT NULL and both destinations
         are a setting, not a channel. Inventing a channel row per address
-        would be a second source of truth that drifts from the env the
-        moment somebody edits it. Each copy is a structured log line
-        (``platform_alert_copy_sent`` / ``_failed``) instead.
+        or per webhook would be a second source of truth that drifts from
+        the env the moment somebody edits it. Each copy is a structured log
+        line (``platform_alert_copy_sent`` / ``_failed`` for email,
+        ``platform_alert_slack_sent`` / ``_failed`` for Slack) instead.
         """
-        if not self.platform_alert_emails or self.notification_service is None:
+        if self.notification_service is None:
+            return
+        if not self.platform_alert_emails and not self.platform_alert_slack_webhook_url:
             return
         rule = await self.repository.get_alert_rule(alert.rule_id)
         if (
@@ -2543,7 +2570,7 @@ class AlertService:
             for address in self.platform_alert_emails
             if address.lower() not in already_emailed
         ]
-        if not recipients:
+        if not recipients and not self.platform_alert_slack_webhook_url:
             return
         (
             organization_name,
@@ -2563,6 +2590,13 @@ class AlertService:
             await self.notification_service.send_platform_alert_email(
                 alert=alert,
                 email=address,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+        if self.platform_alert_slack_webhook_url:
+            await self.notification_service.send_platform_alert_slack(
+                alert=alert,
+                webhook_url=self.platform_alert_slack_webhook_url,
                 organization_label=organization_label,
                 venue_label=venue_label,
             )
@@ -3205,6 +3239,32 @@ class SlackNotifier:
         response = await _post_json(self.http_client, webhook_url, payload)
         return f"HTTP {response.status_code}"
 
+    async def send_platform_copy(
+        self,
+        webhook_url: str,
+        *,
+        alert: Alert,
+        organization_label: str,
+        venue_label: str,
+    ) -> str:
+        """The platform team's copy, led by which tenant and which venue it
+        is about -- the exact counterpart of
+        ``EmailNotifier.send_platform_copy``, and led for the exact same
+        reason: this message arrives for every tenant, so without that line
+        it says a controller is unreachable without saying whose.
+
+        Still a plain ``{"text": ...}`` POST, so a receiver that is not
+        Slack but speaks Slack's incoming-webhook shape keeps working.
+        """
+        payload = {
+            "text": (
+                f"{_format_alert_message(alert)}\n"
+                f"Organization: {organization_label}. Venue: {venue_label}."
+            )
+        }
+        response = await _post_json(self.http_client, webhook_url, payload)
+        return f"HTTP {response.status_code}"
+
 
 class TeamsNotifier:
     """A REAL ``httpx.AsyncClient`` POST to a Microsoft Teams incoming-
@@ -3395,6 +3455,70 @@ class NotificationService:
         logger.info(
             "platform_alert_copy_sent",
             extra={"alert_id": str(alert.id), "email": email},
+        )
+        return True
+
+    async def send_platform_alert_slack(
+        self,
+        *,
+        alert: Alert,
+        webhook_url: str,
+        organization_label: str,
+        venue_label: str,
+    ) -> bool:
+        """Post the platform team's copy of one alert to one Slack
+        incoming-webhook URL.
+
+        The Slack counterpart of :meth:`send_platform_alert_email`, with
+        the identical contract, for the identical reasons:
+
+        * **Never raises.** A Slack workspace that has revoked the webhook,
+          or is simply unreachable, must not cost the platform team the
+          email copy of the same alert, must not cost the *organization*
+          its own channels, and must not crash the evaluation pass. See
+          this class's docstring.
+        * **Writes no ``NotificationLog``.** ``notification_logs
+          .channel_id`` is NOT NULL and this destination is a setting, not
+          a ``NotificationChannel`` -- inventing a channel row for it would
+          be a second source of truth that drifts from the env the moment
+          somebody edits it. See ``AlertService._dispatch_platform_copies``.
+        * **The outcome is recorded either way**, as a structured log line
+          (``platform_alert_slack_sent`` / ``_failed``) and as this
+          method's return value. A failure is never reported as a success
+          and never silently dropped: the ``_failed`` line carries the real
+          error (``HTTP 404: no_service``, a connect timeout, ...), which
+          is the diagnostic an operator needs to tell "nobody configured
+          it" apart from "the webhook is dead".
+
+        The URL is never logged. It is bearer-equivalent -- anyone holding
+        it can post into the channel -- which is exactly why a tenant's own
+        is Fernet-encrypted at rest in ``config_encrypted``.
+        """
+        notifier = self._notifiers[NotificationChannelType.SLACK.value]
+        try:
+            if not isinstance(notifier, SlackNotifier):
+                raise TypeError("the slack notifier is not a SlackNotifier")
+            response_summary = await notifier.send_platform_copy(
+                webhook_url,
+                alert=alert,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see class docstring
+            logger.warning(
+                "platform_alert_slack_failed",
+                extra={
+                    "alert_id": str(alert.id),
+                    "error": str(exc)[:500],
+                },
+            )
+            return False
+        logger.info(
+            "platform_alert_slack_sent",
+            extra={
+                "alert_id": str(alert.id),
+                "response_summary": response_summary,
+            },
         )
         return True
 

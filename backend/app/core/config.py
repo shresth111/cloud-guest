@@ -1376,6 +1376,58 @@ class Settings(BaseSettings):
             address for address in self.platform_alert_emails.split(",") if address
         )
 
+    platform_alert_slack_webhook_url: str = Field(
+        default="",
+        description=(
+            "Slack incoming-webhook URL the WyFy platform team's own copy of "
+            "every WiFi-controller (TP-Link Omada) alert is ALSO posted to, "
+            "for every organization -- the exact same alerts, the exact same "
+            "network_controller* scope and the exact same 'in addition to, "
+            "never instead of, the organization's own channels' rule as "
+            "platform_alert_emails directly above. See "
+            "app.domains.monitoring.service.AlertService"
+            "._dispatch_platform_copies. Empty (the default) posts nothing.\n"
+            "\n"
+            "Why a Setting rather than a NotificationChannel row: a "
+            "NotificationChannel is per-organization and is delivered to only "
+            "because an AlertRule is linked to it, so putting the team's own "
+            "Slack channel there would mean linking one channel to every rule "
+            "of every tenant -- a fleet-wide write (130 rules across 17 "
+            "organizations, measured in production on 2026-09-22) to "
+            "express one platform-team preference, which would then drift "
+            "the moment anybody adds a rule. The team's "
+            "destination is deployment configuration, exactly like "
+            "platform_alert_emails, so it lives in exactly the same place.\n"
+            "\n"
+            "An incoming-webhook URL, not a bot token: this is the credential "
+            "app.domains.monitoring.service.SlackNotifier already posts to "
+            "for tenant-owned SLACK channels, it needs no OAuth install, no "
+            "token refresh and no scope negotiation, and it is generated free "
+            "in seconds. A bot token would buy channel selection at send time "
+            "-- which a single fixed platform-ops channel does not need."
+        ),
+    )
+
+    @field_validator("platform_alert_slack_webhook_url")
+    @classmethod
+    def _normalize_platform_alert_slack_webhook_url(cls, value: str) -> str:
+        """Same posture as ``_normalize_platform_alert_emails``: malformed
+        stops the process from starting rather than silently posting
+        nowhere. ``https://`` only, matching
+        ``validators.validate_notification_channel_config``'s rule for a
+        tenant's own SLACK channel exactly -- and deliberately NOT a
+        ``hooks.slack.com`` host check, because Slack's own webhook URLs
+        live under more than one path and Slack-compatible receivers
+        (Mattermost, Rocket.Chat) accept the identical payload.
+        """
+        url = (value or "").strip()
+        if url and not url.startswith("https://"):
+            raise ValueError(
+                "platform_alert_slack_webhook_url must start with https:// "
+                f"(got {url!r})"
+            )
+        return url
+
     # ======================================================================
     # Demo booking calendar (app.domains.demo_booking)
     # ======================================================================
@@ -1997,12 +2049,26 @@ class Settings(BaseSettings):
         This is not a claim that the setting is required. Sending no
         platform copy is a legitimate choice; it just has to be a visible
         one.
+
+        ## Why the two platform-copy destinations are one gap, not two
+
+        ``platform_alert_emails`` and ``platform_alert_slack_webhook_url``
+        are two ways to deliver the *same* copy of the *same* alerts. A
+        deployment that has set one of them is not missing anything, so
+        naming the other one every startup would be a warning that is
+        simply untrue -- and a warning an operator learns to ignore is
+        worse than no warning, which is the exact failure mode this method
+        exists to prevent. The gap is "the platform team is told nowhere",
+        and it names both env vars because either one closes it.
         """
         if self.is_local_environment:
             return []
         gaps: list[str] = []
-        if not self.platform_alert_email_list:
+        if not self.platform_alert_email_list and (
+            not self.platform_alert_slack_webhook_url
+        ):
             gaps.append("CLOUDGUEST_PLATFORM_ALERT_EMAILS")
+            gaps.append("CLOUDGUEST_PLATFORM_ALERT_SLACK_WEBHOOK_URL")
         return gaps
 
     def uses_public_network_integration_key(self) -> bool:

@@ -473,6 +473,57 @@ channel's delivery is recorded as `FAILED` with a diagnosable
 alert's own `TRIGGERED`/`RESOLVED` state (the actual source of truth an
 operator or automated poller relies on) is completely unaffected.
 
+## 17a. The platform team's own copy: a Setting, not a channel
+
+`AlertService._dispatch_platform_copies` sends the WyFy platform team its
+own copy of every **WiFi-controller** alert (the three
+`ALERT_TARGET_NETWORK_CONTROLLER*` targets, and only those), for every
+organization, naming the organization and the venue. Two destinations, both
+optional, both configured in the environment:
+
+| Setting | Env var | Delivery |
+| --- | --- | --- |
+| `platform_alert_emails` | `CLOUDGUEST_PLATFORM_ALERT_EMAILS` | `EmailNotifier.send_platform_copy`, via the `alert@` identity |
+| `platform_alert_slack_webhook_url` | `CLOUDGUEST_PLATFORM_ALERT_SLACK_WEBHOOK_URL` | `SlackNotifier.send_platform_copy`, a real `httpx` POST |
+
+Either, both or neither may be set. They are dispatched independently: a
+revoked Slack webhook still leaves the email copy, and an unconfigured
+mailbox still leaves the Slack post.
+
+**Why these are Settings and not `NotificationChannel` rows.** A
+`NotificationChannel` belongs to one organization and is only ever delivered
+to because an `AlertRule` is linked to it. Expressing "the platform team
+watches every tenant's controller" that way would mean one channel linked to
+every rule of every tenant -- a fleet-wide write across every organization's
+alerting configuration to record one platform-team preference, which then
+drifts the moment anybody adds a rule. The team's destination is deployment
+configuration, so it lives where deployment configuration lives.
+
+**Consequences of that choice, stated plainly.** These copies write **no**
+`notification_logs` row: `notification_logs.channel_id` is `NOT NULL`, and
+inventing a channel row per address or per webhook would be a second source
+of truth that drifts from the env. The outcome of each copy is a structured
+log line instead -- `platform_alert_copy_sent`/`_failed` for email,
+`platform_alert_slack_sent`/`_failed` for Slack, the failing one carrying
+the real error (`HTTP 404: no_service`, a connect timeout, ...). Neither can
+raise, for the same reason §17 gives.
+
+**Incoming webhook, not a bot token.** Slack offers both. A bot token buys
+choosing the channel at send time, which a single fixed platform-ops channel
+does not need, and costs an OAuth install, token storage and rotation. The
+webhook URL is the same credential `SlackNotifier` already posts to for a
+tenant's own `SLACK` channel, so there is one Slack integration here, not
+two. It is bearer-equivalent -- anyone holding it can post into the channel
+-- which is why a tenant's own is Fernet-encrypted at rest (§13) and why
+this one belongs in the deployment's secret store rather than in git. It is
+never logged.
+
+**When neither is set**, `Settings.alerting_delivery_gaps` names *both* env
+vars at startup (`alert_delivery_not_configured`, WARNING). It is one gap,
+not two, because either setting closes it -- naming the unset one on a
+deployment that has configured the other would be a warning that is simply
+untrue, and a warning operators learn to ignore is worse than none.
+
 # BE-011 Part 3: Real-Time + ZTP Monitoring Dashboard + Analytics -- Design Decisions
 
 Part 3 extends the same `app.domains.monitoring` domain (no new top-level
