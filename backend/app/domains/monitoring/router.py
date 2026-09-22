@@ -163,6 +163,7 @@ from .dependencies import (
     get_sla_service,
     get_ztp_monitoring_service,
 )
+from .exceptions import UnspecifiedChannelOwnerError
 from .models import (
     Alert,
     AlertRule,
@@ -193,10 +194,13 @@ from .schemas import (
     IncidentListResponse,
     IncidentResponse,
     IncidentUpdateRequest,
+    NotificationChannelConfigSummaryResponse,
     NotificationChannelCreateRequest,
     NotificationChannelListResponse,
     NotificationChannelResponse,
+    NotificationChannelTestResponse,
     NotificationChannelUpdateRequest,
+    NotificationDeliveryStatusResponse,
     NotificationLogListResponse,
     NotificationLogResponse,
     PlatformDashboardResponse,
@@ -230,6 +234,7 @@ from .service import (
     ZtpDashboardResult,
     ZtpMonitoringService,
 )
+from .tasks import send_channel_test_notification
 
 router = APIRouter(tags=["Monitoring"])
 
@@ -503,8 +508,39 @@ def _alert_response(
 
 def _notification_channel_response(
     channel: NotificationChannel,
+    *,
+    service: NotificationService | None = None,
+    last_delivery: NotificationLog | None = None,
 ) -> NotificationChannelResponse:
-    return NotificationChannelResponse.model_validate(channel)
+    """Serialize one channel.
+
+    ``config_summary`` is populated only when a ``service`` is supplied to
+    compute it, because computing it decrypts the config -- and a response
+    builder that decrypted unconditionally would be doing cryptography in
+    a code path that may not need it. Every handler below does supply it;
+    the parameter exists so that fact is visible at each call site rather
+    than hidden in here.
+
+    Note what is *not* happening: the model is never dumped wholesale and
+    the decrypted mapping never reaches this function. ``summarize_channel``
+    returns a fixed-shape summary, which is all that is copied across.
+    """
+    response = NotificationChannelResponse.model_validate(channel)
+    if service is not None:
+        summary = service.summarize_channel(channel)
+        response.config_summary = NotificationChannelConfigSummaryResponse(
+            configured=summary.configured,
+            target=summary.target,
+            fingerprint=summary.fingerprint,
+            has_secret=summary.has_secret,
+            auth_header_name=summary.auth_header_name,
+            requirements=list(summary.requirements),
+        )
+    if last_delivery is not None:
+        response.last_delivery = NotificationDeliveryStatusResponse.model_validate(
+            last_delivery
+        )
+    return response
 
 
 def _notification_log_response(log: NotificationLog) -> NotificationLogResponse:
@@ -853,19 +889,49 @@ async def evaluate_alert_rules(
 async def create_notification_channel(
     request: Request,
     payload: NotificationChannelCreateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NotificationService = Depends(get_notification_service),
 ):
+    # Tenant scoping on the WRITE side. ``RequirePermission`` above checks
+    # the caller's scope; this handler used to take ``organization_id``
+    # straight from the body and never compare the two -- the same shape as
+    # the path-id defect class ``app/domains/organization/scoping.py``
+    # documents, arriving through the body instead of the path.
+    #
+    # It mattered here more than it looks: ``PermissionModule.NOTIFICATIONS``
+    # is seeded at ``ScopeType.LOCATION`` with ``GrantLevel.OPERATE`` on
+    # ``Office Admin`` and ``Location Manager``, so a single venue's
+    # front-office account held ``notifications.manage`` -- and a body of
+    # ``{"organization_id": null}`` creates a *platform-wide* channel, the
+    # scope a system alert rule delivers to. See
+    # ``service._assert_may_own``.
+    #
+    # The second clause is the GLOBAL-scope fan-out guard. ``None`` here
+    # means the caller explicitly asked for cross-tenant breadth (see
+    # ``app.domains.rbac.organization_scope``); that is a legitimate answer
+    # for a read and is not a place a channel can exist. Such a caller must
+    # name the organization -- or ``null`` for a deliberate platform-wide
+    # channel -- in the body, which ``organization_id`` being unset cannot
+    # express, so the request is refused rather than resolved to a guess.
+    if requesting_organization_id is None and "organization_id" not in (
+        payload.model_fields_set
+    ):
+        raise UnspecifiedChannelOwnerError()
     channel = await service.create_channel(
         organization_id=payload.organization_id,
         channel_type=payload.channel_type,
         name=payload.name,
         config=payload.config,
         is_active=payload.is_active,
+        event_categories=list(payload.event_categories),
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
         message="Notification channel created",
-        data=_notification_channel_response(channel).model_dump(mode="json"),
+        data=_notification_channel_response(
+            channel, service=service
+        ).model_dump(mode="json"),
         request_id=_request_id(request),
     )
 
@@ -897,8 +963,16 @@ async def list_notification_channels(
         page=page,
         page_size=page_size,
     )
+    # One query for the whole page's last-delivery badges, never one per
+    # row -- see ``latest_notification_logs_by_channel``.
+    latest = await service.latest_logs_for_channels([item.id for item in items])
     payload = NotificationChannelListResponse(
-        items=[_notification_channel_response(item) for item in items],
+        items=[
+            _notification_channel_response(
+                item, service=service, last_delivery=latest.get(item.id)
+            )
+            for item in items
+        ],
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -929,10 +1003,13 @@ async def get_notification_channel(
     channel = await service.get_channel(
         channel_id, requesting_organization_id=requesting_organization_id
     )
+    latest = await service.latest_logs_for_channels([channel.id])
     return build_response(
         success=True,
         message="Notification channel retrieved",
-        data=_notification_channel_response(channel).model_dump(mode="json"),
+        data=_notification_channel_response(
+            channel, service=service, last_delivery=latest.get(channel.id)
+        ).model_dump(mode="json"),
         request_id=_request_id(request),
     )
 
@@ -960,7 +1037,68 @@ async def update_notification_channel(
     return build_response(
         success=True,
         message="Notification channel updated",
-        data=_notification_channel_response(channel).model_dump(mode="json"),
+        data=_notification_channel_response(
+            channel, service=service
+        ).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/notifications/channels/{channel_id}/test",
+    response_model=ApiResponse[NotificationChannelTestResponse],
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(RequirePermission("notifications.manage"))],
+)
+async def test_notification_channel(
+    request: Request,
+    channel_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NotificationService = Depends(get_notification_service),
+):
+    """Queue one clearly-labelled test delivery over this channel.
+
+    ## Why 202 and not the result
+
+    The send is an outbound call to somebody else's server. Awaiting it
+    inline would put a third party's latency on an operator's request --
+    and, worse, would make the API's own timeout the thing that decides
+    whether a channel is reported working. So the request is authorised
+    here, synchronously, against a channel the caller is allowed to touch,
+    and the delivery is handed to Celery; the outcome lands in
+    ``notification_logs`` as a ``kind='test'`` row and the console reads it
+    back from ``last_delivery``.
+
+    ## Scope
+
+    ``get_channel`` applies ``_assert_owned_by`` against the caller's own
+    resolved organization -- the permission check and the read name the
+    same tenant, which is the defect class
+    ``app/domains/organization/scoping.py`` documents. A tenant caller
+    therefore cannot test (and so cannot probe the existence or liveness
+    of) another tenant's channel, nor a platform-wide one.
+
+    Requires ``notifications.manage`` rather than ``notifications.read``:
+    this endpoint causes a real outbound message to a real destination, so
+    it is a write in every sense that matters, and gating it on a read
+    permission would let an account that may only look at the channel list
+    post into every Slack channel on it.
+    """
+    channel = await service.get_channel(
+        channel_id, requesting_organization_id=requesting_organization_id
+    )
+    send_channel_test_notification.delay(str(channel.id))
+    return build_response(
+        success=True,
+        message="Test notification queued",
+        data=NotificationChannelTestResponse(
+            channel_id=channel.id,
+            queued=True,
+            detail=(
+                "Queued. The outcome will appear as this channel's latest "
+                "delivery once the worker has attempted it."
+            ),
+        ).model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

@@ -656,6 +656,25 @@ TASK_RUN_ALERT_RULE_EVALUATION_SWEEP = (
     "app.domains.monitoring.tasks.run_alert_rule_evaluation_sweep"
 )
 
+# On-demand (never Beat-scheduled): one operator pressing "Send test" on one
+# notification channel. Queued rather than awaited inline because the send is
+# a third-party network call -- see
+# ``app.domains.monitoring.service.NotificationService.send_test_notification``
+# for why the HTTP request must not be the thing the operator's browser waits
+# on, and ``tasks.py`` for the Celery bridge.
+TASK_SEND_CHANNEL_TEST_NOTIFICATION = (
+    "app.domains.monitoring.tasks.send_channel_test_notification"
+)
+
+# The body of a test delivery. Deliberately says what it is in the first
+# words: this arrives in a real Slack channel/inbox that real people read,
+# and a message indistinguishable from a real alert is how a test becomes an
+# incident. ``{channel}`` is the channel's operator-given name.
+CHANNEL_TEST_MESSAGE = (
+    "Test notification from the Wyfy Guest master console. "
+    'Channel "{channel}" is configured correctly. No action is required.'
+)
+
 # ============================================================================
 # Notification Engine (BE-011 Part 2)
 # ============================================================================
@@ -690,6 +709,64 @@ class NotificationChannelType(StrEnum):
 class NotificationStatus(StrEnum):
     SENT = "sent"
     FAILED = "failed"
+
+
+class NotificationLogKind(StrEnum):
+    """What produced one ``NotificationLog`` row.
+
+    ``ALERT`` is every row written before this enum existed -- a real
+    ``Alert`` fanned out to the channels its rule is linked to -- and stays
+    the column default so no historical row changes meaning.
+
+    ``TEST`` is an operator pressing "Send test" on the channel itself.
+    The distinction is not cosmetic. These rows share one table, and a
+    channel whose only successful delivery was a test has never actually
+    carried an alert; reading "last delivery: sent" off a test row would
+    tell an operator the channel is proven in production when all that is
+    proven is the credential. ``alert_id`` is NULL on a ``TEST`` row, but
+    NULL alone cannot carry the distinction -- it is already nullable
+    because of ``ondelete="SET NULL"``, so an alert row whose alert was
+    deleted is indistinguishable from a test row by that column alone.
+    """
+
+    ALERT = "alert"
+    TEST = "test"
+
+
+class NotificationEventCategory(StrEnum):
+    """A routing key for producers that are **not** an ``AlertRule``.
+
+    ## Why this exists alongside ``alert_rule_notification_channels``
+
+    Alert-driven routing already has a real association table: a triggered
+    ``AlertRule`` notifies exactly the channels linked to it, and that stays
+    the only mechanism for alerts. This enum does not replace it and does
+    not apply to it.
+
+    It exists because the Notification Engine has acquired producers with
+    no ``AlertRule`` behind them at all -- a customer finishing onboarding,
+    the platform team's copy of a controller outage -- and each one has so
+    far reached Slack by growing its own ``Settings.*_webhook_url``
+    environment variable. That is a webhook URL per producer, configured by
+    editing an env file and redeploying, invisible to the console, with no
+    delivery record. A category is the routing key those producers publish
+    to instead, so a new producer is a new enum member rather than a new
+    setting.
+
+    Categories are additive to a channel: a channel with an empty
+    ``event_categories`` behaves exactly as every channel does today.
+    """
+
+    #: Platform-team copies of tenant-affecting infrastructure events --
+    #: the destination ``Settings.platform_alert_slack_webhook_url`` names
+    #: today. See ``docs/monitoring/FLOW.md`` for the convergence note.
+    PLATFORM_OPS = "platform_ops"
+    #: A customer completing provisioning/onboarding.
+    CUSTOMER_ONBOARDING = "customer_onboarding"
+    #: Subscription, invoice and payment lifecycle events.
+    BILLING = "billing"
+    #: Authentication/authorization events worth a human's attention.
+    SECURITY = "security"
 
 
 # Timeout for every real outbound HTTP POST this module makes (Slack/Teams/
