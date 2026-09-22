@@ -30,7 +30,10 @@ from app.domains.analytics.aggregation import (
 )
 from app.domains.analytics.constants import AnalyticsGranularity, AnalyticsSnapshotType
 from app.domains.analytics.exceptions import AnalyticsOrganizationNotFoundError
-from app.domains.analytics.models import AnalyticsSnapshot
+from app.domains.analytics.models import (
+    SNAPSHOT_NATURAL_KEY_COLUMNS,
+    AnalyticsSnapshot,
+)
 from app.domains.analytics.service import AnalyticsService
 from app.domains.analytics.validators import day_bounds_utc, validate_date_range
 from app.domains.router.enums import RouterStatus
@@ -89,6 +92,16 @@ class FakeGuestAnalyticsService:
         return self.summaries[(organization_id, location_id)]
 
 
+def _natural_key(**fields: object) -> tuple[object, ...]:
+    """The tuple ``uq_analytics_snapshots_natural_key`` is unique over --
+    see ``app.domains.analytics.models.SNAPSHOT_NATURAL_KEY_COLUMNS``."""
+    return tuple(fields.get(column) for column in SNAPSHOT_NATURAL_KEY_COLUMNS)
+
+
+def _natural_key_of(snapshot: AnalyticsSnapshot) -> tuple[object, ...]:
+    return tuple(getattr(snapshot, column) for column in SNAPSHOT_NATURAL_KEY_COLUMNS)
+
+
 @dataclass
 class FakeAnalyticsRepository:
     """Stand-in for ``AnalyticsRepositoryProtocol``."""
@@ -109,11 +122,16 @@ class FakeAnalyticsRepository:
     existing_organization_ids: set[uuid.UUID] = field(default_factory=set)
     snapshots: list[AnalyticsSnapshot] = field(default_factory=list)
     # Simulates one organization's aggregation genuinely failing (e.g. a bad
-    # row) -- create_snapshot raises when persisting this organization's own
+    # row) -- upsert_snapshot raises when persisting this organization's own
     # ORG_DAILY_SUMMARY row.
     fail_organization_id: uuid.UUID | None = None
 
-    async def create_snapshot(self, **fields: object) -> AnalyticsSnapshot:
+    async def upsert_snapshot(self, **fields: object) -> AnalyticsSnapshot:
+        """Keyed on the same natural key ``uq_analytics_snapshots_natural_
+        key`` enforces, so that a test which runs the aggregation twice
+        sees what the database would do rather than what a list would.
+        ``tests/unit/test_analytics_snapshot_upsert.py`` is what proves
+        this fake and the real ``ON CONFLICT`` agree."""
         is_org_summary = (
             fields.get("snapshot_type") == AnalyticsSnapshotType.ORG_DAILY_SUMMARY.value
         )
@@ -123,6 +141,15 @@ class FakeAnalyticsRepository:
             and is_org_summary
         ):
             raise RuntimeError("simulated aggregation failure for this organization")
+        key = _natural_key(**fields)
+        existing = next((s for s in self.snapshots if _natural_key_of(s) == key), None)
+        if existing is not None:
+            existing.metrics = fields["metrics"]
+            existing.computed_at = fields["computed_at"]
+            existing.computation_duration_ms = fields.get("computation_duration_ms")
+            existing.period_end = fields["period_end"]
+            existing.version += 1
+            return existing
         snapshot = AnalyticsSnapshot(**_base_fields(**fields))
         self.snapshots.append(snapshot)
         return snapshot
@@ -589,7 +616,7 @@ async def test_list_snapshots_is_tenant_scoped():
     service = _service_with(repository, guest_analytics)
 
     start, end = _period()
-    await repository.create_snapshot(
+    await repository.upsert_snapshot(
         organization_id=org_a,
         location_id=None,
         snapshot_type=AnalyticsSnapshotType.ORG_DAILY_SUMMARY.value,
@@ -600,7 +627,7 @@ async def test_list_snapshots_is_tenant_scoped():
         computed_at=_now(),
         computation_duration_ms=1.0,
     )
-    await repository.create_snapshot(
+    await repository.upsert_snapshot(
         organization_id=org_b,
         location_id=None,
         snapshot_type=AnalyticsSnapshotType.ORG_DAILY_SUMMARY.value,

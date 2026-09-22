@@ -161,8 +161,16 @@ class AnalyticsService:
         metrics: dict[str, object],
         started: float,
     ) -> AnalyticsSnapshot:
+        """Writes one rollup through ``AnalyticsRepositoryProtocol
+        .upsert_snapshot`` -- an upsert on the snapshot's natural key, not
+        an append. Every caller of this method is a *recomputation* of a
+        window that has usually been computed before (see that method's
+        own docstring for the measured cost of getting this wrong), so
+        "one row per rollup" is the invariant this write path owes its
+        readers, and ``uq_analytics_snapshots_natural_key`` is what makes
+        it one the database keeps rather than one this code hopes for."""
         computation_duration_ms = round((time.perf_counter() - started) * 1000, 3)
-        snapshot = await self.repository.create_snapshot(
+        snapshot = await self.repository.upsert_snapshot(
             organization_id=organization_id,
             location_id=location_id,
             snapshot_type=snapshot_type.value,
