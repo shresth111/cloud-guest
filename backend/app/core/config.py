@@ -1737,8 +1737,9 @@ class Settings(BaseSettings):
             "is inert: no NotificationDelivery rows are written and "
             "onboarding is unaffected. Set via "
             "CLOUDGUEST_SLACK_ONBOARDING_WEBHOOK_URL, sourced from the "
-            "'cloudguest/prod/slack' Secrets Manager secret in production "
-            "-- never commit it."
+            "'cloudguest/prod/mail' Secrets Manager secret in production "
+            "(see deploy/remote-deploy.sh's SLACK_SECRET_ID for why that "
+            "secret and not a dedicated one) -- never commit it."
         ),
     )
     slack_webhook_timeout_seconds: float = Field(

@@ -72,26 +72,32 @@ DB_BACKUP="${DB_BACKUP:-1}"
 MAIL_SECRET_ID="${MAIL_SECRET_ID:-cloudguest/prod/mail}"
 MAIL_ENV_FILE="$DEPLOY_DIR/mail.env"
 # The Slack incoming-webhook URL for Master-console onboarding status. Same
-# reasoning as the mail block above -- the repositories are public and a
-# webhook URL is a bearer credential -- and a SEPARATE secret rather than a key
-# inside cloudguest/prod/mail: it is not mail, it is read by a different
-# feature, and keeping them apart means the instance role can be narrowed to
-# one or the other later without untangling a shared blob.
+# reasoning as the mail block above: the repositories are public and a webhook
+# URL is a bearer credential, so it comes from Secrets Manager and never from
+# git.
 #
-# SLACK_SECRET_ID empty disables the fetch entirely; so does the secret not
-# existing, which is the state of every environment until someone creates it.
-# In both cases the backend sees no webhook and the feature is inert --
-# onboarding is unaffected either way. See
+# It defaults to the SAME secret as the mailboxes, and that default was chosen
+# against the live IAM rather than on taste. `wyfy-app-ec2-role` carries an
+# inline policy, `WyfyMailSecretRead`, whose Resource is exactly
+# `...:secret:cloudguest/prod/mail-*` -- one secret, nothing else. A separate
+# `cloudguest/prod/slack` would therefore have needed a second policy before it
+# could be read at all, and a deploy that silently logs "could not read secret"
+# is a worse default than a shared one. Reusing the mail secret needs no IAM
+# change, no new secret, and no override on the box.
+#
+# The two do not mix, and that is enforced by the code rather than by care:
+# `materialise_mail_env` selects `CLOUDGUEST_*SMTP_*` plus two named keys,
+# `materialise_slack_env` selects `CLOUDGUEST_SLACK_*`, and neither prefix can
+# match the other's keys. They are two GetSecretValue calls against one secret,
+# which is a rounding error on a deploy and keeps the two features independent.
+#
+# Point SLACK_SECRET_ID at a dedicated secret in ~/deploy/.deploy.env if you
+# would rather separate them later -- add the matching IAM statement first.
+# Empty disables the fetch entirely; so does the secret being unreadable. In
+# every one of those cases the backend sees no webhook and the feature is
+# inert, and onboarding is unaffected. See
 # backend/app/domains/notification/onboarding_slack.py.
-#
-# If you would rather not create (and grant the instance role) a second
-# secret, set SLACK_SECRET_ID=cloudguest/prod/mail in ~/deploy/.deploy.env and
-# put CLOUDGUEST_SLACK_ONBOARDING_WEBHOOK_URL in the mail secret instead.
-# materialise_slack_env below selects by key prefix, not by secret name, so
-# that works with no code change and no new IAM statement -- it just writes
-# slack.env from the mail secret. Nothing else in the mail secret matches
-# CLOUDGUEST_SLACK_*, so nothing else moves.
-SLACK_SECRET_ID="${SLACK_SECRET_ID:-cloudguest/prod/slack}"
+SLACK_SECRET_ID="${SLACK_SECRET_ID:-cloudguest/prod/mail}"
 SLACK_ENV_FILE="$DEPLOY_DIR/slack.env"
 
 case "$SERVICE" in
