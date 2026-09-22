@@ -303,3 +303,55 @@ jobs:
           echo "rather than the image. The previous image is still in ECR:"
           echo "  gh workflow run cd.yml -f image_tag=<previous-sha>"
           exit 1
+
+  # ---------------------------------------------------------------------------
+  # Slack
+  # ---------------------------------------------------------------------------
+  # EVERY OUTCOME, unlike CI. A deploy is rare, it changes what is serving
+  # production traffic, and "it worked" is itself the thing people want to
+  # know -- there is no way to tell a successful deploy from one that never
+  # started, other than being told.
+  #
+  # `needs` covers the whole pipeline rather than just `deploy`, because the
+  # interesting failures are the ones where deploy never ran: a failed `ci`
+  # leaves build and deploy *skipped*, not failed, and a notifier watching
+  # only its own outcome would have nothing to say about the run that mattered
+  # most. The action folds the per-job results into one status, failure first.
+  #
+  # Nothing about the deploy above is changed by this job -- it has its own
+  # runner, its own (smaller) permissions, no AWS credentials, and it cannot
+  # run until deploy has already reached a conclusion.
+  notify:
+    name: Tell Slack how the deploy went
+    needs: [ci, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Deliberately does not inherit the workflow's `id-token: write`: this job
+    # has no business minting an OIDC token for the deploy role.
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # The action lives in this repository, so it has to be on disk before it
+      # can be used. Sparse-checked-out: this job wants one action.yml, not a
+      # backend, a node_modules-sized frontend, or a vendored gateway.
+      - name: Check out the composite action
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Notify
+        uses: ./.github/actions/slack-notify
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          needs_json: ${{ toJSON(needs) }}
+          kind: CD
+          environment: production
+          # Empty when the build job was skipped, which the action handles by
+          # leaving the field out rather than printing an empty one.
+          image: ${{ needs.build.outputs.image }}
+          # On a workflow_dispatch rollback the thing that shipped is an older
+          # commit than the ref this run is on; say which one it actually was.
+          commit_sha: ${{ github.event.inputs.image_tag || github.sha }}
