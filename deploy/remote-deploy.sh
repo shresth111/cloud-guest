@@ -285,10 +285,62 @@ PY
   log "mail.env: ${summary:-nothing written -- see the warning above}"
 }
 
+# Wait for ONE container to report healthy. Used to gate the celery services on
+# the migration having finished; see compose_up.
+wait_one_healthy() {
+  local name="deploy-$1-1" deadline=$(( SECONDS + HEALTH_TIMEOUT )) status
+  while (( SECONDS < deadline )); do
+    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck:{{.State.Status}}{{end}}' "$name" 2>/dev/null || echo missing)"
+    case "$status" in
+      healthy)                 return 0 ;;
+      no-healthcheck:running)  return 0 ;;   # nothing to wait on
+      unhealthy|exited|dead)   return 1 ;;
+    esac
+    sleep 3
+  done
+  return 1
+}
+
 compose_up() {
   # --no-deps so postgres/redis are never recreated by an app deploy; they hold
   # the only stateful thing here and have no business bouncing for a code push.
-  docker compose --env-file "$ENV_FILE" up -d --no-deps "${TARGETS[@]}"
+  #
+  # ORDERING, for an api deploy: the api image runs `alembic upgrade head` in its
+  # CMD, so shipping api IS running a migration. Bringing api up alongside
+  # celery-worker/celery-beat leaves a writer alive on the OLD image while that
+  # migration runs. A writer that does not know about a new constraint can insert
+  # a row mid-migration, and for a CREATE UNIQUE INDEX CONCURRENTLY that is not a
+  # transient error -- it leaves an INVALID index behind, which then crash-loops
+  # api on its next boot. So: stop the writers, migrate, and only then start them
+  # again on the new image. `up -d` returns as soon as the container is created,
+  # NOT when alembic has finished, so the gate has to be api's healthcheck.
+  #
+  # Cost is a few seconds of deferred background work. Celery redelivers, and
+  # beat's schedule is wall-clock, so nothing is lost.
+  if [[ "$SERVICE" != "api" ]]; then
+    docker compose --env-file "$ENV_FILE" up -d --no-deps "${TARGETS[@]}"
+    return
+  fi
+
+  log "stopping celery-worker/celery-beat so no writer is live during alembic"
+  docker compose --env-file "$ENV_FILE" stop celery-worker celery-beat || true
+
+  docker compose --env-file "$ENV_FILE" up -d --no-deps api
+
+  log "waiting up to ${HEALTH_TIMEOUT}s for api (this is alembic running)"
+  if ! wait_one_healthy api; then
+    # Deliberately do NOT start the writers, and do NOT die here: returning with
+    # celery down makes the caller's wait_healthy fail, which runs the existing
+    # rollback. Starting a writer against a schema we are about to roll the image
+    # away from is the one thing that turns a failed deploy into a corrupt one.
+    log "WARNING: api not healthy -- alembic may have failed"
+    log "WARNING: leaving celery-worker/celery-beat STOPPED; check: docker logs deploy-api-1"
+    log "WARNING: if a CONCURRENTLY-built index is INVALID, drop it before retrying"
+    return 0
+  fi
+
+  log "api healthy (migration done); starting celery-worker/celery-beat"
+  docker compose --env-file "$ENV_FILE" up -d --no-deps celery-worker celery-beat
 }
 
 wait_healthy() {
