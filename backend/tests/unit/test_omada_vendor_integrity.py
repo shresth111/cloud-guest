@@ -563,6 +563,12 @@ GATED_WRITE_PATHS: tuple[tuple[str, str], ...] = (
     ("provisioning_engine", "execute_console_command"),
     ("provisioning_engine", "discover_device"),
     ("network_diagnostics", "_execute"),
+    # Cloudflare Gateway DNS filtering: each of these reaches a router over
+    # 8728 (a whole-router resolver switch, its restore, the bypass rules)
+    # and the first two also create/delete a Cloudflare location.
+    ("dns_filtering", "enable_router"),
+    ("dns_filtering", "disable_router"),
+    ("dns_filtering", "set_bypass_hardening"),
 )
 
 

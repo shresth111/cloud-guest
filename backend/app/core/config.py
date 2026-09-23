@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from email_validator import EmailNotValidError, validate_email
-from pydantic import Field, PostgresDsn, RedisDsn, field_validator
+from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The default for every Fernet key below. It is base64 of the ASCII string
@@ -1805,6 +1805,45 @@ class Settings(BaseSettings):
             "sweep worker open indefinitely."
         ),
     )
+    # -- Cloudflare Gateway DNS filtering (app.domains.dns_filtering) ------
+    #
+    # One platform-owned Cloudflare account; this platform is the operator
+    # and every venue is a Gateway DNS location inside it. Same posture as
+    # slack_onboarding_webhook_url above: empty = the feature is INERT (every
+    # dns-filtering route that needs Cloudflare answers 503 "not
+    # configured"), never an error at startup. The token is a bearer
+    # credential with Zero Trust Gateway edit rights over every venue's
+    # filtering, so it is a SecretStr (never in a repr or a log line), is
+    # sourced from Secrets Manager in production, and is never committed.
+    cloudflare_api_token: SecretStr = Field(
+        default=SecretStr(""),
+        description=(
+            "Cloudflare API token with Zero Trust Gateway edit scope on "
+            "cloudflare_account_id. Set via CLOUDGUEST_CLOUDFLARE_API_TOKEN. "
+            "Empty = Cloudflare DNS filtering is not configured."
+        ),
+    )
+    cloudflare_account_id: str = Field(
+        default="",
+        description=(
+            "The Cloudflare account (Zero Trust organization) id Gateway "
+            "locations and DNS policies are created in. Not a secret, but "
+            "set per deployment via CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID."
+        ),
+    )
+    cloudflare_api_base_url: str = Field(
+        default="https://api.cloudflare.com/client/v4"
+    )
+    cloudflare_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
+    # Cloudflare Gateway's per-account ceilings (standard limits, as
+    # published): 250 DNS locations, 500 DNS policies. Configurable only
+    # because Cloudflare can raise them on request; the service refuses
+    # before creating anything that would exceed them.
+    cloudflare_gateway_max_locations: int = Field(default=250, ge=1)
+    cloudflare_gateway_max_dns_rules: int = Field(default=500, ge=1)
+    # The name a router must be able to resolve through Gateway after the
+    # switch. Must be a name no plausible category selection blocks.
+    dns_filtering_probe_hostname: str = Field(default="cloudflare.com")
     master_console_base_url: str = Field(
         default="",
         description=(
