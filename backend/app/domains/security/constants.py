@@ -171,19 +171,18 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="zone_to_zone_firewall",
         label="Zone-to-zone firewall",
-        availability=SecurityAvailability.AVAILABLE,
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
         enforcement=(
-            "/ip firewall filter chain=forward inside the platform's sentinel "
-            "band, pushed over 8728 in priority order"
+            "Planned: /ip firewall filter chain=forward, via the RouterOS API "
+            "on 8728"
         ),
         detail=(
-            "Routed traffic between zones that have their own VLAN interface "
-            "and subnet, written as source/destination address rules. A "
-            "router must first have its firewall band placed from the "
-            "platform console; until then a push is refused rather than "
-            "guessed. Traffic switched within one subnet never reaches "
-            "chain=forward and is out of scope, and a block must name a "
-            "source or destination address."
+            "Firewall rules can be saved, but nothing pushes them to a "
+            "router yet: the only device path was an SFTP config upload on "
+            "port 22, which the fleet filters. When a writer ships it will "
+            "cover routed traffic between zones that have their own VLAN "
+            "interface and subnet; traffic switched within one subnet never "
+            "reaches chain=forward and stays out of scope."
         ),
     ),
     SecurityFeature(
