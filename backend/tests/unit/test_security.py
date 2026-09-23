@@ -66,6 +66,12 @@ _SECURITY = PermissionModule.SECURITY
 #: set exactly. Kept here rather than on ``SecurityFeature`` because the
 #: security package is asserted to contain no device-adapter reference at all.
 _AVAILABLE_FEATURE_WRITERS: dict[str, tuple[str, ...]] = {
+    "zone_to_zone_firewall": (
+        "app.domains.firewall.device_adapters:"
+        "MikroTikFirewallAdapter.sync_firewall_rules",
+        "wyfy_device_gateway.mikrotik_adapter:MikroTikAdapter.sync_firewall_rules",
+        "wyfy_device_gateway.mikrotik_firewall:sync_rules",
+    ),
     "domain_blocking_dns": (
         "app.domains.content_filtering.device_adapters:"
         "MikroTikContentFilterAdapter.configure_content_filter_rule",
