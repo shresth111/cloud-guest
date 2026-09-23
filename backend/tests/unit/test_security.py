@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import uuid
 
 import pytest
 
@@ -57,6 +58,15 @@ from app.domains.security.router import router as security_router
 from app.domains.security.service import SecurityOverviewService, _rate_penalty
 
 _SECURITY = PermissionModule.SECURITY
+
+#: A platform-scoped caller: no organization, no venue. Written once because
+#: every existing test in this file is about something other than scope, and
+#: spelling both arguments out at each call site buried what each test was
+#: actually checking. `TestVenueScoping` below passes them explicitly.
+_PLATFORM_SCOPE: dict[str, None] = {
+    "requesting_organization_id": None,
+    "requesting_location_id": None,
+}
 
 
 def _code_without_docstrings(source: str) -> str:
@@ -131,26 +141,42 @@ class _FakeRepository:
             guarded=1, unguarded=0, unknown=0
         )
         self._open_alerts = open_alerts
+        #: Every (method, organization_id, location_id) the service asked for.
+        #: The venue filter itself lives in SQL, which this suite has no
+        #: database for -- what it can prove, and what these tests assert, is
+        #: that the caller's venue reaches every read rather than being
+        #: resolved and then quietly dropped on the way down.
+        self.calls: list[tuple[str, object, object]] = []
 
-    async def fleet_counts(self, *, organization_id, stale_after_minutes):
+    def _record(self, method: str, organization_id, location_id) -> None:
+        self.calls.append((method, organization_id, location_id))
+
+    async def fleet_counts(self, *, organization_id, location_id, stale_after_minutes):
+        self._record("fleet", organization_id, location_id)
         return self._fleet
 
-    async def vpn_peer_counts(self, *, organization_id):
+    async def vpn_peer_counts(self, *, organization_id, location_id):
+        self._record("vpn", organization_id, location_id)
         return self._vpn
 
-    async def block_counts(self, *, organization_id):
+    async def block_counts(self, *, organization_id, location_id):
+        self._record("blocks", organization_id, location_id)
         return self._blocks
 
-    async def firewall_rule_counts(self, *, organization_id):
+    async def firewall_rule_counts(self, *, organization_id, location_id):
+        self._record("firewall", organization_id, location_id)
         return self._rules
 
-    async def device_rule_counts(self, *, organization_id):
+    async def device_rule_counts(self, *, organization_id, location_id):
+        self._record("devices", organization_id, location_id)
         return self._devices
 
-    async def rogue_dhcp_counts(self, *, organization_id):
+    async def rogue_dhcp_counts(self, *, organization_id, location_id):
+        self._record("rogue_dhcp", organization_id, location_id)
         return self._rogue
 
-    async def open_alert_count(self, *, organization_id):
+    async def open_alert_count(self, *, organization_id, location_id):
+        self._record("alerts", organization_id, location_id)
         return self._open_alerts
 
 
@@ -346,7 +372,7 @@ class TestScoreMaths:
 class TestScoreIsProduced:
     async def test_a_clean_venue_scores_full_marks(self) -> None:
         service = SecurityOverviewService(_FakeRepository())
-        score = await service.build_score(requesting_organization_id=None)
+        score = await service.build_score(**_PLATFORM_SCOPE)
         assert score.available is True
         assert score.score == SECURITY_SCORE_MAX
         assert score.band is not None
@@ -357,7 +383,7 @@ class TestScoreIsProduced:
         service = SecurityOverviewService(
             _FakeRepository(fleet=_fleet(0, 0))
         )
-        score = await service.build_score(requesting_organization_id=None)
+        score = await service.build_score(**_PLATFORM_SCOPE)
         assert score.available is False
         assert score.score is None
         assert score.band is None
@@ -380,7 +406,7 @@ class TestScoreIsProduced:
                 open_alerts=3,
             )
         )
-        score = await service.build_score(requesting_organization_id=None)
+        score = await service.build_score(**_PLATFORM_SCOPE)
         assert score.available is True
         assert score.score is not None
         assert score.score == SECURITY_SCORE_MAX - sum(
@@ -389,7 +415,7 @@ class TestScoreIsProduced:
 
     async def test_every_factor_reports_its_own_ceiling(self) -> None:
         service = SecurityOverviewService(_FakeRepository())
-        score = await service.build_score(requesting_organization_id=None)
+        score = await service.build_score(**_PLATFORM_SCOPE)
         keys = {factor.key for factor in score.factors}
         assert keys == {key.value for key in ScoreFactorKey}
         for factor in score.factors:
@@ -456,7 +482,7 @@ class TestCounters:
         and found nothing", which is false, so the honest answer is an
         explicit gap naming the missing pipeline."""
         overview = await SecurityOverviewService(_FakeRepository()).build_overview(
-            requesting_organization_id=None
+            **_PLATFORM_SCOPE
         )
         by_key = {counter.key: counter for counter in overview.counters}
         for key in ("threats_detected", "threats_blocked"):
@@ -475,7 +501,7 @@ class TestCounters:
                     failed=1,
                 )
             )
-        ).build_overview(requesting_organization_id=None)
+        ).build_overview(**_PLATFORM_SCOPE)
         by_key = {counter.key: counter for counter in overview.counters}
         assert by_key["blocked_domains"].count == 5
         assert by_key["blocks_not_applied"].count == 2
@@ -486,7 +512,7 @@ class TestCounters:
     async def test_an_empty_venue_says_so_without_inventing_numbers(self) -> None:
         overview = await SecurityOverviewService(
             _FakeRepository(fleet=_fleet(0, 0))
-        ).build_overview(requesting_organization_id=None)
+        ).build_overview(**_PLATFORM_SCOPE)
         assert overview.fleet.no_managed_gateway is True
         assert overview.fleet.routers_total == 0
         assert overview.score.available is False
@@ -497,7 +523,7 @@ class TestCounters:
                 fleet=_fleet(3, 2, stale=1),
                 vpn=VpnPeerCounts(total=3, active=2),
             )
-        ).build_overview(requesting_organization_id=None)
+        ).build_overview(**_PLATFORM_SCOPE)
         assert overview.fleet.routers_reporting == 2
         assert overview.fleet.routers_stale == 1
         assert overview.fleet.vpn_peers_active == 2
@@ -508,8 +534,52 @@ class TestCounters:
         assert MIN_ROUTERS_FOR_SCORE == 1
         overview = await SecurityOverviewService(
             _FakeRepository(fleet=_fleet(1, 1))
-        ).build_overview(requesting_organization_id=None)
+        ).build_overview(**_PLATFORM_SCOPE)
         assert overview.score.available is True
+
+
+class TestVenueScoping:
+    """A venue named by the caller must reach every read on this page.
+
+    The filter itself is SQL, and this suite has no database. What it can prove
+    is the wiring -- that the venue arrives at all seven reads rather than
+    being resolved in the router and quietly dropped on the way down, which is
+    the failure that would leave a venue's own page showing organization-wide
+    numbers with nothing about them looking wrong.
+    """
+
+    async def test_the_venue_reaches_every_read(self) -> None:
+        repository = _FakeRepository()
+        venue = uuid.uuid4()
+        await SecurityOverviewService(repository).build_overview(
+            requesting_organization_id=None, requesting_location_id=venue
+        )
+        assert len(repository.calls) == 7
+        assert {location for _, _, location in repository.calls} == {venue}
+
+    async def test_a_caller_naming_no_venue_stays_organization_wide(self) -> None:
+        """``None`` must mean "every venue", not "some default venue" -- a
+        platform-scoped caller reads across the estate by design."""
+        repository = _FakeRepository()
+        await SecurityOverviewService(repository).build_overview(**_PLATFORM_SCOPE)
+        assert len(repository.calls) == 7
+        assert {location for _, _, location in repository.calls} == {None}
+
+    async def test_the_score_reads_the_same_scope_as_the_overview(self) -> None:
+        """``/score`` is the overview's own score. If the two resolved scope
+        differently the compact widget and the page would disagree about the
+        number, with no way to tell which was right."""
+        repository = _FakeRepository()
+        venue = uuid.uuid4()
+        service = SecurityOverviewService(repository)
+        await service.build_score(
+            requesting_organization_id=None, requesting_location_id=venue
+        )
+        await service.build_overview(
+            requesting_organization_id=None, requesting_location_id=venue
+        )
+        assert len(repository.calls) == 14
+        assert {location for _, _, location in repository.calls} == {venue}
 
 
 if __name__ == "__main__":  # pragma: no cover
