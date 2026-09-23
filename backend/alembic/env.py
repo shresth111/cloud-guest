@@ -54,6 +54,7 @@ from app.domains.demo_request import models as demo_request_models  # noqa: F401
 from app.domains.device_sync import models as device_sync_models  # noqa: F401
 from app.domains.dhcp import models as dhcp_models  # noqa: F401
 from app.domains.dns import models as dns_models  # noqa: F401
+from app.domains.dns_filtering import models as dns_filtering_models  # noqa: F401
 from app.domains.firewall import models as firewall_models  # noqa: F401
 from app.domains.guest import models as guest_models  # noqa: F401
 from app.domains.guest_access import models as guest_access_models  # noqa: F401
