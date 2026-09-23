@@ -165,13 +165,20 @@ jobs:
       # target -- a floor that drifts down with the suite protects nothing.
       - name: Assert the suite did not shrink
         env:
-          # Raised from 2900 on 2026-09-11. The suite had grown to 5,130
-          # while this floor stayed where it was set, so it would have
-          # passed a branch that silently lost 2,200 tests -- precisely the
-          # green-but-smaller failure described above, with the guard in
-          # place and asleep. Kept just below the real count so a
-          # legitimate small removal does not fail the build.
-          MIN_TESTS: "5100"
+          # Raised from 2900 on 2026-09-11, then from 5100 on 2026-09-22.
+          # The suite had grown to 5,130 while this floor stayed where it was
+          # set, so it would have passed a branch that silently lost 2,200
+          # tests -- precisely the green-but-smaller failure described above,
+          # with the guard in place and asleep. Kept just below the real count
+          # so a legitimate small removal does not fail the build.
+          #
+          # The 2026-09-22 raise is from a measured collection of 6,278 (6,251
+          # passed, 11 failed, 16 skipped -- the 11 are a local-only artifact of
+          # a venv shared between worktrees whose editable install of
+          # `wyfy-device-gateway` resolves to another checkout's older vendor
+          # tree; they pass in CI). 6,200 leaves room for a genuine small
+          # removal without letting another 1,100 tests disappear unnoticed.
+          MIN_TESTS: "6200"
         run: |
           total=$(python - <<'EOF'
           import xml.etree.ElementTree as ET

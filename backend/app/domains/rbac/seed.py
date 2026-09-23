@@ -487,6 +487,22 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # Security: the venue-level posture surface (overview, score) and the
+    # capability matrix. READ is this module's ONLY action in this pass, and
+    # deliberately so: ``app.domains.security`` is read-only, so seeding
+    # create/update/delete/execute/manage here would mint five permission
+    # keys that no route checks -- which this file's own NETWORK_INTEGRATIONS
+    # entry calls out as "dead permission data that reads like a capability".
+    # The write actions arrive with the endpoints that check them.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook -- the identical trap
+    # PermissionModule.CONTENT_FILTERING's own comment above records. This
+    # one is sharper than most: with no ``security.read`` permission row,
+    # *no* role can hold it, and RequirePermission has no super-admin bypass
+    # to fall through to, so shipping these endpoints without re-running the
+    # seed gives every caller including Super Admin a 403.
+    PermissionModule.SECURITY: (_A.READ,),
     # Quotations: CREATE covers the one-shot "generate the PDF + email it"
     # action (there is no separate draft-then-send step), READ covers
     # list/get/PDF-download, DELETE gates the soft delete, MANAGE is the
@@ -610,6 +626,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.SUPPORT_TICKETS: "Support Tickets",
     PermissionModule.DEMO_REQUESTS: "Demo Requests",
     PermissionModule.CONTENT_FILTERING: "Content Filtering",
+    PermissionModule.SECURITY: "Security",
     PermissionModule.QUOTATIONS: "Quotations",
     PermissionModule.READINESS: "Router Readiness Checklist",
     PermissionModule.CHANNEL_PARTNERS: "Channel Partners",
@@ -728,6 +745,14 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # config -- identical ScopeType.ROUTER reasoning as
     # PermissionModule.QOS/FIREWALL/DHCP/VLAN above.
     PermissionModule.CONTENT_FILTERING: ScopeType.ROUTER,
+    # Security's unit of work is a venue's posture, not one device's config:
+    # the overview reads the location's whole fleet, its blocks, its devices,
+    # its tunnels and its alerts at once. ScopeType.LOCATION therefore, the
+    # same "the narrowest scope this is *meaningful* at" reasoning
+    # PermissionModule.POLICY/POLICY's own entry above uses -- not
+    # ScopeType.ROUTER, which would say a venue owner cannot see their own
+    # venue's security unless they happen to be scoped to one gateway.
+    PermissionModule.SECURITY: ScopeType.LOCATION,
     # A quotation belongs to no organization/location/router at all -- its
     # client is very often a prospect who is not yet a platform user or
     # member of any organization (see app.domains.quotation.models's own
@@ -1143,6 +1168,15 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_CONFIG: _L.FULL,
             _M.QOS: _L.FULL,
             _M.CONTENT_FILTERING: _L.FULL,
+            # Security: FULL, which today resolves to _A.READ alone, because
+            # READ is that module's only seeded action (see its MODULE_ACTIONS
+            # entry). Written at FULL rather than READ deliberately: this role
+            # already holds FIREWALL/VLAN/DHCP full technical control at this
+            # location, so when the security write actions land -- deploy a
+            # block, isolate a device -- this role must have them without a
+            # second edit here. Nothing is over-granted in the meantime,
+            # because expand_grant_level is bounded by MODULE_ACTIONS.
+            _M.SECURITY: _L.FULL,
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
             _M.READINESS: _L.FULL,
             _M.NETWORK_DEVICE: _L.FULL,
@@ -1182,6 +1216,66 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         },
     ),
     SystemRoleDefinition(
+        name="Security Administrator",
+        slug="security-administrator",
+        description=(
+            "Owns a single location's security posture: what is blocked, which "
+            "devices are isolated, and which security features this venue can "
+            "actually use."
+        ),
+        scope_type=ScopeType.LOCATION,
+        default_level=_L.NONE,
+        overrides={
+            # The posture surface itself.
+            _M.SECURITY: _L.FULL,
+            # The two enforcement halves of a security decision. Blocking a
+            # domain or an address is CONTENT_FILTERING; blocking or isolating
+            # a device is GUEST_ACCESS. A role that can decide what to block
+            # but cannot carry it out would be a read-only role with a
+            # misleading name.
+            _M.CONTENT_FILTERING: _L.FULL,
+            _M.GUEST_ACCESS: _L.FULL,
+            # OPERATE, not FULL: applying a rule is this role's job, rolling
+            # the whole ruleset back is not. That is the same boundary
+            # network-engineer draws, and it is the reason OPERATE exists as
+            # a level rather than being folded into FULL.
+            _M.FIREWALL: _L.OPERATE,
+            # Read-only context for what a policy is written against: which
+            # zones exist, what is connected, and which MACs are already
+            # trusted. None of these is this role's to change.
+            _M.VLAN: _L.READ,
+            _M.CONNECTED_DEVICES: _L.READ,
+            _M.MAC_AUTHORIZATION: _L.READ,
+            _M.MONITORING: _L.READ,
+            # Alerts are the output of this role's own work, so it owns them
+            # (acknowledge/resolve) rather than only reading them.
+            _M.ALERTS: _L.FULL,
+            _M.ANALYTICS: _L.READ,
+            _M.REPORTS: _L.READ,
+            _M.DASHBOARD: _L.READ,
+            # Deliberately absent, and it is not an oversight:
+            #
+            # * AUDIT_LOGS is ORGANIZATION-scoped, so a LOCATION role cannot
+            #   hold it at all -- ``allowed_scope_types_for_module`` would
+            #   refuse the row, and the seed would raise
+            #   InvalidScopeAssignmentError. An auditor at organization scope
+            #   already covers this.
+            # * DEVICE_CONSOLE stays with Super Admin and Network
+            #   Administrator (see that module's own MODULE_ACTIONS comment).
+            #   A security role does not need a raw command line to do its
+            #   job, and widening who holds one is not a security improvement.
+            _M.DEVICE_CONSOLE: _L.NONE,
+            # The GLOBAL-only modules, spelled out for the same reason every
+            # other non-GLOBAL role here spells them out: so a reader can tell
+            # "deliberately not granted" from "not yet considered".
+            _M.SYSTEM_SETTINGS: _L.NONE,
+            _M.DEMO_REQUESTS: _L.NONE,
+            _M.QUOTATIONS: _L.NONE,
+            _M.CHANNEL_PARTNERS: _L.NONE,
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
+        },
+    ),
+    SystemRoleDefinition(
         name="Network Engineer",
         slug="network-engineer",
         description=(
@@ -1204,6 +1298,13 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_CONFIG: _L.OPERATE,
             _M.QOS: _L.OPERATE,
             _M.CONTENT_FILTERING: _L.OPERATE,
+            # Security: OPERATE, the same tier as the rule CRUD above.
+            # OPERATE excludes DELETE and MANAGE, so this role will be able to
+            # apply a security change but not roll one back or remove it --
+            # the same distinction this file's QUOTATIONS entry spells out.
+            # See Network Administrator's own entry for why this is written as
+            # a level rather than as _A.READ.
+            _M.SECURITY: _L.OPERATE,
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
             _M.READINESS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
