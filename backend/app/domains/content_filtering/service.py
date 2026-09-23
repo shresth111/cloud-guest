@@ -81,6 +81,7 @@ from app.domains.rbac.location_scope import (
     LocationScope,
     enforce_entity_location,
 )
+from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 
 from .constants import (
@@ -109,6 +110,10 @@ from .repository import ContentFilterRepositoryProtocol
 from .validators import normalize_rule_value
 
 logger = logging.getLogger(__name__)
+
+#: The venue-facing name of this screen, as the customer console prints it.
+#: It goes verbatim into the controller-managed refusal a venue owner reads.
+_FEATURE_NAME = "Website Blocking"
 
 
 def _event_extra(event: object) -> dict[str, object]:
@@ -183,6 +188,12 @@ class ContentFilterService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Refused before a row exists, matching `firewall.create_rule`. The
+        # adapter registry would decline this vendor too, but only on a later
+        # push -- after this method had returned 201 and the venue had been
+        # shown a blocked site that no device will ever block. See
+        # `app.domains.router.device_domain_gate`.
+        ensure_not_controller_managed(router, feature=_FEATURE_NAME)
         normalized_value = normalize_rule_value(value_type, value)
         existing = await self.repository.get_rule_by_router_and_value(
             router.id, value_type.value, normalized_value
@@ -390,6 +401,11 @@ class ContentFilterService:
         router = await self.router_lookup.get_router(
             rule.router_id, requesting_organization_id=requesting_organization_id
         )
+        # A row created before the create-time gate existed can still be on a
+        # controller-managed router. Without this the venue is told its
+        # device is "missing connection credentials" -- which reads as "add
+        # some and retry" for a device that will never take any.
+        ensure_not_controller_managed(router, feature=_FEATURE_NAME)
         credentials = self._resolve_device_credentials(router)
         adapter = get_content_filter_adapter(router.vendor)
 

@@ -67,8 +67,6 @@ class SecurityFleetSummaryResponse(BaseModel):
     routers_reporting: int
     routers_stale: int
     routers_unhealthy: int
-    vpn_peers_active: int
-    vpn_peers_total: int
     #: True when no agent-managed gateway exists for this scope, in which case
     #: every infrastructure figure above is ``0`` by absence rather than by
     #: health, and the dashboard must say so instead of showing green.

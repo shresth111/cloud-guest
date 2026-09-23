@@ -165,13 +165,6 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "exists to surface, so a false one costs the whole signal."
     ),
     "app/domains/security/repository.py::"
-    "SecurityRepository.vpn_peer_counts.base": (
-        "WireGuard peers. The tunnel *is* the agent path -- a controller is "
-        "reached through its own API and never through a peer -- so this row "
-        "set is agent-shaped by construction. It also carries no organization "
-        "of its own, which is the only reason it joins `routers` at all."
-    ),
-    "app/domains/security/repository.py::"
     "SecurityRepository.rogue_dhcp_counts.base": (
         "`/ip dhcp-server alert` rows, the rogue-DHCP guard's stored state. A "
         "RouterOS construct with no controller equivalent, and the row set has "
