@@ -31,9 +31,18 @@ uses, unchanged.
 
 It snapshots this platform's own rules before writing and restores them if
 a write or the read-back verification fails. It does not test connectivity
-after a successful push and revert on loss (no safety-revert), and it holds
-no per-router lock, so two pushes to one router at the same moment are not
-serialised. See the gateway module's "What this does NOT do".
+after a successful push and revert on loss (no safety-revert). See the
+gateway module's "What this does NOT do".
+
+## One writer per router at a time
+
+The push, the band placement and the content-filter push all write the
+router's ``chain=forward`` and each assumes it does not move between its
+read and its writes. They share one Redis lock per router
+(``app.common.router_firewall_lock``); a second caller gets a 409
+``FIREWALL_PUSH_IN_PROGRESS`` and nothing reaches the device. The band
+*status* read takes no lock: it writes nothing, and a push never touches the
+sentinels it inspects.
 
 No conflict detection: see ``models.FirewallRule``'s own module docstring
 for why overlapping rules are valid, intentional policy here.
@@ -45,11 +54,12 @@ import dataclasses
 import logging
 import uuid
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from wyfy_device_gateway.contract import FirewallBandResult, FirewallFilterRuleConfig
 
 from app.common.device_push import demote_device_push_on_edit
+from app.common.router_firewall_lock import router_firewall_lock
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
@@ -77,6 +87,7 @@ from .exceptions import (
     FirewallChainNotPushableError,
     FirewallMissingCredentialsError,
     FirewallPushFailedError,
+    FirewallPushInProgressError,
     FirewallRuleNotFoundError,
 )
 from .models import FirewallRule
@@ -122,6 +133,49 @@ class FirewallPushOutcome:
     unchanged: int
 
 
+#: Venue-readable text for each band status reason code the gateway returns.
+#: Nothing here names a sentinel comment or a RouterOS ``.id``.
+_BAND_REASON_TEXT: dict[str, str] = {
+    "BAND_NOT_PLACED": (
+        "This router has not been prepared for firewall rules yet. "
+        "Wyfy support does this once per router; until then a push is refused."
+    ),
+    "BAND_PARTIAL": (
+        "Part of the firewall rule area on this router is missing, so rules "
+        "cannot be placed safely. Wyfy support needs to repair it."
+    ),
+    "BAND_DUPLICATED": (
+        "The firewall rule area on this router appears more than once, so "
+        "rules cannot be placed safely. Wyfy support needs to repair it."
+    ),
+    "BAND_INVERTED": (
+        "The firewall rule area on this router is out of order, so rules "
+        "cannot be placed safely. Wyfy support needs to repair it."
+    ),
+    "BAND_SENTINEL_NOT_PASSTHROUGH": (
+        "The firewall rule area on this router was changed on the device, so "
+        "rules cannot be placed safely. Wyfy support needs to repair it."
+    ),
+}
+_BAND_REASON_FALLBACK = (
+    "The firewall rule area on this router is not in a state rules can be "
+    "placed in. Wyfy support needs to look at it."
+)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FirewallBandState:
+    """Whether a push to this router would find its sentinel band.
+
+    ``state`` is ``ready`` / ``missing`` / ``invalid``; ``reason`` is
+    venue-readable text (``None`` when ready); ``checked_at`` is when the
+    router was read. No RouterOS internals."""
+
+    state: str
+    reason: str | None
+    checked_at: datetime
+
+
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
@@ -136,10 +190,16 @@ class FirewallService:
         *,
         audit_writer: AuditLogWriter | None = None,
         caller_location_scope: LocationScope = None,
+        redis: Any | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
+        # Backs the per-router forward-chain lock. Optional at the type level
+        # only so unit tests can build the service without Redis (no lock is
+        # taken then), exactly as NetworkDiagnosticsService does; the FastAPI
+        # dependency always passes the real client.
+        self._redis = redis
         # Constructor-injected, deliberately, while `requesting_organization_id`
         # stays a per-method argument. The two look similar and are not: an
         # organization id is an *argument* -- which tenant's data this call is
@@ -419,78 +479,81 @@ class FirewallService:
 
         credentials = self._resolve_device_credentials(router)
         adapter = get_firewall_adapter(router.vendor)
-        known_ids = await self.repository.list_rule_ids_for_router(router.id)
+        # Taken after every precondition, so a 4xx that names the problem is
+        # never masked by a 409; held through the failure-record commit.
+        async with self._router_lock(router.id):
+            known_ids = await self.repository.list_rule_ids_for_router(router.id)
 
-        try:
-            result = await adapter.sync_firewall_rules(
-                credentials,
-                rules=[self._to_config(rule) for rule in enabled],
-                known_rule_ids=[str(rule_id) for rule_id in known_ids],
-            )
-        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
-            device_unknown = (
-                isinstance(exc, FirewallPushFailedError) and not exc.restored
-            )
-            for rule in enabled:
-                if (
-                    not device_unknown
-                    and rule.device_push_status
-                    == FirewallDevicePushStatus.ACTIVE.value
-                ):
-                    continue
-                await self.repository.update_rule(
-                    rule,
-                    {
-                        "device_push_status": FirewallDevicePushStatus.FAILED.value,
-                        "device_push_error": str(exc),
-                    },
+            try:
+                result = await adapter.sync_firewall_rules(
+                    credentials,
+                    rules=[self._to_config(rule) for rule in enabled],
+                    known_rule_ids=[str(rule_id) for rule_id in known_ids],
                 )
-            await self.repository.commit()
-            raise
+            except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+                device_unknown = (
+                    isinstance(exc, FirewallPushFailedError) and not exc.restored
+                )
+                for rule in enabled:
+                    if (
+                        not device_unknown
+                        and rule.device_push_status
+                        == FirewallDevicePushStatus.ACTIVE.value
+                    ):
+                        continue
+                    await self.repository.update_rule(
+                        rule,
+                        {
+                            "device_push_status": FirewallDevicePushStatus.FAILED.value,
+                            "device_push_error": str(exc),
+                        },
+                    )
+                await self.repository.commit()
+                raise
 
-        now = datetime.now(UTC)
-        updated: list[FirewallRule] = []
-        for rule in rules:
-            if rule.is_enabled:
-                changes: dict[str, object] = {
-                    "device_push_status": FirewallDevicePushStatus.ACTIVE.value,
-                    "device_push_error": None,
-                    "device_pushed_at": now,
-                }
-            else:
-                # Taken off the router by this push (or never on it).
-                changes = {
-                    "device_push_status": FirewallDevicePushStatus.PENDING.value,
-                    "device_push_error": None,
-                    "device_pushed_at": None,
-                }
-            updated.append(await self.repository.update_rule(rule, changes))
+            now = datetime.now(UTC)
+            updated: list[FirewallRule] = []
+            for rule in rules:
+                if rule.is_enabled:
+                    changes: dict[str, object] = {
+                        "device_push_status": FirewallDevicePushStatus.ACTIVE.value,
+                        "device_push_error": None,
+                        "device_pushed_at": now,
+                    }
+                else:
+                    # Taken off the router by this push (or never on it).
+                    changes = {
+                        "device_push_status": FirewallDevicePushStatus.PENDING.value,
+                        "device_push_error": None,
+                        "device_pushed_at": None,
+                    }
+                updated.append(await self.repository.update_rule(rule, changes))
 
-        event = FirewallRulesPushed(
-            router_id=router.id,
-            added=result.added,
-            removed=result.removed,
-            unchanged=result.unchanged,
-        )
-        logger.info("firewall_rules_pushed", extra=_event_extra(event))
-        await self._audit(
-            actor_user_id,
-            AuditAction.FIREWALL_RULES_PUSHED,
-            entity_id=router.id,
-            entity_type="router",
-            organization_id=router.organization_id,
-            description=(
-                f"Firewall rules pushed to router {router.id}: "
-                f"{len(enabled)} enabled ({result.added} added, "
-                f"{result.removed} removed, {result.unchanged} unchanged)"
-            ),
-        )
-        return FirewallPushOutcome(
-            rules=updated,
-            added=result.added,
-            removed=result.removed,
-            unchanged=result.unchanged,
-        )
+            event = FirewallRulesPushed(
+                router_id=router.id,
+                added=result.added,
+                removed=result.removed,
+                unchanged=result.unchanged,
+            )
+            logger.info("firewall_rules_pushed", extra=_event_extra(event))
+            await self._audit(
+                actor_user_id,
+                AuditAction.FIREWALL_RULES_PUSHED,
+                entity_id=router.id,
+                entity_type="router",
+                organization_id=router.organization_id,
+                description=(
+                    f"Firewall rules pushed to router {router.id}: "
+                    f"{len(enabled)} enabled ({result.added} added, "
+                    f"{result.removed} removed, {result.unchanged} unchanged)"
+                ),
+            )
+            return FirewallPushOutcome(
+                rules=updated,
+                added=result.added,
+                removed=result.removed,
+                unchanged=result.unchanged,
+            )
 
     async def install_firewall_band(
         self,
@@ -509,7 +572,8 @@ class FirewallService:
         ensure_not_controller_managed(router, feature=_FEATURE_NAME)
         credentials = self._resolve_device_credentials(router)
         adapter = get_firewall_adapter(router.vendor)
-        result = await adapter.install_firewall_band(credentials)
+        async with self._router_lock(router.id):
+            result = await adapter.install_firewall_band(credentials)
 
         event = FirewallBandInstalled(router_id=router.id, created=result.created)
         logger.info("firewall_band_installed", extra=_event_extra(event))
@@ -526,6 +590,49 @@ class FirewallService:
                 ),
             )
         return result
+
+    async def read_firewall_band_state(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> FirewallBandState:
+        """Read-only: would a push to this router find its sentinel band?
+
+        One read of the router over 8728 through the same gateway inspector
+        the push uses, so this can never say ``ready`` for a router a push
+        would refuse with ``ACCESS_RULES_BAND_MISSING``, or the reverse.
+        Writes nothing, takes no lock (a push never touches the sentinels),
+        and returns a reason a venue can read -- never an ``.id`` or a
+        comment. Gated exactly like the push: Omada refused, site scope
+        enforced, credentials required before a socket opens."""
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature=_FEATURE_NAME)
+        enforce_entity_location(
+            caller_location_scope=self.caller_location_scope,
+            entity_location_id=router.location_id,
+            error=CrossLocationFirewallRuleAccessError(),
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_firewall_adapter(router.vendor)
+        status = await adapter.read_firewall_band_status(credentials)
+        reason = (
+            None
+            if status.state == "ready"
+            else _BAND_REASON_TEXT.get(status.reason or "", _BAND_REASON_FALLBACK)
+        )
+        return FirewallBandState(
+            state=status.state, reason=reason, checked_at=datetime.now(UTC)
+        )
+
+    def _router_lock(self, router_id: uuid.UUID):  # noqa: ANN202
+        return router_firewall_lock(
+            self._redis,
+            router_id,
+            busy_error=lambda: FirewallPushInProgressError(router_id),
+        )
 
     @staticmethod
     def _to_config(rule: FirewallRule) -> FirewallFilterRuleConfig:
@@ -579,6 +686,7 @@ class FirewallService:
 __all__ = [
     "RouterLookupProtocol",
     "AuditLogWriter",
+    "FirewallBandState",
     "FirewallPushOutcome",
     "FirewallService",
 ]

@@ -73,9 +73,10 @@ import dataclasses
 import logging
 import uuid
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from app.common.device_push import demote_device_push_on_edit
+from app.common.router_firewall_lock import router_firewall_lock
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
@@ -99,6 +100,7 @@ from .events import (
 )
 from .exceptions import (
     ContentFilterMissingCredentialsError,
+    ContentFilterPushInProgressError,
     ContentFilterRuleAlreadyExistsError,
     ContentFilterRuleNotEnabledError,
     ContentFilterRuleNotFoundError,
@@ -158,10 +160,15 @@ class ContentFilterService:
         *,
         audit_writer: AuditLogWriter | None = None,
         caller_location_scope: LocationScope = None,
+        redis: Any | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
+        # Backs the per-router forward-chain lock shared with the firewall
+        # push (app.common.router_firewall_lock). None -> no lock, for unit
+        # tests only; the FastAPI dependency always passes the real client.
+        self._redis = redis
         # Constructor-injected while `requesting_organization_id` stays
         # per-method: an organization id is an *argument* (which tenant
         # this call is about, and a Celery task legitimately varies it
@@ -409,24 +416,31 @@ class ContentFilterService:
         credentials = self._resolve_device_credentials(router)
         adapter = get_content_filter_adapter(router.vendor)
 
-        try:
-            await adapter.configure_content_filter_rule(
-                credentials,
-                rule_id=str(rule.id),
-                value_type=rule.value_type,
-                value=rule.value,
-                label=rule.name,
-            )
-        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
-            await self.repository.update_rule(
-                rule,
-                {
-                    "device_push_status": ContentFilterDevicePushStatus.FAILED.value,
-                    "device_push_error": str(exc),
-                },
-            )
-            await self.repository.commit()
-            raise
+        # The content-filter drop is positioned in chain=forward, the chain a
+        # firewall push converges; the two must not interleave on one router.
+        # A busy lock is a 409 before any write, and records nothing on the
+        # row -- the device was not touched.
+        async with router_firewall_lock(
+            self._redis,
+            router.id,
+            busy_error=lambda: ContentFilterPushInProgressError(router.id),
+        ):
+            try:
+                await adapter.configure_content_filter_rule(
+                    credentials,
+                    rule_id=str(rule.id),
+                    value_type=rule.value_type,
+                    value=rule.value,
+                    label=rule.name,
+                )
+            except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+                failed = ContentFilterDevicePushStatus.FAILED.value
+                await self.repository.update_rule(
+                    rule,
+                    {"device_push_status": failed, "device_push_error": str(exc)},
+                )
+                await self.repository.commit()
+                raise
 
         updated = await self.repository.update_rule(
             rule,

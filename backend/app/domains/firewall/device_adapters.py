@@ -35,6 +35,7 @@ from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCred
 from wyfy_device_gateway.contract import (
     DeviceVendor,
     FirewallBandResult,
+    FirewallBandStatus,
     FirewallFilterRuleConfig,
     FirewallSyncResult,
 )
@@ -88,6 +89,13 @@ class BaseFirewallAdapter(Protocol):
     ) -> FirewallBandResult:
         """Place the forward-chain sentinel band once; leave an existing one
         exactly where it is."""
+        ...
+
+    async def read_firewall_band_status(
+        self, credentials: FirewallCredentials
+    ) -> FirewallBandStatus:
+        """Read-only: ``ready`` / ``missing`` / ``invalid`` plus a reason
+        code, from the same band inspector the push uses."""
         ...
 
 
@@ -144,6 +152,20 @@ class MikroTikFirewallAdapter:
         except MikroTikDeviceError as exc:
             raise FirewallDeviceOperationError(
                 "install_firewall_band", exc.detail
+            ) from exc
+
+    async def read_firewall_band_status(
+        self, credentials: FirewallCredentials
+    ) -> FirewallBandStatus:
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).read_firewall_band_status(
+                self._gateway_credentials(credentials)
+            )
+        except MikroTikConnectionError as exc:
+            raise FirewallDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise FirewallDeviceOperationError(
+                "read_firewall_band_status", exc.detail
             ) from exc
 
 

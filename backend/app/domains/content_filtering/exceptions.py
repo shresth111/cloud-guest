@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.common.router_firewall_lock import FIREWALL_PUSH_IN_PROGRESS
 
 __all__ = [
     "ContentFilteringError",
@@ -25,6 +26,7 @@ __all__ = [
     "UnsupportedContentFilterVendorError",
     "ContentFilterDeviceConnectionError",
     "ContentFilterDeviceOperationError",
+    "ContentFilterPushInProgressError",
 ]
 
 
@@ -179,4 +181,20 @@ class ContentFilterDeviceOperationError(ContentFilteringError):
         super().__init__(
             f"Device operation '{operation}' failed: {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class ContentFilterPushInProgressError(ContentFilteringError):
+    """A firewall push or band placement (or another content-filter push)
+    holds this router's forward-chain lock. The content-filter drop is
+    positioned in that same chain, so it waits its turn -- see
+    ``app.common.router_firewall_lock``. Same code as the firewall's 409 on
+    purpose: it is the same lock and the same remedy."""
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            "Another change to this router's firewall is in progress; "
+            "try again in a moment",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"code": FIREWALL_PUSH_IN_PROGRESS, "router_id": str(router_id)},
         )

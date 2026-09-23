@@ -85,16 +85,27 @@ import uuid
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from .contract import FirewallBandResult, FirewallFilterRuleConfig, FirewallSyncResult
+from .contract import (
+    FirewallBandResult,
+    FirewallBandStatus,
+    FirewallFilterRuleConfig,
+    FirewallSyncResult,
+)
 
 __all__ = [
     "BAND_ANCHOR_COMMENT",
+    "BAND_REASON_DUPLICATED",
+    "BAND_REASON_INVERTED",
+    "BAND_REASON_NOT_PASSTHROUGH",
+    "BAND_REASON_NOT_PLACED",
+    "BAND_REASON_PARTIAL",
     "BAND_BEGIN_COMMENT",
     "BAND_END_COMMENT",
     "RULE_MARKER_PREFIX",
     "FirewallPushFailed",
     "FirewallRefusal",
     "install_band",
+    "read_band_status",
     "rule_marker",
     "sync_rules",
 ]
@@ -345,12 +356,36 @@ def _comment(row: dict[str, Any]) -> str:
     return str(row.get("comment", "") or "")
 
 
-def _locate_band(forward: list[dict[str, Any]]) -> tuple[int, int]:
+#: Band status reason codes (see :class:`FirewallBandStatus`). Stable,
+#: caller-branchable, and free of anything read off the device.
+BAND_REASON_NOT_PLACED = "BAND_NOT_PLACED"
+BAND_REASON_PARTIAL = "BAND_PARTIAL"
+BAND_REASON_DUPLICATED = "BAND_DUPLICATED"
+BAND_REASON_INVERTED = "BAND_INVERTED"
+BAND_REASON_NOT_PASSTHROUGH = "BAND_SENTINEL_NOT_PASSTHROUGH"
+
+
+def _inspect_band(
+    forward: list[dict[str, Any]],
+) -> tuple[int, int] | tuple[str, str]:
+    """The one place that decides whether ``forward`` holds a sound band.
+
+    Returns ``(begin, end)`` indices when it does, else ``(reason, detail)``:
+    a :data:`BAND_REASON_* <BAND_REASON_NOT_PLACED>` code and the operator
+    detail a refused push reports. Shared by the push (via
+    :func:`_locate_band`) and the read-only :func:`read_band_status`, so the
+    status a venue sees can never disagree with what a push would do."""
     begins = [i for i, r in enumerate(forward) if _comment(r) == BAND_BEGIN_COMMENT]
     ends = [i for i, r in enumerate(forward) if _comment(r) == BAND_END_COMMENT]
     if len(begins) != 1 or len(ends) != 1:
-        raise FirewallRefusal(
-            BAND_MISSING,
+        if not begins and not ends:
+            reason = BAND_REASON_NOT_PLACED
+        elif not begins or not ends:
+            reason = BAND_REASON_PARTIAL
+        else:
+            reason = BAND_REASON_DUPLICATED
+        return (
+            reason,
             f"chain=forward has {len(begins)} '{BAND_BEGIN_COMMENT}' and "
             f"{len(ends)} '{BAND_END_COMMENT}' rules; exactly one of each is "
             "required. The band is placed once, deliberately, and is never "
@@ -358,18 +393,27 @@ def _locate_band(forward: list[dict[str, Any]]) -> tuple[int, int]:
         )
     begin, end = begins[0], ends[0]
     if begin > end:
-        raise FirewallRefusal(
-            BAND_MISSING, "the band's end sentinel sits above its begin sentinel"
+        return (
+            BAND_REASON_INVERTED,
+            "the band's end sentinel sits above its begin sentinel",
         )
     for index in (begin, end):
         if str(forward[index].get("action", "")) != "passthrough":
-            raise FirewallRefusal(
-                BAND_MISSING,
+            return (
+                BAND_REASON_NOT_PASSTHROUGH,
                 f"sentinel '{_comment(forward[index])}' is not "
                 "action=passthrough; a sentinel with any other action changes "
                 "what the chain does",
             )
     return begin, end
+
+
+def _locate_band(forward: list[dict[str, Any]]) -> tuple[int, int]:
+    found = _inspect_band(forward)
+    if isinstance(found[0], str):
+        raise FirewallRefusal(BAND_MISSING, str(found[1]))
+    begin, end = found
+    return int(begin), int(end)
 
 
 def _marker_uuid(comment: str) -> str | None:
@@ -680,3 +724,19 @@ def install_band(api) -> FirewallBandResult:  # noqa: ANN001
     return FirewallBandResult(
         created=True, begin_id=begin_id, end_id=end_id, anchor_id=anchor_id
     )
+
+
+def read_band_status(api) -> FirewallBandStatus:  # noqa: ANN001
+    """Read-only: is the band there, and would a push accept it?
+
+    One read of ``/ip firewall filter``, then the same
+    :func:`_inspect_band` a push uses -- never a write, never a repair. The
+    result carries a reason *code*, not the operator detail, because the
+    detail names sentinel comments and a venue reads this."""
+    _, forward = _read(api)
+    found = _inspect_band(forward)
+    if isinstance(found[0], str):
+        reason = str(found[0])
+        state = "missing" if reason == BAND_REASON_NOT_PLACED else "invalid"
+        return FirewallBandStatus(state=state, reason=reason)
+    return FirewallBandStatus(state="ready", reason=None)

@@ -28,7 +28,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from wyfy_device_gateway.contract import FirewallBandResult, FirewallSyncResult
+from wyfy_device_gateway.contract import (
+    FirewallBandResult,
+    FirewallBandStatus,
+    FirewallSyncResult,
+)
 
 from app.domains.firewall import service as firewall_service_module
 from app.domains.firewall.constants import (
@@ -210,6 +214,17 @@ class FakeAdapter:
         return FirewallBandResult(
             created=True, begin_id="*BB", end_id="*BE", anchor_id="*E"
         )
+
+    band_status: FirewallBandStatus = field(
+        default_factory=lambda: FirewallBandStatus(state="ready", reason=None)
+    )
+    band_reads: int = 0
+
+    async def read_firewall_band_status(self, credentials):
+        self.band_reads += 1
+        if self.raises is not None:
+            raise self.raises
+        return self.band_status
 
 
 @dataclass

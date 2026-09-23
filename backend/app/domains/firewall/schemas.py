@@ -6,6 +6,7 @@ domain API. Follows the same pydantic v2 conventions as
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -21,6 +22,7 @@ __all__ = [
     "FirewallRuleListResponse",
     "FirewallPushResponse",
     "FirewallBandResponse",
+    "FirewallBandStatusResponse",
 ]
 
 
@@ -101,6 +103,20 @@ class FirewallBandResponse(BaseModel):
     begin_id: str
     end_id: str
     anchor_id: str | None = None
+
+
+class FirewallBandStatusResponse(BaseModel):
+    """Whether a push to this router would find its sentinel band.
+
+    ``ready``: a push can proceed. ``missing``: the band was never placed
+    (a push is refused with ``ACCESS_RULES_BAND_MISSING``). ``invalid``:
+    something is there but a push would refuse it too. ``reason`` is
+    venue-readable text, ``None`` when ready. Carries no RouterOS ``.id``
+    and no rule comment."""
+
+    state: Literal["ready", "missing", "invalid"]
+    reason: str | None = None
+    checked_at: datetime
 
 
 class FirewallRuleListResponse(BaseModel):

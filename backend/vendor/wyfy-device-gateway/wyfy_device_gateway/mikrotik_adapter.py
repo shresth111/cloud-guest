@@ -100,6 +100,7 @@ from .contract import (
     DhcpOptionSnapshot,
     DhcpPoolConfig,
     FirewallBandResult,
+    FirewallBandStatus,
     FirewallFilterRuleConfig,
     FirewallSyncResult,
     HotspotActiveSession,
@@ -5958,6 +5959,28 @@ class MikroTikAdapter:
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"install_firewall_band: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    async def read_firewall_band_status(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandStatus:
+        """Read-only: whether the router's sentinel band is ready for a
+        push. One read, no writes -- see
+        :func:`wyfy_device_gateway.mikrotik_firewall.read_band_status`."""
+        return await asyncio.to_thread(self._read_firewall_band_status_sync, creds)
+
+    def _read_firewall_band_status_sync(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandStatus:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return _fw.read_band_status(api)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_firewall_band_status: {exc}"
                 ) from exc
         finally:
             self._safe_close(api)

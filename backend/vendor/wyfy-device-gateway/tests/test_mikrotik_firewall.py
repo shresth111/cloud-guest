@@ -640,3 +640,109 @@ class TestInstallBand:
         assert forward.index(f"cloudguest-fw:{rule.rule_id}") < forward.index(
             "cloudguest-fw-fwd-established"
         )
+
+
+# ---------------------------------------------------------------------------
+# Band status: the read-only view a venue gets before it pushes
+# ---------------------------------------------------------------------------
+
+
+def _drop_comment(comment: str):
+    return lambda rows: [r for r in rows if r.get("comment") != comment]
+
+
+class TestReadBandStatus:
+    """The status must agree with what a push would do (same inspector), must
+    never write, and must never carry an ``.id`` or a comment out."""
+
+    async def test_a_sound_band_is_ready(self, patch_connect, mikrotik_creds) -> None:
+        api = _api()
+        patch_connect(api)
+        status = await MikroTikAdapter().read_firewall_band_status(mikrotik_creds)
+        assert (status.state, status.reason) == ("ready", None)
+        assert api.ops == []
+
+    async def test_no_band_at_all_is_missing(self, patch_connect, mikrotik_creds) -> None:
+        api = _api(band=False)
+        patch_connect(api)
+        status = await MikroTikAdapter().read_firewall_band_status(mikrotik_creds)
+        assert (status.state, status.reason) == ("missing", "BAND_NOT_PLACED")
+        assert api.ops == []
+
+    @pytest.mark.parametrize(
+        ("mutate", "reason"),
+        [
+            pytest.param(_drop_comment("cloudguest-fw-band-end"), "BAND_PARTIAL", id="no-end"),
+            pytest.param(_drop_comment("cloudguest-fw-band-begin"), "BAND_PARTIAL", id="no-begin"),
+            pytest.param(
+                lambda rows: rows + [{".id": "*BB2", "chain": "forward", "action": "passthrough",
+                                      "comment": "cloudguest-fw-band-begin"}],
+                "BAND_DUPLICATED",
+                id="duplicate-begin",
+            ),
+            pytest.param(
+                lambda rows: [
+                    {**r, "action": "drop"} if r.get("comment") == "cloudguest-fw-band-end" else r
+                    for r in rows
+                ],
+                "BAND_SENTINEL_NOT_PASSTHROUGH",
+                id="sentinel-not-passthrough",
+            ),
+            pytest.param(
+                lambda rows: [
+                    {**r, "comment": "cloudguest-fw-band-end"} if r.get("comment") == "cloudguest-fw-band-begin"
+                    else {**r, "comment": "cloudguest-fw-band-begin"} if r.get("comment") == "cloudguest-fw-band-end"
+                    else r
+                    for r in rows
+                ],
+                "BAND_INVERTED",
+                id="inverted",
+            ),
+        ],
+    )
+    async def test_every_shape_a_push_refuses_reads_invalid(
+        self, patch_connect, mikrotik_creds, mutate, reason
+    ) -> None:
+        rows = mutate(_input_chain() + _lab_forward())
+        api = _Api(menus={_FILTER: rows})
+        patch_connect(api)
+        status = await MikroTikAdapter().read_firewall_band_status(mikrotik_creds)
+        assert (status.state, status.reason) == ("invalid", reason)
+        assert api.ops == []
+
+        # Agreement with the writer: the very same device state refuses a push.
+        push_api = _Api(menus={_FILTER: mutate(_input_chain() + _lab_forward())})
+        with pytest.raises(MikroTikFirewallRefusedError) as caught:
+            await _sync(patch_connect, mikrotik_creds, push_api, [_rule(10)])
+        assert caught.value.code == "ACCESS_RULES_BAND_MISSING"
+
+    async def test_nothing_read_off_the_device_leaves_in_the_status(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _Api(menus={_FILTER: _drop_comment("cloudguest-fw-band-end")(
+            _input_chain() + _lab_forward())})
+        patch_connect(api)
+        status = await MikroTikAdapter().read_firewall_band_status(mikrotik_creds)
+        rendered = repr(status)
+        assert "*" not in rendered
+        assert "cloudguest-fw" not in rendered
+
+    async def test_a_ready_band_after_install(self, patch_connect, mikrotik_creds) -> None:
+        api = _api(band=False)
+        patch_connect(api)
+        await MikroTikAdapter().install_firewall_band(mikrotik_creds)
+        status = await MikroTikAdapter().read_firewall_band_status(mikrotik_creds)
+        assert status.state == "ready"
+
+    async def test_a_routeros_error_on_the_read_is_a_device_error(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        from wyfy_device_gateway.mikrotik_adapter import MikroTikDeviceError
+
+        class _BrokenReadApi(_Api):
+            def path(self, *segments: str):
+                raise LibRouterosError("failure: simulated read")
+
+        patch_connect(_BrokenReadApi(menus={}))
+        with pytest.raises(MikroTikDeviceError):
+            await MikroTikAdapter().read_firewall_band_status(mikrotik_creds)
