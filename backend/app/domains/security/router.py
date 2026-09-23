@@ -37,7 +37,11 @@ import uuid
 from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
-from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
+from app.domains.rbac.dependencies import (
+    CurrentLocation,
+    CurrentOrganization,
+    RequirePermission,
+)
 
 from .dependencies import get_security_service
 from .schemas import (
@@ -63,10 +67,12 @@ def _request_id(request: Request) -> str:
 async def get_security_overview(
     request: Request,
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    requesting_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: SecurityOverviewService = Depends(get_security_service),
 ):
     overview = await service.build_overview(
-        requesting_organization_id=requesting_organization_id
+        requesting_organization_id=requesting_organization_id,
+        requesting_location_id=requesting_location_id,
     )
     return build_response(
         success=True,
@@ -85,10 +91,12 @@ async def get_security_overview(
 async def get_security_score(
     request: Request,
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    requesting_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: SecurityOverviewService = Depends(get_security_service),
 ):
     score = await service.build_score(
-        requesting_organization_id=requesting_organization_id
+        requesting_organization_id=requesting_organization_id,
+        requesting_location_id=requesting_location_id,
     )
     return build_response(
         success=True,

@@ -108,29 +108,39 @@ class SecurityOverviewService:
         self._repository = repository
 
     async def build_overview(
-        self, *, requesting_organization_id: uuid.UUID | None
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        requesting_location_id: uuid.UUID | None,
     ) -> SecurityOverviewResponse:
         blocks = await self._repository.block_counts(
-            organization_id=requesting_organization_id
+            organization_id=requesting_organization_id,
+            location_id=requesting_location_id,
         )
         fleet = await self._repository.fleet_counts(
             organization_id=requesting_organization_id,
+            location_id=requesting_location_id,
             stale_after_minutes=ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES,
         )
         vpn = await self._repository.vpn_peer_counts(
-            organization_id=requesting_organization_id
+            organization_id=requesting_organization_id,
+            location_id=requesting_location_id,
         )
         rules = await self._repository.firewall_rule_counts(
-            organization_id=requesting_organization_id
+            organization_id=requesting_organization_id,
+            location_id=requesting_location_id,
         )
         devices = await self._repository.device_rule_counts(
-            organization_id=requesting_organization_id
+            organization_id=requesting_organization_id,
+            location_id=requesting_location_id,
         )
         rogue = await self._repository.rogue_dhcp_counts(
-            organization_id=requesting_organization_id
+            organization_id=requesting_organization_id,
+            location_id=requesting_location_id,
         )
         open_alerts = await self._repository.open_alert_count(
-            organization_id=requesting_organization_id
+            organization_id=requesting_organization_id,
+            location_id=requesting_location_id,
         )
 
         score = self._build_score(
@@ -162,10 +172,14 @@ class SecurityOverviewService:
         )
 
     async def build_score(
-        self, *, requesting_organization_id: uuid.UUID | None
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        requesting_location_id: uuid.UUID | None,
     ) -> SecurityScoreResponse:
         overview = await self.build_overview(
-            requesting_organization_id=requesting_organization_id
+            requesting_organization_id=requesting_organization_id,
+            requesting_location_id=requesting_location_id,
         )
         return overview.score
 

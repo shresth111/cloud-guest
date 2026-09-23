@@ -131,47 +131,65 @@ class RogueDhcpCounts:
 
 
 class SecurityRepositoryProtocol(Protocol):
+    """Every read is scoped by organization and, when the caller names one, by
+    location -- see ``_scoped`` for why they are applied in one place rather
+    than at each call site."""
+
     async def fleet_counts(
-        self, *, organization_id: uuid.UUID | None, stale_after_minutes: int
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        stale_after_minutes: int,
     ) -> FleetCounts: ...
 
     async def vpn_peer_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> VpnPeerCounts: ...
 
     async def block_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> BlockCounts: ...
 
     async def firewall_rule_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> RuleCounts: ...
 
     async def device_rule_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> DeviceRuleCounts: ...
 
     async def rogue_dhcp_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> RogueDhcpCounts: ...
 
     async def open_alert_count(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> int: ...
 
 
-def _scoped_by_organization(
-    statement: Select, model: type, organization_id: uuid.UUID | None
+def _scoped(
+    statement: Select,
+    model: type,
+    organization_id: uuid.UUID | None,
+    location_id: uuid.UUID | None,
 ) -> Select:
-    """Apply the organization filter and the soft-delete filter together.
+    """Apply the tenant filters and the soft-delete filter together.
 
-    Both are always wanted, so they are applied in one place rather than at
-    each call site -- a query that forgets ``is_deleted`` silently
-    overcounts, and that is not a mistake worth being able to make seven
-    times."""
+    All three are always wanted, so they are applied in one place rather than
+    at each call site: a query that forgets ``is_deleted`` silently
+    overcounts, and one that forgets the venue filter reports an
+    organization-wide number on a single venue's own page -- the more
+    misleading of the two, because nothing about the number looks wrong.
+
+    ``location_id`` is optional because a platform-scoped caller (Super Admin)
+    legitimately reads across venues. A customer surface always sends it,
+    since its own page is already scoped to one venue."""
     statement = statement.where(model.is_deleted.is_(False))  # type: ignore[attr-defined]
     if organization_id is not None:
         statement = statement.where(model.organization_id == organization_id)
+    if location_id is not None:
+        statement = statement.where(model.location_id == location_id)
     return statement
 
 
@@ -186,7 +204,7 @@ class SecurityRepository:
         return int(result.scalar_one() or 0)
 
     def _agent_managed_router_count_base(
-        self, organization_id: uuid.UUID | None
+        self, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> Select:
         """The one ``routers`` read in this module, narrowed once.
 
@@ -214,13 +232,19 @@ class SecurityRepository:
             statement = statement.where(
                 Router.organization_id == organization_id
             )
+        if location_id is not None:
+            statement = statement.where(Router.location_id == location_id)
         return agent_managed_only(statement)
 
     async def fleet_counts(
-        self, *, organization_id: uuid.UUID | None, stale_after_minutes: int
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        stale_after_minutes: int,
     ) -> FleetCounts:
         cutoff = datetime.now(UTC) - timedelta(minutes=stale_after_minutes)
-        base = self._agent_managed_router_count_base(organization_id)
+        base = self._agent_managed_router_count_base(organization_id, location_id)
 
         total = await self._scalar(base)
         stale = await self._scalar(
@@ -248,7 +272,7 @@ class SecurityRepository:
         )
 
     async def vpn_peer_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> VpnPeerCounts:
         """``wireguard_peers`` carries no organization of its own -- a peer
         belongs to a router -- so an organization-scoped count has to go
@@ -271,6 +295,8 @@ class SecurityRepository:
                 statement = statement.where(
                     Router.organization_id == organization_id
                 )
+            if location_id is not None:
+                statement = statement.where(Router.location_id == location_id)
             return agent_managed_only(statement)
 
         total = await self._scalar(base())
@@ -280,13 +306,14 @@ class SecurityRepository:
         return VpnPeerCounts(total=total, active=active)
 
     async def block_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> BlockCounts:
         def base() -> Select:
-            return _scoped_by_organization(
+            return _scoped(
                 select(func.count()).select_from(ContentFilterRule),
                 ContentFilterRule,
                 organization_id,
+                location_id,
             )
 
         en = ContentFilterRule.is_enabled.is_(True)
@@ -323,32 +350,34 @@ class SecurityRepository:
         )
 
     async def firewall_rule_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> RuleCounts:
         total = await self._scalar(
-            _scoped_by_organization(
+            _scoped(
                 select(func.count()).select_from(FirewallRule),
                 FirewallRule,
                 organization_id,
+                location_id,
             )
         )
         enabled = await self._scalar(
-            _scoped_by_organization(
+            _scoped(
                 select(func.count())
                 .select_from(FirewallRule)
                 .where(FirewallRule.is_enabled.is_(True)),
                 FirewallRule,
                 organization_id,
+                location_id,
             )
         )
         return RuleCounts(total=total, enabled=enabled)
 
     async def device_rule_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> DeviceRuleCounts:
         active = DeviceAccessRule.is_active.is_(True)
         blocks = await self._scalar(
-            _scoped_by_organization(
+            _scoped(
                 select(func.count())
                 .select_from(DeviceAccessRule)
                 .where(
@@ -357,10 +386,11 @@ class SecurityRepository:
                 ),
                 DeviceAccessRule,
                 organization_id,
+                location_id,
             )
         )
         allowlists = await self._scalar(
-            _scoped_by_organization(
+            _scoped(
                 select(func.count())
                 .select_from(DeviceAccessRule)
                 .where(
@@ -369,12 +399,13 @@ class SecurityRepository:
                 ),
                 DeviceAccessRule,
                 organization_id,
+                location_id,
             )
         )
         return DeviceRuleCounts(active_blocks=blocks, active_allowlists=allowlists)
 
     async def rogue_dhcp_counts(
-        self, *, organization_id: uuid.UUID | None
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> RogueDhcpCounts:
         # RouterRogueDhcpStatus is keyed on (router_id, interface) and has no
         # organization_id of its own, so an organization-scoped count has to
@@ -386,10 +417,21 @@ class SecurityRepository:
         # unguarded interfaces would report a working venue as an exposed one.
         def base() -> Select:
             statement = select(func.count()).select_from(RouterRogueDhcpStatus)
-            if organization_id is not None:
+            # The join is needed for a location filter even when no
+            # organization is named -- this row set has neither column, so
+            # either filter has to come from `routers`.
+            if organization_id is not None or location_id is not None:
                 statement = statement.join(
                     Router, Router.id == RouterRogueDhcpStatus.router_id
-                ).where(Router.organization_id == organization_id)
+                )
+                if organization_id is not None:
+                    statement = statement.where(
+                        Router.organization_id == organization_id
+                    )
+                if location_id is not None:
+                    statement = statement.where(
+                        Router.location_id == location_id
+                    )
             return agent_managed_only(statement)
 
         guarded = await self._scalar(
@@ -414,7 +456,9 @@ class SecurityRepository:
             guarded=guarded, unguarded=unguarded, unknown=unknown
         )
 
-    async def open_alert_count(self, *, organization_id: uuid.UUID | None) -> int:
+    async def open_alert_count(
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+    ) -> int:
         """Alerts that are triggered or acknowledged, i.e. not yet resolved.
 
         ``ACKNOWLEDGED`` is counted as open, deliberately: acknowledging an
@@ -426,5 +470,5 @@ class SecurityRepository:
                 (AlertStatus.TRIGGERED.value, AlertStatus.ACKNOWLEDGED.value)
             )
         )
-        statement = _scoped_by_organization(statement, Alert, organization_id)
+        statement = _scoped(statement, Alert, organization_id, location_id)
         return await self._scalar(statement)
