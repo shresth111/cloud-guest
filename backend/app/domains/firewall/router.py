@@ -197,7 +197,7 @@ async def update_firewall_rule(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: FirewallService = Depends(get_firewall_service),
 ):
-    fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    fields = payload.changed_fields()
     if "chain" in fields:
         fields["chain"] = FirewallChain(fields["chain"])
     if "action" in fields:

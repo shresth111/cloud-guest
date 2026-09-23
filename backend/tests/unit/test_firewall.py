@@ -373,3 +373,60 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# Update: an omitted field is unchanged, an explicit null clears it
+# ============================================================================
+
+
+class TestUpdateRequestClearsFields:
+    def test_omitted_fields_are_not_sent(self) -> None:
+        from app.domains.firewall.schemas import FirewallRuleUpdateRequest
+
+        payload = FirewallRuleUpdateRequest.model_validate({"name": "Renamed"})
+        assert payload.changed_fields() == {"name": "Renamed"}
+
+    def test_explicit_null_is_sent_as_a_clear(self) -> None:
+        from app.domains.firewall.schemas import FirewallRuleUpdateRequest
+
+        payload = FirewallRuleUpdateRequest.model_validate(
+            {"source_address": None, "destination_port": None, "comment": None}
+        )
+        assert payload.changed_fields() == {
+            "source_address": None,
+            "destination_port": None,
+            "comment": None,
+        }
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["name", "chain", "action", "protocol", "priority", "is_enabled"],
+    )
+    def test_null_on_a_required_field_is_refused(self, field_name: str) -> None:
+        from pydantic import ValidationError
+
+        from app.domains.firewall.schemas import FirewallRuleUpdateRequest
+
+        with pytest.raises(ValidationError, match="cannot be cleared"):
+            FirewallRuleUpdateRequest.model_validate({field_name: None})
+
+    async def test_clearing_an_address_reaches_the_row(self) -> None:
+        from app.domains.firewall.schemas import FirewallRuleUpdateRequest
+
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        rule = await _create_rule(
+            h, router, source_address="10.0.0.0/24", destination_port=23
+        )
+        payload = FirewallRuleUpdateRequest.model_validate(
+            {"source_address": None, "destination_port": None}
+        )
+        updated = await h.service.update_rule(
+            rule.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            **payload.changed_fields(),
+        )
+        assert updated.source_address is None
+        assert updated.destination_port is None

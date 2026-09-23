@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.domains.auth.schemas import MessageResponse
 
@@ -42,7 +42,20 @@ class FirewallRuleCreateRequest(BaseModel):
     is_enabled: bool = True
 
 
+#: Fields a rule cannot exist without. Omitting one leaves it unchanged; an
+#: explicit ``null`` has no meaning for it and is refused rather than ignored.
+_NON_CLEARABLE_FIELDS: frozenset[str] = frozenset(
+    {"name", "chain", "action", "protocol", "priority", "is_enabled"}
+)
+
+
 class FirewallRuleUpdateRequest(BaseModel):
+    """Partial update. A field left out is unchanged; a field sent as
+    ``null`` is cleared -- "any address", "any port", no interface, no
+    comment. The two used to be indistinguishable: every ``null`` was
+    dropped, so removing an address from a rule returned 200 and kept the
+    old address, and the router kept enforcing it on the next push."""
+
     name: str | None = None
     chain: FirewallChain | None = None
     action: FirewallAction | None = None
@@ -55,6 +68,21 @@ class FirewallRuleUpdateRequest(BaseModel):
     priority: int | None = None
     comment: str | None = None
     is_enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def _refuse_null_on_required(self) -> FirewallRuleUpdateRequest:
+        cleared = sorted(
+            name
+            for name in self.model_fields_set & _NON_CLEARABLE_FIELDS
+            if getattr(self, name) is None
+        )
+        if cleared:
+            raise ValueError(f"cannot be cleared: {', '.join(cleared)}")
+        return self
+
+    def changed_fields(self) -> dict[str, object]:
+        """Exactly the fields the caller sent, ``null`` included."""
+        return self.model_dump(exclude_unset=True)
 
 
 class FirewallRuleResponse(BaseModel):
