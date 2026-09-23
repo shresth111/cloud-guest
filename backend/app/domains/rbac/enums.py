@@ -950,6 +950,11 @@ class AuditAction(StrEnum):
     FIREWALL_RULE_CREATED = "firewall_rule_created"
     FIREWALL_RULE_UPDATED = "firewall_rule_updated"
     FIREWALL_RULE_DELETED = "firewall_rule_deleted"
+    # A router's whole firewall rule set converged onto the device over
+    # 8728 -- not one row, because band order is a property of the set.
+    FIREWALL_RULES_PUSHED = "firewall_rules_pushed"
+    # The forward-chain sentinel band was placed on a router (Master-only).
+    FIREWALL_BAND_INSTALLED = "firewall_band_installed"
 
     # Network Device (NAC) domain events -- written through this same
     # table by ``app.domains.network_device.service.NetworkDeviceService``

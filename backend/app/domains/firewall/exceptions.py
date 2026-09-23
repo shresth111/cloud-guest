@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
     "FirewallError",
@@ -20,6 +21,13 @@ __all__ = [
     "CrossOrganizationFirewallRuleAccessError",
     "InvalidFirewallPortError",
     "InvalidFirewallAddressError",
+    "FirewallMissingCredentialsError",
+    "UnsupportedFirewallVendorError",
+    "FirewallChainNotPushableError",
+    "FirewallDeviceConnectionError",
+    "FirewallDeviceOperationError",
+    "FirewallPushRefusedError",
+    "FirewallPushFailedError",
 ]
 
 
@@ -84,4 +92,96 @@ class InvalidFirewallAddressError(FirewallError):
         super().__init__(
             f"Invalid {field_name}: '{value}'",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Device push
+# ---------------------------------------------------------------------------
+
+
+class FirewallMissingCredentialsError(FirewallError):
+    """Raise rather than guess -- mirrors content_filtering/vlan/dhcp."""
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            f"Router '{router_id}' is missing device connection credentials "
+            "(management or public IP, API username, or API secret)",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class UnsupportedFirewallVendorError(FirewallError):
+    def __init__(self, vendor: str) -> None:
+        super().__init__(
+            unsupported_vendor_message(feature="Firewall Rules", vendor=vendor),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class FirewallChainNotPushableError(FirewallError):
+    """An enabled rule is in a chain the writer does not manage.
+
+    Only ``forward`` has a sentinel band. ``input``/``output`` rules are
+    traffic to and from the router itself -- the management tunnel, the
+    RouterOS API, RADIUS -- and a misplaced one there is how a router was
+    cut off from the platform on 2026-08-16. Refused before any connection,
+    naming the rules, so the operator can disable them or move them."""
+
+    def __init__(self, rule_names: list[str]) -> None:
+        super().__init__(
+            "Only between-network (forward) rules can be applied to the router "
+            "today. Disable or change these rules first: "
+            + ", ".join(sorted(rule_names)),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            data={
+                "code": "ACCESS_RULES_CHAIN_UNSUPPORTED",
+                "rules": sorted(rule_names),
+            },
+        )
+
+
+class FirewallDeviceConnectionError(FirewallError):
+    def __init__(self, host: str, detail: str) -> None:
+        super().__init__(
+            f"Could not connect to router at {host}: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class FirewallDeviceOperationError(FirewallError):
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"Router rejected {operation}: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class FirewallPushRefusedError(FirewallError):
+    """The writer refused before touching the device -- nothing changed.
+
+    ``code`` is the gateway's ``ACCESS_RULES_*`` code, returned in ``data``
+    so a caller can branch on it without parsing the message.
+    ``ACCESS_RULES_BAND_MISSING`` means the router has never had its
+    sentinel band placed, which is a Master-console action, not a retry."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(
+            f"Firewall rules were not applied: {detail}",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"code": code},
+        )
+
+
+class FirewallPushFailedError(FirewallError):
+    """A push failed after it began writing. ``restored`` says whether the
+    router's previous platform rules were put back; ``False`` means the
+    router may hold a partial set and needs a look."""
+
+    def __init__(self, detail: str, *, restored: bool) -> None:
+        self.restored = restored
+        super().__init__(
+            f"Firewall rules could not be applied: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            data={"code": "ACCESS_RULES_PUSH_FAILED", "restored": restored},
         )

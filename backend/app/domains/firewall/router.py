@@ -1,5 +1,6 @@
 """FastAPI routes for the Firewall Rule Management domain: per-router
-packet-filter rule CRUD.
+packet-filter rule CRUD, the per-router device push, and (Master only) the
+sentinel band that push writes into.
 
 Responses use the project's standard envelope (``ApiResponse``/
 ``build_response``), matching every other domain's router. Every endpoint
@@ -30,11 +31,14 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .constants import FirewallAction, FirewallChain, FirewallProtocol
 from .dependencies import get_firewall_service
 from .models import FirewallRule
 from .schemas import (
+    FirewallBandResponse,
+    FirewallPushResponse,
     FirewallRuleCreateRequest,
     FirewallRuleListResponse,
     FirewallRuleResponse,
@@ -79,6 +83,9 @@ def _rule_response(rule: FirewallRule) -> FirewallRuleResponse:
         priority=rule.priority,
         comment=rule.comment,
         is_enabled=rule.is_enabled,
+        device_push_status=rule.device_push_status,
+        device_push_error=rule.device_push_error,
+        device_pushed_at=rule.device_pushed_at,
         created_at=rule.created_at,
     )
 
@@ -232,6 +239,100 @@ async def delete_firewall_rule(
         success=True,
         message="Firewall rule deleted",
         data=MessageResponse(message="Firewall rule deleted").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/push",
+    response_model=ApiResponse[FirewallPushResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
+    ],
+)
+async def push_firewall_rules(
+    request: Request,
+    router_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Puts this router's enabled firewall rules on the device, in priority
+    order, and takes off any of ours that are disabled or deleted.
+
+    Per router, not per rule: order is a property of the set.
+
+    ``firewall.execute``, pinned to ROUTER scope so the check is made
+    against *this* router's site and organization and a caller cannot pick a
+    broader level by what headers it sends. The action already exists on the
+    FIREWALL module (port-forwarding's push uses it), so no re-seed is
+    needed.
+
+    No try/except, deliberately: every failure raises a ``FirewallError``
+    with its own status (409 refused with an ``ACCESS_RULES_*`` code, 422
+    unpushable chain or controller-managed venue, 502 device failure with
+    ``restored`` in ``data``), and must reach the caller as a real non-2xx.
+    """
+    outcome = await service.push_rules_to_router(
+        router_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    payload = FirewallPushResponse(
+        router_id=str(router_id),
+        added=outcome.added,
+        removed=outcome.removed,
+        unchanged=outcome.unchanged,
+        rules=[_rule_response(rule) for rule in outcome.rules],
+    )
+    return build_response(
+        success=True,
+        message="Firewall rules applied to the router",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/band",
+    response_model=ApiResponse[FirewallBandResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.manage", scope=ScopeType.GLOBAL))
+    ],
+)
+async def install_firewall_band(
+    request: Request,
+    router_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Master console only: place the router's forward-chain sentinel band.
+
+    Pinned to GLOBAL scope -- only a platform-level grant passes. Where a
+    router's firewall rules may sit is a provisioning decision (PRD §37.2),
+    not something a venue chooses, and a band in the wrong place is a guest
+    network that stops working. Idempotent: an existing band is left alone.
+    """
+    result = await service.install_firewall_band(
+        router_id, actor_user_id=uuid.UUID(actor.id)
+    )
+    payload = FirewallBandResponse(
+        router_id=str(router_id),
+        created=result.created,
+        begin_id=result.begin_id,
+        end_id=result.end_id,
+        anchor_id=result.anchor_id,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Firewall band placed"
+            if result.created
+            else "Firewall band already present"
+        ),
+        data=payload.model_dump(),
         request_id=_request_id(request),
     )
 

@@ -2046,6 +2046,13 @@ recognisable by comment marker is a rule the platform can neither converge, coun
 
 ### 37.2 The sentinel band — designed, documented, not yet implemented
 
+> **Status 2026-09-23: implemented for `chain=forward`, not yet verified on hardware.**
+> `wyfy_device_gateway/mikrotik_firewall.py` locates the band on every push and refuses with
+> `ACCESS_RULES_BAND_MISSING` without it; `install_band` places it once, directly above
+> `cloudguest-fw-fwd-established`, from a Master-only endpoint
+> (`POST /firewall-rules/routers/{router_id}/band`). The placement is not yet recorded on the
+> router's `ConfigVersion`, and `input`/`output` chains have no band and are refused.
+
 `docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md` §5.2.1 specifies it; the implementation is not in
 the codebase yet. Two `action=passthrough` rules per managed chain, created once at provisioning:
 
