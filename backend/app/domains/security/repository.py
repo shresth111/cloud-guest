@@ -3,9 +3,9 @@
 ## Why this domain reads other domains' tables
 
 The alternative -- one duck-typed ``Protocol`` per data source, each satisfied
-by another domain's service -- would mean seven collaborator dependencies on
+by another domain's service -- would mean six collaborator dependencies on
 one read endpoint, seven more places to keep in step, and no way to answer
-"what is this venue's posture" in fewer than seven round trips.
+"what is this venue's posture" in fewer than six round trips.
 
 ``app.domains.analytics.repository`` is the established precedent for the
 other reading: a domain whose job is to *aggregate* imports the models it
@@ -61,8 +61,6 @@ from app.domains.router.enums import RouterHealthStatus
 from app.domains.router.fleet_scope import agent_managed_only
 from app.domains.router.models import Router
 from app.domains.router_agent.models import RouterAgentCredential
-from app.domains.wireguard.constants import PeerStatus
-from app.domains.wireguard.models import WireGuardPeer
 
 __all__ = [
     "BlockCounts",
@@ -72,7 +70,6 @@ __all__ = [
     "RuleCounts",
     "SecurityRepository",
     "SecurityRepositoryProtocol",
-    "VpnPeerCounts",
 ]
 
 
@@ -84,12 +81,6 @@ class FleetCounts:
     reporting: int
     stale: int
     unhealthy: int
-
-
-@dataclass(frozen=True, slots=True)
-class VpnPeerCounts:
-    total: int
-    active: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,10 +133,6 @@ class SecurityRepositoryProtocol(Protocol):
         location_id: uuid.UUID | None,
         stale_after_minutes: int,
     ) -> FleetCounts: ...
-
-    async def vpn_peer_counts(
-        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
-    ) -> VpnPeerCounts: ...
 
     async def block_counts(
         self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
@@ -270,40 +257,6 @@ class SecurityRepository:
             stale=stale,
             unhealthy=unhealthy,
         )
-
-    async def vpn_peer_counts(
-        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
-    ) -> VpnPeerCounts:
-        """``wireguard_peers`` carries no organization of its own -- a peer
-        belongs to a router -- so an organization-scoped count has to go
-        through ``routers``, the same shape ``rogue_dhcp_counts`` uses below.
-
-        Every peer belongs to an agent-managed router by construction (the
-        tunnel *is* the agent path), but ``agent_managed_only`` is applied
-        anyway: this statement reads ``routers``, and the vendor question is
-        one to answer explicitly rather than to assume."""
-
-        def base() -> Select:
-            statement = (
-                select(func.count())
-                .select_from(WireGuardPeer)
-                .join(Router, Router.id == WireGuardPeer.router_id)
-                .where(WireGuardPeer.is_deleted.is_(False))
-                .where(Router.is_deleted.is_(False))
-            )
-            if organization_id is not None:
-                statement = statement.where(
-                    Router.organization_id == organization_id
-                )
-            if location_id is not None:
-                statement = statement.where(Router.location_id == location_id)
-            return agent_managed_only(statement)
-
-        total = await self._scalar(base())
-        active = await self._scalar(
-            base().where(WireGuardPeer.status == PeerStatus.ACTIVE.value)
-        )
-        return VpnPeerCounts(total=total, active=active)
 
     async def block_counts(
         self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None

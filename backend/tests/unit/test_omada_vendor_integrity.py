@@ -555,6 +555,8 @@ GATED_WRITE_PATHS: tuple[tuple[str, str], ...] = (
     ("queue_management", "create_assignment"),
     ("hotspot", "create_profile"),
     ("firewall", "create_rule"),
+    ("content_filtering", "create_rule"),
+    ("content_filtering", "push_rule_to_device"),
     ("provisioning_engine", "create_job"),
     ("provisioning_engine", "execute_console_command"),
     ("provisioning_engine", "discover_device"),

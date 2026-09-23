@@ -48,6 +48,9 @@ from app.domains.content_filtering.validators import (
     normalize_rule_value,
 )
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.device_domain_gate import (
+    ControllerManagedFeatureUnavailableError,
+)
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
@@ -827,6 +830,52 @@ class TestUnsupportedVendorIsATypedError:
                 actor_user_id=None,
                 requesting_organization_id=router.organization_id,
             )
+
+
+class TestControllerManagedVenueIsRefusedAtCreate:
+    """An Omada venue used to get a 201 for a blocked site no device would
+    ever block: the row was written, the dashboard said "pending", and the
+    only refusal came later, on push, worded as missing credentials. The
+    firewall domain already refused at create; this is the same gate here."""
+
+    async def test_create_on_an_omada_router_is_refused_before_a_row_exists(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        router.vendor = "tplink_omada"
+
+        with pytest.raises(ControllerManagedFeatureUnavailableError) as caught:
+            await _create_rule(h, router)
+
+        assert caught.value.status_code == 422
+        assert "Website Blocking" in str(caught.value)
+        assert h.repository.rules == {}
+        assert h.audit_writer.entries == []
+
+    async def test_push_of_an_old_omada_row_is_refused_before_any_device_io(
+        self, adapter: FakeContentFilterAdapter
+    ) -> None:
+        """A row created before the create-time gate existed still refuses,
+        with the venue-facing sentence rather than a credentials error."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        rule = await _create_rule(h, router)
+        router.vendor = "tplink_omada"
+
+        with pytest.raises(ControllerManagedFeatureUnavailableError):
+            await h.service.push_rule_to_device(
+                rule.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_mikrotik_router_is_unaffected(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        rule = await _create_rule(h, router)
+        assert rule.router_id == router.id
 
 
 class TestContentFilterRuleDeleteReachesTheDevice:

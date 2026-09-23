@@ -24,6 +24,7 @@ is exercised by the integration sweep, not here.
 from __future__ import annotations
 
 import ast
+import importlib
 import pathlib
 import uuid
 
@@ -52,12 +53,39 @@ from app.domains.security.repository import (
     FleetCounts,
     RogueDhcpCounts,
     RuleCounts,
-    VpnPeerCounts,
 )
 from app.domains.security.router import router as security_router
 from app.domains.security.service import SecurityOverviewService, _rate_penalty
 
 _SECURITY = PermissionModule.SECURITY
+
+#: For every capability the matrix calls AVAILABLE, the function(s) that
+#: actually write it to a router, as ``module:attribute.path``. Checked by
+#: ``TestCapabilityMatrix.test_every_available_feature_has_a_writer_that_exists``:
+#: each must import and be callable, and the key set must equal the AVAILABLE
+#: set exactly. Kept here rather than on ``SecurityFeature`` because the
+#: security package is asserted to contain no device-adapter reference at all.
+_AVAILABLE_FEATURE_WRITERS: dict[str, tuple[str, ...]] = {
+    "domain_blocking_dns": (
+        "app.domains.content_filtering.device_adapters:"
+        "MikroTikContentFilterAdapter.configure_content_filter_rule",
+        "wyfy_device_gateway.mikrotik_adapter:"
+        "MikroTikAdapter._ensure_content_filter_dns_entries",
+    ),
+    "ip_and_cidr_blocking": (
+        "app.domains.content_filtering.device_adapters:"
+        "MikroTikContentFilterAdapter.configure_content_filter_rule",
+        "wyfy_device_gateway.mikrotik_adapter:"
+        "MikroTikAdapter._ensure_content_filter_address_list_entry",
+        "wyfy_device_gateway.mikrotik_adapter:"
+        "MikroTikAdapter._ensure_content_filter_enforcement_rule",
+    ),
+    "rogue_dhcp_detection": (
+        "app.domains.dhcp.device_adapters:MikroTikDhcpAdapter.ensure_rogue_dhcp_alert",
+        "wyfy_device_gateway.mikrotik_adapter:"
+        "MikroTikAdapter.configure_rogue_dhcp_alerts",
+    ),
+}
 
 #: A platform-scoped caller: no organization, no venue. Written once because
 #: every existing test in this file is about something other than scope, and
@@ -117,7 +145,6 @@ class _FakeRepository:
         *,
         fleet: FleetCounts | None = None,
         blocks: BlockCounts | None = None,
-        vpn: VpnPeerCounts | None = None,
         rules: RuleCounts | None = None,
         devices: DeviceRuleCounts | None = None,
         rogue: RogueDhcpCounts | None = None,
@@ -132,7 +159,6 @@ class _FakeRepository:
             enabled_not_applied=0,
             failed=0,
         )
-        self._vpn = vpn or VpnPeerCounts(total=1, active=1)
         self._rules = rules or RuleCounts(total=0, enabled=0)
         self._devices = devices or DeviceRuleCounts(
             active_blocks=0, active_allowlists=0
@@ -154,10 +180,6 @@ class _FakeRepository:
     async def fleet_counts(self, *, organization_id, location_id, stale_after_minutes):
         self._record("fleet", organization_id, location_id)
         return self._fleet
-
-    async def vpn_peer_counts(self, *, organization_id, location_id):
-        self._record("vpn", organization_id, location_id)
-        return self._vpn
 
     async def block_counts(self, *, organization_id, location_id):
         self._record("blocks", organization_id, location_id)
@@ -401,7 +423,6 @@ class TestScoreIsProduced:
                     enabled_not_applied=2,
                     failed=1,
                 ),
-                vpn=VpnPeerCounts(total=4, active=3),
                 rogue=RogueDhcpCounts(guarded=2, unguarded=1, unknown=1),
                 open_alerts=3,
             )
@@ -437,9 +458,95 @@ class TestCapabilityMatrix:
         for feature in SECURITY_FEATURES:
             if feature.availability is SecurityAvailability.AVAILABLE:
                 assert feature.enforcement, feature.key
+                assert not feature.enforcement.startswith("Planned"), feature.key
             else:
-                assert feature.enforcement is None, feature.key
+                # A feature that is not enforced may name the mechanism it
+                # will use, but only marked as a plan -- the API must never
+                # hand a consumer an intended mechanism that reads as a
+                # working one.
+                assert feature.enforcement is None or feature.enforcement.startswith(
+                    "Planned: "
+                ), feature.key
             assert feature.detail, feature.key
+
+    def test_every_available_feature_has_a_writer_that_exists(self) -> None:
+        """Naming a mechanism is not the same as shipping one.
+
+        Four entries once said AVAILABLE -- a zone firewall, TLS-hostname
+        blocking, per-device ip-binding blocks and connection limits -- and
+        named a real RouterOS mechanism for each, and nothing in this
+        codebase wrote any of them to a router. The prose test above passed
+        throughout. This one asks the question that would have failed: for
+        every AVAILABLE key, *which function puts it on the device*, and
+        does that function import.
+
+        Adding an AVAILABLE entry therefore means adding it here with the
+        writer's dotted path; promoting one without a writer fails the build.
+        """
+        available = {
+            feature.key
+            for feature in SECURITY_FEATURES
+            if feature.availability is SecurityAvailability.AVAILABLE
+        }
+        assert available == set(_AVAILABLE_FEATURE_WRITERS), (
+            "every AVAILABLE capability must name the function that writes it "
+            "to a router in _AVAILABLE_FEATURE_WRITERS (and nothing else may "
+            f"be listed there): {sorted(available ^ set(_AVAILABLE_FEATURE_WRITERS))}"
+        )
+        for key, writers in _AVAILABLE_FEATURE_WRITERS.items():
+            assert writers, key
+            for dotted in writers:
+                module_name, _, attribute_path = dotted.partition(":")
+                target: object = importlib.import_module(module_name)
+                for part in attribute_path.split("."):
+                    assert hasattr(target, part), f"{key}: {dotted} does not exist"
+                    target = getattr(target, part)
+                assert callable(target), f"{key}: {dotted} is not callable"
+
+    def test_the_management_tunnel_is_not_customer_facing(self) -> None:
+        """The WireGuard management path is this platform's plumbing, not a
+        venue's control. Everything in this domain is served to the customer
+        dashboard, so it appears nowhere here -- not as a capability, not as
+        a score term, not as a fleet figure."""
+        from app.domains.security.schemas import SecurityFleetSummaryResponse
+
+        for feature in SECURITY_FEATURES:
+            name = f"{feature.key} {feature.label}".lower()
+            for word in ("wireguard", "tunnel", "vpn"):
+                assert word not in name, (feature.key, word)
+            # "a VPN" legitimately appears in prose as a *guest's* way around
+            # a block; the platform's own tunnel must not appear at all.
+            text = f"{feature.enforcement} {feature.detail}".lower()
+            for word in ("wireguard", "management tunnel", "management path"):
+                assert word not in text, (feature.key, word)
+        assert not any(
+            "tunnel" in key.value or "vpn" in key.value for key in ScoreFactorKey
+        )
+        assert not any(
+            "vpn" in name or "tunnel" in name
+            for name in SecurityFleetSummaryResponse.model_fields
+        )
+
+    async def test_the_score_has_no_tunnel_term(self) -> None:
+        score = await SecurityOverviewService(_FakeRepository()).build_score(
+            **_PLATFORM_SCOPE
+        )
+        for factor in score.factors:
+            assert "tunnel" not in factor.key
+            assert "tunnel" not in factor.label.lower()
+
+    def test_the_unenforced_features_stay_unavailable_until_a_writer_ships(
+        self,
+    ) -> None:
+        """Pinned by name as well as by the writer map, so the reason they
+        moved is next to them."""
+        by_key = {feature.key: feature for feature in SECURITY_FEATURES}
+        for key in (
+            "domain_blocking_sni",
+            "device_isolation",
+            "connection_flood_protection",
+        ):
+            assert by_key[key].availability is not SecurityAvailability.AVAILABLE, key
 
     def test_the_known_exclusions_stay_excluded(self) -> None:
         """Pinned so that "we'll just show a toggle for now" fails the build
@@ -521,13 +628,10 @@ class TestCounters:
         overview = await SecurityOverviewService(
             _FakeRepository(
                 fleet=_fleet(3, 2, stale=1),
-                vpn=VpnPeerCounts(total=3, active=2),
             )
         ).build_overview(**_PLATFORM_SCOPE)
         assert overview.fleet.routers_reporting == 2
         assert overview.fleet.routers_stale == 1
-        assert overview.fleet.vpn_peers_active == 2
-        assert overview.fleet.vpn_peers_total == 3
         assert overview.fleet.no_managed_gateway is False
 
     async def test_a_single_gateway_is_enough_to_score(self) -> None:
@@ -542,7 +646,7 @@ class TestVenueScoping:
     """A venue named by the caller must reach every read on this page.
 
     The filter itself is SQL, and this suite has no database. What it can prove
-    is the wiring -- that the venue arrives at all seven reads rather than
+    is the wiring -- that the venue arrives at all six reads rather than
     being resolved in the router and quietly dropped on the way down, which is
     the failure that would leave a venue's own page showing organization-wide
     numbers with nothing about them looking wrong.
@@ -554,7 +658,7 @@ class TestVenueScoping:
         await SecurityOverviewService(repository).build_overview(
             requesting_organization_id=None, requesting_location_id=venue
         )
-        assert len(repository.calls) == 7
+        assert len(repository.calls) == 6
         assert {location for _, _, location in repository.calls} == {venue}
 
     async def test_a_caller_naming_no_venue_stays_organization_wide(self) -> None:
@@ -562,7 +666,7 @@ class TestVenueScoping:
         platform-scoped caller reads across the estate by design."""
         repository = _FakeRepository()
         await SecurityOverviewService(repository).build_overview(**_PLATFORM_SCOPE)
-        assert len(repository.calls) == 7
+        assert len(repository.calls) == 6
         assert {location for _, _, location in repository.calls} == {None}
 
     async def test_the_score_reads_the_same_scope_as_the_overview(self) -> None:
@@ -578,7 +682,7 @@ class TestVenueScoping:
         await service.build_overview(
             requesting_organization_id=None, requesting_location_id=venue
         )
-        assert len(repository.calls) == 14
+        assert len(repository.calls) == 12
         assert {location for _, _, location in repository.calls} == {venue}
 
 

@@ -4,11 +4,14 @@
 
 A subtraction from a clean slate, where every term is a fact this platform
 already stores: whether the fleet is reporting, whether enabled blocks actually
-reached a device, whether the DHCP guard is on, whether the management tunnel is
-up, whether anything is already alerting. Each term is returned itemised with
-its own penalty so the number can always be explained rather than asserted --
-"your score is 82" is only useful with "because three gateways stopped
-reporting".
+reached a device, whether the DHCP guard is on, whether anything is already
+alerting. The platform's own management tunnel is deliberately not a term: it
+is this platform's plumbing, not a venue's control, and this page is served to
+the venue (see ``constants``' "What this domain never shows a venue").
+
+Each term is returned itemised with its own penalty so the number can always
+be explained rather than asserted -- "your score is 82" is only useful with
+"because three gateways stopped reporting".
 
 It is a diagnostic of this platform's own configuration hygiene, not a measure
 of threat. Nothing here observes an attack, so nothing here claims to.
@@ -74,7 +77,6 @@ _RATE_FACTORS = frozenset(
         ScoreFactorKey.FLEET_REPORTING,
         ScoreFactorKey.BLOCK_PUSH_INTEGRITY,
         ScoreFactorKey.ROGUE_DHCP_GUARD,
-        ScoreFactorKey.MANAGEMENT_TUNNEL,
     }
 )
 
@@ -85,8 +87,8 @@ def _rate_penalty(
     """Penalty for one factor, capped at that factor's maximum.
 
     A rate factor with no denominator has nothing to be a rate *of* -- zero
-    blocks configured is not a push failure, and zero tunnels is not a tunnel
-    outage -- so it scores no penalty rather than dividing by zero.
+    blocks configured is not a push failure, and zero checked interfaces is not
+    an unguarded one -- so it scores no penalty rather than dividing by zero.
 
     That guard belongs *inside* the rate branch and nowhere else. Applied on
     entry it would also zero every count factor, since those are called with no
@@ -122,10 +124,6 @@ class SecurityOverviewService:
             location_id=requesting_location_id,
             stale_after_minutes=ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES,
         )
-        vpn = await self._repository.vpn_peer_counts(
-            organization_id=requesting_organization_id,
-            location_id=requesting_location_id,
-        )
         rules = await self._repository.firewall_rule_counts(
             organization_id=requesting_organization_id,
             location_id=requesting_location_id,
@@ -144,8 +142,7 @@ class SecurityOverviewService:
         )
 
         score = self._build_score(
-            fleet=fleet, blocks=blocks, vpn_active=vpn.active,
-            vpn_total=vpn.total, rogue_unguarded=rogue.unguarded,
+            fleet=fleet, blocks=blocks, rogue_unguarded=rogue.unguarded,
             rogue_total=rogue.guarded + rogue.unguarded + rogue.unknown,
             open_alerts=open_alerts,
         )
@@ -164,8 +161,6 @@ class SecurityOverviewService:
                 routers_reporting=fleet.reporting,
                 routers_stale=fleet.stale,
                 routers_unhealthy=fleet.unhealthy,
-                vpn_peers_active=vpn.active,
-                vpn_peers_total=vpn.total,
                 no_managed_gateway=fleet.total < MIN_ROUTERS_FOR_SCORE,
             ),
             generated_at=datetime.now(UTC),
@@ -209,8 +204,6 @@ class SecurityOverviewService:
         *,
         fleet: FleetCounts,
         blocks: BlockCounts,
-        vpn_active: int,
-        vpn_total: int,
         rogue_unguarded: int,
         rogue_total: int,
         open_alerts: int,
@@ -284,23 +277,6 @@ class SecurityOverviewService:
                     "nothing watching for a second DHCP server."
                     if rogue_unguarded
                     else "Every checked interface is guarded."
-                ),
-            ),
-            SecurityScoreFactorResponse(
-                key=ScoreFactorKey.MANAGEMENT_TUNNEL.value,
-                label="Management tunnels",
-                penalty=_rate_penalty(
-                    ScoreFactorKey.MANAGEMENT_TUNNEL,
-                    max(0, vpn_total - vpn_active),
-                    vpn_total,
-                ),
-                max_penalty=SCORE_FACTOR_WEIGHTS[ScoreFactorKey.MANAGEMENT_TUNNEL][1],
-                affected=max(0, vpn_total - vpn_active),
-                available=True,
-                detail=(
-                    f"{vpn_active} of {vpn_total} tunnels are established. "
-                    "An unestablished tunnel means this platform cannot manage "
-                    "that gateway."
                 ),
             ),
             SecurityScoreFactorResponse(

@@ -11,9 +11,9 @@ which security features can this platform actually enforce for it?*
 It owns no tables on purpose. Every number it reports is already stored by
 the domain that produced it -- ``routers``/``router_health_snapshots`` for
 fleet health, ``content_filter_rules`` for blocking, ``device_access_rules``
-for blocked devices, ``firewall_rules`` for rules, ``wireguard_peers`` for
-tunnels, ``router_rogue_dhcp_statuses`` for the DHCP guard, ``alerts`` for
-alert pressure. A second copy of any of those numbers would be a number that
+for blocked devices, ``firewall_rules`` for rules,
+``router_rogue_dhcp_statuses`` for the DHCP guard, ``alerts`` for alert
+pressure. A second copy of any of those numbers would be a number that
 can disagree with its own source, and this codebase has already paid for that
 class of bug once -- see ``app.domains.content_filtering.device_adapters``
 module docstring, where a dashboard reported "blocked" for a rule that had
@@ -24,8 +24,17 @@ never reached a device.
 Nothing here can observe an attack. So the score is defined as the absence of
 known-good hygiene, computed only from facts this platform already stores and
 can re-derive: whether the fleet is reporting, whether enabled blocks actually
-reached a device, whether the DHCP guard is on, whether the management tunnel
-is up, whether anything is already alerting.
+reached a device, whether the DHCP guard is on, whether anything is already
+alerting.
+
+## What this domain never shows a venue
+
+The platform's management tunnel (WireGuard, hub to router) is not a venue's
+security control and is not something a venue can act on; it is this
+platform's own plumbing. It is deliberately absent from both the score and the
+capability matrix, because everything here is served to the customer
+dashboard. Tunnel health belongs to the Master console and the backend's own
+monitoring, which already read ``wireguard_peers`` directly.
 
 That definition is what makes the number honest, and it is also what bounds
 it -- see ``SCORE_FACTOR_WEIGHTS``'s own comment. A venue that has done
@@ -81,7 +90,6 @@ class ScoreFactorKey(StrEnum):
     FLEET_REPORTING = "fleet_reporting"
     BLOCK_PUSH_INTEGRITY = "block_push_integrity"
     ROGUE_DHCP_GUARD = "rogue_dhcp_guard"
-    MANAGEMENT_TUNNEL = "management_tunnel"
     ALERT_PRESSURE = "alert_pressure"
 
 
@@ -98,7 +106,6 @@ SCORE_FACTOR_WEIGHTS: dict[ScoreFactorKey, tuple[int, int]] = {
     ScoreFactorKey.FLEET_REPORTING: (60, 40),
     ScoreFactorKey.BLOCK_PUSH_INTEGRITY: (30, 25),
     ScoreFactorKey.ROGUE_DHCP_GUARD: (10, 15),
-    ScoreFactorKey.MANAGEMENT_TUNNEL: (40, 20),
     ScoreFactorKey.ALERT_PRESSURE: (5, 10),
 }
 
@@ -122,9 +129,12 @@ class SecurityAvailability(StrEnum):
 
     #: Enforceable on the fleet this platform already manages, today.
     AVAILABLE = "available"
-    #: Real, but needs technology this platform does not have yet -- a
+    #: Real, but needs something this platform does not have yet -- a
     #: maintained category database, a threat feed, DPI, a DNS filtering
-    #: provider. Usable only after that dependency is integrated.
+    #: provider, or simply the device writer that would put the rule on a
+    #: router. Usable only after that dependency exists. Where the mechanism
+    #: is known, ``enforcement`` names it prefixed ``"Planned: "``, so the
+    #: API never presents an intended mechanism as a working one.
     REQUIRES_ADDITIONAL_TECHNOLOGY = "requires_additional_technology"
     #: Not honestly deliverable on the current architecture at all. Rendered
     #: so the gap is visible and explained rather than silently absent.
@@ -150,19 +160,29 @@ class SecurityFeature:
 #: dashboard renders it, and a test can assert the exclusions stay excluded.
 #:
 #: Every ``AVAILABLE`` entry here is enforced by something that already ships
-#: in this codebase. Every exclusion states what is missing, not that the
-#: feature is hard -- a distinction that matters when someone later asks
-#: "why can't I block Instagram?".
+#: in this codebase, and ``tests/unit/test_security.py`` holds the map from
+#: each one to the function that writes it to a router -- so an entry cannot
+#: be promoted to ``AVAILABLE`` without naming a writer that imports.
+#:
+#: Every exclusion states what is missing, not that the feature is hard --
+#: a distinction that matters when someone later asks "why can't I block
+#: Instagram?".
 SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="zone_to_zone_firewall",
         label="Zone-to-zone firewall",
-        availability=SecurityAvailability.AVAILABLE,
-        enforcement="/ip firewall filter chain=forward, via the RouterOS API on 8728",
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        enforcement=(
+            "Planned: /ip firewall filter chain=forward, via the RouterOS API "
+            "on 8728"
+        ),
         detail=(
-            "Routed traffic between zones that have their own VLAN interface "
-            "and subnet. Traffic switched within one subnet never reaches "
-            "chain=forward and is therefore out of scope."
+            "Firewall rules can be saved, but nothing pushes them to a "
+            "router yet: the only device path was an SFTP config upload on "
+            "port 22, which the fleet filters. When a writer ships it will "
+            "cover routed traffic between zones that have their own VLAN "
+            "interface and subnet; traffic switched within one subnet never "
+            "reaches chain=forward and stays out of scope."
         ),
     ),
     SecurityFeature(
@@ -179,12 +199,17 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="domain_blocking_sni",
         label="Domain blocking (HTTPS hostname)",
-        availability=SecurityAvailability.AVAILABLE,
-        enforcement="/ip firewall filter tls-host (RouterOS 6.41+), pushed over 8728",
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        enforcement=(
+            "Planned: /ip firewall filter tls-host (RouterOS 6.41+), pushed "
+            "over 8728"
+        ),
         detail=(
-            "Matches the hostname in the TLS handshake without inspecting "
-            "traffic. Loses coverage when Encrypted Client Hello negotiates, "
-            "and sees nothing for QUIC, plain HTTP or a VPN."
+            "No code writes a tls-host rule to a router yet; website "
+            "blocking today is the DNS sinkhole only. Once built it would "
+            "match the hostname in the TLS handshake without inspecting "
+            "traffic, lose coverage when Encrypted Client Hello negotiates, "
+            "and see nothing for QUIC, plain HTTP or a VPN."
         ),
     ),
     SecurityFeature(
@@ -201,16 +226,18 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="device_isolation",
         label="Device isolation and blocking",
-        availability=SecurityAvailability.AVAILABLE,
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
         enforcement=(
-            "/ip hotspot ip-binding type=blocked for known hardware; "
-            "address-list drop for an address; /ip hotspot active remove to "
-            "end a live session"
+            "Planned: /ip hotspot ip-binding type=blocked for known hardware; "
+            "address-list drop for an address"
         ),
         detail=(
-            "Durable for enrolled hardware. For anonymous guests, MAC "
-            "randomisation means a block is per-identity, and an IP-keyed "
-            "block lapses when the DHCP lease changes."
+            "Blocking a guest today ends their live session and refuses the "
+            "next sign-in; nothing writes a durable per-device block "
+            "(ip-binding) to a router yet. When built it would be durable "
+            "for enrolled hardware; for anonymous guests, MAC randomisation "
+            "means a block is per-identity, and an IP-keyed block lapses "
+            "when the DHCP lease changes."
         ),
     ),
     SecurityFeature(
@@ -223,22 +250,13 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="connection_flood_protection",
         label="Connection and brute-force limits",
-        availability=SecurityAvailability.AVAILABLE,
-        enforcement="/ip firewall filter connection-limit and dst-limit",
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        enforcement="Planned: /ip firewall filter connection-limit and dst-limit",
         detail=(
-            "Threshold-based, so it reduces rather than eliminates the "
-            "exposure, and it can drop legitimate bursts under a tight limit."
-        ),
-    ),
-    SecurityFeature(
-        key="vpn_tunnel_health",
-        label="Management tunnel health",
-        availability=SecurityAvailability.AVAILABLE,
-        enforcement="WireGuard peers, with handshake recency read back from the hub",
-        detail=(
-            "This is the platform's own management path to the router. It is "
-            "not a guest or staff remote-access VPN, and there is no such "
-            "user VPN today."
+            "No code writes a connection-limit rule to a router yet. When "
+            "built it is threshold-based, so it reduces rather than "
+            "eliminates the exposure, and it can drop legitimate bursts "
+            "under a tight limit."
         ),
     ),
     SecurityFeature(
