@@ -151,6 +151,35 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "run RouterOS at all' is the different question, and the one this "
         "filter answers."
     ),
+    # -- security posture ---------------------------------------------------
+    "app/domains/security/repository.py::"
+    "SecurityRepository._agent_managed_router_count_base": (
+        "The one `routers` read in the security domain, and the base every one "
+        "of its fleet counts is built from -- so the vendor question is "
+        "answered once rather than re-decided per count. It measures "
+        "'gateways reporting' from `router_agent_credentials.last_used_at`, "
+        "which is agent-shaped by definition: a controller-managed venue has "
+        "no agent credential and so no heartbeat that can be late. Counted "
+        "here, a working controller venue would be reported as a silent one -- "
+        "and a venue that silently stops reporting is exactly what this term "
+        "exists to surface, so a false one costs the whole signal."
+    ),
+    "app/domains/security/repository.py::"
+    "SecurityRepository.vpn_peer_counts.base": (
+        "WireGuard peers. The tunnel *is* the agent path -- a controller is "
+        "reached through its own API and never through a peer -- so this row "
+        "set is agent-shaped by construction. It also carries no organization "
+        "of its own, which is the only reason it joins `routers` at all."
+    ),
+    "app/domains/security/repository.py::"
+    "SecurityRepository.rogue_dhcp_counts.base": (
+        "`/ip dhcp-server alert` rows, the rogue-DHCP guard's stored state. A "
+        "RouterOS construct with no controller equivalent, and the row set has "
+        "no organization column, so it joins `routers` for tenancy and is "
+        "narrowed here. Left unnarrowed, a controller venue would report its "
+        "interfaces as unguarded -- an exposed network reported for a venue "
+        "whose guard was never applicable to it."
+    ),
 }
 
 
@@ -169,6 +198,17 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- security -----------------------------------------------------------
+    "app/domains/security/repository.py::SecurityRepository.fleet_counts": (
+        "Narrowing happened upstream and this method cannot undo it: every "
+        "statement here starts from `_agent_managed_router_count_base`, which "
+        "applies `agent_managed_only`, and this method only adds a predicate "
+        "to that already-filtered statement. It appears in this list rather "
+        "than AGENT_MANAGED_ONLY because it does not call the filter itself, "
+        "and putting it there would make that bucket's own test fail -- which "
+        "is the correct outcome, since a bucket claiming a filter is applied "
+        "here would be documentation that lies about the SQL."
+    ),
     # -- dashboard ----------------------------------------------------------
     "app/domains/dashboard/repository.py::DashboardFleetRepository.count_routers": (
         "The denominator next to `count_agent_managed_routers` above, and "

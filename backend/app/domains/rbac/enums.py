@@ -135,6 +135,19 @@ class PermissionModule(StrEnum):
     # for the full, honest RouterOS scope decision this module composes
     # into the network_config push pipeline.
     CONTENT_FILTERING = "content_filtering"
+    # Security: the venue-level security posture surface (overview, score)
+    # and the capability matrix recording what this platform can and cannot
+    # enforce -- see app.domains.security's own module docstring.
+    #
+    # Deliberately a separate module from CONTENT_FILTERING/FIREWALL rather
+    # than folded into either. Those two are per-rule/per-router CRUD at
+    # ScopeType.ROUTER; this one answers a venue-level question ("what is
+    # this location's security posture, and which features can it actually
+    # have?") at ScopeType.LOCATION, and its read set spans the fleet,
+    # blocking, devices, tunnels and alerts at once. A venue owner deciding
+    # whether to trust the number is not doing the same job as an engineer
+    # editing one filter rule, and one permission key cannot describe both.
+    SECURITY = "security"
     # Sales quotations: a branded PDF quotation an operator generates and
     # emails to a prospective/existing client -- see
     # app.domains.quotation's own module docstring. GLOBAL-only, same

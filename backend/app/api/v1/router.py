@@ -74,6 +74,7 @@ from app.domains.readiness.router import router as readiness_router
 from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
+from app.domains.security.router import router as security_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
@@ -197,6 +198,20 @@ api_v1_router.include_router(network_integration_portal_router)
 api_v1_router.include_router(network_integration_customer_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
+# Security: venue posture (overview, score) and the capability matrix.
+#
+# Deliberately NOT on _PAID_WRITES, and this is a decision rather than an
+# omission. The licence note above is explicit that reads are never gated --
+# a customer whose plan lapsed must still be able to sign in and see what they
+# have. Every route on this router is a read, so gating it would lock a lapsed
+# venue out of the page describing its own exposure.
+#
+# That argument expires the moment this router grows a write endpoint, and the
+# gating decision is not left to whoever adds it: tests/unit/test_security.py
+# asserts this router has no write route, so adding one fails the suite rather
+# than silently shipping an ungated write. See app.domains.security.router's
+# own docstring for the same note next to the routes themselves.
+api_v1_router.include_router(security_router)
 api_v1_router.include_router(campaigns_guest_router)
 api_v1_router.include_router(campaigns_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(notification_router, dependencies=_PAID_WRITES)
