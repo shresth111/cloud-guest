@@ -263,12 +263,24 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
         key="web_category_filtering",
         label="Web category filtering",
         availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
-        enforcement=None,
+        enforcement=(
+            "Planned: Cloudflare Gateway DNS category policies; the router "
+            "forwards its DNS lookups to a per-router Gateway address over "
+            "DNS-over-HTTPS (RouterOS 7.19 or later)"
+        ),
         detail=(
-            "Needs a maintained domain-to-category database and a resolver "
-            "that applies it. RouterOS provides neither, and this platform "
-            "does not run a filtering resolver. A DNS filtering provider "
-            "would supply both."
+            "RouterOS has no category database, so categories are applied by "
+            "Cloudflare Gateway when the router looks a name up. The switch "
+            "is built but not yet available: it needs the platform's "
+            "Cloudflare account to be connected and has not been proven on "
+            "a real router. Limits once it ships: it filters by website "
+            "name only, at the DNS lookup, never the page or content. A "
+            "guest whose device uses its own encrypted DNS (private DNS, "
+            "DNS-over-HTTPS or DNS-over-TLS) or a VPN is not filtered, "
+            "unless the router's optional bypass protection is turned on, "
+            "and even then only encrypted DNS to well-known resolvers is "
+            "stopped. Categories are Cloudflare's, and a site can be "
+            "misclassified."
         ),
     ),
     SecurityFeature(
