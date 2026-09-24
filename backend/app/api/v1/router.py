@@ -27,6 +27,7 @@ from app.domains.demo_request.router import router as demo_request_router
 from app.domains.device_sync.router import router as device_sync_router
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.dns.router import router as dns_router
+from app.domains.dns_filtering.router import router as dns_filtering_router
 from app.domains.feature_entitlement.router import router as feature_entitlement_router
 from app.domains.firewall.router import router as firewall_router
 from app.domains.guest.router import admin_router as guest_admin_router
@@ -198,6 +199,9 @@ api_v1_router.include_router(network_integration_portal_router)
 api_v1_router.include_router(network_integration_customer_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
+# Cloudflare Gateway category filtering: the provider-backed half of the same
+# customer feature, gated on the same licence rule (writes need an active plan).
+api_v1_router.include_router(dns_filtering_router, dependencies=_PAID_WRITES)
 # Security: venue posture (overview, score) and the capability matrix.
 #
 # Deliberately NOT on _PAID_WRITES, and this is a decision rather than an

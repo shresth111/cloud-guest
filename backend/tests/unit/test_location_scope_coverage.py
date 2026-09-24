@@ -80,6 +80,20 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "dns_filtering": (
+        "Two location-bearing models. `DnsFilteringPolicy` is reached only "
+        "through `/locations/{location_id}/policy` (RBAC pinned at LOCATION, "
+        "so the path id is the checked id) or `/organizations/"
+        "{organization_id}/policy` (pinned at ORGANIZATION, which a "
+        "location-scoped grant can never satisfy); `_load_location` also "
+        "runs `enforce_entity_location` on the loaded row and reads the "
+        "organization off that row, never off a header. "
+        "`DnsFilteringRouterLocation` is reached only by `{router_id}` "
+        "(pinned at ROUTER), and every router path loads the router "
+        "org-scoped and then enforces its location. There is no by-own-id "
+        "route for either table. `DnsFilteringProfile` is platform-owned, "
+        "carries no location, and has no route at all."
+    ),
     "guest": (
         "The PII surface, done last and alone. THREE getters across TWO "
         "service classes: `_require_guest` (the chokepoint all nine "

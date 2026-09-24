@@ -996,6 +996,16 @@ class AuditAction(StrEnum):
     # and the same reason, as DHCP_POOL_PUSHED and VLAN_PUSHED above.
     CONTENT_FILTER_RULE_PUSHED = "content_filter_rule_pushed"
 
+    # Cloudflare Gateway DNS (category) filtering -- written by
+    # ``app.domains.dns_filtering.service.DnsFilteringService``. ENABLED and
+    # DISABLED are whole-router DNS changes (the router's resolver was
+    # switched to, or restored from, a Gateway DoH endpoint), which is why
+    # they are recorded separately from the policy edit.
+    DNS_FILTERING_POLICY_UPDATED = "dns_filtering_policy_updated"
+    DNS_FILTERING_ENABLED = "dns_filtering_enabled"
+    DNS_FILTERING_DISABLED = "dns_filtering_disabled"
+    DNS_FILTERING_BYPASS_HARDENING_CHANGED = "dns_filtering_bypass_hardening_changed"
+
     # Support Tickets domain events -- written through this same table by
     # ``app.domains.support_tickets.service.TicketService`` via the same
     # narrow ``AuditLogWriter`` protocol shape every other domain's service
