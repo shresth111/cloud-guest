@@ -14,17 +14,15 @@ for why there are three owners):
 Nothing to backfill: no router has ever been pointed at Gateway.
 
 **Head coordination.** Based on
-``0129_add_notification_channel_routing_and_log_kind`` (origin/main at the
-time of writing). PR #304 also adds a ``0130`` on the same parent; whichever
-merges second must rebase its ``down_revision`` onto the other so the chain
-keeps a single head.
+``0130_add_device_push_columns_to_firewall_rules`` (PR #304, merged first),
+so the chain keeps a single head.
 
 Downgrade drops all three. Any router still switched to Gateway keeps its
 DoH setting on the device and loses the snapshot that would restore it --
 disable every router first.
 
-Revision ID: 0130_create_dns_filtering_tables
-Revises: 0129_add_notification_channel_routing_and_log_kind
+Revision ID: 0131_create_dns_filtering_tables
+Revises: 0130_add_device_push_columns_to_firewall_rules
 Create Date: 2026-09-23
 """
 
@@ -33,8 +31,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0130_create_dns_filtering_tables"
-down_revision = "0129_add_notification_channel_routing_and_log_kind"
+revision = "0131_create_dns_filtering_tables"
+down_revision = "0130_add_device_push_columns_to_firewall_rules"
 branch_labels = None
 depends_on = None
 
