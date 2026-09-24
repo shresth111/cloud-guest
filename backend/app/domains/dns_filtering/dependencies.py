@@ -72,6 +72,9 @@ def get_dns_filtering_service(
         max_locations=settings.cloudflare_gateway_max_locations,
         max_dns_rules=settings.cloudflare_gateway_max_dns_rules,
         probe_hostname=settings.dns_filtering_probe_hostname,
+        ip_exclusions=tuple(settings.dns_bypass_ip_exclusions),
+        hostname_exclusions=tuple(settings.dns_bypass_hostname_exclusions),
+        list_max_entries=settings.dns_bypass_list_max_entries,
     )
 
 

@@ -53,6 +53,7 @@ from app.domains.dns_filtering.exceptions import (
     UnknownCategoryError,
 )
 from app.domains.dns_filtering.models import (
+    DnsBypassBlocklist,
     DnsFilteringPolicy,
     DnsFilteringProfile,
     DnsFilteringRouterLocation,
@@ -229,6 +230,9 @@ _ROW_DEFAULTS = {
     "bypass_hardening_enabled": False,
     "bypass_hardening_status": "off",
     "bypass_hardening_error": None,
+    "bypass_layers": [],
+    "bypass_lists_sha": None,
+    "bypass_lists_pushed_at": None,
 }
 
 
@@ -239,6 +243,7 @@ class FakeRepo:
     rows: dict[uuid.UUID, DnsFilteringRouterLocation] = field(default_factory=dict)
     extra_cf_locations: int = 0
     commits: int = 0
+    blocklists: dict[str, Any] = field(default_factory=dict)
 
     async def get_profile(self, profile_id):
         return self.profiles.get(profile_id)
@@ -329,6 +334,27 @@ class FakeRepo:
             if r.organization_id == organization_id
             and r.state != RouterFilteringState.DISABLED.value
             and (location_id is None or r.location_id == location_id)
+        ]
+
+    async def get_blocklist(self, kind):
+        return self.blocklists.get(kind)
+
+    async def save_blocklist(self, kind, data):
+        row = self.blocklists.get(kind)
+        if row is None:
+            row = DnsBypassBlocklist(**_base(kind=kind, **data))
+            self.blocklists[kind] = row
+        else:
+            for k, v in data.items():
+                setattr(row, k, v)
+        return row
+
+    async def list_bypass_hardened(self):
+        return [
+            r
+            for r in self.rows.values()
+            if r.bypass_hardening_enabled
+            and r.state == RouterFilteringState.ACTIVE.value
         ]
 
     async def commit(self):
@@ -498,8 +524,22 @@ class FakeAdapter:
 
         return DnsRestoreResult(changed=True, probe_ok=True, probe_error=None)
 
-    async def apply_bypass_hardening(self, credentials):
-        self.calls.append(("apply_bypass_hardening", {}))
+    bypass_error: Exception | None = None
+    counters: Any = None
+
+    async def apply_bypass_hardening(self, credentials, **kw):
+        self.calls.append(("apply_bypass_hardening", kw))
+        if self.bypass_error:
+            raise self.bypass_error
+        from wyfy_device_gateway.mikrotik_dns_filtering import BypassApplyResult
+
+        return BypassApplyResult(layers=tuple(sorted(kw["layers"])))
+
+    async def read_bypass_counters(self, credentials):
+        self.calls.append(("read_bypass_counters", {}))
+        if self.bypass_error:
+            raise self.bypass_error
+        return self.counters
 
     async def remove_bypass_hardening(self, credentials):
         self.calls.append(("remove_bypass_hardening", {}))
@@ -1206,6 +1246,7 @@ class _FakeRouterOS:
             ("ip", "dns", "static"): [{".id": "*S1", "name": "facebook.com"}],
         }
         self.probe_ok = probe_ok
+        self.next_id = 0x100
         self.writes: list[tuple[tuple[str, ...], dict]] = []
 
     def path(self, *segments):
@@ -1218,8 +1259,26 @@ class _FakeRouterOS:
 
             def update(self, **fields):
                 api.writes.append((segments, fields))
+                target = fields.get(".id")
                 for row in rows:
-                    row.update(fields)
+                    if target is None or row.get(".id") == target:
+                        row.update(fields)
+
+            def add(self, **fields):
+                api.writes.append((segments, fields))
+                api.next_id += 1
+                anchor = fields.pop("place-before", None)
+                row = {".id": f"*{api.next_id:X}", **fields}
+                ids = [r.get(".id") for r in rows]
+                if anchor in ids:
+                    rows.insert(ids.index(anchor), row)
+                else:
+                    rows.append(row)
+                return row[".id"]
+
+            def remove(self, *ids):
+                api.writes.append((segments, {"remove": ids}))
+                rows[:] = [r for r in rows if r.get(".id") not in ids]
 
         return _Path()
 
@@ -1417,6 +1476,10 @@ _EXPECTED = {
         "content_filtering.execute",
         ScopeType.ROUTER,
     ),
+    ("GET", "/dns-filtering/routers/{router_id}/bypass-hardening/counters"): (
+        "content_filtering.read",
+        ScopeType.ROUTER,
+    ),
 }
 
 
@@ -1444,3 +1507,626 @@ class TestRoutes:
             PermissionAction.EXECUTE,
         ):
             assert action in actions
+
+
+# ============================================================================
+# 8. DNS bypass layers
+# ============================================================================
+
+from app.domains.dns_filtering.bypass_lists import (  # noqa: E402
+    HttpxListFetcher,
+    ListFetchError,
+    ParsedList,
+    RefreshSettings,
+    hostnames_to_push,
+    list_sha,
+    parse_hostname_list,
+    parse_ip_list,
+    refresh_blocklists,
+    refusal_reason,
+)
+from app.domains.dns_filtering.constants import (  # noqa: E402
+    ANONYMIZER_CATEGORY_ID,
+    CURATED_DOH_HOSTNAMES,
+    DEFAULT_BYPASS_LAYERS,
+    BypassLayer,
+)
+from app.domains.dns_filtering.exceptions import (  # noqa: E402
+    BypassLayerInvalidError,
+    DnsFilteringDeviceConnectionError,
+)
+
+# Shaped like the real dibdot files (observed 2026-09-24).
+_IPV4_FILE = """\
+1.0.0.1             # 1dot1dot1dot1.cloudflare-dns.com, one.one.one.one
+1.1.1.1             # 1dot1dot1dot1.cloudflare-dns.com, one.one.one.one
+8.8.8.8             # dns.google
+9.9.9.9             # dns.quad9.net
+162.159.36.5        # frd4wvnobp.cloudflare-gateway.com
+172.64.36.1         # gateway
+10.1.2.3            # a private address has no business here
+127.0.0.1
+224.0.0.1
+2001:4860:4860::8888
+9.9.9.9
+not-an-address
+1.2.3.0/24
+<html>oops</html>
+"""
+_DOMAINS_FILE = """\
+cleanbrowsing.org
+ahoj.email
+dns.quad9.net
+doh.cleanbrowsing.org
+frd4wvnobp.cloudflare-gateway.com
+*.wild.example
+DNS.EXAMPLE.NET.
+"""
+
+
+class TestListParsing:
+    def test_ipv4_keeps_only_global_literals_minus_exclusions(self) -> None:
+        parsed = parse_ip_list(
+            _IPV4_FILE, version=4, exclusions=("172.64.36.0/24", "162.159.36.0/24")
+        )
+        assert parsed.entries == ["1.0.0.1", "1.1.1.1", "8.8.8.8", "9.9.9.9"]
+        assert parsed.excluded == 2
+        # private, loopback, multicast, the v6 line, garbage, CIDR, html
+        assert parsed.rejected == 7
+
+    def test_ipv6_list_is_parsed_separately(self) -> None:
+        assert parse_ip_list(_IPV4_FILE, version=6).entries == ["2001:4860:4860::8888"]
+
+    def test_hostnames_skip_apex_domains_and_the_gateway_suffix(self) -> None:
+        parsed = parse_hostname_list(
+            _DOMAINS_FILE, exclusions=("cloudflare-gateway.com",)
+        )
+        assert parsed.entries == [
+            "dns.example.net",
+            "dns.quad9.net",
+            "doh.cleanbrowsing.org",
+        ]
+        assert parsed.excluded == 1
+
+    def test_hostnames_to_push_never_includes_the_upstream_or_the_probe(self) -> None:
+        names = hostnames_to_push(
+            ["abc.cloudflare-gateway.com", "cloudflare.com", "dns.x.example"],
+            exclusions=("cloudflare-gateway.com",),
+            probe_hostname="cloudflare.com",
+            max_entries=5000,
+        )
+        assert "abc.cloudflare-gateway.com" not in names
+        assert "cloudflare.com" not in names
+        assert names[: len(CURATED_DOH_HOSTNAMES)] == list(CURATED_DOH_HOSTNAMES)
+        assert names[-1] == "dns.x.example"
+
+    @pytest.mark.parametrize(
+        ("entries", "last", "expect"),
+        [
+            ([], None, "no valid entries"),
+            ([f"1.1.1.{i}" for i in range(11)], None, "exceeds the cap"),
+            ([f"1.1.1.{i}" for i in range(4)], 10, "under 50%"),
+            ([f"1.1.1.{i}" for i in range(5)], 10, None),
+            ([f"1.1.1.{i}" for i in range(9)], None, None),
+        ],
+    )
+    def test_refusal_rules(self, entries, last, expect) -> None:
+        reason = refusal_reason(
+            ParsedList(entries),
+            last_good_count=last,
+            max_entries=10,
+            min_keep_ratio=0.5,
+        )
+        if expect is None:
+            assert reason is None
+        else:
+            assert expect in reason
+
+
+@dataclass
+class FakeFetcher:
+    files: dict[str, str]
+    fail: set[str] = field(default_factory=set)
+    calls: list[str] = field(default_factory=list)
+
+    async def fetch(self, url):
+        self.calls.append(url)
+        if url in self.fail:
+            raise ListFetchError(f"HTTP 503 from {url}")
+        return self.files[url]
+
+
+_REFRESH = RefreshSettings(
+    ipv4_url="https://lists.example/doh-ipv4.txt",
+    ipv6_url="https://lists.example/doh-ipv6.txt",
+    domains_url="https://lists.example/doh-domains.txt",
+    max_entries=5000,
+    min_keep_ratio=0.5,
+    ip_exclusions=("172.64.36.0/24", "162.159.36.0/24"),
+    hostname_exclusions=("cloudflare-gateway.com",),
+)
+
+
+def _files(ipv4: str = _IPV4_FILE) -> dict[str, str]:
+    return {
+        _REFRESH.ipv4_url: ipv4,
+        _REFRESH.ipv6_url: _IPV4_FILE,
+        _REFRESH.domains_url: _DOMAINS_FILE,
+    }
+
+
+class TestRefresh:
+    async def test_stores_each_list_once_platform_wide(self) -> None:
+        repo = FakeRepo()
+        outcome = await refresh_blocklists(repo, FakeFetcher(_files()), _REFRESH)
+        assert outcome.statuses == {
+            "doh_ipv4": "ok",
+            "doh_ipv6": "ok",
+            "doh_domains": "ok",
+        }
+        row = repo.blocklists["doh_ipv4"]
+        assert row.entries == ["1.0.0.1", "1.1.1.1", "8.8.8.8", "9.9.9.9"]
+        assert row.sha256 == list_sha(row.entries)
+        assert repo.commits == 1
+
+    async def test_a_list_that_shrinks_by_more_than_half_is_refused(self) -> None:
+        repo = FakeRepo()
+        await refresh_blocklists(repo, FakeFetcher(_files()), _REFRESH)
+        before = list(repo.blocklists["doh_ipv4"].entries)
+        outcome = await refresh_blocklists(
+            repo, FakeFetcher(_files(ipv4="9.9.9.9\n")), _REFRESH
+        )
+        row = repo.blocklists["doh_ipv4"]
+        assert outcome.statuses["doh_ipv4"] == "refused"
+        assert row.entries == before  # last good kept
+        assert row.last_status == "refused" and "under 50%" in row.last_error
+        assert outcome.statuses["doh_domains"] == "ok"  # others unaffected
+
+    async def test_a_failed_fetch_keeps_the_last_good_list(self) -> None:
+        repo = FakeRepo()
+        await refresh_blocklists(repo, FakeFetcher(_files()), _REFRESH)
+        fetcher = FakeFetcher(_files(), fail={_REFRESH.ipv4_url})
+        outcome = await refresh_blocklists(repo, fetcher, _REFRESH)
+        assert outcome.statuses["doh_ipv4"] == "error"
+        assert repo.blocklists["doh_ipv4"].entry_count == 4
+
+    async def test_garbage_with_no_last_good_list_stores_nothing(self) -> None:
+        repo = FakeRepo()
+        files = _files(ipv4="<html>rate limited</html>\n")
+        outcome = await refresh_blocklists(repo, FakeFetcher(files), _REFRESH)
+        assert outcome.statuses["doh_ipv4"] == "refused"
+        assert "doh_ipv4" not in repo.blocklists
+
+
+class TestFetcher:
+    async def test_refuses_plain_http(self) -> None:
+        with pytest.raises(ListFetchError):
+            await HttpxListFetcher().fetch("http://lists.example/doh-ipv4.txt")
+
+    async def test_does_not_follow_redirects(self) -> None:
+        def handler(request):
+            return httpx.Response(302, headers={"location": "https://evil.example/x"})
+
+        fetcher = HttpxListFetcher(transport=httpx.MockTransport(handler))
+        with pytest.raises(ListFetchError, match="HTTP 302"):
+            await fetcher.fetch("https://lists.example/doh-ipv4.txt")
+
+    async def test_refuses_an_oversized_body(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "app.domains.dns_filtering.bypass_lists.MAX_LIST_BYTES", 100
+        )
+
+        def handler(request):
+            return httpx.Response(200, content=b"1.1.1.1\n" * 50)
+
+        fetcher = HttpxListFetcher(transport=httpx.MockTransport(handler))
+        with pytest.raises(ListFetchError, match="larger than"):
+            await fetcher.fetch("https://lists.example/doh-ipv4.txt")
+
+    async def test_returns_the_body(self) -> None:
+        def handler(request):
+            assert request.url.host == "lists.example"
+            return httpx.Response(200, content=b"9.9.9.9 # quad9\n")
+
+        fetcher = HttpxListFetcher(transport=httpx.MockTransport(handler))
+        assert await fetcher.fetch("https://lists.example/x") == "9.9.9.9 # quad9\n"
+
+
+_CATALOGUE_WITH_ANONYMIZER = [
+    *_CATALOGUE[:2],
+    GatewayCategory(
+        21,
+        "Security threats",
+        "",
+        "free",
+        False,
+        (
+            GatewayCategory(117, "Malware", "", "free", False, ()),
+            GatewayCategory(68, "Anonymizer", "", "free", False, ()),
+        ),
+    ),
+]
+
+
+async def _active_router(h: Harness, categories=(7,)):
+    _, _, router = await _venue_with_router(h, list(categories))
+    await h.service.enable_router(
+        router.id, actor_user_id=None, requesting_organization_id=None
+    )
+    return router
+
+
+def _bypass(h: Harness, router, **kw):
+    return h.service.set_bypass_hardening(
+        router.id, actor_user_id=None, requesting_organization_id=None, **kw
+    )
+
+
+class TestBypassLayersService:
+    def test_layer_names_match_the_gateway(self) -> None:
+        from wyfy_device_gateway.mikrotik_dns_filtering import (
+            BYPASS_LAYERS,
+        )
+        from wyfy_device_gateway.mikrotik_dns_filtering import (
+            DEFAULT_BYPASS_LAYERS as GATEWAY_DEFAULT,
+        )
+
+        assert {layer.value for layer in BypassLayer} == set(BYPASS_LAYERS)
+        assert DEFAULT_BYPASS_LAYERS == GATEWAY_DEFAULT
+        assert BypassLayer.VPN_BLOCK.value not in DEFAULT_BYPASS_LAYERS
+
+    async def test_default_is_every_layer_but_vpn_with_the_platform_lists(
+        self, adapter
+    ) -> None:
+        h = _harness()
+        await refresh_blocklists(h.repo, FakeFetcher(_files()), _REFRESH)
+        # a Gateway resolver address that slipped into the stored list must
+        # still never be pushed
+        h.repo.blocklists["doh_ipv4"].entries.append("162.159.36.20")
+        router = await _active_router(h)
+
+        row = await _bypass(h, router, enabled=True)
+
+        (call,) = [c for c in adapter.calls if c[0] == "apply_bypass_hardening"]
+        kw = call[1]
+        assert kw["layers"] == DEFAULT_BYPASS_LAYERS
+        assert kw["doh_ipv4"] == ["1.0.0.1", "1.1.1.1", "8.8.8.8", "9.9.9.9"]
+        assert "doh.cleanbrowsing.org" in kw["doh_hostnames"]
+        assert not any("cloudflare-gateway.com" in n for n in kw["doh_hostnames"])
+        assert "cloudflare.com" not in kw["doh_hostnames"]
+        assert kw["sni_hostnames"] == list(CURATED_DOH_HOSTNAMES)
+        assert row.bypass_layers == sorted(DEFAULT_BYPASS_LAYERS)
+        assert row.bypass_lists_sha is not None
+        assert row.bypass_hardening_status == "active"
+
+    async def test_each_layer_is_individually_toggleable(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        row = await _bypass(h, router, enabled=True, layers=["canary_domains"])
+        assert row.bypass_layers == ["canary_domains"]
+        assert row.bypass_lists_sha is None  # no list-backed layer, no list push
+        kw = [c for c in adapter.calls if c[0] == "apply_bypass_hardening"][-1][1]
+        assert kw["layers"] == frozenset({"canary_domains"})
+        assert kw["doh_ipv4"] == [] and kw["sni_hostnames"] == []
+
+    @pytest.mark.parametrize("layers", [["dpi"], []])
+    async def test_bad_layer_sets_are_refused_before_the_router(
+        self, adapter, layers
+    ) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        before = list(adapter.calls)
+        with pytest.raises(BypassLayerInvalidError) as exc:
+            await _bypass(h, router, enabled=True, layers=layers)
+        assert exc.value.status_code == 400
+        assert adapter.calls == before
+
+    async def test_vpn_blocking_adds_the_anonymizer_category_and_removes_it(
+        self, adapter, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            FakeGateway,
+            "list_categories",
+            lambda self: _async(_CATALOGUE_WITH_ANONYMIZER),
+        )
+        h = _harness()
+        router = await _active_router(h, categories=(7,))
+        row = await h.repo.get_router_location(router.id)
+        plain_profile = row.applied_profile_id
+
+        row = await _bypass(
+            h, router, enabled=True, layers=["encrypted_dns_ports", "vpn_block"]
+        )
+        vpn_profile = h.repo.profiles[row.applied_profile_id]
+        assert vpn_profile.category_ids == [7, ANONYMIZER_CATEGORY_ID]
+        rule = h.gateway.rules[vpn_profile.cf_rule_id]
+        assert "dns.security_category[*] in {68}" in rule["traffic"]
+        assert "dns.content_category[*] in {7}" in rule["traffic"]
+        # Locations are per category set: the router was re-pointed at the
+        # VPN set's own endpoint through the verified switch...
+        doh_calls = [c for c in adapter.calls if c[0] == "apply_doh"]
+        assert doh_calls[-1][1]["doh_url"] == doh_url(vpn_profile.doh_subdomain)
+        # ...and the plain set's rule and location were released once nobody
+        # pointed at them.
+        assert h.repo.profiles[plain_profile].cf_rule_id is None
+        assert h.repo.profiles[plain_profile].cf_location_id is None
+        assert list(h.gateway.locations) == [vpn_profile.cf_location_id]
+
+        row = await _bypass(h, router, enabled=True, layers=["encrypted_dns_ports"])
+        assert row.applied_profile_id == plain_profile
+        assert h.repo.profiles[plain_profile].cf_rule_id is not None
+        assert vpn_profile.cf_rule_id is None
+        assert vpn_profile.cf_location_id is None
+
+    async def test_vpn_blocking_past_the_location_cap_is_refused_before_the_router(
+        self, adapter, monkeypatch
+    ) -> None:
+        """The VPN set is a distinct category set, so it needs its own
+        Gateway location. With another router sharing the plain set, turning
+        it on here would need a second location."""
+        monkeypatch.setattr(
+            FakeGateway,
+            "list_categories",
+            lambda self: _async(_CATALOGUE_WITH_ANONYMIZER),
+        )
+        h = _harness(max_locations=1)
+        router = await _active_router(h, categories=(7,))
+        await _active_router(h, categories=(7,))
+        before = list(adapter.calls)
+
+        with pytest.raises(CategorySetLimitError) as exc:
+            await _bypass(h, router, enabled=True, layers=["vpn_block"])
+
+        assert exc.value.data["nearest_category_ids"] == [7]
+        assert adapter.calls == before
+        row = await h.repo.get_router_location(router.id)
+        assert row.bypass_layers == []
+
+    async def test_a_policy_change_keeps_the_anonymizer_for_a_vpn_router(
+        self, adapter, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            FakeGateway,
+            "list_categories",
+            lambda self: _async(_CATALOGUE_WITH_ANONYMIZER),
+        )
+        h = _harness()
+        router = await _active_router(h, categories=(7,))
+        await _bypass(h, router, enabled=True, layers=["vpn_block"])
+        await h.service.set_location_policy(
+            router.location_id,
+            category_ids=[2],
+            actor_user_id=None,
+            requesting_organization_id=None,
+        )
+        row = await h.repo.get_router_location(router.id)
+        assert h.repo.profiles[row.applied_profile_id].category_ids == [
+            2,
+            ANONYMIZER_CATEGORY_ID,
+        ]
+
+    async def test_without_the_category_in_the_catalogue_vpn_blocking_is_router_only(
+        self, adapter
+    ) -> None:
+        h = _harness()  # _CATALOGUE has no Anonymizer
+        router = await _active_router(h, categories=(7,))
+        before = (await h.repo.get_router_location(router.id)).applied_profile_id
+        row = await _bypass(h, router, enabled=True, layers=["vpn_block"])
+        assert row.applied_profile_id == before
+        assert row.bypass_layers == ["vpn_block"]
+
+    async def test_a_device_failure_is_recorded_and_raised(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        adapter.bypass_error = DnsFilteringDeviceConnectionError("10.20.0.5", "timeout")
+        with pytest.raises(DnsFilteringDeviceConnectionError):
+            await _bypass(h, router, enabled=True)
+        row = await h.repo.get_router_location(router.id)
+        assert row.bypass_hardening_status == "failed"
+        assert row.bypass_layers == []
+
+    async def test_disable_clears_the_layers(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        await _bypass(h, router, enabled=True)
+        row = await _bypass(h, router, enabled=False)
+        assert row.bypass_layers == [] and row.bypass_hardening_enabled is False
+        assert adapter.calls[-1][0] == "remove_bypass_hardening"
+
+
+async def _async(value):
+    return value
+
+
+class TestListPush:
+    async def test_pushes_only_when_the_lists_moved(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        await _bypass(h, router, enabled=True)
+
+        def pushes() -> int:
+            return sum(1 for c in adapter.calls if c[0] == "apply_bypass_hardening")
+
+        assert await h.service.push_bypass_lists_to_router(router.id) == "unchanged"
+        assert pushes() == 1
+
+        await refresh_blocklists(h.repo, FakeFetcher(_files()), _REFRESH)
+        assert await h.service.push_bypass_lists_to_router(router.id) == "pushed"
+        assert pushes() == 2
+        kw = [c for c in adapter.calls if c[0] == "apply_bypass_hardening"][-1][1]
+        assert kw["layers"] == DEFAULT_BYPASS_LAYERS  # the router's own layers
+        assert await h.service.push_bypass_lists_to_router(router.id) == "unchanged"
+
+    async def test_skips_routers_without_a_list_layer(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        assert await h.service.push_bypass_lists_to_router(router.id) == "skipped"
+        await _bypass(h, router, enabled=True, layers=["vpn_block"])
+        assert await h.service.push_bypass_lists_to_router(router.id) == "skipped"
+
+    async def test_a_failed_push_is_recorded_not_raised(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        await _bypass(h, router, enabled=True)
+        await refresh_blocklists(h.repo, FakeFetcher(_files()), _REFRESH)
+        adapter.bypass_error = DnsFilteringDeviceConnectionError("10.20.0.5", "timeout")
+        assert await h.service.push_bypass_lists_to_router(router.id) == "failed"
+        row = await h.repo.get_router_location(router.id)
+        assert "DoH list refresh failed" in row.bypass_hardening_error
+        assert row.bypass_hardening_status == "active"  # its rules stay in force
+
+
+class TestCountersService:
+    async def test_off_is_unavailable_with_a_reason(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        view = await h.service.get_bypass_counters(
+            router.id, requesting_organization_id=None
+        )
+        assert view.available is False and "off" in view.reason
+        assert all(v.packets is None for v in view.layers)
+        assert not any(c[0] == "read_bypass_counters" for c in adapter.calls)
+
+    async def test_an_unreachable_router_is_unavailable_not_zero(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        await _bypass(h, router, enabled=True)
+        adapter.bypass_error = DnsFilteringDeviceConnectionError("10.20.0.5", "timeout")
+        view = await h.service.get_bypass_counters(
+            router.id, requesting_organization_id=None
+        )
+        assert view.available is False
+        assert "Could not read the router" in view.reason
+        assert all(v.packets is None and not v.available for v in view.layers)
+
+    async def test_another_orgs_router_is_not_found(self, adapter) -> None:
+        h = _harness()
+        router = await _active_router(h)
+        with pytest.raises(RouterNotFoundError):
+            await h.service.get_bypass_counters(
+                router.id, requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_controller_managed_is_refused(self, adapter) -> None:
+        h = _harness()
+        router = h.routers.add(_router(vendor="tplink_omada"))
+        for call in (
+            h.service.get_bypass_counters(router.id, requesting_organization_id=None),
+            h.service.push_bypass_lists_to_router(router.id),
+        ):
+            with pytest.raises(ControllerManagedFeatureUnavailableError):
+                await call
+        assert adapter.calls == []
+
+
+class TestBypassEndToEnd:
+    async def test_layers_counters_and_disable_through_the_real_gateway(
+        self, fake_routeros
+    ) -> None:
+        h = _harness()
+        await refresh_blocklists(h.repo, FakeFetcher(_files()), _REFRESH)
+        _, _, router = await _venue_with_router(h, [7])
+        api = _FakeRouterOS()
+        api.menus[("ip", "firewall", "filter")] = [
+            {
+                ".id": "*I1",
+                "chain": "input",
+                "action": "accept",
+                "protocol": "udp",
+                "dst-port": "51820",
+                "comment": "cloudguest-fw-allow-wg-mgmt",
+            },
+            {
+                ".id": "*F3",
+                "chain": "forward",
+                "action": "drop",
+                "hotspot": "!auth",
+                "protocol": "udp",
+                "dst-port": "853",
+                "comment": "cloudguest-block-dot-udp",
+            },
+            {
+                ".id": "*F7",
+                "chain": "forward",
+                "action": "accept",
+                "comment": "cloudguest-fw-fwd-established",
+            },
+        ]
+        api.menus[("ip", "firewall", "address-list")] = [
+            {
+                ".id": "*A1",
+                "list": "cloudguest-doh-ips",
+                "address": "1.1.1.1",
+                "comment": "cloudguest-doh",
+            },
+        ]
+        fake_routeros(api)
+        await h.service.enable_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+
+        await _bypass(
+            h, router, enabled=True, layers=[layer.value for layer in BypassLayer]
+        )
+
+        filters = api.menus[("ip", "firewall", "filter")]
+        ours = [
+            r
+            for r in filters
+            if str(r.get("comment", "")).startswith("cloudguest-dnsf-")
+        ]
+        assert ours and all(
+            r["chain"] == "forward" and r["hotspot"] == "auth" for r in ours
+        )
+        assert filters[0]["comment"] == "cloudguest-fw-allow-wg-mgmt"
+        # 1.1.1.1 is the bootstrap's own entry, so it is not duplicated.
+        synced = sorted(
+            r["address"]
+            for r in api.menus[("ip", "firewall", "address-list")]
+            if r.get("comment") == "cloudguest-dnsf-doh-sync"
+        )
+        assert synced == ["1.0.0.1", "8.8.8.8", "9.9.9.9"]
+        static = api.menus[("ip", "dns", "static")]
+        canary = sorted(
+            r["name"] for r in static if r.get("comment") == "cloudguest-dnsf-canary"
+        )
+        assert canary == [
+            "mask-h2.icloud.com",
+            "mask.icloud.com",
+            "use-application-dns.net",
+        ]
+        router_doh_host = api.menus[("ip", "dns")][0]["use-doh-server"].split("/")[2]
+        assert all(r.get("name") != router_doh_host for r in static)
+
+        for r in filters:
+            if r.get("comment") in ("cloudguest-dnsf-block-dot-udp-auth",):
+                r.update(packets="12", bytes="720")
+            elif str(r.get("comment", "")).startswith("cloudguest-dnsf-"):
+                r.update(packets="0", bytes="0")
+        for r in api.menus[("ip", "firewall", "nat")]:
+            r.update(packets="3", bytes="180")
+        view = await h.service.get_bypass_counters(
+            router.id, requesting_organization_id=None
+        )
+        by = {v.layer: v for v in view.layers}
+        assert view.available is True
+        assert by["encrypted_dns_ports"].packets == 12
+        assert by["vpn_block"].packets == 0 and by["vpn_block"].available is True
+        assert by["canary_domains"].available is False
+
+        await h.service.disable_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+        assert not any(
+            str(r.get("comment", "")).startswith("cloudguest-dnsf-")
+            for menu in api.menus.values()
+            for r in menu
+        )
+        assert [r["comment"] for r in api.menus[("ip", "firewall", "filter")]] == [
+            "cloudguest-fw-allow-wg-mgmt",
+            "cloudguest-block-dot-udp",
+            "cloudguest-fw-fwd-established",
+        ]
+        assert api.menus[("ip", "dns", "static")] == [
+            {".id": "*S1", "name": "facebook.com"}
+        ]

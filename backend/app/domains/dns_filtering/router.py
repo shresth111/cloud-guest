@@ -35,7 +35,9 @@ from .constants import SECURITY_THREATS_CATEGORY_ID, RouterFilteringState
 from .dependencies import get_dns_filtering_service
 from .models import DnsFilteringRouterLocation
 from .schemas import (
+    BypassCountersResponse,
     BypassHardeningRequest,
+    BypassLayerCounters,
     CategoryListResponse,
     CategoryResponse,
     LocationPolicyResponse,
@@ -52,6 +54,11 @@ LIMITATIONS = [
     "Devices using their own DNS, DNS-over-HTTPS or DNS-over-TLS are not "
     "covered unless DNS bypass hardening is on -- and even then DoH to an "
     "unlisted server looks like ordinary HTTPS and still gets through.",
+    "Nothing at the router stops a VPN or DNS-over-HTTPS server that runs on "
+    "port 443 with no recognisable name (or with Encrypted Client Hello), a "
+    "resolver the guest runs themselves, or a phone on mobile data. Bypass "
+    "protection stops default settings and casual workarounds, not a "
+    "determined user.",
     "Blocks whole domains only: no URL paths, no in-app content.",
     "If Cloudflare Gateway is unreachable, guests at this venue cannot "
     "resolve names until filtering is disabled.",
@@ -115,6 +122,8 @@ def _status(
         if row is not None
         else "off",
         bypass_hardening_error=row.bypass_hardening_error if row is not None else None,
+        bypass_layers=list(row.bypass_layers or []) if row is not None else [],
+        bypass_lists_pushed_at=row.bypass_lists_pushed_at if row is not None else None,
         routeros_version=row.routeros_version if row is not None else None,
         limitations=LIMITATIONS,
     )
@@ -378,11 +387,13 @@ async def set_bypass_hardening(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: DnsFilteringService = Depends(get_dns_filtering_service),
 ):
-    """Opt-in, off by default: drop DoT/DoH for logged-in guests too and
-    redirect their plain DNS to the router."""
+    """Opt-in, off by default: converge the router's DNS-bypass layers on
+    ``layers`` (omitted = every layer except VPN blocking), or remove them
+    all with ``enabled=false``."""
     await service.set_bypass_hardening(
         router_id,
         enabled=payload.enabled,
+        layers=payload.layers,
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
     )
@@ -397,4 +408,59 @@ async def set_bypass_hardening(
     )
 
 
-__all__ = ["LIMITATIONS", "router"]
+COUNTER_SEMANTICS = (
+    "Packets dropped by this platform's bypass rules on the router, "
+    "cumulative since each rule was added or the router last restarted "
+    "(RouterOS resets counters on reboot). One blocked connection is usually "
+    "several packets, so this is not a count of attempts or of people. "
+    "Lookups answered 'does not exist' by the canary and DoH-hostname "
+    "entries are not counted by RouterOS at all."
+)
+
+
+@router.get(
+    "/routers/{router_id}/bypass-hardening/counters",
+    response_model=ApiResponse[BypassCountersResponse],
+    dependencies=[
+        Depends(RequirePermission("content_filtering.read", scope=ScopeType.ROUTER))
+    ],
+)
+async def get_bypass_counters(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: DnsFilteringService = Depends(get_dns_filtering_service),
+):
+    """Evidence, not a claim: per-layer drop counters read live off the
+    router's own marked rules over 8728. ``available=false`` with a reason
+    whenever a number cannot be read -- never a zero standing in for one."""
+    view = await service.get_bypass_counters(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    payload = BypassCountersResponse(
+        router_id=str(router_id),
+        available=view.available,
+        reason=view.reason,
+        router_uptime=view.router_uptime,
+        layers=[
+            BypassLayerCounters(
+                layer=v.layer,
+                enabled=v.enabled,
+                available=v.available,
+                packets=v.packets,
+                bytes=v.bytes,
+                reason=v.reason,
+            )
+            for v in view.layers
+        ],
+        semantics=COUNTER_SEMANTICS,
+    )
+    return build_response(
+        success=True,
+        message="DNS bypass counters retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+__all__ = ["COUNTER_SEMANTICS", "LIMITATIONS", "router"]

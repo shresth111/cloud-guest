@@ -209,6 +209,17 @@ class DnsFilteringRouterLocation(BaseModel):
         nullable=False,
     )
     bypass_hardening_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which bypass layers are on (constants.BypassLayer values). Empty while
+    # bypass hardening is off. Written only after the device converged.
+    bypass_layers: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    # The combined sha256 of the platform DoH lists last pushed to this
+    # router, so the scheduled refresh only dials routers whose lists moved.
+    bypass_lists_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    bypass_lists_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index(
@@ -230,7 +241,45 @@ class DnsFilteringRouterLocation(BaseModel):
     )
 
 
+class DnsBypassBlocklist(BaseModel):
+    """**Platform-owned.** The last *good* copy of one public DoH list
+    (IPv4, IPv6 or hostnames), fetched once for the whole platform and
+    pushed to every opted-in router from here -- never fetched per router.
+
+    ``entries`` only ever holds validated literals (IP addresses or plain
+    hostnames). A refresh that is refused (shrank by more than half, over
+    the cap, empty) or fails leaves ``entries``/``sha256``/``fetched_at``
+    untouched and records only ``last_status``/``last_error``.
+    """
+
+    __tablename__ = "dns_bypass_blocklists"
+
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    entries: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    entry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_dns_bypass_blocklists_kind",
+            "kind",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+    )
+
+
 __all__ = [
+    "DnsBypassBlocklist",
     "DnsFilteringPolicy",
     "DnsFilteringProfile",
     "DnsFilteringRouterLocation",

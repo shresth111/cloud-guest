@@ -34,6 +34,114 @@ CATEGORY_CACHE_TTL_SECONDS = 3600
 RULE_PRECEDENCE_BASE = 10_000
 
 
+#: Cloudflare Gateway "Anonymizer" -- a subcategory of Security threats (21),
+#: "Sites that allow users to surf the Internet anonymously", per Cloudflare's
+#: published domain-category table (developers.cloudflare.com/cloudflare-one/
+#: traffic-policies/domain-categories/). Added to a router's Gateway profile
+#: only while that router's VPN-blocking layer is on, and only if the live
+#: catalogue still lists it. The table has no "VPN" or "Proxy" category.
+ANONYMIZER_CATEGORY_ID = 68
+
+
+class BypassLayer(StrEnum):
+    """The individually switchable DNS-bypass layers. Values are the device
+    gateway's (``wyfy_device_gateway.mikrotik_dns_filtering.BYPASS_LAYERS``);
+    a test pins the two together."""
+
+    CANARY_DOMAINS = "canary_domains"
+    ENCRYPTED_DNS_PORTS = "encrypted_dns_ports"
+    DOH_IP_LIST = "doh_ip_list"
+    DOH_HOSTNAMES = "doh_hostnames"
+    PLAIN_DNS_REDIRECT = "plain_dns_redirect"
+    VPN_BLOCK = "vpn_block"
+
+
+#: ``{"enabled": true}`` with no layer list means these. VPN blocking is
+#: never implied: hotel and business guests use corporate VPNs.
+DEFAULT_BYPASS_LAYERS: frozenset[str] = frozenset(
+    layer.value for layer in BypassLayer if layer is not BypassLayer.VPN_BLOCK
+)
+
+#: Layers whose device state depends on the synced public DoH lists, so a
+#: list refresh has to be pushed to the router.
+LIST_BACKED_LAYERS: frozenset[str] = frozenset(
+    {BypassLayer.DOH_IP_LIST.value, BypassLayer.DOH_HOSTNAMES.value}
+)
+
+#: Well-known DoH hostnames: sinkholed (NXDOMAIN) whatever the synced list
+#: says, and the only names that get a per-packet ``tls-host`` drop. Every
+#: one was checked present in dibdot/DoH-IP-blocklists ``doh-domains.txt``
+#: on 2026-09-24. Kept short on purpose: each ``tls-host`` rule is a
+#: per-packet match on small hardware.
+CURATED_DOH_HOSTNAMES: tuple[str, ...] = (
+    "dns.google",
+    "cloudflare-dns.com",
+    "mozilla.cloudflare-dns.com",
+    "chrome.cloudflare-dns.com",
+    "1dot1dot1dot1.cloudflare-dns.com",
+    "security.cloudflare-dns.com",
+    "family.cloudflare-dns.com",
+    "one.one.one.one",
+    "dns.quad9.net",
+    "dns9.quad9.net",
+    "dns10.quad9.net",
+    "dns11.quad9.net",
+    "doh.opendns.com",
+    "doh.familyshield.opendns.com",
+    "dns.adguard-dns.com",
+    "dns.adguard.com",
+    "family.adguard-dns.com",
+    "dns.nextdns.io",
+    "doh.cleanbrowsing.org",
+    "doh.mullvad.net",
+    "dns.mullvad.net",
+    "dns.controld.com",
+    "freedns.controld.com",
+    "doh.dns.sb",
+    "dns.alidns.com",
+    "doh.pub",
+    "dns.twnic.tw",
+    "doh.libredns.gr",
+    "dns0.eu",
+)
+
+
+class BlocklistKind(StrEnum):
+    """One platform-wide row per kind in ``dns_bypass_blocklists``."""
+
+    DOH_IPV4 = "doh_ipv4"
+    DOH_IPV6 = "doh_ipv6"
+    DOH_DOMAINS = "doh_domains"
+
+
+class BlocklistRefreshStatus(StrEnum):
+    OK = "ok"
+    #: Fetched, but refused by validation (shrank too far, over the cap,
+    #: empty). The last good list is kept.
+    REFUSED = "refused"
+    #: Could not fetch. The last good list is kept.
+    ERROR = "error"
+
+
+#: Celery. The coordinator (Beat) refreshes the platform lists -- outbound
+#: HTTPS to GitHub, no device I/O -- then fans out one leaf per opted-in
+#: router; the leaf is the RouterOS round trip and runs on the device-I/O
+#: queue.
+TASK_REFRESH_DNS_BYPASS_BLOCKLISTS = (
+    "app.domains.dns_filtering.tasks.refresh_dns_bypass_blocklists"
+)
+TASK_PUSH_DNS_BYPASS_LISTS_FOR_ROUTER = (
+    "app.domains.dns_filtering.tasks.push_dns_bypass_lists_for_router"
+)
+#: Six hours. The source regenerates its address files several times a day
+#: and its hostname list about monthly; a DoH server that appeared this
+#: morning is not an emergency, and every tick that finds a change dials
+#: every opted-in router.
+DNS_BYPASS_REFRESH_INTERVAL_SECONDS = 21_600.0
+DNS_BYPASS_REFRESH_LOCK_REDIS_KEY = "dns_filtering:bypass_list_refresh:lock"
+DNS_BYPASS_REFRESH_LOCK_TTL_SECONDS = 600
+
+
 class RouterFilteringState(StrEnum):
     """Where one router is in its Cloudflare DNS lifecycle."""
 
@@ -146,7 +254,19 @@ def build_rule_traffic(
 
 
 __all__ = [
+    "ANONYMIZER_CATEGORY_ID",
+    "BlocklistKind",
+    "BlocklistRefreshStatus",
     "BypassHardeningStatus",
+    "BypassLayer",
+    "CURATED_DOH_HOSTNAMES",
+    "DEFAULT_BYPASS_LAYERS",
+    "DNS_BYPASS_REFRESH_INTERVAL_SECONDS",
+    "DNS_BYPASS_REFRESH_LOCK_REDIS_KEY",
+    "DNS_BYPASS_REFRESH_LOCK_TTL_SECONDS",
+    "TASK_PUSH_DNS_BYPASS_LISTS_FOR_ROUTER",
+    "TASK_REFRESH_DNS_BYPASS_BLOCKLISTS",
+    "LIST_BACKED_LAYERS",
     "CATEGORY_CACHE_TTL_SECONDS",
     "DevicePushStatus",
     "FEATURE_NAME",
