@@ -132,6 +132,11 @@ from app.domains.dhcp.constants import (
     TASK_DETECT_ROGUE_DHCP_FOR_ROUTER,
     TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
 )
+from app.domains.dns_filtering.constants import (
+    DNS_BYPASS_REFRESH_INTERVAL_SECONDS,
+    TASK_PUSH_DNS_BYPASS_LISTS_FOR_ROUTER,
+    TASK_REFRESH_DNS_BYPASS_BLOCKLISTS,
+)
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
     OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
@@ -239,6 +244,7 @@ celery_app = Celery(
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
         "app.domains.dhcp.tasks",
+        "app.domains.dns_filtering.tasks",
         "app.domains.guest.tasks",
         "app.domains.guest_access.tasks",
         "app.domains.hub_reconciliation.tasks",
@@ -318,6 +324,10 @@ celery_app.conf.update(
         # left off -- one DB query plus N .delay() calls, no device I/O of
         # its own.
         TASK_DETECT_ROGUE_DHCP_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The DNS-bypass list push -- one real RouterOS round trip per
+        # opted-in router. Its coordinator (the list refresh) does outbound
+        # HTTPS to GitHub and no device I/O, so it stays on the default queue.
+        TASK_PUSH_DNS_BYPASS_LISTS_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
         # The captive-portal DHCP-option converger -- one real RouterOS
         # write per router, so it belongs here for the same reason. Routed
         # but NOT Beat-scheduled: see the constant's own note on why a
@@ -599,6 +609,13 @@ celery_app.conf.update(
         "dhcp-rogue-detection-sweep": {
             "task": TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
             "schedule": ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
+        },
+        # DNS bypass layers: refresh the platform's public DoH lists (once,
+        # platform-wide) and push them to routers that opted in. See
+        # app.domains.dns_filtering.tasks. Six hours.
+        "dns-bypass-blocklist-refresh": {
+            "task": TASK_REFRESH_DNS_BYPASS_BLOCKLISTS,
+            "schedule": DNS_BYPASS_REFRESH_INTERVAL_SECONDS,
         },
         # Queue Management Engine: re-evaluates every ACTIVE/SUSPENDED
         # QueueAssignment scoped to a QueueSchedule and flips its device

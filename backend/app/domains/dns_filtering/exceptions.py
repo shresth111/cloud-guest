@@ -11,6 +11,7 @@ from fastapi import status
 from app.common.exceptions import CloudGuestError
 
 __all__ = [
+    "BypassLayerInvalidError",
     "CategoryNotSelectableError",
     "CategorySetLimitError",
     "CloudflareGatewayCeilingError",
@@ -224,3 +225,8 @@ class DnsFilteringDeviceOperationError(DnsFilteringError):
         # settings, kept server-side (never in the response) so a router
         # whose rollback failed can still be restored by a later disable.
         self.snapshot: dict[str, object] | None = None
+
+
+class BypassLayerInvalidError(DnsFilteringError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)

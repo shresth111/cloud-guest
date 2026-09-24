@@ -50,17 +50,25 @@ read (they are what resolves the DoH hostname itself) and never written.
   certificate-lifecycle feature this module does not pretend to be. The
   planner already refuses anything below 7.
 
-## Bypass hardening (opt-in, separate)
+## Bypass hardening (opt-in, separate, in layers)
 
 :func:`apply_dns_bypass_hardening` extends the platform's existing
 pre-login DoT/DoH drops (``cloudguest-block-dot-udp``/``-tcp``,
 ``cloudguest-block-doh``, all ``hotspot=!auth``) to *authenticated* guests,
-and redirects authenticated guests' plain DNS (udp/tcp 53) to the router.
-New rows only -- the existing ones are never modified -- each carrying a
-``cloudguest-dnsf-`` comment marker, placed directly above
-``cloudguest-block-dot-udp`` so they sit with the rules they extend and
-above the firewall band (see the function's own docstring for why that
-position, and what it means for customer allow rules).
+in individually switchable layers (:data:`BYPASS_LAYERS`): canary/opt-out
+domains, DoT/DoQ ports, DoH by IP (with a synced address-list), DoH by
+hostname (NXDOMAIN + ``tls-host``), a plain-DNS redirect, and -- off by
+default -- VPN transports. New objects only -- the existing ones are never
+modified -- each carrying a ``cloudguest-dnsf-`` comment marker; filter
+rows are placed directly above ``cloudguest-block-dot-udp`` so they sit
+with the rules they extend and above the firewall band (see the function's
+own docstring for why that position, and what it means for customer allow
+rules).
+
+The ``/ip dns static`` rule above is about *other people's* entries: the
+bypass layers add and remove only static entries carrying their own
+marker (``cloudguest-dnsf-canary`` / ``cloudguest-dnsf-doh-host``) and skip
+any name another entry already answers.
 
 ## Honest scope
 
@@ -93,7 +101,14 @@ from .mikrotik_adapter import (
 
 __all__ = [
     "BYPASS_FILTER_MARKERS",
+    "BYPASS_LAYERS",
     "BYPASS_NAT_MARKERS",
+    "BypassApplyResult",
+    "BypassCounters",
+    "CANARY_DOMAINS",
+    "DEFAULT_BYPASS_LAYERS",
+    "LayerCounters",
+    "VPN_FILTER_MARKERS",
     "DnsResolverSnapshot",
     "DohApplyResult",
     "DnsRestoreResult",
@@ -103,7 +118,9 @@ __all__ = [
     "MikroTikDohProbeFailedError",
     "apply_dns_bypass_hardening",
     "apply_gateway_doh",
+    "normalize_hostname",
     "parse_routeros_version",
+    "read_dns_bypass_counters",
     "remove_dns_bypass_hardening",
     "restore_dns_resolver",
 ]
@@ -668,11 +685,6 @@ async def restore_dns_resolver(
     )
 
 
-# ---------------------------------------------------------------------------
-# bypass hardening
-# ---------------------------------------------------------------------------
-
-
 def _ensure_rows(
     menu, desired: tuple[dict[str, str], ...], *, place_before: str | None  # noqa: ANN001
 ) -> None:
@@ -700,10 +712,410 @@ def _ensure_rows(
             menu.remove(*[r[".id"] for r in extras])
 
 
-def _hardening_apply_sync(creds: DeviceCredentials) -> None:
+# ---------------------------------------------------------------------------
+# bypass hardening, in layers
+# ---------------------------------------------------------------------------
+#
+# Each layer is individually switchable per router and converges on every
+# call: an enabled layer's objects are made to exist exactly once, a
+# disabled layer's objects are removed. Only objects carrying one of this
+# module's ``cloudguest-dnsf-`` comment markers are ever written or removed;
+# the platform's pre-login drops, the bootstrap's own ``cloudguest-doh``
+# address-list entries, content filtering's ``/ip dns static`` sinkhole and
+# anything a customer or operator added are read (to avoid duplicating
+# them) and never modified.
+#
+# **Every filter row is ``chain=forward hotspot=auth``.** The router's own
+# traffic -- its WireGuard management tunnel, its DoH upstream, its 8728
+# API -- is ``chain=input``/``chain=output`` and cannot match a forward
+# rule. :func:`_assert_guest_forward_only` re-checks that on every write,
+# so a future edit that "simplifies" a chain fails before it reaches a
+# router.
+
+#: Firefox (default-on DoH only) and Apple iCloud Private Relay both look
+#: these names up through the network's resolver and stand down when the
+#: answer is NXDOMAIN. Sources in the backend PR; neither applies to a user
+#: who explicitly chose DoH / "max protection" in Firefox.
+LAYER_CANARY_DOMAINS = "canary_domains"
+#: DoT (tcp/udp 853) and DoQ (udp 853, RFC 9250) for logged-in guests.
+LAYER_ENCRYPTED_DNS_PORTS = "encrypted_dns_ports"
+#: DoH by destination IP: tcp/443 to ``cloudguest-doh-ips``, plus keeping
+#: that list fresh from the platform's synced public DoH-server list.
+LAYER_DOH_IP_LIST = "doh_ip_list"
+#: DoH by name: NXDOMAIN for known DoH hostnames (bootstrap by name fails)
+#: and ``tls-host`` drops for a short, curated set (DoH by IP with a
+#: visible SNI).
+LAYER_DOH_HOSTNAMES = "doh_hostnames"
+#: Logged-in guests' plain DNS (udp/tcp 53) redirected to the router.
+LAYER_PLAIN_DNS_REDIRECT = "plain_dns_redirect"
+#: Common VPN transports. OFF by default: hotel and business guests use
+#: corporate VPNs legitimately.
+LAYER_VPN_BLOCK = "vpn_block"
+
+BYPASS_LAYERS: tuple[str, ...] = (
+    LAYER_CANARY_DOMAINS,
+    LAYER_ENCRYPTED_DNS_PORTS,
+    LAYER_DOH_IP_LIST,
+    LAYER_DOH_HOSTNAMES,
+    LAYER_PLAIN_DNS_REDIRECT,
+    LAYER_VPN_BLOCK,
+)
+#: What "bypass hardening on" means when no layer set is named. Everything
+#: except VPN blocking, which is always an explicit per-venue choice.
+DEFAULT_BYPASS_LAYERS: frozenset[str] = frozenset(BYPASS_LAYERS) - {LAYER_VPN_BLOCK}
+
+CANARY_DOMAINS: tuple[str, ...] = (
+    "use-application-dns.net",
+    "mask.icloud.com",
+    "mask-h2.icloud.com",
+)
+
+_STATIC = ("ip", "dns", "static")
+_CANARY_COMMENT = "cloudguest-dnsf-canary"
+_DOH_HOST_COMMENT = "cloudguest-dnsf-doh-host"
+_DOH_SYNC_COMMENT = "cloudguest-dnsf-doh-sync"
+_SNI_PREFIX = "cloudguest-dnsf-doh-sni-auth:"
+
+#: Hard ceilings enforced on the device side too, whatever the backend
+#: sends: an address-list or static table this size is already large for a
+#: small board, and a per-packet ``tls-host`` rule is expensive.
+MAX_DOH_IPV4 = 5000
+MAX_DOH_HOSTNAMES = 5000
+MAX_SNI_HOSTNAMES = 50
+
+#: Never sinkholed, whatever a list says: the router's own Gateway DoH
+#: upstream lives under this suffix, and ``/ip dns static`` answers the
+#: router's *own* lookups too -- sinkholing it would cut the venue's DNS.
+_NEVER_SINKHOLE_SUFFIXES: tuple[str, ...] = ("cloudflare-gateway.com",)
+
+VPN_FILTER_MARKERS: tuple[str, ...] = (
+    "cloudguest-dnsf-vpn-ike-auth",
+    "cloudguest-dnsf-vpn-esp-auth",
+    "cloudguest-dnsf-vpn-openvpn-udp-auth",
+    "cloudguest-dnsf-vpn-openvpn-tcp-auth",
+    "cloudguest-dnsf-vpn-wireguard-auth",
+    "cloudguest-dnsf-vpn-pptp-auth",
+    "cloudguest-dnsf-vpn-gre-auth",
+    "cloudguest-dnsf-vpn-l2tp-auth",
+)
+
+
+def _guest_drop(comment: str, **match: str) -> dict[str, str]:
+    return {
+        "chain": "forward",
+        "action": "drop",
+        "hotspot": "auth",
+        **match,
+        "comment": comment,
+    }
+
+
+_VPN_FILTER_ROWS: tuple[dict[str, str], ...] = (
+    # IKE and IPsec NAT-T.
+    _guest_drop(VPN_FILTER_MARKERS[0], protocol="udp", **{"dst-port": "500,4500"}),
+    # IPsec ESP (IP protocol 50) -- no ports.
+    _guest_drop(VPN_FILTER_MARKERS[1], protocol="ipsec-esp"),
+    _guest_drop(VPN_FILTER_MARKERS[2], protocol="udp", **{"dst-port": "1194"}),
+    _guest_drop(VPN_FILTER_MARKERS[3], protocol="tcp", **{"dst-port": "1194"}),
+    # WireGuard's *default* port only; WireGuard can run on any UDP port.
+    _guest_drop(VPN_FILTER_MARKERS[4], protocol="udp", **{"dst-port": "51820"}),
+    _guest_drop(VPN_FILTER_MARKERS[5], protocol="tcp", **{"dst-port": "1723"}),
+    _guest_drop(VPN_FILTER_MARKERS[6], protocol="gre"),
+    _guest_drop(VPN_FILTER_MARKERS[7], protocol="udp", **{"dst-port": "1701"}),
+)
+
+_LAYER_FILTER_MARKERS: dict[str, tuple[str, ...]] = {
+    LAYER_ENCRYPTED_DNS_PORTS: BYPASS_FILTER_MARKERS[:2],
+    LAYER_DOH_IP_LIST: BYPASS_FILTER_MARKERS[2:],
+    LAYER_VPN_BLOCK: VPN_FILTER_MARKERS,
+}
+
+
+def _layer_of_comment(comment: str) -> str | None:
+    if comment.startswith(_SNI_PREFIX):
+        return LAYER_DOH_HOSTNAMES
+    for layer, markers in _LAYER_FILTER_MARKERS.items():
+        if comment in markers:
+            return layer
+    if comment in BYPASS_NAT_MARKERS:
+        return LAYER_PLAIN_DNS_REDIRECT
+    if comment == _CANARY_COMMENT:
+        return LAYER_CANARY_DOMAINS
+    if comment == _DOH_HOST_COMMENT:
+        return LAYER_DOH_HOSTNAMES
+    if comment == _DOH_SYNC_COMMENT:
+        return LAYER_DOH_IP_LIST
+    return None
+
+
+def _owned_filter_comment(comment: str) -> bool:
+    return comment.startswith(_SNI_PREFIX) or any(
+        comment in markers for markers in _LAYER_FILTER_MARKERS.values()
+    )
+
+
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$"
+)
+
+
+def normalize_hostname(raw: object) -> str | None:
+    """A lower-case DNS hostname with at least two labels, or ``None``.
+    Wildcards, IP literals, underscores and anything with whitespace are
+    refused -- the value ends up in ``/ip dns static name=`` and in a
+    ``tls-host=`` matcher, and nothing but a plain hostname belongs there."""
+    name = str(raw or "").strip().lower().rstrip(".")
+    if not _HOSTNAME_RE.match(name):
+        return None
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return name
+    return None
+
+
+def _is_never_sinkholed(name: str, extra: tuple[str, ...]) -> bool:
+    for suffix in (*_NEVER_SINKHOLE_SUFFIXES, *extra):
+        if suffix and (name == suffix or name.endswith("." + suffix)):
+            return True
+    return False
+
+
+def _global_ipv4(raw: object) -> str | None:
+    try:
+        address = ipaddress.IPv4Address(str(raw).strip())
+    except ValueError:
+        return None
+    if not address.is_global or address.is_multicast:
+        return None
+    return str(address)
+
+
+def _sni_row(hostname: str) -> dict[str, str]:
+    # tls-host is a RouterOS >= 6.41 matcher; the planner refuses anything
+    # below 7, so every router this reaches has it.
+    return _guest_drop(
+        f"{_SNI_PREFIX}{hostname}",
+        protocol="tcp",
+        **{"dst-port": "443", "tls-host": hostname},
+    )
+
+
+def _assert_guest_forward_only(rows: tuple[dict[str, str], ...], host: str) -> None:
+    """Defence in depth for the one property this whole feature must never
+    lose: nothing here may match the router's own traffic."""
+    for row in rows:
+        if row.get("chain") != "forward" or row.get("hotspot") != "auth":
+            raise MikroTikDnsFilteringError(
+                host,
+                "UNSAFE_BYPASS_RULE",
+                f"refusing to write {row.get('comment')!r}: bypass rules must be "
+                "chain=forward hotspot=auth",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class BypassApplyResult:
+    layers: tuple[str, ...]
+    doh_ipv4_added: int = 0
+    doh_ipv4_removed: int = 0
+    doh_ipv4_present: int = 0
+    hostnames_added: int = 0
+    hostnames_removed: int = 0
+    hostnames_present: int = 0
+    #: Names already answered by an entry this module does not own (content
+    #: filtering's sinkhole, an operator's own entry) -- left alone.
+    hostnames_skipped_foreign: int = 0
+    sni_rules: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "layers": list(self.layers)}
+
+
+@dataclass(frozen=True, slots=True)
+class LayerCounters:
+    layer: str
+    rules_present: int
+    counters_available: bool
+    packets: int | None
+    bytes: int | None
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BypassCounters:
+    router_uptime: str | None
+    layers: tuple[LayerCounters, ...]
+
+
+def _chunks(items: list[Any], size: int = 200) -> list[list[Any]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _converge_rows(
+    menu,  # noqa: ANN001
+    desired: tuple[dict[str, str], ...],
+    *,
+    owned: Callable[[str], bool],
+    place_before: str | None,
+) -> None:
+    """Desired rows exist once each (added above ``place_before``, drifted
+    fields corrected); every other row ``owned`` claims is removed. Adds
+    happen before removes: a half-applied change is an extra drop, never a
+    gap."""
+    _ensure_rows(menu, desired, place_before=place_before)
+    wanted = {row["comment"] for row in desired}
+    stale = [
+        r[".id"]
+        for r in menu
+        if owned(str(r.get("comment", ""))) and r.get("comment") not in wanted
+    ]
+    for chunk in _chunks(stale):
+        menu.remove(*chunk)
+
+
+def _converge_static(
+    menu, names: list[str], *, comment: str  # noqa: ANN001
+) -> tuple[int, int, int, int]:
+    """NXDOMAIN entries for ``names`` carrying ``comment``. Returns
+    ``(added, removed, present, skipped_foreign)``."""
+    rows = [dict(r) for r in menu]
+    foreign = {
+        str(r.get("name", "")).lower()
+        for r in rows
+        if r.get("comment") != comment and r.get("name")
+    }
+    ours: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("comment") == comment:
+            ours.setdefault(str(row.get("name", "")).lower(), []).append(row)
+    desired = [n for n in dict.fromkeys(names) if n not in foreign]
+    skipped = sum(1 for n in dict.fromkeys(names) if n in foreign)
+    added = 0
+    for name in desired:
+        mine = ours.get(name)
+        if not mine:
+            menu.add(name=name, type="NXDOMAIN", comment=comment)
+            added += 1
+            continue
+        keep = mine[0]
+        changed: dict[str, str] = {}
+        if str(keep.get("type", "")).upper() != "NXDOMAIN":
+            changed["type"] = "NXDOMAIN"
+        if _is_truthy(keep.get("disabled", False)):
+            changed["disabled"] = "no"
+        if changed:
+            menu.update(**{".id": keep[".id"], **changed})
+    wanted = set(desired)
+    stale = [
+        row[".id"]
+        for name, mine in ours.items()
+        for i, row in enumerate(mine)
+        if name not in wanted or i > 0
+    ]
+    for chunk in _chunks(stale):
+        menu.remove(*chunk)
+    return added, len(stale), len(desired), skipped
+
+
+def _converge_address_list(
+    menu, addresses: list[str]  # noqa: ANN001
+) -> tuple[int, int, int]:
+    """Our synced entries in ``cloudguest-doh-ips`` become exactly
+    ``addresses`` minus whatever the list already holds under another
+    comment (the bootstrap's own ten). Returns ``(added, removed,
+    present)``."""
+    rows = [dict(r) for r in menu if r.get("list") == _DOH_ADDRESS_LIST]
+    foreign = {
+        str(r.get("address", "")) for r in rows if r.get("comment") != _DOH_SYNC_COMMENT
+    }
+    ours: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("comment") == _DOH_SYNC_COMMENT:
+            ours.setdefault(str(row.get("address", "")), []).append(row)
+    desired = [a for a in dict.fromkeys(addresses) if a not in foreign]
+    added = 0
+    for address in desired:
+        if address not in ours:
+            menu.add(list=_DOH_ADDRESS_LIST, address=address, comment=_DOH_SYNC_COMMENT)
+            added += 1
+    wanted = set(desired)
+    stale = [
+        row[".id"]
+        for address, mine in ours.items()
+        for i, row in enumerate(mine)
+        if address not in wanted or i > 0
+    ]
+    for chunk in _chunks(stale):
+        menu.remove(*chunk)
+    return added, len(stale), len(desired)
+
+
+def _own_doh_host(api) -> str | None:  # noqa: ANN001
+    """The hostname of the router's own DoH upstream, if any -- never
+    sinkholed, whatever list it appears on."""
+    url = str(_first_row(api, _DNS).get("use-doh-server") or "")
+    match = re.match(r"^https://([^/:]+)", url)
+    return match.group(1).lower() if match else None
+
+
+def _hardening_converge_sync(
+    creds: DeviceCredentials,
+    *,
+    layers: frozenset[str],
+    doh_ipv4: tuple[str, ...],
+    doh_hostnames: tuple[str, ...],
+    sni_hostnames: tuple[str, ...],
+    require_anchor: bool,
+) -> BypassApplyResult:
+    unknown = sorted(set(layers) - set(BYPASS_LAYERS))
+    if unknown:
+        raise MikroTikDnsFilteringRefusedError(
+            creds.host, "UNKNOWN_BYPASS_LAYER", f"unknown layer(s) {unknown}"
+        )
+    # Validate everything before the first write.
+    ipv4 = [a for a in dict.fromkeys(_global_ipv4(x) for x in doh_ipv4) if a]
+    if len(ipv4) > MAX_DOH_IPV4:
+        raise MikroTikDnsFilteringRefusedError(
+            creds.host,
+            "BLOCKLIST_TOO_LARGE",
+            f"{len(ipv4)} DoH addresses exceeds the cap of {MAX_DOH_IPV4}",
+        )
+    hosts = [h for h in dict.fromkeys(normalize_hostname(x) for x in doh_hostnames) if h]
+    if len(hosts) > MAX_DOH_HOSTNAMES:
+        raise MikroTikDnsFilteringRefusedError(
+            creds.host,
+            "BLOCKLIST_TOO_LARGE",
+            f"{len(hosts)} DoH hostnames exceeds the cap of {MAX_DOH_HOSTNAMES}",
+        )
+    sni = [h for h in dict.fromkeys(normalize_hostname(x) for x in sni_hostnames) if h]
+    if len(sni) > MAX_SNI_HOSTNAMES:
+        raise MikroTikDnsFilteringRefusedError(
+            creds.host,
+            "BLOCKLIST_TOO_LARGE",
+            f"{len(sni)} tls-host rules exceeds the cap of {MAX_SNI_HOSTNAMES}",
+        )
+
     api = MikroTikAdapter()._connect_api(creds)
     try:
         try:
+            own_host = _own_doh_host(api)
+            keep_out = (own_host,) if own_host else ()
+            hosts = [h for h in hosts if not _is_never_sinkholed(h, keep_out)]
+            sni = [h for h in sni if not _is_never_sinkholed(h, keep_out)]
+
+            filter_rows: list[dict[str, str]] = []
+            if LAYER_VPN_BLOCK in layers:
+                filter_rows.extend(_VPN_FILTER_ROWS)
+            if LAYER_DOH_HOSTNAMES in layers:
+                filter_rows.extend(_sni_row(h) for h in sni)
+            if LAYER_ENCRYPTED_DNS_PORTS in layers:
+                filter_rows.extend(_BYPASS_FILTER_ROWS[:2])
+            if LAYER_DOH_IP_LIST in layers:
+                filter_rows.extend(_BYPASS_FILTER_ROWS[2:])
+            desired_filter = tuple(filter_rows)
+            _assert_guest_forward_only(desired_filter, creds.host)
+
             filter_menu = api.path(*_FILTER)
             anchor = next(
                 (
@@ -714,18 +1126,14 @@ def _hardening_apply_sync(creds: DeviceCredentials) -> None:
                 ),
                 None,
             )
-            has_list = any(
-                r.get("list") == _DOH_ADDRESS_LIST for r in api.path(*_ADDRESS_LIST)
-            )
-            if anchor is None or not has_list:
-                missing = [
-                    name
-                    for name, ok in (
-                        (f"filter rule {_EXISTING_DOT_UDP}", anchor is not None),
-                        (f"address-list {_DOH_ADDRESS_LIST}", has_list),
-                    )
-                    if not ok
-                ]
+            list_menu = api.path(*_ADDRESS_LIST)
+            has_list = any(r.get("list") == _DOH_ADDRESS_LIST for r in list_menu)
+            missing: list[str] = []
+            if require_anchor and desired_filter and anchor is None:
+                missing.append(f"filter rule {_EXISTING_DOT_UDP}")
+            if require_anchor and LAYER_DOH_IP_LIST in layers and not (has_list or ipv4):
+                missing.append(f"address-list {_DOH_ADDRESS_LIST}")
+            if missing:
                 raise MikroTikDnsFilteringRefusedError(
                     creds.host,
                     "BYPASS_ANCHOR_MISSING",
@@ -733,61 +1141,192 @@ def _hardening_apply_sync(creds: DeviceCredentials) -> None:
                     f"DoT/DoH drops ({', '.join(missing)} not found); not "
                     "guessing where the extension belongs",
                 )
-            # Adds before anything else: a partially-applied hardening is two
-            # extra drops, never a gap.
-            _ensure_rows(filter_menu, _BYPASS_FILTER_ROWS, place_before=anchor[".id"])
-            _ensure_rows(api.path(*_NAT), _BYPASS_NAT_ROWS, place_before=None)
+
+            # Filter rows first (drops before anything they depend on is
+            # removed), then NAT, then the lists and static entries.
+            _converge_rows(
+                filter_menu,
+                desired_filter,
+                owned=_owned_filter_comment,
+                place_before=anchor[".id"] if anchor else None,
+            )
+            _converge_rows(
+                api.path(*_NAT),
+                _BYPASS_NAT_ROWS if LAYER_PLAIN_DNS_REDIRECT in layers else (),
+                owned=lambda c: c in BYPASS_NAT_MARKERS,
+                place_before=None,
+            )
+            ip_added, ip_removed, ip_present = _converge_address_list(
+                list_menu, ipv4 if LAYER_DOH_IP_LIST in layers else []
+            )
+            static_menu = api.path(*_STATIC)
+            _converge_static(
+                static_menu,
+                list(CANARY_DOMAINS) if LAYER_CANARY_DOMAINS in layers else [],
+                comment=_CANARY_COMMENT,
+            )
+            h_added, h_removed, h_present, h_skipped = _converge_static(
+                static_menu,
+                hosts if LAYER_DOH_HOSTNAMES in layers else [],
+                comment=_DOH_HOST_COMMENT,
+            )
         except LibRouterosError as exc:
-            raise MikroTikDeviceError(creds.host, f"apply_dns_bypass_hardening: {exc}") from exc
+            raise MikroTikDeviceError(creds.host, f"dns bypass hardening: {exc}") from exc
     finally:
         MikroTikAdapter._safe_close(api)
+    return BypassApplyResult(
+        layers=tuple(sorted(layers)),
+        doh_ipv4_added=ip_added,
+        doh_ipv4_removed=ip_removed,
+        doh_ipv4_present=ip_present,
+        hostnames_added=h_added,
+        hostnames_removed=h_removed,
+        hostnames_present=h_present,
+        hostnames_skipped_foreign=h_skipped,
+        sni_rules=len(sni) if LAYER_DOH_HOSTNAMES in layers else 0,
+    )
 
 
-def _hardening_remove_sync(creds: DeviceCredentials) -> None:
-    api = MikroTikAdapter()._connect_api(creds)
-    try:
-        try:
-            for segments, markers in (
-                (_FILTER, BYPASS_FILTER_MARKERS),
-                (_NAT, BYPASS_NAT_MARKERS),
-            ):
-                menu = api.path(*segments)
-                ids = [r[".id"] for r in menu if r.get("comment") in markers]
-                if ids:
-                    menu.remove(*ids)
-        except LibRouterosError as exc:
-            raise MikroTikDeviceError(creds.host, f"remove_dns_bypass_hardening: {exc}") from exc
-    finally:
-        MikroTikAdapter._safe_close(api)
+async def apply_dns_bypass_hardening(
+    creds: DeviceCredentials,
+    *,
+    layers: frozenset[str] | set[str] | None = None,
+    doh_ipv4: tuple[str, ...] | list[str] = (),
+    doh_hostnames: tuple[str, ...] | list[str] = (),
+    sni_hostnames: tuple[str, ...] | list[str] = (),
+) -> BypassApplyResult:
+    """Converge the router's bypass hardening on exactly ``layers``
+    (default :data:`DEFAULT_BYPASS_LAYERS`); layers not named are removed.
 
-
-async def apply_dns_bypass_hardening(creds: DeviceCredentials) -> None:
-    """Extend the pre-login DoT/DoH drops to authenticated guests, and
-    redirect authenticated guests' plain DNS to the router.
-
-    **Position.** The three drops go directly above the existing
+    **Position.** Every filter row goes directly above the existing
     ``cloudguest-block-dot-udp`` -- beside the rules they extend, and, on a
     router with the firewall sentinel band installed, *above* the band (the
     band sits directly above ``cloudguest-fw-fwd-established``, below the
-    existing DoT/DoH drops). That is deliberate and it has one consequence
-    worth stating: a customer firewall *allow* rule inside the band cannot
-    re-open DoT/DoH for logged-in guests. The rows match only udp/tcp 853 and
-    tcp/443 to ``cloudguest-doh-ips``, so -- like the content-filter drop --
-    they cannot touch the portal, the management tunnel or 8728.
+    existing DoT/DoH drops). A customer firewall *allow* rule inside the
+    band therefore cannot re-open these for logged-in guests. Every row is
+    ``chain=forward hotspot=auth``: never the router's own input/output.
 
     The two dstnat redirects are appended (NAT order relative to the
     hotspot's own dynamic rules is not ours to change) and match
-    ``hotspot=auth`` only, so a pre-login guest is still handled by the
-    hotspot's own DNS interception. [UNVERIFIED on hardware.]
+    ``hotspot=auth`` only. [UNVERIFIED on hardware.]
+
+    ``doh_ipv4`` fills ``cloudguest-doh-ips`` (our entries only);
+    ``doh_hostnames`` become ``type=NXDOMAIN`` static entries;
+    ``sni_hostnames`` become ``tls-host`` drops. All are re-validated here
+    (global IPv4 literals, plain hostnames, hard caps) whatever the caller
+    sent, and the router's own DoH upstream host -- plus anything under
+    ``cloudflare-gateway.com`` -- is never sinkholed.
 
     Refuses (``BYPASS_ANCHOR_MISSING``) on a router without the platform's
-    existing drops and address-list. Idempotent; only rows carrying a
-    ``cloudguest-dnsf-`` marker are ever written or removed.
+    existing drops when a filter layer is requested. Idempotent.
     """
-    await asyncio.to_thread(_hardening_apply_sync, creds)
+    chosen = frozenset(DEFAULT_BYPASS_LAYERS if layers is None else layers)
+    return await asyncio.to_thread(
+        _hardening_converge_sync,
+        creds,
+        layers=chosen,
+        doh_ipv4=tuple(doh_ipv4),
+        doh_hostnames=tuple(doh_hostnames),
+        sni_hostnames=tuple(sni_hostnames),
+        require_anchor=True,
+    )
 
 
 async def remove_dns_bypass_hardening(creds: DeviceCredentials) -> None:
-    """Remove exactly the rows :func:`apply_dns_bypass_hardening` owns.
-    Idempotent."""
-    await asyncio.to_thread(_hardening_remove_sync, creds)
+    """Remove exactly the objects the bypass hardening owns -- every
+    layer's rows, synced address-list entries and static entries. Leaves
+    the bootstrap's own ``cloudguest-doh`` entries and every foreign static
+    entry alone. Idempotent."""
+    await asyncio.to_thread(
+        _hardening_converge_sync,
+        creds,
+        layers=frozenset(),
+        doh_ipv4=(),
+        doh_hostnames=(),
+        sni_hostnames=(),
+        require_anchor=False,
+    )
+
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _counters_sync(creds: DeviceCredentials) -> BypassCounters:
+    api = MikroTikAdapter()._connect_api(creds)
+    try:
+        try:
+            uptime = _first_row(api, _RESOURCE).get("uptime")
+            rows: dict[str, list[dict[str, Any]]] = {layer: [] for layer in BYPASS_LAYERS}
+            for segments in (_FILTER, _NAT):
+                for row in api.path(*segments):
+                    layer = _layer_of_comment(str(row.get("comment", "")))
+                    if layer is not None:
+                        rows[layer].append(dict(row))
+            static_counts: dict[str, int] = {}
+            for row in api.path(*_STATIC):
+                layer = _layer_of_comment(str(row.get("comment", "")))
+                if layer is not None:
+                    static_counts[layer] = static_counts.get(layer, 0) + 1
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(creds.host, f"read bypass counters: {exc}") from exc
+    finally:
+        MikroTikAdapter._safe_close(api)
+
+    out: list[LayerCounters] = []
+    for layer in BYPASS_LAYERS:
+        mine = rows[layer]
+        if not mine:
+            reason = (
+                "answered by NXDOMAIN static DNS entries, which RouterOS does "
+                "not count"
+                if static_counts.get(layer)
+                else "no rule for this layer is on the router"
+            )
+            out.append(LayerCounters(layer, 0, False, None, None, reason))
+            continue
+        packets = [_as_int(r.get("packets")) for r in mine]
+        sizes = [_as_int(r.get("bytes")) for r in mine]
+        if any(p is None for p in packets) or any(b is None for b in sizes):
+            out.append(
+                LayerCounters(
+                    layer,
+                    len(mine),
+                    False,
+                    None,
+                    None,
+                    "the router did not return packet/byte counters for these rules",
+                )
+            )
+            continue
+        out.append(
+            LayerCounters(
+                layer,
+                len(mine),
+                True,
+                sum(p for p in packets if p is not None),
+                sum(b for b in sizes if b is not None),
+                None,
+            )
+        )
+    return BypassCounters(
+        router_uptime=str(uptime) if uptime is not None else None, layers=tuple(out)
+    )
+
+
+async def read_dns_bypass_counters(creds: DeviceCredentials) -> BypassCounters:
+    """Packet/byte counters of the bypass rules, per layer.
+
+    Counters are cumulative since the rule was added or the router last
+    rebooted, whichever is later, and count *packets*, not attempts (one
+    blocked connection is usually several retransmitted packets). NXDOMAIN
+    static entries have no hit counter at all, so the canary layer and the
+    name half of the DoH-hostname layer are reported unavailable rather than
+    as zero. [UNVERIFIED on hardware: that the API ``print`` of
+    ``/ip firewall filter`` returns ``packets``/``bytes`` without ``stats``;
+    if it does not, every layer reads unavailable, never zero.]
+    """
+    return await asyncio.to_thread(_counters_sync, creds)

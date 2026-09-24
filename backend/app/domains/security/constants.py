@@ -285,6 +285,32 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
         ),
     ),
     SecurityFeature(
+        key="dns_bypass_protection",
+        label="DNS bypass protection",
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        enforcement=(
+            "Planned: per-router layers over 8728 for signed-in guests -- "
+            "'does not exist' answers for the Firefox and iCloud Private Relay "
+            "opt-out names, DNS-over-TLS/QUIC port drops, a DNS-over-HTTPS "
+            "server address list refreshed from a public source, known "
+            "DNS-over-HTTPS names blocked by lookup and by TLS hostname, and, "
+            "only if a venue turns it on, common VPN ports"
+        ),
+        detail=(
+            "Built, not yet proven on a real router, so not offered as "
+            "working. It stops default settings and casual workarounds: "
+            "Firefox's automatic encrypted DNS and iCloud Private Relay stand "
+            "down on the venue network, and encrypted DNS to well-known "
+            "providers is blocked. It cannot stop an encrypted DNS server or "
+            "a VPN that runs on the normal web port with no recognisable name "
+            "(or with Encrypted Client Hello), a resolver the guest runs "
+            "themselves, or a phone on mobile data. No guest WiFi product "
+            "stops a determined user with a disguised VPN. VPN blocking is "
+            "off unless the venue turns it on, because business guests "
+            "use work VPNs."
+        ),
+    ),
+    SecurityFeature(
         key="application_control",
         label="Application control",
         availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,

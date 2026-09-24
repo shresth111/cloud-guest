@@ -569,6 +569,9 @@ GATED_WRITE_PATHS: tuple[tuple[str, str], ...] = (
     ("dns_filtering", "enable_router"),
     ("dns_filtering", "disable_router"),
     ("dns_filtering", "set_bypass_hardening"),
+    # The scheduled DoH-list push re-converges a router's bypass layers
+    # over 8728.
+    ("dns_filtering", "push_bypass_lists_to_router"),
 )
 
 

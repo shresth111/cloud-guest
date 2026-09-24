@@ -957,6 +957,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # exactly like one that is -- there is no alert row, no error, and
         # nothing anywhere that says so.
         "dhcp-rogue-detection-sweep",
+        # Refreshes the platform's public DoH lists once, then pushes them
+        # to routers that turned on a list-backed DNS bypass layer. See
+        # app.domains.dns_filtering.tasks.
+        "dns-bypass-blocklist-refresh",
         # Polls each enabled network integration's controller for status,
         # devices, clients and guest sessions, on that integration's own
         # configured interval. Its absence from this set is not a missing

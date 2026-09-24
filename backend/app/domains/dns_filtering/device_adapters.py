@@ -22,6 +22,8 @@ from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikDeviceError,
 )
 from wyfy_device_gateway.mikrotik_dns_filtering import (
+    BypassApplyResult,
+    BypassCounters,
     DnsResolverSnapshot,
     DnsRestoreResult,
     DohApplyResult,
@@ -29,6 +31,7 @@ from wyfy_device_gateway.mikrotik_dns_filtering import (
     MikroTikDohProbeFailedError,
     apply_dns_bypass_hardening,
     apply_gateway_doh,
+    read_dns_bypass_counters,
     remove_dns_bypass_hardening,
     restore_dns_resolver,
 )
@@ -84,12 +87,22 @@ class BaseDnsFilteringAdapter(Protocol):
     ) -> DnsRestoreResult: ...
 
     async def apply_bypass_hardening(
-        self, credentials: DnsFilteringCredentials
-    ) -> None: ...
+        self,
+        credentials: DnsFilteringCredentials,
+        *,
+        layers: frozenset[str],
+        doh_ipv4: list[str],
+        doh_hostnames: list[str],
+        sni_hostnames: list[str],
+    ) -> BypassApplyResult: ...
 
     async def remove_bypass_hardening(
         self, credentials: DnsFilteringCredentials
     ) -> None: ...
+
+    async def read_bypass_counters(
+        self, credentials: DnsFilteringCredentials
+    ) -> BypassCounters: ...
 
 
 def _translate(operation: str, exc: MikroTikDeviceError) -> Exception:
@@ -164,12 +177,32 @@ class MikroTikDnsFilteringAdapter:
             raise _translate("restore_dns", exc) from exc
 
     async def apply_bypass_hardening(
-        self, credentials: DnsFilteringCredentials
-    ) -> None:
+        self,
+        credentials: DnsFilteringCredentials,
+        *,
+        layers: frozenset[str],
+        doh_ipv4: list[str],
+        doh_hostnames: list[str],
+        sni_hostnames: list[str],
+    ) -> BypassApplyResult:
         try:
-            await apply_dns_bypass_hardening(self._creds(credentials))
+            return await apply_dns_bypass_hardening(
+                self._creds(credentials),
+                layers=layers,
+                doh_ipv4=doh_ipv4,
+                doh_hostnames=doh_hostnames,
+                sni_hostnames=sni_hostnames,
+            )
         except MikroTikDeviceError as exc:
             raise _translate("apply_bypass_hardening", exc) from exc
+
+    async def read_bypass_counters(
+        self, credentials: DnsFilteringCredentials
+    ) -> BypassCounters:
+        try:
+            return await read_dns_bypass_counters(self._creds(credentials))
+        except MikroTikDeviceError as exc:
+            raise _translate("read_bypass_counters", exc) from exc
 
     async def remove_bypass_hardening(
         self, credentials: DnsFilteringCredentials

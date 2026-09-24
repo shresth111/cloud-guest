@@ -7,7 +7,9 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 __all__ = [
+    "BypassCountersResponse",
     "BypassHardeningRequest",
+    "BypassLayerCounters",
     "CategoryListResponse",
     "CategoryResponse",
     "LocationPolicyResponse",
@@ -67,6 +69,8 @@ class RouterFilteringStatusResponse(BaseModel):
     bypass_hardening_enabled: bool
     bypass_hardening_status: str
     bypass_hardening_error: str | None
+    bypass_layers: list[str]
+    bypass_lists_pushed_at: datetime | None
     routeros_version: str | None
     # Honest limits, always shown with the status (PRD §10.2, §11.3).
     limitations: list[str]
@@ -74,3 +78,25 @@ class RouterFilteringStatusResponse(BaseModel):
 
 class BypassHardeningRequest(BaseModel):
     enabled: bool
+    # Exactly the layers to have on. Omitted = every layer except
+    # ``vpn_block``, which is only ever on when named here.
+    layers: list[str] | None = Field(default=None, max_length=10)
+
+
+class BypassLayerCounters(BaseModel):
+    layer: str
+    enabled: bool
+    available: bool
+    packets: int | None
+    bytes: int | None
+    reason: str | None
+
+
+class BypassCountersResponse(BaseModel):
+    router_id: str
+    available: bool
+    reason: str | None
+    router_uptime: str | None
+    layers: list[BypassLayerCounters]
+    # How to read the numbers, returned with them so no screen can drop it.
+    semantics: str
