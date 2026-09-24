@@ -82,6 +82,7 @@ import asyncssh
 import librouteros
 from librouteros.exceptions import LibRouterosError
 
+from . import mikrotik_firewall as _fw
 from .contract import (
     ConnectedDevice,
     ContentFilterRuleConfig,
@@ -98,6 +99,9 @@ from .contract import (
     DhcpOptionSetInfo,
     DhcpOptionSnapshot,
     DhcpPoolConfig,
+    FirewallBandResult,
+    FirewallFilterRuleConfig,
+    FirewallSyncResult,
     HotspotActiveSession,
     HotspotCertificatePush,
     HotspotCertificatePushResult,
@@ -1129,6 +1133,30 @@ def _smallest_enclosing_network(
         if start_ip in candidate and end_ip in candidate:
             return candidate
     return ipaddress.ip_network(f"{start_ip}/0", strict=False)
+
+
+class MikroTikFirewallRefusedError(MikroTikDeviceError):
+    """A firewall push or band placement was refused before any write.
+
+    ``code`` is one of the ``ACCESS_RULES_*`` codes in
+    :mod:`wyfy_device_gateway.mikrotik_firewall` (``ACCESS_RULES_BAND_MISSING``
+    first among them). Nothing on the device changed."""
+
+    def __init__(self, host: str, code: str, detail: str) -> None:
+        self.code = code
+        super().__init__(host, f"{code}: {detail}")
+
+
+class MikroTikFirewallPushFailedError(MikroTikDeviceError):
+    """A firewall push failed after writing began.
+
+    ``restored`` is True only when the pre-push snapshot of this platform's
+    own marked rules was put back in full. False means the router may hold a
+    partial rule set and needs a look -- it is never reported as success."""
+
+    def __init__(self, host: str, detail: str, *, restored: bool) -> None:
+        self.restored = restored
+        super().__init__(host, detail)
 
 
 class MikroTikAdapter:
@@ -5859,6 +5887,82 @@ class MikroTikAdapter:
         menu.add(**fields)
 
     # ------------------------------------------------------------------
+    # Customer firewall rules, inside the sentinel band (chain=forward)
+    # ------------------------------------------------------------------
+
+    async def sync_firewall_rules(
+        self,
+        creds: DeviceCredentials,
+        *,
+        rules: Sequence[FirewallFilterRuleConfig],
+        known_rule_ids: Sequence[str],
+    ) -> FirewallSyncResult:
+        """Converge this router's ``cloudguest-fw:`` rules onto ``rules``.
+
+        The whole algorithm, its refusals and its limits live in
+        :mod:`wyfy_device_gateway.mikrotik_firewall`; this method owns the
+        connection and translates its two failure types into this module's
+        exception family. Refused -> :class:`MikroTikFirewallRefusedError`,
+        nothing written. Failed after writing began ->
+        :class:`MikroTikFirewallPushFailedError`, with ``restored`` saying
+        whether the pre-push snapshot was put back."""
+        return await asyncio.to_thread(
+            self._sync_firewall_rules_sync, creds, tuple(rules), tuple(known_rule_ids)
+        )
+
+    def _sync_firewall_rules_sync(
+        self,
+        creds: DeviceCredentials,
+        rules: tuple[FirewallFilterRuleConfig, ...],
+        known_rule_ids: tuple[str, ...],
+    ) -> FirewallSyncResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return _fw.sync_rules(api, rules, known_rule_ids=known_rule_ids)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except _fw.FirewallPushFailed as exc:
+                raise MikroTikFirewallPushFailedError(
+                    creds.host, str(exc), restored=exc.restored
+                ) from exc
+            except LibRouterosError as exc:
+                # Raised by the initial read, before any write.
+                raise MikroTikDeviceError(
+                    creds.host, f"sync_firewall_rules: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    async def install_firewall_band(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandResult:
+        """Place the forward-chain sentinel band once, directly above
+        ``cloudguest-fw-fwd-established``; leave an existing band alone. See
+        :func:`wyfy_device_gateway.mikrotik_firewall.install_band`."""
+        return await asyncio.to_thread(self._install_firewall_band_sync, creds)
+
+    def _install_firewall_band_sync(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return _fw.install_band(api)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"install_firewall_band: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
     # QoS: the packet-mark half
     # ------------------------------------------------------------------
 
@@ -7218,6 +7322,8 @@ def _merge_connected_devices(
 
 
 __all__ = [
+    "MikroTikFirewallPushFailedError",
+    "MikroTikFirewallRefusedError",
     "MikroTikAdapter",
     "MikroTikDeviceError",
     "MikroTikConnectionError",

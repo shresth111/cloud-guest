@@ -47,6 +47,12 @@ class FirewallRepositoryProtocol(Protocol):
         self, router_id: uuid.UUID
     ) -> list[FirewallRule]: ...
 
+    async def list_rule_ids_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[uuid.UUID]: ...
+
+    async def commit(self) -> None: ...
+
 
 class FirewallRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -106,6 +112,27 @@ class FirewallRepository:
             sort_by="priority",
             sort_order=SortOrder.ASC,
         )
+
+    async def list_rule_ids_for_router(self, router_id: uuid.UUID) -> list[uuid.UUID]:
+        """Every rule id this platform has ever held for the router,
+        soft-deleted included.
+
+        The device push uses it to tell "a rule of ours the customer deleted
+        or disabled" (remove it) from "a marker nothing here ever wrote"
+        (refuse the whole push and say so). Without deleted rows here, every
+        deletion would read as an orphan and block the next push."""
+        rows = await self.rules.get_all(
+            filters={"router_id": router_id}, include_deleted=True
+        )
+        return [row.id for row in rows]
+
+    async def commit(self) -> None:
+        """Commits the current transaction. Needed by the device push only:
+        ``GenericRepository.update`` flushes, and ``get_db_session`` rolls
+        back on any exception, so a failure record written just before a
+        re-raise would otherwise be discarded -- see
+        ``ContentFilterRepository.commit`` for the same reasoning."""
+        await self.session.commit()
 
 
 __all__ = ["FirewallRepositoryProtocol", "FirewallRepository"]

@@ -6,8 +6,8 @@ Follows this project's plain-``assert``/native-``async def`` style (see
 ``tests/unit/test_dhcp.py``); ``asyncio_mode = "auto"`` runs async tests
 directly. ``FirewallService`` is exercised against small, hand-rolled
 in-memory fakes for its own repository and the composed
-``RouterLookupProtocol``. This domain has no device I/O to test (a pure
-rules/inventory domain, no ``device_adapters.py`` in this pass), and no
+``RouterLookupProtocol``. The device push is tested separately, in
+``test_firewall_device_push.py``. No
 conflict detection -- overlapping rules are valid, intentional policy
 (see ``models.FirewallRule``'s own module docstring).
 """
@@ -250,6 +250,9 @@ class TestFirewallRuleCrud:
         assert rule.protocol == FirewallProtocol.ALL.value
         assert rule.organization_id == router.organization_id
         assert rule.location_id == router.location_id
+        # Never pushed, and says so from the moment it exists.
+        assert rule.device_push_status == "pending"
+        assert rule.device_pushed_at is None
         assert len(h.audit_writer.entries) == 1
 
     async def test_create_with_invalid_source_address_raises(self) -> None:
@@ -363,7 +366,8 @@ class TestFirewallRuleCrud:
 
 class TestEveryRouteRequiresPermission:
     def test_every_firewall_route_has_a_permission_dependency(self) -> None:
-        assert len(firewall_router.routes) == 5
+        # CRUD (5) + the per-router push + the Master-only band placement.
+        assert len(firewall_router.routes) == 7
         for route in firewall_router.routes:
             assert (
                 route.dependencies != []

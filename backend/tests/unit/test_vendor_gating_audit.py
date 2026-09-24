@@ -32,12 +32,15 @@ endpoint refused on "Router has no stored connection details", which reads as
 also reached that refusal *after* ``reveal_credentials``, writing an audit
 entry for a credential reveal that revealed nothing.
 
-**``router_agent``, ``device_sync``, ``hotspot`` and ``firewall`` are
-inventory/DB domains** with no device I/O at all -- their own module
-docstrings say so and ``TestTheInventoryDomainsStayDeviceFree`` below checks
-it rather than trusting them. A controller row in those tables is no more
-broken than any other row: nothing there talks to a device, so nothing there
-can lie about one.
+**``router_agent``, ``device_sync`` and ``hotspot`` are inventory/DB
+domains** with no device I/O at all -- their own module docstrings say so and
+``TestTheInventoryDomainsStayDeviceFree`` below checks it rather than
+trusting them. ``firewall`` was the fourth until it gained a real 8728 push
+(2026-09-23); it left this list at that moment, exactly as the test below
+demands, and its create, push and band-placement paths are now in
+``test_omada_vendor_integrity.GATED_WRITE_PATHS``. A controller row in the
+remaining three tables is no more broken than any other row: nothing there
+talks to a device, so nothing there can lie about one.
 """
 
 from __future__ import annotations
@@ -202,12 +205,12 @@ class TestTheGateRunsBeforeTheIrreversibleCall:
 
 
 # ============================================================================
-# The four that had nothing to gate
+# The three that have nothing to gate
 # ============================================================================
 
 
 class TestTheInventoryDomainsStayDeviceFree:
-    """`router_agent`, `device_sync`, `hotspot` and `firewall` need no
+    """`router_agent`, `device_sync` and `hotspot` need no
     vendor gate for one reason only: they never talk to a device. That is a
     property of today's code, not a law, so it is asserted rather than
     recorded in a comment -- if someone later adds a device push to one of
@@ -216,7 +219,9 @@ class TestTheInventoryDomainsStayDeviceFree:
     a broken MikroTik.
     """
 
-    DOMAINS = ("router_agent", "device_sync", "hotspot", "firewall")
+    # `firewall` left this tuple when it gained a device push; its gate is
+    # asserted in test_omada_vendor_integrity.GATED_WRITE_PATHS instead.
+    DOMAINS = ("router_agent", "device_sync", "hotspot")
 
     # Importing any of these means reaching a real device: the vendored
     # gateway, the RouterOS client, or this platform's own push helpers.

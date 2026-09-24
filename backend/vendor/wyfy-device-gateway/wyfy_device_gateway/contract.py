@@ -1791,8 +1791,77 @@ class DeviceGatewayAdapter(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# Firewall filter rules (MikroTik only, over 8728)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallFilterRuleConfig:
+    """One ``/ip firewall filter`` rule this platform owns on a router.
+
+    ``rule_id`` is the rule's identity and nothing else: it becomes the
+    device comment ``cloudguest-fw:<rule_id>`` and is how a later push finds
+    the row again. The customer's own name and free-text comment are
+    deliberately NOT carried -- putting customer text into the comment field
+    would hand the customer control of this platform's identity scheme (see
+    ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §5.3).
+
+    ``priority`` decides order inside the sentinel band (lower first) and is
+    never turned into a chain index. Ties are broken by ``rule_id`` so the
+    order is a pure function of the desired set.
+
+    ``protocol=None`` means "any" and omits ``protocol=`` entirely, the
+    RouterOS equivalent. Ports are only valid with ``tcp``/``udp``; the
+    writer refuses the combination before any write rather than letting
+    RouterOS reject it mid-push.
+    """
+
+    rule_id: str
+    chain: str
+    action: str  # "accept" | "drop" | "reject"
+    priority: int
+    protocol: str | None = None  # "tcp" | "udp" | "icmp" | None (any)
+    src_address: str | None = None
+    dst_address: str | None = None
+    src_port: int | None = None
+    dst_port: int | None = None
+    in_interface: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallSyncResult:
+    """What a converging push did, counted from the writes it issued.
+
+    ``unchanged`` rules produced no write at all -- a re-push of the same
+    desired set is expected to report every rule here and nothing else.
+    """
+
+    added: int
+    removed: int
+    unchanged: int
+    #: The desired rule ids now on the device, in band order. Read back
+    #: after the writes, not echoed from the input.
+    ordered_rule_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallBandResult:
+    """Outcome of placing (or finding) the forward-chain sentinel band."""
+
+    created: bool
+    begin_id: str
+    end_id: str
+    #: The ``.id`` the band was placed immediately above when it was
+    #: created, or ``None`` when it already existed and was left alone.
+    anchor_id: str | None
+
+
 __all__ = [
     "DeviceVendor",
+    "FirewallBandResult",
+    "FirewallFilterRuleConfig",
+    "FirewallSyncResult",
     "UnsupportedVendorError",
     "DeviceCredentials",
     "InterfaceInfo",

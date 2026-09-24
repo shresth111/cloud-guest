@@ -35,4 +35,26 @@ class FirewallRuleDeleted:
     occurred_at: datetime = field(default_factory=_now)
 
 
-__all__ = ["FirewallRuleCreated", "FirewallRuleUpdated", "FirewallRuleDeleted"]
+@dataclass(frozen=True, slots=True)
+class FirewallRulesPushed:
+    router_id: uuid.UUID
+    added: int
+    removed: int
+    unchanged: int
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallBandInstalled:
+    router_id: uuid.UUID
+    created: bool
+    occurred_at: datetime = field(default_factory=_now)
+
+
+__all__ = [
+    "FirewallRuleCreated",
+    "FirewallRuleUpdated",
+    "FirewallRuleDeleted",
+    "FirewallRulesPushed",
+    "FirewallBandInstalled",
+]

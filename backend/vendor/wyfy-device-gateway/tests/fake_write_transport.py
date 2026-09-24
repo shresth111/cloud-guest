@@ -98,7 +98,7 @@ class FakePath:
         return _apply()
 
     def add(self, **fields: Any) -> str:
-        new_id = f"*{len(self._rows) + 1}"
+        new_id = self._recorder.mint_id(len(self._rows))
         # RouterOS *consumes* place-before: it decides where the row lands
         # and is not itself stored on the row. Verified on 7.23.3 (hEX
         # lite) as device test T1 -- adding a, b, then c with
@@ -274,6 +274,13 @@ class FakeRouterOSApi:
         # Menus (as path tuples) whose ``update`` records the call and then
         # does nothing -- see FakePath.update.
         self.silently_ignore_updates: set[tuple[str, ...]] = set()
+
+    def mint_id(self, row_count: int) -> str:
+        """The ``.id`` a new row gets. ``*<n+1>`` by default, which every
+        existing test was written against; it repeats an id once a row has
+        been removed, so a test that removes and then adds overrides this
+        with a counter (RouterOS itself never reuses an ``.id``)."""
+        return f"*{row_count + 1}"
 
     def path(self, *segments: str) -> FakePath:
         from librouteros.exceptions import LibRouterosError

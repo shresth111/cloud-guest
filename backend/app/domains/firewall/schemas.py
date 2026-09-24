@@ -19,6 +19,8 @@ __all__ = [
     "FirewallRuleUpdateRequest",
     "FirewallRuleResponse",
     "FirewallRuleListResponse",
+    "FirewallPushResponse",
+    "FirewallBandResponse",
 ]
 
 
@@ -70,7 +72,35 @@ class FirewallRuleResponse(BaseModel):
     priority: int
     comment: str | None
     is_enabled: bool
+    #: ``pending`` | ``active`` | ``failed`` -- whether this rule is on its
+    #: router. See ``constants.FirewallDevicePushStatus``.
+    device_push_status: str
+    device_push_error: str | None = None
+    device_pushed_at: datetime | None = None
     created_at: datetime
+
+
+class FirewallPushResponse(BaseModel):
+    """A router's rules after a successful push. ``added``/``removed``/
+    ``unchanged`` are counted from the writes the push issued; an unchanged
+    re-push reports every rule as unchanged and wrote nothing."""
+
+    router_id: str
+    added: int
+    removed: int
+    unchanged: int
+    rules: list[FirewallRuleResponse]
+
+
+class FirewallBandResponse(BaseModel):
+    """Master-console result of placing a router's sentinel band.
+    ``created=False`` means a band already existed and was left in place."""
+
+    router_id: str
+    created: bool
+    begin_id: str
+    end_id: str
+    anchor_id: str | None = None
 
 
 class FirewallRuleListResponse(BaseModel):
