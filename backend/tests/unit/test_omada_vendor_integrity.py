@@ -557,6 +557,8 @@ GATED_WRITE_PATHS: tuple[tuple[str, str], ...] = (
     ("firewall", "create_rule"),
     ("firewall", "push_rules_to_router"),
     ("firewall", "install_firewall_band"),
+    # Read-only, but it decrypts the router's API secret and dials 8728.
+    ("firewall", "read_firewall_band_state"),
     ("content_filtering", "create_rule"),
     ("content_filtering", "push_rule_to_device"),
     ("provisioning_engine", "create_job"),

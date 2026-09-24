@@ -38,6 +38,7 @@ from .dependencies import get_firewall_service
 from .models import FirewallRule
 from .schemas import (
     FirewallBandResponse,
+    FirewallBandStatusResponse,
     FirewallPushResponse,
     FirewallRuleCreateRequest,
     FirewallRuleListResponse,
@@ -332,6 +333,42 @@ async def install_firewall_band(
             if result.created
             else "Firewall band already present"
         ),
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/band",
+    response_model=ApiResponse[FirewallBandStatusResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+)
+async def get_firewall_band_status(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Read-only: would a push to this router find its sentinel band?
+
+    ``firewall.read`` pinned to ROUTER scope, so a venue can see *why* its
+    push would be refused before pressing it (placing the band stays
+    Master-only, above). Reads the router over 8728 through the same
+    inspector the push uses; writes nothing and takes no lock. Returns
+    ``state`` / ``reason`` / ``checked_at`` only -- never a RouterOS ``.id``
+    or comment. A controller-managed router is refused (422) like every other
+    firewall route; an unreachable router is a 502.
+    """
+    band = await service.read_firewall_band_state(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    payload = FirewallBandStatusResponse(
+        state=band.state, reason=band.reason, checked_at=band.checked_at
+    )
+    return build_response(
+        success=True,
+        message="Firewall band status retrieved",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )

@@ -1857,9 +1857,26 @@ class FirewallBandResult:
     anchor_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class FirewallBandStatus:
+    """What a read-only look at the forward-chain sentinel band found.
+
+    ``state`` is ``"ready"`` (a push would find it), ``"missing"`` (neither
+    sentinel exists: the band was never placed) or ``"invalid"`` (something
+    is there, but a push would refuse it). ``reason`` is a stable code for
+    the ``invalid`` shape (``BAND_PARTIAL``, ``BAND_DUPLICATED``,
+    ``BAND_INVERTED``, ``BAND_SENTINEL_NOT_PASSTHROUGH``), ``BAND_NOT_PLACED``
+    for ``missing``, and ``None`` for ``ready``. Deliberately no ``.id`` and
+    no comment text: a caller shows this to a venue."""
+
+    state: str
+    reason: str | None
+
+
 __all__ = [
     "DeviceVendor",
     "FirewallBandResult",
+    "FirewallBandStatus",
     "FirewallFilterRuleConfig",
     "FirewallSyncResult",
     "UnsupportedVendorError",

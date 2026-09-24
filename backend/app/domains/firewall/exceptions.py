@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.common.router_firewall_lock import FIREWALL_PUSH_IN_PROGRESS
 from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "FirewallDeviceOperationError",
     "FirewallPushRefusedError",
     "FirewallPushFailedError",
+    "FirewallPushInProgressError",
 ]
 
 
@@ -184,4 +186,18 @@ class FirewallPushFailedError(FirewallError):
             f"Firewall rules could not be applied: {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
             data={"code": "ACCESS_RULES_PUSH_FAILED", "restored": restored},
+        )
+
+
+class FirewallPushInProgressError(FirewallError):
+    """Another firewall push, band placement or content-filter push to this
+    router holds its forward-chain lock (``app.common.router_firewall_lock``).
+    Nothing was sent to the device; retrying shortly is correct."""
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            "Another change to this router's firewall is in progress; "
+            "try again in a moment",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"code": FIREWALL_PUSH_IN_PROGRESS, "router_id": str(router_id)},
         )
