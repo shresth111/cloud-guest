@@ -43,11 +43,13 @@ from app.domains.dns_filtering.constants import (
 )
 from app.domains.dns_filtering.exceptions import (
     CategoryNotSelectableError,
+    CategorySetLimitError,
     CloudflareGatewayCeilingError,
     CloudflareNotConfiguredError,
     CrossLocationDnsFilteringAccessError,
     DnsFilteringDeviceOperationError,
     DnsFilteringNoCategoriesError,
+    DnsFilteringRoutersStillEnabledError,
     UnknownCategoryError,
 )
 from app.domains.dns_filtering.models import (
@@ -191,9 +193,9 @@ def test_profile_fingerprint_ignores_order_and_duplicates() -> None:
     assert profile_fingerprint([1, 2]) != profile_fingerprint([1, 2, 3])
 
 
-def test_location_name_is_keyed_on_the_router_uuid_only() -> None:
-    rid = uuid.uuid4()
-    assert gateway_location_name(rid) == f"wyfy-router-{rid}"
+def test_location_name_is_keyed_on_the_profile_uuid_only() -> None:
+    pid = uuid.uuid4()
+    assert gateway_location_name(pid) == f"wyfy-profile-{pid}"
 
 
 # ============================================================================
@@ -218,9 +220,8 @@ def _base(**overrides: object) -> dict[str, object]:
 
 
 _ROW_DEFAULTS = {
-    "cf_location_id": None,
-    "doh_subdomain": None,
     "applied_profile_id": None,
+    "switching_to_profile_id": None,
     "dns_snapshot": None,
     "routeros_version": None,
     "device_push_error": None,
@@ -249,6 +250,8 @@ class FakeRepo:
 
     async def create_profile(self, **fields):
         fields.setdefault("cf_rule_id", None)
+        fields.setdefault("cf_location_id", None)
+        fields.setdefault("doh_subdomain", None)
         profile = DnsFilteringProfile(**_base(**fields))
         self.profiles[profile.id] = profile
         return profile
@@ -266,6 +269,17 @@ class FakeRepo:
 
     async def count_profiles_with_rule(self):
         return sum(1 for p in self.profiles.values() if p.cf_rule_id)
+
+    async def count_profiles_with_location(self):
+        return self.extra_cf_locations + sum(
+            1 for p in self.profiles.values() if p.cf_location_id
+        )
+
+    async def list_profiles_with_location(self):
+        return [p for p in self.profiles.values() if p.cf_location_id]
+
+    async def list_profiles_holding_cloudflare_resources(self):
+        return [p for p in self.profiles.values() if p.cf_location_id or p.cf_rule_id]
 
     async def get_policy(self, organization_id, location_id):
         return next(
@@ -300,17 +314,13 @@ class FakeRepo:
             setattr(row, k, v)
         return row
 
-    async def count_cloudflare_locations(self):
-        return self.extra_cf_locations + sum(
-            1 for r in self.rows.values() if r.cf_location_id
-        )
-
-    async def list_profile_members(self, profile_id):
-        return [
-            r
+    async def count_profile_members(self, profile_id, *, excluding_row_ids=frozenset()):
+        return sum(
+            1
             for r in self.rows.values()
-            if r.applied_profile_id == profile_id and r.cf_location_id
-        ]
+            if r.id not in excluding_row_ids
+            and profile_id in (r.applied_profile_id, r.switching_to_profile_id)
+        )
 
     async def list_enabled_in_scope(self, organization_id, location_id):
         return [
@@ -551,42 +561,57 @@ async def _venue_with_router(h: Harness, categories: list[int], org=None):
     return org, loc, router
 
 
+def _profile_of(h: Harness, row) -> DnsFilteringProfile:
+    return h.repo.profiles[row.applied_profile_id]
+
+
+async def _enable(h: Harness, router):
+    return await h.service.enable_router(
+        router.id, actor_user_id=None, requesting_organization_id=None
+    )
+
+
 # ============================================================================
-# 2. Profiles are shared, not per venue
+# 2. Profiles own the Gateway location: one per distinct category set
 # ============================================================================
 
 
 class TestProfiles:
-    async def test_same_categories_in_two_orgs_share_one_rule(self, adapter) -> None:
+    async def test_same_set_in_two_orgs_shares_one_location_and_one_rule(
+        self, adapter
+    ) -> None:
         h = _harness()
         _, _, r1 = await _venue_with_router(h, [7, 2])
         _, _, r2 = await _venue_with_router(h, [2, 7, 7])
 
-        await h.service.enable_router(
-            r1.id, actor_user_id=None, requesting_organization_id=None
-        )
-        await h.service.enable_router(
-            r2.id, actor_user_id=None, requesting_organization_id=None
-        )
+        row1 = await _enable(h, r1)
+        row2 = await _enable(h, r2)
 
         assert len(h.repo.profiles) == 1
+        assert row1.applied_profile_id == row2.applied_profile_id
+        assert len(h.gateway.locations) == 1
+        assert h.gateway.calls.count("create_location") == 1
         assert len(h.gateway.rules) == 1
+        profile = _profile_of(h, row1)
         (rule,) = h.gateway.rules.values()
-        for row in h.repo.rows.values():
-            assert f'"{row.cf_location_id}"' in rule["traffic"]
-        assert "any(dns.content_category[*] in {2 7})" in rule["traffic"]
+        assert rule["traffic"] == (
+            "any(dns.content_category[*] in {2 7}) and "
+            f'dns.location in {{"{profile.cf_location_id}"}}'
+        )
+        # Both routers point at the one shared DoH endpoint.
+        urls = {c[1]["doh_url"] for c in adapter.calls if c[0] == "apply_doh"}
+        assert urls == {doh_url(profile.doh_subdomain)}
 
-    async def test_a_different_set_gets_its_own_rule_with_security_selector(
+    async def test_a_different_set_gets_its_own_location_rule_and_selector(
         self, adapter
     ) -> None:
         h = _harness()
         _, _, r1 = await _venue_with_router(h, [7])
         _, _, r2 = await _venue_with_router(h, [117, 131, 2])
         for r in (r1, r2):
-            await h.service.enable_router(
-                r.id, actor_user_id=None, requesting_organization_id=None
-            )
+            await _enable(h, r)
 
+        assert len(h.gateway.locations) == 2
         assert len(h.gateway.rules) == 2
         traffic = {body["traffic"] for body in h.gateway.rules.values()}
         assert any(
@@ -595,27 +620,134 @@ class TestProfiles:
             for t in traffic
         )
 
-    async def test_changing_a_venue_moves_it_between_rules_and_frees_the_empty_one(
+    async def test_changing_the_set_moves_the_router_and_reclaims_the_old_location(
         self, adapter
     ) -> None:
         h = _harness()
-        org, loc, r1 = await _venue_with_router(h, [7])
-        await h.service.enable_router(
-            r1.id, actor_user_id=None, requesting_organization_id=None
-        )
-        (old_rule,) = h.gateway.rules
+        _, loc, r1 = await _venue_with_router(h, [7])
+        row = await _enable(h, r1)
+        old = _profile_of(h, row)
+        old_location, old_rule = old.cf_location_id, old.cf_rule_id
+        h.gateway.calls.clear()
+        adapter.calls.clear()
 
         await h.service.set_location_policy(
             loc, category_ids=[2], actor_user_id=None, requesting_organization_id=None
         )
 
-        assert old_rule not in h.gateway.rules  # the 500-slot budget got one back
-        (body,) = h.gateway.rules.values()
-        assert "{2}" in body["traffic"]
-        # New rule written before the old one was deleted: never unfiltered.
-        assert h.gateway.calls.index("create_rule", 1) < h.gateway.calls.index(
-            "delete_rule"
+        new = _profile_of(h, row)
+        assert new.id != old.id
+        assert row.state == "active"
+        # The router was re-pointed at the new set's endpoint, verified.
+        ((name, kw),) = adapter.calls
+        assert name == "apply_doh"
+        assert kw["doh_url"] == doh_url(new.doh_subdomain)
+        # Old rule and location are gone at Cloudflare and on the profile.
+        assert old_location not in h.gateway.locations
+        assert old_rule not in h.gateway.rules
+        assert old.cf_location_id is None and old.cf_rule_id is None
+        assert list(h.gateway.locations) == [new.cf_location_id]
+        # New endpoint existed before the old one was released: the router
+        # never pointed at a deleted location.
+        calls = h.gateway.calls
+        assert calls.index("create_rule") < calls.index("delete_rule")
+        assert calls.index("create_location") < calls.index("delete_location")
+        assert row.switching_to_profile_id is None
+
+    async def test_a_move_keeps_the_old_location_while_another_router_uses_it(
+        self, adapter
+    ) -> None:
+        h = _harness()
+        _, loc1, r1 = await _venue_with_router(h, [7])
+        _, _, r2 = await _venue_with_router(h, [7])
+        row1 = await _enable(h, r1)
+        await _enable(h, r2)
+        shared = _profile_of(h, row1)
+
+        await h.service.set_location_policy(
+            loc1, category_ids=[2], actor_user_id=None, requesting_organization_id=None
         )
+
+        assert shared.cf_location_id in h.gateway.locations
+        assert len(h.gateway.locations) == 2
+
+    async def test_the_org_default_moves_only_venues_without_their_own_choice(
+        self, adapter
+    ) -> None:
+        h = _harness()
+        org = uuid.uuid4()
+        await h.service.set_organization_policy(
+            org, category_ids=[7], actor_user_id=None
+        )
+        inherits = h.add_location(org)
+        overrides = h.add_location(org)
+        await h.service.set_location_policy(
+            overrides,
+            category_ids=[2],
+            actor_user_id=None,
+            requesting_organization_id=None,
+        )
+        ra = h.routers.add(_router(org=org, loc=inherits))
+        rb = h.routers.add(_router(org=org, loc=overrides))
+        row_a = await _enable(h, ra)
+        row_b = await _enable(h, rb)
+        before_b = row_b.applied_profile_id
+
+        await h.service.set_organization_policy(
+            org, category_ids=[7, 117], actor_user_id=None
+        )
+
+        assert _profile_of(h, row_a).category_ids == [7, 117]
+        assert row_b.applied_profile_id == before_b
+
+    async def test_a_failed_move_rolled_back_keeps_filtering_on_the_old_set(
+        self, adapter
+    ) -> None:
+        h = _harness()
+        _, loc, r1 = await _venue_with_router(h, [7])
+        row = await _enable(h, r1)
+        old = _profile_of(h, row)
+        adapter.apply_error = DnsFilteringDeviceOperationError(
+            "apply_doh",
+            "DOH_PROBE_FAILED: x",
+            code="DOH_PROBE_FAILED",
+            rolled_back=True,
+        )
+
+        # The policy is saved; the router's failure is on its own row.
+        await h.service.set_location_policy(
+            loc, category_ids=[2], actor_user_id=None, requesting_organization_id=None
+        )
+
+        assert row.applied_profile_id == old.id
+        assert row.state == "active"
+        assert row.device_push_status == "failed"
+        assert "previous category selection" in row.device_push_error
+        assert row.switching_to_profile_id is None
+        # The new set's location was created for the move and released again.
+        assert list(h.gateway.locations) == [old.cf_location_id]
+        new = next(p for p in h.repo.profiles.values() if p.id != old.id)
+        assert new.cf_location_id is None and new.cf_rule_id is None
+        # The original pre-platform snapshot is untouched.
+        assert row.dns_snapshot["use_doh_server"] == ""
+
+    async def test_clearing_the_set_while_routers_filter_is_refused(
+        self, adapter
+    ) -> None:
+        h = _harness()
+        _, loc, r1 = await _venue_with_router(h, [7])
+        await _enable(h, r1)
+
+        with pytest.raises(DnsFilteringRoutersStillEnabledError) as exc:
+            await h.service.set_location_policy(
+                loc,
+                category_ids=[],
+                actor_user_id=None,
+                requesting_organization_id=None,
+            )
+        assert exc.value.status_code == 409
+        (policy,) = h.repo.policies.values()
+        assert policy.category_ids == [7]
 
     async def test_org_default_applies_until_the_venue_overrides(self, adapter) -> None:
         h = _harness()
@@ -656,48 +788,117 @@ class TestProfiles:
         await h.service.list_categories()
         assert h.gateway.calls.count("list_categories") == 1
 
+    async def test_nothing_tenant_identifying_reaches_cloudflare(self, adapter) -> None:
+        h = _harness()
+        org, loc, router = await _venue_with_router(h, [7, 117])
+        row = await _enable(h, router)
+        profile = _profile_of(h, row)
+
+        (location,) = h.gateway.locations.values()
+        (rule,) = h.gateway.rules.values()
+        assert location.name == f"wyfy-profile-{profile.id}"
+        assert rule["name"] == f"wyfy-profile-{profile.id}"
+        sent = json.dumps(
+            {"location": location.name, "rule": rule}, default=str
+        ).lower()
+        for tenant_value in (org, loc, router.id, router.name):
+            assert str(tenant_value).lower() not in sent
+
 
 # ============================================================================
-# 3. Ceilings
+# 3. Ceilings: the location cap counts distinct category sets
 # ============================================================================
 
 
 class TestCeilings:
-    async def test_the_250th_location_is_the_last(self, adapter) -> None:
-        h = _harness(max_locations=250)
-        h.repo.extra_cf_locations = 250
-        _, _, router = await _venue_with_router(h, [7])
+    async def test_routers_do_not_count_against_the_cap_sets_do(self, adapter) -> None:
+        h = _harness(max_locations=1)
+        routers = [(await _venue_with_router(h, [7]))[2] for _ in range(5)]
+        for r in routers:
+            await _enable(h, r)
+        assert len(h.gateway.locations) == 1
 
-        with pytest.raises(CloudflareGatewayCeilingError) as exc:
-            await h.service.enable_router(
-                router.id, actor_user_id=None, requesting_organization_id=None
-            )
+    async def test_a_new_set_past_the_cap_is_refused_with_the_nearest_set(
+        self, adapter
+    ) -> None:
+        h = _harness(max_locations=1)
+        _, _, r1 = await _venue_with_router(h, [7, 2])
+        await _enable(h, r1)
+        _, _, r2 = await _venue_with_router(h, [7, 117])
+        h.gateway.calls.clear()
+        adapter.calls.clear()
+
+        with pytest.raises(CategorySetLimitError) as exc:
+            await _enable(h, r2)
 
         assert exc.value.status_code == 409
-        assert "250" in exc.value.message
+        assert exc.value.data["limit"] == 1
+        assert exc.value.data["nearest_category_ids"] == [2, 7]
+        assert exc.value.data["nearest_adds"] == [2]
+        assert exc.value.data["nearest_removes"] == [117]
+        assert "Adult Themes" in exc.value.message
+        assert "Malware" in exc.value.message
         assert "create_location" not in h.gateway.calls
         assert adapter.calls == []
 
-    async def test_the_249th_still_fits(self, adapter) -> None:
-        h = _harness(max_locations=250)
-        h.repo.extra_cf_locations = 249
-        _, _, router = await _venue_with_router(h, [7])
-        await h.service.enable_router(
-            router.id, actor_user_id=None, requesting_organization_id=None
+    async def test_a_policy_change_past_the_cap_is_refused_before_it_is_written(
+        self, adapter
+    ) -> None:
+        h = _harness(max_locations=1)
+        _, loc1, r1 = await _venue_with_router(h, [7])
+        _, _, r2 = await _venue_with_router(h, [7])
+        await _enable(h, r1)
+        await _enable(h, r2)
+        adapter.calls.clear()
+
+        with pytest.raises(CategorySetLimitError):
+            await h.service.set_location_policy(
+                loc1,
+                category_ids=[2],
+                actor_user_id=None,
+                requesting_organization_id=None,
+            )
+        policy = await h.repo.get_policy(h.routers.routers[r1.id].organization_id, loc1)
+        assert policy.category_ids == [7]
+        assert adapter.calls == []
+
+    async def test_a_sole_member_can_change_set_at_the_cap(self, adapter) -> None:
+        """Its old location is freed by the same move, so it fits."""
+        h = _harness(max_locations=1)
+        _, loc, r1 = await _venue_with_router(h, [7])
+        row = await _enable(h, r1)
+
+        await h.service.set_location_policy(
+            loc, category_ids=[2], actor_user_id=None, requesting_organization_id=None
         )
-        assert "create_location" in h.gateway.calls
+
+        assert _profile_of(h, row).category_ids == [2]
+        assert len(h.gateway.locations) == 1
+
+    async def test_a_set_not_yet_live_can_be_chosen_without_routers(self) -> None:
+        """Choosing costs nothing until a router is switched to it."""
+        h = _harness(max_locations=1)
+        h.repo.extra_cf_locations = 1
+        loc = h.add_location(uuid.uuid4())
+        await h.service.set_location_policy(
+            loc, category_ids=[2], actor_user_id=None, requesting_organization_id=None
+        )
+        assert "create_location" not in h.gateway.calls
+
+    async def test_the_default_cap_is_conservative(self) -> None:
+        from app.core.config import Settings
+
+        assert Settings().cloudflare_gateway_max_locations == 3
 
     async def test_the_rule_ceiling_refuses_a_new_profile(self, adapter) -> None:
         h = _harness(max_rules=1)
         _, _, r1 = await _venue_with_router(h, [7])
         _, _, r2 = await _venue_with_router(h, [2])
-        await h.service.enable_router(
-            r1.id, actor_user_id=None, requesting_organization_id=None
-        )
+        await _enable(h, r1)
         with pytest.raises(CloudflareGatewayCeilingError):
-            await h.service.enable_router(
-                r2.id, actor_user_id=None, requesting_organization_id=None
-            )
+            await _enable(h, r2)
+        # The location created for the refused set was given back.
+        assert len(h.gateway.locations) == 1
 
 
 # ============================================================================
@@ -721,9 +922,8 @@ class TestLifecycle:
             "trust_setting": None,
             "trust_setting_value": None,
         }
-        assert row.cf_location_name == f"wyfy-router-{router.id}"
         (call,) = adapter.calls
-        assert call[1]["doh_url"] == doh_url(row.doh_subdomain)
+        assert call[1]["doh_url"] == doh_url(_profile_of(h, row).doh_subdomain)
         assert AuditAction.DNS_FILTERING_ENABLED.value in [
             e["action"] for e in h.audit.entries
         ]
@@ -731,8 +931,9 @@ class TestLifecycle:
     async def test_a_crashed_create_is_adopted_not_duplicated(self, adapter) -> None:
         h = _harness()
         _, _, router = await _venue_with_router(h, [7])
+        (profile,) = h.repo.profiles.values()
         orphan = GatewayLocation(
-            id="cf-orphan", name=gateway_location_name(router.id), doh_subdomain="zzz"
+            id="cf-orphan", name=gateway_location_name(profile.id), doh_subdomain="zzz"
         )
         h.gateway.locations[orphan.id] = orphan
 
@@ -740,7 +941,7 @@ class TestLifecycle:
             router.id, actor_user_id=None, requesting_organization_id=None
         )
 
-        assert row.cf_location_id == "cf-orphan"
+        assert _profile_of(h, row).cf_location_id == "cf-orphan"
         assert "create_location" not in h.gateway.calls
 
     async def test_a_failed_switch_is_committed_then_raised(self, adapter) -> None:
@@ -763,6 +964,11 @@ class TestLifecycle:
         assert row.state == "failed"
         assert "DOH_PROBE_FAILED" in row.device_push_error
         assert error.data["rolled_back"] is True
+        # Rolled back to its own DNS: it holds no profile, and the location
+        # made for it was given back.
+        assert row.applied_profile_id is None
+        assert h.gateway.locations == {}
+        assert h.gateway.rules == {}
 
     async def test_repush_keeps_the_original_snapshot(self, adapter) -> None:
         h = _harness()
@@ -811,10 +1017,14 @@ class TestLifecycle:
 
         assert adapter.calls[-1][0] == "restore_dns"
         assert row.state == "disabled"
-        assert row.cf_location_id is None
+        assert row.applied_profile_id is None
         assert h.gateway.locations == {}
         assert h.gateway.rules == {}
         assert row.dns_snapshot is None
+        # Rule before location: the rule is what references it.
+        assert h.gateway.calls.index("delete_rule") < h.gateway.calls.index(
+            "delete_location"
+        )
 
     async def test_disable_with_cloudflare_down_still_restores_the_router(
         self, adapter
@@ -844,7 +1054,10 @@ class TestLifecycle:
             router.id, actor_user_id=None, requesting_organization_id=None
         )
         assert sum(1 for c in adapter.calls if c[0] == "restore_dns") == restores
-        assert row.cf_location_id is None
+        assert h.gateway.locations == {}
+        assert h.gateway.rules == {}
+        (profile,) = h.repo.profiles.values()
+        assert profile.cf_location_id is None
 
     async def test_bypass_hardening_is_opt_in_and_needs_an_active_router(
         self, adapter
@@ -1072,7 +1285,7 @@ class TestEndToEnd:
             router.id, actor_user_id=None, requesting_organization_id=None
         )
         assert api.menus[("ip", "dns")][0]["use-doh-server"] == doh_url(
-            row.doh_subdomain
+            _profile_of(h, row).doh_subdomain
         )
         assert row.dns_snapshot["use_doh_server"] == "https://isp.example/dns-query"
 
@@ -1083,6 +1296,58 @@ class TestEndToEnd:
             api.menus[("ip", "dns")][0]["use-doh-server"]
             == "https://isp.example/dns-query"
         )
+
+    async def test_a_set_change_repoints_the_router_and_disable_still_restores(
+        self, fake_routeros
+    ) -> None:
+        h = _harness()
+        _, loc, router = await _venue_with_router(h, [7])
+        api = fake_routeros(_FakeRouterOS(doh="https://isp.example/dns-query"))
+        row = await h.service.enable_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+
+        await h.service.set_location_policy(
+            loc, category_ids=[2], actor_user_id=None, requesting_organization_id=None
+        )
+
+        new = _profile_of(h, row)
+        assert new.category_ids == [2]
+        assert api.menus[("ip", "dns")][0]["use-doh-server"] == doh_url(
+            new.doh_subdomain
+        )
+        # The snapshot is still the venue's own, not the first profile's.
+        assert row.dns_snapshot["use_doh_server"] == "https://isp.example/dns-query"
+
+        await h.service.disable_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+        assert (
+            api.menus[("ip", "dns")][0]["use-doh-server"]
+            == "https://isp.example/dns-query"
+        )
+        assert h.gateway.locations == {}
+
+    async def test_a_move_whose_probe_fails_goes_back_to_the_old_endpoint(
+        self, fake_routeros
+    ) -> None:
+        h = _harness()
+        _, loc, router = await _venue_with_router(h, [7])
+        api = fake_routeros(_FakeRouterOS(doh=""))
+        row = await h.service.enable_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+        old_url = doh_url(_profile_of(h, row).doh_subdomain)
+        api.probe_ok = False
+
+        await h.service.set_location_policy(
+            loc, category_ids=[2], actor_user_id=None, requesting_organization_id=None
+        )
+
+        assert api.menus[("ip", "dns")][0]["use-doh-server"] == old_url
+        assert row.state == "active"
+        assert row.device_push_status == "failed"
+        assert _profile_of(h, row).category_ids == [7]
 
     async def test_old_routeros_is_a_409_with_nothing_written(
         self, fake_routeros

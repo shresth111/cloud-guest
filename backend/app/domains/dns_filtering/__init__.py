@@ -3,13 +3,15 @@
 The honest path PRD §11.1 option A and §17 recommend: category filtering
 needs a maintained category database and a resolver that applies it, and
 RouterOS has neither. So the venue's router forwards its DNS to a
-per-router Cloudflare Gateway DoH endpoint, and the categories are enforced
-by Gateway DNS policies this platform manages.
+Cloudflare Gateway DoH endpoint -- one per distinct category selection,
+shared by every venue that chose it -- and the categories are enforced by
+Gateway DNS policies this platform manages.
 
 * ``cloudflare_client`` -- the Gateway API (categories, locations, rules).
-* ``service`` -- profiles shared across venues (one rule per distinct
-  category set, not per venue), per-router locations, the 250-location
-  ceiling, and the enable/disable lifecycle.
+* ``service`` -- profiles shared across venues (one Gateway location and
+  one rule per distinct category set, not per router or venue), the
+  configurable location cap, moving routers between sets, and the
+  enable/disable lifecycle.
 * ``device_adapters`` -> ``wyfy_device_gateway.mikrotik_dns_filtering`` --
   the whole-router resolver switch with snapshot, read-back, probe and
   rollback, and the opt-in DoT/DoH bypass hardening.

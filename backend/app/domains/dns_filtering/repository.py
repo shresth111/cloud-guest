@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
@@ -37,6 +37,11 @@ class DnsFilteringRepositoryProtocol(Protocol):
         self, profile: DnsFilteringProfile, data: dict[str, object]
     ) -> DnsFilteringProfile: ...
     async def count_profiles_with_rule(self) -> int: ...
+    async def count_profiles_with_location(self) -> int: ...
+    async def list_profiles_with_location(self) -> list[DnsFilteringProfile]: ...
+    async def list_profiles_holding_cloudflare_resources(
+        self,
+    ) -> list[DnsFilteringProfile]: ...
 
     # policies
     async def get_policy(
@@ -57,10 +62,12 @@ class DnsFilteringRepositoryProtocol(Protocol):
     async def update_router_location(
         self, row: DnsFilteringRouterLocation, data: dict[str, object]
     ) -> DnsFilteringRouterLocation: ...
-    async def count_cloudflare_locations(self) -> int: ...
-    async def list_profile_members(
-        self, profile_id: uuid.UUID
-    ) -> list[DnsFilteringRouterLocation]: ...
+    async def count_profile_members(
+        self,
+        profile_id: uuid.UUID,
+        *,
+        excluding_row_ids: frozenset[uuid.UUID] = frozenset(),
+    ) -> int: ...
     async def list_enabled_in_scope(
         self, organization_id: uuid.UUID, location_id: uuid.UUID | None
     ) -> list[DnsFilteringRouterLocation]: ...
@@ -126,6 +133,43 @@ class DnsFilteringRepository:
         )
         return int(result.scalar_one())
 
+    async def count_profiles_with_location(self) -> int:
+        """Gateway DNS locations this platform holds, across all tenants --
+        one per profile in use. What the configured location cap (the
+        Cloudflare plan's allowance) is measured against."""
+        result = await self.session.execute(
+            select(func.count())
+            .select_from(DnsFilteringProfile)
+            .where(
+                DnsFilteringProfile.is_deleted.is_(False),
+                DnsFilteringProfile.cf_location_id.is_not(None),
+            )
+        )
+        return int(result.scalar_one())
+
+    async def list_profiles_with_location(self) -> list[DnsFilteringProfile]:
+        result = await self.session.execute(
+            select(DnsFilteringProfile).where(
+                DnsFilteringProfile.is_deleted.is_(False),
+                DnsFilteringProfile.cf_location_id.is_not(None),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_profiles_holding_cloudflare_resources(
+        self,
+    ) -> list[DnsFilteringProfile]:
+        result = await self.session.execute(
+            select(DnsFilteringProfile).where(
+                DnsFilteringProfile.is_deleted.is_(False),
+                or_(
+                    DnsFilteringProfile.cf_location_id.is_not(None),
+                    DnsFilteringProfile.cf_rule_id.is_not(None),
+                ),
+            )
+        )
+        return list(result.scalars().all())
+
     # -- policies ------------------------------------------------------------
 
     async def get_policy(
@@ -169,30 +213,31 @@ class DnsFilteringRepository:
     ) -> DnsFilteringRouterLocation:
         return await self.router_locations.update(row, data)
 
-    async def count_cloudflare_locations(self) -> int:
-        """Every Gateway location this platform holds, across all tenants --
-        the number Cloudflare's 250-per-account ceiling is measured against."""
-        result = await self.session.execute(
+    async def count_profile_members(
+        self,
+        profile_id: uuid.UUID,
+        *,
+        excluding_row_ids: frozenset[uuid.UUID] = frozenset(),
+    ) -> int:
+        """Routers pointing at the profile's endpoint, or being switched to
+        it. Zero means its Gateway location and rule can be released."""
+        statement = (
             select(func.count())
             .select_from(DnsFilteringRouterLocation)
             .where(
                 DnsFilteringRouterLocation.is_deleted.is_(False),
-                DnsFilteringRouterLocation.cf_location_id.is_not(None),
+                or_(
+                    DnsFilteringRouterLocation.applied_profile_id == profile_id,
+                    DnsFilteringRouterLocation.switching_to_profile_id == profile_id,
+                ),
             )
         )
+        if excluding_row_ids:
+            statement = statement.where(
+                DnsFilteringRouterLocation.id.not_in(excluding_row_ids)
+            )
+        result = await self.session.execute(statement)
         return int(result.scalar_one())
-
-    async def list_profile_members(
-        self, profile_id: uuid.UUID
-    ) -> list[DnsFilteringRouterLocation]:
-        result = await self.session.execute(
-            select(DnsFilteringRouterLocation).where(
-                DnsFilteringRouterLocation.is_deleted.is_(False),
-                DnsFilteringRouterLocation.applied_profile_id == profile_id,
-                DnsFilteringRouterLocation.cf_location_id.is_not(None),
-            )
-        )
-        return list(result.scalars().all())
 
     async def list_enabled_in_scope(
         self, organization_id: uuid.UUID, location_id: uuid.UUID | None

@@ -1835,11 +1835,30 @@ class Settings(BaseSettings):
         default="https://api.cloudflare.com/client/v4"
     )
     cloudflare_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
-    # Cloudflare Gateway's per-account ceilings (standard limits, as
-    # published): 250 DNS locations, 500 DNS policies. Configurable only
-    # because Cloudflare can raise them on request; the service refuses
-    # before creating anything that would exceed them.
-    cloudflare_gateway_max_locations: int = Field(default=250, ge=1)
+    # How many Gateway DNS locations the platform may hold. Locations are
+    # allocated per distinct category set (dns_filtering profile), not per
+    # router, so this is the number of different category selections that
+    # can be live at once. The *plan* allowance is what binds, not the 250
+    # in Cloudflare's account-limits doc (an upper bound): Zero Trust
+    # Standard lists 25 DNS filtering locations, Free lists none (plan page
+    # checked 2026-09-24). Default 3 is deliberately conservative until the
+    # real allowance is measured on the platform's account; keep it at
+    # least one below the plan's number, because moving a venue between
+    # sets creates the new location before releasing the old one. A new
+    # distinct set past this is refused with a 409 naming the nearest set
+    # in use -- never silently merged.
+    cloudflare_gateway_max_locations: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Max Cloudflare Gateway DNS locations (= distinct category "
+            "selections live at once). Set via "
+            "CLOUDGUEST_CLOUDFLARE_GATEWAY_MAX_LOCATIONS to the plan's "
+            "allowance minus one."
+        ),
+    )
+    # Cloudflare's published per-account DNS policy limit. One rule per
+    # location now, so the location cap binds first; kept as a backstop.
     cloudflare_gateway_max_dns_rules: int = Field(default=500, ge=1)
     # The name a router must be able to resolve through Gateway after the
     # switch. Must be a name no plausible category selection blocks.

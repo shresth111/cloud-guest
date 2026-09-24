@@ -37,13 +37,15 @@ RULE_PRECEDENCE_BASE = 10_000
 class RouterFilteringState(StrEnum):
     """Where one router is in its Cloudflare DNS lifecycle."""
 
-    #: A Gateway location exists (or is being created); the router has not
-    #: yet been switched successfully.
+    #: The router's profile location exists (or is being created); the
+    #: router has not yet been switched successfully.
     PENDING = "pending"
     #: The router resolves through Gateway, probe passed.
     ACTIVE = "active"
-    #: The last switch failed. ``device_push_error`` says why and whether the
-    #: rollback read back clean.
+    #: The first switch failed. ``device_push_error`` says why and whether the
+    #: rollback read back clean. (A failed *move* between two profiles of a
+    #: router that was already active, rolled back clean, stays ACTIVE on its
+    #: previous profile with ``device_push_status=failed``.)
     FAILED = "failed"
     #: Switched off; the router's own DNS settings were restored.
     DISABLED = "disabled"
@@ -80,19 +82,29 @@ def profile_fingerprint(ids: Iterable[int]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def gateway_location_name(router_id: uuid.UUID) -> str:
-    """The Cloudflare location name for a router.
+def gateway_location_name(profile_id: uuid.UUID) -> str:
+    """The Cloudflare location name for a category profile.
 
-    Keyed on our router UUID and nothing a tenant controls -- not the venue
-    name, not the router name -- so two tenants can never collide on, or
-    guess, each other's location, and a location found by name after a
-    crashed create is provably ours.
+    Locations are allocated **per profile** (one per distinct category set),
+    not per router, so the name is keyed on our profile UUID and nothing
+    else. A profile is platform-owned and holds only category ids; the name
+    carries no organization, venue or router name, so a location shared by
+    venues of different tenants reveals nothing about any of them, and a
+    location found by name after a crashed create is provably ours.
     """
-    return f"wyfy-router-{router_id}"
+    return f"wyfy-profile-{profile_id}"
 
 
 def gateway_rule_name(profile_id: uuid.UUID) -> str:
+    """Same key as the location, same reason: nothing tenant-derived."""
     return f"wyfy-profile-{profile_id}"
+
+
+def category_distance(a: Iterable[int], b: Iterable[int]) -> int:
+    """How far two category sets are apart: the size of their symmetric
+    difference. Used only to suggest the nearest existing profile when a new
+    distinct set would exceed the location cap."""
+    return len(set(a) ^ set(b))
 
 
 def doh_url(doh_subdomain: str) -> str:
@@ -145,6 +157,7 @@ __all__ = [
     "UNSELECTABLE_CATEGORY_CLASSES",
     "build_rule_traffic",
     "canonical_category_ids",
+    "category_distance",
     "doh_url",
     "gateway_location_name",
     "gateway_rule_name",

@@ -12,6 +12,7 @@ from app.common.exceptions import CloudGuestError
 
 __all__ = [
     "CategoryNotSelectableError",
+    "CategorySetLimitError",
     "CloudflareGatewayCeilingError",
     "CloudflareNotConfiguredError",
     "CloudflareSyncError",
@@ -22,6 +23,7 @@ __all__ = [
     "DnsFilteringMissingCredentialsError",
     "DnsFilteringNotEnabledError",
     "DnsFilteringNoCategoriesError",
+    "DnsFilteringRoutersStillEnabledError",
     "UnknownCategoryError",
     "UnsupportedDnsFilteringVendorError",
 ]
@@ -57,22 +59,78 @@ class CloudflareSyncError(DnsFilteringError):
 
 
 class CloudflareGatewayCeilingError(DnsFilteringError):
-    """The platform's Cloudflare account is at a published per-account limit.
-
-    409 and a sentence an operator can act on: past 250 locations the
-    account needs a limit increase from Cloudflare, or a second account --
-    this platform does not silently start sharing locations between venues,
-    which would merge their filtering.
-    """
+    """The platform's Cloudflare account is at a per-account limit that is
+    not the location cap (today: DNS policies). 409 and a sentence an
+    operator can act on."""
 
     def __init__(self, *, resource: str, limit: int) -> None:
         super().__init__(
             f"The platform's Cloudflare Gateway account is at its limit of "
-            f"{limit} {resource}. Category filtering cannot be enabled for "
-            "another router until Cloudflare raises the limit or a second "
-            "account is added.",
+            f"{limit} {resource}. Category filtering cannot use another "
+            "category set until Cloudflare raises the limit.",
             status_code=status.HTTP_409_CONFLICT,
             data={"resource": resource, "limit": limit},
+        )
+
+
+class CategorySetLimitError(DnsFilteringError):
+    """A **new distinct** category set would need a Gateway DNS location the
+    platform's plan does not have.
+
+    Locations are allocated per category set (profile), and the cap is a
+    setting (``cloudflare_gateway_max_locations``) because the Cloudflare
+    plan's allowance is not published for Free and is 25 on Standard. 409,
+    and never a silent merge into another set: the detail names the nearest
+    set already in use so the venue can choose it deliberately. Only
+    category ids are disclosed -- a profile holds no tenant data.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        in_use: int,
+        requested_category_ids: list[int],
+        nearest_category_ids: list[int] | None,
+        nearest_adds: list[int],
+        nearest_removes: list[int],
+        nearest_label: str | None,
+    ) -> None:
+        message = (
+            f"Category filtering can run at most {limit} different category "
+            f"selections at once on this platform, and {in_use} are in use. "
+            "This selection is new, so it cannot be applied as it stands."
+        )
+        if nearest_label:
+            message += f" The closest selection already in use {nearest_label}."
+        super().__init__(
+            message,
+            status_code=status.HTTP_409_CONFLICT,
+            data={
+                "resource": "DNS locations",
+                "limit": limit,
+                "in_use": in_use,
+                "requested_category_ids": requested_category_ids,
+                "nearest_category_ids": nearest_category_ids,
+                "nearest_adds": nearest_adds,
+                "nearest_removes": nearest_removes,
+            },
+        )
+
+
+class DnsFilteringRoutersStillEnabledError(DnsFilteringError):
+    """Clearing a policy to "block nothing" while routers still point at a
+    category set's DoH endpoint. There is no endpoint for "nothing", so the
+    routers would have to be switched back first -- refused rather than
+    silently turning filtering off on live routers."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(
+            f"Category filtering is still on for {count} router(s) that would "
+            "block nothing under this change. Turn category filtering off on "
+            "those routers first, or keep at least one category.",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"routers": count},
         )
 
 

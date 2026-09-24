@@ -1,38 +1,59 @@
 """Cloudflare Gateway DNS (category) filtering: business logic.
 
-## The shape, and the two ceilings that decided it
+## The shape: one Gateway location per category set, not per router
 
-Cloudflare Gateway allows, per account, **250 DNS locations** and **500 DNS
-policies** (standard limits). This platform operates one Cloudflare account
-on behalf of every tenant, so both are platform-wide budgets.
+This platform operates one Cloudflare account on behalf of every tenant, so
+Cloudflare's per-account budgets are platform-wide. Two of them matter:
 
-* **One Gateway location per router.** A location is what binds a router's
-  DoH queries to a policy, and venue WAN addresses are dynamic, so the DoH
-  subdomain -- not a source IP -- is the only identity that works. That
-  makes locations the binding ceiling: **250 routers** on one account
-  (the fleet is ~28 today). Past it, :meth:`enable_router` refuses with
-  :class:`CloudflareGatewayCeilingError` *before* creating anything; the
-  way forward is a limit increase from Cloudflare or a second account
-  (sharding), and this module deliberately does not paper over it by
-  sharing one location between venues, which would merge their filtering.
-* **One Gateway rule per distinct category set ("profile"), not per venue.**
-  A rule blocks ``dns.content_category``/``dns.security_category`` ids *and*
-  ``dns.location in {...}`` -- every router, in any organization, whose
-  venue chose exactly that set. The rule count grows with the number of
-  different choices, which is small, instead of with venues, which would hit
-  500. A profile whose last router leaves has its rule deleted at Cloudflare
-  so the slot comes back.
+* **DNS locations.** A location is what binds a router's DoH queries to a
+  policy (venue WAN addresses are dynamic, so the DoH subdomain -- not a
+  source IP -- is the only identity that works). The *plan* allowance is
+  small and partly unknown: Zero Trust Standard lists 25 DNS filtering
+  locations, Free lists no number at all, and the 250 in Cloudflare's
+  account-limits doc is an upper bound, not what a plan grants. One
+  location per router (~28 routers today) would already be past Standard.
+* **DNS policies** (500).
+
+So both are allocated **per profile** -- one profile per distinct category
+set, shared by every venue, in any organization, whose effective policy
+resolves to exactly that set. A profile in use owns one location (one DoH
+endpoint) and one rule whose selector is that single location. Every router
+of the profile points at the same endpoint. Locations in use therefore equal
+the number of *distinct active category sets*, whatever the router count.
+
+* **The cap is a setting** (``cloudflare_gateway_max_locations``, default 3
+  until the plan's real allowance is measured). A change that needs a
+  location for a **new** distinct set past the cap is refused with a 409
+  (:class:`CategorySetLimitError`) *before anything is written*, naming the
+  nearest set already in use. It never silently merges the venue into
+  another set.
+* **Switching sets moves the router, not the rule.** A venue whose set
+  changes has each enabled router re-pointed at the new profile's endpoint
+  through the same verified switch as enable (snapshot, write, read back,
+  probe, restore on failure). The new profile's location and rule exist
+  before the router is pointed at them, so a router is never on an
+  unfiltered endpoint. When a profile's last router leaves (moved or
+  disabled), its rule and then its location are deleted at Cloudflare and
+  both slots come back.
+* **What sharing costs.** Cloudflare's own DNS logs are per location, so
+  they cannot tell apart the venues (or organizations) that share a
+  profile. The platform does not surface those logs today; if it ever
+  needs per-venue query logs, it needs per-venue locations and a plan that
+  pays for them.
 
 ## Tenant isolation is ours
 
-The Cloudflare account is shared, so isolation is enforced here: a location
-is named ``wyfy-router-<router uuid>`` (nothing a tenant chooses), a router
-is reached only through ``RouterService`` scoped to the caller's
-organization, a venue through ``LocationService`` likewise, the policy's
-organization is read off the location row -- never off a header -- and a
-location-confined caller is checked against the row's location. A profile
-rule lists location ids from several tenants, but no tenant ever reads a
-rule; they read their own policy and their own routers.
+The Cloudflare account is shared, so isolation is enforced here. A profile
+is platform-owned and holds only category ids; its location and rule are
+named ``wyfy-profile-<profile uuid>`` -- no organization, venue or router
+name ever reaches Cloudflare -- so sharing a profile across organizations
+exposes nothing about any of them. A router is reached only through
+``RouterService`` scoped to the caller's organization, a venue through
+``LocationService`` likewise, the policy's organization is read off the
+location row -- never off a header -- and a location-confined caller is
+checked against the row's location. No tenant ever reads a profile; the
+one place a profile's category ids are shown is the cap refusal's "nearest
+selection" hint, which is category ids and nothing else.
 
 ## Safety
 
@@ -42,9 +63,10 @@ upstream means no guest resolves anything. The device side
 back, probes, and restores on failure. This side makes that record durable:
 a failed switch is committed before it is re-raised (the session would
 otherwise roll it back), the pre-switch snapshot is written once and never
-overwritten by a re-push, and disable restores the router **before** it
-touches Cloudflare, so a revoked token can never stop a venue getting its
-own DNS back.
+overwritten by a re-push or a move, disable restores the router **before**
+it touches Cloudflare, so a revoked token can never stop a venue getting its
+own DNS back, and a profile's location is never released while a router
+points at it or is being switched to it (``switching_to_profile_id``).
 """
 
 from __future__ import annotations
@@ -56,6 +78,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from app.common.exceptions import CloudGuestError
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
@@ -78,6 +101,7 @@ from .constants import (
     RouterFilteringState,
     build_rule_traffic,
     canonical_category_ids,
+    category_distance,
     doh_url,
     gateway_location_name,
     gateway_rule_name,
@@ -86,13 +110,16 @@ from .constants import (
 from .device_adapters import DnsFilteringCredentials, get_dns_filtering_adapter
 from .exceptions import (
     CategoryNotSelectableError,
+    CategorySetLimitError,
     CloudflareGatewayCeilingError,
     CloudflareNotConfiguredError,
     CloudflareSyncError,
     CrossLocationDnsFilteringAccessError,
+    DnsFilteringError,
     DnsFilteringMissingCredentialsError,
     DnsFilteringNoCategoriesError,
     DnsFilteringNotEnabledError,
+    DnsFilteringRoutersStillEnabledError,
     UnknownCategoryError,
 )
 from .models import DnsFilteringPolicy, DnsFilteringProfile, DnsFilteringRouterLocation
@@ -233,7 +260,7 @@ class DnsFilteringService:
         gateway: GatewayClientProtocol | None,
         audit_writer: AuditLogWriter | None = None,
         caller_location_scope: LocationScope = None,
-        max_locations: int = 250,
+        max_locations: int = 3,
         max_dns_rules: int = 500,
         probe_hostname: str = "cloudflare.com",
         category_cache: CategoryCache | None = None,
@@ -371,6 +398,24 @@ class DnsFilteringService:
     ) -> DnsFilteringPolicy:
         ids = await self._validated_ids(category_ids)
         profile = await self._get_or_create_profile(ids)
+
+        # Every refusal is decided before the policy is written: which
+        # enabled routers this moves, whether any would be left with nothing
+        # to point at, and whether a new category set fits the location cap.
+        moves = await self._planned_moves(
+            organization_id=organization_id,
+            location_id=location_id,
+            ids=ids,
+            profile=profile,
+        )
+        if any(target is None for _, target in moves):
+            raise DnsFilteringRoutersStillEnabledError(
+                sum(1 for _, target in moves if target is None)
+            )
+        if moves:
+            self._require_gateway()
+            await self._check_location_cap(ids, moves)
+
         existing = await self.repository.get_policy(organization_id, location_id)
         fields = {
             "category_ids": ids,
@@ -387,44 +432,133 @@ class DnsFilteringService:
             policy = await self.repository.update_policy(
                 existing, {**fields, "updated_by": actor_user_id}
             )
-
-        # Routers whose effective profile this changes move rules. New rule
-        # first, old rule second: for a moment a router may be in both
-        # (blocking the union), never in neither.
-        to_sync_new: list[uuid.UUID] = []
-        to_sync_old: list[uuid.UUID] = []
-        for row in await self.repository.list_enabled_in_scope(
-            organization_id, location_id
-        ):
-            effective = await self._effective(organization_id, row.location_id)
-            if effective.profile_id == row.applied_profile_id:
-                continue
-            if row.applied_profile_id is not None:
-                to_sync_old.append(row.applied_profile_id)
-            if effective.profile_id is not None:
-                to_sync_new.append(effective.profile_id)
-            await self.repository.update_router_location(
-                row, {"applied_profile_id": effective.profile_id}
-            )
         await self.repository.commit()
-        for profile_id in dict.fromkeys([*to_sync_new, *to_sync_old]):
-            await self._sync_profile(profile_id)
 
+        # Each affected router is re-pointed at the new set's endpoint with
+        # the verified switch. One router failing (unreachable, probe failed
+        # and rolled back) does not stop the others: its failure is recorded
+        # on its own row, where the router status endpoint shows it.
+        moved = failed = 0
+        for row, target in moves:
+            if await self._move_router(
+                row,
+                target,  # type: ignore[arg-type] -- None refused above
+                organization_id=organization_id,
+                actor_user_id=actor_user_id,
+            ):
+                moved += 1
+            else:
+                failed += 1
+
+        description = f"Blocked categories set to {ids} for " + (
+            f"location {location_id}" if location_id else "the organization"
+        )
+        if moves:
+            description += f"; routers re-pointed: {moved}, failed: {failed}"
         await self._audit(
             actor_user_id,
             AuditAction.DNS_FILTERING_POLICY_UPDATED,
             entity_type="dns_filtering_policy",
             entity_id=policy.id,
             organization_id=organization_id,
-            description=(
-                f"Blocked categories set to {ids} for "
-                + (f"location {location_id}" if location_id else "the organization")
-            ),
+            description=description,
         )
         return policy
 
+    async def _planned_moves(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        ids: list[int],
+        profile: DnsFilteringProfile | None,
+    ) -> list[tuple[DnsFilteringRouterLocation, uuid.UUID | None]]:
+        """The active routers whose target profile this policy change
+        alters, and the profile each would move to -- computed against the
+        policy as it *would* be, without writing it."""
+        proposed = DnsFilteringPolicy(
+            organization_id=organization_id,
+            location_id=location_id,
+            category_ids=ids,
+            profile_id=profile.id if profile is not None else None,
+        )
+        organization_policy = (
+            await self.repository.get_policy(organization_id, None)
+            if location_id is not None
+            else proposed
+        )
+        moves: list[tuple[DnsFilteringRouterLocation, uuid.UUID | None]] = []
+        for row in await self.repository.list_enabled_in_scope(
+            organization_id, location_id
+        ):
+            # Only routers already filtering are moved here. A router whose
+            # first switch never succeeded is left for its next enable.
+            if row.state != RouterFilteringState.ACTIVE.value:
+                continue
+            if location_id is None:
+                # An organization default reaches only venues without their
+                # own choice.
+                own = await self.repository.get_policy(organization_id, row.location_id)
+                if own is not None:
+                    continue
+                effective = EffectivePolicy(None, proposed)
+            else:
+                effective = EffectivePolicy(proposed, organization_policy)
+            target = effective.profile_id
+            if target == row.applied_profile_id:
+                continue
+            moves.append((row, target))
+        return moves
+
+    async def _move_router(
+        self,
+        row: DnsFilteringRouterLocation,
+        target: uuid.UUID,
+        *,
+        organization_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None,
+    ) -> bool:
+        """One router of a policy change: resolve it, then switch it. Never
+        raises -- the outcome is on the row."""
+        try:
+            router = await self.router_lookup.get_router(
+                row.router_id, requesting_organization_id=organization_id
+            )
+            adapter = get_dns_filtering_adapter(router.vendor)
+            credentials = self._resolve_device_credentials(router)
+        except CloudGuestError as exc:
+            await self.repository.update_router_location(
+                row,
+                {
+                    "device_push_status": DevicePushStatus.FAILED.value,
+                    "device_push_error": (
+                        "Could not move this router to the new category "
+                        f"selection: {exc.message}. It still filters with its "
+                        "previous selection."
+                    ),
+                },
+            )
+            await self.repository.commit()
+            return False
+        try:
+            await self._switch_router(
+                row,
+                target,
+                adapter=adapter,
+                credentials=credentials,
+                actor_user_id=actor_user_id,
+            )
+        except Exception:  # noqa: BLE001 -- recorded on the row by the switch
+            logger.warning(
+                "dns_filtering_policy_move_failed",
+                extra={"router_id": str(row.router_id)},
+                exc_info=True,
+            )
+            return False
+        return True
+
     # ------------------------------------------------------------------
-    # profiles (shared Gateway rules)
+    # profiles (shared Gateway location + rule per category set)
     # ------------------------------------------------------------------
 
     async def _get_or_create_profile(
@@ -443,56 +577,175 @@ class DnsFilteringService:
             sync_status=ProfileSyncStatus.PENDING.value,
         )
 
-    async def _sync_profile(self, profile_id: uuid.UUID) -> DnsFilteringProfile | None:
-        """Make the profile's Gateway rule list exactly its member routers.
+    async def _check_location_cap(
+        self,
+        requested_ids: list[int],
+        moves: list[tuple[DnsFilteringRouterLocation, uuid.UUID | None]],
+    ) -> None:
+        """Refuse (409) when these moves need more Gateway locations than the
+        configured cap allows, counting the locations the same moves free.
 
-        The member set is recomputed from the database under a row lock on
-        the profile, then written whole (PUT). Two venues changing one
-        shared rule at once serialize here rather than each writing a set
-        that is missing the other's change.
+        A move creates the new location before the old one is released (the
+        router must never point at an endpoint that is gone), so for the
+        length of one switch the account can hold one location more than
+        the cap. The cap is deliberately set below the plan's allowance for
+        that reason.
+
+        Not serialized across concurrent requests: two different new sets
+        created at the same instant can both pass. The window is one request
+        long and Cloudflare's own limit still stops the create.
+        """
+        targets = {t for _, t in moves if t is not None}
+        needed = 0
+        for target in targets:
+            profile = await self.repository.get_profile(target)
+            if profile is not None and profile.cf_location_id is None:
+                needed += 1
+        if needed == 0:
+            return
+        moving = frozenset(row.id for row, _ in moves)
+        freed = 0
+        for previous in {r.applied_profile_id for r, _ in moves} - targets - {None}:
+            profile = await self.repository.get_profile(previous)  # type: ignore[arg-type]
+            if profile is None or profile.cf_location_id is None:
+                continue
+            if (
+                await self.repository.count_profile_members(
+                    profile.id, excluding_row_ids=moving
+                )
+                == 0
+            ):
+                freed += 1
+        in_use = await self.repository.count_profiles_with_location()
+        if in_use - freed + needed > self.max_locations:
+            raise await self._location_cap_error(requested_ids, in_use)
+
+    async def _location_cap_error(
+        self, requested_ids: list[int], in_use: int
+    ) -> CategorySetLimitError:
+        """The refusal, with the nearest category set already in use (by
+        symmetric difference) so the venue can pick it on purpose."""
+        requested = canonical_category_ids(requested_ids)
+        candidates = await self.repository.list_profiles_with_location()
+        nearest = min(
+            (canonical_category_ids(p.category_ids) for p in candidates),
+            key=lambda ids: (category_distance(ids, requested), len(ids), ids),
+            default=None,
+        )
+        adds = sorted(set(nearest or []) - set(requested))
+        removes = sorted(set(requested) - set(nearest or []))
+        label: str | None = None
+        if nearest is not None:
+            names = self._category_names()
+            parts = []
+            if adds:
+                parts.append("also blocks " + ", ".join(names(adds)))
+            if removes:
+                parts.append("does not block " + ", ".join(names(removes)))
+            label = " and ".join(parts) if parts else None
+        return CategorySetLimitError(
+            limit=self.max_locations,
+            in_use=in_use,
+            requested_category_ids=requested,
+            nearest_category_ids=nearest,
+            nearest_adds=adds,
+            nearest_removes=removes,
+            nearest_label=label,
+        )
+
+    def _category_names(self) -> Any:
+        """Id -> display name from the cached catalogue (never a Cloudflare
+        call from inside a refusal); falls back to the id."""
+        cached = self.category_cache.get(self.clock())
+        catalogue = _flatten(cached) if cached else {}
+
+        def names(ids: list[int]) -> list[str]:
+            return [
+                catalogue[i].name if i in catalogue else f"category {i}" for i in ids
+            ]
+
+        return names
+
+    async def _ensure_profile_endpoint(
+        self, profile_id: uuid.UUID, row: DnsFilteringRouterLocation
+    ) -> DnsFilteringProfile:
+        """The profile's Gateway location and rule, created if missing, with
+        ``row`` marked as switching to it first.
+
+        The mark is written under the profile's row lock and committed with
+        (or before) the location, so a concurrent release of the same
+        profile -- which counts members under the same lock -- sees this
+        router and leaves the location alone.
         """
         gateway = self._require_gateway()
         profile = await self.repository.lock_profile(profile_id)
         if profile is None:
-            return None
-        members = await self.repository.list_profile_members(profile.id)
-        location_ids = [m.cf_location_id for m in members if m.cf_location_id]
+            raise DnsFilteringNoCategoriesError()
+        row = await self.repository.update_router_location(
+            row, {"switching_to_profile_id": profile.id}
+        )
         try:
-            if not location_ids:
-                if profile.cf_rule_id:
-                    await gateway.delete_rule(profile.cf_rule_id)
-                data: dict[str, object] = {"cf_rule_id": None}
-            else:
-                catalogue = await self.list_categories()
-                security = _security_ids(catalogue)
-                traffic = build_rule_traffic(
-                    content_ids=[i for i in profile.category_ids if i not in security],
-                    security_ids=[i for i in profile.category_ids if i in security],
-                    location_ids=location_ids,
+            if profile.cf_location_id is None:
+                location = await self._create_or_adopt_location(
+                    gateway, gateway_location_name(profile.id)
                 )
-                rule = await self._upsert_rule(profile, traffic)
-                data = {"cf_rule_id": rule.id}
-        except CloudflareApiError as exc:
-            await self.repository.update_profile(
-                profile,
-                {
-                    "sync_status": ProfileSyncStatus.FAILED.value,
-                    "sync_error": exc.message,
-                },
+                profile = await self.repository.update_profile(
+                    profile,
+                    {
+                        "cf_location_id": location.id,
+                        "doh_subdomain": location.doh_subdomain,
+                    },
+                )
+                # Committed now: a later failure must not forget a location
+                # that exists at Cloudflare and counts against the cap.
+                await self.repository.commit()
+            catalogue = await self.list_categories()
+            security = _security_ids(catalogue)
+            traffic = build_rule_traffic(
+                content_ids=[i for i in profile.category_ids if i not in security],
+                security_ids=[i for i in profile.category_ids if i in security],
+                location_ids=[str(profile.cf_location_id)],
             )
-            await self.repository.commit()
+            rule = await self._upsert_rule(profile, traffic)
+        except CloudflareApiError as exc:
+            await self._endpoint_failed(profile, row, exc.message)
             raise CloudflareSyncError(exc.message) from exc
-        updated = await self.repository.update_profile(
+        except DnsFilteringError as exc:
+            await self._endpoint_failed(profile, row, exc.message)
+            raise
+        profile = await self.repository.update_profile(
             profile,
             {
-                **data,
+                "cf_rule_id": rule.id,
                 "sync_status": ProfileSyncStatus.ACTIVE.value,
                 "sync_error": None,
                 "synced_at": datetime.now(UTC),
             },
         )
         await self.repository.commit()
-        return updated
+        return profile
+
+    async def _endpoint_failed(
+        self,
+        profile: DnsFilteringProfile,
+        row: DnsFilteringRouterLocation,
+        message: str,
+    ) -> None:
+        await self.repository.update_profile(
+            profile,
+            {"sync_status": ProfileSyncStatus.FAILED.value, "sync_error": message},
+        )
+        await self.repository.update_router_location(
+            row,
+            {
+                "switching_to_profile_id": None,
+                "device_push_status": DevicePushStatus.FAILED.value,
+                "device_push_error": f"Cloudflare Gateway: {message}",
+            },
+        )
+        await self.repository.commit()
+        # A location created before the rule failed must not hold a slot.
+        await self._release_quietly(profile.id)
 
     async def _upsert_rule(
         self, profile: DnsFilteringProfile, traffic: str
@@ -517,6 +770,71 @@ class DnsFilteringService:
                 resource="DNS policies", limit=self.max_dns_rules
             )
         return await gateway.create_rule(**body)
+
+    async def _release_profile_if_unused(self, profile_id: uuid.UUID) -> None:
+        """Delete the profile's rule, then its location, at Cloudflare --
+        only when no router points at it or is being switched to it,
+        counted under the profile's row lock."""
+        profile = await self.repository.lock_profile(profile_id)
+        if profile is None or (
+            profile.cf_location_id is None and profile.cf_rule_id is None
+        ):
+            return
+        if await self.repository.count_profile_members(profile.id) > 0:
+            return
+        gateway = self._require_gateway()
+        try:
+            # Rule first: it is the thing that references the location.
+            if profile.cf_rule_id:
+                await gateway.delete_rule(profile.cf_rule_id)
+                profile = await self.repository.update_profile(
+                    profile, {"cf_rule_id": None}
+                )
+            if profile.cf_location_id:
+                await gateway.delete_location(profile.cf_location_id)
+                profile = await self.repository.update_profile(
+                    profile, {"cf_location_id": None, "doh_subdomain": None}
+                )
+        except CloudflareApiError as exc:
+            await self.repository.update_profile(
+                profile,
+                {
+                    "sync_status": ProfileSyncStatus.FAILED.value,
+                    "sync_error": exc.message,
+                },
+            )
+            await self.repository.commit()
+            raise CloudflareSyncError(exc.message) from exc
+        await self.repository.update_profile(
+            profile,
+            {
+                "sync_status": ProfileSyncStatus.PENDING.value,
+                "sync_error": None,
+                "synced_at": datetime.now(UTC),
+            },
+        )
+        await self.repository.commit()
+
+    async def _release_quietly(self, profile_id: uuid.UUID) -> None:
+        """Release after a router already moved away: a Cloudflare failure
+        here leaves an unused location holding a slot (recorded on the
+        profile, retried by the next disable's sweep), never a router
+        without DNS -- so it is logged, not raised."""
+        try:
+            await self._release_profile_if_unused(profile_id)
+        except DnsFilteringError:
+            logger.warning(
+                "dns_filtering_profile_release_failed",
+                extra={"profile_id": str(profile_id)},
+                exc_info=True,
+            )
+
+    async def _reclaim_unused_profiles(self) -> None:
+        """Sweep: release every profile still holding a Cloudflare location
+        or rule with no router behind it."""
+        repository = self.repository
+        for profile in await repository.list_profiles_holding_cloudflare_resources():
+            await self._release_profile_if_unused(profile.id)
 
     # ------------------------------------------------------------------
     # routers
@@ -550,9 +868,9 @@ class DnsFilteringService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> DnsFilteringRouterLocation:
-        """Create (or adopt) the router's Gateway location, put it in its
-        profile's rule, then switch the router's resolver -- verified, or
-        rolled back.
+        """Point the router at its category set's shared Gateway endpoint
+        (creating that set's location and rule if it is the set's first
+        router) -- verified, or rolled back.
 
         Every precondition is checked before Cloudflare or the router is
         contacted, and the controller-managed refusal before anything else.
@@ -566,7 +884,7 @@ class DnsFilteringService:
             caller_location_scope=self.caller_location_scope,
             error=CrossLocationDnsFilteringAccessError(),
         )
-        gateway = self._require_gateway()
+        self._require_gateway()
         adapter = get_dns_filtering_adapter(router.vendor)
         credentials = self._resolve_device_credentials(router)
         effective = await self._effective(router.organization_id, router.location_id)
@@ -579,81 +897,20 @@ class DnsFilteringService:
                 router_id=router.id,
                 organization_id=router.organization_id,
                 location_id=router.location_id,
-                cf_location_name=gateway_location_name(router.id),
                 state=RouterFilteringState.PENDING.value,
                 device_push_status=DevicePushStatus.PENDING.value,
                 created_by=actor_user_id,
             )
+        target = effective.profile_id
+        await self._check_location_cap(effective.category_ids, [(row, target)])
 
-        if row.cf_location_id is None:
-            if await self.repository.count_cloudflare_locations() >= self.max_locations:
-                raise CloudflareGatewayCeilingError(
-                    resource="DNS locations", limit=self.max_locations
-                )
-            location = await self._create_or_adopt_location(
-                gateway, row.cf_location_name
-            )
-            row = await self.repository.update_router_location(
-                row,
-                {
-                    "cf_location_id": location.id,
-                    "doh_subdomain": location.doh_subdomain,
-                },
-            )
-            # Committed now: a later failure must not forget a location that
-            # exists at Cloudflare and counts against the 250.
-            await self.repository.commit()
-
-        previous_profile = row.applied_profile_id
-        row = await self.repository.update_router_location(
+        updated = await self._switch_router(
             row,
-            {
-                "applied_profile_id": effective.profile_id,
-                "state": RouterFilteringState.PENDING.value,
-            },
+            target,
+            adapter=adapter,
+            credentials=credentials,
+            actor_user_id=actor_user_id,
         )
-        await self.repository.commit()
-        # Rule membership before the router switch: the reverse order would
-        # leave a switched router briefly resolving unfiltered.
-        await self._sync_profile(effective.profile_id)
-        if previous_profile is not None and previous_profile != effective.profile_id:
-            await self._sync_profile(previous_profile)
-
-        url = doh_url(str(row.doh_subdomain))
-        try:
-            result = await adapter.apply_doh(
-                credentials,
-                doh_url=url,
-                probe_hostname=self.probe_hostname,
-                rollback_to=row.dns_snapshot,
-            )
-        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
-            failure: dict[str, object] = {
-                "state": RouterFilteringState.FAILED.value,
-                "device_push_status": DevicePushStatus.FAILED.value,
-                "device_push_error": str(exc),
-            }
-            snapshot = getattr(exc, "snapshot", None)
-            if row.dns_snapshot is None and snapshot:
-                failure["dns_snapshot"] = snapshot
-            await self.repository.update_router_location(row, failure)
-            await self.repository.commit()
-            raise
-
-        updated = await self.repository.update_router_location(
-            row,
-            {
-                "state": RouterFilteringState.ACTIVE.value,
-                "device_push_status": DevicePushStatus.ACTIVE.value,
-                "device_push_error": None,
-                "device_pushed_at": datetime.now(UTC),
-                "routeros_version": result.routeros_version,
-                # Written once: a re-push's "before" is our own state.
-                "dns_snapshot": row.dns_snapshot or result.snapshot.to_dict(),
-                "updated_by": actor_user_id,
-            },
-        )
-        await self.repository.commit()
         await self._audit(
             actor_user_id,
             AuditAction.DNS_FILTERING_ENABLED,
@@ -662,10 +919,95 @@ class DnsFilteringService:
             organization_id=router.organization_id,
             description=(
                 f"Router {router.id} DNS switched to Cloudflare Gateway "
-                f"(location {row.cf_location_id}); probe resolved "
-                f"{self.probe_hostname} -> {result.probe_address}"
+                f"(category profile {target}); probe resolved "
+                f"{self.probe_hostname}"
             ),
         )
+        return updated
+
+    async def _switch_router(
+        self,
+        row: DnsFilteringRouterLocation,
+        target: uuid.UUID,
+        *,
+        adapter: Any,
+        credentials: DnsFilteringCredentials,
+        actor_user_id: uuid.UUID | None,
+    ) -> DnsFilteringRouterLocation:
+        """Point one router at ``target``'s endpoint: first enable, re-push,
+        or a move from another profile. The target's location and rule are
+        in place before the router is touched; the previous profile is
+        released only after the router has verifiably left it."""
+        previous = row.applied_profile_id
+        was_active = row.state == RouterFilteringState.ACTIVE.value
+        profile = await self._ensure_profile_endpoint(target, row)
+        url = doh_url(str(profile.doh_subdomain))
+        try:
+            result = await adapter.apply_doh(
+                credentials,
+                doh_url=url,
+                probe_hostname=self.probe_hostname,
+                rollback_to=row.dns_snapshot,
+            )
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+            rolled_back = (getattr(exc, "data", None) or {}).get("rolled_back")
+            # Where the router is now. A rollback that did not read back
+            # clean leaves it on the new endpoint. A clean rollback puts back
+            # what the device snapshotted: the previous profile's endpoint on
+            # a move, the pre-platform DNS on a re-push of the same one.
+            # Anything else (refused before writing, unreachable) changed
+            # nothing.
+            if rolled_back is False:
+                now_on: uuid.UUID | None = target
+            elif rolled_back is True:
+                now_on = None if previous == target else previous
+            else:
+                now_on = previous
+            still_filtering = was_active and now_on is not None and now_on == previous
+            detail = str(exc)
+            if still_filtering and previous != target:
+                detail += (
+                    " The router still filters with its previous category " "selection."
+                )
+            failure: dict[str, object] = {
+                "switching_to_profile_id": None,
+                "applied_profile_id": now_on,
+                "state": (
+                    RouterFilteringState.ACTIVE
+                    if still_filtering
+                    else RouterFilteringState.FAILED
+                ).value,
+                "device_push_status": DevicePushStatus.FAILED.value,
+                "device_push_error": detail,
+            }
+            snapshot = getattr(exc, "snapshot", None)
+            if row.dns_snapshot is None and snapshot and previous is None:
+                failure["dns_snapshot"] = snapshot
+            await self.repository.update_router_location(row, failure)
+            await self.repository.commit()
+            for other in {previous, target} - {now_on, None}:
+                await self._release_quietly(other)  # type: ignore[arg-type]
+            raise
+
+        updated = await self.repository.update_router_location(
+            row,
+            {
+                "applied_profile_id": target,
+                "switching_to_profile_id": None,
+                "state": RouterFilteringState.ACTIVE.value,
+                "device_push_status": DevicePushStatus.ACTIVE.value,
+                "device_push_error": None,
+                "device_pushed_at": datetime.now(UTC),
+                "routeros_version": result.routeros_version,
+                # Written once: a re-push's or a move's "before" is our own
+                # state, never the venue's.
+                "dns_snapshot": row.dns_snapshot or result.snapshot.to_dict(),
+                "updated_by": actor_user_id,
+            },
+        )
+        await self.repository.commit()
+        if previous is not None and previous != target:
+            await self._release_quietly(previous)
         return updated
 
     async def _create_or_adopt_location(
@@ -673,7 +1015,7 @@ class DnsFilteringService:
     ) -> GatewayLocation:
         """A create that succeeded at Cloudflare but whose id was never
         committed here (crash, timeout) left a location named for this
-        router. Adopt it rather than create a second one against the 250."""
+        profile. Adopt it rather than create a second one against the cap."""
         try:
             for location in await gateway.list_locations():
                 if location.name == name:
@@ -689,7 +1031,8 @@ class DnsFilteringService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> DnsFilteringRouterLocation:
-        """Restore the router's own DNS, then release its Cloudflare location.
+        """Restore the router's own DNS, then release its profile's Cloudflare
+        location and rule if it was the profile's last router.
 
         The router goes first and a router failure aborts: a venue must get
         its DNS back, and a Cloudflare location with no router behind it is
@@ -710,74 +1053,60 @@ class DnsFilteringService:
         row = await self.repository.get_router_location(router.id)
         if row is None:
             raise DnsFilteringNotEnabledError(router.id)
-        if (
-            row.state == RouterFilteringState.DISABLED.value
-            and row.cf_location_id is None
-        ):
+        if row.state == RouterFilteringState.DISABLED.value:
+            # The router is already restored. Finish any Cloudflare release
+            # an earlier disable could not complete.
+            if self.gateway is not None:
+                await self._reclaim_or_report()
             return row
 
-        if row.state != RouterFilteringState.DISABLED.value:
-            adapter = get_dns_filtering_adapter(router.vendor)
-            credentials = self._resolve_device_credentials(router)
-            if row.bypass_hardening_enabled:
-                await adapter.remove_bypass_hardening(credentials)
-                row = await self.repository.update_router_location(
-                    row,
-                    {
-                        "bypass_hardening_enabled": False,
-                        "bypass_hardening_status": BypassHardeningStatus.OFF.value,
-                        "bypass_hardening_error": None,
-                    },
-                )
-            note: str | None = None
-            if row.dns_snapshot is not None or row.device_pushed_at is not None:
-                result = await adapter.restore_dns(
-                    credentials,
-                    snapshot=row.dns_snapshot
-                    or {"use_doh_server": "", "verify_doh_cert": False},
-                    expected_doh_url=doh_url(row.doh_subdomain)
-                    if row.doh_subdomain
-                    else None,
-                    probe_hostname=self.probe_hostname,
-                )
-                if not result.probe_ok:
-                    note = (
-                        "DNS settings restored, but the router could not resolve "
-                        f"{self.probe_hostname} afterwards: {result.probe_error}"
-                    )
+        adapter = get_dns_filtering_adapter(router.vendor)
+        credentials = self._resolve_device_credentials(router)
+        if row.bypass_hardening_enabled:
+            await adapter.remove_bypass_hardening(credentials)
             row = await self.repository.update_router_location(
                 row,
                 {
-                    "state": RouterFilteringState.DISABLED.value,
-                    "device_push_status": DevicePushStatus.PENDING.value,
-                    "device_push_error": note,
-                    "dns_snapshot": None,
-                    "updated_by": actor_user_id,
+                    "bypass_hardening_enabled": False,
+                    "bypass_hardening_status": BypassHardeningStatus.OFF.value,
+                    "bypass_hardening_error": None,
                 },
             )
-            await self.repository.commit()
-
-        previous_profile = row.applied_profile_id
+        previous = row.applied_profile_id
+        note: str | None = None
+        if row.dns_snapshot is not None or row.device_pushed_at is not None:
+            applied = (
+                await self.repository.get_profile(previous)
+                if previous is not None
+                else None
+            )
+            result = await adapter.restore_dns(
+                credentials,
+                snapshot=row.dns_snapshot
+                or {"use_doh_server": "", "verify_doh_cert": False},
+                expected_doh_url=doh_url(applied.doh_subdomain)
+                if applied is not None and applied.doh_subdomain
+                else None,
+                probe_hostname=self.probe_hostname,
+            )
+            if not result.probe_ok:
+                note = (
+                    "DNS settings restored, but the router could not resolve "
+                    f"{self.probe_hostname} afterwards: {result.probe_error}"
+                )
         row = await self.repository.update_router_location(
-            row, {"applied_profile_id": None}
+            row,
+            {
+                "state": RouterFilteringState.DISABLED.value,
+                "applied_profile_id": None,
+                "switching_to_profile_id": None,
+                "device_push_status": DevicePushStatus.PENDING.value,
+                "device_push_error": note,
+                "dns_snapshot": None,
+                "updated_by": actor_user_id,
+            },
         )
         await self.repository.commit()
-        if previous_profile is not None:
-            await self._sync_profile(previous_profile)
-        if row.cf_location_id is not None:
-            gateway = self._require_gateway()
-            try:
-                await gateway.delete_location(row.cf_location_id)
-            except CloudflareApiError as exc:
-                raise CloudflareSyncError(
-                    "the router's DNS was restored, but releasing its Gateway "
-                    f"location failed ({exc.message}); disable again to retry"
-                ) from exc
-            row = await self.repository.update_router_location(
-                row, {"cf_location_id": None, "doh_subdomain": None}
-            )
-            await self.repository.commit()
-
         await self._audit(
             actor_user_id,
             AuditAction.DNS_FILTERING_DISABLED,
@@ -786,7 +1115,22 @@ class DnsFilteringService:
             organization_id=router.organization_id,
             description=f"Router {router.id} DNS restored from Cloudflare Gateway",
         )
+        if previous is not None:
+            await self._reclaim_or_report(previous)
         return row
+
+    async def _reclaim_or_report(self, profile_id: uuid.UUID | None = None) -> None:
+        try:
+            if profile_id is not None:
+                await self._release_profile_if_unused(profile_id)
+            else:
+                await self._reclaim_unused_profiles()
+        except CloudflareSyncError as exc:
+            raise CloudflareSyncError(
+                "the router's DNS was restored, but releasing its category "
+                f"set's Gateway location failed ({exc.message}); disable again "
+                "to retry"
+            ) from exc
 
     async def set_bypass_hardening(
         self,

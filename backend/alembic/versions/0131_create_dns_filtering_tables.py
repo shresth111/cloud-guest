@@ -4,12 +4,14 @@ Three new tables, additive only (see ``app.domains.dns_filtering.models``
 for why there are three owners):
 
 * ``dns_filtering_profiles`` -- platform-owned, one per distinct category
-  set, one Gateway DNS rule each. Shared across venues and organizations so
-  the account's 500-policy ceiling grows with distinct choices, not venues.
+  set; while any router uses it, it owns one Gateway DNS location (DoH
+  endpoint) and one Gateway DNS rule. Shared across venues and
+  organizations, so Cloudflare locations in use grow with distinct category
+  sets, not routers.
 * ``dns_filtering_policies`` -- a tenant's choice, per organization
   (``location_id IS NULL``) or per venue.
-* ``dns_filtering_router_locations`` -- a router's Gateway DNS location,
-  its pre-switch DNS snapshot, and its push state.
+* ``dns_filtering_router_locations`` -- which profile endpoint a router
+  points at, its pre-switch DNS snapshot, and its push state.
 
 Nothing to backfill: no router has ever been pointed at Gateway.
 
@@ -80,6 +82,8 @@ def upgrade() -> None:
         *_base_columns(),
         sa.Column("fingerprint", sa.String(length=64), nullable=False),
         sa.Column("category_ids", postgresql.JSONB(), nullable=False),
+        sa.Column("cf_location_id", sa.String(length=64), nullable=True),
+        sa.Column("doh_subdomain", sa.String(length=64), nullable=True),
         sa.Column("cf_rule_id", sa.String(length=64), nullable=True),
         sa.Column("rule_precedence", sa.Integer(), nullable=False),
         sa.Column(
@@ -171,11 +175,14 @@ def upgrade() -> None:
             sa.ForeignKey("locations.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("cf_location_name", sa.String(length=100), nullable=False),
-        sa.Column("cf_location_id", sa.String(length=64), nullable=True),
-        sa.Column("doh_subdomain", sa.String(length=64), nullable=True),
         sa.Column(
             "applied_profile_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("dns_filtering_profiles.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "switching_to_profile_id",
             postgresql.UUID(as_uuid=True),
             sa.ForeignKey("dns_filtering_profiles.id", ondelete="SET NULL"),
             nullable=True,
@@ -215,7 +222,12 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text("is_deleted = false"),
     )
-    for column in ("organization_id", "location_id", "applied_profile_id"):
+    for column in (
+        "organization_id",
+        "location_id",
+        "applied_profile_id",
+        "switching_to_profile_id",
+    ):
         op.create_index(
             f"ix_dns_filtering_router_locations_{column}",
             "dns_filtering_router_locations",
