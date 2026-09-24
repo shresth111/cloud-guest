@@ -4,21 +4,31 @@ Three tables, because there are three different owners:
 
 ``dns_filtering_profiles`` -- **platform-owned.** One row per distinct set
 of blocked categories, shared by every venue (in any organization) that
-chose that set, and one Gateway DNS rule per row. Cloudflare allows 500 DNS
-policies per account; one rule per venue would hit that at 500 venues,
-while one rule per *distinct category set* grows with the number of
-different choices, which is far smaller. A profile carries no tenant data:
-its rule names only category ids and our own location ids, and a tenant
-never reads a profile directly -- only its own policy.
+chose that set. A profile that has at least one router owns exactly **one
+Gateway DNS location** (its DoH endpoint) and **one Gateway DNS rule** whose
+selector is that one location. Routers are never given a location of their
+own: Cloudflare's plan allowance for DNS locations is small (Zero Trust
+Standard lists 25; Free lists none; the 250 in the account-limits doc is an
+upper bound, not the plan allowance), so locations in use equal the number
+of *distinct active category sets*, not routers. A profile carries no
+tenant data -- only category ids, and names keyed on its own UUID -- so
+sharing one across organizations exposes nothing about either.
 
 ``dns_filtering_policies`` -- **tenant-owned.** What an organization (as a
 default, ``location_id IS NULL``) or one venue chose. A venue's own policy
 overrides its organization's default.
 
-``dns_filtering_router_locations`` -- **per router.** The router's Gateway
-DNS location (id, DoH subdomain), which profile rule it is currently in, the
-snapshot of the router's own DNS settings taken before the switch (what
-disable restores), and the device-push record.
+``dns_filtering_router_locations`` -- **per router.** Which profile's DoH
+endpoint the router currently points at (``applied_profile_id``), which one
+it is being switched to (``switching_to_profile_id``, so a concurrent
+release of that profile cannot delete the location mid-switch), the
+snapshot of the router's own DNS settings taken before the first switch
+(what disable restores), and the device-push record. The table keeps its
+name from the per-router design; it no longer holds a Cloudflare location.
+
+What sharing costs: Cloudflare's own query logs are per location, so they
+cannot tell the venues of one profile apart. The platform does not surface
+those logs today.
 """
 
 from __future__ import annotations
@@ -50,15 +60,19 @@ from .constants import (
 
 
 class DnsFilteringProfile(BaseModel):
-    """One distinct category set, and the one Gateway rule enforcing it."""
+    """One distinct category set, its Gateway location and the one Gateway
+    rule enforcing it on that location."""
 
     __tablename__ = "dns_filtering_profiles"
 
     # sha256 of the sorted id list -- constants.profile_fingerprint.
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     category_ids: Mapped[list[int]] = mapped_column(JSONB, nullable=False)
-    # NULL while no router uses the profile: an empty-location rule is
-    # deleted at Cloudflare to give the policy slot back.
+    # All three NULL while no router uses the profile: the rule and the
+    # location are deleted at Cloudflare to give both slots back.
+    # The location's name is constants.gateway_location_name(profile.id).
+    cf_location_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    doh_subdomain: Mapped[str | None] = mapped_column(String(64), nullable=True)
     cf_rule_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Unique per account at Cloudflare's side too; assigned once, on create.
     rule_precedence: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -148,12 +162,16 @@ class DnsFilteringRouterLocation(BaseModel):
         ForeignKey("locations.id", ondelete="CASCADE"),
         nullable=False,
     )
-    # constants.gateway_location_name(router_id) -- never tenant-derived.
-    cf_location_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    cf_location_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    doh_subdomain: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # The profile whose rule currently lists this location, if any.
+    # The profile whose DoH endpoint the router currently points at, if any.
     applied_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_filtering_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Set (and committed) before a switch starts, cleared when it ends: a
+    # profile with a router mid-switch is not "unused" and must not have its
+    # location released under it.
+    switching_to_profile_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("dns_filtering_profiles.id", ondelete="SET NULL"),
         nullable=True,
@@ -204,6 +222,10 @@ class DnsFilteringRouterLocation(BaseModel):
         Index(
             "ix_dns_filtering_router_locations_applied_profile_id",
             "applied_profile_id",
+        ),
+        Index(
+            "ix_dns_filtering_router_locations_switching_to_profile_id",
+            "switching_to_profile_id",
         ),
     )
 

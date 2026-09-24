@@ -265,7 +265,8 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
         availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
         enforcement=(
             "Planned: Cloudflare Gateway DNS category policies; the router "
-            "forwards its DNS lookups to a per-router Gateway address over "
+            "forwards its DNS lookups to a Gateway address shared by every "
+            "venue with the same category selection, over "
             "DNS-over-HTTPS (RouterOS 7.19 or later)"
         ),
         detail=(
