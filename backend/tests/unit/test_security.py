@@ -565,6 +565,27 @@ class TestCapabilityMatrix:
         assert "private dns" in detail
         assert "bypass protection" in detail
 
+    def test_dns_bypass_protection_is_honest_about_what_it_cannot_stop(
+        self,
+    ) -> None:
+        """Built but not hardware-verified, so it stays a plan, and the
+        customer-facing text names what no router-side control can stop."""
+        feature = {f.key: f for f in SECURITY_FEATURES}["dns_bypass_protection"]
+        assert feature.availability is (
+            SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY
+        )
+        assert feature.enforcement is not None
+        assert feature.enforcement.startswith("Planned: ")
+        detail = feature.detail.lower()
+        for phrase in (
+            "encrypted client hello",
+            "mobile data",
+            "determined user",
+            "runs themselves",
+            "off unless the venue turns it on",
+        ):
+            assert phrase in detail, phrase
+
     def test_the_known_exclusions_stay_excluded(self) -> None:
         """Pinned so that "we'll just show a toggle for now" fails the build
         rather than shipping a control that writes a row and blocks nothing."""

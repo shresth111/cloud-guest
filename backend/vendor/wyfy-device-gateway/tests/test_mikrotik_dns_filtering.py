@@ -522,3 +522,312 @@ class TestBypassHardening:
 
         assert _comments(api, _FILTER) == before_filter
         assert _comments(api, _NAT) == before_nat
+
+
+# ---------------------------------------------------------------------------
+# bypass layers
+# ---------------------------------------------------------------------------
+
+from wyfy_device_gateway.mikrotik_dns_filtering import (  # noqa: E402
+    BYPASS_LAYERS,
+    CANARY_DOMAINS,
+    DEFAULT_BYPASS_LAYERS,
+    LAYER_CANARY_DOMAINS,
+    LAYER_DOH_HOSTNAMES,
+    LAYER_DOH_IP_LIST,
+    LAYER_ENCRYPTED_DNS_PORTS,
+    LAYER_VPN_BLOCK,
+    MAX_DOH_IPV4,
+    VPN_FILTER_MARKERS,
+    MikroTikDnsFilteringError,
+    _assert_guest_forward_only,
+    normalize_hostname,
+    read_dns_bypass_counters,
+)
+
+_LIST = ("ip", "firewall", "address-list")
+
+
+class _CountingIds(FakeRouterOSApi):
+    """RouterOS never reuses an ``.id``; the default fake does after a
+    remove, which would make a remove-then-add test lie."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        self._next = 1000
+
+    def mint_id(self, row_count: int) -> str:
+        self._next += 1
+        return f"*{self._next:X}"
+
+
+def _layered_router(*, doh: str = _URL) -> _CountingIds:
+    return _CountingIds(
+        menus={
+            _FILTER: _provisioned_forward()
+            + [
+                {".id": "*I1", "chain": "input", "action": "accept", "protocol": "udp",
+                 "dst-port": "51820", "comment": "cloudguest-fw-allow-wg-mgmt"},
+            ],
+            _NAT: [{".id": "*N1", "chain": "srcnat", "action": "masquerade",
+                    "comment": "WYFYGUEST-masq"}],
+            _LIST: [
+                {".id": "*A1", "list": "cloudguest-doh-ips", "address": "1.1.1.1",
+                 "comment": "cloudguest-doh"},
+                {".id": "*A2", "list": "wyfyguest-content-filter-blocked",
+                 "address": "5.5.5.5"},
+            ],
+            _DNS: [{"use-doh-server": doh, "servers": "8.8.8.8"}],
+            _STATIC: [
+                {".id": "*S1", "name": "facebook.com", "address": "127.0.0.1",
+                 "comment": "WyfyGuest content filter x: Block"},
+                {".id": "*S2", "name": "dns.google", "address": "127.0.0.1",
+                 "comment": "WyfyGuest content filter y: Block"},
+            ],
+            ("system", "resource"): [{"version": "7.23.3", "uptime": "3d04:05:06"}],
+        }
+    )
+
+
+def _rows(api: FakeRouterOSApi, path: tuple[str, ...]) -> list[dict[str, Any]]:
+    return [dict(r) for r in api.path(*path)]
+
+
+class TestBypassLayers:
+    async def test_vpn_blocking_is_off_by_default(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        assert LAYER_VPN_BLOCK not in DEFAULT_BYPASS_LAYERS
+        api = _layered_router()
+        patch_connect(api)
+        await apply_dns_bypass_hardening(mikrotik_creds)
+        comments = _comments(api, _FILTER)
+        assert not set(VPN_FILTER_MARKERS) & set(comments)
+
+    async def test_canary_domains_answer_nxdomain_and_only_ours(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        await apply_dns_bypass_hardening(mikrotik_creds, layers={LAYER_CANARY_DOMAINS})
+        ours = [r for r in _rows(api, _STATIC) if r.get("comment") == "cloudguest-dnsf-canary"]
+        assert sorted(r["name"] for r in ours) == sorted(CANARY_DOMAINS)
+        assert {r["type"] for r in ours} == {"NXDOMAIN"}
+        # content filtering's sinkhole untouched; no firewall writes at all
+        assert _rows(api, _STATIC)[0]["name"] == "facebook.com"
+        assert all(seg != _FILTER for seg, _ in api.add_calls)
+
+        adds = len(api.add_calls)
+        await apply_dns_bypass_hardening(mikrotik_creds, layers={LAYER_CANARY_DOMAINS})
+        assert len(api.add_calls) == adds
+
+    async def test_turning_one_layer_off_removes_only_that_layer(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        await apply_dns_bypass_hardening(mikrotik_creds, layers=set(BYPASS_LAYERS))
+        await apply_dns_bypass_hardening(
+            mikrotik_creds, layers=set(BYPASS_LAYERS) - {LAYER_VPN_BLOCK}
+        )
+        comments = _comments(api, _FILTER)
+        assert not set(VPN_FILTER_MARKERS) & set(comments)
+        assert set(BYPASS_FILTER_MARKERS) <= set(comments)
+        assert any(r.get("comment") == "cloudguest-dnsf-canary" for r in _rows(api, _STATIC))
+
+    async def test_vpn_rows_are_guest_forward_only_and_above_the_band(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        await apply_dns_bypass_hardening(mikrotik_creds, layers={LAYER_VPN_BLOCK})
+        rows = _rows(api, _FILTER)
+        comments = [r.get("comment") for r in rows]
+        for marker in VPN_FILTER_MARKERS:
+            row = rows[comments.index(marker)]
+            assert row["chain"] == "forward" and row["hotspot"] == "auth"
+            assert comments.index(marker) < comments.index("cloudguest-block-dot-udp")
+        # the router's own WireGuard management accept is untouched
+        wg = next(r for r in rows if r.get("comment") == "cloudguest-fw-allow-wg-mgmt")
+        assert wg == {".id": "*I1", "chain": "input", "action": "accept",
+                      "protocol": "udp", "dst-port": "51820",
+                      "comment": "cloudguest-fw-allow-wg-mgmt"}
+        protocols = {
+            (r.get("protocol"), r.get("dst-port"))
+            for r in rows
+            if r.get("comment") in VPN_FILTER_MARKERS
+        }
+        assert protocols == {
+            ("udp", "500,4500"), ("ipsec-esp", None), ("udp", "1194"),
+            ("tcp", "1194"), ("udp", "51820"), ("tcp", "1723"), ("gre", None),
+            ("udp", "1701"),
+        }
+
+    async def test_no_layer_ever_writes_input_or_output(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        await apply_dns_bypass_hardening(
+            mikrotik_creds,
+            layers=set(BYPASS_LAYERS),
+            doh_ipv4=["9.9.9.9", "8.8.8.8"],
+            doh_hostnames=["dns.quad9.net"],
+            sni_hostnames=["dns.quad9.net", "doh.opendns.com"],
+        )
+        for segments, fields in api.add_calls:
+            if segments == _FILTER:
+                assert fields["chain"] == "forward", fields
+                assert fields["hotspot"] == "auth", fields
+            if segments == _NAT:
+                assert fields["chain"] == "dstnat" and fields["hotspot"] == "auth"
+
+    def test_the_guard_refuses_an_input_or_unauthenticated_row(self) -> None:
+        for bad in (
+            {"chain": "input", "hotspot": "auth", "comment": "x"},
+            {"chain": "output", "hotspot": "auth", "comment": "x"},
+            {"chain": "forward", "comment": "x"},
+        ):
+            with pytest.raises(MikroTikDnsFilteringError) as exc:
+                _assert_guest_forward_only((bad,), "h")
+            assert exc.value.code == "UNSAFE_BYPASS_RULE"
+
+    async def test_doh_ip_sync_diffs_only_our_entries(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        result = await apply_dns_bypass_hardening(
+            mikrotik_creds,
+            layers={LAYER_DOH_IP_LIST},
+            doh_ipv4=["1.1.1.1", "9.9.9.9", "9.9.9.9", "10.0.0.1", "not-an-ip",
+                      "127.0.0.1", "224.0.0.1", "94.140.14.14"],
+        )
+        ours = sorted(
+            r["address"] for r in _rows(api, _LIST)
+            if r.get("comment") == "cloudguest-dnsf-doh-sync"
+        )
+        # 1.1.1.1 is the bootstrap's own entry; private/loopback/multicast
+        # and garbage are never written.
+        assert ours == ["9.9.9.9", "94.140.14.14"]
+        assert result.doh_ipv4_added == 2
+
+        await apply_dns_bypass_hardening(
+            mikrotik_creds, layers={LAYER_DOH_IP_LIST}, doh_ipv4=["9.9.9.9", "76.76.2.0"]
+        )
+        ours = sorted(
+            r["address"] for r in _rows(api, _LIST)
+            if r.get("comment") == "cloudguest-dnsf-doh-sync"
+        )
+        assert ours == ["76.76.2.0", "9.9.9.9"]
+        assert any(r.get("comment") == "cloudguest-doh" for r in _rows(api, _LIST))
+        assert any(r.get("address") == "5.5.5.5" for r in _rows(api, _LIST))
+
+    async def test_an_oversized_list_is_refused_before_any_write(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        many = [f"{a}.{b}.{c}.1" for a in (11, 12) for b in range(50) for c in range(51)]
+        assert len(many) > MAX_DOH_IPV4
+        with pytest.raises(MikroTikDnsFilteringRefusedError) as exc:
+            await apply_dns_bypass_hardening(
+                mikrotik_creds, layers={LAYER_DOH_IP_LIST}, doh_ipv4=many
+            )
+        assert exc.value.code == "BLOCKLIST_TOO_LARGE"
+        assert api.add_calls == [] and api.remove_calls == []
+
+    async def test_hostnames_never_sinkhole_the_routers_own_upstream(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router(doh="https://myloc.example.net/dns-query")
+        patch_connect(api)
+        await apply_dns_bypass_hardening(
+            mikrotik_creds,
+            layers={LAYER_DOH_HOSTNAMES},
+            doh_hostnames=[
+                "dns.quad9.net", "DNS.QUAD9.NET.", "myloc.example.net",
+                "abc.cloudflare-gateway.com", "cloudflare-gateway.com",
+                "dns.google", "*.bad.example", "1.2.3.4", "under_score.example",
+            ],
+            sni_hostnames=["dns.quad9.net", "myloc.example.net",
+                           "x.cloudflare-gateway.com"],
+        )
+        ours = sorted(
+            r["name"] for r in _rows(api, _STATIC)
+            if r.get("comment") == "cloudguest-dnsf-doh-host"
+        )
+        # dns.google is already answered by content filtering's entry: left alone.
+        assert ours == ["dns.quad9.net"]
+        sni = [r for r in _rows(api, _FILTER) if str(r.get("comment", "")).startswith(
+            "cloudguest-dnsf-doh-sni-auth:")]
+        assert [r["tls-host"] for r in sni] == ["dns.quad9.net"]
+        assert sni[0]["protocol"] == "tcp" and sni[0]["dst-port"] == "443"
+
+    async def test_remove_takes_off_every_layer_and_nothing_else(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        before = {p: _rows(api, p) for p in (_FILTER, _NAT, _LIST, _STATIC)}
+        await apply_dns_bypass_hardening(
+            mikrotik_creds,
+            layers=set(BYPASS_LAYERS),
+            doh_ipv4=["9.9.9.9"],
+            doh_hostnames=["dns.quad9.net"],
+            sni_hostnames=["dns.quad9.net"],
+        )
+        await remove_dns_bypass_hardening(mikrotik_creds)
+        await remove_dns_bypass_hardening(mikrotik_creds)
+        for path, rows in before.items():
+            assert _rows(api, path) == rows, path
+
+    async def test_unknown_layer_is_refused(self, patch_connect, mikrotik_creds) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        with pytest.raises(MikroTikDnsFilteringRefusedError) as exc:
+            await apply_dns_bypass_hardening(mikrotik_creds, layers={"dpi"})
+        assert exc.value.code == "UNKNOWN_BYPASS_LAYER"
+
+    def test_hostname_normalisation(self) -> None:
+        assert normalize_hostname("DNS.Google.") == "dns.google"
+        for bad in ("localhost", "*.x.com", "1.2.3.4", "a..b", "-a.com", "a b.com", ""):
+            assert normalize_hostname(bad) is None, bad
+
+
+class TestBypassCounters:
+    async def test_sums_per_layer_and_is_honest_about_what_it_cannot_count(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        await apply_dns_bypass_hardening(
+            mikrotik_creds, layers={LAYER_ENCRYPTED_DNS_PORTS, LAYER_CANARY_DOMAINS,
+                                    LAYER_VPN_BLOCK}
+        )
+        for row in api.path(*_FILTER):
+            comment = row.get("comment")
+            if comment in BYPASS_FILTER_MARKERS[:2]:
+                row.update(packets="10", bytes="600")
+            elif comment in VPN_FILTER_MARKERS:
+                row.update(packets="1", bytes="60")
+        counters = await read_dns_bypass_counters(mikrotik_creds)
+        by = {c.layer: c for c in counters.layers}
+        assert counters.router_uptime == "3d04:05:06"
+        assert (by[LAYER_ENCRYPTED_DNS_PORTS].packets, by[LAYER_ENCRYPTED_DNS_PORTS].bytes) == (20, 1200)
+        assert by[LAYER_VPN_BLOCK].packets == 8
+        assert by[LAYER_CANARY_DOMAINS].counters_available is False
+        assert "not count" in by[LAYER_CANARY_DOMAINS].reason
+        assert by[LAYER_DOH_IP_LIST].counters_available is False
+        assert by[LAYER_DOH_IP_LIST].packets is None  # never a fake zero
+
+    async def test_missing_counters_read_unavailable_not_zero(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _layered_router()
+        patch_connect(api)
+        await apply_dns_bypass_hardening(mikrotik_creds, layers={LAYER_ENCRYPTED_DNS_PORTS})
+        counters = await read_dns_bypass_counters(mikrotik_creds)
+        layer = next(c for c in counters.layers if c.layer == LAYER_ENCRYPTED_DNS_PORTS)
+        assert layer.counters_available is False and layer.packets is None
+        assert layer.rules_present == 2
