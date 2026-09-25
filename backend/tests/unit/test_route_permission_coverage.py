@@ -197,6 +197,23 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Unauthenticated guest-portal <img> fetch of the venue's uploaded "
         "pre-login content image -- mirrors the branding public proxies."
     ),
+    # -- Guest Marketing: guest opt-in and the public unsubscribe page --
+    ("POST", "/api/v1/guest/marketing-consent"): (
+        "Unauthenticated guest ticking the portal opt-in. Proof is their own "
+        "ACTIVE GuestSession (same shape as /guest/profile); refused unless "
+        "the venue offers the opt-in and the org is entitled."
+    ),
+    ("GET", "/api/v1/public/marketing/unsubscribe/{token}"): (
+        "Recipient of a marketing message opening the unsubscribe link. The "
+        "unguessable per-recipient token is the whole credential; honouring "
+        "an opt-out is a legal duty, so it is not login- or licence-gated. "
+        "Rate-limited per IP."
+    ),
+    ("POST", "/api/v1/public/marketing/unsubscribe/{token}"): (
+        "The unsubscribe itself, including RFC 8058 one-click from a mail "
+        "client (List-Unsubscribe-Post). Token-authenticated, idempotent, "
+        "rate-limited per IP; it can only ever opt the token's recipient out."
+    ),
     # -- Device/NAS/webhook: a different, non-RBAC identity mechanism --
     ("GET", "/api/v1/agent/actions"): "Router agent -- CurrentAgent device credential.",
     ("GET", "/api/v1/agent/config"): "Router agent -- CurrentAgent device credential.",

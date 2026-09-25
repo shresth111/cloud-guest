@@ -80,6 +80,21 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "marketing": (
+        "Guest Marketing. Two location-bearing models: MarketingCampaign "
+        "(nullable location_id = org-wide) and GuestMarketingConsent "
+        "(captured_at_location_id, provenance only, never a filter). "
+        "Campaigns are reached by `{campaign_id}` on nine routes, all through "
+        "`MarketingService._get_campaign`, whose repository read filters on "
+        "the caller's organization AND, for a location-scoped caller, "
+        "location_id = theirs (org-wide campaigns are a 404 to them). "
+        "`get_caller_scope` folds X-Location-Id and CallerLocationScope into "
+        "one CallerScope, and `_guard` re-asserts the grant-derived "
+        "confinement at every entry point. Guests are confined by 'has a "
+        "session at the caller's location'. The unauthenticated routes "
+        "(public unsubscribe, guest opt-in) use a separate provider with no "
+        "confinement: they act on a token or the guest's own session."
+    ),
     "guest": (
         "The PII surface, done last and alone. THREE getters across TWO "
         "service classes: `_require_guest` (the chokepoint all nine "
