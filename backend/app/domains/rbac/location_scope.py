@@ -80,6 +80,7 @@ __all__ = [
     "CallerLocationScope",
     "LocationScope",
     "OptionalCallerLocationScope",
+    "confine_location_filter",
     "enforce_entity_location",
 ]
 
@@ -141,6 +142,41 @@ def enforce_entity_location(
     if entity_location_id in caller_location_scope:
         return
     raise error
+
+
+def confine_location_filter(
+    *,
+    requested_location_id: uuid.UUID | None,
+    caller_location_scope: LocationScope,
+    error: Exception,
+) -> uuid.UUID | list[uuid.UUID] | None:
+    """The ``location_id`` filter a *listing* should actually apply.
+
+    ``enforce_entity_location`` covers a row reached by its own id. A listing
+    has no row to compare yet, and when the request names no location it
+    reads as "every location in the organization" -- which, for a caller
+    confined to particular sites, is every *other* site's data too. The
+    header-vs-query guard (``app.domains.location.scoping
+    .enforce_target_location``) cannot help there: with no location named it
+    has nothing to compare.
+
+    * ``caller_location_scope is None`` -- platform or organization caller:
+      the request's own filter, unchanged (``None`` still means "all").
+    * a location was requested -- it must be one of the caller's sites, else
+      ``error``; returned unchanged.
+    * nothing was requested -- the caller's sites, as a list. A list is what
+      ``app.database.utils.filters.apply_filters`` turns into ``IN (...)``
+      (a ``frozenset`` is not, hence the conversion). An empty confinement
+      becomes an empty list, which matches no rows -- never ``None``, which
+      would mean "unfiltered".
+    """
+    if caller_location_scope is None:
+        return requested_location_id
+    if requested_location_id is not None:
+        if requested_location_id not in caller_location_scope:
+            raise error
+        return requested_location_id
+    return sorted(caller_location_scope, key=str)
 
 
 # ---------------------------------------------------------------------------
