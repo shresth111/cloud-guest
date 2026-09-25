@@ -47,6 +47,7 @@ from typing import Protocol
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 from app.domains.router.models import Router
@@ -221,9 +222,18 @@ class MacAuthorizationService:
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[MacAuthorizationEntry], object]:
+        # A listing with no location_id used to return every venue's entries
+        # to a caller whose grants cover one venue. Organization-wide entries
+        # (location_id IS NULL) apply at the caller's venues and stay
+        # visible -- see app.domains.rbac.location_scope.confine_location_filter.
         return await self.repository.list_entries(
             requesting_organization_id=requesting_organization_id,
-            location_id=location_id,
+            location_id=confine_location_filter(
+                requested_location_id=location_id,
+                caller_location_scope=self.caller_location_scope,
+                error=CrossLocationMacAuthorizationAccessError(),
+                include_organization_wide=True,
+            ),
             page=page,
             page_size=page_size,
         )
