@@ -273,6 +273,7 @@ from app.domains.queue_management.constants import QueueTargetType
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 from app.domains.router.crypto import (
@@ -4538,8 +4539,9 @@ class GuestService:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
-        if location_id is not None:
-            filters["location_id"] = location_id
+        location_filter = self._confined_location_filter(location_id)
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         if is_blocked is not None:
             filters["is_blocked"] = is_blocked
         return await self.repository.list_guests(
@@ -5158,8 +5160,9 @@ class GuestService:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
-        if location_id is not None:
-            filters["location_id"] = location_id
+        location_filter = self._confined_location_filter(location_id)
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         if router_id is not None:
             filters["router_id"] = router_id
         if guest_id is not None:
@@ -5186,7 +5189,7 @@ class GuestService:
         it."""
         return await self.repository.list_sessions_in_range(
             organization_id=organization_id,
-            location_id=location_id,
+            location_id=self._confined_location_filter(location_id),
             start=start,
             end=end,
             page=page,
@@ -5213,7 +5216,7 @@ class GuestService:
         entry point instead."""
         return await self.repository.list_login_history(
             organization_id=requesting_organization_id,
-            location_id=location_id,
+            location_id=self._confined_location_filter(location_id),
             guest_id=guest_id,
             page=page,
             page_size=page_size,
@@ -5235,7 +5238,7 @@ class GuestService:
         ``GuestLoginHistory``."""
         return await self.repository.list_login_history_in_range(
             organization_id=organization_id,
-            location_id=location_id,
+            location_id=self._confined_location_filter(location_id),
             start=start,
             end=end,
             page=page,
@@ -7164,6 +7167,23 @@ class GuestService:
         )
         logger.warning("guest_login_failed", extra=_event_extra(event))
 
+    def _confined_location_filter(
+        self, location_id: uuid.UUID | None
+    ) -> uuid.UUID | list[uuid.UUID] | None:
+        """The location filter a listing applies for this caller.
+
+        A listing with no ``location_id`` used to mean "every site in the
+        organization" for every caller, including one whose grants cover a
+        single site -- ``enforce_target_location`` has nothing to compare
+        when no location is named. See
+        ``app.domains.rbac.location_scope.confine_location_filter``.
+        """
+        return confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationGuestAccessError(),
+        )
+
     async def _require_guest(
         self,
         guest_id: uuid.UUID,
@@ -7575,8 +7595,15 @@ class RadiusService:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
-        if location_id is not None:
-            filters["location_id"] = location_id
+        # Same confinement as GuestService's listings -- see
+        # GuestService._confined_location_filter.
+        location_filter = confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationGuestAccessError(),
+        )
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         if router_id is not None:
             filters["router_id"] = router_id
         if status is not None:

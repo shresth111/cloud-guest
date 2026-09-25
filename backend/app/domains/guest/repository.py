@@ -166,6 +166,18 @@ class QuotaUsageWithOrgTimezone:
     organization_timezone: str
 
 
+def _location_condition(
+    column: ColumnElement, location_id: uuid.UUID | Sequence[uuid.UUID]
+) -> ColumnElement[bool]:
+    """``column == id`` for one location, ``column IN (...)`` for several --
+    the hand-written counterpart of ``apply_filters``' list handling, so a
+    caller confined to particular sites (``GuestService
+    ._confined_location_filter``) can be expressed on these range queries."""
+    if isinstance(location_id, uuid.UUID):
+        return column == location_id
+    return column.in_(list(location_id))
+
+
 def guest_identifier_clause(
     *, organization_id: uuid.UUID, identifier: str
 ) -> ColumnElement[bool]:
@@ -303,7 +315,7 @@ class GuestRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -499,7 +511,7 @@ class GuestRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
-        location_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None = None,
         guest_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
@@ -509,7 +521,7 @@ class GuestRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -1057,7 +1069,7 @@ class GuestRepository:
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -1084,7 +1096,9 @@ class GuestRepository:
             GuestSession.is_deleted.is_(False),
         ]
         if location_id is not None:
-            conditions.append(GuestSession.location_id == location_id)
+            conditions.append(
+                _location_condition(GuestSession.location_id, location_id)
+            )
 
         count_statement = (
             select(func.count()).select_from(GuestSession).where(*conditions)
@@ -1778,7 +1792,7 @@ class GuestRepository:
         self,
         *,
         organization_id: uuid.UUID | None,
-        location_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None = None,
         guest_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
@@ -1808,7 +1822,7 @@ class GuestRepository:
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -1826,7 +1840,9 @@ class GuestRepository:
             GuestLoginHistory.is_deleted.is_(False),
         ]
         if location_id is not None:
-            conditions.append(GuestLoginHistory.location_id == location_id)
+            conditions.append(
+                _location_condition(GuestLoginHistory.location_id, location_id)
+            )
 
         count_statement = (
             select(func.count()).select_from(GuestLoginHistory).where(*conditions)
