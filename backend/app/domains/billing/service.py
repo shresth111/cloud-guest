@@ -66,6 +66,7 @@ from .constants import (
     AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED,
     BILLING_DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE,
     BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES,
+    BOOLEAN_FEATURE_KEYS,
     BYTES_PER_MB,
     CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT,
     CUSTOMER_DASHBOARD_RECENT_PAYMENTS_LIMIT,
@@ -674,6 +675,15 @@ class EntitlementSnapshotSource(Protocol):
     ) -> EntitlementSnapshot: ...
 
 
+class FeatureOverrideSourceProtocol(Protocol):
+    """Satisfied by ``repository.FeatureOverrideRepository``."""
+
+    async def list_for_organization(self, organization_id: uuid.UUID) -> list: ...
+
+
+_BOOLEAN_FEATURE_KEY_VALUES = frozenset(key.value for key in BOOLEAN_FEATURE_KEYS)
+
+
 class EntitlementChecker:
     """Cache-or-fetch resolver of an organization's current
     :class:`EntitlementSnapshot` -- mirrors
@@ -720,9 +730,17 @@ class LicenseService:
         # the old plan, which is the (broken) pre-fix behaviour. See
         # ``_sync_subscription_plan`` for what it is actually for.
         subscription_repository: SubscriptionRepositoryProtocol | None = None,
+        # Per-organization add-on overrides (``OrganizationFeatureOverride``),
+        # merged into ``get_entitlement_snapshot``. Optional so every
+        # existing construction site keeps compiling; the request-time
+        # wiring (``dependencies.get_license_service``) and every path that
+        # gates on entitlements must pass it, or an unlocked add-on reads
+        # as locked there.
+        feature_overrides: FeatureOverrideSourceProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.plan_repository = plan_repository
+        self.feature_overrides = feature_overrides
         self.organization_sync = organization_sync
         self.usage_validator = usage_validator
         self.audit_writer = audit_writer
@@ -785,6 +803,9 @@ class LicenseService:
             if feature.feature_type == PlanFeatureType.TIER.value
             and feature.tier_value is not None
         }
+        enabled_features = await self._apply_feature_overrides(
+            organization_id, enabled_features
+        )
         return EntitlementSnapshot(
             organization_id=organization_id,
             plan_id=license_.plan_id,
@@ -793,6 +814,48 @@ class LicenseService:
             enabled_features=enabled_features,
             limits=limits,
             tiers=tiers,
+        )
+
+    async def _apply_feature_overrides(
+        self, organization_id: uuid.UUID, enabled_features: frozenset[str]
+    ) -> frozenset[str]:
+        """``effective(org, key) = override.is_enabled`` when a live override
+        row exists, the plan's value otherwise. Only BOOLEAN keys can be
+        overridden, so only ``enabled_features`` is touched. The license
+        must still be active for any of this to matter: ``RequireFeature``
+        runs ``RequireActiveLicense`` first."""
+        if self.feature_overrides is None:
+            return enabled_features
+        overrides = await self.feature_overrides.list_for_organization(
+            organization_id
+        )
+        if not overrides:
+            return enabled_features
+        effective = set(enabled_features)
+        for override in overrides:
+            if override.feature_key not in _BOOLEAN_FEATURE_KEY_VALUES:
+                continue
+            if override.is_enabled:
+                effective.add(override.feature_key)
+            else:
+                effective.discard(override.feature_key)
+        return frozenset(effective)
+
+    async def get_plan_feature_enabled(
+        self, organization_id: uuid.UUID, feature_key: PlanFeatureKey
+    ) -> bool:
+        """What the organization's plan alone says about a BOOLEAN feature,
+        ignoring overrides. ``False`` when the organization has no license."""
+        try:
+            license_ = await self.get_license_for_organization(organization_id)
+        except LicenseNotFoundError:
+            return False
+        features = await self.plan_repository.list_plan_features(license_.plan_id)
+        return any(
+            feature.feature_key == feature_key.value
+            and feature.feature_type == PlanFeatureType.BOOLEAN.value
+            and bool(feature.is_enabled)
+            for feature in features
         )
 
     async def _invalidate_entitlement_cache(self, organization_id: uuid.UUID) -> None:

@@ -94,6 +94,11 @@ class PermissionModule(StrEnum):
     OTP = "otp"
     VOUCHER = "voucher"
     CAMPAIGNS = "campaigns"
+    # Guest Marketing: outbound WhatsApp/SMS/email campaigns to opted-in
+    # guests (``app.domains.marketing``). Its own module, not CAMPAIGNS:
+    # bulk-messaging guests' personal contacts is a bigger act than editing
+    # a portal banner and needs its own grant (``marketing.execute``).
+    MARKETING = "marketing"
     RADIUS = "radius"
     WIREGUARD = "wireguard"
     FIREWALL = "firewall"
@@ -930,6 +935,26 @@ class AuditAction(StrEnum):
     CAMPAIGN_STATUS_CHANGED = "campaign_status_changed"
     CAMPAIGN_DELETED = "campaign_deleted"
     CAMPAIGN_CLONED = "campaign_cloned"
+
+    # Per-organization add-on overrides (billing's
+    # ``OrganizationFeatureOverride``), written by the GLOBAL-pinned Master
+    # ``/platform/organizations/{id}/addons`` routes.
+    ORGANIZATION_FEATURE_OVERRIDE_SET = "organization_feature_override_set"
+    ORGANIZATION_FEATURE_OVERRIDE_CLEARED = "organization_feature_override_cleared"
+
+    # Guest Marketing domain events (``app.domains.marketing``).
+    MARKETING_TEMPLATE_CREATED = "marketing_template_created"
+    MARKETING_TEMPLATE_UPDATED = "marketing_template_updated"
+    MARKETING_TEMPLATE_DELETED = "marketing_template_deleted"
+    MARKETING_CAMPAIGN_CREATED = "marketing_campaign_created"
+    MARKETING_CAMPAIGN_UPDATED = "marketing_campaign_updated"
+    MARKETING_CAMPAIGN_DELETED = "marketing_campaign_deleted"
+    MARKETING_CAMPAIGN_STATUS_CHANGED = "marketing_campaign_status_changed"
+    MARKETING_CAMPAIGN_SCHEDULED = "marketing_campaign_scheduled"
+    MARKETING_CAMPAIGN_CANCELLED = "marketing_campaign_cancelled"
+    MARKETING_CAMPAIGN_TEST_SENT = "marketing_campaign_test_sent"
+    MARKETING_CONSENT_STAFF_OPT_OUT = "marketing_consent_staff_opt_out"
+    MARKETING_PORTAL_CONSENT_UPDATED = "marketing_portal_consent_updated"
 
     # DNS Management domain events -- written through this same table by
     # ``app.domains.dns.service.DnsService`` via the same narrow

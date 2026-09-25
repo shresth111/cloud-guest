@@ -78,6 +78,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -1201,7 +1202,56 @@ class CreditDebitNote(BaseModel):
         )
 
 
+class OrganizationFeatureOverride(BaseModel):
+    """A per-organization override of one BOOLEAN plan feature -- today only
+    the add-ons in ``constants.ADDON_FEATURE_KEYS`` (``guest_marketing``).
+
+    Effective entitlement is ``is_enabled`` when a live (not soft-deleted)
+    row exists, the plan's own ``PlanFeature`` value otherwise -- merged in
+    ``service.LicenseService.get_entitlement_snapshot`` so ``RequireFeature``,
+    ``/me/entitlements`` and the Master add-on panel can never disagree.
+
+    Written only by the GLOBAL-pinned ``/platform/organizations/{id}/addons``
+    routes. Uniqueness of the live row per ``(organization_id, feature_key)``
+    is a partial unique index (``WHERE deleted_at IS NULL``, see migration
+    ``0131``), so clearing an override (soft delete) and setting it again
+    later keeps the history rows.
+    """
+
+    __tablename__ = "organization_feature_overrides"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    feature_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    set_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_org_feature_overrides_org_key_live",
+            "organization_id",
+            "feature_key",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        Index("ix_org_feature_overrides_organization_id", "organization_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OrganizationFeatureOverride(organization_id={self.organization_id}, "
+            f"feature_key={self.feature_key}, is_enabled={self.is_enabled})>"
+        )
+
+
 __all__ = [
+    "OrganizationFeatureOverride",
     "Plan",
     "PlanFeature",
     "License",

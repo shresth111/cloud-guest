@@ -18,8 +18,14 @@ from app.common.exceptions import CloudGuestError
 class RBACError(CloudGuestError):
     """Base exception for RBAC domain errors."""
 
-    def __init__(self, message: str, *, status_code: int) -> None:
-        super().__init__(message, status_code=status_code)
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        data: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, data=data)
 
 
 class RoleNotFoundError(RBACError):
@@ -273,7 +279,11 @@ class PermissionDeniedError(RBACError):
             message += f" at {scope_description}"
         if scope_description == GLOBAL_SCOPE_DESCRIPTION:
             message += GLOBAL_SCOPE_DENIAL_GUIDANCE
-        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+        super().__init__(
+            message,
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"error_code": "permission_denied"},
+        )
 
 
 class RoleNotHeldError(RBACError):
@@ -304,6 +314,7 @@ class MissingScopeContextError(RBACError):
             f"A valid {scope_name} context is required for this operation "
             f"(supply the X-{scope_name.title()}-Id header)",
             status_code=status.HTTP_400_BAD_REQUEST,
+            data={"error_code": f"{scope_name}_required"},
         )
 
 
@@ -327,6 +338,7 @@ class UnspecifiedOrganizationScopeError(RBACError):
             "for every organization explicitly (send X-Organization-Scope: all). "
             "Reading across organizations is never the default.",
             status_code=status.HTTP_400_BAD_REQUEST,
+            data={"error_code": "organization_required"},
         )
 
 
@@ -360,4 +372,5 @@ class SingleOrganizationRequiredError(RBACError):
             "across all of them. Select an organization (send its id in the "
             "X-Organization-Id header).",
             status_code=status.HTTP_400_BAD_REQUEST,
+            data={"error_code": "organization_required"},
         )

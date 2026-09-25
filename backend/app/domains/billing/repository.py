@@ -68,6 +68,7 @@ from .models import (
     InvoiceNumberCounter,
     License,
     LicenseChangeLog,
+    OrganizationFeatureOverride,
     Payment,
     PaymentMethod,
     Plan,
@@ -1475,7 +1476,73 @@ class BillingDashboardRepository:
         return rows, PaginationMeta.from_total(params, total_items)
 
 
+# ============================================================================
+# OrganizationFeatureOverride
+# ============================================================================
+
+
+class FeatureOverrideRepositoryProtocol(Protocol):
+    async def list_for_organization(
+        self, organization_id: uuid.UUID
+    ) -> list[OrganizationFeatureOverride]: ...
+
+    async def get_live(
+        self, organization_id: uuid.UUID, feature_key: str
+    ) -> OrganizationFeatureOverride | None: ...
+
+    async def create(self, **fields: object) -> OrganizationFeatureOverride: ...
+
+    async def update(
+        self, override: OrganizationFeatureOverride, data: dict[str, object]
+    ) -> OrganizationFeatureOverride: ...
+
+    async def soft_delete(
+        self, override: OrganizationFeatureOverride
+    ) -> OrganizationFeatureOverride: ...
+
+
+class FeatureOverrideRepository:
+    """Concrete implementation of ``FeatureOverrideRepositoryProtocol``.
+    Only live (not soft-deleted) rows are ever read -- a cleared override
+    is history, not a value."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.overrides = GenericRepository(OrganizationFeatureOverride, session)
+
+    async def list_for_organization(
+        self, organization_id: uuid.UUID
+    ) -> list[OrganizationFeatureOverride]:
+        return await self.overrides.get_all(
+            filters={"organization_id": organization_id}
+        )
+
+    async def get_live(
+        self, organization_id: uuid.UUID, feature_key: str
+    ) -> OrganizationFeatureOverride | None:
+        rows = await self.overrides.get_all(
+            filters={"organization_id": organization_id, "feature_key": feature_key},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def create(self, **fields: object) -> OrganizationFeatureOverride:
+        return await self.overrides.create(fields)
+
+    async def update(
+        self, override: OrganizationFeatureOverride, data: dict[str, object]
+    ) -> OrganizationFeatureOverride:
+        return await self.overrides.partial_update(override, data)
+
+    async def soft_delete(
+        self, override: OrganizationFeatureOverride
+    ) -> OrganizationFeatureOverride:
+        return await self.overrides.soft_delete(override)
+
+
 __all__ = [
+    "FeatureOverrideRepositoryProtocol",
+    "FeatureOverrideRepository",
     "PlanRepositoryProtocol",
     "PlanRepository",
     "LicenseRepositoryProtocol",

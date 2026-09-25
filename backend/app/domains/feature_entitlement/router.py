@@ -25,17 +25,34 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
-from .dependencies import get_feature_entitlement_service
+from .addons import AddonService, AddonView
+from .dependencies import get_addon_service, get_feature_entitlement_service
 from .schemas import (
+    Addon,
+    AddonOverride,
+    AddonSetBy,
+    AddonUpdateRequest,
+    AddonUpdateResponse,
     CustomerFeaturesResponse,
     CustomerFeaturesUpdateRequest,
     CustomerFeaturesUpdateResponse,
     FeatureListResponse,
+    OrganizationAddonsResponse,
 )
 from .service import FeatureEntitlementService
 
 router = APIRouter(tags=["Features"])
+
+# Master (platform) add-on control -- contract §5.9. Every route pins
+# ``scope=ScopeType.GLOBAL``: that pin is the entire authorization for a
+# route that names its target organization in the path (see
+# ``addons.py``'s module docstring). Deliberately not on ``_PAID_WRITES``:
+# the caller is the platform, not the tenant whose licence is in question.
+platform_router = APIRouter(
+    prefix="/platform/organizations", tags=["Platform Add-ons"]
+)
 
 
 def _request_id(request: Request) -> str:
@@ -164,6 +181,120 @@ async def update_customer_features(
     return build_response(
         success=True,
         message=payload.message,
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+def _addon_payload(view: AddonView) -> Addon:
+    override = None
+    if view.override is not None:
+        override = AddonOverride(
+            is_enabled=view.override.is_enabled,
+            reason=view.override.reason,
+            set_by=AddonSetBy(
+                id=str(view.override.set_by_id), name=view.override.set_by_name
+            )
+            if view.override.set_by_id
+            else None,
+            set_at=view.override.set_at.isoformat().replace("+00:00", "Z"),
+        )
+    return Addon(
+        key=view.key,
+        name=view.name,
+        description=view.description,
+        enabled=view.enabled,
+        source=view.source,
+        plan_value=view.plan_value,
+        override=override,
+        active_campaign_count=view.active_campaign_count,
+    )
+
+
+@platform_router.get(
+    "/{organization_id}/addons",
+    response_model=ApiResponse[OrganizationAddonsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("billing.read", scope=ScopeType.GLOBAL))
+    ],
+)
+async def list_organization_addons(
+    request: Request,
+    organization_id: uuid.UUID,
+    service: AddonService = Depends(get_addon_service),
+):
+    views = await service.list_addons(organization_id)
+    payload = OrganizationAddonsResponse(
+        organization_id=str(organization_id),
+        addons=[_addon_payload(view) for view in views],
+    )
+    return build_response(
+        success=True,
+        message="Add-ons retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@platform_router.put(
+    "/{organization_id}/addons/{addon_key}",
+    response_model=ApiResponse[AddonUpdateResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))
+    ],
+)
+async def set_organization_addon(
+    request: Request,
+    organization_id: uuid.UUID,
+    addon_key: str,
+    body: AddonUpdateRequest,
+    user: AuthUser = Depends(CurrentUser),
+    service: AddonService = Depends(get_addon_service),
+):
+    view, cancelled = await service.set_addon(
+        organization_id,
+        addon_key,
+        enabled=body.enabled,
+        reason=body.reason,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    payload = AddonUpdateResponse(
+        addon=_addon_payload(view), cancelled_campaign_count=cancelled
+    )
+    return build_response(
+        success=True,
+        message="Add-on unlocked" if view.enabled else "Add-on locked",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@platform_router.delete(
+    "/{organization_id}/addons/{addon_key}",
+    response_model=ApiResponse[AddonUpdateResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))
+    ],
+)
+async def clear_organization_addon(
+    request: Request,
+    organization_id: uuid.UUID,
+    addon_key: str,
+    user: AuthUser = Depends(CurrentUser),
+    service: AddonService = Depends(get_addon_service),
+):
+    view, cancelled = await service.clear_addon(
+        organization_id, addon_key, actor_user_id=uuid.UUID(user.id)
+    )
+    payload = AddonUpdateResponse(
+        addon=_addon_payload(view), cancelled_campaign_count=cancelled
+    )
+    return build_response(
+        success=True,
+        message="Add-on reset to plan default",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

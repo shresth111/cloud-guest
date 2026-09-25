@@ -184,6 +184,18 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXPORT,
         _A.MANAGE,
     ),
+    # Guest Marketing: EXECUTE is the send/schedule/cancel/test-send act and
+    # is deliberately its own action -- it falls inside OPERATE, so only
+    # roles explicitly given MARKETING: OPERATE (Location Manager) or a
+    # broader default (Organization Owner/Admin, MSP roles) can send.
+    PermissionModule.MARKETING: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
     PermissionModule.RADIUS: (
         _A.CREATE,
         _A.READ,
@@ -589,6 +601,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.OTP: "OTP",
     PermissionModule.VOUCHER: "Voucher",
     PermissionModule.CAMPAIGNS: "Campaigns",
+    PermissionModule.MARKETING: "Marketing",
     PermissionModule.RADIUS: "Radius",
     PermissionModule.WIREGUARD: "WireGuard",
     PermissionModule.FIREWALL: "Firewall",
@@ -655,6 +668,7 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     PermissionModule.OTP: ScopeType.LOCATION,
     PermissionModule.VOUCHER: ScopeType.LOCATION,
     PermissionModule.CAMPAIGNS: ScopeType.LOCATION,
+    PermissionModule.MARKETING: ScopeType.LOCATION,
     PermissionModule.RADIUS: ScopeType.ROUTER,
     PermissionModule.WIREGUARD: ScopeType.ROUTER,
     PermissionModule.FIREWALL: ScopeType.ROUTER,
@@ -1383,6 +1397,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.CAPTIVE_PORTAL: _L.OPERATE,
             _M.VOUCHER: _L.OPERATE,
             _M.CAMPAIGNS: _L.OPERATE,
+            # Guest Marketing: a site manager may build and send campaigns
+            # to their own site's opted-in guests (service-layer location
+            # confinement keeps it to their site).
+            _M.MARKETING: _L.OPERATE,
             _M.OTP: _L.OPERATE,
             _M.POLICY: _L.OPERATE,
             _M.DASHBOARD: _L.READ,

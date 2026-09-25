@@ -64,6 +64,8 @@ from .repository import (
     CouponRepositoryProtocol,
     CreditDebitNoteRepository,
     CreditDebitNoteRepositoryProtocol,
+    FeatureOverrideRepository,
+    FeatureOverrideRepositoryProtocol,
     InvoiceRepository,
     InvoiceRepositoryProtocol,
     LicenseRepository,
@@ -114,6 +116,12 @@ def get_license_repository(
     db: AsyncSession = Depends(get_db_session),
 ) -> LicenseRepositoryProtocol:
     return LicenseRepository(db)
+
+
+def get_feature_override_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> FeatureOverrideRepositoryProtocol:
+    return FeatureOverrideRepository(db)
 
 
 def get_usage_repository(
@@ -201,6 +209,9 @@ def get_license_service(
     subscription_repository: SubscriptionRepositoryProtocol = Depends(
         get_subscription_repository
     ),
+    feature_overrides: FeatureOverrideRepositoryProtocol = Depends(
+        get_feature_override_repository
+    ),
 ) -> LicenseService:
     return LicenseService(
         repository,
@@ -211,6 +222,7 @@ def get_license_service(
         entitlement_cache=entitlement_cache,
         white_label_reset=powered_by_reset,
         subscription_repository=subscription_repository,
+        feature_overrides=feature_overrides,
     )
 
 
