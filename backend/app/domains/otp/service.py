@@ -233,6 +233,12 @@ class EmailAttachment:
 
 
 class EmailProviderProtocol(Protocol):
+    """``headers`` and ``from_name`` are additive (Guest Marketing needs
+    ``List-Unsubscribe``/``List-Unsubscribe-Post`` and a per-venue display
+    name); every existing caller omits both. Implementations return the
+    provider's message id when there is one -- callers that only need
+    "did it raise" keep ignoring it."""
+
     async def send(
         self,
         email: str,
@@ -240,7 +246,9 @@ class EmailProviderProtocol(Protocol):
         body: str,
         *,
         attachment: EmailAttachment | None = None,
-    ) -> None: ...
+        headers: Mapping[str, str] | None = None,
+        from_name: str | None = None,
+    ) -> str | None: ...
 
 
 class WhatsAppProviderProtocol(Protocol):
@@ -301,7 +309,9 @@ class LoggingEmailProvider:
         body: str,
         *,
         attachment: EmailAttachment | None = None,
-    ) -> None:
+        headers: Mapping[str, str] | None = None,
+        from_name: str | None = None,
+    ) -> str | None:
         logger.info(
             "otp_email_would_send",
             extra={
@@ -311,6 +321,7 @@ class LoggingEmailProvider:
                 "attachment_filename": attachment.filename if attachment else None,
             },
         )
+        return None
 
 
 class LoggingWhatsAppProvider:
@@ -461,6 +472,11 @@ class MailIdentity(StrEnum):
     DEMO = "demo"
     SUPPORT = "support"
     ALERT = "alert"
+    # Guest Marketing (``app.domains.marketing``). Resolved by the
+    # marketing sender with NO fallback to DEFAULT: marketing mail must
+    # never go out from sales@/admin@ (spec §7.3). Nothing in the
+    # notification outbox routes to it.
+    MARKETING = "marketing"
 
 
 #: The ``Settings`` block behind each identity. One table: the answer to
@@ -476,6 +492,7 @@ _SETTINGS_BLOCK_BY_IDENTITY: Mapping[MailIdentity, str] = MappingProxyType(
         MailIdentity.DEMO: "demo_smtp",
         MailIdentity.SUPPORT: "support_smtp",
         MailIdentity.ALERT: "alert_smtp",
+        MailIdentity.MARKETING: "marketing_smtp",
     }
 )
 
@@ -695,14 +712,26 @@ class SmtpEmailProvider:
         body: str,
         *,
         attachment: EmailAttachment | None = None,
-    ) -> None:
+        headers: Mapping[str, str] | None = None,
+        from_name: str | None = None,
+    ) -> str:
         import smtplib
         from email.message import EmailMessage
+        from email.utils import formataddr, make_msgid
 
         message = EmailMessage()
         message["Subject"] = subject
-        message["From"] = self.from_address
+        message["From"] = (
+            formataddr((from_name, self.from_address))
+            if from_name
+            else self.from_address
+        )
         message["To"] = email
+        domain = self.from_address.rpartition("@")[2] or None
+        message_id = make_msgid(domain=domain)
+        message["Message-ID"] = message_id
+        for name, value in (headers or {}).items():
+            message[name] = value
         message.set_content(html_to_plain_text(body))
         message.add_alternative(body, subtype="html")
         if attachment is not None:
@@ -721,6 +750,7 @@ class SmtpEmailProvider:
             if self.username:
                 smtp.login(self.username, self.password)
             smtp.send_message(message)
+        return message_id
 
     async def send(
         self,
@@ -729,9 +759,17 @@ class SmtpEmailProvider:
         body: str,
         *,
         attachment: EmailAttachment | None = None,
-    ) -> None:
-        await asyncio.to_thread(
-            self._send_sync, email, subject, body, attachment=attachment
+        headers: Mapping[str, str] | None = None,
+        from_name: str | None = None,
+    ) -> str | None:
+        return await asyncio.to_thread(
+            self._send_sync,
+            email,
+            subject,
+            body,
+            attachment=attachment,
+            headers=headers,
+            from_name=from_name,
         )
 
 
@@ -766,10 +804,19 @@ class SesEmailProvider:
         body: str,
         *,
         attachment: EmailAttachment | None = None,
-    ) -> None:
-        if attachment is None:
-            self._client.send_email(
-                Source=self.from_address,
+        headers: Mapping[str, str] | None = None,
+        from_name: str | None = None,
+    ) -> str | None:
+        from email.utils import formataddr
+
+        source = (
+            formataddr((from_name, self.from_address))
+            if from_name
+            else self.from_address
+        )
+        if attachment is None and not headers:
+            response = self._client.send_email(
+                Source=source,
                 Destination={"ToAddresses": [email]},
                 Message={
                     "Subject": {"Data": subject},
@@ -779,7 +826,7 @@ class SesEmailProvider:
                     },
                 },
             )
-            return
+            return response.get("MessageId")
 
         # An attachment needs a real MIME multipart body -- SES's plain
         # ``send_email`` API has no attachment field at all, so this branch
@@ -791,22 +838,26 @@ class SesEmailProvider:
 
         message = EmailMessage()
         message["Subject"] = subject
-        message["From"] = self.from_address
+        message["From"] = source
         message["To"] = email
+        for name, value in (headers or {}).items():
+            message[name] = value
         message.set_content(html_to_plain_text(body))
         message.add_alternative(body, subtype="html")
-        maintype, _, subtype = attachment.content_type.partition("/")
-        message.add_attachment(
-            attachment.content,
-            maintype=maintype or "application",
-            subtype=subtype or "octet-stream",
-            filename=attachment.filename,
-        )
-        self._client.send_raw_email(
+        if attachment is not None:
+            maintype, _, subtype = attachment.content_type.partition("/")
+            message.add_attachment(
+                attachment.content,
+                maintype=maintype or "application",
+                subtype=subtype or "octet-stream",
+                filename=attachment.filename,
+            )
+        response = self._client.send_raw_email(
             Source=self.from_address,
             Destinations=[email],
             RawMessage={"Data": message.as_bytes()},
         )
+        return response.get("MessageId")
 
     async def send(
         self,
@@ -815,9 +866,17 @@ class SesEmailProvider:
         body: str,
         *,
         attachment: EmailAttachment | None = None,
-    ) -> None:
-        await asyncio.to_thread(
-            self._send_sync, email, subject, body, attachment=attachment
+        headers: Mapping[str, str] | None = None,
+        from_name: str | None = None,
+    ) -> str | None:
+        return await asyncio.to_thread(
+            self._send_sync,
+            email,
+            subject,
+            body,
+            attachment=attachment,
+            headers=headers,
+            from_name=from_name,
         )
 
 

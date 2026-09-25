@@ -447,6 +447,25 @@ class CaptivePortalConfig(BaseModel):
         String(REVIEW_URL_MAX_LENGTH), nullable=True
     )
 
+    # Guest Marketing consent capture (``app.domains.marketing``). Off by
+    # default per venue: the post-connect card shows an UNTICKED opt-in
+    # checkbox only when this is on AND the organization is entitled to the
+    # ``guest_marketing`` add-on. ``marketing_consent_text`` null means the
+    # default wording (``marketing.constants.DEFAULT_CONSENT_TEXT``);
+    # ``marketing_consent_text_version`` is bumped by the backend whenever
+    # the text changes, so a consent row records which wording was agreed
+    # to. All three are public by construction (they are what the guest is
+    # shown).
+    marketing_consent_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    marketing_consent_text: Mapped[str | None] = mapped_column(
+        String(300), nullable=True
+    )
+    marketing_consent_text_version: Mapped[str | None] = mapped_column(
+        String(50), nullable=True
+    )
+
     # The post-connect **private** feedback card -- a star rating that goes
     # to the venue's own results page and nowhere public.
     #

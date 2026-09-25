@@ -1313,6 +1313,92 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ========================================================================
+    # Guest Marketing (app.domains.marketing) -- its OWN settings block.
+    #
+    # Hard rule (spec §7): marketing never uses the OTP sender settings.
+    # Promotional traffic on the transactional/OTP DLT header, marketing
+    # volume on the OTP WhatsApp number, or a spam-complaint spike on the
+    # admin@ mailbox can get that sender blocked -- and then guests cannot
+    # log in to WiFi. Everything below defaults to "unconfigured", and
+    # "logging" is reported as NOT configured: a marketing send must never
+    # look like it happened when nothing went out. Provider *credentials*
+    # (Ping4SMS key, Exotel account, Twilio account, SES keys) are shared
+    # with the account; the sender identity (header / number / mailbox) is
+    # not, and ``marketing.senders`` refuses a sender that equals the OTP one.
+    # ========================================================================
+    marketing_sms_provider: str = Field(
+        default="unconfigured",
+        description="'unconfigured' (default) | 'ping4sms' | 'exotel'.",
+    )
+    marketing_sms_sender_id: str = Field(
+        default="",
+        description=(
+            "Promotional DLT header (Ping4SMS sender) or Exotel From number "
+            "for marketing SMS. Must differ from the OTP sender."
+        ),
+    )
+    marketing_ping4sms_route: str = Field(
+        default="", description="Ping4SMS promotional route id."
+    )
+    marketing_dlt_entity_id: str = Field(
+        default="", description="TRAI DLT Principal Entity id for marketing SMS."
+    )
+    marketing_whatsapp_provider: str = Field(
+        default="unconfigured", description="'unconfigured' (default) | 'twilio'."
+    )
+    marketing_whatsapp_from_number: str = Field(
+        default="",
+        description=(
+            "Production WhatsApp sender for marketing (E.164). Must differ "
+            "from whatsapp_twilio_from_number, the OTP sender."
+        ),
+    )
+    marketing_email_provider: str = Field(
+        default="unconfigured",
+        description="'unconfigured' (default) | 'ses' | 'smtp'.",
+    )
+    marketing_email_from_address: str = Field(
+        default="",
+        description=(
+            "From address for marketing mail via SES, e.g. "
+            "offers@offers.wyfyguest.com. The display name is the venue's."
+        ),
+    )
+    marketing_email_unsubscribe_mailto: str = Field(
+        default="",
+        description=(
+            "Optional mailto: target for the List-Unsubscribe header, e.g. "
+            "unsubscribe@offers.wyfyguest.com."
+        ),
+    )
+    marketing_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server for MailIdentity.MARKETING when "
+            "marketing_email_provider='smtp'. Never the admin@/sales@ mailbox."
+        ),
+    )
+    marketing_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    marketing_smtp_username: str = Field(default="")
+    marketing_smtp_password: str = Field(default="")
+    marketing_smtp_use_tls: bool = Field(default=True)
+    marketing_smtp_from_address: str = Field(default="")
+    marketing_unsubscribe_base_url: str = Field(
+        default="",
+        description=(
+            "Public origin the unsubscribe link is built on "
+            "({base}/u/{token}). Empty = frontend_base_url."
+        ),
+    )
+    marketing_quiet_hours_start: str = Field(default="21:00")
+    marketing_quiet_hours_end: str = Field(default="09:00")
+    marketing_max_recipients_per_campaign: int = Field(default=5000, ge=1)
+    marketing_test_sends_per_day: int = Field(default=20, ge=0)
+    marketing_rate_per_sec_sms: float = Field(default=10.0, gt=0)
+    marketing_rate_per_sec_whatsapp: float = Field(default=20.0, gt=0)
+    marketing_rate_per_sec_email: float = Field(default=10.0, gt=0)
+
     demo_request_notify_email: str = Field(
         default="",
         description=(

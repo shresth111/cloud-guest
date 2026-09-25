@@ -48,6 +48,10 @@ from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
 from app.domains.location.scoping import enforce_target_location
+from app.domains.marketing.dependencies import (
+    MarketingConsentOfferResolver,
+    get_marketing_consent_offer_resolver,
+)
 from app.domains.rbac.dependencies import (
     CurrentLocation,
     CurrentOrganization,
@@ -694,6 +698,17 @@ def _login_history_response(entry: GuestLoginHistory) -> GuestLoginHistoryRespon
     )
 
 
+async def _login_payload(
+    result: GuestLoginResult, marketing_offer: MarketingConsentOfferResolver
+) -> dict:
+    """The login response plus ``marketing_consent_offer`` (Guest Marketing
+    contract §5.8). The resolver never raises: marketing can never fail a
+    guest login."""
+    response = _login_response(result)
+    response.marketing_consent_offer = await marketing_offer.offer_for(result)
+    return response.model_dump()
+
+
 def _login_response(result: GuestLoginResult) -> GuestLoginResponse:
     return GuestLoginResponse(
         guest_id=str(result.guest.id),
@@ -722,6 +737,9 @@ async def guest_login_via_otp(
     request: Request,
     payload: GuestOtpLoginRequest,
     service: GuestService = Depends(get_guest_service),
+    marketing_offer: MarketingConsentOfferResolver = Depends(
+        get_marketing_consent_offer_resolver
+    ),
 ):
     ip_address = payload.ip_address or (request.client.host if request.client else None)
     # BE-012 Part 2: capture the raw User-Agent header at login time -- see
@@ -748,7 +766,7 @@ async def guest_login_via_otp(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=_login_response(result).model_dump(),
+        data=(await _login_payload(result, marketing_offer)),
         request_id=_request_id(request),
     )
 
@@ -762,6 +780,9 @@ async def guest_login_via_voucher(
     request: Request,
     payload: GuestVoucherLoginRequest,
     service: GuestService = Depends(get_guest_service),
+    marketing_offer: MarketingConsentOfferResolver = Depends(
+        get_marketing_consent_offer_resolver
+    ),
 ):
     ip_address = payload.ip_address or (request.client.host if request.client else None)
     user_agent = request.headers.get("user-agent")
@@ -781,7 +802,7 @@ async def guest_login_via_voucher(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=_login_response(result).model_dump(),
+        data=(await _login_payload(result, marketing_offer)),
         request_id=_request_id(request),
     )
 
@@ -795,6 +816,9 @@ async def guest_login_via_password(
     request: Request,
     payload: GuestPasswordLoginRequest,
     service: GuestService = Depends(get_guest_service),
+    marketing_offer: MarketingConsentOfferResolver = Depends(
+        get_marketing_consent_offer_resolver
+    ),
 ):
     ip_address = payload.ip_address or (request.client.host if request.client else None)
     user_agent = request.headers.get("user-agent")
@@ -814,7 +838,7 @@ async def guest_login_via_password(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=_login_response(result).model_dump(),
+        data=(await _login_payload(result, marketing_offer)),
         request_id=_request_id(request),
     )
 
@@ -828,6 +852,9 @@ async def guest_login_via_pin(
     request: Request,
     payload: GuestPinLoginRequest,
     service: GuestService = Depends(get_guest_service),
+    marketing_offer: MarketingConsentOfferResolver = Depends(
+        get_marketing_consent_offer_resolver
+    ),
 ):
     ip_address = payload.ip_address or (request.client.host if request.client else None)
     user_agent = request.headers.get("user-agent")
@@ -847,7 +874,7 @@ async def guest_login_via_pin(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=_login_response(result).model_dump(),
+        data=(await _login_payload(result, marketing_offer)),
         request_id=_request_id(request),
     )
 
@@ -862,6 +889,9 @@ async def guest_active_session(
     router_id: uuid.UUID = Query(...),
     device_mac: str = Query(...),
     service: GuestService = Depends(get_guest_service),
+    marketing_offer: MarketingConsentOfferResolver = Depends(
+        get_marketing_consent_offer_resolver
+    ),
 ):
     """Guest-facing, unauthenticated (no RBAC/JWT -- same posture as
     ``/login/*``): lets the captive portal check, on load, whether this
@@ -874,7 +904,7 @@ async def guest_active_session(
     return build_response(
         success=True,
         message="Active session found" if result else "No active session",
-        data=_login_response(result).model_dump() if result else None,
+        data=(await _login_payload(result, marketing_offer)) if result else None,
         request_id=_request_id(request),
     )
 

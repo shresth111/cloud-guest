@@ -49,6 +49,9 @@ from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.live_sessions.router import router as live_sessions_router
 from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
+from app.domains.marketing.router import guest_router as marketing_guest_router
+from app.domains.marketing.router import public_router as marketing_public_router
+from app.domains.marketing.router import router as marketing_router
 from app.domains.monitored_hardware.router import router as monitored_hardware_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
@@ -217,6 +220,15 @@ api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES
 api_v1_router.include_router(security_router)
 api_v1_router.include_router(campaigns_guest_router)
 api_v1_router.include_router(campaigns_router, dependencies=_PAID_WRITES)
+# Guest Marketing (contract §5.0): the customer router is licence-gated for
+# writes like every other paid surface, and every route on it also carries
+# RequireFeature(GUEST_MARKETING). The unsubscribe page and the portal opt-in
+# are NOT gated: honouring an opt-out is a legal duty whatever the billing
+# state, and the opt-in endpoint refuses on its own when the org is not
+# entitled.
+api_v1_router.include_router(marketing_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(marketing_public_router)
+api_v1_router.include_router(marketing_guest_router)
 api_v1_router.include_router(notification_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(api_keys_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(audit_router)

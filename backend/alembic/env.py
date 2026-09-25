@@ -65,6 +65,7 @@ from app.domains.location import models as location_models  # noqa: F401
 from app.domains.mac_authorization import (
     models as mac_authorization_models,  # noqa: F401,E501
 )
+from app.domains.marketing import models as marketing_models  # noqa: F401
 from app.domains.monitored_hardware import (
     models as monitored_hardware_models,  # noqa: F401
 )
