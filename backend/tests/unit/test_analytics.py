@@ -913,6 +913,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # still holds a lease for a dead device".
         "monitored-hardware-liveness-sweep",
         "campaigns-sweep-status-transitions",
+        # Guest Marketing: dispatcher, at-most-once reaper, PII retention.
+        "marketing-dispatch-due-campaigns",
+        "marketing-reap-stuck-recipients",
+        "marketing-prune-recipient-addresses",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
         # Its absence from this set is not a missing schedule entry, it is

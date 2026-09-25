@@ -158,6 +158,22 @@ from app.domains.isp.constants import (
     ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
 )
+from app.domains.marketing.constants import (
+    DISPATCH_SWEEP_INTERVAL_SECONDS as MARKETING_DISPATCH_SWEEP_INTERVAL_SECONDS,
+)
+from app.domains.marketing.constants import (
+    MARKETING_QUEUE_NAME,
+    TASK_DISPATCH_DUE_CAMPAIGNS,
+    TASK_PRUNE_RECIPIENT_ADDRESSES,
+    TASK_REAP_STUCK_RECIPIENTS,
+    TASK_SEND_CAMPAIGN_BATCH,
+)
+from app.domains.marketing.constants import (
+    PRUNE_SWEEP_INTERVAL_SECONDS as MARKETING_PRUNE_SWEEP_INTERVAL_SECONDS,
+)
+from app.domains.marketing.constants import (
+    REAP_SWEEP_INTERVAL_SECONDS as MARKETING_REAP_SWEEP_INTERVAL_SECONDS,
+)
 from app.domains.monitoring.constants import (
     ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
     HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
@@ -243,6 +259,7 @@ celery_app = Celery(
         "app.domains.guest_access.tasks",
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
+        "app.domains.marketing.tasks",
         "app.domains.monitoring.tasks",
         "app.domains.network_diagnostics.tasks",
         "app.domains.network_integration.tasks",
@@ -352,8 +369,30 @@ celery_app.conf.update(
         # the sweep it matters most to keep unblocked, because every tick it
         # misses is a customer's own device still refused by their own WiFi.
         TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Guest Marketing sends: real provider HTTP round trips (SMS,
+        # WhatsApp, email) paced by a rate limiter, so a batch can hold a
+        # worker for minutes. Their own queue keeps a large campaign from
+        # starving the pure-DB sweeps AND the device-I/O queue. The prod
+        # worker must consume it (-Q ...,marketing) -- see
+        # app.domains.marketing.tasks.
+        TASK_SEND_CAMPAIGN_BATCH: {"queue": MARKETING_QUEUE_NAME},
     },
     beat_schedule={
+        # Guest Marketing: start due campaigns (pure DB, default queue),
+        # reap rows a dead worker left in `sending` (at-most-once), and
+        # null recipient addresses after 180 days (retention).
+        "marketing-dispatch-due-campaigns": {
+            "task": TASK_DISPATCH_DUE_CAMPAIGNS,
+            "schedule": MARKETING_DISPATCH_SWEEP_INTERVAL_SECONDS,
+        },
+        "marketing-reap-stuck-recipients": {
+            "task": TASK_REAP_STUCK_RECIPIENTS,
+            "schedule": MARKETING_REAP_SWEEP_INTERVAL_SECONDS,
+        },
+        "marketing-prune-recipient-addresses": {
+            "task": TASK_PRUNE_RECIPIENT_ADDRESSES,
+            "schedule": MARKETING_PRUNE_SWEEP_INTERVAL_SECONDS,
+        },
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
         # this schedule alongside the guest session-timeout sweep, and for
         # a stronger reason than any of them: the state it repairs is one
@@ -857,6 +896,29 @@ def ping_celery_workers(
     fakes rather than a real Postgres/Redis in every unit test.
     """
     return celery_app.control.inspect(timeout=timeout).ping()
+
+
+from celery.signals import worker_ready  # noqa: E402
+
+
+@worker_ready.connect
+def _log_consumed_queues(sender=None, **_kwargs):  # noqa: ANN001
+    """Startup line naming the queues this worker consumes. A worker that
+    does not list ``marketing`` will never send a campaign (spec §9 deploy
+    trap) -- this makes that visible in the first line of its log."""
+    try:
+        queues = sorted(q.name for q in sender.app.amqp.queues.consume_from.values())
+    except Exception:  # noqa: BLE001
+        queues = []
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "celery_worker_consuming_queues",
+        extra={
+            "queues": queues,
+            "marketing_consumed": MARKETING_QUEUE_NAME in queues,
+        },
+    )
 
 
 __all__ = [
