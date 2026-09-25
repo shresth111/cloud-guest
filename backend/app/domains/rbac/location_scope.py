@@ -60,6 +60,7 @@ import uuid
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials
 
+from app.database.utils.filters import AnyOfOrNull
 from app.domains.api_keys.service import ApiKeyService
 from app.domains.auth.dependencies import (
     _API_KEY_HEADER,
@@ -80,6 +81,7 @@ __all__ = [
     "CallerLocationScope",
     "LocationScope",
     "OptionalCallerLocationScope",
+    "confine_location_filter",
     "enforce_entity_location",
 ]
 
@@ -141,6 +143,51 @@ def enforce_entity_location(
     if entity_location_id in caller_location_scope:
         return
     raise error
+
+
+def confine_location_filter(
+    *,
+    requested_location_id: uuid.UUID | None,
+    caller_location_scope: LocationScope,
+    error: Exception,
+    include_organization_wide: bool = False,
+) -> uuid.UUID | list[uuid.UUID] | AnyOfOrNull | None:
+    """The ``location_id`` filter a *listing* should actually apply.
+
+    ``enforce_entity_location`` covers a row reached by its own id. A listing
+    has no row to compare yet, and when the request names no location it
+    reads as "every location in the organization" -- which, for a caller
+    confined to particular sites, is every *other* site's data too. The
+    header-vs-query guard (``app.domains.location.scoping
+    .enforce_target_location``) cannot help there: with no location named it
+    has nothing to compare.
+
+    * ``caller_location_scope is None`` -- platform or organization caller:
+      the request's own filter, unchanged (``None`` still means "all").
+    * a location was requested -- it must be one of the caller's sites, else
+      ``error``; returned unchanged.
+    * nothing was requested -- the caller's sites, as a list. A list is what
+      ``app.database.utils.filters.apply_filters`` turns into ``IN (...)``
+      (a ``frozenset`` is not, hence the conversion). An empty confinement
+      becomes an empty list, which matches no rows -- never ``None``, which
+      would mean "unfiltered".
+
+    ``include_organization_wide`` is for tables where ``location_id IS NULL``
+    means "applies at every location" (guest access rules, MAC authorization
+    entries). Such a row applies at the caller's sites too, so they keep
+    seeing it: the unfiltered case then returns ``AnyOfOrNull`` -- ``IN
+    (sites) OR IS NULL`` -- instead of a plain list.
+    """
+    if caller_location_scope is None:
+        return requested_location_id
+    if requested_location_id is not None:
+        if requested_location_id not in caller_location_scope:
+            raise error
+        return requested_location_id
+    sites = sorted(caller_location_scope, key=str)
+    if include_organization_wide:
+        return AnyOfOrNull(tuple(sites))
+    return sites
 
 
 # ---------------------------------------------------------------------------

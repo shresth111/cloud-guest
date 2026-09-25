@@ -105,6 +105,7 @@ from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 
@@ -1050,6 +1051,22 @@ class GuestAccessService:
         )
         return rule
 
+    def _confined_location_filter(self, location_id: uuid.UUID | None) -> object:
+        """The ``location_id`` filter a rule listing applies for this caller.
+
+        Without it, a listing with no ``location_id`` returned every venue's
+        rules to a caller whose grants cover one venue. Organization-wide
+        rules (``location_id IS NULL``) stay visible: they apply at the
+        caller's venues too -- see ``_enforce_write_location``'s read/write
+        note and ``app.domains.rbac.location_scope.confine_location_filter``.
+        """
+        return confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAccessRuleError(),
+            include_organization_wide=True,
+        )
+
     async def list_guest_rules(
         self,
         *,
@@ -1063,8 +1080,9 @@ class GuestAccessService:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
-        if location_id is not None:
-            filters["location_id"] = location_id
+        location_filter = self._confined_location_filter(location_id)
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         if identifier is not None:
             # Strip-only, deliberately: this is a dashboard list filter,
             # not an access decision. ``canonicalize_rule_identifier``
@@ -1640,8 +1658,9 @@ class GuestAccessService:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
-        if location_id is not None:
-            filters["location_id"] = location_id
+        location_filter = self._confined_location_filter(location_id)
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         if mac_address is not None:
             filters["mac_address"] = normalize_mac_address(mac_address)
         if rule_type is not None:
