@@ -826,9 +826,7 @@ class LicenseService:
         runs ``RequireActiveLicense`` first."""
         if self.feature_overrides is None:
             return enabled_features
-        overrides = await self.feature_overrides.list_for_organization(
-            organization_id
-        )
+        overrides = await self.feature_overrides.list_for_organization(organization_id)
         if not overrides:
             return enabled_features
         effective = set(enabled_features)

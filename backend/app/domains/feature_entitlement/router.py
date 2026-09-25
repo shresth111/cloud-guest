@@ -50,9 +50,7 @@ router = APIRouter(tags=["Features"])
 # route that names its target organization in the path (see
 # ``addons.py``'s module docstring). Deliberately not on ``_PAID_WRITES``:
 # the caller is the platform, not the tenant whose licence is in question.
-platform_router = APIRouter(
-    prefix="/platform/organizations", tags=["Platform Add-ons"]
-)
+platform_router = APIRouter(prefix="/platform/organizations", tags=["Platform Add-ons"])
 
 
 def _request_id(request: Request) -> str:
@@ -215,9 +213,7 @@ def _addon_payload(view: AddonView) -> Addon:
     "/{organization_id}/addons",
     response_model=ApiResponse[OrganizationAddonsResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[
-        Depends(RequirePermission("billing.read", scope=ScopeType.GLOBAL))
-    ],
+    dependencies=[Depends(RequirePermission("billing.read", scope=ScopeType.GLOBAL))],
 )
 async def list_organization_addons(
     request: Request,
@@ -241,9 +237,7 @@ async def list_organization_addons(
     "/{organization_id}/addons/{addon_key}",
     response_model=ApiResponse[AddonUpdateResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[
-        Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))
-    ],
+    dependencies=[Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))],
 )
 async def set_organization_addon(
     request: Request,
@@ -275,9 +269,7 @@ async def set_organization_addon(
     "/{organization_id}/addons/{addon_key}",
     response_model=ApiResponse[AddonUpdateResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[
-        Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))
-    ],
+    dependencies=[Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))],
 )
 async def clear_organization_addon(
     request: Request,
