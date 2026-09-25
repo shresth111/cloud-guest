@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class FeatureInfo(BaseModel):
@@ -53,3 +53,48 @@ class CustomerFeaturesUpdateResponse(BaseModel):
     customer_id: str
     features: list[CustomerFeatureValue]
     message: str = "Features updated"
+
+
+# ---------------------------------------------------------------------------
+# Master add-on control (contract §5.9)
+# ---------------------------------------------------------------------------
+
+
+class AddonSetBy(BaseModel):
+    id: str
+    name: str | None = None
+
+
+class AddonOverride(BaseModel):
+    is_enabled: bool
+    reason: str | None = None
+    set_by: AddonSetBy | None = None
+    set_at: str
+
+
+class Addon(BaseModel):
+    key: str
+    name: str
+    description: str
+    enabled: bool
+    source: str
+    plan_value: bool
+    override: AddonOverride | None = None
+    active_campaign_count: int = 0
+
+
+class OrganizationAddonsResponse(BaseModel):
+    organization_id: str
+    addons: list[Addon]
+
+
+class AddonUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class AddonUpdateResponse(BaseModel):
+    addon: Addon
+    cancelled_campaign_count: int = 0

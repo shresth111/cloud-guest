@@ -96,6 +96,11 @@ FEATURE_META: dict[PlanFeatureKey, tuple[str, str, str]] = {
         "Automatic ISP failover and routing",
         "network",
     ),
+    PlanFeatureKey.GUEST_MARKETING: (
+        "Guest Marketing",
+        "WhatsApp, SMS and email campaigns to opted-in WiFi guests",
+        "marketing",
+    ),
 }
 
 
@@ -137,6 +142,9 @@ class FeatureEntitlementService:
                     PlanFeatureKey.WHITE_LABEL,
                     PlanFeatureKey.AI_FEATURES,
                     PlanFeatureKey.ISP_FAILOVER,
+                    # A paid add-on: off unless a plan or a Master override
+                    # turns it on.
+                    PlanFeatureKey.GUEST_MARKETING,
                 ),
                 tier_options=[tier.value for tier in SupportTier] if is_tier else [],
                 default_tier_value=SupportTier.BASIC.value if is_tier else None,

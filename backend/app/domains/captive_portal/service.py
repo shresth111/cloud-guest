@@ -662,6 +662,10 @@ _NOT_NULL_BOOLEAN_UPDATE_FIELDS = frozenset(
         "social_login_enabled",
         "business_hours_enabled",
         "whitelist_only_enabled",
+        # Written by app.domains.marketing (PUT /marketing/portal-consent),
+        # not by this domain's update request -- listed so an explicit null
+        # can never reach the NOT NULL column through any path.
+        "marketing_consent_enabled",
     }
 )
 

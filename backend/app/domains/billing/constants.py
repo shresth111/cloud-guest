@@ -138,6 +138,15 @@ class PlanFeatureKey(StrEnum):
     EXPORTS = "exports"
     ISP_FAILOVER = "isp_failover"
 
+    # -- Guest Marketing add-on (WhatsApp/SMS/email campaigns to opted-in
+    # WiFi guests, ``app.domains.marketing``). BOOLEAN, off by default: no
+    # seeded plan carries it, so every organization starts locked and is
+    # unlocked per organization by a Master-console override row
+    # (``models.OrganizationFeatureOverride``) or by a plan that includes it.
+    # Distinct from ``CAMPAIGNS``, which is the captive-portal content
+    # feature and is on by default.
+    GUEST_MARKETING = "guest_marketing"
+
 
 class PlanFeatureType(StrEnum):
     """The value-shape a :class:`~.models.PlanFeature` row carries -- see
@@ -208,7 +217,17 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.MFA,
         PlanFeatureKey.EXPORTS,
         PlanFeatureKey.ISP_FAILOVER,
+        PlanFeatureKey.GUEST_MARKETING,
     }
+)
+
+# The BOOLEAN keys the Master console may lock/unlock per organization
+# through ``OrganizationFeatureOverride`` (``/platform/organizations/{id}/
+# addons``). Deliberately a closed allowlist rather than "any BOOLEAN key":
+# an override silently diverging from a customer's plan is a billing act,
+# and each add-on that can be sold separately is a product decision.
+ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
+    {PlanFeatureKey.GUEST_MARKETING}
 )
 TIER_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset({PlanFeatureKey.SUPPORT_LEVEL})
 

@@ -614,6 +614,11 @@ class GuestLoginResponse(BaseModel):
     # See ``models.Guest.review_link_opened_at`` for why the difference
     # matters and why this can never be counted as reviews.
     has_opened_review_link: bool
+    # Guest Marketing (contract §5.8): non-null only when the venue's portal
+    # has the opt-in turned on, the organization is entitled to the
+    # add-on, and this guest has no consent row yet. The portal renders an
+    # UNTICKED checkbox from it and never blocks access on it.
+    marketing_consent_offer: dict[str, str] | None = None
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
 

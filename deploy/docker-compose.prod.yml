@@ -108,7 +108,7 @@ services:
     # left on the old code after `alembic upgrade head` has already run is a
     # worker executing against a schema it does not know.
     image: ${API_IMAGE:?API_IMAGE is unset -- see ~/deploy/.deploy.env}
-    command: ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info", "-Q", "celery,device_io"]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info", "-Q", "celery,device_io,marketing"]
     env_file:
       - ${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}
       # ...then the mail identities, which come from Secrets Manager via
