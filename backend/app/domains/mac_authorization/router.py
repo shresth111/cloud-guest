@@ -186,11 +186,13 @@ async def import_mac_authorization_entries(
     dependencies=[Depends(RequirePermission("mac_authorization.export"))],
 )
 async def export_mac_authorization_entries(
+    location_id: uuid.UUID | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: MacAuthorizationService = Depends(get_mac_authorization_service),
 ) -> Response:
     csv_text = await service.export_entries_csv(
-        requesting_organization_id=requesting_organization_id
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
     )
     return Response(
         content=csv_text,

@@ -1,5 +1,5 @@
-"""Guest access rules and MAC authorization entries: an unfiltered listing is
-confined to the caller's granted sites.
+"""Guest access rules and MAC authorization entries: an unfiltered listing (and
+the MAC CSV export) is confined to the caller's granted sites.
 
 Sibling of ``test_guest_list_location_confinement.py``. It is the same
 defect: a listing with no ``location_id`` was filtered on organization only,
@@ -14,7 +14,10 @@ hide the rules that actually govern their own venue.
 
 from __future__ import annotations
 
+import csv
+import io
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -209,3 +212,90 @@ class TestAnyOfOrNullReachesSql:
             1
         ]
         assert "location_id IS NULL" in where
+
+
+# ---------------------------------------------------------------------------
+# GET /mac-authorization/entries/export -- the same rows, as a CSV download
+# ---------------------------------------------------------------------------
+
+
+def _export_world() -> _World:
+    world = _World()
+    for row in world.rows:
+        row.mac_address = "AA:BB:CC:DD:EE:FF"
+        row.authorization_type = "permanent"
+        row.expires_at = None
+        row.comment = None
+        row.is_enabled = True
+        row.created_at = datetime(2026, 9, 25, tzinfo=UTC)
+    return world
+
+
+async def _export(world: _World, scope, **kwargs) -> set:
+    rows = world.rows
+
+    class _Repo:
+        async def list_all_for_organization(self, organization_id):
+            return [r for r in rows if r.organization_id == organization_id]
+
+    service = MacAuthorizationService(_Repo(), caller_location_scope=scope)
+    text = await service.export_entries_csv(
+        requesting_organization_id=world.org, **kwargs
+    )
+    return {
+        uuid.UUID(r["location_id"]) if r["location_id"] else None
+        for r in csv.DictReader(io.StringIO(text))
+    }
+
+
+class TestMacExportConfinement:
+    async def test_single_site_caller_exports_own_site_and_org_wide(self) -> None:
+        world = _export_world()
+
+        assert await _export(world, frozenset({world.site_a})) == {world.site_a, None}
+
+    async def test_multi_site_caller_exports_exactly_their_sites(self) -> None:
+        world = _export_world()
+
+        seen = await _export(world, frozenset({world.site_a, world.site_c}))
+
+        assert seen == {world.site_a, world.site_c, None}
+
+    async def test_foreign_location_is_refused(self) -> None:
+        world = _export_world()
+
+        with pytest.raises(CrossLocationMacAuthorizationAccessError) as exc_info:
+            await _export(world, frozenset({world.site_a}), location_id=world.site_b)
+        assert exc_info.value.status_code == 403
+
+    async def test_own_location_filter_is_allowed(self) -> None:
+        world = _export_world()
+
+        seen = await _export(world, frozenset({world.site_a}), location_id=world.site_a)
+
+        assert seen == {world.site_a}
+
+    async def test_organization_caller_is_unchanged(self) -> None:
+        world = _export_world()
+
+        assert await _export(world, None) == world.all_locations
+
+    async def test_caller_with_no_sites_exports_only_org_wide(self) -> None:
+        world = _export_world()
+
+        assert await _export(world, frozenset()) == {None}
+
+    def test_route_accepts_a_location_filter(self) -> None:
+        """The route must pass ``location_id`` through, or the 403 above is
+        unreachable over HTTP and a venue user can only ever get the
+        confined whole-organization file."""
+        import inspect
+
+        from app.domains.mac_authorization.router import (
+            export_mac_authorization_entries,
+        )
+
+        assert (
+            "location_id"
+            in inspect.signature(export_mac_authorization_entries).parameters
+        )
