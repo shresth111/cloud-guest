@@ -167,3 +167,48 @@ class DailyTestSendLimitError(MarketingError):
 class PublicRateLimitedError(MarketingError):
     error_code = "rate_limited"
     status_code_default = status.HTTP_429_TOO_MANY_REQUESTS
+
+
+# -- Bring-your-own providers (spec §12.4) ----------------------------------
+
+
+class OwnProviderUnacknowledgedError(_Conflict):
+    error_code = "own_provider_unacknowledged"
+
+
+class ProviderConfigInvalidError(_Unprocessable):
+    error_code = "provider_config_invalid"
+
+
+class ProviderTypeNotSupportedError(_Unprocessable):
+    error_code = "provider_type_not_supported"
+
+
+class SmtpHostNotAllowedHttpError(_Unprocessable):
+    error_code = "smtp_host_not_allowed"
+
+
+class ProviderNotVerifiedError(_Conflict):
+    error_code = "provider_not_verified"
+
+
+class ProviderSenderConflictError(_Conflict):
+    error_code = "provider_sender_conflict"
+
+
+class ProviderError(MarketingError):
+    error_code = "provider_error"
+    status_code_default = status.HTTP_502_BAD_GATEWAY
+
+
+class SyncedTemplateReadOnlyError(_Unprocessable):
+    error_code = "synced_template_read_only"
+
+
+class ProviderEncryptionUnavailableHttpError(MarketingError):
+    error_code = "provider_encryption_unavailable"
+    status_code_default = status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+class OrganizationNotFoundForMarketingError(_NotFound):
+    error_code = "organization_not_found"

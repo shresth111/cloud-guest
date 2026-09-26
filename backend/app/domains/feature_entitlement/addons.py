@@ -35,7 +35,11 @@ from typing import Protocol
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
-from app.domains.billing.constants import ADDON_FEATURE_KEYS, PlanFeatureKey
+from app.domains.billing.constants import (
+    ADDON_FEATURE_KEYS,
+    FEATURE_REQUIRES,
+    PlanFeatureKey,
+)
 from app.domains.billing.models import OrganizationFeatureOverride
 from app.domains.billing.repository import FeatureOverrideRepositoryProtocol
 from app.domains.organization.exceptions import OrganizationNotFoundError
@@ -146,6 +150,9 @@ class AddonView:
     plan_value: bool
     override: AddonOverrideView | None
     active_campaign_count: int
+    # The prerequisite add-on keeping this one off, if any (spec §12.3:
+    # guest_marketing_byo is only effective while guest_marketing is).
+    blocked_by: str | None = None
 
 
 class AddonService:
@@ -253,8 +260,9 @@ class AddonService:
         plan_value = await self.plan_features.get_plan_feature_enabled(
             organization_id, key
         )
+        effective = (await self._view(organization_id, key)).enabled
         cancelled = 0
-        if not plan_value:
+        if not effective:
             cancelled = await self._cancel_active(organization_id, key)
         await self.audit_writer.create_audit_log_entry(
             actor_user_id=actor_user_id,
@@ -331,11 +339,21 @@ class AddonService:
         name, description, _category = FEATURE_META.get(
             key, (key.value, key.value, "general")
         )
+        enabled = override.is_enabled if override else plan_value
+        blocked_by: str | None = None
+        prerequisite = FEATURE_REQUIRES.get(key)
+        if (
+            prerequisite is not None
+            and not (await self._view(organization_id, prerequisite)).enabled
+        ):
+            blocked_by = prerequisite.value
+            enabled = False
         return AddonView(
             key=key.value,
             name=name,
             description=description,
-            enabled=override.is_enabled if override else plan_value,
+            blocked_by=blocked_by,
+            enabled=enabled,
             source="override" if override else "plan",
             plan_value=plan_value,
             override=override,

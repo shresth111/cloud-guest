@@ -53,6 +53,8 @@ def enqueue_send_batch(campaign_id: uuid.UUID, countdown: int = 0) -> None:
 
 
 def _service(session) -> MarketingService:  # noqa: ANN001
+    from app.domains.billing.constants import PlanFeatureKey
+
     from .dependencies import build_entitlement_check
 
     settings = get_settings()
@@ -62,6 +64,9 @@ def _service(session) -> MarketingService:  # noqa: ANN001
         senders=resolve_marketing_senders(settings),
         redis=redis_client,
         entitlement_check=build_entitlement_check(session, redis_client),
+        byo_entitlement_check=build_entitlement_check(
+            session, redis_client, PlanFeatureKey.GUEST_MARKETING_BYO
+        ),
         enqueue_batch=enqueue_send_batch,
     )
 

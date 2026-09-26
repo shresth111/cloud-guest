@@ -60,11 +60,13 @@ from .constants import (
     SEND_BATCH_SIZE,
     SEND_MAX_ATTEMPTS,
     STALE_SENDING_MINUTES,
+    TEMPLATE_VARIABLES,
     TEST_SEND_COUNTER_KEY_TEMPLATE,
     WORST_CASE_VARIABLE_LENGTHS,
     CampaignStatus,
     CancelReason,
     Channel,
+    ChannelMode,
     ConsentSource,
     ConsentStatus,
     RecipientStatus,
@@ -90,12 +92,14 @@ from .exceptions import (
     MarketingError,
     MarketingNotFoundError,
     MarketingValidationError,
+    OwnProviderUnacknowledgedError,
     PortalConfigMissingError,
     QuietHoursError,
     ScheduleOutOfRangeError,
     SessionNotActiveError,
     SmsTooLongError,
     StaleConsentTextError,
+    SyncedTemplateReadOnlyError,
     SystemTemplateReadOnlyError,
     TemplateEmptyError,
     TemplateInUseError,
@@ -108,6 +112,14 @@ from .exceptions import (
     WhatsAppCustomNotSupportedError,
 )
 from .models import MarketingCampaign, MarketingCampaignRecipient, MarketingTemplate
+from .providers import (
+    OwnSenders,
+    build_own_senders,
+    decrypt_config,
+    placeholder_count,
+    scrub,
+    spec_for,
+)
 from .repository import (
     AudienceCandidate,
     AudienceCriteria,
@@ -174,6 +186,125 @@ _EMAIL_LAYOUT = (
 )
 
 
+OWN_PROVIDER_REQUIRES_OWN_TEMPLATE = "own_provider_requires_own_template"
+
+
+def _campaign_provider(campaign: Any, rows: dict[uuid.UUID, Any]) -> dict | None:
+    """Campaign.provider (spec §12.4): null for drafts, else the snapshot."""
+    if campaign.status == CampaignStatus.DRAFT.value:
+        return None
+    source = getattr(campaign, "provider_source", None) or "wyfy"
+    if source != "own":
+        return {"source": "wyfy", "type": None, "display_name": "Wyfy default"}
+    row = rows.get(getattr(campaign, "org_provider_id", None))
+    provider_type = getattr(campaign, "provider_type", None)
+    if row is not None:
+        name = provider_display_name(row)
+    else:
+        spec = spec_for(Channel(campaign.channel), provider_type or "")
+        name = f"Your {spec.display_name if spec else provider_type} (removed)"
+    return {"source": "own", "type": provider_type, "display_name": name}
+
+
+def _own_status(channel: Channel, row: Any) -> ChannelStatus:
+    return ChannelStatus(
+        channel,
+        True,
+        row.provider_type,
+        ChannelMode.LIVE,
+        None,
+        requires_dlt_template_id=channel is Channel.SMS,
+        custom_templates_supported=channel is not Channel.WHATSAPP,
+    )
+
+
+def render_positional(body: str | None, parameters: list[str]) -> str:
+    """Preview of a WABA template: ``{{n}}`` -> parameters[n-1]."""
+    import re as _re
+
+    def _sub(match):  # noqa: ANN001
+        index = int(match.group(1)) - 1
+        return parameters[index] if 0 <= index < len(parameters) else ""
+
+    return _re.sub(r"\{\{(\d+)\}\}", _sub, body or "")
+
+
+class _OwnProviderTripped(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass
+class ProviderResolution:
+    """The §12.1 answer for one channel, right now."""
+
+    channel: Channel
+    source: str  # "wyfy" | "own"
+    row: Any | None
+    status: ChannelStatus
+    byo_entitled: bool
+
+    @property
+    def own(self) -> bool:
+        return self.source == "own"
+
+    @property
+    def needs_fallback_ack(self) -> bool:
+        """The org HAS an own row for the channel that is not what will be
+        used (enabled but unverified, failed, or BYO locked): scheduling
+        through Wyfy then needs an explicit acknowledgement (Q11 = A)."""
+        row = self.row
+        return (
+            row is not None
+            and not self.own
+            and (bool(row.enabled) or row.status == "failed")
+        )
+
+    def display_name(self) -> str:
+        if not self.own or self.row is None:
+            return "Wyfy default"
+        return provider_display_name(self.row)
+
+    def as_status_dict(self) -> dict[str, Any]:
+        data = self.status.as_dict()
+        data["provider_source"] = self.source
+        data["provider_display_name"] = self.display_name()
+        data["own_provider_status"] = self.row.status if self.row is not None else None
+        # Additive (FE request, 2026-09-26): with own_provider_status this is
+        # everything the composer needs to know that acknowledge_wyfy_fallback
+        # will be required (see needs_fallback_ack / deviation #20).
+        data["own_provider_enabled"] = (
+            bool(self.row.enabled) if self.row is not None else None
+        )
+        data["requires_fallback_ack"] = self.needs_fallback_ack
+        data["byo_entitled"] = self.byo_entitled
+        return data
+
+
+def provider_display_name(row: Any) -> str:
+    spec = spec_for(Channel(row.channel), row.provider_type)
+    label = provider_sender_label(row)
+    name = spec.display_name if spec else row.provider_type
+    return f"Your {name} ({label})" if label else f"Your {name}"
+
+
+def provider_sender_label(row: Any) -> str | None:
+    spec = spec_for(Channel(row.channel), row.provider_type)
+    display = row.display or {}
+    if spec is None or spec.sender_field is None:
+        return None
+    value = display.get(spec.sender_field)
+    return value if isinstance(value, str) else None
+
+
+def default_own_sender_factory(row: Any, settings: Settings) -> OwnSenders:
+    config = decrypt_config(row.config_encrypted, settings=settings)
+    senders = build_own_senders(row.provider_type, config, settings=settings)
+    senders.scrubber = lambda message: scrub(message, config)
+    return senders
+
+
 @dataclass(frozen=True)
 class CallerScope:
     organization_id: uuid.UUID
@@ -190,13 +321,27 @@ class RateLimiter:
         self.redis = redis
         self.rates = rates
 
-    async def acquire(self, channel: Channel) -> None:
-        limit = max(int(self.rates.get(channel, 10.0)), 1)
+    async def acquire(
+        self,
+        channel: Channel,
+        *,
+        own_organization_id: uuid.UUID | None = None,
+        own_rate: float = 5.0,
+    ) -> None:
+        """An own provider gets its own per-organization bucket
+        (``marketing:rate:{channel}:org:{org_id}``) so Wyfy's shared bucket
+        never throttles a venue that pays its own provider (spec §12.5)."""
+        if own_organization_id is not None:
+            limit = max(int(own_rate), 1)
+            prefix = f"marketing:rate:{channel.value}:org:{own_organization_id}"
+        else:
+            limit = max(int(self.rates.get(channel, 10.0)), 1)
+            prefix = f"marketing:rate:{channel.value}"
         if self.redis is None:
             return
         while True:
             second = int(time_module.time())
-            key = f"marketing:rate:{channel.value}:{second}"
+            key = f"{prefix}:{second}"
             count = await self.redis.incr(key)
             if count == 1:
                 await self.redis.expire(key, 2)
@@ -218,8 +363,16 @@ class MarketingService:
         enqueue_batch: Callable[[uuid.UUID, int], None] | None = None,
         now: Callable[[], datetime] | None = None,
         caller_location_scope: frozenset[uuid.UUID] | None = None,
+        byo_entitlement_check: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
+        own_sender_factory: Callable[[Any], OwnSenders] | None = None,
     ) -> None:
         self.repository = repository
+        # guest_marketing_byo (spec §12.1). None = not entitled.
+        self.byo_entitlement_check = byo_entitlement_check
+        # Builds the adapters for one own-provider row; decrypts in-process.
+        self.own_sender_factory = own_sender_factory or (
+            lambda row: default_own_sender_factory(row, settings)
+        )
         # Grant-derived confinement (``CallerLocationScope``). ``get_caller_scope``
         # already folds it into ``CallerScope.location_id``; ``_guard``
         # re-asserts it at every entry point so a CallerScope built any other
@@ -332,6 +485,51 @@ class MarketingService:
     def channel_statuses(self) -> list[ChannelStatus]:
         return [self.senders.status(channel) for channel in CHANNEL_ORDER]
 
+    # -- provider resolution (spec §12.1) ----------------------------------
+
+    async def _byo_entitled(self, organization_id: uuid.UUID) -> bool:
+        if self.byo_entitlement_check is None:
+            return False
+        try:
+            return await self.byo_entitlement_check(organization_id)
+        except Exception:  # noqa: BLE001 - no licence row etc. = not entitled
+            logger.info("marketing_byo_entitlement_check_failed", exc_info=True)
+            return False
+
+    async def resolve_providers(
+        self, organization_id: uuid.UUID
+    ) -> dict[Channel, ProviderResolution]:
+        """effective(org, channel) = own iff a row exists, is enabled, is
+        verified and the org is entitled to guest_marketing_byo; else Wyfy."""
+        rows = await self.repository.list_providers(organization_id)
+        byo = await self._byo_entitled(organization_id)
+        out: dict[Channel, ProviderResolution] = {}
+        for channel in CHANNEL_ORDER:
+            row = rows.get(channel.value)
+            effective = bool(
+                row is not None and row.enabled and row.status == "verified" and byo
+            )
+            if effective:
+                status = ChannelStatus(
+                    channel,
+                    True,
+                    row.provider_type,
+                    ChannelMode.LIVE,
+                    None,
+                    requires_dlt_template_id=channel is Channel.SMS,
+                    custom_templates_supported=channel is not Channel.WHATSAPP,
+                )
+            else:
+                status = self.senders.status(channel)
+            out[channel] = ProviderResolution(
+                channel=channel,
+                source="own" if effective else "wyfy",
+                row=row,
+                status=status,
+                byo_entitled=byo,
+            )
+        return out
+
     @staticmethod
     def _consent_view(config, venue_name: str) -> dict[str, Any]:
         if config is None:
@@ -361,8 +559,11 @@ class MarketingService:
             scope.organization_id, location_ids
         )
         zone = self._zone(organization)
+        resolutions = await self.resolve_providers(scope.organization_id)
         return {
-            "channels": [status.as_dict() for status in self.channel_statuses()],
+            "channels": [
+                resolutions[channel].as_status_dict() for channel in CHANNEL_ORDER
+            ],
             "portal_consent": self._consent_view(config, organization.name),
             "consent_counts": {
                 channel.value: counts.get(channel.value, 0) for channel in CHANNEL_ORDER
@@ -712,11 +913,12 @@ class MarketingService:
         channel: Channel,
         *,
         review_url: str | None,
+        resolution: ProviderResolution | None = None,
     ) -> tuple[bool, str | None]:
         get = (
             template.get
             if isinstance(template, dict)
-            else lambda key: getattr(template, key)
+            else lambda key: getattr(template, key, None)
         )
         body_key = {
             Channel.SMS: "sms_body",
@@ -726,11 +928,30 @@ class MarketingService:
         body = get(body_key)
         if not body:
             return False, SendableReason.CHANNEL_MISSING_IN_TEMPLATE.value
-        if not self.senders.status(channel).configured:
+        status = resolution.status if resolution else self.senders.status(channel)
+        if not status.configured:
             return False, SendableReason.CHANNEL_NOT_CONFIGURED.value
+        own = resolution is not None and resolution.own
+        synced = get("whatsapp_source") == "own_waba"
+        order = list(get("whatsapp_variable_order") or [])
+        if own and channel is Channel.SMS and get("organization_id") is None:
+            # System templates carry Wyfy's DLT ids, registered to Wyfy's
+            # entity and header; carriers drop them on the venue's header.
+            return False, OWN_PROVIDER_REQUIRES_OWN_TEMPLATE
+        if own and channel is Channel.WHATSAPP and not synced:
+            return False, OWN_PROVIDER_REQUIRES_OWN_TEMPLATE
         if channel is Channel.SMS and not get("sms_dlt_template_id"):
             return False, SendableReason.DLT_TEMPLATE_ID_MISSING.value
-        if channel is Channel.WHATSAPP and (
+        if channel is Channel.WHATSAPP and synced:
+            if not own:
+                # A template approved in the venue's WABA cannot be sent from
+                # Wyfy's number.
+                return False, SendableReason.WHATSAPP_NOT_APPROVED.value
+            if get("whatsapp_approval_status") != WhatsAppApprovalStatus.APPROVED.value:
+                return False, SendableReason.WHATSAPP_NOT_APPROVED.value
+            if "unsubscribe_link" not in order or len(order) != placeholder_count(body):
+                return False, SendableReason.UNSUBSCRIBE_LINK_MISSING.value
+        elif channel is Channel.WHATSAPP and (
             not get("whatsapp_content_sid")
             or get("whatsapp_approval_status") != WhatsAppApprovalStatus.APPROVED.value
         ):
@@ -743,12 +964,19 @@ class MarketingService:
         texts = [body]
         if channel is Channel.EMAIL:
             texts += [get("email_subject") or "", get("email_preheader") or ""]
-        if any("{{review_link}}" in text for text in texts) and not review_url:
+        uses_review = any("{{review_link}}" in text for text in texts) or (
+            synced and "review_link" in order
+        )
+        if uses_review and not review_url:
             return False, "review_link_missing"
         return True, None
 
     def template_resource(
-        self, template: MarketingTemplate, *, review_url: str | None
+        self,
+        template: MarketingTemplate,
+        *,
+        review_url: str | None,
+        resolutions: dict[Channel, ProviderResolution] | None = None,
     ) -> dict[str, Any]:
         variables: list[str] = []
         for text in (
@@ -781,6 +1009,18 @@ class MarketingService:
                 "content_sid": template.whatsapp_content_sid,
                 "variable_order": template.whatsapp_variable_order or [],
                 "approval_status": template.whatsapp_approval_status,
+                # BYO (spec §12.4): "wyfy" for Wyfy-approved rows,
+                # "own_waba" for templates synced from the venue's WABA.
+                "source": getattr(template, "whatsapp_source", None) or "wyfy",
+                "provider_template_name": getattr(
+                    template, "whatsapp_provider_template_name", None
+                ),
+                "provider_language": getattr(
+                    template, "whatsapp_provider_language", None
+                ),
+                "placeholder_count": placeholder_count(template.whatsapp_body)
+                if getattr(template, "whatsapp_source", None) == "own_waba"
+                else None,
             }
         email = None
         if template.email_body_html is not None:
@@ -791,7 +1031,12 @@ class MarketingService:
             }
         sendable = {}
         for channel in CHANNEL_ORDER:
-            ok, reason = self._sendable_for(template, channel, review_url=review_url)
+            ok, reason = self._sendable_for(
+                template,
+                channel,
+                review_url=review_url,
+                resolution=(resolutions or {}).get(channel),
+            )
             sendable[channel.value] = {"ok": ok, "reason": reason}
         return {
             "id": str(template.id),
@@ -829,8 +1074,10 @@ class MarketingService:
             page_size=page_size,
         )
         review_url = await self._review_url(scope.organization_id, scope.location_id)
+        resolutions = await self.resolve_providers(scope.organization_id)
         return [
-            self.template_resource(row, review_url=review_url) for row in rows
+            self.template_resource(row, review_url=review_url, resolutions=resolutions)
+            for row in rows
         ], meta
 
     async def _get_template(
@@ -848,7 +1095,10 @@ class MarketingService:
     ) -> dict[str, Any]:
         template = await self._get_template(scope, template_id)
         review_url = await self._review_url(scope.organization_id, scope.location_id)
-        return self.template_resource(template, review_url=review_url)
+        resolutions = await self.resolve_providers(scope.organization_id)
+        return self.template_resource(
+            template, review_url=review_url, resolutions=resolutions
+        )
 
     @staticmethod
     def _validate_variables(*texts: str | None) -> None:
@@ -924,7 +1174,10 @@ class MarketingService:
             description=f"Marketing template '{template.name}' created",
         )
         review_url = await self._review_url(scope.organization_id, scope.location_id)
-        return self.template_resource(template, review_url=review_url)
+        resolutions = await self.resolve_providers(scope.organization_id)
+        return self.template_resource(
+            template, review_url=review_url, resolutions=resolutions
+        )
 
     async def _require_custom(
         self, scope: CallerScope, template_id: uuid.UUID
@@ -940,6 +1193,8 @@ class MarketingService:
         self, scope: CallerScope, template_id: uuid.UUID, body: TemplateUpdate
     ) -> dict[str, Any]:
         template = await self._require_custom(scope, template_id)
+        if getattr(template, "whatsapp_source", None) == "own_waba":
+            return await self._update_synced_template(scope, template, body)
         if body.whatsapp is not None:
             raise WhatsAppCustomNotSupportedError(
                 "Custom WhatsApp templates are not supported yet"
@@ -1001,7 +1256,65 @@ class MarketingService:
             description=f"Marketing template '{template.name}' updated",
         )
         review_url = await self._review_url(scope.organization_id, scope.location_id)
-        return self.template_resource(template, review_url=review_url)
+        resolutions = await self.resolve_providers(scope.organization_id)
+        return self.template_resource(
+            template, review_url=review_url, resolutions=resolutions
+        )
+
+    async def _update_synced_template(
+        self, scope: CallerScope, template: MarketingTemplate, body: TemplateUpdate
+    ) -> dict[str, Any]:
+        """A template synced from the venue's WABA: its content is Meta's, so
+        only ``name`` and ``whatsapp.variable_order`` may change (spec §12.4)."""
+        provided = body.model_fields_set - {"version"}
+        whatsapp = body.whatsapp if "whatsapp" in provided else None
+        if provided - {"name", "whatsapp"} or (
+            whatsapp is not None and set(whatsapp) - {"variable_order"}
+        ):
+            raise SyncedTemplateReadOnlyError(
+                "Only the name and the variable mapping of a synced template "
+                "can be changed"
+            )
+        if template.version != body.version:
+            raise VersionConflictError(
+                "This template was changed by someone else",
+                current_version=template.version,
+            )
+        data: dict[str, Any] = {"updated_by": scope.actor_user_id}
+        if "name" in provided and body.name:
+            if await self.repository.template_name_taken(
+                scope.organization_id, body.name, exclude_id=template.id
+            ):
+                raise TemplateNameTakenError("A template with this name already exists")
+            data["name"] = body.name.strip()
+        if whatsapp is not None:
+            order = whatsapp.get("variable_order")
+            if not isinstance(order, list) or not all(
+                isinstance(item, str) for item in order
+            ):
+                raise MarketingValidationError("variable_order must be a list of names")
+            if len(order) != placeholder_count(template.whatsapp_body):
+                raise MarketingValidationError(
+                    "variable_order must map every {{n}} placeholder",
+                    placeholder_count=placeholder_count(template.whatsapp_body),
+                )
+            unknown = sorted(set(order) - TEMPLATE_VARIABLES)
+            if unknown:
+                raise UnknownVariableError("Unknown variables", variables=unknown)
+            data["whatsapp_variable_order"] = order
+        if not await self.repository.update_template_cas(
+            template, expected_version=body.version, data=data
+        ):
+            await self.repository.refresh(template)
+            raise VersionConflictError(
+                "This template was changed by someone else",
+                current_version=template.version,
+            )
+        review_url = await self._review_url(scope.organization_id, scope.location_id)
+        resolutions = await self.resolve_providers(scope.organization_id)
+        return self.template_resource(
+            template, review_url=review_url, resolutions=resolutions
+        )
 
     async def delete_template(
         self, scope: CallerScope, template_id: uuid.UUID
@@ -1060,7 +1373,10 @@ class MarketingService:
             ),
         )
         review_url = await self._review_url(scope.organization_id, scope.location_id)
-        return self.template_resource(template, review_url=review_url)
+        resolutions = await self.resolve_providers(scope.organization_id)
+        return self.template_resource(
+            template, review_url=review_url, resolutions=resolutions
+        )
 
     async def preview_template(
         self, scope: CallerScope, body: TemplatePreviewRequest
@@ -1143,7 +1459,20 @@ class MarketingService:
         users = await self.repository.get_user_names(
             [c.created_by_user_id for c in campaigns if c.created_by_user_id]
         )
-        return [self._campaign_resource(c, templates, users) for c in campaigns]
+        rows: dict[uuid.UUID, Any] = {}
+        for campaign in campaigns:
+            provider_id = getattr(campaign, "org_provider_id", None)
+            if provider_id is not None and provider_id not in rows:
+                rows[provider_id] = await self.repository.get_provider_by_id(
+                    campaign.organization_id, provider_id
+                )
+        return [
+            {
+                **self._campaign_resource(c, templates, users),
+                "provider": _campaign_provider(c, rows),
+            }
+            for c in campaigns
+        ]
 
     def _campaign_resource(
         self,
@@ -1476,6 +1805,18 @@ class MarketingService:
             "whatsapp_content_sid": template.whatsapp_content_sid,
             "whatsapp_variable_order": template.whatsapp_variable_order or [],
             "whatsapp_approval_status": template.whatsapp_approval_status,
+            "whatsapp_source": getattr(template, "whatsapp_source", None),
+            "whatsapp_provider_template_name": getattr(
+                template, "whatsapp_provider_template_name", None
+            ),
+            "whatsapp_provider_language": getattr(
+                template, "whatsapp_provider_language", None
+            ),
+            # Template owner (None = system template) -- the own-provider
+            # sendability rule for SMS needs it.
+            "organization_id": str(template.organization_id)
+            if template.organization_id
+            else None,
             "email_subject": template.email_subject,
             "email_preheader": template.email_preheader,
             "email_body_html": template.email_body_html,
@@ -1530,12 +1871,15 @@ class MarketingService:
         address: str,
         *,
         test: bool = False,
+        own: OwnSenders | None = None,
     ) -> tuple[ProviderResult, str]:
-        """Render and hand one message to the channel's sender. Returns the
+        """Render and hand one message to the channel's sender -- the
+        venue's own adapter when ``own`` is given (the campaign snapshot said
+        so), Wyfy's otherwise. Never both, never a fallback. Returns the
         provider result and a ≤200-char rendered preview. Raises
         ``SendError`` on any provider failure."""
         if channel is Channel.SMS:
-            sender = self.senders.sms
+            sender = own.sms if own is not None else self.senders.sms
             if sender is None:
                 raise SendError(
                     "channel_not_configured",
@@ -1549,6 +1893,24 @@ class MarketingService:
                 address, body, dlt_template_id=snapshot.get("sms_dlt_template_id") or ""
             )
             return result, body[:200]
+        if channel is Channel.WHATSAPP and own is not None:
+            if own.whatsapp is None:
+                raise SendError(
+                    "channel_not_configured",
+                    "Own WhatsApp not configured",
+                    permanent=True,
+                )
+            order = snapshot.get("whatsapp_variable_order") or []
+            parameters = [values.get(name, "") for name in order]
+            result = await own.whatsapp.send_waba_template(
+                address,
+                template_name=snapshot.get("whatsapp_provider_template_name") or "",
+                language=snapshot.get("whatsapp_provider_language") or "en",
+                parameters=parameters,
+            )
+            return result, render_positional(snapshot.get("whatsapp_body"), parameters)[
+                :200
+            ]
         if channel is Channel.WHATSAPP:
             sender = self.senders.whatsapp
             if sender is None:
@@ -1567,7 +1929,7 @@ class MarketingService:
                 variables=variables,
             )
             return result, render(snapshot.get("whatsapp_body"), values)[:200]
-        sender = self.senders.email
+        sender = own.email if own is not None else self.senders.email
         if sender is None:
             raise SendError(
                 "channel_not_configured", "Email sender not configured", permanent=True
@@ -1594,7 +1956,11 @@ class MarketingService:
             address,
             subject=subject,
             html_body=document,
-            from_name=f"{snapshot.get('venue_name') or 'Wyfy Guest'} via Wyfy Guest",
+            # Own account: the venue's own name (its own from_name config
+            # wins inside the adapter). Wyfy's shared domain says "via".
+            from_name=(snapshot.get("venue_name") or "Wyfy Guest")
+            if own is not None
+            else f"{snapshot.get('venue_name') or 'Wyfy Guest'} via Wyfy Guest",
             headers=headers,
         )
         return result, f"{subject} | {render(snapshot.get('email_body_html'), values)}"[
@@ -1603,8 +1969,10 @@ class MarketingService:
 
     # -- readiness ---------------------------------------------------------
 
-    def _require_channel_configured(self, channel: Channel) -> None:
-        status = self.senders.status(channel)
+    def _require_channel_configured(
+        self, channel: Channel, resolution: ProviderResolution | None = None
+    ) -> None:
+        status = resolution.status if resolution else self.senders.status(channel)
         if not status.configured:
             raise ChannelNotConfiguredError(
                 status.reason or "This channel is not configured",
@@ -1612,17 +1980,45 @@ class MarketingService:
             )
 
     def _require_sendable(
-        self, snapshot_or_template, channel: Channel, review_url: str | None
+        self,
+        snapshot_or_template,
+        channel: Channel,
+        review_url: str | None,
+        resolution: ProviderResolution | None = None,
     ) -> None:
         ok, reason = self._sendable_for(
-            snapshot_or_template, channel, review_url=review_url
+            snapshot_or_template,
+            channel,
+            review_url=review_url,
+            resolution=resolution,
         )
         if not ok:
             if reason == SendableReason.CHANNEL_NOT_CONFIGURED.value:
-                self._require_channel_configured(channel)
+                self._require_channel_configured(channel, resolution)
             raise TemplateNotSendableError(
                 "This template cannot be sent on this channel yet", reason=reason
             )
+
+    async def _snapshot_row(
+        self, campaign: MarketingCampaign
+    ) -> tuple[Any | None, str]:
+        """The own-provider row a campaign was snapshotted to, if it is still
+        usable. Returns (row, "") or (None, reason) -- never a fallback."""
+        provider_id = getattr(campaign, "org_provider_id", None)
+        if provider_id is None:
+            return None, "provider removed"
+        row = await self.repository.get_provider_by_id(
+            campaign.organization_id, provider_id
+        )
+        if row is None or row.is_deleted:
+            return None, "provider removed"
+        if row.status == "failed":
+            return None, f"provider failed: {row.last_error or 'verification failed'}"
+        if row.status != "verified":
+            return None, "provider not verified"
+        if not row.enabled:
+            return None, "provider disabled"
+        return row, ""
 
     async def test_send(
         self,
@@ -1637,7 +2033,29 @@ class MarketingService:
                 "A cancelled campaign cannot be test-sent"
             )
         channel = Channel(campaign.channel)
-        self._require_channel_configured(channel)
+        # A draft tests through whatever §12.1 resolves to now; a scheduled
+        # or sent campaign tests through its own snapshot.
+        resolution = (await self.resolve_providers(scope.organization_id))[channel]
+        own: OwnSenders | None = None
+        if campaign.status != CampaignStatus.DRAFT.value:
+            if getattr(campaign, "provider_source", "wyfy") == "own":
+                row, reason = await self._snapshot_row(campaign)
+                if row is None:
+                    raise ChannelNotConfiguredError(
+                        f"own_provider_unavailable: {reason}",
+                        channel_status=resolution.as_status_dict(),
+                    )
+                own = self.own_sender_factory(row)
+                resolution = ProviderResolution(
+                    channel, "own", row, _own_status(channel, row), True
+                )
+            else:
+                resolution = ProviderResolution(
+                    channel, "wyfy", None, self.senders.status(channel), False
+                )
+        elif resolution.own:
+            own = self.own_sender_factory(resolution.row)
+        self._require_channel_configured(channel, resolution)
         addresses = []
         for raw in to:
             normalized = normalize_address(channel, raw)
@@ -1651,7 +2069,9 @@ class MarketingService:
         snapshot = campaign.template_snapshot or await self._build_snapshot(
             campaign, template
         )
-        self._require_sendable(snapshot, channel, snapshot.get("review_link"))
+        self._require_sendable(
+            snapshot, channel, snapshot.get("review_link"), resolution
+        )
         await self._consume_test_quota(scope.organization_id, len(addresses))
         results = []
         for address in addresses:
@@ -1663,7 +2083,7 @@ class MarketingService:
             )
             try:
                 result, _ = await self._deliver(
-                    channel, snapshot, values, address, test=True
+                    channel, snapshot, values, address, test=True, own=own
                 )
                 results.append(
                     {
@@ -1730,6 +2150,7 @@ class MarketingService:
         *,
         scheduled_at: datetime | None,
         idempotency_key: str,
+        acknowledge_wyfy_fallback: bool = False,
     ) -> dict[str, Any]:
         campaign = await self._get_campaign(scope, campaign_id)
         now = self._now()
@@ -1750,10 +2171,22 @@ class MarketingService:
         if campaign.status != CampaignStatus.DRAFT.value:
             raise InvalidStatusTransitionError("Only a draft can be scheduled")
         channel = Channel(campaign.channel)
-        self._require_channel_configured(channel)
+        resolution = (await self.resolve_providers(scope.organization_id))[channel]
+        if resolution.needs_fallback_ack and not acknowledge_wyfy_fallback:
+            # Founder Q11 = Option A: the org has its own provider for this
+            # channel but it is not usable, so this would go through Wyfy --
+            # only with an explicit acknowledgement, never silently.
+            raise OwnProviderUnacknowledgedError(
+                "Your own provider for this channel is not usable; this "
+                "campaign would be sent through Wyfy's default account.",
+                channel_status=resolution.as_status_dict(),
+            )
+        self._require_channel_configured(channel, resolution)
         template = await self._get_template(scope, campaign.template_id)
         snapshot = await self._build_snapshot(campaign, template)
-        self._require_sendable(snapshot, channel, snapshot.get("review_link"))
+        self._require_sendable(
+            snapshot, channel, snapshot.get("review_link"), resolution
+        )
 
         if scheduled_at is not None:
             if scheduled_at.tzinfo is None:
@@ -1815,6 +2248,10 @@ class MarketingService:
             "schedule_idempotency_at": now,
             "last_error": None,
             "updated_by": scope.actor_user_id,
+            # §12.1 snapshot: the only thing dispatch and send_batch read.
+            "provider_source": resolution.source,
+            "provider_type": resolution.row.provider_type if resolution.own else None,
+            "org_provider_id": resolution.row.id if resolution.own else None,
         }
         if target_status == CampaignStatus.SENDING.value:
             data["started_at"] = now
@@ -1836,7 +2273,13 @@ class MarketingService:
                     else "sent now"
                 )
             ),
-            metadata={"reachable_at_schedule": preview["reachable"]},
+            metadata={
+                "reachable_at_schedule": preview["reachable"],
+                "provider_source": resolution.source,
+                "acknowledged_wyfy_fallback": bool(
+                    resolution.needs_fallback_ack and acknowledge_wyfy_fallback
+                ),
+            },
         )
         if target_status == CampaignStatus.SENDING.value:
             await self.materialize(campaign)
@@ -1860,6 +2303,9 @@ class MarketingService:
                 "status": CampaignStatus.DRAFT.value,
                 "scheduled_at": None,
                 "template_snapshot": None,
+                "provider_source": "wyfy",
+                "provider_type": None,
+                "org_provider_id": None,
                 "schedule_idempotency_key": None,
                 "schedule_idempotency_at": None,
                 "updated_by": scope.actor_user_id,
@@ -1935,6 +2381,7 @@ class MarketingService:
             "error_code": recipient.error_code,
             "error_message": (recipient.error_message or "")[:200] or None,
             "attempt_count": recipient.attempt_count,
+            "provider_source": getattr(recipient, "provider_source", None),
             "submitted_at": utc_iso(recipient.submitted_at),
             "delivered_at": utc_iso(recipient.delivered_at),
             "failed_at": utc_iso(recipient.failed_at),
@@ -2221,6 +2668,7 @@ class MarketingService:
                     "location_id": attributed.get(candidate.guest_id)
                     or campaign.location_id,
                     "address": address,
+                    "provider_source": getattr(campaign, "provider_source", "wyfy"),
                     "unsubscribe_token": token,
                     "rendered_preview": render(snapshot.get(body_key), values)[:200]
                     or None,
@@ -2264,7 +2712,37 @@ class MarketingService:
                     cancelled += 1
                 continue
             channel = Channel(campaign.channel)
-            status = self.senders.status(channel)
+            if getattr(campaign, "provider_source", "wyfy") == "own":
+                if not await self._byo_entitled(campaign.organization_id):
+                    if await self.repository.update_campaign_cas(
+                        campaign,
+                        expected_status=CampaignStatus.SCHEDULED.value,
+                        data={
+                            "status": CampaignStatus.CANCELLED.value,
+                            "cancel_reason": "byo_locked",
+                            "cancelled_at": now,
+                            "last_error": "Own-provider add-on is locked",
+                        },
+                    ):
+                        cancelled += 1
+                    continue
+                row, reason = await self._snapshot_row(campaign)
+                if row is None:
+                    # §12.1 row 1: fail, never fall back to Wyfy.
+                    if await self.repository.update_campaign_cas(
+                        campaign,
+                        expected_status=CampaignStatus.SCHEDULED.value,
+                        data={
+                            "status": CampaignStatus.FAILED.value,
+                            "completed_at": now,
+                            "last_error": f"own_provider_unavailable: {reason}"[:500],
+                        },
+                    ):
+                        failed += 1
+                    continue
+                status = _own_status(channel, row)
+            else:
+                status = self.senders.status(channel)
             if not status.configured:
                 if await self.repository.update_campaign_cas(
                     campaign,
@@ -2353,12 +2831,39 @@ class MarketingService:
                 expected_status=CampaignStatus.SENDING.value,
                 data={"paused_until": None},
             )
+        own: OwnSenders | None = None
+        own_row = None
+        if getattr(campaign, "provider_source", "wyfy") == "own":
+            own_row, reason = await self._snapshot_row(campaign)
+            if own_row is None:
+                # The row this campaign was snapshotted to is gone, disabled
+                # or tripped by another campaign: fail what is left. Nothing
+                # is ever re-sent through Wyfy.
+                prefix = (
+                    "own_provider_failed"
+                    if reason.startswith("provider failed")
+                    else "own_provider_unavailable"
+                )
+                await self._abort_own(campaign, f"{prefix}: {reason}", reason)
+                return {"requeue": None, "reason": prefix}
+            own = self.own_sender_factory(own_row)
         claimed = await self.repository.claim_batch(campaign.id, SEND_BATCH_SIZE, now)
         await self.repository.commit()
         snapshot = campaign.template_snapshot or {}
         transient = 0
-        for recipient in claimed:
-            outcome = await self._send_one(campaign, channel, snapshot, recipient)
+        for index, recipient in enumerate(claimed):
+            try:
+                outcome = await self._send_one(
+                    campaign, channel, snapshot, recipient, own=own
+                )
+            except _OwnProviderTripped as trip:
+                await self._trip_own(
+                    campaign,
+                    own_row,
+                    trip.reason,
+                    unsent_claimed=[r.id for r in claimed[index:]],
+                )
+                return {"requeue": None, "reason": "own_provider_failed"}
             if outcome == "transient":
                 transient += 1
             await self.repository.commit()
@@ -2381,6 +2886,8 @@ class MarketingService:
         channel: Channel,
         snapshot: dict[str, Any],
         recipient: MarketingCampaignRecipient,
+        *,
+        own: OwnSenders | None = None,
     ) -> str:
         now = self._now()
         # Cancel takes effect between messages.
@@ -2413,12 +2920,22 @@ class MarketingService:
             guest_name=guest.display_name if guest else None,
             token=recipient.unsubscribe_token,
         )
-        await self.rate_limiter.acquire(channel)
+        await self.rate_limiter.acquire(
+            channel,
+            own_organization_id=campaign.organization_id if own else None,
+            own_rate=self.settings.marketing_own_rate_per_sec,
+        )
         try:
             result, preview = await self._deliver(
-                channel, snapshot, values, recipient.address or ""
+                channel, snapshot, values, recipient.address or "", own=own
             )
         except SendError as exc:
+            if own is not None:
+                exc.message = own.scrubber(exc.message) or ""
+                if exc.auth:
+                    # §12.1 row 2: the venue's account refused our
+                    # credentials. Stop; nothing goes through Wyfy.
+                    raise _OwnProviderTripped(exc.message) from exc
             if not exc.permanent and recipient.attempt_count < SEND_MAX_ATTEMPTS:
                 await self.repository.update_recipient(
                     recipient.id,
@@ -2450,6 +2967,7 @@ class MarketingService:
             recipient.id,
             status=RecipientStatus.SUBMITTED.value,
             provider=result.provider,
+            provider_source="own" if own is not None else "wyfy",
             provider_message_id=result.message_id,
             submitted_at=now,
             rendered_preview=preview,
@@ -2489,8 +3007,59 @@ class MarketingService:
             return SkipReason.SUPPRESSED.value
         return None
 
+    async def _abort_own(
+        self,
+        campaign: MarketingCampaign,
+        last_error: str,
+        reason: str,
+        *,
+        unsent_claimed: list[uuid.UUID] | None = None,
+    ) -> None:
+        await self.repository.fail_unsent_recipients(
+            campaign.id,
+            error_code="own_provider_failed",
+            error_message=reason,
+            claimed_ids=unsent_claimed or [],
+        )
+        await self._finalize(campaign, last_error=last_error)
+        await self.repository.commit()
+
+    async def _trip_own(
+        self,
+        campaign: MarketingCampaign,
+        row: Any,
+        reason: str,
+        *,
+        unsent_claimed: list[uuid.UUID],
+    ) -> None:
+        """Auth-class error from the venue's own provider: trip the row to
+        ``failed`` once (compare-and-set), fail the current and every
+        remaining recipient with ``own_provider_failed``, finalize. Other
+        campaigns on the row fail at their next batch."""
+        tripped = await self.repository.trip_provider(row.id, reason)
+        if tripped:
+            await self._audit(
+                None,
+                AuditAction.MARKETING_PROVIDER_TRIPPED,
+                entity_type="org_marketing_provider",
+                entity_id=row.id,
+                organization_id=campaign.organization_id,
+                description=f"Own {row.channel} provider failed authentication",
+                metadata={"campaign_id": str(campaign.id)},
+            )
+        await self._abort_own(
+            campaign,
+            f"own_provider_failed: {reason}",
+            reason,
+            unsent_claimed=unsent_claimed,
+        )
+
     async def _finalize(
-        self, campaign: MarketingCampaign, *, reason_if_failed: str | None = None
+        self,
+        campaign: MarketingCampaign,
+        *,
+        reason_if_failed: str | None = None,
+        last_error: str | None = None,
     ) -> None:
         await self.repository.refresh(campaign)
         if campaign.status != CampaignStatus.SENDING.value:
@@ -2498,12 +3067,16 @@ class MarketingService:
         now = self._now()
         if campaign.count_submitted > 0:
             data = {"status": CampaignStatus.SENT.value, "completed_at": now}
+            if last_error:
+                data["last_error"] = last_error[:500]
         else:
             data = {
                 "status": CampaignStatus.FAILED.value,
                 "completed_at": now,
                 "last_error": (
-                    reason_if_failed or "No message was accepted by the provider"
+                    last_error
+                    or reason_if_failed
+                    or "No message was accepted by the provider"
                 )[:500],
             }
         await self.repository.update_campaign_cas(

@@ -99,6 +99,10 @@ class PermissionModule(StrEnum):
     # bulk-messaging guests' personal contacts is a bigger act than editing
     # a portal banner and needs its own grant (``marketing.execute``).
     MARKETING = "marketing"
+    # Guest Marketing bring-your-own providers (spec §12.3): who may see and
+    # change a venue's own SMS/WhatsApp/email credentials. Organization-level
+    # only -- never grantable at a location.
+    MARKETING_PROVIDERS = "marketing_providers"
     RADIUS = "radius"
     WIREGUARD = "wireguard"
     FIREWALL = "firewall"
@@ -955,6 +959,12 @@ class AuditAction(StrEnum):
     MARKETING_CAMPAIGN_TEST_SENT = "marketing_campaign_test_sent"
     MARKETING_CONSENT_STAFF_OPT_OUT = "marketing_consent_staff_opt_out"
     MARKETING_PORTAL_CONSENT_UPDATED = "marketing_portal_consent_updated"
+    MARKETING_PROVIDER_UPDATED = "marketing_provider_updated"
+    MARKETING_PROVIDER_DELETED = "marketing_provider_deleted"
+    MARKETING_PROVIDER_VERIFIED = "marketing_provider_verified"
+    MARKETING_PROVIDER_ENABLED = "marketing_provider_enabled"
+    MARKETING_PROVIDER_TRIPPED = "marketing_provider_tripped"
+    MARKETING_PROVIDER_TEMPLATES_SYNCED = "marketing_provider_templates_synced"
 
     # DNS Management domain events -- written through this same table by
     # ``app.domains.dns.service.DnsService`` via the same narrow

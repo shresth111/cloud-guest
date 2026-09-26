@@ -56,11 +56,17 @@ class SendError(Exception):
         *,
         permanent: bool,
         suppress_reason: str | None = None,
+        auth: bool = False,
     ) -> None:
         self.code = code
         self.message = message[:500]
-        self.permanent = permanent
+        self.permanent = permanent or auth
         self.suppress_reason = suppress_reason
+        # An account/credential failure (HTTP 401/403, Meta 190, SMTP 535,
+        # SES InvalidClientTokenId/AccessDenied, Ping4SMS "invalid user").
+        # For an own provider this trips the row to `failed` and stops the
+        # campaign (spec §12.1) -- nothing is ever re-sent through Wyfy.
+        self.auth = auth
         super().__init__(f"{code}: {message}")
 
 
@@ -70,12 +76,45 @@ def _classify_http_error(provider: str, exc: Exception) -> SendError:
         body = exc.response.text[:300]
         if code == 429 or code >= 500:
             return SendError(f"{provider}_http_{code}", body, permanent=False)
+        if code in (401, 403):
+            return SendError(
+                "provider_auth_failed",
+                f"HTTP {code}: {body}",
+                permanent=True,
+                auth=True,
+            )
         return SendError("provider_rejected", f"HTTP {code}: {body}", permanent=True)
     if isinstance(exc, httpx.TimeoutException | httpx.TransportError):
         return SendError(
             "provider_timeout", str(exc) or "transport error", permanent=False
         )
     return SendError("provider_error", str(exc), permanent=False)
+
+
+_SES_AUTH_CODES = frozenset(
+    {
+        "InvalidClientTokenId",
+        "AccessDenied",
+        "AccessDeniedException",
+        "SignatureDoesNotMatch",
+        "UnrecognizedClientException",
+        "AccountSendingPausedException",
+    }
+)
+
+
+def is_email_auth_error(exc: BaseException) -> bool:
+    """SMTP 535/534/530 (``SMTPAuthenticationError``) or an SES credential
+    or account error."""
+    import smtplib
+
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = (response.get("Error") or {}).get("Code")
+        return code in _SES_AUTH_CODES
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +208,10 @@ class Ping4SmsMarketingSender:
             code = int(text)
             if code in self._ERROR_CODES:
                 name, bad_number = self._ERROR_CODES[code]
+                if code == 101:  # "Invalid user": the API key is wrong
+                    raise SendError(
+                        name, f"ping4sms error {code}", permanent=True, auth=True
+                    )
                 # Account/config errors are permanent for this message too
                 # (retrying cannot fix a wrong route), but only a bad number
                 # is suppressed.
@@ -329,6 +372,10 @@ class ProviderBackedEmailSender:
             # smtplib.SMTPRecipientsRefused / SES MessageRejected are
             # hard rejects; everything else is retried.
             name = type(exc).__name__
+            if is_email_auth_error(exc):
+                raise SendError(
+                    "provider_auth_failed", text or name, permanent=True, auth=True
+                ) from exc
             if name in {"SMTPRecipientsRefused", "MessageRejected"}:
                 raise SendError(
                     "hard_bounce", text, permanent=True, suppress_reason="hard_bounce"

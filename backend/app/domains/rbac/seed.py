@@ -196,6 +196,9 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # Own-provider credentials (spec §12.3): read the masked view, or manage
+    # (create/update/delete/verify/sync). Two keys only, by design.
+    PermissionModule.MARKETING_PROVIDERS: (_A.READ, _A.MANAGE),
     PermissionModule.RADIUS: (
         _A.CREATE,
         _A.READ,
@@ -602,6 +605,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.VOUCHER: "Voucher",
     PermissionModule.CAMPAIGNS: "Campaigns",
     PermissionModule.MARKETING: "Marketing",
+    PermissionModule.MARKETING_PROVIDERS: "Marketing Providers",
     PermissionModule.RADIUS: "Radius",
     PermissionModule.WIREGUARD: "WireGuard",
     PermissionModule.FIREWALL: "Firewall",
@@ -669,6 +673,7 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     PermissionModule.VOUCHER: ScopeType.LOCATION,
     PermissionModule.CAMPAIGNS: ScopeType.LOCATION,
     PermissionModule.MARKETING: ScopeType.LOCATION,
+    PermissionModule.MARKETING_PROVIDERS: ScopeType.ORGANIZATION,
     PermissionModule.RADIUS: ScopeType.ROUTER,
     PermissionModule.WIREGUARD: ScopeType.ROUTER,
     PermissionModule.FIREWALL: ScopeType.ROUTER,
@@ -1009,6 +1014,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.ORGANIZATION,
         default_level=_L.OPERATE,
         overrides={
+            # Own-provider credentials are the venue org's own business (MVP).
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ORGANIZATIONS: _L.FULL,
             _M.LOCATIONS: _L.FULL,
             _M.ROUTERS: _L.FULL,
@@ -1052,6 +1059,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.ORGANIZATION,
         default_level=_L.OPERATE,
         overrides={
+            # Own-provider credentials are the venue org's own business (MVP).
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROLES: _L.OPERATE,
             _M.BILLING: _L.READ,
             _M.SYSTEM_SETTINGS: _L.NONE,
@@ -1125,6 +1134,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.ORGANIZATION,
         default_level=_L.OPERATE,
         overrides={
+            # FULL, not the OPERATE default: OPERATE excludes MANAGE, and
+            # managing the org's own providers is this role's job.
+            _M.MARKETING_PROVIDERS: _L.FULL,
             _M.ORGANIZATIONS: _L.READ,
             _M.PERMISSIONS: _L.READ,
             _M.ROLES: _L.READ,
@@ -1158,6 +1170,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.FULL,
             _M.ROUTER_PROVISIONING: _L.FULL,
             _M.PROVISIONING_ENGINE: _L.FULL,
@@ -1240,6 +1254,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             # The posture surface itself.
             _M.SECURITY: _L.FULL,
             # The two enforcement halves of a security decision. Blocking a
@@ -1301,6 +1317,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.OPERATE,
             _M.WIREGUARD: _L.OPERATE,
             _M.FIREWALL: _L.OPERATE,
@@ -1367,6 +1385,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.LOCATIONS: _L.OPERATE,
             _M.POLICY: _L.OPERATE,
             _M.NOTIFICATIONS: _L.OPERATE,
@@ -1387,6 +1407,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.LOCATIONS: _L.OPERATE,
             _M.GUEST_WIFI: _L.OPERATE,
             _M.GUEST_USERS: _L.OPERATE,
@@ -1423,6 +1445,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.OPERATE,
@@ -1443,6 +1467,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.GUEST_USERS: _L.READ,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.READ,
@@ -1524,6 +1550,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.GUEST_WIFI: _L.OPERATE,
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,

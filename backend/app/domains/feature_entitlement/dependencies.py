@@ -19,7 +19,7 @@ from app.domains.billing.service import (
     LicenseService,
     SuperAdminBillingDashboardService,
 )
-from app.domains.marketing.repository import MarketingRepository
+from app.domains.marketing.repository import ByoCampaignLockHook, MarketingRepository
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
@@ -57,6 +57,9 @@ def get_addon_service(
         overrides=overrides,
         campaign_hooks={
             PlanFeatureKey.GUEST_MARKETING.value: MarketingRepository(db),
+            PlanFeatureKey.GUEST_MARKETING_BYO.value: ByoCampaignLockHook(
+                MarketingRepository(db)
+            ),
         },
         user_names=SqlUserNameLookup(db),
         audit_writer=audit_repository,
