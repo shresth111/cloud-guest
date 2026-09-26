@@ -205,13 +205,17 @@ def _extend(repo) -> None:
         return sum(
             1
             for r in repo.recipients.values()
-            if r.campaign_id == campaign_id and r.status == RecipientStatus.SENDING.value
+            if r.campaign_id == campaign_id
+            and r.status == RecipientStatus.SENDING.value
         )
 
     async def skip_pending_recipients(campaign_id, reason):
         count = 0
         for r in repo.recipients.values():
-            if r.campaign_id == campaign_id and r.status == RecipientStatus.PENDING.value:
+            if (
+                r.campaign_id == campaign_id
+                and r.status == RecipientStatus.PENDING.value
+            ):
                 r.status = RecipientStatus.SKIPPED.value
                 r.skip_reason = reason
                 count += 1
@@ -305,7 +309,9 @@ def _rig(world=None) -> Rig:
     prices = FakePriceRepository()
     hook = Hook()
     clock = [NOW]
-    return Rig(world, ledger, prices, _credits(ledger, prices, hook, clock), hook, clock)
+    return Rig(
+        world, ledger, prices, _credits(ledger, prices, hook, clock), hook, clock
+    )
 
 
 async def _create(rig: Rig, *, channel=Channel.EMAIL, template=None) -> uuid.UUID:
@@ -349,7 +355,9 @@ def _add_guest(rig: Rig, name: str, *, days_ago: int = 0) -> None:
     )
     repo.guests[guest.id] = guest
     repo.visits.add((guest.id, next(iter(repo.locations))))
-    repo.consents[(guest.id, "email")] = _row(status="opted_in", source="captive_portal")
+    repo.consents[(guest.id, "email")] = _row(
+        status="opted_in", source="captive_portal"
+    )
 
 
 # The default world has two reachable email guests (a1_in, a2_in); email
@@ -373,7 +381,11 @@ async def test_schedule_snapshots_the_price_and_reserves_the_audience() -> None:
     )
     assert detail["status"] == "scheduled"
     assert detail["credits"] == {
-        "price_snapshot": {"channel": "email", "unit": "message", "unit_price_minor": 5},
+        "price_snapshot": {
+            "channel": "email",
+            "unit": "message",
+            "unit_price_minor": 5,
+        },
         "reserved_minor": 10,
         "debited_minor": 0,
         "released_minor": 0,
@@ -412,11 +424,15 @@ async def test_unschedule_releases_everything_and_reschedule_reserves_afresh() -
     campaign_id = await _create(rig)
     service = rig.service()
     at = NOW + timedelta(hours=3)
-    await service.schedule(_scope(ORG_A), campaign_id, scheduled_at=at, idempotency_key="k-one-1")
+    await service.schedule(
+        _scope(ORG_A), campaign_id, scheduled_at=at, idempotency_key="k-one-1"
+    )
     await service.unschedule(_scope(ORG_A), campaign_id)
     assert rig.ledger.outstanding(campaign_id) == 0
     assert rig.world.repo.campaigns[campaign_id].price_snapshot is None
-    await service.schedule(_scope(ORG_A), campaign_id, scheduled_at=at, idempotency_key="k-two-2")
+    await service.schedule(
+        _scope(ORG_A), campaign_id, scheduled_at=at, idempotency_key="k-two-2"
+    )
     keys = [e.idempotency_key for e in rig.ledger.rows_for(campaign_id)]
     assert keys == [
         f"reserve:{campaign_id}:0",
@@ -431,8 +447,7 @@ async def test_unschedule_releases_everything_and_reschedule_reserves_afresh() -
 # ============================================================================
 
 
-async def test_a_finished_campaign_debits_each_accepted_recipient_and_nets_to_zero(
-) -> None:
+async def test_a_finished_campaign_debits_each_accepted_and_nets_to_zero() -> None:
     rig = _rig()
     await rig.topup(1_000)
     service = rig.service()
@@ -603,8 +618,7 @@ async def test_a_cancel_between_batches_releases_everything_unsent() -> None:
 # ============================================================================
 
 
-async def test_dispatch_extends_at_the_snapshot_price_and_caps_what_it_cannot_cover(
-) -> None:
+async def test_dispatch_extends_at_the_snapshot_price_and_caps_the_rest() -> None:
     rig = _rig()
     await rig.topup(15)  # 3 recipients at 5
     campaign_id = await _create(rig)
@@ -822,15 +836,12 @@ def test_sms_units_use_the_real_unsubscribe_link_budget_not_30() -> None:
     # A long review link is budgeted at its real length too.
     body2 = ("x" * 215) + " {{review_link}} {{unsubscribe_link}}"
     long_review = "https://g.page/r/" + "a" * 60
-    assert (
-        units_per_recipient_max(
-            Channel.SMS,
-            {"sms_body": body2, "review_link": long_review},
-            unsubscribe_link_budget=budget,
-        )
-        > units_per_recipient_max(
-            Channel.SMS, {"sms_body": body2}, unsubscribe_link_budget=budget
-        )
+    assert units_per_recipient_max(
+        Channel.SMS,
+        {"sms_body": body2, "review_link": long_review},
+        unsubscribe_link_budget=budget,
+    ) > units_per_recipient_max(
+        Channel.SMS, {"sms_body": body2}, unsubscribe_link_budget=budget
     )
 
 
@@ -851,7 +862,9 @@ async def test_sms_debit_is_the_rendered_segments_at_the_snapshot_price() -> Non
         whatsapp=None,
         email=None,
         statuses={
-            Channel.SMS: ChannelStatus(Channel.SMS, True, "exotel", ChannelMode.LIVE, None),
+            Channel.SMS: ChannelStatus(
+                Channel.SMS, True, "exotel", ChannelMode.LIVE, None
+            ),
             Channel.WHATSAPP: ChannelStatus(
                 Channel.WHATSAPP, False, None, ChannelMode.LOGGING, "off"
             ),
@@ -874,7 +887,9 @@ async def test_sms_debit_is_the_rendered_segments_at_the_snapshot_price() -> Non
     for key in ("a1_in", "a2_in"):
         guest = repo.guests[rig.world.guest_ids[key]]
         guest.identifier = "+9198" + str(abs(hash(key)))[:8].ljust(8, "1")
-        repo.consents[(guest.id, "sms")] = _row(status="opted_in", source="captive_portal")
+        repo.consents[(guest.id, "sms")] = _row(
+            status="opted_in", source="captive_portal"
+        )
 
     async def _entitled(org):
         return True
@@ -986,9 +1001,9 @@ async def test_customer_credits_payload_carries_prices_and_byo_channels() -> Non
     service, *_ = credits_service()
 
     async def pricing(org, platform):
-        return {"email": {"unit": "message", "unit_price_minor": 5, "source": "platform"}}, [
-            "sms"
-        ]
+        return {
+            "email": {"unit": "message", "unit_price_minor": 5, "source": "platform"}
+        }, ["sms"]
 
     service.pricing = pricing
     payload = await service.customer_balance(ORG_A)
