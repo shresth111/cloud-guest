@@ -51,6 +51,7 @@ from .constants import (
     TASK_RUN_INVOICE_OVERDUE_SWEEP,
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
+from .credits_constants import TASK_RECONCILE_CREDIT_WALLETS
 from .dependencies import build_payment_gateway
 from .renewal_service import RenewalService, RenewalSweepReport
 from .repository import (
@@ -238,4 +239,86 @@ def run_invoice_overdue_sweep() -> dict[str, object]:
     return {"overdue_invoice_ids": overdue_ids}
 
 
-__all__ = ["run_subscription_renewal_sweep", "run_invoice_overdue_sweep"]
+# ============================================================================
+# Prepaid credits: nightly reconciliation (spec §13.2)
+# ============================================================================
+
+
+async def _send_reconciliation_alert(subject: str, body: str) -> dict[str, int]:
+    """Platform alert for a ledger mismatch: the same two destinations the
+    monitoring engine's platform copies use (``platform_alert_emails`` and
+    ``platform_alert_slack_webhook_url``). Each is best-effort and isolated;
+    the ERROR log line already written is the record that always exists."""
+    from app.domains.notification.slack import HttpxSlackWebhookSender
+
+    settings = get_settings()
+    sent = {"email": 0, "slack": 0}
+    recipients = settings.platform_alert_email_list
+    if recipients:
+        provider = get_configured_email_provider(settings)
+        for address in recipients:
+            try:
+                await provider.send(address, subject, body)
+                sent["email"] += 1
+            except Exception as exc:  # noqa: BLE001 -- one address never blocks the rest
+                logger.warning(
+                    "credit_reconciliation_alert_email_failed",
+                    extra={"error_type": type(exc).__name__},
+                )
+    webhook = settings.platform_alert_slack_webhook_url.strip()
+    if webhook:
+        try:
+            await HttpxSlackWebhookSender(
+                webhook, timeout_seconds=settings.slack_webhook_timeout_seconds
+            ).send(f"*{subject}*\n{body}")
+            sent["slack"] += 1
+        except Exception as exc:  # noqa: BLE001 -- the log line is the record
+            logger.warning(
+                "credit_reconciliation_alert_slack_failed",
+                extra={"error_type": type(exc).__name__},
+            )
+    if not recipients and not webhook:
+        logger.error(
+            "credit_reconciliation_alert_unrouted",
+            extra={"reason": "no platform_alert_emails or Slack webhook configured"},
+        )
+    return sent
+
+
+async def _run_credit_reconciliation_async() -> dict[str, object]:
+    from .credits_repository import CreditRepository
+    from .credits_service import (
+        format_reconciliation_alert,
+        reconcile_credit_wallets,
+    )
+
+    async with SessionLocal() as session:
+        # Read-only: nothing is written, so nothing is committed.
+        report = await reconcile_credit_wallets(CreditRepository(session))
+        await session.rollback()
+    alerts: dict[str, int] = {"email": 0, "slack": 0}
+    if not report.ok:
+        subject, body = format_reconciliation_alert(report)
+        alerts = await _send_reconciliation_alert(subject, body)
+    return {
+        "ok": report.ok,
+        "wallet_mismatches": len(report.wallet_mismatches),
+        "campaign_mismatches": len(report.campaign_mismatches),
+        "alerts_sent": alerts,
+    }
+
+
+@celery_app.task(name=TASK_RECONCILE_CREDIT_WALLETS)
+def reconcile_credit_wallets_task() -> dict[str, object]:
+    """Beat-scheduled nightly (``billing-reconcile-credit-wallets``). Never
+    corrects anything: a human investigates and posts a Master adjustment."""
+    result = run_celery_task(_run_credit_reconciliation_async())
+    logger.info("billing_task_reconcile_credit_wallets_completed", extra=result)
+    return result
+
+
+__all__ = [
+    "reconcile_credit_wallets_task",
+    "run_invoice_overdue_sweep",
+    "run_subscription_renewal_sweep",
+]

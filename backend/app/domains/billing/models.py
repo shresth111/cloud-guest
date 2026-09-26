@@ -69,7 +69,9 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -1250,7 +1252,166 @@ class OrganizationFeatureOverride(BaseModel):
         )
 
 
+class CreditWallet(BaseModel):
+    """One organization's prepaid credit balance for one ``bucket`` (§13.2).
+
+    Two buckets of money, both integer minor units (100 minor = 1 credit):
+
+    * ``available_minor`` -- spendable now;
+    * ``reserved_minor`` -- held for an in-flight campaign. Only that
+      campaign's own debits and releases can consume it; test sends, other
+      campaigns and Master negative adjustments draw on ``available_minor``
+      only.
+
+    Both carry a ``CHECK (>= 0)``, so even a service bug cannot produce an
+    overdraft: the write fails instead. The row is only ever changed inside
+    ``credits_service.CreditWalletService``, under ``SELECT ... FOR UPDATE``,
+    in the same transaction as the ledger row that explains the change --
+    so ``available_minor == SUM(ledger.delta_available_minor)`` holds at
+    every commit, which the nightly reconciliation checks.
+
+    Created lazily at 0 on the first write. Credits never expire.
+    """
+
+    __tablename__ = "credit_wallets"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    bucket: Mapped[str] = mapped_column(String(20), nullable=False)
+    available_minor: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    reserved_minor: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    low_balance_threshold_minor: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=10_000, server_default="10000"
+    )
+    low_balance_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "bucket", name="uq_credit_wallets_org_bucket"
+        ),
+        CheckConstraint("available_minor >= 0", name="available_nonneg"),
+        CheckConstraint("reserved_minor >= 0", name="reserved_nonneg"),
+        CheckConstraint("low_balance_threshold_minor >= 0", name="threshold_nonneg"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CreditWallet(organization_id={self.organization_id}, "
+            f"bucket={self.bucket}, available_minor={self.available_minor}, "
+            f"reserved_minor={self.reserved_minor})>"
+        )
+
+
+class CreditLedgerEntry(BaseModel):
+    """One movement of credits -- **append-only** (§13.2).
+
+    No UPDATE or DELETE is ever issued: the repository has no method for
+    either, and migration ``0136`` installs a trigger that refuses both at
+    the database (a DELETE is allowed only as the cascade of the owning
+    organization being deleted). Retention never prunes this table.
+
+    ``delta_*`` are signed; ``balance_*_after_minor`` are the wallet's two
+    buckets immediately after this entry, for display and reconciliation.
+    ``idempotency_key`` is unique per ``(organization_id, bucket)``: a retry
+    with the same key returns the existing row instead of charging twice.
+
+    ``campaign_id`` / ``recipient_id`` / ``actor_user_id`` deliberately have
+    no foreign key: an FK with ``ON DELETE SET NULL`` would have to UPDATE
+    this table, which the trigger forbids, and the ledger must outlive the
+    rows it mentions. ``invoice_id`` does reference ``invoices`` (a top-up's
+    GST invoice), with no ``ON DELETE`` action: invoices are never deleted.
+    """
+
+    __tablename__ = "credit_ledger_entries"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    bucket: Mapped[str] = mapped_column(String(20), nullable=False)
+    entry_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    delta_available_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    delta_reserved_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    balance_available_after_minor: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    balance_reserved_after_minor: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    recipient_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    is_test_send: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    unit_price_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    invoice_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("invoices.id"), nullable=True
+    )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "bucket",
+            "idempotency_key",
+            name="uq_credit_ledger_entries_idempotency",
+        ),
+        Index(
+            "ix_credit_ledger_entries_org_bucket_created",
+            "organization_id",
+            "bucket",
+            text("created_at DESC"),
+        ),
+        Index("ix_credit_ledger_entries_campaign_id", "campaign_id"),
+        Index(
+            "uq_credit_ledger_entries_recipient_debit",
+            "recipient_id",
+            unique=True,
+            postgresql_where=text("entry_type = 'debit'"),
+        ),
+        CheckConstraint(
+            "entry_type IN ('topup','reserve','release','debit','refund',"
+            "'adjustment')",
+            name="entry_type_valid",
+        ),
+        CheckConstraint(
+            "balance_available_after_minor >= 0 AND balance_reserved_after_minor >= 0",
+            name="balances_nonneg",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CreditLedgerEntry(organization_id={self.organization_id}, "
+            f"entry_type={self.entry_type}, "
+            f"delta_available_minor={self.delta_available_minor}, "
+            f"delta_reserved_minor={self.delta_reserved_minor})>"
+        )
+
+
 __all__ = [
+    "CreditLedgerEntry",
+    "CreditWallet",
     "OrganizationFeatureOverride",
     "Plan",
     "PlanFeature",

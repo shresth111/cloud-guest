@@ -8,6 +8,12 @@ from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
 from app.domains.auth.router import router as auth_router
+from app.domains.billing.credits_router import (
+    customer_router as marketing_credits_router,
+)
+from app.domains.billing.credits_router import (
+    platform_router as platform_credits_router,
+)
 from app.domains.billing.dependencies import RequireActiveLicenseForWrites
 from app.domains.billing.router import router as billing_router
 from app.domains.branding.router import router as branding_router
@@ -232,6 +238,12 @@ api_v1_router.include_router(marketing_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(marketing_providers_router, dependencies=_PAID_WRITES)
 # Master read-only own-provider view; pinned GLOBAL, platform surface.
 api_v1_router.include_router(marketing_platform_providers_router)
+# Marketing credits (§13): the customer balance/ledger routes live in the
+# billing domain (the ledger is billing's) but carry the same guards as every
+# /marketing route. The Master routes are GLOBAL-pinned platform surface, so
+# not on _PAID_WRITES.
+api_v1_router.include_router(marketing_credits_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(platform_credits_router)
 api_v1_router.include_router(marketing_public_router)
 api_v1_router.include_router(marketing_guest_router)
 api_v1_router.include_router(notification_router, dependencies=_PAID_WRITES)

@@ -1240,7 +1240,11 @@ def _marketing_routes():
     routes = []
     for route in app.routes:
         path = getattr(route, "path", "")
-        if path.startswith("/api/v1/marketing"):
+        # /marketing/credits is billing's (spec §13); its own guards are
+        # asserted in tests/unit/test_marketing_credits.py.
+        if path.startswith("/api/v1/marketing") and not path.startswith(
+            "/api/v1/marketing/credits"
+        ):
             for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
                 routes.append((method, path))
     return routes
