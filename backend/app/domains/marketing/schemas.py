@@ -172,6 +172,9 @@ class TestSendRequest(_Strict):
 class ScheduleRequest(_Strict):
     scheduled_at: datetime | None = None
     idempotency_key: str = Field(min_length=8, max_length=64)
+    # Spec §12.4 (Q11 = Option A): required only when the channel has an own
+    # provider that is not usable and the campaign would go through Wyfy.
+    acknowledge_wyfy_fallback: bool = False
 
 
 class EmptyRequest(_Strict):
@@ -183,3 +186,19 @@ class GuestConsentRequest(_Strict):
     session_id: uuid.UUID
     opt_in: bool
     consent_text_version: str | None = Field(default=None, max_length=50)
+
+
+# -- Bring-your-own providers (spec §12.4) ------------------------------------
+
+
+class ProviderPutRequest(_Strict):
+    provider_type: str | None = Field(default=None, max_length=20)
+    # Per-type fields are validated by providers.normalize_config (unknown
+    # keys are refused there -- the extra="forbid" rule, applied per type).
+    config: dict[str, str | int | bool | None] = Field(default_factory=dict)
+    enabled: bool | None = None
+
+
+class ProviderVerifyRequest(_Strict):
+    test_to: str | None = Field(default=None, max_length=255)
+    template_id: uuid.UUID | None = None

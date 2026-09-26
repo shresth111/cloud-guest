@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -163,9 +164,32 @@ class MarketingTemplate(BaseModel):
     email_subject: Mapped[str | None] = mapped_column(String(150), nullable=True)
     email_preheader: Mapped[str | None] = mapped_column(String(150), nullable=True)
     email_body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # WABA template sync (spec §12.2/§12.3): "wyfy" for the system rows,
+    # "own_waba" for templates synced from a venue's own WhatsApp Business
+    # Account. Synced rows are sent by provider template name + language.
+    whatsapp_source: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    whatsapp_provider_template_name: Mapped[str | None] = mapped_column(
+        String(512), nullable=True
+    )
+    whatsapp_provider_language: Mapped[str | None] = mapped_column(
+        String(15), nullable=True
+    )
+    whatsapp_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_mt_org", "organization_id"),
+        Index(
+            "uq_mt_org_waba_template",
+            "organization_id",
+            "whatsapp_provider_template_name",
+            "whatsapp_provider_language",
+            unique=True,
+            postgresql_where=text(
+                "whatsapp_source = 'own_waba' AND deleted_at IS NULL"
+            ),
+        ),
         Index(
             "uq_mt_system_key",
             "system_key",
@@ -253,6 +277,18 @@ class MarketingCampaign(BaseModel):
     schedule_idempotency_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Provider snapshot (spec §12.1), written at schedule time and the only
+    # thing the dispatcher and send_batch read: never re-resolved, never a
+    # fallback from own to Wyfy or back.
+    provider_source: Mapped[str] = mapped_column(
+        String(8), default="wyfy", server_default="wyfy", nullable=False
+    )
+    provider_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    org_provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("org_marketing_providers.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     __table_args__ = (
         Index("ix_mc_org_status", "organization_id", "status"),
@@ -313,6 +349,7 @@ class MarketingCampaignRecipient(BaseModel):
     )
     skip_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    provider_source: Mapped[str | None] = mapped_column(String(8), nullable=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -344,7 +381,57 @@ class MarketingCampaignRecipient(BaseModel):
     )
 
 
+class OrgMarketingProvider(BaseModel):
+    """A venue organization's own provider account for one channel
+    (spec §12.3). At most one live row per (organization, channel).
+
+    ``config_encrypted`` holds every config field, secret and not,
+    Fernet-encrypted under ``router_encryption_key``; it is decrypted only
+    inside the verify and send code paths and never leaves the process.
+    ``display`` is the only thing any API reads: non-secret fields verbatim
+    plus a ``{set, hint}`` stub per secret."""
+
+    __tablename__ = "org_marketing_providers"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    config_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    display: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), default="unverified", nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    verified_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_omp_org_channel",
+            "organization_id",
+            "channel",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+
 __all__ = [
+    "OrgMarketingProvider",
     "GuestMarketingConsent",
     "GuestMarketingConsentEvent",
     "MarketingCampaign",

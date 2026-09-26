@@ -1398,6 +1398,19 @@ class Settings(BaseSettings):
     marketing_rate_per_sec_sms: float = Field(default=10.0, gt=0)
     marketing_rate_per_sec_whatsapp: float = Field(default=20.0, gt=0)
     marketing_rate_per_sec_email: float = Field(default=10.0, gt=0)
+    # Bring-your-own providers (spec §12). Own providers get their own
+    # per-organization Redis bucket so Wyfy's shared bucket never throttles
+    # a venue paying its own provider.
+    marketing_own_rate_per_sec: float = Field(default=5.0, gt=0)
+    marketing_smtp_blocked_cidrs: str = Field(
+        default="",
+        description=(
+            "Extra comma-separated CIDRs a customer SMTP host may never "
+            "resolve to (the platform's own VPC, if it is not RFC 1918). "
+            "Loopback, private, link-local (incl. 169.254.169.254), CGNAT, "
+            "multicast and reserved ranges are always refused."
+        ),
+    )
 
     demo_request_notify_email: str = Field(
         default="",

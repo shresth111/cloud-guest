@@ -70,6 +70,7 @@ from .constants import (
     BYTES_PER_MB,
     CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT,
     CUSTOMER_DASHBOARD_RECENT_PAYMENTS_LIMIT,
+    FEATURE_REQUIRES,
     MAX_DASHBOARD_REVENUE_TREND_MONTHS,
     MIN_DASHBOARD_REVENUE_TREND_MONTHS,
     USAGE_METRIC_TO_LIMIT_FEATURE,
@@ -824,19 +825,21 @@ class LicenseService:
         overridden, so only ``enabled_features`` is touched. The license
         must still be active for any of this to matter: ``RequireFeature``
         runs ``RequireActiveLicense`` first."""
-        if self.feature_overrides is None:
-            return enabled_features
-        overrides = await self.feature_overrides.list_for_organization(organization_id)
-        if not overrides:
-            return enabled_features
         effective = set(enabled_features)
-        for override in overrides:
-            if override.feature_key not in _BOOLEAN_FEATURE_KEY_VALUES:
-                continue
-            if override.is_enabled:
-                effective.add(override.feature_key)
-            else:
-                effective.discard(override.feature_key)
+        if self.feature_overrides is not None:
+            overrides = await self.feature_overrides.list_for_organization(
+                organization_id
+            )
+            for override in overrides:
+                if override.feature_key not in _BOOLEAN_FEATURE_KEY_VALUES:
+                    continue
+                if override.is_enabled:
+                    effective.add(override.feature_key)
+                else:
+                    effective.discard(override.feature_key)
+        for dependent, prerequisite in FEATURE_REQUIRES.items():
+            if prerequisite.value not in effective:
+                effective.discard(dependent.value)
         return frozenset(effective)
 
     async def get_plan_feature_enabled(

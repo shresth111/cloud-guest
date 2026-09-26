@@ -81,6 +81,7 @@ class Addon(BaseModel):
     plan_value: bool
     override: AddonOverride | None = None
     active_campaign_count: int = 0
+    blocked_by: str | None = None
 
 
 class OrganizationAddonsResponse(BaseModel):

@@ -25,7 +25,7 @@ import uuid
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from redis.asyncio import Redis
 
 from app.common.responses import ApiResponse, build_response
@@ -45,9 +45,12 @@ from .constants import (
 from .dependencies import (
     get_caller_scope,
     get_marketing_service,
+    get_platform_provider_service,
+    get_provider_service,
     get_public_marketing_service,
 )
 from .exceptions import PublicRateLimitedError
+from .provider_service import ProviderService
 from .schemas import (
     AudienceFilter,
     CampaignCreate,
@@ -55,6 +58,8 @@ from .schemas import (
     EmptyRequest,
     GuestConsentRequest,
     PortalConsentUpdate,
+    ProviderPutRequest,
+    ProviderVerifyRequest,
     ScheduleRequest,
     StaffOptOutRequest,
     TemplateCreate,
@@ -66,6 +71,16 @@ from .schemas import (
 from .service import CallerScope, MarketingService
 
 router = APIRouter(prefix="/marketing", tags=["Marketing"])
+# Bring-your-own providers (spec §12.4). Its own router so the guard set can
+# differ: both add-ons, and a permission pinned at ORGANIZATION (never
+# grantable at a location -- a location-confined caller is refused).
+providers_router = APIRouter(
+    prefix="/marketing/providers", tags=["Marketing providers"]
+)
+# Master read-only view, pinned GLOBAL.
+platform_providers_router = APIRouter(
+    prefix="/platform/organizations", tags=["Platform Add-ons"]
+)
 public_router = APIRouter(prefix="/public/marketing", tags=["Marketing (public)"])
 guest_router = APIRouter(prefix="/guest", tags=["Marketing (guest)"])
 
@@ -75,6 +90,15 @@ def _guards(permission: str) -> list[Any]:
         Depends(RequireOrganization),
         Depends(RequireFeature(PlanFeatureKey.GUEST_MARKETING)),
         Depends(RequirePermission(permission, scope=ScopeType.LOCATION)),
+    ]
+
+
+def _provider_guards(permission: str) -> list[Any]:
+    return [
+        Depends(RequireOrganization),
+        Depends(RequireFeature(PlanFeatureKey.GUEST_MARKETING)),
+        Depends(RequireFeature(PlanFeatureKey.GUEST_MARKETING_BYO)),
+        Depends(RequirePermission(permission, scope=ScopeType.ORGANIZATION)),
     ]
 
 
@@ -482,6 +506,7 @@ async def schedule_campaign(
             campaign_id,
             scheduled_at=body.scheduled_at,
             idempotency_key=body.idempotency_key,
+            acknowledge_wyfy_fallback=body.acknowledge_wyfy_fallback,
         ),
     )
 
@@ -646,4 +671,115 @@ async def guest_marketing_consent(
             consent_text_version=body.consent_text_version,
             ip_address=ip,
         ),
+    )
+
+
+# ============================================================================
+# §12.4 Own providers
+# ============================================================================
+
+
+@providers_router.get(
+    "",
+    response_model=ApiResponse[dict],
+    dependencies=_provider_guards("marketing_providers.read"),
+)
+async def list_providers(
+    request: Request,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: ProviderService = Depends(get_provider_service),
+):
+    return _ok(request, "Providers", await service.list_providers(scope))
+
+
+@providers_router.get(
+    "/{channel}",
+    response_model=ApiResponse[dict],
+    dependencies=_provider_guards("marketing_providers.read"),
+)
+async def get_provider(
+    request: Request,
+    channel: Channel,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: ProviderService = Depends(get_provider_service),
+):
+    return _ok(request, "Provider", await service.get_provider(scope, channel))
+
+
+@providers_router.put(
+    "/{channel}",
+    response_model=ApiResponse[dict],
+    dependencies=_provider_guards("marketing_providers.manage"),
+)
+async def put_provider(
+    request: Request,
+    response: Response,
+    channel: Channel,
+    body: ProviderPutRequest,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: ProviderService = Depends(get_provider_service),
+):
+    view, created = await service.put_provider(
+        scope,
+        channel,
+        provider_type=body.provider_type,
+        config=dict(body.config),
+        enabled=body.enabled,
+    )
+    if created:
+        response.status_code = status.HTTP_201_CREATED
+    return _ok(request, "Provider saved", view)
+
+
+@providers_router.delete(
+    "/{channel}",
+    response_model=ApiResponse[dict],
+    dependencies=_provider_guards("marketing_providers.manage"),
+)
+async def delete_provider(
+    request: Request,
+    channel: Channel,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: ProviderService = Depends(get_provider_service),
+):
+    return _ok(
+        request, "Provider removed", await service.delete_provider(scope, channel)
+    )
+
+
+@providers_router.post(
+    "/{channel}/verify",
+    response_model=ApiResponse[dict],
+    dependencies=_provider_guards("marketing_providers.manage"),
+)
+async def verify_provider(
+    request: Request,
+    channel: Channel,
+    body: ProviderVerifyRequest,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: ProviderService = Depends(get_provider_service),
+):
+    return _ok(
+        request,
+        "Verification finished",
+        await service.verify(
+            scope, channel, test_to=body.test_to, template_id=body.template_id
+        ),
+    )
+
+
+@platform_providers_router.get(
+    "/{organization_id}/marketing-providers",
+    response_model=ApiResponse[dict],
+    dependencies=[
+        Depends(RequirePermission("organizations.read", scope=ScopeType.GLOBAL))
+    ],
+)
+async def platform_marketing_providers(
+    request: Request,
+    organization_id: uuid.UUID,
+    service: ProviderService = Depends(get_platform_provider_service),
+):
+    return _ok(
+        request, "Marketing providers", await service.platform_view(organization_id)
     )

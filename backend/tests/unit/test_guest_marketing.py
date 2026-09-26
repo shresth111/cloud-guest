@@ -127,6 +127,25 @@ class FakeRepo:
     async def refresh(self, instance: Any) -> None:
         return None
 
+    providers: dict[Any, Any] = field(default_factory=dict)
+
+    async def list_providers(self, organization_id):
+        return {
+            channel: row
+            for (org, channel), row in self.providers.items()
+            if org == organization_id and not row.is_deleted
+        }
+
+    async def get_provider_by_id(self, organization_id, provider_id):
+        return next(
+            (
+                row
+                for (org, _c), row in self.providers.items()
+                if org == organization_id and row.id == provider_id
+            ),
+            None,
+        )
+
     async def get_organization(self, organization_id):
         return self.organizations.get(organization_id)
 
@@ -1231,7 +1250,7 @@ MARKETING_ROUTES = _marketing_routes()
 
 
 def test_route_table_is_the_contract() -> None:
-    assert len(MARKETING_ROUTES) == 23, MARKETING_ROUTES
+    assert len(MARKETING_ROUTES) == 28, MARKETING_ROUTES  # 23 + 5 BYO provider routes
 
 
 @pytest.mark.parametrize(("method", "path"), MARKETING_ROUTES)
@@ -1304,15 +1323,25 @@ def test_every_marketing_route_declares_the_guards_with_pinned_scope(
         i for i, n in enumerate(names) if n.startswith("RequirePermission")
     )
     assert org_index < feature_index < permission_index
-    feature_closure = {
-        cell.cell_contents for cell in (calls[feature_index].__closure__ or ())
+    features = {
+        str(cell.cell_contents)
+        for i, n in enumerate(names)
+        if n.startswith("RequireFeature")
+        for cell in (calls[i].__closure__ or ())
     }
-    assert "guest_marketing" in {str(v) for v in feature_closure}
+    assert "guest_marketing" in features
     permission_closure = {
         str(cell.cell_contents) for cell in (calls[permission_index].__closure__ or ())
     }
-    assert any(v.startswith("marketing.") for v in permission_closure)
-    assert "location" in permission_closure  # scope=ScopeType.LOCATION pinned
+    if path.startswith("/api/v1/marketing/providers"):
+        # BYO provider routes (spec §12.4): both add-ons, and a permission
+        # pinned at ORGANIZATION -- never satisfiable by a location grant.
+        assert "guest_marketing_byo" in features
+        assert any(v.startswith("marketing_providers.") for v in permission_closure)
+        assert "organization" in permission_closure
+    else:
+        assert any(v.startswith("marketing.") for v in permission_closure)
+        assert "location" in permission_closure  # scope=ScopeType.LOCATION pinned
 
 
 # ============================================================================
