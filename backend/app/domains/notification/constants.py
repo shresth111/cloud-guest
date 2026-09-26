@@ -45,6 +45,10 @@ class NotificationEventType(StrEnum):
     ONBOARDING_LOCATION_PROVISIONED = "onboarding_location_provisioned"
     ONBOARDING_CONTROLLER_ONBOARDED = "onboarding_controller_onboarded"
     ONBOARDING_FAILED = "onboarding_failed"
+    # app.domains.billing.credits_notifications -- the marketing credits
+    # balance fell below the org's alert level (spec §13.5). Once per
+    # crossing, to Organization.contact_email, from MailIdentity.DEFAULT.
+    MARKETING_CREDITS_LOW = "marketing_credits_low"
 
 
 # Every event above that is delivered to Slack rather than to a person.

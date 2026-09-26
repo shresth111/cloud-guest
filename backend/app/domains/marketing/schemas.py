@@ -202,3 +202,41 @@ class ProviderPutRequest(_Strict):
 class ProviderVerifyRequest(_Strict):
     test_to: str | None = Field(default=None, max_length=255)
     template_id: uuid.UUID | None = None
+
+
+# -- Price book (spec §13.7, Master) ------------------------------------------
+
+
+class PlatformPrice(_Strict):
+    channel: Channel
+    unit_price_minor: int = Field(strict=True, ge=0, le=10_000)
+
+
+class PriceBookUpdate(_Strict):
+    prices: list[PlatformPrice] = Field(min_length=1, max_length=3)
+    note: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def _unique(self) -> PriceBookUpdate:
+        channels = [p.channel for p in self.prices]
+        if len(set(channels)) != len(channels):
+            raise ValueError("each channel may appear once")
+        return self
+
+
+class OrgPrice(_Strict):
+    channel: Channel
+    # null clears the override (inherit the platform price).
+    unit_price_minor: int | None = Field(strict=True, ge=0, le=10_000)
+
+
+class OrgPricesUpdate(_Strict):
+    prices: list[OrgPrice] = Field(min_length=1, max_length=3)
+    note: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def _unique(self) -> OrgPricesUpdate:
+        channels = [p.channel for p in self.prices]
+        if len(set(channels)) != len(channels):
+            raise ValueError("each channel may appear once")
+        return self

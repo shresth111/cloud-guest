@@ -55,6 +55,9 @@ from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.live_sessions.router import router as live_sessions_router
 from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
+from app.domains.marketing.pricing_router import (
+    platform_pricing_router as marketing_platform_pricing_router,
+)
 from app.domains.marketing.router import guest_router as marketing_guest_router
 from app.domains.marketing.router import (
     platform_providers_router as marketing_platform_providers_router,
@@ -238,6 +241,8 @@ api_v1_router.include_router(marketing_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(marketing_providers_router, dependencies=_PAID_WRITES)
 # Master read-only own-provider view; pinned GLOBAL, platform surface.
 api_v1_router.include_router(marketing_platform_providers_router)
+# Master price book (spec §13.7); GLOBAL-pinned platform surface.
+api_v1_router.include_router(marketing_platform_pricing_router)
 # Marketing credits (§13): the customer balance/ledger routes live in the
 # billing domain (the ledger is billing's) but carry the same guards as every
 # /marketing route. The Master routes are GLOBAL-pinned platform surface, so

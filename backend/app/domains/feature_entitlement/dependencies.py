@@ -19,7 +19,8 @@ from app.domains.billing.service import (
     LicenseService,
     SuperAdminBillingDashboardService,
 )
-from app.domains.marketing.repository import ByoCampaignLockHook, MarketingRepository
+from app.domains.marketing.credits import SettlingLockHook, build_campaign_credits
+from app.domains.marketing.repository import MarketingRepository
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
@@ -55,10 +56,17 @@ def get_addon_service(
         organizations=organization_service,
         plan_features=license_service,
         overrides=overrides,
+        # Both hooks cancel AND settle credits (spec §13.4 step 6).
         campaign_hooks={
-            PlanFeatureKey.GUEST_MARKETING.value: MarketingRepository(db),
-            PlanFeatureKey.GUEST_MARKETING_BYO.value: ByoCampaignLockHook(
-                MarketingRepository(db)
+            PlanFeatureKey.GUEST_MARKETING.value: SettlingLockHook(
+                MarketingRepository(db), build_campaign_credits(db)
+            ),
+            PlanFeatureKey.GUEST_MARKETING_BYO.value: SettlingLockHook(
+                MarketingRepository(db),
+                build_campaign_credits(db),
+                own_only=True,
+                cancel_reason="byo_locked",
+                last_error="Own-provider add-on was locked",
             ),
         },
         user_names=SqlUserNameLookup(db),
