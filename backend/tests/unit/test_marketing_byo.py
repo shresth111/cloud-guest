@@ -655,11 +655,22 @@ class TestResolution:
             assert email["provider_source"] == expected
             assert email["own_provider_status"] == status
             assert email["byo_entitled"] is byo
+            assert email["own_provider_enabled"] is enabled
+            assert email["requires_fallback_ack"] is (expected == "wyfy" and enabled)
             if expected == "own":
                 assert (
                     email["provider_display_name"] == "Your SMTP (offers@cafe.example)"
                 )
                 assert email["configured"] is True
+
+    async def test_status_without_own_row_reports_nulls(self) -> None:
+        world, _ = _byo_world()
+        payload = await world.service().status(_scope())
+        for channel in payload["channels"]:
+            assert channel["own_provider_enabled"] is None
+            assert channel["own_provider_status"] is None
+            assert channel["requires_fallback_ack"] is False
+            assert channel["provider_source"] == "wyfy"
 
     async def test_unusable_own_provider_needs_acknowledgement(self) -> None:
         world, own_email = _byo_world()

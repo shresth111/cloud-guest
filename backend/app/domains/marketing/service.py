@@ -271,6 +271,13 @@ class ProviderResolution:
         data["provider_source"] = self.source
         data["provider_display_name"] = self.display_name()
         data["own_provider_status"] = self.row.status if self.row is not None else None
+        # Additive (FE request, 2026-09-26): with own_provider_status this is
+        # everything the composer needs to know that acknowledge_wyfy_fallback
+        # will be required (see needs_fallback_ack / deviation #20).
+        data["own_provider_enabled"] = (
+            bool(self.row.enabled) if self.row is not None else None
+        )
+        data["requires_fallback_ack"] = self.needs_fallback_ack
         data["byo_entitled"] = self.byo_entitled
         return data
 
