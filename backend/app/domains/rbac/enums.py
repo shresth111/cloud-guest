@@ -942,6 +942,15 @@ class AuditAction(StrEnum):
     ORGANIZATION_FEATURE_OVERRIDE_SET = "organization_feature_override_set"
     ORGANIZATION_FEATURE_OVERRIDE_CLEARED = "organization_feature_override_cleared"
 
+    # Prepaid credits (billing's ``CreditLedgerEntry``), written by the
+    # GLOBAL-pinned Master ``/platform/organizations/{id}/credits`` routes.
+    # One row per ledger entry a human posted; system entries (reserve,
+    # release, debit) are their own audit trail in the append-only ledger.
+    CREDITS_TOPUP = "credits_topup"
+    CREDITS_ADJUSTED = "credits_adjusted"
+    CREDITS_REFUNDED = "credits_refunded"
+    CREDITS_SETTINGS_UPDATED = "credits_settings_updated"
+
     # Guest Marketing domain events (``app.domains.marketing``).
     MARKETING_TEMPLATE_CREATED = "marketing_template_created"
     MARKETING_TEMPLATE_UPDATED = "marketing_template_updated"

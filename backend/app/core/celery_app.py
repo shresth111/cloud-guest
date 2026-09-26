@@ -115,6 +115,11 @@ from app.domains.billing.constants import (
     TASK_RUN_INVOICE_OVERDUE_SWEEP,
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
+from app.domains.billing.credits_constants import (
+    RECONCILE_CREDIT_WALLETS_HOUR_UTC,
+    RECONCILE_CREDIT_WALLETS_MINUTE_UTC,
+    TASK_RECONCILE_CREDIT_WALLETS,
+)
 from app.domains.campaigns.constants import (
     CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS,
     TASK_SWEEP_CAMPAIGN_STATUS_TRANSITIONS,
@@ -485,6 +490,18 @@ celery_app.conf.update(
         "billing-invoice-overdue-sweep": {
             "task": TASK_RUN_INVOICE_OVERDUE_SWEEP,
             "schedule": crontab(hour=1, minute=0),
+        },
+        # Prepaid credits (spec §13.2): nightly, read-only check that every
+        # wallet equals the sum of its append-only ledger and that no
+        # finished campaign still holds a reservation. A mismatch is logged
+        # (`credit_wallet_mismatch`) and sent to the platform alert
+        # destinations; it is never auto-corrected.
+        "billing-reconcile-credit-wallets": {
+            "task": TASK_RECONCILE_CREDIT_WALLETS,
+            "schedule": crontab(
+                hour=RECONCILE_CREDIT_WALLETS_HOUR_UTC,
+                minute=RECONCILE_CREDIT_WALLETS_MINUTE_UTC,
+            ),
         },
         # Guest Session Engine (Phase 1): the session-timeout sweep --
         # every 5 minutes, shorter than every other cadence in this

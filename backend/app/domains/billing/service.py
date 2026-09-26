@@ -48,6 +48,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -3820,7 +3821,86 @@ class InvoiceService:
         )
         if billing_profile is None:
             raise BillingProfileNotFoundError(organization_id)
+        return await self._issue_invoice_from_lines(
+            organization_id=organization_id,
+            billing_profile=billing_profile,
+            line_items=line_items,
+            status=InvoiceStatus.ISSUED,
+            actor_user_id=None,
+            audit_description=lambda invoice: (
+                f"Invoice {invoice.invoice_number} manually created "
+                f"for organization {organization_id}"
+            ),
+        )
 
+    async def generate_invoice_for_credit_topup(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        amount_paid_minor_inr: int,
+        credits_minor: int,
+        reference: str | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> Invoice:
+        """A GST tax invoice for a prepaid-credits top-up (§13.9).
+
+        Same machinery as ``create_manual_invoice`` -- the organization's
+        ``BillingProfile``, the active ``TaxRate``, the CGST/SGST-vs-IGST
+        split in ``compute_tax_breakdown``, the ``InvoiceNumberCounter``
+        sequence, the frozen ``billing_snapshot`` -- with ``subscription_id``
+        NULL and one line item, "Marketing credits: N credits".
+
+        ``amount_paid_minor_inr`` is the **taxable value actually paid**, in
+        paise, which may differ from ``credits_minor`` (a bonus). GST is
+        charged on it, once, at top-up; consumption is never invoiced again.
+        Issued straight to ``PAID``: the money was received before the
+        operator posted the top-up.
+
+        Raises ``BillingProfileMissingError`` (409 ``billing_profile_missing``)
+        rather than the generic 404, because here the caller can still post
+        the top-up without an invoice. Nothing is committed.
+        """
+        from .credits_constants import MINOR_PER_CREDIT
+        from .credits_exceptions import BillingProfileMissingError
+
+        billing_profile = await self.billing_profile_repository.get_by_organization_id(
+            organization_id
+        )
+        if billing_profile is None:
+            raise BillingProfileMissingError(organization_id)
+        taxable = (Decimal(amount_paid_minor_inr) / Decimal(100)).quantize(
+            Decimal("0.01")
+        )
+        whole, part = divmod(credits_minor, MINOR_PER_CREDIT)
+        credits_label = f"{whole:,}" + (f".{part:02d}" if part else "")
+        description = f"Marketing credits: {credits_label} credits"
+        if reference:
+            description += f" (ref {reference})"
+        return await self._issue_invoice_from_lines(
+            organization_id=organization_id,
+            billing_profile=billing_profile,
+            line_items=[(description, Decimal("1"), taxable)],
+            status=InvoiceStatus.PAID,
+            actor_user_id=actor_user_id,
+            audit_description=lambda invoice: (
+                f"Invoice {invoice.invoice_number} issued for a marketing "
+                f"credits top-up ({credits_label} credits)"
+            ),
+        )
+
+    async def _issue_invoice_from_lines(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        billing_profile: BillingProfile,
+        line_items: list[tuple[str, Decimal, Decimal]],
+        status: InvoiceStatus,
+        actor_user_id: uuid.UUID | None,
+        audit_description: Callable[[Invoice], str],
+    ) -> Invoice:
+        """The shared body of ``create_manual_invoice`` and
+        ``generate_invoice_for_credit_topup``: tax, number, snapshot, items,
+        audit. ``due_date`` is ``now`` for an invoice issued already paid."""
         subtotal = sum(
             (
                 quantity * unit_price
@@ -3870,9 +3950,13 @@ class InvoiceService:
             subscription_id=None,
             payment_id=None,
             invoice_number=invoice_number,
-            status=InvoiceStatus.ISSUED.value,
+            status=status.value,
             issue_date=now,
-            due_date=now + timedelta(days=self.invoice_due_days),
+            due_date=(
+                now
+                if status == InvoiceStatus.PAID
+                else now + timedelta(days=self.invoice_due_days)
+            ),
             subtotal=subtotal,
             cgst_amount=breakdown.cgst_amount,
             sgst_amount=breakdown.sgst_amount,
@@ -3895,13 +3979,10 @@ class InvoiceService:
             )
 
         await self._audit(
-            None,
+            actor_user_id,
             AuditAction.INVOICE_GENERATED,
             invoice,
-            description=(
-                f"Invoice {invoice.invoice_number} manually created "
-                f"for organization {organization_id}"
-            ),
+            description=audit_description(invoice),
         )
         return invoice
 

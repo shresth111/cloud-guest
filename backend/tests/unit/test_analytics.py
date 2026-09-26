@@ -917,6 +917,8 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "marketing-dispatch-due-campaigns",
         "marketing-reap-stuck-recipients",
         "marketing-prune-recipient-addresses",
+        # Prepaid credits: nightly ledger-vs-wallet reconciliation (§13.2).
+        "billing-reconcile-credit-wallets",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
         # Its absence from this set is not a missing schedule entry, it is
