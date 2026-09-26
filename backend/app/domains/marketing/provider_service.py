@@ -32,6 +32,7 @@ from .exceptions import (
     OrganizationNotFoundForMarketingError,
     ProviderConfigInvalidError,
     ProviderEncryptionUnavailableHttpError,
+    ProviderError,
     ProviderNotVerifiedError,
     ProviderSenderConflictError,
     ProviderTypeNotSupportedError,
@@ -55,8 +56,10 @@ from .providers import (
     system_resolver,
     verify_provider,
     vet_smtp_host,
+    waba_template_body,
 )
 from .repository import MarketingRepository
+from .senders import SendError
 from .service import (
     CallerScope,
     MarketingService,
@@ -489,6 +492,117 @@ class ProviderService:
 
         await self.marketing._consume_test_quota(scope.organization_id, 1)
         return send
+
+    # -- WABA sync (BE-11b) --------------------------------------------------
+
+    async def sync_whatsapp_templates(self, scope: CallerScope) -> dict[str, Any]:
+        row = await self._require_row(scope, Channel.WHATSAPP)
+        if row.provider_type != "meta_cloud" or row.status != "verified":
+            raise ProviderNotVerifiedError("Verify your WhatsApp account first")
+        config = decrypt_config(row.config_encrypted, settings=self.settings)
+        senders = self.own_sender_builder(row.provider_type, config)
+        try:
+            remote = await senders.whatsapp.list_templates()
+        except SendError as exc:
+            raise ProviderError(
+                "WhatsApp did not return your templates",
+                detail=scrub(exc.message, config),
+            ) from exc
+        now = self._now()
+        existing = {
+            (t.whatsapp_provider_template_name, t.whatsapp_provider_language): t
+            for t in await self.repository.list_synced_templates(scope.organization_id)
+        }
+        seen: set[tuple[str, str]] = set()
+        created = updated = unavailable = 0
+        synced_rows = []
+        for item in remote:
+            name = str(item.get("name") or "")
+            language = str(item.get("language") or "")
+            if not name or not language:
+                continue
+            approved = (item.get("status") or "").upper() == "APPROVED" and (
+                item.get("category") or ""
+            ).upper() == "MARKETING"
+            body, _unsupported = waba_template_body(item)
+            if not approved or body is None:
+                continue
+            key = (name, language)
+            seen.add(key)
+            current = existing.get(key)
+            if current is None:
+                display_name = await self._free_template_name(
+                    scope.organization_id, f"{name} ({language})"
+                )
+                template = await self.repository.create_template(
+                    organization_id=scope.organization_id,
+                    system_key=None,
+                    name=display_name,
+                    category="custom",
+                    description="Synced from your WhatsApp Business Account",
+                    whatsapp_body=body,
+                    whatsapp_variable_order=[],
+                    whatsapp_approval_status="approved",
+                    whatsapp_source="own_waba",
+                    whatsapp_provider_template_name=name,
+                    whatsapp_provider_language=language,
+                    whatsapp_synced_at=now,
+                    created_by=scope.actor_user_id,
+                )
+                created += 1
+            else:
+                data: dict[str, Any] = {
+                    "whatsapp_approval_status": "approved",
+                    "whatsapp_synced_at": now,
+                }
+                if current.whatsapp_body != body:
+                    data["whatsapp_body"] = body
+                    if placeholder_count(body) != len(
+                        current.whatsapp_variable_order or []
+                    ):
+                        data["whatsapp_variable_order"] = []
+                template = await self.repository.update_template(current, data)
+                updated += 1
+            synced_rows.append(template)
+        for key, template in existing.items():
+            if key in seen or template.whatsapp_approval_status != "approved":
+                continue
+            await self.repository.update_template(
+                template,
+                {"whatsapp_approval_status": "rejected", "whatsapp_synced_at": now},
+            )
+            unavailable += 1
+        await self._audit(
+            scope,
+            AuditAction.MARKETING_PROVIDER_TEMPLATES_SYNCED,
+            row,
+            "WhatsApp templates synced from the venue's WABA",
+            {"created": created, "updated": updated, "marked_unavailable": unavailable},
+        )
+        review_url = await self.marketing._review_url(
+            scope.organization_id, scope.location_id
+        )
+        resolutions = await self.marketing.resolve_providers(scope.organization_id)
+        return {
+            "synced": created + updated,
+            "created": created,
+            "updated": updated,
+            "marked_unavailable": unavailable,
+            "templates": [
+                self.marketing.template_resource(
+                    t, review_url=review_url, resolutions=resolutions
+                )
+                for t in synced_rows
+            ],
+        }
+
+    async def _free_template_name(self, organization_id: uuid.UUID, base: str) -> str:
+        candidate = base[:120]
+        for suffix in ("", " · WhatsApp", " · WhatsApp 2", " · WhatsApp 3"):
+            name = (base[: 120 - len(suffix)] + suffix) if suffix else candidate
+            if not await self.repository.template_name_taken(organization_id, name):
+                return name
+        return f"{base[:80]} · {uuid.uuid4().hex[:8]}"
 
     # -- Master (platform, read-only) --------------------------------------
 

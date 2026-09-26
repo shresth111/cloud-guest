@@ -60,6 +60,7 @@ from .constants import (
     SEND_BATCH_SIZE,
     SEND_MAX_ATTEMPTS,
     STALE_SENDING_MINUTES,
+    TEMPLATE_VARIABLES,
     TEST_SEND_COUNTER_KEY_TEMPLATE,
     WORST_CASE_VARIABLE_LENGTHS,
     CampaignStatus,
@@ -98,6 +99,7 @@ from .exceptions import (
     SessionNotActiveError,
     SmsTooLongError,
     StaleConsentTextError,
+    SyncedTemplateReadOnlyError,
     SystemTemplateReadOnlyError,
     TemplateEmptyError,
     TemplateInUseError,
@@ -1184,6 +1186,8 @@ class MarketingService:
         self, scope: CallerScope, template_id: uuid.UUID, body: TemplateUpdate
     ) -> dict[str, Any]:
         template = await self._require_custom(scope, template_id)
+        if getattr(template, "whatsapp_source", None) == "own_waba":
+            return await self._update_synced_template(scope, template, body)
         if body.whatsapp is not None:
             raise WhatsAppCustomNotSupportedError(
                 "Custom WhatsApp templates are not supported yet"
@@ -1244,6 +1248,61 @@ class MarketingService:
             organization_id=scope.organization_id,
             description=f"Marketing template '{template.name}' updated",
         )
+        review_url = await self._review_url(scope.organization_id, scope.location_id)
+        resolutions = await self.resolve_providers(scope.organization_id)
+        return self.template_resource(
+            template, review_url=review_url, resolutions=resolutions
+        )
+
+    async def _update_synced_template(
+        self, scope: CallerScope, template: MarketingTemplate, body: TemplateUpdate
+    ) -> dict[str, Any]:
+        """A template synced from the venue's WABA: its content is Meta's, so
+        only ``name`` and ``whatsapp.variable_order`` may change (spec §12.4)."""
+        provided = body.model_fields_set - {"version"}
+        whatsapp = body.whatsapp if "whatsapp" in provided else None
+        if provided - {"name", "whatsapp"} or (
+            whatsapp is not None and set(whatsapp) - {"variable_order"}
+        ):
+            raise SyncedTemplateReadOnlyError(
+                "Only the name and the variable mapping of a synced template "
+                "can be changed"
+            )
+        if template.version != body.version:
+            raise VersionConflictError(
+                "This template was changed by someone else",
+                current_version=template.version,
+            )
+        data: dict[str, Any] = {"updated_by": scope.actor_user_id}
+        if "name" in provided and body.name:
+            if await self.repository.template_name_taken(
+                scope.organization_id, body.name, exclude_id=template.id
+            ):
+                raise TemplateNameTakenError("A template with this name already exists")
+            data["name"] = body.name.strip()
+        if whatsapp is not None:
+            order = whatsapp.get("variable_order")
+            if not isinstance(order, list) or not all(
+                isinstance(item, str) for item in order
+            ):
+                raise MarketingValidationError("variable_order must be a list of names")
+            if len(order) != placeholder_count(template.whatsapp_body):
+                raise MarketingValidationError(
+                    "variable_order must map every {{n}} placeholder",
+                    placeholder_count=placeholder_count(template.whatsapp_body),
+                )
+            unknown = sorted(set(order) - TEMPLATE_VARIABLES)
+            if unknown:
+                raise UnknownVariableError("Unknown variables", variables=unknown)
+            data["whatsapp_variable_order"] = order
+        if not await self.repository.update_template_cas(
+            template, expected_version=body.version, data=data
+        ):
+            await self.repository.refresh(template)
+            raise VersionConflictError(
+                "This template was changed by someone else",
+                current_version=template.version,
+            )
         review_url = await self._review_url(scope.organization_id, scope.location_id)
         resolutions = await self.resolve_providers(scope.organization_id)
         return self.template_resource(

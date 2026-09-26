@@ -692,6 +692,22 @@ async def list_providers(
     return _ok(request, "Providers", await service.list_providers(scope))
 
 
+@providers_router.post(
+    "/whatsapp/sync-templates",
+    response_model=ApiResponse[dict],
+    dependencies=_provider_guards("marketing_providers.manage"),
+)
+async def sync_whatsapp_templates(
+    request: Request,
+    body: EmptyRequest | None = None,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: ProviderService = Depends(get_provider_service),
+):
+    return _ok(
+        request, "Templates synced", await service.sync_whatsapp_templates(scope)
+    )
+
+
 @providers_router.get(
     "/{channel}",
     response_model=ApiResponse[dict],

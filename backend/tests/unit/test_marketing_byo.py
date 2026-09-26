@@ -26,6 +26,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from app.domains.marketing.constants import CampaignStatus, Channel, RecipientStatus
@@ -37,11 +38,13 @@ from app.domains.marketing.exceptions import (
     ProviderSenderConflictError,
     ProviderTypeNotSupportedError,
     SmtpHostNotAllowedHttpError,
+    SyncedTemplateReadOnlyError,
 )
 from app.domains.marketing.provider_service import ProviderService
 from app.domains.marketing.providers import (
     PROVIDER_SPECS,
     GuardedSMTP,
+    MetaCloudWhatsAppSender,
     OwnSenders,
     SmtpHostNotAllowedError,
     VerifyCheck,
@@ -49,7 +52,9 @@ from app.domains.marketing.providers import (
     ip_is_blocked,
     secret_hint,
     vet_smtp_host,
+    waba_template_body,
 )
+from app.domains.marketing.schemas import TemplateUpdate
 from app.domains.marketing.senders import ProviderResult, SendError
 from app.domains.marketing.service import MarketingService
 from tests.unit.test_guest_marketing import (
@@ -79,6 +84,7 @@ SECRETS = {
         "access_key_id": "Dk9Fj2Gh5Lz8Xc3Vb0005",
         "secret_access_key": "Nm4Qa7Ws1Ed6Rf9Tg0006",
     },
+    "meta_cloud": {"access_token": "Yh3Uj8Ik2Ol5Pz9Mx0007"},
 }
 PLAIN = {
     "ping4sms": {"route": "2", "sender_id": "CAFEXY", "dlt_entity_id": "1101001"},
@@ -95,12 +101,14 @@ PLAIN = {
         "from_address": "offers@cafe.example",
     },
     "ses": {"region": "ap-south-1", "from_address": "offers@cafe.example"},
+    "meta_cloud": {"phone_number_id": "1234567890", "waba_id": "9876543210"},
 }
 CHANNEL_OF = {
     "ping4sms": Channel.SMS,
     "exotel": Channel.SMS,
     "smtp": Channel.EMAIL,
     "ses": Channel.EMAIL,
+    "meta_cloud": Channel.WHATSAPP,
 }
 
 
@@ -891,13 +899,13 @@ class TestByoAddon:
                 return []
 
         def overrides(*keys):
-            class O:
+            class _Overrides:
                 async def list_for_organization(self, org):
                     return [
                         SimpleNamespace(feature_key=k, is_enabled=True) for k in keys
                     ]
 
-            return O()
+            return _Overrides()
 
         only_byo = LicenseService(
             Licenses(), Plans(), feature_overrides=overrides("guest_marketing_byo")
@@ -1085,6 +1093,7 @@ class TestProviderRbac:
             ("PUT", "/api/v1/marketing/providers/sms"),
             ("DELETE", "/api/v1/marketing/providers/sms"),
             ("POST", "/api/v1/marketing/providers/sms/verify"),
+            ("POST", "/api/v1/marketing/providers/whatsapp/sync-templates"),
         ]:
             response = client.request(
                 method, path, json={}, headers={"X-Organization-Id": str(ORG_A)}
@@ -1157,8 +1166,198 @@ def _mock_client(monkeypatch, handler):
     monkeypatch.setattr(providers_module.httpx, "AsyncClient", factory)
 
 
+class TestMetaCloud:
+    CONFIG = {
+        "phone_number_id": "111",
+        "waba_id": "222",
+        "access_token": "Yh3Uj8Ik2Ol5Pz9Mx0007",
+    }
+
+    async def test_template_send_payload_and_message_id(self, monkeypatch) -> None:
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            seen["auth"] = request.headers["authorization"]
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "messaging_product": "whatsapp",
+                    "messages": [{"id": "wamid.ABC"}],
+                },
+            )
+
+        _mock_client(monkeypatch, handler)
+        sender = MetaCloudWhatsAppSender(self.CONFIG)
+        result = await sender.send_waba_template(
+            "+919876543210",
+            template_name="weekend",
+            language="en_US",
+            parameters=["Riya", "u"],
+        )
+        assert result.message_id == "wamid.ABC"
+        assert seen["url"].endswith("/111/messages")
+        assert seen["body"]["to"] == "919876543210"
+        assert seen["body"]["template"]["components"][0]["parameters"][1] == {
+            "type": "text",
+            "text": "u",
+        }
+
+    async def test_error_190_is_an_auth_failure(self, monkeypatch) -> None:
+        _mock_client(
+            monkeypatch,
+            lambda r: httpx.Response(
+                401,
+                json={
+                    "error": {"message": "Error validating access token", "code": 190}
+                },
+            ),
+        )
+        with pytest.raises(SendError) as excinfo:
+            await MetaCloudWhatsAppSender(self.CONFIG).send_waba_template(
+                "+919876543210", template_name="t", language="en", parameters=[]
+            )
+        assert excinfo.value.auth and excinfo.value.permanent
+
+    async def test_list_templates_follows_paging(self, monkeypatch) -> None:
+        pages = {
+            "first": {
+                "data": [{"name": "a"}],
+                "paging": {"next": "https://graph.facebook.com/next-page"},
+            },
+            "second": {"data": [{"name": "b"}], "paging": {}},
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=pages["second"]
+                if "next-page" in str(request.url)
+                else pages["first"],
+            )
+
+        _mock_client(monkeypatch, handler)
+        names = [
+            t["name"]
+            for t in await MetaCloudWhatsAppSender(self.CONFIG).list_templates()
+        ]
+        assert names == ["a", "b"]
+
+    def test_unsupported_template_shapes_are_skipped(self) -> None:
+        assert (
+            waba_template_body({"components": [{"type": "BODY", "text": "Hi {{1}}"}]})[
+                0
+            ]
+            == "Hi {{1}}"
+        )
+        assert (
+            waba_template_body({"parameter_format": "NAMED", "components": []})[0]
+            is None
+        )
+        assert (
+            waba_template_body(
+                {
+                    "components": [
+                        {"type": "HEADER", "format": "IMAGE"},
+                        {"type": "BODY", "text": "x"},
+                    ]
+                }
+            )[0]
+            is None
+        )
+
+
+class TestWabaSync:
+    async def _world_with_meta(self, remote):
+        world, _ = _byo_world()
+
+        class FakeMeta:
+            async def list_templates(self):
+                return remote
+
+        service = _provider_service(
+            world, own_sender_builder=lambda t, c: OwnSenders(t, whatsapp=FakeMeta())
+        )
+        await service.put_provider(
+            _scope(),
+            Channel.WHATSAPP,
+            provider_type="meta_cloud",
+            config={**PLAIN["meta_cloud"], **SECRETS["meta_cloud"]},
+            enabled=None,
+        )
+        row = await world.repo.get_provider(ORG_A, "whatsapp")
+        row.status, row.enabled = "verified", True
+        return world, service
+
+    async def test_sync_upserts_approved_marketing_templates(self) -> None:
+        remote = [
+            {
+                "name": "weekend",
+                "language": "en",
+                "status": "APPROVED",
+                "category": "MARKETING",
+                "components": [{"type": "BODY", "text": "Hi {{1}}, stop: {{2}}"}],
+            },
+            {
+                "name": "otp",
+                "language": "en",
+                "status": "APPROVED",
+                "category": "AUTHENTICATION",
+                "components": [{"type": "BODY", "text": "{{1}}"}],
+            },
+            {
+                "name": "pending",
+                "language": "en",
+                "status": "PENDING",
+                "category": "MARKETING",
+            },
+        ]
+        world, service = await self._world_with_meta(remote)
+        result = await service.sync_whatsapp_templates(_scope())
+        assert (result["created"], result["updated"], result["marked_unavailable"]) == (
+            1,
+            0,
+            0,
+        )
+        template = result["templates"][0]
+        assert template["whatsapp"]["source"] == "own_waba"
+        assert template["whatsapp"]["provider_template_name"] == "weekend"
+        assert template["sendable"]["whatsapp"] == {
+            "ok": False,
+            "reason": "unsubscribe_link_missing",
+        }
+        # Map the placeholders; now sendable through the own number.
+        row = world.repo.templates[uuid.UUID(template["id"])]
+        mapped = await world.service().update_template(
+            _scope(),
+            row.id,
+            TemplateUpdate(
+                version=row.version,
+                whatsapp={"variable_order": ["guest_name", "unsubscribe_link"]},
+            ),
+        )
+        assert mapped["sendable"]["whatsapp"] == {"ok": True, "reason": None}
+        with pytest.raises(SyncedTemplateReadOnlyError):
+            await world.service().update_template(
+                _scope(), row.id, TemplateUpdate(version=row.version, description="x")
+            )
+        # Removed from the WABA -> marked unavailable on the next sync.
+        remote.clear()
+        again = await service.sync_whatsapp_templates(_scope())
+        assert again["marked_unavailable"] == 1
+        assert row.whatsapp_approval_status == "rejected"
+
+    async def test_sync_requires_verified_meta_row(self) -> None:
+        world, service = await self._world_with_meta([])
+        row = await world.repo.get_provider(ORG_A, "whatsapp")
+        row.status = "unverified"
+        with pytest.raises(ProviderNotVerifiedError):
+            await service.sync_whatsapp_templates(_scope())
+
+
 def test_every_provider_type_has_a_secret_spec() -> None:
-    for (channel, provider_type), spec in PROVIDER_SPECS.items():
+    for (_channel, provider_type), spec in PROVIDER_SPECS.items():
         assert spec.secrets, provider_type
         assert set(spec.secrets) <= set(spec.required)
         assert provider_type in SECRETS

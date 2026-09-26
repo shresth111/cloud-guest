@@ -35,16 +35,19 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 from app.core.config import Settings, get_settings
 
 from .constants import Channel
-from .senders import ProviderResult, SendError
+from .senders import ProviderResult, SendError, _classify_http_error
 
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 10.0
 SMTP_ALLOWED_PORTS = (25, 465, 587, 2525)
 EXOTEL_SUBDOMAINS = ("api.exotel.com", "api.in.exotel.com")
+META_GRAPH_BASE = "https://graph.facebook.com/v21.0"
 HINT_MIN_LENGTH = 12
 
 # ---------------------------------------------------------------------------
@@ -108,6 +111,14 @@ PROVIDER_SPECS: dict[tuple[Channel, str], ProviderSpec] = {
         optional=("from_name", "configuration_set"),
         secrets=("access_key_id", "secret_access_key"),
         sender_field="from_address",
+    ),
+    (Channel.WHATSAPP, "meta_cloud"): ProviderSpec(
+        Channel.WHATSAPP,
+        "meta_cloud",
+        "WhatsApp Cloud API",
+        required=("phone_number_id", "waba_id", "access_token"),
+        secrets=("access_token",),
+        sender_field="display_phone_number",
     ),
 }
 
@@ -582,6 +593,137 @@ class ByoSesEmailSender:
         return ProviderResult(provider=self.provider, message_id=message_id)
 
 
+class MetaCloudWhatsAppSender:
+    """WhatsApp Cloud API (Graph ``POST /{phone_number_id}/messages``, type
+    ``template``). Templates are addressed by name + language from the
+    venue's own WABA; parameters are positional ``{{1}}..{{n}}``."""
+
+    provider = "meta_cloud"
+    _AUTH_CODES = {190, 102, 10, 200}
+    _BAD_NUMBER_CODES = {131026, 131030}
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._config = config
+        self._transport = transport
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=_TIMEOUT_SECONDS,
+            transport=self._transport,
+            headers={"Authorization": f"Bearer {self._config['access_token']}"},
+        )
+
+    def _error(self, response: httpx.Response) -> SendError:
+        try:
+            error = response.json().get("error") or {}
+        except ValueError:
+            error = {}
+        code = int(error.get("code") or 0)
+        message = str(error.get("message") or response.text[:300])
+        if code in self._AUTH_CODES or response.status_code in (401, 403):
+            return SendError(
+                "provider_auth_failed",
+                f"Meta {code}: {message}",
+                permanent=True,
+                auth=True,
+            )
+        if code in self._BAD_NUMBER_CODES:
+            return SendError(
+                "invalid_number",
+                f"Meta {code}: {message}",
+                permanent=True,
+                suppress_reason="invalid_number",
+            )
+        if (
+            response.status_code == 429
+            or response.status_code >= 500
+            or code in (4, 80007, 130429, 131048, 131056)
+        ):
+            return SendError(
+                f"meta_http_{response.status_code}",
+                f"Meta {code}: {message}",
+                permanent=False,
+            )
+        return SendError("provider_rejected", f"Meta {code}: {message}", permanent=True)
+
+    async def get(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        try:
+            async with self._client() as client:
+                response = await client.get(
+                    path if path.startswith("http") else f"{META_GRAPH_BASE}/{path}",
+                    params=params,
+                )
+        except httpx.HTTPError as exc:
+            raise _classify_http_error(self.provider, exc) from exc
+        if response.status_code >= 400:
+            raise self._error(response)
+        return response.json()
+
+    async def send_waba_template(
+        self,
+        phone_e164: str,
+        *,
+        template_name: str,
+        language: str,
+        parameters: list[str],
+    ) -> ProviderResult:
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "to": phone_e164.lstrip("+"),
+            "type": "template",
+            "template": {"name": template_name, "language": {"code": language}},
+        }
+        if parameters:
+            payload["template"]["components"] = [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": p} for p in parameters],
+                }
+            ]
+        try:
+            async with self._client() as client:
+                response = await client.post(
+                    f"{META_GRAPH_BASE}/{self._config['phone_number_id']}/messages",
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            raise _classify_http_error(self.provider, exc) from exc
+        if response.status_code >= 400:
+            raise self._error(response)
+        messages = (response.json() or {}).get("messages") or []
+        message_id = messages[0].get("id") if messages else None
+        if not message_id:
+            raise SendError(
+                "provider_rejected", "Meta returned no message id", permanent=False
+            )
+        return ProviderResult(provider=self.provider, message_id=message_id)
+
+    async def list_templates(self) -> list[dict[str, Any]]:
+        """Every template in the WABA (``GET /{waba_id}/message_templates``,
+        following ``paging.next``)."""
+        out: list[dict[str, Any]] = []
+        url: str | None = f"{self._config['waba_id']}/message_templates"
+        params: dict[str, Any] | None = {
+            "fields": "name,language,status,category,components,parameter_format",
+            "limit": 100,
+        }
+        for _ in range(50):  # hard page cap
+            if url is None:
+                break
+            page = await self.get(url, params)
+            out.extend(page.get("data") or [])
+            url = ((page.get("paging") or {}).get("next")) or None
+            params = None
+        return out
+
+
 @dataclass
 class OwnSenders:
     """The adapter for one own-provider row, typed per channel."""
@@ -589,7 +731,7 @@ class OwnSenders:
     provider_type: str
     sms: Any | None = None
     email: Any | None = None
-    whatsapp: Any | None = None
+    whatsapp: MetaCloudWhatsAppSender | None = None
     # Removes this row's configured values from provider error text before
     # anything is stored or returned.
     scrubber: Callable[[str | None], str | None] = lambda message: message
@@ -638,6 +780,8 @@ def build_own_senders(
         )
     if provider_type == "ses":
         return OwnSenders(provider_type, email=ByoSesEmailSender(config))
+    if provider_type == "meta_cloud":
+        return OwnSenders(provider_type, whatsapp=MetaCloudWhatsAppSender(config))
     raise ValueError(f"unsupported provider type {provider_type!r}")
 
 
@@ -764,6 +908,26 @@ async def verify_provider(
             result.checks.append(
                 VerifyCheck("credentials", False, f"{type(exc).__name__}: {exc}")
             )
+    elif provider_type == "meta_cloud":
+        try:
+            phone = await senders.whatsapp.get(
+                config["phone_number_id"],
+                {"fields": "display_phone_number,verified_name,quality_rating"},
+            )
+            await senders.whatsapp.get(config["waba_id"], {"fields": "id,name"})
+            result.display_phone_number = phone.get("display_phone_number")
+            result.checks.append(
+                VerifyCheck(
+                    "credentials",
+                    True,
+                    f"Number {phone.get('display_phone_number')} "
+                    f"({phone.get('verified_name')}), "
+                    f"quality {phone.get('quality_rating')}",
+                )
+            )
+            result.checks.append(await _test_send_check(test_send))
+        except SendError as exc:
+            result.checks.append(VerifyCheck("credentials", False, exc.message))
     for check in result.checks:
         check.detail = scrub(check.detail, config) or ""
     return result
@@ -785,6 +949,33 @@ def _ses_identity_verified(client, from_address: str) -> bool:  # noqa: ANN001
 # ---------------------------------------------------------------------------
 
 _POSITIONAL = re.compile(r"\{\{(\d+)\}\}")
+
+
+def waba_template_body(template: dict[str, Any]) -> tuple[str | None, str | None]:
+    """(body text, reason it cannot be synced). Only positional-parameter
+    templates whose variables are all in the BODY and whose header, if any,
+    is static text can be sent by this platform."""
+    if (template.get("parameter_format") or "POSITIONAL").upper() != "POSITIONAL":
+        return None, "named parameters are not supported"
+    body: str | None = None
+    for component in template.get("components") or []:
+        kind = (component.get("type") or "").upper()
+        if kind == "BODY":
+            body = component.get("text") or ""
+        elif kind == "HEADER":
+            if (component.get("format") or "TEXT").upper() != "TEXT":
+                return None, "media headers are not supported"
+            if _POSITIONAL.search(component.get("text") or ""):
+                return None, "header variables are not supported"
+        elif kind == "BUTTONS":
+            for button in component.get("buttons") or []:
+                if _POSITIONAL.search(button.get("url") or "") or _POSITIONAL.search(
+                    button.get("text") or ""
+                ):
+                    return None, "button variables are not supported"
+    if body is None:
+        return None, "template has no body"
+    return body, None
 
 
 def placeholder_count(body: str | None) -> int:

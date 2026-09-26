@@ -1250,7 +1250,7 @@ MARKETING_ROUTES = _marketing_routes()
 
 
 def test_route_table_is_the_contract() -> None:
-    assert len(MARKETING_ROUTES) == 28, MARKETING_ROUTES  # 23 + 5 BYO provider routes
+    assert len(MARKETING_ROUTES) == 29, MARKETING_ROUTES  # 23 + 6 BYO provider routes
 
 
 @pytest.mark.parametrize(("method", "path"), MARKETING_ROUTES)
