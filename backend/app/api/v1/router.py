@@ -56,6 +56,10 @@ from app.domains.live_sessions.router import router as live_sessions_router
 from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
 from app.domains.marketing.router import guest_router as marketing_guest_router
+from app.domains.marketing.router import (
+    platform_providers_router as marketing_platform_providers_router,
+)
+from app.domains.marketing.router import providers_router as marketing_providers_router
 from app.domains.marketing.router import public_router as marketing_public_router
 from app.domains.marketing.router import router as marketing_router
 from app.domains.monitored_hardware.router import router as monitored_hardware_router
@@ -200,9 +204,7 @@ api_v1_router.include_router(network_device_router, dependencies=_PAID_WRITES)
 # Two routers, one prefix. The customer/platform CRUD half is a paid
 # feature; the guest-facing portal authorize half must never be, for the
 # reason spelled out in the licence-gating note above.
-api_v1_router.include_router(
-    network_integration_router, dependencies=_PAID_WRITES
-)
+api_v1_router.include_router(network_integration_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(network_integration_portal_router)
 # Customer-facing (organization-scoped), read-only controller device
 # inventory -- deliberately NOT on the GLOBAL network_integration_router,
@@ -233,6 +235,9 @@ api_v1_router.include_router(campaigns_router, dependencies=_PAID_WRITES)
 # state, and the opt-in endpoint refuses on its own when the org is not
 # entitled.
 api_v1_router.include_router(marketing_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(marketing_providers_router, dependencies=_PAID_WRITES)
+# Master read-only own-provider view; pinned GLOBAL, platform surface.
+api_v1_router.include_router(marketing_platform_providers_router)
 # Marketing credits (§13): the customer balance/ledger routes live in the
 # billing domain (the ledger is billing's) but carry the same guards as every
 # /marketing route. The Master routes are GLOBAL-pinned platform surface, so

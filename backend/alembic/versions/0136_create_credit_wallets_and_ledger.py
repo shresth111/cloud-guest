@@ -15,13 +15,11 @@ zero balance, and the wallet is created at 0 on its first write.
   DELETE except the cascade of the owning organization being deleted (the
   organization row is already gone when the cascade reaches the ledger).
 
-Numbered 0136 because BYO providers (branch ``feat/marketing-byo``) claims
-``0135_create_org_marketing_providers``. **Until that merges this revises
-0134; re-point ``down_revision`` at 0135 once it is on main** (CI asserts a
-single head).
+Revises 0135 (BYO providers, PR #312), so this merges after it with a
+single alembic head.
 
 Revision ID: 0136_create_credit_wallets_and_ledger
-Revises: 0134_create_guest_marketing_tables
+Revises: 0135_create_org_marketing_providers
 Create Date: 2026-09-26
 """
 
@@ -31,7 +29,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "0136_create_credit_wallets_and_ledger"
-down_revision = "0134_create_guest_marketing_tables"
+down_revision = "0135_create_org_marketing_providers"
 branch_labels = None
 depends_on = None
 

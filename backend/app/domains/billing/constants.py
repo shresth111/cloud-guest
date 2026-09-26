@@ -146,6 +146,10 @@ class PlanFeatureKey(StrEnum):
     # Distinct from ``CAMPAIGNS``, which is the captive-portal content
     # feature and is on by default.
     GUEST_MARKETING = "guest_marketing"
+    # Bring-your-own marketing providers (spec §12): a separate paid add-on,
+    # off by default, only effective while GUEST_MARKETING is effective
+    # (see FEATURE_REQUIRES below).
+    GUEST_MARKETING_BYO = "guest_marketing_byo"
 
 
 class PlanFeatureType(StrEnum):
@@ -218,6 +222,7 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.EXPORTS,
         PlanFeatureKey.ISP_FAILOVER,
         PlanFeatureKey.GUEST_MARKETING,
+        PlanFeatureKey.GUEST_MARKETING_BYO,
     }
 )
 
@@ -227,8 +232,16 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
 # an override silently diverging from a customer's plan is a billing act,
 # and each add-on that can be sold separately is a product decision.
 ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
-    {PlanFeatureKey.GUEST_MARKETING}
+    {PlanFeatureKey.GUEST_MARKETING, PlanFeatureKey.GUEST_MARKETING_BYO}
 )
+
+# An add-on that only means anything on top of another one. The entitlement
+# snapshot drops a dependent key whose prerequisite is not effective, so
+# RequireFeature, /me/entitlements and the Master panel all agree that BYO
+# is off while Guest Marketing itself is locked.
+FEATURE_REQUIRES: dict[PlanFeatureKey, PlanFeatureKey] = {
+    PlanFeatureKey.GUEST_MARKETING_BYO: PlanFeatureKey.GUEST_MARKETING,
+}
 TIER_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset({PlanFeatureKey.SUPPORT_LEVEL})
 
 FEATURE_KEY_TYPE: dict[PlanFeatureKey, PlanFeatureType] = {

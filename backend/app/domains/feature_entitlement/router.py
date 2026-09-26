@@ -206,6 +206,7 @@ def _addon_payload(view: AddonView) -> Addon:
         plan_value=view.plan_value,
         override=override,
         active_campaign_count=view.active_campaign_count,
+        blocked_by=view.blocked_by,
     )
 
 

@@ -43,6 +43,7 @@ from .models import (
     MarketingCampaignRecipient,
     MarketingSuppression,
     MarketingTemplate,
+    OrgMarketingProvider,
 )
 
 _ACTIVE = [status.value for status in ACTIVE_CAMPAIGN_STATUSES]
@@ -853,23 +854,34 @@ class MarketingRepository:
         )
         return int(result.scalar_one())
 
-    async def cancel_active_campaigns_for_lock(self, organization_id: uuid.UUID) -> int:
-        """The add-on was locked: cancel every scheduled/sending campaign and
+    async def cancel_active_campaigns_for_lock(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        own_only: bool = False,
+        cancel_reason: str = CancelReason.ADDON_LOCKED.value,
+        last_error: str = "Marketing add-on was locked",
+    ) -> int:
+        """The add-on was locked: cancel every scheduled/sending campaign (or,
+        for the BYO add-on, only those snapshotted to an own provider) and
         skip its pending recipients. Runs inside the Master write's
         transaction (see ``feature_entitlement.addons``)."""
         now = datetime.now(UTC)
+        conditions = [
+            MarketingCampaign.organization_id == organization_id,
+            MarketingCampaign.is_deleted.is_(False),
+            MarketingCampaign.status.in_(_ACTIVE),
+        ]
+        if own_only:
+            conditions.append(MarketingCampaign.provider_source == "own")
         result = await self.session.execute(
             update(MarketingCampaign)
-            .where(
-                MarketingCampaign.organization_id == organization_id,
-                MarketingCampaign.is_deleted.is_(False),
-                MarketingCampaign.status.in_(_ACTIVE),
-            )
+            .where(*conditions)
             .values(
                 status=CampaignStatus.CANCELLED.value,
-                cancel_reason=CancelReason.ADDON_LOCKED.value,
+                cancel_reason=cancel_reason,
                 cancelled_at=now,
-                last_error="Marketing add-on was locked",
+                last_error=last_error,
                 version=MarketingCampaign.version + 1,
                 updated_at=now,
             )
@@ -882,6 +894,159 @@ class MarketingRepository:
                 campaign_id, SkipReason.ADDON_LOCKED.value
             )
         return len(cancelled_ids)
+
+    async def count_active_campaigns_for(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        own_only: bool = False,
+        org_provider_id: uuid.UUID | None = None,
+    ) -> int:
+        conditions = [
+            MarketingCampaign.organization_id == organization_id,
+            MarketingCampaign.is_deleted.is_(False),
+            MarketingCampaign.status.in_(_ACTIVE),
+        ]
+        if own_only:
+            conditions.append(MarketingCampaign.provider_source == "own")
+        if org_provider_id is not None:
+            conditions.append(MarketingCampaign.org_provider_id == org_provider_id)
+        result = await self.session.execute(select(func.count()).where(*conditions))
+        return int(result.scalar_one())
+
+    # ======================================================================
+    # Own providers (spec §12)
+    # ======================================================================
+
+    async def list_providers(
+        self, organization_id: uuid.UUID
+    ) -> dict[str, OrgMarketingProvider]:
+        result = await self.session.execute(
+            select(OrgMarketingProvider).where(
+                OrgMarketingProvider.organization_id == organization_id,
+                OrgMarketingProvider.is_deleted.is_(False),
+            )
+        )
+        return {row.channel: row for row in result.scalars()}
+
+    async def get_provider(
+        self, organization_id: uuid.UUID, channel: str
+    ) -> OrgMarketingProvider | None:
+        return (await self.list_providers(organization_id)).get(channel)
+
+    async def get_provider_by_id(
+        self, organization_id: uuid.UUID, provider_id: uuid.UUID
+    ) -> OrgMarketingProvider | None:
+        """Includes soft-deleted rows: the worker must be able to tell
+        "deleted after schedule" apart from "never existed"."""
+        result = await self.session.execute(
+            select(OrgMarketingProvider).where(
+                OrgMarketingProvider.id == provider_id,
+                OrgMarketingProvider.organization_id == organization_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def create_provider(self, **fields: Any) -> OrgMarketingProvider:
+        row = OrgMarketingProvider(**fields)
+        self.session.add(row)
+        await self.session.flush()
+        await self.session.refresh(row)
+        return row
+
+    async def update_provider(
+        self, row: OrgMarketingProvider, data: dict[str, Any]
+    ) -> OrgMarketingProvider:
+        for key, value in data.items():
+            setattr(row, key, value)
+        row.version = (row.version or 1) + 1
+        await self.session.flush()
+        return row
+
+    async def soft_delete_provider(self, row: OrgMarketingProvider) -> None:
+        row.mark_deleted()
+        await self.session.flush()
+
+    async def trip_provider(self, provider_id: uuid.UUID, last_error: str) -> bool:
+        """verified -> failed, exactly once (compare-and-set): concurrent
+        batches hitting the same auth error do not race."""
+        result = await self.session.execute(
+            update(OrgMarketingProvider)
+            .where(
+                OrgMarketingProvider.id == provider_id,
+                OrgMarketingProvider.status == "verified",
+            )
+            .values(
+                status="failed",
+                last_error=last_error[:500],
+                updated_at=datetime.now(UTC),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    async def fail_unsent_recipients(
+        self,
+        campaign_id: uuid.UUID,
+        *,
+        error_code: str,
+        error_message: str,
+        claimed_ids: Sequence[uuid.UUID] = (),
+    ) -> int:
+        """Fail every pending recipient, plus this batch's own claimed rows
+        that were not sent. Never touches rows another worker holds."""
+        now = datetime.now(UTC)
+        condition = MarketingCampaignRecipient.status == RecipientStatus.PENDING.value
+        if claimed_ids:
+            condition = or_(
+                condition,
+                and_(
+                    MarketingCampaignRecipient.id.in_(list(claimed_ids)),
+                    MarketingCampaignRecipient.status == RecipientStatus.SENDING.value,
+                ),
+            )
+        result = await self.session.execute(
+            update(MarketingCampaignRecipient)
+            .where(MarketingCampaignRecipient.campaign_id == campaign_id, condition)
+            .values(
+                status=RecipientStatus.FAILED.value,
+                error_code=error_code,
+                error_message=error_message[:500],
+                failed_at=now,
+                updated_at=now,
+            )
+            .returning(MarketingCampaignRecipient.id)
+            .execution_options(synchronize_session=False)
+        )
+        count = len(list(result.scalars()))
+        if count:
+            # A claimed (`sending`) row still counts in count_pending until it
+            # finishes, so every row failed here leaves `pending`.
+            await self.adjust_counters(campaign_id, pending=-count, failed=count)
+        return count
+
+    # -- WABA-synced templates (BE-11b) ----------------------------------
+
+    async def list_synced_templates(
+        self, organization_id: uuid.UUID
+    ) -> list[MarketingTemplate]:
+        result = await self.session.execute(
+            select(MarketingTemplate).where(
+                MarketingTemplate.organization_id == organization_id,
+                MarketingTemplate.whatsapp_source == "own_waba",
+                MarketingTemplate.is_deleted.is_(False),
+            )
+        )
+        return list(result.scalars())
+
+    async def update_template(
+        self, template: MarketingTemplate, data: dict[str, Any]
+    ) -> MarketingTemplate:
+        for key, value in data.items():
+            setattr(template, key, value)
+        template.version = (template.version or 1) + 1
+        await self.session.flush()
+        return template
 
     async def due_campaign_ids(self, now: datetime, limit: int = 20) -> list[uuid.UUID]:
         result = await self.session.execute(
@@ -1201,6 +1366,28 @@ class MarketingRepository:
         return int(result.rowcount or 0)
 
 
+class ByoCampaignLockHook:
+    """``AddonCampaignHookProtocol`` for ``guest_marketing_byo``: locking
+    BYO cancels only the campaigns snapshotted to an own provider, with
+    ``cancel_reason="byo_locked"`` (spec §12.1)."""
+
+    def __init__(self, repository: MarketingRepository) -> None:
+        self.repository = repository
+
+    async def count_active_campaigns(self, organization_id: uuid.UUID) -> int:
+        return await self.repository.count_active_campaigns_for(
+            organization_id, own_only=True
+        )
+
+    async def cancel_active_campaigns_for_lock(self, organization_id: uuid.UUID) -> int:
+        return await self.repository.cancel_active_campaigns_for_lock(
+            organization_id,
+            own_only=True,
+            cancel_reason="byo_locked",
+            last_error="Own-provider add-on was locked",
+        )
+
+
 def new_unsubscribe_token() -> str:
     return secrets.token_urlsafe(16)[:32]
 
@@ -1214,6 +1401,7 @@ def day_bounds(
 
 __all__ = [
     "AudienceCandidate",
+    "ByoCampaignLockHook",
     "AudienceCounts",
     "AudienceCriteria",
     "MarketingRepository",

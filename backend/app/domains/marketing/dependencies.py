@@ -44,6 +44,7 @@ from app.domains.rbac.location_scope import CallerLocationScope, LocationScope
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .exceptions import CrossLocationError
+from .provider_service import ProviderService
 from .repository import MarketingRepository
 from .senders import resolve_marketing_senders
 from .service import CallerScope, MarketingService
@@ -51,7 +52,11 @@ from .service import CallerScope, MarketingService
 logger = logging.getLogger(__name__)
 
 
-def build_entitlement_check(session: AsyncSession, redis: Redis | None):
+def build_entitlement_check(
+    session: AsyncSession,
+    redis: Redis | None,
+    feature: PlanFeatureKey = PlanFeatureKey.GUEST_MARKETING,
+):
     """``organization_id -> bool`` for ``guest_marketing``, through the same
     ``EntitlementChecker`` (overrides merged, Redis-cached) ``RequireFeature``
     uses -- so the dispatcher and the portal offer agree with the API gate."""
@@ -77,9 +82,7 @@ def build_entitlement_check(session: AsyncSession, redis: Redis | None):
 
     async def _check(organization_id: uuid.UUID) -> bool:
         snapshot = await checker.get_snapshot(organization_id)
-        return snapshot.is_active and snapshot.has_feature(
-            PlanFeatureKey.GUEST_MARKETING
-        )
+        return snapshot.is_active and snapshot.has_feature(feature)
 
     return _check
 
@@ -110,6 +113,9 @@ def get_marketing_service(
         redis=redis,
         audit_writer=audit_repository,
         entitlement_check=build_entitlement_check(repository.session, redis),
+        byo_entitlement_check=build_entitlement_check(
+            repository.session, redis, PlanFeatureKey.GUEST_MARKETING_BYO
+        ),
         enqueue_batch=_enqueue_batch,
         caller_location_scope=caller_location_scope,
     )
@@ -126,6 +132,9 @@ def get_public_marketing_service(
         senders=resolve_marketing_senders(settings),
         redis=redis,
         entitlement_check=build_entitlement_check(repository.session, redis),
+        byo_entitlement_check=build_entitlement_check(
+            repository.session, redis, PlanFeatureKey.GUEST_MARKETING_BYO
+        ),
     )
 
 
@@ -158,6 +167,45 @@ async def get_caller_scope(
         organization_id=organization_id,
         location_id=location_id,
         actor_user_id=uuid.UUID(user.id),
+    )
+
+
+def get_provider_service(
+    repository: MarketingRepository = Depends(get_marketing_repository),
+    settings: Settings = Depends(get_settings),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    marketing: MarketingService = Depends(get_marketing_service),
+) -> ProviderService:
+    return ProviderService(
+        repository,
+        settings=settings,
+        marketing=marketing,
+        audit_writer=audit_repository,
+    )
+
+
+def get_platform_provider_service(
+    repository: MarketingRepository = Depends(get_marketing_repository),
+    settings: Settings = Depends(get_settings),
+    redis: Redis = Depends(get_redis_client),
+) -> ProviderService:
+    """Master read-only view: no caller confinement (the route is pinned
+    GLOBAL), no audit (it reads nothing secret and writes nothing)."""
+    marketing = MarketingService(
+        repository,
+        settings=settings,
+        senders=resolve_marketing_senders(settings),
+        redis=redis,
+        byo_entitlement_check=build_entitlement_check(
+            repository.session, redis, PlanFeatureKey.GUEST_MARKETING_BYO
+        ),
+    )
+
+    async def _exists(organization_id: uuid.UUID) -> bool:
+        return await repository.get_organization(organization_id) is not None
+
+    return ProviderService(
+        repository, settings=settings, marketing=marketing, organization_exists=_exists
     )
 
 
