@@ -954,6 +954,9 @@ class AuditAction(StrEnum):
     CREDITS_ADJUSTED = "credits_adjusted"
     CREDITS_REFUNDED = "credits_refunded"
     CREDITS_SETTINGS_UPDATED = "credits_settings_updated"
+    # Marketing price book (spec §13.3), GLOBAL-pinned Master routes.
+    MARKETING_PRICE_BOOK_UPDATED = "marketing_price_book_updated"
+    MARKETING_ORG_PRICES_UPDATED = "marketing_org_prices_updated"
 
     # Guest Marketing domain events (``app.domains.marketing``).
     MARKETING_TEMPLATE_CREATED = "marketing_template_created"

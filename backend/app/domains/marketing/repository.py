@@ -862,6 +862,23 @@ class MarketingRepository:
         cancel_reason: str = CancelReason.ADDON_LOCKED.value,
         last_error: str = "Marketing add-on was locked",
     ) -> int:
+        return len(
+            await self.cancel_active_campaign_ids_for_lock(
+                organization_id,
+                own_only=own_only,
+                cancel_reason=cancel_reason,
+                last_error=last_error,
+            )
+        )
+
+    async def cancel_active_campaign_ids_for_lock(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        own_only: bool = False,
+        cancel_reason: str = CancelReason.ADDON_LOCKED.value,
+        last_error: str = "Marketing add-on was locked",
+    ) -> list[uuid.UUID]:
         """The add-on was locked: cancel every scheduled/sending campaign (or,
         for the BYO add-on, only those snapshotted to an own provider) and
         skip its pending recipients. Runs inside the Master write's
@@ -893,7 +910,7 @@ class MarketingRepository:
             await self.skip_pending_recipients(
                 campaign_id, SkipReason.ADDON_LOCKED.value
             )
-        return len(cancelled_ids)
+        return cancelled_ids
 
     async def count_active_campaigns_for(
         self,
@@ -1219,6 +1236,17 @@ class MarketingRepository:
             .execution_options(synchronize_session=False)
         )
         return list(result.scalars())
+
+    async def count_in_flight(self, campaign_id: uuid.UUID) -> int:
+        """Recipients claimed by a worker and not yet settled (``sending``):
+        they may still be debited, so a release holds their share back."""
+        result = await self.session.execute(
+            select(func.count()).where(
+                MarketingCampaignRecipient.campaign_id == campaign_id,
+                MarketingCampaignRecipient.status == RecipientStatus.SENDING.value,
+            )
+        )
+        return int(result.scalar_one())
 
     async def update_recipient(self, recipient_id: uuid.UUID, **values: Any) -> None:
         values["updated_at"] = datetime.now(UTC)

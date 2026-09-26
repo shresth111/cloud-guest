@@ -43,6 +43,7 @@ from app.domains.rbac.dependencies import (
 from app.domains.rbac.location_scope import CallerLocationScope, LocationScope
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
+from .credits import build_campaign_credits
 from .exceptions import CrossLocationError
 from .provider_service import ProviderService
 from .repository import MarketingRepository
@@ -118,6 +119,9 @@ def get_marketing_service(
         ),
         enqueue_batch=_enqueue_batch,
         caller_location_scope=caller_location_scope,
+        credits=build_campaign_credits(
+            repository.session, audit_writer=audit_repository
+        ),
     )
 
 

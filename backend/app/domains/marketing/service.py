@@ -76,6 +76,11 @@ from .constants import (
     TemplateCategory,
     WhatsAppApprovalStatus,
 )
+from .credits import (
+    CampaignCredits,
+    actual_units,
+    per_recipient_minor,
+)
 from .exceptions import (
     AudienceEmptyError,
     AudienceTooLargeError,
@@ -204,6 +209,31 @@ def _campaign_provider(campaign: Any, rows: dict[uuid.UUID, Any]) -> dict | None
         spec = spec_for(Channel(campaign.channel), provider_type or "")
         name = f"Your {spec.display_name if spec else provider_type} (removed)"
     return {"source": "own", "type": provider_type, "display_name": name}
+
+
+def _campaign_credits(
+    campaign: Any, totals: tuple[int, int, int] | None
+) -> dict[str, Any] | None:
+    """Campaign.credits (spec §13.7): null for drafts and own-provider
+    campaigns; otherwise the frozen price and the gross ledger totals."""
+    snapshot = getattr(campaign, "price_snapshot", None)
+    if (
+        campaign.status == CampaignStatus.DRAFT.value
+        or getattr(campaign, "provider_source", "wyfy") == "own"
+        or not snapshot
+    ):
+        return None
+    reserved, debited, released = totals or (0, 0, 0)
+    return {
+        "price_snapshot": {
+            "channel": snapshot.get("channel"),
+            "unit": snapshot.get("unit"),
+            "unit_price_minor": snapshot.get("unit_price_minor"),
+        },
+        "reserved_minor": reserved,
+        "debited_minor": debited,
+        "released_minor": released,
+    }
 
 
 def _own_status(channel: Channel, row: Any) -> ChannelStatus:
@@ -365,8 +395,12 @@ class MarketingService:
         caller_location_scope: frozenset[uuid.UUID] | None = None,
         byo_entitlement_check: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
         own_sender_factory: Callable[[Any], OwnSenders] | None = None,
+        credits: CampaignCredits | None = None,
     ) -> None:
         self.repository = repository
+        # Spec §13 charge flow. None only in tests that predate credits; every
+        # production wiring (API dependencies and the Celery tasks) passes it.
+        self.credits = credits
         # guest_marketing_byo (spec §12.1). None = not entitled.
         self.byo_entitlement_check = byo_entitlement_check
         # Builds the adapters for one own-provider row; decrypts in-process.
@@ -895,7 +929,91 @@ class MarketingService:
         self, scope: CallerScope, audience: AudienceFilter
     ) -> dict[str, Any]:
         preview, _ = await self.evaluate_audience(scope, audience)
+        preview["credit_estimate"] = await self._credit_estimate(
+            scope.organization_id, audience.channel
+        )
         return preview
+
+    async def _credit_estimate(
+        self, organization_id: uuid.UUID, channel: Channel
+    ) -> dict[str, Any] | None:
+        """§13.7: per recipient per unit only (a preview has no template, so
+        no segment count). Own provider = 0."""
+        if self.credits is None:
+            return None
+        resolution = (await self.resolve_providers(organization_id))[channel]
+        if resolution.own:
+            quote_price, unit = 0, None
+        else:
+            quote = (await self.credits.prices.quotes(organization_id))[channel]
+            quote_price, unit = quote.unit_price_minor, quote.unit
+        from .credits import UNIT_BY_CHANNEL
+
+        return {
+            "provider_source": resolution.source,
+            "unit": unit or UNIT_BY_CHANNEL[channel],
+            "unit_price_minor": quote_price,
+            "estimated_minor_per_unit_recipient": quote_price,
+        }
+
+    async def estimate(
+        self, scope: CallerScope, campaign_id: uuid.UUID
+    ) -> dict[str, Any]:
+        """``GET /marketing/campaigns/{id}/estimate`` (§13.7): what schedule
+        would reserve now. A draft is priced live (current provider, current
+        price); a scheduled or sent campaign at its own snapshot."""
+        campaign = await self._get_campaign(scope, campaign_id)
+        channel = Channel(campaign.channel)
+        audience = AudienceFilter.model_validate(campaign.audience_filter)
+        preview, _ = await self.evaluate_audience(scope, audience)
+        reachable = min(
+            preview["reachable"], self.settings.marketing_max_recipients_per_campaign
+        )
+        available = (
+            await self.credits.available_minor(scope.organization_id)
+            if self.credits is not None
+            else 0
+        )
+        if campaign.status == CampaignStatus.DRAFT.value:
+            resolution = (await self.resolve_providers(scope.organization_id))[channel]
+            source = resolution.source
+            price_snapshot = None
+            if not resolution.own and self.credits is not None:
+                template = await self._get_template(scope, campaign.template_id)
+                snapshot = await self._build_snapshot(campaign, template)
+                price_snapshot = await self.credits.quote(
+                    scope.organization_id,
+                    channel,
+                    snapshot,
+                    unsubscribe_link_budget=self.sms_unsubscribe_link_budget(),
+                )
+        else:
+            source = getattr(campaign, "provider_source", "wyfy") or "wyfy"
+            price_snapshot = getattr(campaign, "price_snapshot", None)
+        from .credits import UNIT_BY_CHANNEL
+
+        if source == "own" or price_snapshot is None:
+            return {
+                "provider_source": source,
+                "reachable": reachable,
+                "unit": UNIT_BY_CHANNEL[channel],
+                "unit_price_minor": 0,
+                "units_per_recipient_max": 0,
+                "estimated_max_minor": 0,
+                "available_minor": available,
+                "sufficient": True,
+            }
+        needed = reachable * per_recipient_minor(price_snapshot)
+        return {
+            "provider_source": source,
+            "reachable": reachable,
+            "unit": price_snapshot["unit"],
+            "unit_price_minor": price_snapshot["unit_price_minor"],
+            "units_per_recipient_max": price_snapshot["units_per_recipient_max"],
+            "estimated_max_minor": needed,
+            "available_minor": available,
+            "sufficient": available >= needed,
+        }
 
     # ======================================================================
     # Templates (§5.4)
@@ -1466,10 +1584,18 @@ class MarketingService:
                 rows[provider_id] = await self.repository.get_provider_by_id(
                     campaign.organization_id, provider_id
                 )
+        totals: dict[uuid.UUID, tuple[int, int, int]] = {}
+        if self.credits is not None and campaigns:
+            by_org: dict[uuid.UUID, list[uuid.UUID]] = {}
+            for c in campaigns:
+                by_org.setdefault(c.organization_id, []).append(c.id)
+            for org_id, ids in by_org.items():
+                totals.update(await self.credits.totals(org_id, ids))
         return [
             {
                 **self._campaign_resource(c, templates, users),
                 "provider": _campaign_provider(c, rows),
+                "credits": _campaign_credits(c, totals.get(c.id)),
             }
             for c in campaigns
         ]
@@ -1510,6 +1636,7 @@ class MarketingService:
                 # No provider in MVP reports delivery receipts.
                 "delivered_is_tracked": False,
                 "excluded_at_dispatch": campaign.exclusion_counts,
+                "capped_by_credits": getattr(campaign, "capped_by_credits", 0) or 0,
             },
             "created_by": {
                 "id": str(campaign.created_by_user_id),
@@ -2072,6 +2199,43 @@ class MarketingService:
         self._require_sendable(
             snapshot, channel, snapshot.get("review_link"), resolution
         )
+        # §13.4 step 7: a Wyfy-provider test send is charged per accepted
+        # message from *available* (never reserved), at the campaign's
+        # snapshot price once scheduled, the current price for a draft. An
+        # own-provider test is free.
+        test_price: dict[str, Any] | None = None
+        if self.credits is not None and own is None:
+            test_price = getattr(campaign, "price_snapshot", None)
+            if campaign.status == CampaignStatus.DRAFT.value or not test_price:
+                test_price = await self.credits.quote(
+                    scope.organization_id,
+                    channel,
+                    snapshot,
+                    unsubscribe_link_budget=self.sms_unsubscribe_link_budget(),
+                )
+            # The [TEST] prefix can add a segment; budget one extra.
+            worst = per_recipient_minor(test_price) + (
+                test_price["unit_price_minor"] if channel is Channel.SMS else 0
+            )
+            needed = worst * len(addresses)
+            available = await self.credits.available_minor(scope.organization_id)
+            if needed > available:
+                from app.domains.billing.credits_exceptions import (
+                    InsufficientCreditsError,
+                )
+
+                raise InsufficientCreditsError(
+                    needed_minor=needed,
+                    available_minor=available,
+                    extra={
+                        "unit_price_minor": test_price["unit_price_minor"],
+                        "units_per_recipient_max": test_price[
+                            "units_per_recipient_max"
+                        ],
+                        "reachable": len(addresses),
+                    },
+                )
+        request_id = uuid.uuid4().hex
         await self._consume_test_quota(scope.organization_id, len(addresses))
         results = []
         for address in addresses:
@@ -2085,12 +2249,22 @@ class MarketingService:
                 result, _ = await self._deliver(
                     channel, snapshot, values, address, test=True, own=own
                 )
+                charged = 0
+                if test_price is not None and self.credits is not None:
+                    charged = await self.credits.charge_test_send(
+                        campaign,
+                        request_id=request_id,
+                        address=address,
+                        unit_price_minor=int(test_price["unit_price_minor"]),
+                        units=actual_units(channel, snapshot, values, test=True),
+                    )
                 results.append(
                     {
                         "to_masked": mask_address(channel, address),
                         "status": RecipientStatus.SUBMITTED.value,
                         "provider_message_id": result.message_id,
                         "error_code": None,
+                        "charged_minor": charged,
                     }
                 )
             except SendError as exc:
@@ -2104,6 +2278,7 @@ class MarketingService:
                         "status": RecipientStatus.FAILED.value,
                         "provider_message_id": None,
                         "error_code": "provider_rejected",
+                        "charged_minor": 0,
                     }
                 )
         await self._audit(
@@ -2240,6 +2415,20 @@ class MarketingService:
             if scheduled_at
             else CampaignStatus.SENDING.value
         )
+        # §13.4 steps 1-2: Wyfy provider only -- freeze the price and reserve
+        # for the whole reachable audience, or 402 while still a draft. An
+        # own-provider campaign has no price, no reservation, no ledger row.
+        price_snapshot: dict[str, Any] | None = None
+        if self.credits is not None and not resolution.own:
+            price_snapshot = await self.credits.quote(
+                scope.organization_id,
+                channel,
+                snapshot,
+                unsubscribe_link_budget=self.sms_unsubscribe_link_budget(),
+            )
+            await self.credits.reserve_at_schedule(
+                campaign, price_snapshot, preview["reachable"]
+            )
         data: dict[str, Any] = {
             "status": target_status,
             "scheduled_at": scheduled_at,
@@ -2252,6 +2441,8 @@ class MarketingService:
             "provider_source": resolution.source,
             "provider_type": resolution.row.provider_type if resolution.own else None,
             "org_provider_id": resolution.row.id if resolution.own else None,
+            "price_snapshot": price_snapshot,
+            "capped_by_credits": 0,
         }
         if target_status == CampaignStatus.SENDING.value:
             data["started_at"] = now
@@ -2276,6 +2467,7 @@ class MarketingService:
             metadata={
                 "reachable_at_schedule": preview["reachable"],
                 "provider_source": resolution.source,
+                "price_snapshot": price_snapshot,
                 "acknowledged_wyfy_fallback": bool(
                     resolution.needs_fallback_ack and acknowledge_wyfy_fallback
                 ),
@@ -2308,11 +2500,19 @@ class MarketingService:
                 "org_provider_id": None,
                 "schedule_idempotency_key": None,
                 "schedule_idempotency_at": None,
+                "price_snapshot": None,
+                "capped_by_credits": 0,
                 "updated_by": scope.actor_user_id,
             },
         ):
             raise InvalidStatusTransitionError(
                 "Only a scheduled campaign can be unscheduled"
+            )
+        if self.credits is not None:
+            # Back to draft: it holds nothing. A reschedule reserves afresh
+            # (reserve:{id}:{n+1}) at the price of that day.
+            await self.credits.release_all(
+                campaign, key_base=f"release:{campaign.id}:unschedule"
             )
         await self._audit(
             scope,
@@ -2346,6 +2546,7 @@ class MarketingService:
             campaign.id, SkipReason.CANCELLED.value
         )
         await self.repository.refresh(campaign)
+        await self._settle_credits(campaign)
         await self._audit(
             scope,
             AuditAction.MARKETING_CAMPAIGN_CANCELLED,
@@ -2385,7 +2586,22 @@ class MarketingService:
             "submitted_at": utc_iso(recipient.submitted_at),
             "delivered_at": utc_iso(recipient.delivered_at),
             "failed_at": utc_iso(recipient.failed_at),
+            "charged_minor": None,
         }
+
+    async def _with_charges(
+        self, organization_id: uuid.UUID, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """``charged_minor`` on recipient/delivery rows (§13.7): the
+        recipient's debit, null when it was not charged."""
+        if self.credits is None or not items:
+            return items
+        charges = await self.credits.recipient_charges(
+            organization_id, [uuid.UUID(item["id"]) for item in items]
+        )
+        for item in items:
+            item["charged_minor"] = charges.get(uuid.UUID(item["id"]))
+        return items
 
     async def list_recipients(
         self,
@@ -2408,10 +2624,11 @@ class MarketingService:
             page=page,
             page_size=page_size,
         )
-        return [
+        items = [
             self._recipient_item(r, name, location_name)
             for r, _c, name, location_name in rows
-        ], meta
+        ]
+        return await self._with_charges(scope.organization_id, items), meta
 
     async def list_deliveries(
         self,
@@ -2452,7 +2669,7 @@ class MarketingService:
             item["campaign"] = {"id": str(campaign.id), "name": campaign.name}
             item["channel"] = recipient.channel
             items.append(item)
-        return items, meta
+        return await self._with_charges(scope.organization_id, items), meta
 
     # ======================================================================
     # Public unsubscribe (§5.7)
@@ -2635,6 +2852,15 @@ class MarketingService:
         preview, reachable = await self.evaluate_audience(scope, audience)
         limit = self.settings.marketing_max_recipients_per_campaign
         reachable = reachable[:limit]
+        capped_by_credits = getattr(campaign, "capped_by_credits", 0) or 0
+        if self.credits is not None and campaign.recipient_count == 0:
+            # §13.4 step 3: fit the reservation to the audience as it is now.
+            # ``reachable`` is ordered by last_seen_at desc, so a cap keeps
+            # the most recent guests. Never fails the campaign for credits.
+            allowed, capped_by_credits = await self.credits.adjust_at_dispatch(
+                campaign, len(reachable)
+            )
+            reachable = reachable[:allowed]
         organization = await self._organization(campaign.organization_id)
         criteria = await self._criteria(scope, audience, organization)
         attributed = await self.repository.attribute_locations(
@@ -2682,6 +2908,7 @@ class MarketingService:
                 "exclusion_counts": preview["excluded"],
                 "recipient_count": campaign.recipient_count + inserted,
                 "count_pending": campaign.count_pending + inserted,
+                "capped_by_credits": capped_by_credits,
             },
         )
         if inserted == 0 and campaign.recipient_count == 0:
@@ -2710,6 +2937,7 @@ class MarketingService:
                     },
                 ):
                     cancelled += 1
+                    await self._settle_credits(campaign)
                 continue
             channel = Channel(campaign.channel)
             if getattr(campaign, "provider_source", "wyfy") == "own":
@@ -2725,6 +2953,7 @@ class MarketingService:
                         },
                     ):
                         cancelled += 1
+                        await self._settle_credits(campaign)
                     continue
                 row, reason = await self._snapshot_row(campaign)
                 if row is None:
@@ -2739,6 +2968,7 @@ class MarketingService:
                         },
                     ):
                         failed += 1
+                        await self._settle_credits(campaign)
                     continue
                 status = _own_status(channel, row)
             else:
@@ -2754,6 +2984,7 @@ class MarketingService:
                     },
                 ):
                     failed += 1
+                    await self._settle_credits(campaign)
                 continue
             if not await self.repository.update_campaign_cas(
                 campaign,
@@ -2776,6 +3007,7 @@ class MarketingService:
                     },
                 )
                 failed += 1
+                await self._settle_credits(campaign)
                 continue
             await self.repository.commit()
             self._enqueue(campaign.id, 0)
@@ -2796,6 +3028,7 @@ class MarketingService:
                 await self.repository.skip_pending_recipients(
                     campaign.id, SkipReason.CANCELLED.value
                 )
+                await self._settle_credits(campaign)
                 failed += 1
         await self.repository.commit()
         return {"started": started, "cancelled": cancelled, "failed": failed}
@@ -2867,6 +3100,13 @@ class MarketingService:
             if outcome == "transient":
                 transient += 1
             await self.repository.commit()
+        await self.repository.refresh(campaign)
+        if campaign.status != CampaignStatus.SENDING.value:
+            # Cancelled or locked mid-batch: the claimed rows this batch
+            # skipped no longer need their hold.
+            await self._settle_credits(campaign)
+            await self.repository.commit()
+            return {"requeue": None, "reason": "not_sending"}
         remaining = await self.repository.count_pending(campaign.id)
         if remaining:
             max_attempt = max((r.attempt_count for r in claimed), default=1)
@@ -2975,6 +3215,15 @@ class MarketingService:
             error_message=None,
         )
         await self.repository.adjust_counters(campaign.id, pending=-1, submitted=1)
+        if self.credits is not None and own is None:
+            # §13.4 step 4: in the same transaction as "submitted" (the
+            # caller commits both), after the campaign-row update so every
+            # writer takes the campaign row before the wallet row.
+            await self.credits.debit_recipient(
+                campaign,
+                recipient.id,
+                actual_units(channel, snapshot, values, test=False),
+            )
         return "submitted"
 
     async def _recheck_recipient(
@@ -3079,9 +3328,19 @@ class MarketingService:
                     or "No message was accepted by the provider"
                 )[:500],
             }
-        await self.repository.update_campaign_cas(
+        if await self.repository.update_campaign_cas(
             campaign, expected_status=CampaignStatus.SENDING.value, data=data
-        )
+        ):
+            await self._settle_credits(campaign)
+
+    async def _settle_credits(self, campaign: MarketingCampaign) -> None:
+        """§13.4 step 6: a terminal campaign releases what it still holds,
+        except the share of recipients a worker is still sending (released
+        by that worker's batch once they settle)."""
+        if self.credits is None:
+            return
+        in_flight = await self.repository.count_in_flight(campaign.id)
+        await self.credits.settle(campaign, in_flight)
 
     async def reap_stuck(self) -> dict[str, int]:
         now = self._now()
@@ -3096,6 +3355,9 @@ class MarketingService:
             if await self.repository.count_pending(campaign.id) == 0:
                 await self._finalize(campaign)
                 finalized += 1
+            # worker_lost recipients are never charged: once the campaign is
+            # terminal, their hold goes back to available.
+            await self._settle_credits(campaign)
         await self.repository.commit()
         return {"campaigns": len(campaign_ids), "finalized": finalized}
 

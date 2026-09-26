@@ -432,6 +432,21 @@ async def get_campaign(
     )
 
 
+@router.get(
+    "/campaigns/{campaign_id}/estimate",
+    response_model=ApiResponse[dict],
+    dependencies=_guards("marketing.read"),
+)
+async def estimate_campaign(
+    request: Request,
+    campaign_id: uuid.UUID,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: MarketingService = Depends(get_marketing_service),
+):
+    """Credits estimate (spec §13.7): what schedule would reserve now."""
+    return _ok(request, "Campaign estimate", await service.estimate(scope, campaign_id))
+
+
 @router.patch(
     "/campaigns/{campaign_id}",
     response_model=ApiResponse[dict],

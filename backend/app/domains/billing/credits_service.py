@@ -109,6 +109,12 @@ class LedgerWrite:
 
 
 BeforeWrite = Callable[[CreditWallet], Awaitable[Mapping[str, object]]]
+LowBalanceHook = Callable[[CreditWallet], Awaitable[None]]
+
+# §13.5: the low-balance alert is considered after these entry types only.
+_LOW_BALANCE_ENTRY_TYPES = frozenset(
+    {CreditEntryType.RESERVE, CreditEntryType.DEBIT, CreditEntryType.ADJUSTMENT}
+)
 
 
 class CreditWalletService:
@@ -116,8 +122,99 @@ class CreditWalletService:
     owns the transaction (a Master route commits after its audit row; BE-12b
     commits a debit together with the recipient status it pays for)."""
 
-    def __init__(self, repository: CreditRepositoryProtocol) -> None:
+    def __init__(
+        self,
+        repository: CreditRepositoryProtocol,
+        *,
+        low_balance_hook: LowBalanceHook | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self.repository = repository
+        # §13.5: called once per crossing below the threshold (see _apply).
+        self.low_balance_hook = low_balance_hook
+        self._now = now or (lambda: datetime.now(UTC))
+
+    # -- campaign helpers (BE-12b) ---------------------------------------------
+
+    async def reserve_for_campaign(
+        self,
+        organization_id: uuid.UUID,
+        campaign_id: uuid.UUID,
+        amount_minor: int,
+        *,
+        unit_minor: int | None = None,
+        bucket: CreditBucket = CreditBucket.MARKETING,
+    ) -> int:
+        """Reserve for a campaign with the next ``reserve:{campaign_id}:{n}``
+        key, ``n`` counted under the wallet lock. Returns the amount reserved.
+
+        With ``unit_minor`` a shortfall is not an error: as many whole units
+        as ``available`` covers are reserved (the dispatch-time extension,
+        §13.4 step 3). Without it, a shortfall is 402 ``insufficient_credits``.
+        """
+        if amount_minor <= 0:
+            return 0
+        wallet = await self.repository.lock_wallet(organization_id, bucket.value)
+        if unit_minor is not None:
+            if unit_minor <= 0:
+                return 0
+            units = min(
+                amount_minor // unit_minor, wallet.available_minor // unit_minor
+            )
+            amount_minor = units * unit_minor
+            if amount_minor <= 0:
+                return 0
+        n = await self.repository.count_campaign_entries(
+            organization_id, bucket.value, campaign_id, CreditEntryType.RESERVE.value
+        )
+        await self.reserve(
+            organization_id,
+            amount_minor,
+            idempotency_key=f"reserve:{campaign_id}:{n}",
+            campaign_id=campaign_id,
+            bucket=bucket,
+        )
+        return amount_minor
+
+    async def release_campaign_remainder(
+        self,
+        organization_id: uuid.UUID,
+        campaign_id: uuid.UUID,
+        *,
+        key_base: str,
+        hold_minor: int = 0,
+        bucket: CreditBucket = CreditBucket.MARKETING,
+    ) -> int:
+        """Release what the campaign still has reserved, minus ``hold_minor``
+        (recipients claimed but not yet settled, which may still be debited).
+
+        The outstanding amount is summed from the ledger **under the wallet
+        lock**, so a debit racing this call is either already counted or
+        waits for it. Idempotent in effect: a repeat finds nothing left. The
+        first release uses ``key_base`` itself (``release:{id}:final``);
+        later ones append ``:{n}``."""
+        await self.repository.lock_wallet(organization_id, bucket.value)
+        outstanding = await self.repository.campaign_reserved_outstanding(
+            organization_id, bucket.value, campaign_id
+        )
+        amount = outstanding - max(0, hold_minor)
+        if amount <= 0:
+            return 0
+        prior = await self.repository.count_campaign_entries(
+            organization_id,
+            bucket.value,
+            campaign_id,
+            CreditEntryType.RELEASE.value,
+            key_prefix=key_base,
+        )
+        await self.release(
+            organization_id,
+            amount,
+            idempotency_key=key_base if prior == 0 else f"{key_base}:{prior}",
+            campaign_id=campaign_id,
+            bucket=bucket,
+        )
+        return amount
 
     async def topup(
         self,
@@ -277,6 +374,23 @@ class CreditWalletService:
             },
         )
 
+    async def _maybe_alert_low_balance(
+        self, entry_type: CreditEntryType, wallet: CreditWallet
+    ) -> None:
+        """§13.5: once per crossing. ``low_balance_notified_at`` is set when
+        the alert is queued and cleared (in ``_apply``) once the balance is
+        back at or above the threshold."""
+        if (
+            self.low_balance_hook is None
+            or entry_type not in _LOW_BALANCE_ENTRY_TYPES
+            or wallet.low_balance_notified_at is not None
+            or wallet.available_minor >= wallet.low_balance_threshold_minor
+        ):
+            return
+        await self.low_balance_hook(wallet)
+        wallet.low_balance_notified_at = self._now()
+        await self.repository.save_wallet(wallet)
+
     async def _apply(
         self,
         organization_id: uuid.UUID,
@@ -349,6 +463,7 @@ class CreditWalletService:
                 # the threshold (§13.5); BE-12b fires it.
                 wallet.low_balance_notified_at = None
             await self.repository.save_wallet(wallet)
+            await self._maybe_alert_low_balance(entry_type, wallet)
         except IntegrityError as exc:
             if not _is_check_violation(exc):
                 raise
@@ -465,12 +580,26 @@ class CreditsService:
         invoices: TopupInvoiceIssuer,
         audit_writer: AuditWriter,
         committer: Committer,
+        pricing: Callable[
+            [uuid.UUID, bool], Awaitable[tuple[dict[str, Any], list[str]]]
+        ]
+        | None = None,
     ) -> None:
         self.repository = repository
         self.wallets = wallets
         self.invoices = invoices
         self.audit_writer = audit_writer
         self.committer = committer
+        # Marketing's price book + provider resolution (BE-12b):
+        # (org, platform) -> (prices, byo_channels).
+        self.pricing = pricing
+
+    async def _prices(
+        self, organization_id: uuid.UUID, *, platform: bool
+    ) -> tuple[dict[str, Any], list[str]]:
+        if self.pricing is None:
+            return {}, []
+        return await self.pricing(organization_id, platform)
 
     # -- customer -------------------------------------------------------------
 
@@ -478,13 +607,14 @@ class CreditsService:
         wallet = await self.repository.get_wallet(
             organization_id, CreditBucket.MARKETING.value
         )
+        prices, byo_channels = await self._prices(organization_id, platform=False)
         return {
             **wallet_summary(wallet),
             "minor_per_credit": MINOR_PER_CREDIT,
-            # BE-12b (price book, BYO resolution) fills these. Until then
-            # there is no price to show and nothing resolves to 0 credits.
-            "prices": {},
-            "byo_channels": [],
+            # Effective for new campaigns now; channels in byo_channels
+            # resolve to the org's own provider and cost 0 credits.
+            "prices": prices,
+            "byo_channels": byo_channels,
         }
 
     async def list_ledger(
@@ -536,7 +666,7 @@ class CreditsService:
         )
         return {
             "wallet": wallet_summary(wallet),
-            "prices": {},  # BE-12b
+            "prices": (await self._prices(organization_id, platform=True))[0],
             "recent_entries": await self._ledger_views(organization_id, rows),
             "active_campaign_reservations": [
                 {

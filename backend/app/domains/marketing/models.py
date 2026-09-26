@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -289,6 +290,17 @@ class MarketingCampaign(BaseModel):
         ForeignKey("org_marketing_providers.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Credits (spec §13.4): the price frozen at schedule/send-now --
+    # ``{channel, unit, unit_price_minor, price_book_row_id,
+    # units_per_recipient_max}`` -- NULL for drafts and own-provider
+    # campaigns. Every reservation, extension and debit of this campaign
+    # uses it, whatever the price book says later.
+    price_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Reachable recipients left out at dispatch because the wallet could not
+    # cover them (stats.capped_by_credits).
+    capped_by_credits: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
 
     __table_args__ = (
         Index("ix_mc_org_status", "organization_id", "status"),
@@ -430,7 +442,62 @@ class OrgMarketingProvider(BaseModel):
     )
 
 
+class MarketingPriceBook(BaseModel):
+    """Per-unit prices for Wyfy-provider sends, in credit minor units
+    (spec §13.3). **Versioned and append-only**: a change inserts a row with
+    ``effective_from = now()``; nothing is updated, so the history answers
+    "what was the price on the day this campaign was scheduled".
+
+    ``organization_id`` NULL = the platform default; set = a per-org
+    override. An org row with ``unit_price_minor`` NULL clears the override
+    (inherit the platform price). The current price for ``(org, channel)``
+    is the org's latest row with ``effective_from <= now()`` when that row
+    has a price, else the platform's latest.
+    """
+
+    __tablename__ = "marketing_price_book"
+
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    unit: Mapped[str] = mapped_column(String(8), nullable=False)
+    unit_price_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    set_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    note: Mapped[str | None] = mapped_column(String(300), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_mpb_org_channel_effective",
+            "organization_id",
+            "channel",
+            "effective_from",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_mpb_channel_effective", "channel", "effective_from"),
+        CheckConstraint(
+            "unit_price_minor IS NULL OR (unit_price_minor >= 0 "
+            "AND unit_price_minor <= 10000)",
+            name="price_range",
+        ),
+        CheckConstraint(
+            "organization_id IS NOT NULL OR unit_price_minor IS NOT NULL",
+            name="platform_price_required",
+        ),
+        CheckConstraint("channel IN ('sms','whatsapp','email')", name="channel_valid"),
+    )
+
+
 __all__ = [
+    "MarketingPriceBook",
     "OrgMarketingProvider",
     "GuestMarketingConsent",
     "GuestMarketingConsentEvent",

@@ -136,14 +136,19 @@ def bound_values(values: dict[str, str]) -> dict[str, str]:
     return bounded
 
 
-def sms_worst_case_segments(body: str, *, unsubscribe_link_length: int = 0) -> int:
+def sms_worst_case_segments(
+    body: str, *, unsubscribe_link_length: int = 0, review_link_length: int = 0
+) -> int:
     """Segments when every variable renders at its maximum length. The
     unsubscribe link is taken at ``max(30, unsubscribe_link_length)`` -- the
-    real link (base URL + ``/u/`` + token) is usually longer than 30."""
+    real link (base URL + ``/u/`` + token) is usually longer than 30 -- and
+    the review link at ``max(30, review_link_length)`` (links are never
+    truncated, so the credits reservation must budget the real one)."""
     lengths = dict(WORST_CASE_VARIABLE_LENGTHS)
     lengths["unsubscribe_link"] = max(
         lengths["unsubscribe_link"], unsubscribe_link_length
     )
+    lengths["review_link"] = max(lengths["review_link"], review_link_length)
     worst = render(body, {name: "x" * length for name, length in lengths.items()})
     return sms_stats(worst).segments
 

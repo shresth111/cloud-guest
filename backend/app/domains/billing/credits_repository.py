@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from sqlalchemy import (
     BigInteger,
@@ -106,6 +106,20 @@ class CreditRepositoryProtocol(Protocol):
 
     async def save_wallet(self, wallet: CreditWallet) -> CreditWallet: ...
 
+    async def count_campaign_entries(
+        self,
+        organization_id: uuid.UUID,
+        bucket: str,
+        campaign_id: uuid.UUID,
+        entry_type: str,
+        *,
+        key_prefix: str | None = None,
+    ) -> int: ...
+
+    async def campaign_reserved_outstanding(
+        self, organization_id: uuid.UUID, bucket: str, campaign_id: uuid.UUID
+    ) -> int: ...
+
 
 class CreditRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -177,6 +191,109 @@ class CreditRepository:
         self.session.add(entry)
         await self.session.flush()
         return entry
+
+    async def count_campaign_entries(
+        self,
+        organization_id: uuid.UUID,
+        bucket: str,
+        campaign_id: uuid.UUID,
+        entry_type: str,
+        *,
+        key_prefix: str | None = None,
+    ) -> int:
+        e = CreditLedgerEntry
+        conditions = [
+            e.organization_id == organization_id,
+            e.bucket == bucket,
+            e.campaign_id == campaign_id,
+            e.entry_type == entry_type,
+        ]
+        if key_prefix is not None:
+            conditions.append(e.idempotency_key.startswith(key_prefix, autoescape=True))
+        result = await self.session.execute(select(func.count()).where(*conditions))
+        return int(result.scalar_one())
+
+    async def campaign_reserved_outstanding(
+        self, organization_id: uuid.UUID, bucket: str, campaign_id: uuid.UUID
+    ) -> int:
+        """Σ delta_reserved for the campaign: what it still holds."""
+        e = CreditLedgerEntry
+        result = await self.session.execute(
+            select(func.coalesce(func.sum(e.delta_reserved_minor), 0)).where(
+                e.organization_id == organization_id,
+                e.bucket == bucket,
+                e.campaign_id == campaign_id,
+            )
+        )
+        return int(result.scalar_one())
+
+    async def campaign_totals(
+        self, organization_id: uuid.UUID, bucket: str, campaign_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, tuple[int, int, int]]:
+        """``{campaign_id: (reserved, debited, released)}``, gross amounts.
+        Test-send debits (from available) are not campaign debits."""
+        ids = [cid for cid in set(campaign_ids) if cid is not None]
+        if not ids:
+            return {}
+        e = CreditLedgerEntry
+
+        def _gross(entry_type: CreditEntryType, column) -> Any:  # noqa: ANN001
+            return cast(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    e.entry_type == entry_type.value,
+                                    e.is_test_send.is_(False),
+                                ),
+                                column,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                BigInteger,
+            )
+
+        result = await self.session.execute(
+            select(
+                e.campaign_id,
+                _gross(CreditEntryType.RESERVE, e.delta_reserved_minor).label("r"),
+                _gross(CreditEntryType.DEBIT, -e.delta_reserved_minor).label("d"),
+                _gross(CreditEntryType.RELEASE, -e.delta_reserved_minor).label("l"),
+            )
+            .where(
+                e.organization_id == organization_id,
+                e.bucket == bucket,
+                e.campaign_id.in_(ids),
+            )
+            .group_by(e.campaign_id)
+        )
+        return {row.campaign_id: (int(row.r), int(row.d), int(row.l)) for row in result}
+
+    async def debits_for_recipients(
+        self, organization_id: uuid.UUID, recipient_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        """``{recipient_id: charged_minor}`` (the unique per-recipient debit)."""
+        ids = [rid for rid in set(recipient_ids) if rid is not None]
+        if not ids:
+            return {}
+        e = CreditLedgerEntry
+        result = await self.session.execute(
+            select(
+                e.recipient_id, e.delta_reserved_minor, e.delta_available_minor
+            ).where(
+                e.organization_id == organization_id,
+                e.entry_type == CreditEntryType.DEBIT.value,
+                e.recipient_id.in_(ids),
+            )
+        )
+        return {
+            row.recipient_id: -(row.delta_reserved_minor + row.delta_available_minor)
+            for row in result
+        }
 
     # -- listings -------------------------------------------------------------
 

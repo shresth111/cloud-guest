@@ -55,6 +55,7 @@ def enqueue_send_batch(campaign_id: uuid.UUID, countdown: int = 0) -> None:
 def _service(session) -> MarketingService:  # noqa: ANN001
     from app.domains.billing.constants import PlanFeatureKey
 
+    from .credits import build_campaign_credits
     from .dependencies import build_entitlement_check
 
     settings = get_settings()
@@ -68,6 +69,7 @@ def _service(session) -> MarketingService:  # noqa: ANN001
             session, redis_client, PlanFeatureKey.GUEST_MARKETING_BYO
         ),
         enqueue_batch=enqueue_send_batch,
+        credits=build_campaign_credits(session),
     )
 
 
