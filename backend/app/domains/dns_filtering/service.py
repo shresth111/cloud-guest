@@ -72,6 +72,7 @@ points at it or is being switched to it (``switching_to_profile_id``).
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import logging
 import time
 import uuid
@@ -84,6 +85,7 @@ from app.domains.rbac.location_scope import LocationScope, enforce_entity_locati
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 
+from .bypass_lists import hostnames_to_push, list_sha
 from .cloudflare_client import (
     CloudflareApiError,
     GatewayCategory,
@@ -91,11 +93,17 @@ from .cloudflare_client import (
     GatewayRule,
 )
 from .constants import (
+    ANONYMIZER_CATEGORY_ID,
     CATEGORY_CACHE_TTL_SECONDS,
+    CURATED_DOH_HOSTNAMES,
+    DEFAULT_BYPASS_LAYERS,
     FEATURE_NAME,
+    LIST_BACKED_LAYERS,
     SECURITY_THREATS_CATEGORY_ID,
     UNSELECTABLE_CATEGORY_CLASSES,
+    BlocklistKind,
     BypassHardeningStatus,
+    BypassLayer,
     DevicePushStatus,
     ProfileSyncStatus,
     RouterFilteringState,
@@ -109,6 +117,7 @@ from .constants import (
 )
 from .device_adapters import DnsFilteringCredentials, get_dns_filtering_adapter
 from .exceptions import (
+    BypassLayerInvalidError,
     CategoryNotSelectableError,
     CategorySetLimitError,
     CloudflareGatewayCeilingError,
@@ -220,6 +229,38 @@ def _security_ids(categories: list[GatewayCategory]) -> set[int]:
     return set()
 
 
+def _vpn_block_on(row: DnsFilteringRouterLocation | None) -> bool:
+    return row is not None and BypassLayer.VPN_BLOCK.value in (row.bypass_layers or [])
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class BypassPayload:
+    """What the list-backed layers put on a router, and its version."""
+
+    doh_ipv4: list[str]
+    doh_hostnames: list[str]
+    sni_hostnames: list[str]
+    sha: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class LayerCountersView:
+    layer: str
+    enabled: bool
+    available: bool
+    packets: int | None
+    bytes: int | None
+    reason: str | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class BypassCountersView:
+    available: bool
+    reason: str | None
+    router_uptime: str | None
+    layers: list[LayerCountersView]
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class EffectivePolicy:
     """What a venue actually blocks, and where that came from."""
@@ -265,6 +306,9 @@ class DnsFilteringService:
         probe_hostname: str = "cloudflare.com",
         category_cache: CategoryCache | None = None,
         clock: Any = time.monotonic,
+        ip_exclusions: tuple[str, ...] = ("172.64.36.0/24", "162.159.36.0/24"),
+        hostname_exclusions: tuple[str, ...] = ("cloudflare-gateway.com",),
+        list_max_entries: int = 5000,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -277,6 +321,9 @@ class DnsFilteringService:
         self.probe_hostname = probe_hostname
         self.category_cache = category_cache or _PROCESS_CATEGORY_CACHE
         self.clock = clock
+        self.ip_exclusions = tuple(ip_exclusions)
+        self.hostname_exclusions = tuple(hostname_exclusions)
+        self.list_max_entries = list_max_entries
 
     # ------------------------------------------------------------------
     # categories
@@ -504,7 +551,9 @@ class DnsFilteringService:
                 effective = EffectivePolicy(None, proposed)
             else:
                 effective = EffectivePolicy(proposed, organization_policy)
-            target = effective.profile_id
+            target = await self._target_profile_id(
+                effective, vpn_block=_vpn_block_on(row)
+            )
             if target == row.applied_profile_id:
                 continue
             moves.append((row, target))
@@ -576,6 +625,31 @@ class DnsFilteringService:
             rule_precedence=await self.repository.next_rule_precedence(),
             sync_status=ProfileSyncStatus.PENDING.value,
         )
+
+    async def _target_profile_id(
+        self, effective: EffectivePolicy, *, vpn_block: bool
+    ) -> uuid.UUID | None:
+        """The profile a router's Gateway location belongs in: the venue's
+        effective one, plus Cloudflare's Anonymizer category while that
+        router's VPN-blocking layer is on -- but only if the live catalogue
+        still lists the category as blockable. Never adds a category the
+        venue did not choose unless the venue turned VPN blocking on."""
+        if effective.profile_id is None or not vpn_block:
+            return effective.profile_id
+        ids = effective.category_ids
+        if ANONYMIZER_CATEGORY_ID in ids:
+            return effective.profile_id
+        category = _flatten(await self.list_categories()).get(ANONYMIZER_CATEGORY_ID)
+        if category is None or category.category_class in UNSELECTABLE_CATEGORY_CLASSES:
+            logger.warning(
+                "dns_filtering_anonymizer_category_unavailable",
+                extra={"category_id": ANONYMIZER_CATEGORY_ID},
+            )
+            return effective.profile_id
+        profile = await self._get_or_create_profile(
+            canonical_category_ids([*ids, ANONYMIZER_CATEGORY_ID])
+        )
+        return profile.id if profile is not None else effective.profile_id
 
     async def _check_location_cap(
         self,
@@ -901,8 +975,14 @@ class DnsFilteringService:
                 device_push_status=DevicePushStatus.PENDING.value,
                 created_by=actor_user_id,
             )
-        target = effective.profile_id
-        await self._check_location_cap(effective.category_ids, [(row, target)])
+        target = await self._target_profile_id(effective, vpn_block=_vpn_block_on(row))
+        target_profile = await self.repository.get_profile(target)
+        await self._check_location_cap(
+            list(target_profile.category_ids)
+            if target_profile is not None
+            else effective.category_ids,
+            [(row, target)],
+        )
 
         updated = await self._switch_router(
             row,
@@ -1070,6 +1150,8 @@ class DnsFilteringService:
                     "bypass_hardening_enabled": False,
                     "bypass_hardening_status": BypassHardeningStatus.OFF.value,
                     "bypass_hardening_error": None,
+                    "bypass_layers": [],
+                    "bypass_lists_sha": None,
                 },
             )
         previous = row.applied_profile_id
@@ -1137,13 +1219,21 @@ class DnsFilteringService:
         router_id: uuid.UUID,
         *,
         enabled: bool,
+        layers: list[str] | None = None,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> DnsFilteringRouterLocation:
-        """Opt-in: extend the DoT/DoH drops to logged-in guests and redirect
-        their plain DNS to the router. Only on a router already switched to
-        Gateway -- without it, forcing guests onto the router's resolver buys
-        the category filter nothing."""
+        """Opt-in: converge the router's DNS-bypass layers on exactly
+        ``layers`` (default: every layer except VPN blocking), or remove all
+        of them when ``enabled`` is false. Only on a router already switched
+        to Gateway -- without it, forcing guests onto the router's resolver
+        buys the category filter nothing.
+
+        Turning the VPN layer on or off also re-points the router between
+        its venue's category set and the same set plus Cloudflare's
+        Anonymizer category -- a different Gateway location, so it counts
+        against the location cap and is checked before the router is
+        touched."""
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
@@ -1153,14 +1243,39 @@ class DnsFilteringService:
             caller_location_scope=self.caller_location_scope,
             error=CrossLocationDnsFilteringAccessError(),
         )
+        chosen = self._chosen_layers(enabled, layers)
         row = await self.repository.get_router_location(router.id)
         if row is None or (enabled and row.state != RouterFilteringState.ACTIVE.value):
             raise DnsFilteringNotEnabledError(router.id)
         adapter = get_dns_filtering_adapter(router.vendor)
         credentials = self._resolve_device_credentials(router)
+        vpn_after = BypassLayer.VPN_BLOCK.value in chosen
+        if (
+            vpn_after != _vpn_block_on(row)
+            and row.state == RouterFilteringState.ACTIVE.value
+        ):
+            # The VPN layer moves the router to another category set (its
+            # venue's plus Anonymizer) -- which may be a new distinct set and
+            # need a Gateway location of its own. Refused before the router
+            # is touched.
+            effective = await self._effective(row.organization_id, row.location_id)
+            target = await self._target_profile_id(effective, vpn_block=vpn_after)
+            if target is not None and target != row.applied_profile_id:
+                target_profile = await self.repository.get_profile(target)
+                await self._check_location_cap(
+                    list(target_profile.category_ids) if target_profile else [],
+                    [(row, target)],
+                )
+        payload = await self._bypass_payload() if chosen & LIST_BACKED_LAYERS else None
         try:
             if enabled:
-                await adapter.apply_bypass_hardening(credentials)
+                await adapter.apply_bypass_hardening(
+                    credentials,
+                    layers=chosen,
+                    doh_ipv4=payload.doh_ipv4 if payload else [],
+                    doh_hostnames=payload.doh_hostnames if payload else [],
+                    sni_hostnames=payload.sni_hostnames if payload else [],
+                )
             else:
                 await adapter.remove_bypass_hardening(credentials)
         except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
@@ -1173,6 +1288,7 @@ class DnsFilteringService:
             )
             await self.repository.commit()
             raise
+        vpn_before = _vpn_block_on(row)
         updated = await self.repository.update_router_location(
             row,
             {
@@ -1183,10 +1299,23 @@ class DnsFilteringService:
                     else BypassHardeningStatus.OFF
                 ).value,
                 "bypass_hardening_error": None,
+                "bypass_layers": sorted(chosen),
+                "bypass_lists_sha": payload.sha if payload else None,
+                "bypass_lists_pushed_at": datetime.now(UTC) if payload else None,
                 "updated_by": actor_user_id,
             },
         )
         await self.repository.commit()
+        if (
+            vpn_before != _vpn_block_on(updated)
+            and updated.state == RouterFilteringState.ACTIVE.value
+        ):
+            updated = await self._move_to_target_profile(
+                updated,
+                adapter=adapter,
+                credentials=credentials,
+                actor_user_id=actor_user_id,
+            )
         await self._audit(
             actor_user_id,
             AuditAction.DNS_FILTERING_BYPASS_HARDENING_CHANGED,
@@ -1195,10 +1324,226 @@ class DnsFilteringService:
             organization_id=router.organization_id,
             description=(
                 f"DNS bypass hardening {'enabled' if enabled else 'disabled'} "
-                f"on router {router.id}"
+                f"on router {router.id}; layers: {sorted(chosen) or 'none'}"
             ),
         )
         return updated
+
+    @staticmethod
+    def _chosen_layers(enabled: bool, layers: list[str] | None) -> frozenset[str]:
+        if not enabled:
+            return frozenset()
+        if layers is None:
+            return DEFAULT_BYPASS_LAYERS
+        valid = {layer.value for layer in BypassLayer}
+        unknown = sorted(set(layers) - valid)
+        if unknown:
+            raise BypassLayerInvalidError(f"Unknown bypass layer(s): {unknown}")
+        if not layers:
+            raise BypassLayerInvalidError(
+                "Name at least one layer, or send enabled=false to turn bypass "
+                "protection off."
+            )
+        return frozenset(layers)
+
+    async def _move_to_target_profile(
+        self,
+        row: DnsFilteringRouterLocation,
+        *,
+        adapter: Any,
+        credentials: DnsFilteringCredentials,
+        actor_user_id: uuid.UUID | None,
+    ) -> DnsFilteringRouterLocation:
+        """Re-point the router after its VPN layer changed: Gateway locations
+        are per category set, so "venue's set plus Anonymizer" is a
+        different endpoint, reached with the same verified switch as any
+        other set change. The bypass rules are already committed on the
+        device; a failed switch is recorded on the row and raised, and the
+        router keeps filtering with the set it was on."""
+        effective = await self._effective(row.organization_id, row.location_id)
+        target = await self._target_profile_id(effective, vpn_block=_vpn_block_on(row))
+        if target is None or target == row.applied_profile_id:
+            return row
+        try:
+            return await self._switch_router(
+                row,
+                target,
+                adapter=adapter,
+                credentials=credentials,
+                actor_user_id=actor_user_id,
+            )
+        except DnsFilteringError as exc:
+            await self.repository.update_router_location(
+                row,
+                {
+                    "bypass_hardening_error": (
+                        "The router's bypass rules were updated, but moving it "
+                        "to the category selection with Cloudflare's "
+                        f"Anonymizer category failed: {exc.message}"
+                    )
+                },
+            )
+            await self.repository.commit()
+            raise
+
+    async def _bypass_payload(self) -> BypassPayload:
+        """The platform's last good DoH lists, re-filtered against the
+        current exclusions (a setting change must not wait for the next
+        refresh), plus the curated hostnames that also get ``tls-host``."""
+        ipv4_row = await self.repository.get_blocklist(BlocklistKind.DOH_IPV4.value)
+        names_row = await self.repository.get_blocklist(BlocklistKind.DOH_DOMAINS.value)
+        networks = [ipaddress.ip_network(n, strict=False) for n in self.ip_exclusions]
+        ipv4 = [
+            a
+            for a in (ipv4_row.entries if ipv4_row is not None else [])
+            if not any(
+                ipaddress.ip_address(a).version == n.version
+                and ipaddress.ip_address(a) in n
+                for n in networks
+            )
+        ][: self.list_max_entries]
+        names = hostnames_to_push(
+            names_row.entries if names_row is not None else [],
+            exclusions=self.hostname_exclusions,
+            probe_hostname=self.probe_hostname,
+            max_entries=self.list_max_entries,
+        )
+        sni = hostnames_to_push(
+            [],
+            exclusions=self.hostname_exclusions,
+            probe_hostname=self.probe_hostname,
+            max_entries=len(CURATED_DOH_HOSTNAMES),
+        )
+        return BypassPayload(
+            doh_ipv4=ipv4,
+            doh_hostnames=names,
+            sni_hostnames=sni,
+            sha=list_sha([*ipv4, *(f"name:{n}" for n in names)]),
+        )
+
+    async def push_bypass_lists_to_router(self, router_id: uuid.UUID) -> str:
+        """The scheduled refresh's per-router leaf: re-converge a router's
+        layers when the platform lists moved since its last push.
+
+        Never raises for a device problem -- one unreachable router must not
+        fail the task; the error is recorded on the row. Returns
+        ``pushed`` / ``unchanged`` / ``skipped`` / ``failed``."""
+        router = await self.router_lookup.get_router(router_id)
+        ensure_not_controller_managed(router, feature=FEATURE_NAME)
+        row = await self.repository.get_router_location(router.id)
+        if (
+            row is None
+            or not row.bypass_hardening_enabled
+            or row.state != RouterFilteringState.ACTIVE.value
+        ):
+            return "skipped"
+        layers = frozenset(row.bypass_layers or [])
+        if not layers & LIST_BACKED_LAYERS:
+            return "skipped"
+        payload = await self._bypass_payload()
+        if row.bypass_lists_sha == payload.sha:
+            return "unchanged"
+        adapter = get_dns_filtering_adapter(router.vendor)
+        try:
+            credentials = self._resolve_device_credentials(router)
+            await adapter.apply_bypass_hardening(
+                credentials,
+                layers=layers,
+                doh_ipv4=payload.doh_ipv4,
+                doh_hostnames=payload.doh_hostnames,
+                sni_hostnames=payload.sni_hostnames,
+            )
+        except DnsFilteringError as exc:
+            # The rules already on the router stay in force; only the list
+            # refresh did not land.
+            await self.repository.update_router_location(
+                row,
+                {"bypass_hardening_error": f"DoH list refresh failed: {exc.message}"},
+            )
+            await self.repository.commit()
+            return "failed"
+        await self.repository.update_router_location(
+            row,
+            {
+                "bypass_lists_sha": payload.sha,
+                "bypass_lists_pushed_at": datetime.now(UTC),
+                "bypass_hardening_error": None,
+            },
+        )
+        await self.repository.commit()
+        return "pushed"
+
+    async def get_bypass_counters(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> BypassCountersView:
+        """Per-layer drop counters read off the router's own marked rules.
+        Honest by construction: anything that cannot be read is
+        ``available=False`` with the reason, never a zero."""
+        router = await self._load_router(router_id, requesting_organization_id)
+        ensure_not_controller_managed(router, feature=FEATURE_NAME)
+        row = await self.repository.get_router_location(router.id)
+        enabled_layers = set(row.bypass_layers or []) if row is not None else set()
+
+        def unavailable(reason: str) -> BypassCountersView:
+            return BypassCountersView(
+                available=False,
+                reason=reason,
+                router_uptime=None,
+                layers=[
+                    LayerCountersView(
+                        layer.value,
+                        layer.value in enabled_layers,
+                        False,
+                        None,
+                        None,
+                        reason,
+                    )
+                    for layer in BypassLayer
+                ],
+            )
+
+        if row is None or not row.bypass_hardening_enabled:
+            return unavailable("Bypass protection is off on this router.")
+        try:
+            adapter = get_dns_filtering_adapter(router.vendor)
+            credentials = self._resolve_device_credentials(router)
+            counters = await adapter.read_bypass_counters(credentials)
+        except DnsFilteringError as exc:
+            return unavailable(f"Could not read the router: {exc.message}")
+        by_layer = {c.layer: c for c in counters.layers}
+        views: list[LayerCountersView] = []
+        for layer in BypassLayer:
+            c = by_layer.get(layer.value)
+            if c is None:
+                views.append(
+                    LayerCountersView(
+                        layer.value,
+                        layer.value in enabled_layers,
+                        False,
+                        None,
+                        None,
+                        "the router returned nothing for this layer",
+                    )
+                )
+                continue
+            views.append(
+                LayerCountersView(
+                    layer.value,
+                    layer.value in enabled_layers,
+                    c.counters_available,
+                    c.packets,
+                    c.bytes,
+                    c.reason,
+                )
+            )
+        return BypassCountersView(
+            available=any(v.available for v in views),
+            reason=None
+            if any(v.available for v in views)
+            else "No layer on this router has a readable counter.",
+            router_uptime=counters.router_uptime,
+            layers=views,
+        )
 
     # ------------------------------------------------------------------
     # helpers
@@ -1236,6 +1581,8 @@ class DnsFilteringService:
 
 
 __all__ = [
+    "BypassCountersView",
+    "BypassPayload",
     "CategoryCache",
     "DnsFilteringService",
     "EffectivePolicy",

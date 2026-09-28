@@ -17,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.repositories.generic import GenericRepository
 
 from .constants import RULE_PRECEDENCE_BASE, RouterFilteringState
-from .models import DnsFilteringPolicy, DnsFilteringProfile, DnsFilteringRouterLocation
+from .models import (
+    DnsBypassBlocklist,
+    DnsFilteringPolicy,
+    DnsFilteringProfile,
+    DnsFilteringRouterLocation,
+)
 
 
 class DnsFilteringRepositoryProtocol(Protocol):
@@ -72,6 +77,13 @@ class DnsFilteringRepositoryProtocol(Protocol):
         self, organization_id: uuid.UUID, location_id: uuid.UUID | None
     ) -> list[DnsFilteringRouterLocation]: ...
 
+    # platform DoH lists and the routers they are pushed to
+    async def get_blocklist(self, kind: str) -> DnsBypassBlocklist | None: ...
+    async def save_blocklist(
+        self, kind: str, data: dict[str, object]
+    ) -> DnsBypassBlocklist: ...
+    async def list_bypass_hardened(self) -> list[DnsFilteringRouterLocation]: ...
+
     async def commit(self) -> None: ...
 
 
@@ -81,6 +93,7 @@ class DnsFilteringRepository:
         self.profiles = GenericRepository(DnsFilteringProfile, session)
         self.policies = GenericRepository(DnsFilteringPolicy, session)
         self.router_locations = GenericRepository(DnsFilteringRouterLocation, session)
+        self.blocklists = GenericRepository(DnsBypassBlocklist, session)
 
     # -- profiles ------------------------------------------------------------
 
@@ -252,6 +265,33 @@ class DnsFilteringRepository:
                 DnsFilteringRouterLocation.location_id == location_id
             )
         result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    # -- platform DoH lists -------------------------------------------------
+
+    async def get_blocklist(self, kind: str) -> DnsBypassBlocklist | None:
+        rows = await self.blocklists.get_all(filters={"kind": kind}, limit=1)
+        return rows[0] if rows else None
+
+    async def save_blocklist(
+        self, kind: str, data: dict[str, object]
+    ) -> DnsBypassBlocklist:
+        existing = await self.get_blocklist(kind)
+        if existing is None:
+            return await self.blocklists.create({"kind": kind, **data})
+        return await self.blocklists.update(existing, data)
+
+    async def list_bypass_hardened(self) -> list[DnsFilteringRouterLocation]:
+        """Every router with bypass hardening on and Gateway active -- the
+        candidates for a list push. Platform-wide by design: this is the
+        scheduled sweep, never a tenant request."""
+        result = await self.session.execute(
+            select(DnsFilteringRouterLocation).where(
+                DnsFilteringRouterLocation.is_deleted.is_(False),
+                DnsFilteringRouterLocation.bypass_hardening_enabled.is_(True),
+                DnsFilteringRouterLocation.state == RouterFilteringState.ACTIVE.value,
+            )
+        )
         return list(result.scalars().all())
 
     async def commit(self) -> None:
