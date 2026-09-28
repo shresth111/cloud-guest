@@ -42,6 +42,8 @@ REQUIRED_HELPERS = (
     "read_var",
     "set_var",
     "materialise_mail_env",
+    "materialise_slack_env",
+    "materialise_cloudflare_env",
     "compose_up",
     "wait_healthy",
     "report",
@@ -238,3 +240,129 @@ def test_values_are_never_printed(tmp_path: Path) -> None:
         assert (
             "out[" not in line and "value" not in line
         ), f"the filter prints something derived from a value: {line}"
+
+
+# ---------------------------------------------------------------------------
+# materialise_cloudflare_env: the Cloudflare Gateway pair
+# ---------------------------------------------------------------------------
+
+CF_TOKEN = "cf-token-value-never-logged"
+CF_ACCOUNT = "cf-account-id-never-logged"
+
+
+def test_cloudflare_env_is_loaded_after_the_base_env_file() -> None:
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+    base = "${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}"
+    slack = "${SLACK_ENV_FILE:-./slack.env}"
+    cloudflare = "${CLOUDFLARE_ENV_FILE:-./cloudflare.env}"
+    for service in ("api", "celery-worker", "celery-beat"):
+        block = _service_block(compose, service)
+        assert cloudflare in block, f"{service} does not load cloudflare.env"
+        assert (
+            block.index(base) < block.index(slack) < block.index(cloudflare)
+        ), f"{service} loads cloudflare.env before the base env file"
+    # Never on the frontend: it reads no backend configuration.
+    assert cloudflare not in _service_block(compose, "frontend")
+
+
+def test_the_cloudflare_filter_is_called_for_the_backend_only() -> None:
+    source = _script()
+    call = source[source.index('if [[ "$SERVICE" == "api" ]]; then') :]
+    assert call.index("materialise_cloudflare_env") < call.index("compose_up")
+    assert call.index("materialise_cloudflare_env") < call.index("\nfi\n")
+
+
+def _run_cloudflare(
+    tmp_path: Path, aws_output: str, aws_exit: int = 0, secret_id: str = "x"
+) -> tuple[str, str, Path]:
+    """Extract the real `materialise_cloudflare_env` and run it against a fake
+    aws. Returns (file contents, combined output, file path)."""
+    source = _script()
+    start = source.index("materialise_cloudflare_env() {")
+    end = source.index("\n}\n", start) + len("\n}\n")
+    (tmp_path / "fn.sh").write_text(source[start:end], encoding="utf-8")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_aws = fake_bin / "aws"
+    fake_aws.write_text(
+        "#!/bin/bash\nprintf '%s' " + _sh_quote(aws_output) + f"\nexit {aws_exit}\n",
+        encoding="utf-8",
+    )
+    fake_aws.chmod(0o755)
+
+    target = tmp_path / "cloudflare.env"
+    harness = tmp_path / "harness.sh"
+    harness.write_text(
+        "set -euo pipefail\n"
+        'log() { echo "[test] $*"; }\n'
+        "REGION=ap-south-1\n"
+        f"CLOUDFLARE_SECRET_ID={_sh_quote(secret_id)}\n"
+        f"CLOUDFLARE_ENV_FILE={target}\n"
+        f'source "{tmp_path / "fn.sh"}"\n'
+        "materialise_cloudflare_env\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}")
+    result = subprocess.run(
+        ["bash", str(harness)], capture_output=True, text=True, env=env
+    )
+    assert result.returncode == 0, result.stderr
+    written = target.read_text(encoding="utf-8") if target.exists() else ""
+    return written, result.stdout + result.stderr, target
+
+
+def test_cloudflare_pair_is_written_and_nothing_else(tmp_path: Path) -> None:
+    secret = (
+        f'{{"CLOUDGUEST_CLOUDFLARE_API_TOKEN": "{CF_TOKEN}",'
+        f' "CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID": "{CF_ACCOUNT}",'
+        ' "CLOUDGUEST_CLOUDFLARE_STRAY": "nope", "CLOUDGUEST_DEBUG": "true"}'
+    )
+    written, output, target = _run_cloudflare(tmp_path, secret)
+    lines = sorted(line for line in written.splitlines() if line)
+    assert lines == [
+        f"CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID={CF_ACCOUNT}",
+        f"CLOUDGUEST_CLOUDFLARE_API_TOKEN={CF_TOKEN}",
+    ]
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    # Values never reach the log; key names do.
+    assert CF_TOKEN not in output and CF_ACCOUNT not in output
+    assert "CLOUDGUEST_CLOUDFLARE_API_TOKEN" in output
+
+
+def test_half_a_cloudflare_pair_writes_nothing(tmp_path: Path) -> None:
+    """A token without an account id cannot make one API call; writing it
+    would turn "not configured, 503" into "fails on every request"."""
+    for i, secret in enumerate(
+        (
+            f'{{"CLOUDGUEST_CLOUDFLARE_API_TOKEN": "{CF_TOKEN}"}}',
+            f'{{"CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID": "{CF_ACCOUNT}"}}',
+            f'{{"CLOUDGUEST_CLOUDFLARE_API_TOKEN": "{CF_TOKEN}",'
+            ' "CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID": "  "}',
+        )
+    ):
+        case = tmp_path / f"case{i}"
+        case.mkdir()
+        written, output, _ = _run_cloudflare(case, secret)
+        assert written == "", secret
+        assert CF_TOKEN not in output and CF_ACCOUNT not in output
+
+
+def test_a_denied_cloudflare_secret_does_not_fail_the_deploy(tmp_path: Path) -> None:
+    written, _, target = _run_cloudflare(
+        tmp_path, "An error occurred (AccessDeniedException)", aws_exit=254
+    )
+    assert written == ""
+    assert target.exists(), "compose refuses to start on a missing env_file"
+
+
+def test_a_cloudflare_secret_that_is_not_json_writes_nothing(tmp_path: Path) -> None:
+    written, _, target = _run_cloudflare(tmp_path, "not json at all")
+    assert written == ""
+    assert target.exists()
+
+
+def test_an_empty_cloudflare_secret_id_still_leaves_a_file(tmp_path: Path) -> None:
+    written, _, target = _run_cloudflare(tmp_path, "unused", secret_id="")
+    assert written == ""
+    assert target.exists(), "compose refuses to start on a missing env_file"

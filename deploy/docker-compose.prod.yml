@@ -86,6 +86,11 @@ services:
       # that does not exist yet. An empty file is the correct steady
       # state until a webhook is actually configured.
       - ${SLACK_ENV_FILE:-./slack.env}
+      # ...and the Cloudflare Gateway token + account id for DNS category
+      # filtering, from cloudguest/prod/cloudflare via
+      # `materialise_cloudflare_env`. Same rules as slack.env, including
+      # `touch ~/deploy/cloudflare.env` before adding this line by hand.
+      - ${CLOUDFLARE_ENV_FILE:-./cloudflare.env}
     ports:
       - "8000:8000"
     depends_on:
@@ -128,6 +133,11 @@ services:
       # that does not exist yet. An empty file is the correct steady
       # state until a webhook is actually configured.
       - ${SLACK_ENV_FILE:-./slack.env}
+      # ...and the Cloudflare Gateway token + account id for DNS category
+      # filtering, from cloudguest/prod/cloudflare via
+      # `materialise_cloudflare_env`. Same rules as slack.env, including
+      # `touch ~/deploy/cloudflare.env` before adding this line by hand.
+      - ${CLOUDFLARE_ENV_FILE:-./cloudflare.env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -176,6 +186,11 @@ services:
       # that does not exist yet. An empty file is the correct steady
       # state until a webhook is actually configured.
       - ${SLACK_ENV_FILE:-./slack.env}
+      # ...and the Cloudflare Gateway token + account id for DNS category
+      # filtering, from cloudguest/prod/cloudflare via
+      # `materialise_cloudflare_env`. Same rules as slack.env, including
+      # `touch ~/deploy/cloudflare.env` before adding this line by hand.
+      - ${CLOUDFLARE_ENV_FILE:-./cloudflare.env}
     depends_on:
       postgres:
         condition: service_healthy
