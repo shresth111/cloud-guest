@@ -548,6 +548,23 @@ class TestCapabilityMatrix:
         ):
             assert by_key[key].availability is not SecurityAvailability.AVAILABLE, key
 
+    def test_category_filtering_names_its_planned_mechanism_and_limits(
+        self,
+    ) -> None:
+        """The Cloudflare Gateway switch exists in code but has not run
+        against a real account or router, so the row names it only as a
+        plan and says, in the customer's words, how a guest gets around it."""
+        feature = {f.key: f for f in SECURITY_FEATURES}["web_category_filtering"]
+        assert feature.availability is (
+            SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY
+        )
+        assert feature.enforcement is not None
+        assert feature.enforcement.startswith("Planned: ")
+        assert "Cloudflare Gateway" in feature.enforcement
+        detail = feature.detail.lower()
+        assert "private dns" in detail
+        assert "bypass protection" in detail
+
     def test_the_known_exclusions_stay_excluded(self) -> None:
         """Pinned so that "we'll just show a toggle for now" fails the build
         rather than shipping a control that writes a row and blocks nothing."""
