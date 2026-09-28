@@ -18,8 +18,8 @@ exactly what is on the device. Nothing is written to any router.
 Downgrade drops the table and the columns. Any router with a layer on keeps
 its rows on the device; disable bypass hardening first.
 
-Revision ID: 0132_add_dns_bypass_layers
-Revises: 0131_create_dns_filtering_tables
+Revision ID: 0139_add_dns_bypass_layers
+Revises: 0138_create_dns_filtering_tables
 Create Date: 2026-09-24
 """
 
@@ -28,8 +28,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0132_add_dns_bypass_layers"
-down_revision = "0131_create_dns_filtering_tables"
+revision = "0139_add_dns_bypass_layers"
+down_revision = "0138_create_dns_filtering_tables"
 branch_labels = None
 depends_on = None
 
