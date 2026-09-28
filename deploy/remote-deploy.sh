@@ -93,6 +93,15 @@ MAIL_ENV_FILE="$DEPLOY_DIR/mail.env"
 # CLOUDGUEST_SLACK_*, so nothing else moves.
 SLACK_SECRET_ID="${SLACK_SECRET_ID:-cloudguest/prod/slack}"
 SLACK_ENV_FILE="$DEPLOY_DIR/slack.env"
+# The Cloudflare Gateway API token and account id for DNS category filtering
+# (backend/app/domains/dns_filtering/cloudflare_client.py; its endpoints answer 503 until both are
+# set). Same reasoning as Slack: the token is a bearer credential and these
+# repositories are public, so it lives in its own secret and the instance role
+# is granted GetSecretValue on cloudguest/prod/cloudflare-* and nothing wider.
+# CLOUDFLARE_SECRET_ID empty disables the fetch; a missing or unreadable
+# secret leaves the feature returning 503 and the deploy unaffected.
+CLOUDFLARE_SECRET_ID="${CLOUDFLARE_SECRET_ID:-cloudguest/prod/cloudflare}"
+CLOUDFLARE_ENV_FILE="$DEPLOY_DIR/cloudflare.env"
 
 case "$SERVICE" in
   api)      VAR=API_IMAGE;      TARGETS=(api celery-worker celery-beat) ;;
@@ -383,6 +392,74 @@ SLACKPY
   log "slack.env: ${summary:-nothing written -- see the warning above}"
 }
 
+# The Cloudflare Gateway credentials, materialised the same way as Slack.
+#
+# Narrower still: an explicit whitelist of exactly two keys, and both-or-
+# neither -- a token without an account id (or the reverse) cannot make a
+# single API call, so writing half of the pair would only turn "not configured,
+# 503" into "configured, fails on every request". Half a pair writes nothing.
+#
+# Every failure path is "continue with no Cloudflare config", never "fail the
+# deploy". Nothing here prints a value: the log names which keys were written.
+materialise_cloudflare_env() {
+  if [[ -z "$CLOUDFLARE_SECRET_ID" ]]; then
+    # Unlike slack, make sure the path exists: compose refuses to start on an
+    # env_file that is missing, and an empty file is the correct "off" state.
+    touch "$CLOUDFLARE_ENV_FILE"; chmod 600 "$CLOUDFLARE_ENV_FILE"
+    log "CLOUDFLARE_SECRET_ID is empty -- leaving $CLOUDFLARE_ENV_FILE alone"
+    return 0
+  fi
+  : > "$CLOUDFLARE_ENV_FILE"; chmod 600 "$CLOUDFLARE_ENV_FILE"
+
+  local raw summary
+  if ! raw="$(aws secretsmanager get-secret-value --region "$REGION" \
+                --secret-id "$CLOUDFLARE_SECRET_ID" --query SecretString --output text 2>&1)"; then
+    log "WARNING: could not read secret '$CLOUDFLARE_SECRET_ID' ($raw)"
+    log "WARNING: continuing with no Cloudflare config -- DNS filtering endpoints stay 503"
+    return 0
+  fi
+
+  # Same stdin/temp-file dance as materialise_mail_env: the JSON arrives on
+  # STDIN, so the program cannot also come from stdin.
+  local py
+  py="$(mktemp)"
+  cat > "$py" <<'CLOUDFLAREPY'
+import json, sys
+
+KEYS = ("CLOUDGUEST_CLOUDFLARE_API_TOKEN", "CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID")
+
+target = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception as exc:  # any unreadable secret means "no Cloudflare config"
+    print(f"WARNING: secret is not valid JSON ({exc})", file=sys.stderr)
+    sys.exit(0)
+if not isinstance(data, dict):
+    print("WARNING: secret is not a JSON object", file=sys.stderr)
+    sys.exit(0)
+
+present = {k: str(data[k]).strip() for k in KEYS if str(data.get(k) or "").strip()}
+if len(present) != len(KEYS):
+    missing = sorted(set(KEYS) - set(present))
+    print(f"0 keys written: incomplete pair, missing {', '.join(missing)}")
+    sys.exit(0)
+
+with open(target, "w", encoding="utf-8") as handle:
+    for key in KEYS:
+        handle.write(f"{key}={present[key]}\n")
+
+print(f"{len(KEYS)} keys written: {', '.join(KEYS)}")
+CLOUDFLAREPY
+
+  if ! summary="$(printf '%s' "$raw" | python3 "$py" "$CLOUDFLARE_ENV_FILE")"; then
+    rm -f "$py"
+    log "WARNING: python3 could not build $CLOUDFLARE_ENV_FILE -- continuing with no Cloudflare config"
+    return 0
+  fi
+  rm -f "$py"
+  log "cloudflare.env: ${summary:-nothing written -- see the warning above}"
+}
+
 # Wait for ONE container to report healthy. Used to gate the celery services on
 # the migration having finished; see compose_up.
 wait_one_healthy() {
@@ -475,6 +552,7 @@ set_var "$VAR" "$IMAGE"
 if [[ "$SERVICE" == "api" ]]; then
   materialise_mail_env
   materialise_slack_env
+  materialise_cloudflare_env
 fi
 
 if ! compose_up; then
