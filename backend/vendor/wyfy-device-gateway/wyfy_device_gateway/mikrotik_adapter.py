@@ -200,6 +200,25 @@ _CONTENT_FILTER_RULE_COMMENT_PREFIX = "WyfyGuest content filter "
 # Appended to the marker of the second, subdomain-matching DNS entry, so the
 # two entries one domain rule creates stay individually addressable.
 _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX = " (subdomains)"
+# The HTTPS-name half of a domain rule: two ``/ip firewall filter`` drops on
+# tcp/443 matching ``tls-host=<domain>`` and ``tls-host=*.<domain>``. Same
+# rule-id marker family as the DNS entries, so one identity finds, corrects
+# and removes all four of a domain rule's objects. None of these four
+# markers is a prefix of another: they branch at ``": "``, ``" (s"`` and
+# ``" (h"``, and the two https markers at ``")"`` versus ``" "``.
+_CONTENT_FILTER_HTTPS_MARKER_SUFFIX = " (https)"
+_CONTENT_FILTER_HTTPS_SUBDOMAIN_MARKER_SUFFIX = " (https subdomains)"
+# Where the tls-host drops go: directly above the platform's own pre-login
+# DoT drop, exactly where ``mikrotik_dns_filtering``'s ``doh_hostnames``
+# tls-host rows go. That is below the hotspot's dynamic ``jump`` rules and
+# above both the firewall sentinel band and
+# ``cloudguest-fw-fwd-established``. Above the established accept is not a
+# preference: a ClientHello is sent *after* the TCP handshake, on a
+# connection conntrack already calls established, so a tls-host drop below
+# that accept never sees a single ClientHello and blocks nothing. Duplicated
+# as a literal (not imported) because ``mikrotik_dns_filtering`` imports
+# this module.
+_CONTENT_FILTER_SNI_ANCHOR_COMMENT = "cloudguest-block-dot-udp"
 # NAT / internet access: the marker that makes one VLAN's masquerade rule
 # findable again on the next push. It is deliberately the rule's *identity*
 # rather than any of its RouterOS fields -- ``src-address`` is exactly what
@@ -353,16 +372,56 @@ def _qos_mangle_fields(rule: QosPacketMarkConfig) -> dict[str, str]:
     return fields
 
 
-def _content_filter_marker(rule_id: str, *, subdomains: bool = False) -> str:
+def _content_filter_marker(
+    rule_id: str, *, subdomains: bool = False, https: bool = False
+) -> str:
     """The identity half of a content-filtering object's comment.
 
     Ends in ``": "`` so the customer's own label can follow it in the same
     field without the marker ever being a prefix of another rule's -- and
     so the non-subdomain marker is not a prefix of the subdomain one, which
     branches at ``" ("`` before the colon is reached.
+
+    ``https`` selects the marker of a ``tls-host`` filter row rather than a
+    DNS entry; see :data:`_CONTENT_FILTER_HTTPS_MARKER_SUFFIX`.
     """
-    suffix = _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX if subdomains else ""
+    if https:
+        suffix = (
+            _CONTENT_FILTER_HTTPS_SUBDOMAIN_MARKER_SUFFIX
+            if subdomains
+            else _CONTENT_FILTER_HTTPS_MARKER_SUFFIX
+        )
+    else:
+        suffix = _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX if subdomains else ""
     return f"{_CONTENT_FILTER_RULE_COMMENT_PREFIX}{rule_id}{suffix}: "
+
+
+def _content_filter_sni_rows(
+    rule_id: str, domain: str, label: str
+) -> tuple[tuple[str, dict[str, str]], ...]:
+    """``(marker, desired row)`` for the two ``tls-host`` drops one blocked
+    domain becomes: the name itself, and every subdomain of it.
+
+    ``tls-host`` takes a glob, so ``*.<domain>`` is the subdomain match --
+    the counterpart of the DNS entry's ``regexp=``. Two rows rather than
+    one ``*<domain>`` glob because that would also match
+    ``notfacebook.com``. ``chain=forward`` only: the router's own traffic
+    (its management path, its API, its DNS upstream) is input/output and
+    can never match these.
+    """
+
+    def row(subdomains: bool) -> tuple[str, dict[str, str]]:
+        marker = _content_filter_marker(rule_id, subdomains=subdomains, https=True)
+        return marker, {
+            "chain": "forward",
+            "protocol": "tcp",
+            "dst-port": "443",
+            "tls-host": f"*.{domain}" if subdomains else domain,
+            "action": "drop",
+            "comment": f"{marker}{label}",
+        }
+
+    return (row(False), row(True))
 
 
 def _content_filter_comment(
@@ -377,6 +436,46 @@ def _content_filter_comment(
     the rename cannot touch.
     """
     return f"{_content_filter_marker(rule_id, subdomains=subdomains)}{label}"
+
+
+def _owns_content_filter_comment(comment: object, base: str) -> bool:
+    """Whether a comment carries any of one rule's markers. ``base`` is the
+    prefix plus the rule id; a marker continues with ``": "`` or ``" ("``,
+    never another id character, so a rule whose id merely starts the same
+    way is not claimed."""
+    if not isinstance(comment, str) or not comment.startswith(base):
+        return False
+    return comment[len(base) :].startswith((": ", " ("))
+
+
+def _content_filter_sni_anchor(
+    forward: list[dict],
+) -> tuple[str | None, int | None]:
+    """``(place-before id, index of the first accept)`` for a ``tls-host``
+    drop, over the ``forward`` rows in order.
+
+    The id is :data:`_CONTENT_FILTER_SNI_ANCHOR_COMMENT`'s row when it sits
+    above the first accept, else the first accept itself, else ``None``
+    (append: nothing in ``forward`` accepts, so nothing can be above the
+    drop that lets a ClientHello through).
+    """
+    accept_index = next(
+        (i for i, r in enumerate(forward) if str(r.get("action", "")) == "accept"),
+        None,
+    )
+    anchor = next(
+        (
+            i
+            for i, r in enumerate(forward)
+            if r.get("comment") == _CONTENT_FILTER_SNI_ANCHOR_COMMENT
+        ),
+        None,
+    )
+    if anchor is not None and (accept_index is None or anchor < accept_index):
+        return forward[anchor][".id"], accept_index
+    if accept_index is not None:
+        return forward[accept_index][".id"], accept_index
+    return None, None
 
 
 class _HotspotNames:
@@ -5523,6 +5622,47 @@ class MikroTikAdapter:
         out and fixed for its own whitelist entries before this addition
         existed.
 
+        ## A domain is also blocked by its HTTPS name (``tls-host``)
+
+        The sinkhole only binds a guest who asks this router for the name.
+        A guest with the address already cached, or with their own
+        resolver, connects straight past it. So a domain rule also writes
+        two ``/ip firewall filter`` drops on tcp/443 --
+        ``tls-host=<domain>`` and ``tls-host=*.<domain>`` -- which match the
+        site name the browser sends in the clear in its TLS ClientHello.
+        Nothing is decrypted or inspected beyond that one field.
+
+        **Where they sit is the whole feature.** A ClientHello travels on a
+        connection conntrack already calls *established* (it follows the
+        TCP handshake), so a drop below
+        ``cloudguest-fw-fwd-established`` never sees one. They go directly
+        above :data:`_CONTENT_FILTER_SNI_ANCHOR_COMMENT` -- the same place
+        ``mikrotik_dns_filtering``'s ``doh_hostnames`` tls-host rows go:
+        under the hotspot's dynamic jumps, above the firewall band (so a
+        customer allow rule cannot re-open a blocked site) and above the
+        established accept. A router without that anchor gets them above
+        the first ``accept`` in ``forward``, the rule
+        :meth:`_ensure_content_filter_enforcement_rule` already uses; a
+        row found below the first accept is re-added above it and the old
+        one removed after, so the chain is never without the drop.
+
+        **Read back after writing.** Every object this rule should own is
+        re-read once the writes are done; a write that returned cleanly and
+        changed nothing (a known RouterOS shape) fails the push instead of
+        reporting a block that is not there.
+
+        What it cannot see, stated rather than implied: Encrypted Client
+        Hello hides the name (Cloudflare-fronted sites with a current
+        browser); QUIC (HTTP/3 on udp/443) carries no name this matcher
+        reads; RouterOS documents that ``tls-host`` cannot match a
+        ClientHello split across TCP segments, which is what a browser
+        with post-quantum key exchange sends -- so this layer may not fire
+        for current desktop Chrome at all and must be proven on hardware.
+        QUIC is deliberately not blocked wholesale: dropping udp/443
+        changes every guest's traffic to every site to stop a guest who
+        already bypassed the sinkhole, and that is a venue-wide decision a
+        single "block this site" press must not make.
+
         ## What this deliberately does not do
 
         No Layer7 protocol matching, no ``/ip proxy`` web-proxy, and --
@@ -5575,10 +5715,11 @@ class MikroTikAdapter:
             try:
                 if rule.value_type == "ip_cidr":
                     # A rule re-typed from "domain" leaves two DNS entries
-                    # still answering for a name nobody is blocking any
-                    # more; the objects this rule no longer uses come off
-                    # before the ones it does go on.
+                    # and two tls-host drops still blocking a name nobody
+                    # is blocking any more; the objects this rule no longer
+                    # uses come off before the ones it does go on.
                     self._remove_content_filter_dns_entries(api, rule.rule_id)
+                    self._remove_content_filter_sni_rows(api, rule.rule_id)
                     self._ensure_content_filter_address_list_entry(api, rule)
                     self._ensure_content_filter_enforcement_rule(api)
                 else:
@@ -5589,10 +5730,18 @@ class MikroTikAdapter:
                         _content_filter_marker(rule.rule_id),
                     )
                     self._ensure_content_filter_dns_entries(api, rule)
+                    self._ensure_content_filter_sni_rows(api, rule)
+                problems = self._content_filter_readback_problems(api, rule)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_content_filter_rule: {exc}"
                 ) from exc
+            if problems:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "configure_content_filter_rule: read-back after writing "
+                    "found " + "; ".join(problems),
+                )
         finally:
             api.close()
 
@@ -5693,6 +5842,148 @@ class MikroTikAdapter:
             return
         menu.add(**desired, disabled="no")
 
+    def _ensure_content_filter_sni_rows(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> None:  # noqa: ANN001
+        """The two ``tls-host`` drops of one blocked domain, made to exist
+        exactly once each, field-correct, enabled, and above the first
+        ``accept`` in ``forward``.
+
+        Found by marker like every other content-filter object. A row that
+        is present but below the first accept is the one case an update
+        cannot fix (``librouteros`` has no ``move``), so it is re-added at
+        the anchor and the old row removed *after* -- a window with two
+        identical drops, never one with none. Only rows carrying this
+        rule's own two markers are ever written or removed.
+        """
+        menu = api.path("ip", "firewall", "filter")
+        for marker, desired in _content_filter_sni_rows(
+            rule.rule_id, rule.value, rule.label
+        ):
+            forward = [
+                dict(row) for row in menu if str(row.get("chain", "")) == "forward"
+            ]
+            anchor_id, accept_index = _content_filter_sni_anchor(forward)
+            mine = [
+                (index, row)
+                for index, row in enumerate(forward)
+                if str(row.get("comment", "")).startswith(marker)
+            ]
+            placed = [
+                (index, row)
+                for index, row in mine
+                if accept_index is None or index < accept_index
+            ]
+            if not placed:
+                fields = dict(desired, disabled="no")
+                if anchor_id is not None:
+                    fields["place-before"] = anchor_id
+                menu.add(**fields)
+                stale = [row[".id"] for _, row in mine]
+            else:
+                keep = placed[0][1]
+                changed = {
+                    key: value
+                    for key, value in desired.items()
+                    if str(keep.get(key, "")) != value
+                }
+                if _is_truthy(keep.get("disabled")):
+                    changed["disabled"] = "no"
+                if changed:
+                    menu.update(**{".id": keep[".id"], **changed})
+                stale = [row[".id"] for _, row in mine if row is not keep]
+            for row_id in stale:
+                menu.remove(row_id)
+
+    def _remove_content_filter_sni_rows(self, api, rule_id: str) -> None:  # noqa: ANN001
+        """Both of one rule's ``tls-host`` drops, by their own two markers."""
+        for subdomains in (False, True):
+            self._remove_where_prefixed(
+                api,
+                ("ip", "firewall", "filter"),
+                "comment",
+                _content_filter_marker(rule_id, subdomains=subdomains, https=True),
+            )
+
+    def _content_filter_readback_problems(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> list[str]:  # noqa: ANN001
+        """What the device holds for this rule, compared against what the
+        push just wrote. Empty means every object is present once, carries
+        the intended values, is enabled, and -- for a filter row -- sits
+        above the first ``accept`` in ``forward``.
+
+        Read fresh, after every write, because "no exception" is not "it is
+        there": a ``set`` that returns cleanly and changes nothing is a
+        known RouterOS shape (``tests/fake_write_transport.py``'s
+        ``silently_ignore_updates``).
+        """
+        problems: list[str] = []
+
+        def check(
+            rows: list[dict], marker: str, desired: dict[str, str], what: str
+        ) -> int | None:
+            mine = [
+                (i, r)
+                for i, r in enumerate(rows)
+                if str(r.get("comment", "")).startswith(marker)
+            ]
+            if len(mine) != 1:
+                problems.append(f"{len(mine)} {what} (expected 1)")
+                return None
+            index, row = mine[0]
+            wrong = sorted(
+                key
+                for key, value in desired.items()
+                if key != "comment" and str(row.get(key, "")) != value
+            )
+            if wrong:
+                problems.append(f"{what} has wrong {', '.join(wrong)}")
+            if _is_truthy(row.get("disabled")):
+                problems.append(f"{what} is disabled")
+            return index
+
+        if rule.value_type == "ip_cidr":
+            entries = [dict(r) for r in api.path("ip", "firewall", "address-list")]
+            check(
+                entries,
+                _content_filter_marker(rule.rule_id),
+                {"list": _CONTENT_FILTER_ADDRESS_LIST_NAME, "address": rule.value},
+                "address-list entry",
+            )
+            return problems
+
+        static = [dict(r) for r in api.path("ip", "dns", "static")]
+        check(
+            static,
+            _content_filter_marker(rule.rule_id),
+            {"name": rule.value, "address": _CONTENT_FILTER_SINKHOLE_ADDRESS},
+            "DNS entry",
+        )
+        check(
+            static,
+            _content_filter_marker(rule.rule_id, subdomains=True),
+            {
+                "regexp": _domain_subdomain_regex(rule.value),
+                "address": _CONTENT_FILTER_SINKHOLE_ADDRESS,
+            },
+            "subdomain DNS entry",
+        )
+        forward = [
+            dict(r)
+            for r in api.path("ip", "firewall", "filter")
+            if str(r.get("chain", "")) == "forward"
+        ]
+        _, accept_index = _content_filter_sni_anchor(forward)
+        for marker, desired in _content_filter_sni_rows(
+            rule.rule_id, rule.value, rule.label
+        ):
+            what = f"HTTPS-name drop for {desired['tls-host']}"
+            index = check(forward, marker, desired, what)
+            if index is not None and accept_index is not None and index > accept_index:
+                problems.append(f"{what} sits below the first accept in forward")
+        return problems
+
     def _remove_content_filter_dns_entries(self, api, rule_id: str) -> None:
         """Both of one rule's DNS entries, by their own two markers."""
         for subdomains in (False, True):
@@ -5749,10 +6040,31 @@ class MikroTikAdapter:
                     _content_filter_marker(rule.rule_id),
                 )
                 self._remove_content_filter_dns_entries(api, rule.rule_id)
+                self._remove_content_filter_sni_rows(api, rule.rule_id)
+                # Read back: an unblock that left anything of this rule's on
+                # the device is a site still blocked with no row to show
+                # for it, so it fails rather than reports done.
+                base = f"{_CONTENT_FILTER_RULE_COMMENT_PREFIX}{rule.rule_id}"
+                leftover = [
+                    "/".join(segments)
+                    for segments in (
+                        ("ip", "firewall", "address-list"),
+                        ("ip", "dns", "static"),
+                        ("ip", "firewall", "filter"),
+                    )
+                    for row in api.path(*segments)
+                    if _owns_content_filter_comment(row.get("comment"), base)
+                ]
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"delete_content_filter_rule: {exc}"
                 ) from exc
+            if leftover:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "delete_content_filter_rule: read-back after removing "
+                    f"still found this rule's objects in {sorted(set(leftover))}",
+                )
         finally:
             api.close()
 

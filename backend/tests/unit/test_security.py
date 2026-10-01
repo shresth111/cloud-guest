@@ -97,6 +97,23 @@ _AVAILABLE_FEATURE_WRITERS: dict[str, tuple[str, ...]] = {
         "wyfy_device_gateway.mikrotik_adapter:"
         "MikroTikAdapter._ensure_content_filter_enforcement_rule",
     ),
+    "application_control": (
+        # The catalogue toggle: rows per app hostname, each pushed.
+        "app.domains.content_filtering.service:ContentFilterService.block_app",
+        "app.domains.content_filtering.device_adapters:"
+        "MikroTikContentFilterAdapter.configure_content_filter_rule",
+        "wyfy_device_gateway.mikrotik_adapter:"
+        "MikroTikAdapter._ensure_content_filter_dns_entries",
+    ),
+    "threat_intelligence": (
+        # The same Gateway rule + location + router DoH switch as category
+        # filtering; the Security threats category is one policy entry.
+        "app.domains.dns_filtering.cloudflare_client:"
+        "CloudflareGatewayClient.create_rule",
+        "app.domains.dns_filtering.device_adapters:"
+        "MikroTikDnsFilteringAdapter.apply_doh",
+        "wyfy_device_gateway.mikrotik_dns_filtering:apply_gateway_doh",
+    ),
     "rogue_dhcp_detection": (
         "app.domains.dhcp.device_adapters:MikroTikDhcpAdapter.ensure_rogue_dhcp_alert",
         "wyfy_device_gateway.mikrotik_adapter:"
@@ -628,8 +645,6 @@ class TestCapabilityMatrix:
         req = SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY
         unsupported = SecurityAvailability.NOT_SUPPORTED
         expected = {
-            "application_control": req,
-            "threat_intelligence": req,
             "geo_blocking": req,
             "per_application_traffic": unsupported,
             "ids_ips": unsupported,
@@ -639,6 +654,26 @@ class TestCapabilityMatrix:
         for key, availability in expected.items():
             assert key in by_key, key
             assert by_key[key].availability is availability, key
+
+    def test_app_and_threat_blocking_say_how_they_are_got_round(self) -> None:
+        """Offered now that a writer exists; still stated in the customer's
+        words as name matching that some apps and devices get past."""
+        by_key = {f.key: f for f in SECURITY_FEATURES}
+        apps = by_key["application_control"].detail.lower()
+        for phrase in ("not the app itself", "still get through", "vpn"):
+            assert phrase in apps, phrase
+        threats = by_key["threat_intelligence"].detail.lower()
+        for phrase in ("cloudflare", "7.19", "own dns", "misclassified"):
+            assert phrase in threats, phrase
+
+    def test_https_name_blocking_names_what_it_cannot_see(self) -> None:
+        """Built but not hardware-proven, so still a plan -- and the limits
+        that make it so are in the text."""
+        feature = {f.key: f for f in SECURITY_FEATURES}["domain_blocking_sni"]
+        assert feature.availability is not SecurityAvailability.AVAILABLE
+        detail = feature.detail.lower()
+        for phrase in ("encrypted client hello", "quic", "split across packets"):
+            assert phrase in detail, phrase
 
     def test_feature_keys_are_unique(self) -> None:
         keys = [feature.key for feature in SECURITY_FEATURES]

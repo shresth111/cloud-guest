@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
+from app.database.utils.filters import AnyOfOrNull
 from app.database.utils.pagination import PaginationMeta
 
 from .models import ContentFilterRule
@@ -57,6 +58,7 @@ class ContentFilterRepositoryProtocol(Protocol):
         router_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
+        exclude_app_rules: bool = False,
     ) -> tuple[list[ContentFilterRule], PaginationMeta]: ...
 
     async def list_rules_for_router(
@@ -107,8 +109,12 @@ class ContentFilterRepository:
         router_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
+        exclude_app_rules: bool = False,
     ) -> tuple[list[ContentFilterRule], PaginationMeta]:
         filters: dict[str, object] = {}
+        if exclude_app_rules:
+            # app_key IS NULL: only websites blocked by hand.
+            filters["app_key"] = AnyOfOrNull(values=())
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
         if router_id is not None:
