@@ -58,6 +58,19 @@ typed failure rather than one opaque partial outcome. Should batching
 ever be worth it, the honest shape is a router-level endpoint that pushes
 each rule and reports per-rule results, not one that collapses them.
 
+## Apps (``block_app`` / ``unblock_app``)
+
+The "Apps" toggles are a convenience over the same per-rule rows and the
+same push, not a second mechanism: switching an app off creates one
+ordinary row per name (and published address range) in
+``app_catalogue.APP_CATALOGUE``, tagged ``app_key``, and pushes each.
+Switching it back on deletes exactly the rows carrying that ``app_key`` --
+never a website the customer blocked by hand, even when it is one of the
+app's names (that row is counted towards the app's state and left alone).
+Each push and each delete is still its own device operation with its own
+status, so a partial outcome is recorded per row and reported as a real
+502 naming how many failed, never as a success.
+
 ## Honest scope, unchanged
 
 DNS sinkhole + address-list/firewall-filter only: no Layer7, no
@@ -85,6 +98,7 @@ from app.domains.rbac.location_scope import (
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 
+from .app_catalogue import APP_CATALOGUE, CatalogueApp, app_by_key
 from .constants import (
     DEVICE_CARRIED_FIELDS,
     ContentFilterCategory,
@@ -99,6 +113,7 @@ from .events import (
     ContentFilterRuleUpdated,
 )
 from .exceptions import (
+    ContentFilterAppIncompleteError,
     ContentFilterMissingCredentialsError,
     ContentFilterPushInProgressError,
     ContentFilterRuleAlreadyExistsError,
@@ -106,6 +121,7 @@ from .exceptions import (
     ContentFilterRuleNotFoundError,
     CrossLocationContentFilterRuleAccessError,
     CrossOrganizationContentFilterRuleAccessError,
+    UnknownContentFilterAppError,
 )
 from .models import ContentFilterRule
 from .repository import ContentFilterRepositoryProtocol
@@ -128,6 +144,59 @@ def _event_extra(event: object) -> dict[str, object]:
         else str(value)
         for f in dataclasses.fields(event)
     }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AppTargetState:
+    """One name or address range of a catalogue app, on one router."""
+
+    value_type: str
+    value: str
+    rule_id: uuid.UUID | None
+    #: True when the row was created by this app's toggle; False for a row
+    #: the customer made by hand (counted, never removed by the toggle).
+    owned: bool
+    is_enabled: bool
+    device_push_status: str | None
+    device_push_error: str | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AppBlockState:
+    app: CatalogueApp
+    targets: tuple[AppTargetState, ...]
+
+    @property
+    def state(self) -> str:
+        """``blocked`` when every target has an enabled rule, ``not_blocked``
+        when none does, ``partly_blocked`` otherwise. Intent, read from
+        rows; whether the device holds them is ``push_status``."""
+        covered = sum(1 for t in self.targets if t.rule_id and t.is_enabled)
+        if covered == 0:
+            return "not_blocked"
+        return "blocked" if covered == len(self.targets) else "partly_blocked"
+
+    @property
+    def push_status(self) -> str | None:
+        """``failed`` if any rule's last push failed, ``active`` only when
+        every rule is on the device, else ``pending``; ``None`` when there
+        are no rules at all."""
+        statuses = [t.device_push_status for t in self.targets if t.rule_id]
+        if not statuses:
+            return None
+        if ContentFilterDevicePushStatus.FAILED.value in statuses:
+            return ContentFilterDevicePushStatus.FAILED.value
+        if len(statuses) == len(self.targets) and all(
+            s == ContentFilterDevicePushStatus.ACTIVE.value for s in statuses
+        ):
+            return ContentFilterDevicePushStatus.ACTIVE.value
+        return ContentFilterDevicePushStatus.PENDING.value
+
+
+def _app_targets(app: CatalogueApp) -> list[tuple[ContentFilterValueType, str]]:
+    return [(ContentFilterValueType.DOMAIN, d) for d in app.domains] + [
+        (ContentFilterValueType.IP_CIDR, c) for c in app.cidrs
+    ]
 
 
 class RouterLookupProtocol(Protocol):
@@ -191,6 +260,7 @@ class ContentFilterService:
         category: ContentFilterCategory | None = None,
         comment: str | None = None,
         is_enabled: bool = True,
+        app_key: str | None = None,
     ) -> ContentFilterRule:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
@@ -220,6 +290,7 @@ class ContentFilterService:
             value=normalized_value,
             comment=comment,
             is_enabled=is_enabled,
+            app_key=app_key,
             # Written explicitly rather than left to the column default,
             # which only applies at INSERT: a freshly constructed row would
             # otherwise carry None until it round-trips through the
@@ -271,12 +342,17 @@ class ContentFilterService:
         router_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
+        exclude_app_rules: bool = False,
     ) -> tuple[list[ContentFilterRule], object]:
+        # Only passed when asked for, so a repository written before the
+        # Apps toggle keeps working unchanged.
+        extra = {"exclude_app_rules": True} if exclude_app_rules else {}
         return await self.repository.list_rules(
             requesting_organization_id=requesting_organization_id,
             router_id=router_id,
             page=page,
             page_size=page_size,
+            **extra,
         )
 
     async def list_rules_for_router(
@@ -547,7 +623,182 @@ class ContentFilterService:
         )
         credentials = self._resolve_device_credentials(router)
         adapter = get_content_filter_adapter(router.vendor)
-        await adapter.delete_content_filter_rule(credentials, rule_id=str(rule.id))
+        # A domain rule's tls-host drops live in chain=forward too, so the
+        # removal takes the same forward-chain lock the push does.
+        async with router_firewall_lock(
+            self._redis,
+            router.id,
+            busy_error=lambda: ContentFilterPushInProgressError(router.id),
+        ):
+            await adapter.delete_content_filter_rule(credentials, rule_id=str(rule.id))
+
+    # -- apps -----------------------------------------------------------------
+
+    async def _app_router(
+        self, router_id: uuid.UUID, requesting_organization_id: uuid.UUID | None
+    ) -> Router:
+        """The router an app toggle acts on, scoped exactly like a rule:
+        organization by the lookup, site by the caller's own grants."""
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        enforce_entity_location(
+            entity_location_id=getattr(router, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationContentFilterRuleAccessError(),
+        )
+        return router
+
+    @staticmethod
+    def _app_state(app: CatalogueApp, rules: list[ContentFilterRule]) -> AppBlockState:
+        by_value = {(r.value_type, r.value): r for r in rules}
+        targets = []
+        for value_type, value in _app_targets(app):
+            rule = by_value.get((value_type.value, value))
+            targets.append(
+                AppTargetState(
+                    value_type=value_type.value,
+                    value=value,
+                    rule_id=rule.id if rule else None,
+                    owned=bool(rule and rule.app_key == app.key),
+                    is_enabled=bool(rule and rule.is_enabled),
+                    device_push_status=rule.device_push_status if rule else None,
+                    device_push_error=rule.device_push_error if rule else None,
+                )
+            )
+        return AppBlockState(app=app, targets=tuple(targets))
+
+    async def list_app_states(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> list[AppBlockState]:
+        """Every catalogue app and how much of it is blocked on this router."""
+        router = await self._app_router(router_id, requesting_organization_id)
+        rules = await self.repository.list_rules_for_router(router.id)
+        return [self._app_state(app, rules) for app in APP_CATALOGUE]
+
+    async def block_app(
+        self,
+        router_id: uuid.UUID,
+        app_key: str,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> AppBlockState:
+        """Creates the missing rows for every name (and range) of ``app_key``
+        and pushes each row this app owns that is not already on the device.
+
+        Idempotent and retryable: a second press after a partial failure
+        creates nothing and re-pushes only what did not land. A row the
+        customer already made by hand for one of these names is left exactly
+        as it is. Any push that fails is recorded on its own row and the
+        call ends in :class:`ContentFilterAppIncompleteError` (502) -- a
+        half-applied app block is never reported as done.
+        """
+        app = app_by_key(app_key)
+        if app is None:
+            raise UnknownContentFilterAppError(app_key)
+        router = await self._app_router(router_id, requesting_organization_id)
+        ensure_not_controller_managed(router, feature=_FEATURE_NAME)
+
+        existing = {
+            (r.value_type, r.value): r
+            for r in await self.repository.list_rules_for_router(router.id)
+        }
+        to_push: list[ContentFilterRule] = []
+        for value_type, value in _app_targets(app):
+            rule = existing.get((value_type.value, value))
+            if rule is None:
+                rule = await self.create_rule(
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                    router_id=router.id,
+                    name=f"{app.name}: {value}",
+                    value_type=value_type,
+                    value=value,
+                    category=app.category,
+                    comment=f"Blocked with the {app.name} app toggle",
+                    app_key=app.key,
+                )
+            if rule.app_key != app.key:
+                continue  # the customer's own row: theirs to manage
+            if not rule.is_enabled:
+                rule = await self.update_rule(
+                    rule.id,
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                    is_enabled=True,
+                )
+            if rule.device_push_status != ContentFilterDevicePushStatus.ACTIVE.value:
+                to_push.append(rule)
+
+        failures: list[str] = []
+        for rule in to_push:
+            try:
+                await self.push_rule_to_device(
+                    rule.id,
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                )
+            except Exception as exc:  # noqa: BLE001 -- collected, then raised
+                failures.append(f"{rule.value}: {exc}")
+        if failures:
+            await self.repository.commit()
+            raise ContentFilterAppIncompleteError(
+                app.key,
+                "block",
+                failed=len(failures),
+                total=len(to_push),
+                first_error=failures[0],
+            )
+        rules = await self.repository.list_rules_for_router(router.id)
+        return self._app_state(app, rules)
+
+    async def unblock_app(
+        self,
+        router_id: uuid.UUID,
+        app_key: str,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> AppBlockState:
+        """Deletes -- device first, then row -- every rule this app's toggle
+        created on the router, and nothing else. A failure leaves that row
+        in place (still blocked, still visible) and ends in a 502."""
+        app = app_by_key(app_key)
+        if app is None:
+            raise UnknownContentFilterAppError(app_key)
+        router = await self._app_router(router_id, requesting_organization_id)
+        ensure_not_controller_managed(router, feature=_FEATURE_NAME)
+
+        owned = [
+            r
+            for r in await self.repository.list_rules_for_router(router.id)
+            if r.app_key == app.key
+        ]
+        failures: list[str] = []
+        for rule in owned:
+            try:
+                await self.delete_rule(
+                    rule.id,
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                )
+            except Exception as exc:  # noqa: BLE001 -- collected, then raised
+                failures.append(f"{rule.value}: {exc}")
+        if failures:
+            await self.repository.commit()
+            raise ContentFilterAppIncompleteError(
+                app.key,
+                "unblock",
+                failed=len(failures),
+                total=len(owned),
+                first_error=failures[0],
+            )
+        rules = await self.repository.list_rules_for_router(router.id)
+        return self._app_state(app, rules)
 
     def _resolve_device_credentials(self, router: Router) -> ContentFilterCredentials:
         """Raise rather than guess -- mirrors ``vlan``/``dhcp``."""
@@ -580,4 +831,10 @@ class ContentFilterService:
         )
 
 
-__all__ = ["RouterLookupProtocol", "AuditLogWriter", "ContentFilterService"]
+__all__ = [
+    "AppBlockState",
+    "AppTargetState",
+    "AuditLogWriter",
+    "ContentFilterService",
+    "RouterLookupProtocol",
+]

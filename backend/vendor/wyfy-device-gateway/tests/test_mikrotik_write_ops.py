@@ -1265,7 +1265,9 @@ async def test_a_blocked_domain_becomes_two_sinkholed_dns_entries(
         mikrotik_creds, rule=_domain_rule()
     )
 
-    assert api.add_calls == [
+    # The two tls-host drops a domain also becomes are pinned in
+    # test_mikrotik_content_filter_sni.py; this test is about the DNS half.
+    assert [c for c in api.add_calls if c[0] == ("ip", "dns", "static")] == [
         (
             ("ip", "dns", "static"),
             {
@@ -1346,9 +1348,11 @@ async def test_re_pushing_an_unchanged_domain_rule_is_a_clean_no_op(
 
     await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
 
-    assert len(api.add_calls) == 2  # the first push's two entries, and no more
+    # The first push's two DNS entries and two tls-host drops, and no more.
+    assert len(api.add_calls) == 4
     assert api.update_calls == []
     assert len(list(api.path("ip", "dns", "static"))) == 2
+    assert len(list(api.path("ip", "firewall", "filter"))) == 2
 
 
 @pytest.mark.asyncio
@@ -1421,8 +1425,8 @@ async def test_editing_the_blocked_domain_updates_both_entries_in_place(
         mikrotik_creds, rule=_domain_rule(value="instagram.com")
     )
 
-    assert len(api.add_calls) == 2
-    assert api.update_calls == [
+    assert len(api.add_calls) == 4
+    assert [c for c in api.update_calls if c[0] == ("ip", "dns", "static")] == [
         (("ip", "dns", "static"), {".id": "*1", "name": "instagram.com"}),
         (
             ("ip", "dns", "static"),

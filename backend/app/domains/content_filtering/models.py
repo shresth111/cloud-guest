@@ -71,6 +71,11 @@ class ContentFilterRule(BaseModel):
     # never stored in whatever casing/form the caller happened to submit.
     value: Mapped[str] = mapped_column(String(255), nullable=False)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The curated app (``app_catalogue.APP_CATALOGUE``) this row was created
+    # for by the "Apps" toggle, or NULL for a website the customer blocked
+    # by hand. Ownership, not enforcement: it is what lets "unblock YouTube"
+    # remove exactly the rows that toggle made and never a hand-made one.
+    app_key: Mapped[str | None] = mapped_column(String(40), nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     # -- device push ---------------------------------------------------------
@@ -103,6 +108,7 @@ class ContentFilterRule(BaseModel):
         Index("ix_content_filter_rules_location_id", "location_id"),
         Index("ix_content_filter_rules_value_type", "value_type"),
         Index("ix_content_filter_rules_is_enabled", "is_enabled"),
+        Index("ix_content_filter_rules_app_key", "app_key"),
         Index(
             "uq_content_filter_rules_router_id_value_type_value",
             "router_id",

@@ -29,18 +29,22 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .constants import ContentFilterCategory, ContentFilterValueType
 from .dependencies import get_content_filter_service
 from .models import ContentFilterRule
 from .schemas import (
+    ContentFilterAppListResponse,
+    ContentFilterAppResponse,
+    ContentFilterAppTargetResponse,
     ContentFilterRuleCreateRequest,
     ContentFilterRuleListResponse,
     ContentFilterRuleResponse,
     ContentFilterRuleUpdateRequest,
     MessageResponse,
 )
-from .service import ContentFilterService
+from .service import AppBlockState, ContentFilterService
 
 router = APIRouter(prefix="/content-filter-rules", tags=["Content Filtering"])
 
@@ -71,11 +75,151 @@ def _rule_response(rule: ContentFilterRule) -> ContentFilterRuleResponse:
         value_type=rule.value_type,
         value=rule.value,
         comment=rule.comment,
+        app_key=getattr(rule, "app_key", None),
         is_enabled=rule.is_enabled,
         device_push_status=rule.device_push_status,
         device_push_error=rule.device_push_error,
         device_pushed_at=rule.device_pushed_at,
         created_at=rule.created_at,
+    )
+
+
+#: Shown beside the Apps toggles, verbatim. Customer words, no RouterOS.
+APP_LIMITATIONS = [
+    "This blocks the website names an app uses. It does not recognise the "
+    "app itself, so some apps may still get through.",
+    "An app that is already open, or that connects without looking up a "
+    "name, can keep working until it reconnects.",
+    "A device using its own DNS or a VPN, or a phone on mobile data, is not "
+    "covered.",
+]
+
+
+def _app_response(state: AppBlockState) -> ContentFilterAppResponse:
+    return ContentFilterAppResponse(
+        key=state.app.key,
+        name=state.app.name,
+        category=state.app.category.value,
+        note=state.app.note,
+        state=state.state,
+        push_status=state.push_status,
+        targets=[
+            ContentFilterAppTargetResponse(
+                value_type=t.value_type,
+                value=t.value,
+                rule_id=str(t.rule_id) if t.rule_id else None,
+                owned=t.owned,
+                is_enabled=t.is_enabled,
+                device_push_status=t.device_push_status,
+                device_push_error=t.device_push_error,
+            )
+            for t in state.targets
+        ],
+    )
+
+
+# -- apps ---------------------------------------------------------------------
+#
+# Registered before every "/{rule_id}" route. ``router_id`` is a PATH
+# parameter on purpose: RBAC's scope context reads it from the path and pins
+# the permission check to that router's own site (see
+# ``app.domains.rbac.dependencies._current_scope_context``), and the service
+# re-checks the site against the caller's grants.
+
+
+@router.get(
+    "/routers/{router_id}/apps",
+    response_model=ApiResponse[ContentFilterAppListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("content_filtering.read", scope=ScopeType.ROUTER))
+    ],
+)
+async def list_content_filter_apps(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: ContentFilterService = Depends(get_content_filter_service),
+):
+    states = await service.list_app_states(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    payload = ContentFilterAppListResponse(
+        router_id=str(router_id),
+        items=[_app_response(s) for s in states],
+        limitations=APP_LIMITATIONS,
+    )
+    return build_response(
+        success=True,
+        message="Apps retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/routers/{router_id}/apps/{app_key}",
+    response_model=ApiResponse[ContentFilterAppResponse],
+    status_code=status.HTTP_200_OK,
+    # Creates rows and reaches into the router: both privileges, as the
+    # create and push routes require them separately.
+    dependencies=[
+        Depends(RequirePermission("content_filtering.create", scope=ScopeType.ROUTER)),
+        Depends(RequirePermission("content_filtering.execute", scope=ScopeType.ROUTER)),
+    ],
+)
+async def block_content_filter_app(
+    request: Request,
+    router_id: uuid.UUID,
+    app_key: str,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: ContentFilterService = Depends(get_content_filter_service),
+):
+    """Blocks every name of one catalogue app on this router. A partial
+    result is a 502 (``CONTENT_FILTER_APP_INCOMPLETE``), never a 200."""
+    state = await service.block_app(
+        router_id,
+        app_key,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="App blocked",
+        data=_app_response(state).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.delete(
+    "/routers/{router_id}/apps/{app_key}",
+    response_model=ApiResponse[ContentFilterAppResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("content_filtering.delete", scope=ScopeType.ROUTER))
+    ],
+)
+async def unblock_content_filter_app(
+    request: Request,
+    router_id: uuid.UUID,
+    app_key: str,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: ContentFilterService = Depends(get_content_filter_service),
+):
+    """Removes exactly the rows this app's toggle created -- device first."""
+    state = await service.unblock_app(
+        router_id,
+        app_key,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="App unblocked",
+        data=_app_response(state).model_dump(),
+        request_id=_request_id(request),
     )
 
 
@@ -122,6 +266,9 @@ async def list_content_filter_rules(
     router_id: uuid.UUID | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
+    # True on the "Specific websites" list, so rows an app toggle created
+    # (dozens of names) never push a hand-blocked site off its one page.
+    exclude_app_rules: bool = Query(default=False),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: ContentFilterService = Depends(get_content_filter_service),
 ):
@@ -130,6 +277,7 @@ async def list_content_filter_rules(
         router_id=router_id,
         page=page,
         page_size=page_size,
+        exclude_app_rules=exclude_app_rules,
     )
     payload = ContentFilterRuleListResponse(
         items=[_rule_response(rule) for rule in rules], **_pagination_fields(meta)
