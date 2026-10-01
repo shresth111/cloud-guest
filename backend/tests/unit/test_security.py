@@ -66,6 +66,23 @@ _SECURITY = PermissionModule.SECURITY
 #: set exactly. Kept here rather than on ``SecurityFeature`` because the
 #: security package is asserted to contain no device-adapter reference at all.
 _AVAILABLE_FEATURE_WRITERS: dict[str, tuple[str, ...]] = {
+    "zone_to_zone_firewall": (
+        "app.domains.firewall.device_adapters:"
+        "MikroTikFirewallAdapter.sync_firewall_rules",
+        "wyfy_device_gateway.mikrotik_adapter:MikroTikAdapter.sync_firewall_rules",
+        "wyfy_device_gateway.mikrotik_firewall:sync_rules",
+    ),
+    "web_category_filtering": (
+        # The Gateway side: the shared per-category-set rule and location.
+        "app.domains.dns_filtering.cloudflare_client:"
+        "CloudflareGatewayClient.create_rule",
+        "app.domains.dns_filtering.cloudflare_client:"
+        "CloudflareGatewayClient.create_location",
+        # The router side: point /ip dns at that location over DoH.
+        "app.domains.dns_filtering.device_adapters:"
+        "MikroTikDnsFilteringAdapter.apply_doh",
+        "wyfy_device_gateway.mikrotik_dns_filtering:apply_gateway_doh",
+    ),
     "domain_blocking_dns": (
         "app.domains.content_filtering.device_adapters:"
         "MikroTikContentFilterAdapter.configure_content_filter_rule",
@@ -150,9 +167,7 @@ class _FakeRepository:
         rogue: RogueDhcpCounts | None = None,
         open_alerts: int = 0,
     ) -> None:
-        self._fleet = fleet or FleetCounts(
-            total=1, reporting=1, stale=0, unhealthy=0
-        )
+        self._fleet = fleet or FleetCounts(total=1, reporting=1, stale=0, unhealthy=0)
         self._blocks = blocks or BlockCounts(
             domains_enabled=0,
             addresses_enabled=0,
@@ -163,9 +178,7 @@ class _FakeRepository:
         self._devices = devices or DeviceRuleCounts(
             active_blocks=0, active_allowlists=0
         )
-        self._rogue = rogue or RogueDhcpCounts(
-            guarded=1, unguarded=0, unknown=0
-        )
+        self._rogue = rogue or RogueDhcpCounts(guarded=1, unguarded=0, unknown=0)
         self._open_alerts = open_alerts
         #: Every (method, organization_id, location_id) the service asked for.
         #: The venue filter itself lives in SQL, which this suite has no
@@ -241,9 +254,9 @@ class TestTheDomainIsReadOnly:
                 getattr(dep.call, "__qualname__", "")
                 for dep in route.dependant.dependencies
             }
-            assert any(name.startswith("RequirePermission") for name in names), (
-                route.path
-            )
+            assert any(
+                name.startswith("RequirePermission") for name in names
+            ), route.path
 
     def test_the_package_contains_no_write_or_device_io(self) -> None:
         """A source-level guard, because a future method could write through
@@ -271,9 +284,7 @@ class TestTheDomainIsReadOnly:
         assert package.is_dir(), package
         checked = 0
         for source_file in sorted(package.glob("*.py")):
-            code = _code_without_docstrings(
-                source_file.read_text(encoding="utf-8")
-            )
+            code = _code_without_docstrings(source_file.read_text(encoding="utf-8"))
             checked += 1
             for token in forbidden:
                 assert token not in code, f"{source_file.name} contains {token!r}"
@@ -370,25 +381,31 @@ class TestScoreMaths:
         per, cap = SCORE_FACTOR_WEIGHTS[ScoreFactorKey.FLEET_REPORTING]
         assert per > cap, "this test assumes the cap binds before the raw rate"
         # Every gateway stale would be a 60-point rate against a 40-point cap.
-        assert _rate_penalty(
-            ScoreFactorKey.FLEET_REPORTING, affected=10, denominator=10
-        ) == cap
+        assert (
+            _rate_penalty(ScoreFactorKey.FLEET_REPORTING, affected=10, denominator=10)
+            == cap
+        )
 
     def test_a_rate_factor_with_no_denominator_scores_nothing(self) -> None:
-        """"Zero blocks configured" is a posture gap, not a push failure, and
+        """ "Zero blocks configured" is a posture gap, not a push failure, and
         a rate with no denominator has nothing to be a rate of."""
-        assert _rate_penalty(
-            ScoreFactorKey.BLOCK_PUSH_INTEGRITY, affected=0, denominator=0
-        ) == 0
+        assert (
+            _rate_penalty(
+                ScoreFactorKey.BLOCK_PUSH_INTEGRITY, affected=0, denominator=0
+            )
+            == 0
+        )
 
     def test_a_count_factor_scales_per_occurrence(self) -> None:
         per, cap = SCORE_FACTOR_WEIGHTS[ScoreFactorKey.ALERT_PRESSURE]
-        assert _rate_penalty(
-            ScoreFactorKey.ALERT_PRESSURE, affected=1, denominator=0
-        ) == per
-        assert _rate_penalty(
-            ScoreFactorKey.ALERT_PRESSURE, affected=99, denominator=0
-        ) == cap
+        assert (
+            _rate_penalty(ScoreFactorKey.ALERT_PRESSURE, affected=1, denominator=0)
+            == per
+        )
+        assert (
+            _rate_penalty(ScoreFactorKey.ALERT_PRESSURE, affected=99, denominator=0)
+            == cap
+        )
 
 
 class TestScoreIsProduced:
@@ -402,9 +419,7 @@ class TestScoreIsProduced:
     async def test_no_managed_gateway_is_unavailable_not_perfect(self) -> None:
         """The failure this guards: an unmonitored venue rendering as a
         hardened one, because every counter is zero by absence."""
-        service = SecurityOverviewService(
-            _FakeRepository(fleet=_fleet(0, 0))
-        )
+        service = SecurityOverviewService(_FakeRepository(fleet=_fleet(0, 0)))
         score = await service.build_score(**_PLATFORM_SCOPE)
         assert score.available is False
         assert score.score is None
@@ -548,22 +563,43 @@ class TestCapabilityMatrix:
         ):
             assert by_key[key].availability is not SecurityAvailability.AVAILABLE, key
 
-    def test_category_filtering_names_its_planned_mechanism_and_limits(
+    def test_category_filtering_names_its_mechanism_and_limits(
         self,
     ) -> None:
-        """The Cloudflare Gateway switch exists in code but has not run
-        against a real account or router, so the row names it only as a
-        plan and says, in the customer's words, how a guest gets around it."""
+        """Category filtering is offered now that #307/#308 write it (a
+        Cloudflare Gateway rule and location, and the router's DoH switch).
+        Being offered does not let it overclaim: the row still says, in the
+        customer's words, how a guest gets around it."""
         feature = {f.key: f for f in SECURITY_FEATURES}["web_category_filtering"]
-        assert feature.availability is (
-            SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY
-        )
+        assert feature.availability is SecurityAvailability.AVAILABLE
         assert feature.enforcement is not None
-        assert feature.enforcement.startswith("Planned: ")
+        assert not feature.enforcement.startswith("Planned: ")
         assert "Cloudflare Gateway" in feature.enforcement
         detail = feature.detail.lower()
         assert "private dns" in detail
         assert "bypass protection" in detail
+        assert "misclassified" in detail
+        assert "7.19" in detail
+
+    def test_the_firewall_names_its_precondition_and_scope(self) -> None:
+        """The firewall push (#304-#306) refuses a router whose band is not
+        placed, and chain=forward never sees same-subnet traffic; an
+        AVAILABLE row must say both rather than read as 'everything'."""
+        feature = {f.key: f for f in SECURITY_FEATURES}["zone_to_zone_firewall"]
+        assert feature.availability is SecurityAvailability.AVAILABLE
+        assert feature.enforcement is not None
+        assert not feature.enforcement.startswith("Planned: ")
+        detail = feature.detail.lower()
+        assert "band" in detail
+        assert "within one subnet" in detail
+
+    def test_no_available_feature_reads_as_a_plan(self) -> None:
+        for feature in SECURITY_FEATURES:
+            if feature.availability is SecurityAvailability.AVAILABLE:
+                assert feature.enforcement is not None, feature.key
+                assert "planned" not in feature.enforcement.lower(), feature.key
+                assert "not yet" not in feature.detail.lower(), feature.key
+                assert "nothing pushes" not in feature.detail.lower(), feature.key
 
     def test_dns_bypass_protection_is_honest_about_what_it_cannot_stop(
         self,
@@ -592,7 +628,6 @@ class TestCapabilityMatrix:
         req = SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY
         unsupported = SecurityAvailability.NOT_SUPPORTED
         expected = {
-            "web_category_filtering": req,
             "application_control": req,
             "threat_intelligence": req,
             "geo_blocking": req,
