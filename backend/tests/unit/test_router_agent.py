@@ -1162,7 +1162,13 @@ class TestAgentHeartbeat:
     async def test_heartbeat_records_public_ip_address(self) -> None:
         """Mirrors test_heartbeat_refreshes_routeros_version -- the WAN1
         address `buildRouterSetupScriptChunks`'s Heartbeat chunk now
-        resolves live and reports alongside management_ip_address."""
+        resolves live and reports alongside management_ip_address.
+
+        The address is globally routable on purpose: the heartbeat drops
+        non-public WAN addresses, and an RFC 5737 documentation literal
+        (203.0.113.0/24) counts as non-public here -- Python's
+        ``ipaddress`` reports it as ``is_private`` -- so a TEST-NET value
+        would be filtered out before this test could observe it."""
         fx = make_services()
         organization = fx.org_lookup.add()
         router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
@@ -1176,9 +1182,9 @@ class TestAgentHeartbeat:
         )
 
         updated = await fx.agent_service.heartbeat(
-            router=identity.router, public_ip_address="203.0.113.5"
+            router=identity.router, public_ip_address="8.8.8.8"
         )
-        assert updated.public_ip_address == "203.0.113.5"
+        assert updated.public_ip_address == "8.8.8.8"
 
     async def test_heartbeat_omitted_public_ip_address_leaves_existing_value(
         self,
@@ -1199,11 +1205,11 @@ class TestAgentHeartbeat:
             router_repository=fx.router_repo,
         )
         first = await fx.agent_service.heartbeat(
-            router=identity.router, public_ip_address="203.0.113.5"
+            router=identity.router, public_ip_address="8.8.8.8"
         )
 
         second = await fx.agent_service.heartbeat(router=first)
-        assert second.public_ip_address == "203.0.113.5"
+        assert second.public_ip_address == "8.8.8.8"
 
 
 # ============================================================================
