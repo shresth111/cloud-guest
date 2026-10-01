@@ -33,7 +33,13 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 
-from .constants import FirewallAction, FirewallChain, FirewallProtocol
+from .constants import (
+    FLOOD_LIMIT_PRESETS,
+    FirewallAction,
+    FirewallChain,
+    FirewallProtocol,
+    FloodLimitPreset,
+)
 from .dependencies import get_firewall_service
 from .models import FirewallRule
 from .schemas import (
@@ -44,9 +50,11 @@ from .schemas import (
     FirewallRuleListResponse,
     FirewallRuleResponse,
     FirewallRuleUpdateRequest,
+    FloodLimitResponse,
+    FloodLimitUpdateRequest,
     MessageResponse,
 )
-from .service import FirewallService
+from .service import FirewallService, FloodLimitState
 
 router = APIRouter(prefix="/firewall-rules", tags=["Firewall Rule Management"])
 
@@ -374,6 +382,85 @@ async def get_firewall_band_status(
         success=True,
         message="Firewall band status retrieved",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+def _flood_response(router_id: uuid.UUID, state: FloodLimitState) -> FloodLimitResponse:
+    return FloodLimitResponse(
+        router_id=str(router_id),
+        preset=state.preset.value if state.preset is not None else None,
+        limit=state.limit,
+        enabled=state.enabled,
+        consistent=state.consistent,
+        band_state=state.band_state,  # type: ignore[arg-type]
+        guest_networks=list(state.guest_networks),
+        presets={preset.value: value for preset, value in FLOOD_LIMIT_PRESETS.items()},
+        checked_at=state.checked_at,
+    )
+
+
+@router.get(
+    "/routers/{router_id}/flood-limit",
+    response_model=ApiResponse[FloodLimitResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+)
+async def get_flood_limit(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Read-only: is "Limit connection floods" on for this router, and at
+    which preset? Read off the router over 8728 -- the router's rows are the
+    switch's only state. Same gating as the band status read."""
+    state = await service.read_flood_limit(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Connection-flood limit retrieved",
+        data=_flood_response(router_id, state).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/routers/{router_id}/flood-limit",
+    response_model=ApiResponse[FloodLimitResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
+    ],
+)
+async def set_flood_limit(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: FloodLimitUpdateRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Turn "Limit connection floods" on at a preset, change it, or turn it
+    off. ``firewall.execute`` pinned to ROUTER scope, the same grant the rule
+    push takes -- this writes the same chain. Refusals are 409 with an
+    ``ACCESS_RULES_*`` code (band not placed, no guest network); a write
+    that failed part-way is a 502 carrying ``restored``."""
+    state = await service.set_flood_limit(
+        router_id,
+        preset=FloodLimitPreset(payload.preset),
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Connection-flood limit turned off"
+            if not state.enabled
+            else "Connection-flood limit applied"
+        ),
+        data=_flood_response(router_id, state).model_dump(),
         request_id=_request_id(request),
     )
 

@@ -20,6 +20,7 @@ from .constants import (
 )
 
 __all__ = [
+    "RouterDeviceBlockResponse",
     "GuestAccessRuleCreate",
     "GuestAccessRuleImportRow",
     "GuestAccessRuleImportRequest",
@@ -340,6 +341,34 @@ class GuestAccessRuleResponse(BaseModel):
     updated_at: datetime
 
 
+class RouterDeviceBlockResponse(BaseModel):
+    """What one MikroTik router did about a ``BLOCKLIST`` device rule.
+
+    * ``enforced`` -- a ``type=blocked`` hotspot binding read back on the
+      router, and the device's live session (if any) is gone. The device
+      gets neither the internet nor the login page there until unblocked.
+    * ``failed`` -- not written, or written but the session survived;
+      ``error_message`` says which. The rule still refuses the next sign-in.
+    * ``not_applicable`` -- the router runs no guest login page.
+
+    ``error_message`` may also carry a note on an ``enforced`` row (another
+    entry for the same device was left on the router). ``cleared_at`` is set
+    once the binding was confirmed removed."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    router_id: uuid.UUID
+    location_id: uuid.UUID | None = None
+    mac_address: str
+    status: str
+    error_message: str | None = None
+    sessions_ended: int = 0
+    blocked_at: datetime | None = None
+    cleared_at: datetime | None = None
+    release_error: str | None = None
+
+
 class DeviceAccessRuleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -352,6 +381,9 @@ class DeviceAccessRuleResponse(BaseModel):
     email: str | None
     expires_at: datetime | None
     is_active: bool
+    #: One entry per MikroTik router a ``BLOCKLIST`` rule was written to.
+    #: Empty for any other rule type, and at a controller-managed venue.
+    router_blocks: list[RouterDeviceBlockResponse] = []
     created_at: datetime
     updated_at: datetime
 

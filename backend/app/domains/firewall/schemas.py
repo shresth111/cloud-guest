@@ -23,6 +23,8 @@ __all__ = [
     "FirewallPushResponse",
     "FirewallBandResponse",
     "FirewallBandStatusResponse",
+    "FloodLimitResponse",
+    "FloodLimitUpdateRequest",
 ]
 
 
@@ -162,3 +164,31 @@ class FirewallRuleListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class FloodLimitUpdateRequest(BaseModel):
+    """Turn "Limit connection floods" on at a preset, or ``off``."""
+
+    preset: Literal["off", "relaxed", "normal", "strict"]
+
+
+class FloodLimitResponse(BaseModel):
+    """A router's "Limit connection floods" switch, read off the router.
+
+    ``preset`` is ``off`` when nothing is on the router, one of the three
+    presets when its cap matches one, and ``null`` when the router holds a
+    cap none of them writes. ``limit`` is that cap: connections one guest
+    device may hold before its next new connection is dropped.
+    ``consistent`` is false when a guest network is missing its row or the
+    rows disagree; turning the switch on again repairs it. ``band_state`` is
+    ``ready`` when the switch can be turned on here."""
+
+    router_id: str
+    preset: Literal["off", "relaxed", "normal", "strict"] | None
+    limit: int | None
+    enabled: bool
+    consistent: bool
+    band_state: Literal["ready", "missing", "invalid"]
+    guest_networks: list[str] = []
+    presets: dict[str, int]
+    checked_at: datetime

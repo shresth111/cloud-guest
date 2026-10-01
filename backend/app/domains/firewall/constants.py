@@ -98,7 +98,45 @@ DEVICE_CARRIED_FIELDS: tuple[str, ...] = (
 )
 
 
+class FloodLimitPreset(StrEnum):
+    """The per-router "Limit connection floods" switch's settings.
+
+    Each is a cap on how many connections one guest device may hold before
+    its next new TCP connection is dropped (RouterOS ``connection-limit=N,32``
+    on ``chain=forward``, per guest address). ``off`` removes the rows."""
+
+    OFF = "off"
+    RELAXED = "relaxed"
+    NORMAL = "normal"
+    STRICT = "strict"
+
+
+#: Connections one guest device may hold. A phone with a browser, a few
+#: messaging apps and a video stream sits in the tens; a laptop syncing a
+#: cloud drive or running a torrent client goes into the hundreds, which is
+#: why "strict" can break busy apps and the venue is told so.
+FLOOD_LIMIT_PRESETS: dict[FloodLimitPreset, int] = {
+    FloodLimitPreset.RELAXED: 300,
+    FloodLimitPreset.NORMAL: 150,
+    FloodLimitPreset.STRICT: 80,
+}
+
+
+def flood_preset_for_limit(limit: int | None) -> FloodLimitPreset | None:
+    """The preset a cap read off a router corresponds to; ``None`` for a cap
+    none of them writes (set by hand, or by an older build)."""
+    if limit is None:
+        return FloodLimitPreset.OFF
+    for preset, value in FLOOD_LIMIT_PRESETS.items():
+        if value == limit:
+            return preset
+    return None
+
+
 __all__ = [
+    "FLOOD_LIMIT_PRESETS",
+    "FloodLimitPreset",
+    "flood_preset_for_limit",
     "DEVICE_CARRIED_FIELDS",
     "FirewallDevicePushStatus",
     "MIN_PORT",

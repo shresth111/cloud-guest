@@ -158,7 +158,9 @@ from app.domains.guest.constants import (
 )
 from app.domains.guest_access.constants import (
     CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+    DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP,
+    TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP,
 )
 from app.domains.hub_reconciliation.constants import (
     HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
@@ -384,6 +386,8 @@ celery_app.conf.update(
         # the sweep it matters most to keep unblocked, because every tick it
         # misses is a customer's own device still refused by their own WiFi.
         TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Its RouterOS twin: one 8728 round trip per stranded device block.
+        TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
         # Guest Marketing sends: real provider HTTP round trips (SMS,
         # WhatsApp, email) paced by a rate limiter, so a batch can hold a
         # worker for minutes. Their own queue keeps a large campaign from
@@ -900,6 +904,13 @@ celery_app.conf.update(
         "guest-access-controller-block-release-sweep": {
             "task": TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP,
             "schedule": CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+        },
+        # Takes a device rule's ``type=blocked`` ip-binding back off each
+        # MikroTik router once the rule expires, or when an unblock could not
+        # reach the router at the time.
+        "guest-access-device-block-release-sweep": {
+            "task": TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP,
+            "schedule": DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

@@ -449,6 +449,36 @@ async def get_device_rule(
 
 
 @router.post(
+    "/device-rules/{rule_id}/enforce",
+    response_model=ApiResponse[DeviceAccessRuleResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_access.update"))],
+)
+async def enforce_device_rule(
+    request: Request,
+    rule_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestAccessService = Depends(get_guest_access_service),
+):
+    """Re-writes a blocklist device rule to every MikroTik router in its
+    scope -- the retry for a router that was unreachable, or one added to
+    the venue after the block. Idempotent. Each router's answer is in
+    ``router_blocks``; a router failure is reported there, not as a 5xx."""
+    rule = await service.enforce_device_rule(
+        rule_id=rule_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Device access rule enforced",
+        data=_device_rule_response(rule).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
     "/device-rules/{rule_id}/deactivate",
     response_model=ApiResponse[DeviceAccessRuleResponse],
     status_code=status.HTTP_200_OK,

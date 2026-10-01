@@ -97,6 +97,12 @@ NARROWING_HELPERS = frozenset({"agent_managed_only", "agent_managed_vendor_crite
 # ---------------------------------------------------------------------------
 
 AGENT_MANAGED_ONLY: dict[str, str] = {
+    "app/domains/router/repository.py::RouterRepository.list_routers_in_scope": (
+        "The routers a blocklist device rule is written to "
+        "(`guest_access.device_blocking`): each row gets an 8728 session and "
+        "an ip-binding write with its own stored credentials. A controller's "
+        "synthetic row has none and keeps its own per-client block path."
+    ),
     "app/domains/connected_devices/repository.py::"
     "ConnectedDeviceRepository.list_routers_for_sync": (
         "Fleet-wide DHCP-lease discovery. Each row is dispatched to "

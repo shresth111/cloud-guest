@@ -97,6 +97,21 @@ _AVAILABLE_FEATURE_WRITERS: dict[str, tuple[str, ...]] = {
         "wyfy_device_gateway.mikrotik_adapter:"
         "MikroTikAdapter._ensure_content_filter_enforcement_rule",
     ),
+    "device_isolation": (
+        "app.domains.guest_access.device_adapters:"
+        "MikroTikGuestAccessAdapter.block_device",
+        "app.domains.guest_access.device_blocking:RouterDeviceBlocker.block",
+        "wyfy_device_gateway.mikrotik_adapter:MikroTikAdapter.block_hotspot_device",
+        "wyfy_device_gateway.mikrotik_adapter:"
+        "MikroTikAdapter.unblock_hotspot_device",
+    ),
+    "connection_flood_protection": (
+        "app.domains.firewall.device_adapters:"
+        "MikroTikFirewallAdapter.apply_flood_limit",
+        "wyfy_device_gateway.mikrotik_adapter:MikroTikAdapter.apply_flood_limit",
+        "wyfy_device_gateway.mikrotik_firewall:apply_flood_limit",
+        "wyfy_device_gateway.mikrotik_firewall:remove_flood_limit",
+    ),
     "rogue_dhcp_detection": (
         "app.domains.dhcp.device_adapters:MikroTikDhcpAdapter.ensure_rogue_dhcp_alert",
         "wyfy_device_gateway.mikrotik_adapter:"
@@ -556,12 +571,29 @@ class TestCapabilityMatrix:
         """Pinned by name as well as by the writer map, so the reason they
         moved is next to them."""
         by_key = {feature.key: feature for feature in SECURITY_FEATURES}
-        for key in (
-            "domain_blocking_sni",
-            "device_isolation",
-            "connection_flood_protection",
-        ):
+        for key in ("domain_blocking_sni",):
             assert by_key[key].availability is not SecurityAvailability.AVAILABLE, key
+
+    def test_device_blocking_and_flood_limits_name_their_limits(self) -> None:
+        """Promoted once a writer shipped (ip-binding blocks; the per-guest
+        connection cap). Being offered does not let either overclaim: the
+        device row must say a randomised MAC walks around it and that
+        isolation is not built; the flood row must say strict limits break
+        busy apps and that it reduces rather than removes the exposure."""
+        by_key = {f.key: f for f in SECURITY_FEATURES}
+        device = by_key["device_isolation"]
+        assert device.availability is SecurityAvailability.AVAILABLE
+        assert "ip-binding type=blocked" in (device.enforcement or "")
+        detail = device.detail.lower()
+        assert "randomised" in detail
+        assert "isolating devices" in detail and "not built" in detail
+        flood = by_key["connection_flood_protection"]
+        assert flood.availability is SecurityAvailability.AVAILABLE
+        assert "connection-limit" in (flood.enforcement or "")
+        assert "chain=forward" in (flood.enforcement or "")
+        detail = flood.detail.lower()
+        assert "break busy apps" in detail
+        assert "reduces rather than eliminates" in detail
 
     def test_category_filtering_names_its_mechanism_and_limits(
         self,

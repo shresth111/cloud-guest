@@ -90,6 +90,8 @@ from .contract import (
     FirewallBandStatus,
     FirewallFilterRuleConfig,
     FirewallSyncResult,
+    FloodLimitResult,
+    FloodLimitStatus,
 )
 
 __all__ = [
@@ -101,11 +103,17 @@ __all__ = [
     "BAND_REASON_PARTIAL",
     "BAND_BEGIN_COMMENT",
     "BAND_END_COMMENT",
+    "FLOOD_LIMIT_COMMENT",
+    "FLOOD_LIMIT_MAX",
+    "FLOOD_LIMIT_MIN",
     "RULE_MARKER_PREFIX",
     "FirewallPushFailed",
     "FirewallRefusal",
+    "apply_flood_limit",
     "install_band",
     "read_band_status",
+    "read_flood_limit",
+    "remove_flood_limit",
     "rule_marker",
     "sync_rules",
 ]
@@ -864,3 +872,299 @@ def read_band_status(api) -> FirewallBandStatus:  # noqa: ANN001
     return FirewallBandStatus(
         state="ready", reason=None, guest_networks=guest_networks, guest_dns_servers=dns
     )
+
+
+# ============================================================================
+# Connection-flood limit
+# ============================================================================
+#
+# One drop row per guest network, at the TOP of the sentinel band:
+#
+#   chain=forward action=drop protocol=tcp connection-state=new
+#     src-address=<guest network> connection-limit=<N>,32
+#     comment=cloudguest-fw-flood-limit
+#
+# ``connection-limit=N,32`` matches once one source address (a /32 -- one
+# guest) already holds more than N tracked connections, so the guest's
+# (N+1)th new TCP connection is dropped and the ones it has keep working.
+# ``connection-state=new`` is there because RouterOS documents the matcher as
+# expensive and meant to be paired with it, and because only new connections
+# should be refused.
+#
+# Why these properties and not others:
+#
+# * **forward only, never input.** Traffic to the router itself -- the
+#   management tunnel, the API, RADIUS, the login page -- is ``input`` and
+#   never passes here. A guest hammering the router itself is out of scope
+#   for this switch, deliberately: an input-chain drop is the 2026-08-16
+#   outage shape.
+# * **src-address is a guest network, always.** Without a source the rule
+#   would also count connections arriving from the internet to a forwarded
+#   port, and it would cover the venue's own office devices on a separate
+#   network. With no guest network found on the router the write is refused
+#   rather than widened.
+# * **top of the band.** Above every customer rule, so a customer accept
+#   cannot exempt a source from it; inside the band, so it sits below the
+#   hotspot's own dynamic jumps (a guest who has not signed in is handled by
+#   the hotspot, not by us) and above the established accept.
+# * **Its own comment, never ``cloudguest-fw:``.** The customer-rule push
+#   (:func:`sync_rules`) owns ``cloudguest-fw:<uuid>`` rows and refuses any it
+#   cannot explain; these rows use the hyphenated platform family so that
+#   push neither counts nor moves nor removes them.
+# * **No SYN-rate row.** A per-source SYN rate needs ``dst-limit`` in an
+#   accept-then-drop pair or a jump to a chain of our own. An accept inside
+#   the band would skip every customer rule below it, and a new chain is a
+#   second thing to place and clean up. Not built; the connection cap is the
+#   whole of this switch.
+
+FLOOD_LIMIT_COMMENT = "cloudguest-fw-flood-limit"
+#: The bounds a write accepts. Below 20 a single phone opening a few apps
+#: trips it; above 5000 the row is decoration.
+FLOOD_LIMIT_MIN = 20
+FLOOD_LIMIT_MAX = 5000
+
+FLOOD_NO_GUEST_NETWORK = "ACCESS_RULES_FLOOD_NO_GUEST_NETWORK"
+FLOOD_LIMIT_INVALID = "ACCESS_RULES_FLOOD_LIMIT_INVALID"
+FLOOD_OUTSIDE_BAND = "ACCESS_RULES_FLOOD_OUTSIDE_BAND"
+
+_FLOOD_KEYS = (
+    "chain",
+    "action",
+    "protocol",
+    "connection-state",
+    "src-address",
+    "connection-limit",
+)
+
+
+def _flood_fields(network: str, limit: int) -> dict[str, str]:
+    return {
+        "chain": _MANAGED_CHAIN,
+        "action": "drop",
+        "protocol": "tcp",
+        "connection-state": "new",
+        "src-address": _norm_address(network) or network,
+        "connection-limit": f"{int(limit)},32",
+        "comment": FLOOD_LIMIT_COMMENT,
+    }
+
+
+def _norm_flood(key: str, value: object) -> str | None:
+    if key == "connection-limit":
+        text = str(value or "").replace(" ", "")
+        return text or None
+    return _norm(key, value)
+
+
+def _flood_matches(row: dict[str, Any], desired: dict[str, str]) -> bool:
+    if _is_truthy(row.get("disabled")):
+        return False
+    return all(
+        _norm_flood(key, row.get(key)) == _norm_flood(key, desired.get(key))
+        for key in _FLOOD_KEYS
+    )
+
+
+def _flood_limit_of(row: dict[str, Any]) -> int | None:
+    head = str(row.get("connection-limit") or "").replace(" ", "").split(",", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+def _flood_rows(forward: list[dict[str, Any]]) -> list[int]:
+    return [i for i, r in enumerate(forward) if _comment(r) == FLOOD_LIMIT_COMMENT]
+
+
+def _first_customer_index(forward: list[dict[str, Any]], begin: int, end: int) -> int:
+    """Index of the first ``cloudguest-fw:<uuid>`` row in the band, or
+    ``end`` when the band holds none."""
+    for i in range(begin + 1, end):
+        if _marker_uuid(_comment(forward[i])) is not None:
+            return i
+    return end
+
+
+def _validate_flood_limit(limit: int) -> int:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not FLOOD_LIMIT_MIN <= limit <= FLOOD_LIMIT_MAX
+    ):
+        raise FirewallRefusal(
+            FLOOD_LIMIT_INVALID,
+            f"connection limit {limit!r} is outside {FLOOD_LIMIT_MIN}-"
+            f"{FLOOD_LIMIT_MAX}",
+        )
+    return limit
+
+
+def _flood_shape(
+    forward: list[dict[str, Any]],
+    begin: int,
+    end: int,
+    networks: Sequence[str],
+    limit: int,
+) -> tuple[dict[str, str], list[str]]:
+    """``(network -> kept row .id, stale row .ids)`` for a desired state.
+
+    A row is kept only if it matches the desired fields exactly, is enabled,
+    sits inside the band above every customer rule, and is the first such row
+    for its network. Everything else of ours is stale."""
+    first_customer = _first_customer_index(forward, begin, end)
+    wanted = {n: _flood_fields(n, limit) for n in networks}
+    kept: dict[str, str] = {}
+    stale: list[str] = []
+    for index in _flood_rows(forward):
+        row = forward[index]
+        row_id = str(row[".id"])
+        placed = begin < index < first_customer
+        match = next(
+            (
+                n
+                for n, fields in wanted.items()
+                if n not in kept and _flood_matches(row, fields)
+            ),
+            None,
+        )
+        if placed and match is not None:
+            kept[match] = row_id
+        else:
+            stale.append(row_id)
+    return kept, stale
+
+
+def read_flood_limit(api) -> FloodLimitStatus:  # noqa: ANN001
+    """Read-only: is the flood limit on, at what cap, and is it in the shape
+    a write would leave it? Never writes, never repairs."""
+    _, forward = _read(api)
+    guest_networks, _, _ = read_router_networks(api)
+    found = _inspect_band(forward)
+    if isinstance(found[0], str):
+        band_state = "missing" if found[0] == BAND_REASON_NOT_PLACED else "invalid"
+    else:
+        band_state = "ready"
+    indices = _flood_rows(forward)
+    limits = {_flood_limit_of(forward[i]) for i in indices}
+    limit = next(iter(limits)) if len(limits) == 1 else None
+    consistent = False
+    if indices and band_state == "ready" and limit is not None and guest_networks:
+        begin, end = int(found[0]), int(found[1])
+        kept, stale = _flood_shape(forward, begin, end, guest_networks, limit)
+        consistent = not stale and set(kept) == set(guest_networks)
+    return FloodLimitStatus(
+        enabled=bool(indices),
+        limit=limit,
+        consistent=consistent,
+        rows=len(indices),
+        band_state=band_state,
+        guest_networks=guest_networks,
+    )
+
+
+def apply_flood_limit(api, *, limit: int) -> FloodLimitResult:  # noqa: ANN001
+    """Turn the flood limit on, or change its cap, for every guest network.
+
+    Refuses, writing nothing, when the band is not sound, when the router
+    serves no guest network, when the cap is out of bounds, or when one of
+    our flood rows sits outside the band (something other than this writer
+    moved it). Then: add the missing rows at the top of the band, re-read
+    and confirm them, and only then remove the stale ones -- so the chain is
+    never without a cap while the cap is being changed. A failure before the
+    removals takes the new rows off again (``restored=True``); a failure
+    after leaves the router with both and says so (``restored=False``).
+    """
+    _validate_flood_limit(limit)
+    menu = api.path(*_FILTER_PATH)
+    _, forward = _read(api)
+    begin, end = _locate_band(forward)
+    guest_networks, _, _ = read_router_networks(api)
+    networks = [
+        n for n in guest_networks if ipaddress.ip_network(n, strict=False).prefixlen > 0
+    ]
+    if not networks:
+        raise FirewallRefusal(
+            FLOOD_NO_GUEST_NETWORK,
+            "this router serves no guest network (no hotspot or DHCP server "
+            "interface with an address), so a per-guest limit has no source to "
+            "apply to; it is refused rather than applied to all traffic",
+        )
+    for index in _flood_rows(forward):
+        if not begin < index < end:
+            raise FirewallRefusal(
+                FLOOD_OUTSIDE_BAND,
+                f"flood-limit row {forward[index].get('.id')} sits outside the "
+                "sentinel band; something other than this writer put it there",
+            )
+
+    kept, stale = _flood_shape(forward, begin, end, networks, limit)
+    missing = [n for n in networks if n not in kept]
+    anchor = str(forward[begin + 1][".id"])
+    added: list[str] = []
+    try:
+        for network in missing:
+            added.append(
+                str(menu.add(**_flood_fields(network, limit), **{"place-before": anchor}))
+            )
+        _, after = _read(api)
+        new_begin, new_end = _locate_band(after)
+        now_kept, _ = _flood_shape(after, new_begin, new_end, networks, limit)
+        if set(now_kept) != set(networks):
+            raise FirewallRefusal(
+                VERIFY_FAILED,
+                "after writing, the flood-limit rows for "
+                f"{sorted(set(networks) - set(now_kept))} were not found at the "
+                "top of the band",
+            )
+    except Exception as exc:  # noqa: BLE001 -- undone, then re-raised typed
+        detail = exc.detail if isinstance(exc, FirewallRefusal) else str(exc)
+        try:
+            for row_id in added:
+                menu.remove(row_id)
+        except Exception as undo_exc:  # noqa: BLE001
+            raise FirewallPushFailed(
+                f"{detail}; removing the new rows also failed: {undo_exc}",
+                restored=False,
+            ) from exc
+        raise FirewallPushFailed(detail, restored=True) from exc
+
+    try:
+        for row_id in stale:
+            menu.remove(row_id)
+        _, final = _read(api)
+        if len(_flood_rows(final)) != len(networks):
+            raise FirewallRefusal(
+                VERIFY_FAILED,
+                f"after writing, {len(_flood_rows(final))} flood-limit rows exist "
+                f"but {len(networks)} were expected",
+            )
+    except Exception as exc:  # noqa: BLE001
+        detail = exc.detail if isinstance(exc, FirewallRefusal) else str(exc)
+        raise FirewallPushFailed(detail, restored=False) from exc
+    return FloodLimitResult(
+        added=len(added),
+        removed=len(stale),
+        limit=limit,
+        guest_networks=tuple(networks),
+    )
+
+
+def remove_flood_limit(api) -> FloodLimitResult:  # noqa: ANN001
+    """Turn the flood limit off: remove every ``forward`` row carrying our
+    flood comment, wherever it sits, and confirm by re-reading that none is
+    left. Needs no band -- taking our own rows off must work even on a router
+    whose band someone broke. Touches no other row."""
+    menu = api.path(*_FILTER_PATH)
+    _, forward = _read(api)
+    ids = [str(forward[i][".id"]) for i in _flood_rows(forward)]
+    for row_id in ids:
+        menu.remove(row_id)
+    _, after = _read(api)
+    left = len(_flood_rows(after))
+    if left:
+        raise FirewallPushFailed(
+            f"after removing, {left} flood-limit rows are still on the router",
+            restored=False,
+        )
+    return FloodLimitResult(added=0, removed=len(ids), limit=None)

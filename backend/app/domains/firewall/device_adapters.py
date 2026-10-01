@@ -38,6 +38,8 @@ from wyfy_device_gateway.contract import (
     FirewallBandStatus,
     FirewallFilterRuleConfig,
     FirewallSyncResult,
+    FloodLimitResult,
+    FloodLimitStatus,
 )
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
@@ -96,6 +98,25 @@ class BaseFirewallAdapter(Protocol):
     ) -> FirewallBandStatus:
         """Read-only: ``ready`` / ``missing`` / ``invalid`` plus a reason
         code, from the same band inspector the push uses."""
+        ...
+
+
+    async def read_flood_limit(
+        self, credentials: FirewallCredentials
+    ) -> FloodLimitStatus:
+        """Read-only: is the per-guest connection cap on, and at what."""
+        ...
+
+    async def apply_flood_limit(
+        self, credentials: FirewallCredentials, *, limit: int
+    ) -> FloodLimitResult:
+        """Turn the cap on or change it, inside the sentinel band."""
+        ...
+
+    async def remove_flood_limit(
+        self, credentials: FirewallCredentials
+    ) -> FloodLimitResult:
+        """Take every flood-limit row off the router."""
         ...
 
 
@@ -166,6 +187,53 @@ class MikroTikFirewallAdapter:
         except MikroTikDeviceError as exc:
             raise FirewallDeviceOperationError(
                 "read_firewall_band_status", exc.detail
+            ) from exc
+
+
+    async def read_flood_limit(
+        self, credentials: FirewallCredentials
+    ) -> FloodLimitStatus:
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).read_flood_limit(
+                self._gateway_credentials(credentials)
+            )
+        except MikroTikConnectionError as exc:
+            raise FirewallDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise FirewallDeviceOperationError("read_flood_limit", exc.detail) from exc
+
+    async def apply_flood_limit(
+        self, credentials: FirewallCredentials, *, limit: int
+    ) -> FloodLimitResult:
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).apply_flood_limit(
+                self._gateway_credentials(credentials), limit=limit
+            )
+        except MikroTikConnectionError as exc:
+            raise FirewallDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikFirewallRefusedError as exc:
+            raise FirewallPushRefusedError(exc.code, exc.detail) from exc
+        except MikroTikFirewallPushFailedError as exc:
+            raise FirewallPushFailedError(exc.detail, restored=exc.restored) from exc
+        except MikroTikDeviceError as exc:
+            raise FirewallDeviceOperationError(
+                "apply_flood_limit", exc.detail
+            ) from exc
+
+    async def remove_flood_limit(
+        self, credentials: FirewallCredentials
+    ) -> FloodLimitResult:
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).remove_flood_limit(
+                self._gateway_credentials(credentials)
+            )
+        except MikroTikConnectionError as exc:
+            raise FirewallDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikFirewallPushFailedError as exc:
+            raise FirewallPushFailedError(exc.detail, restored=exc.restored) from exc
+        except MikroTikDeviceError as exc:
+            raise FirewallDeviceOperationError(
+                "remove_flood_limit", exc.detail
             ) from exc
 
 

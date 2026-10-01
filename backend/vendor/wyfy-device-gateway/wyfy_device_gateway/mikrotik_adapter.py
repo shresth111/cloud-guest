@@ -101,11 +101,15 @@ from .contract import (
     DhcpPoolConfig,
     FirewallBandResult,
     FirewallBandStatus,
+    FloodLimitResult,
+    FloodLimitStatus,
     FirewallFilterRuleConfig,
     FirewallSyncResult,
     HotspotActiveSession,
     HotspotCertificatePush,
     HotspotCertificatePushResult,
+    HotspotDeviceBlockResult,
+    HotspotDeviceUnblockResult,
     HotspotDisconnectResult,
     HotspotSessionControl,
     InterfaceInfo,
@@ -1136,6 +1140,20 @@ def _smallest_enclosing_network(
     return ipaddress.ip_network(f"{start_ip}/0", strict=False)
 
 
+#: ``comment=`` on the session bypass the router's own authorized-MAC loop
+#: writes (``cloudguest-authmac-sched``, see
+#: docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md §1.4). The one binding a
+#: device block removes that it did not write itself.
+_AUTHMAC_BINDING_COMMENT = "cloudguest-authmac"
+#: ``cloudguest-devblock:<device rule uuid>`` -- the only shape
+#: :meth:`MikroTikAdapter.block_hotspot_device` writes or removes.
+DEVICE_BLOCK_MARKER_PREFIX = "cloudguest-devblock:"
+_DEVICE_BLOCK_MARKER_RE = re.compile(
+    r"^cloudguest-devblock:"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
 class MikroTikFirewallRefusedError(MikroTikDeviceError):
     """A firewall push or band placement was refused before any write.
 
@@ -1842,6 +1860,256 @@ class MikroTikAdapter:
             removed_ids=tuple(row.routeros_id for row in matched),
             still_active=still_active,
         )
+
+    # ------------------------------------------------------------------
+    # durable per-device block (guest_access device rules)
+    # ------------------------------------------------------------------
+
+    async def block_hotspot_device(
+        self, creds: DeviceCredentials, *, mac_address: str, marker: str
+    ) -> HotspotDeviceBlockResult:
+        """Cut one device off this router by MAC, now and on every reconnect.
+
+        Two halves, both read back (see :class:`HotspotDeviceBlockResult`):
+
+        1. **The binding.** One ``/ip hotspot ip-binding`` row,
+           ``mac-address=<mac> type=blocked comment=<marker>``. RouterOS
+           documents ``blocked`` as "translation is not performed and packets
+           from a host are dropped", so the device gets neither the internet
+           nor the login page for as long as the row exists -- which is what
+           the login-gate refusal alone never did for a device that was
+           already signed in, or one the venue had bypassed.
+
+           Idempotent by ``comment``: an existing enabled ``type=blocked`` row
+           with our marker and this MAC is kept, and duplicates of it are
+           removed. Added ``place-before`` the router's first binding, so a
+           bypass written earlier for the same MAC cannot win; whether it
+           landed first is read back, never assumed.
+
+           The one row for this MAC this method *does* remove that it did not
+           write is the session bypass the router's own authorized-MAC loop
+           adds (``comment=cloudguest-authmac``): it exists only to let a
+           signed-in guest through, a blocked device is by definition not
+           one, and that loop re-adds a MAC only when ``[find where
+           mac-address=...]`` is empty -- which our row now guarantees it is
+           not. Every other row for the MAC (a hand-made bypass, a
+           trusted-device bypass) is left alone and reported.
+
+        2. **The live session.** Every ``/ip hotspot active`` row and
+           ``/ip hotspot host`` row for the MAC is removed per ``.id``, and
+           the active table is read again.
+
+        A router running no hotspot gets no write at all: ip-bindings are a
+        hotspot table, and a row there would read back as a block that
+        blocks nothing.
+        """
+        return await asyncio.to_thread(
+            self._block_hotspot_device_sync, creds, mac_address, marker
+        )
+
+    async def unblock_hotspot_device(
+        self, creds: DeviceCredentials, *, mac_address: str, marker: str
+    ) -> HotspotDeviceUnblockResult:
+        """Remove exactly the binding(s) :meth:`block_hotspot_device` wrote
+        for this MAC and marker, and nothing else; re-read and report what
+        is left. Idempotent: nothing to remove is a clean success."""
+        return await asyncio.to_thread(
+            self._unblock_hotspot_device_sync, creds, mac_address, marker
+        )
+
+    @staticmethod
+    def _device_block_args(mac_address: str, marker: str) -> str:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+        if not _DEVICE_BLOCK_MARKER_RE.match(marker or ""):
+            raise ValueError(f"not a device-block marker: {marker!r}")
+        return mac
+
+    def _block_hotspot_device_sync(
+        self, creds: DeviceCredentials, mac_address: str, marker: str
+    ) -> HotspotDeviceBlockResult:
+        mac = self._device_block_args(mac_address, marker)
+        api = self._connect_api(creds)
+        try:
+            control = self._hotspot_session_control(api, creds.host)
+            if not control.hotspot_servers:
+                return HotspotDeviceBlockResult(
+                    hotspot_servers=0,
+                    binding_id=None,
+                    created=False,
+                    first_in_order=False,
+                    removed_bypass_ids=(),
+                    other_bindings=(),
+                    sessions_removed=0,
+                    hosts_removed=0,
+                    still_active=0,
+                )
+            try:
+                bindings = api.path("ip", "hotspot", "ip-binding")
+                rows = [dict(r) for r in bindings]
+                for_mac = [
+                    r for r in rows if normalize_mac_address(r.get("mac-address")) == mac
+                ]
+                ours = [
+                    r
+                    for r in for_mac
+                    if _safe_str(r.get("comment")) == marker
+                    and _safe_str(r.get("type")) == "blocked"
+                    and not _is_truthy(r.get("disabled"))
+                ]
+                created = False
+                if ours:
+                    binding_id = str(ours[0][".id"])
+                else:
+                    fields = {
+                        "mac-address": mac,
+                        "type": "blocked",
+                        "comment": marker,
+                        "disabled": "no",
+                    }
+                    first = next((str(r[".id"]) for r in rows if r.get(".id")), None)
+                    if first is not None:
+                        try:
+                            binding_id = str(
+                                bindings.add(**fields, **{"place-before": first})
+                            )
+                        except LibRouterosError as exc:
+                            # Not expected (ip-binding is an ordered list that
+                            # accepts place-before), but an add that fails only
+                            # on position must still block. ``first_in_order``
+                            # below reports where it really landed.
+                            logger.warning(
+                                "mikrotik_ip_binding_place_before_refused",
+                                extra={"host": creds.host, "detail": str(exc)},
+                            )
+                            binding_id = str(bindings.add(**fields))
+                    else:
+                        binding_id = str(bindings.add(**fields))
+                    created = True
+                # Our own stale copies (a disabled row, a duplicate, a row whose
+                # type someone changed) and the session bypass the agent loop
+                # wrote. Removed only after our blocked row exists, so the MAC
+                # is never momentarily free.
+                removable = [
+                    str(r[".id"])
+                    for r in for_mac
+                    if str(r.get(".id")) != binding_id
+                    and _safe_str(r.get("comment")) in (marker, _AUTHMAC_BINDING_COMMENT)
+                ]
+                for row_id in removable:
+                    bindings.remove(row_id)
+                removed_bypass = tuple(
+                    str(r[".id"])
+                    for r in for_mac
+                    if _safe_str(r.get("comment")) == _AUTHMAC_BINDING_COMMENT
+                )
+
+                after = [dict(r) for r in api.path("ip", "hotspot", "ip-binding")]
+                mine = [r for r in after if str(r.get(".id")) == binding_id]
+                if (
+                    len(mine) != 1
+                    or normalize_mac_address(mine[0].get("mac-address")) != mac
+                    or _safe_str(mine[0].get("type")) != "blocked"
+                    or _safe_str(mine[0].get("comment")) != marker
+                    or _is_truthy(mine[0].get("disabled"))
+                ):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "block_hotspot_device: the blocked ip-binding was not "
+                        "found on the router after writing it",
+                    )
+                others = tuple(
+                    f"{_safe_str(r.get('type')) or 'regular'}:"
+                    f"{_safe_str(r.get('comment')) or ''}"
+                    for r in after
+                    if normalize_mac_address(r.get("mac-address")) == mac
+                    and str(r.get(".id")) != binding_id
+                    and _safe_str(r.get("comment")) != marker
+                )
+                ordered = [str(r.get(".id")) for r in after]
+                first_in_order = bool(ordered) and ordered[0] == binding_id
+
+                active = api.path("ip", "hotspot", "active")
+                session_ids = [
+                    str(r[".id"])
+                    for r in active
+                    if normalize_mac_address(r.get("mac-address")) == mac and r.get(".id")
+                ]
+                for row_id in session_ids:
+                    active.remove(row_id)
+                still_active = sum(
+                    1
+                    for r in api.path("ip", "hotspot", "active")
+                    if normalize_mac_address(r.get("mac-address")) == mac
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"block_hotspot_device: {exc}"
+                ) from exc
+
+            hosts_removed = 0
+            try:
+                hosts = api.path("ip", "hotspot", "host")
+                host_ids = [
+                    str(r[".id"])
+                    for r in hosts
+                    if normalize_mac_address(r.get("mac-address")) == mac and r.get(".id")
+                ]
+                for row_id in host_ids:
+                    hosts.remove(row_id)
+                hosts_removed = len(host_ids)
+            except LibRouterosError as exc:
+                # RouterOS usually drops the host itself once the binding says
+                # blocked; this is the belt to that. Its failure does not undo
+                # the block above, so it is logged, not raised.
+                logger.info(
+                    "mikrotik_hotspot_host_remove_failed",
+                    extra={"host": creds.host, "detail": str(exc)},
+                )
+        finally:
+            self._safe_close(api)
+        return HotspotDeviceBlockResult(
+            hotspot_servers=control.hotspot_servers,
+            binding_id=binding_id,
+            created=created,
+            first_in_order=first_in_order,
+            removed_bypass_ids=removed_bypass,
+            other_bindings=others,
+            sessions_removed=len(session_ids),
+            hosts_removed=hosts_removed,
+            still_active=still_active,
+        )
+
+    def _unblock_hotspot_device_sync(
+        self, creds: DeviceCredentials, mac_address: str, marker: str
+    ) -> HotspotDeviceUnblockResult:
+        mac = self._device_block_args(mac_address, marker)
+        api = self._connect_api(creds)
+        try:
+            try:
+                bindings = api.path("ip", "hotspot", "ip-binding")
+
+                def _ours(rows: object) -> list[str]:
+                    return [
+                        str(r[".id"])
+                        for r in rows  # type: ignore[attr-defined]
+                        if _safe_str(r.get("comment")) == marker
+                        and normalize_mac_address(r.get("mac-address")) == mac
+                        and r.get(".id")
+                    ]
+
+                removed = _ours(list(bindings))
+                for row_id in removed:
+                    bindings.remove(row_id)
+                remaining = len(_ours(list(api.path("ip", "hotspot", "ip-binding"))))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"unblock_hotspot_device: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+        return HotspotDeviceUnblockResult(removed_ids=tuple(removed), remaining=remaining)
 
     # ------------------------------------------------------------------
     # diagnostics (shared by network_diagnostics + isp call sites)
@@ -5981,6 +6249,55 @@ class MikroTikAdapter:
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"read_firewall_band_status: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # connection-flood limit (forward chain, inside the sentinel band)
+    # ------------------------------------------------------------------
+
+    async def read_flood_limit(self, creds: DeviceCredentials) -> FloodLimitStatus:
+        """Read-only: see :func:`wyfy_device_gateway.mikrotik_firewall
+        .read_flood_limit`."""
+        return await asyncio.to_thread(self._flood_sync, creds, "read", None)
+
+    async def apply_flood_limit(
+        self, creds: DeviceCredentials, *, limit: int
+    ) -> FloodLimitResult:
+        """Turn the per-guest connection cap on, or change it. Refused ->
+        :class:`MikroTikFirewallRefusedError` (nothing written); failed after
+        writing -> :class:`MikroTikFirewallPushFailedError`. See
+        :func:`wyfy_device_gateway.mikrotik_firewall.apply_flood_limit`."""
+        return await asyncio.to_thread(self._flood_sync, creds, "apply", limit)
+
+    async def remove_flood_limit(self, creds: DeviceCredentials) -> FloodLimitResult:
+        """Take every flood-limit row off; see
+        :func:`wyfy_device_gateway.mikrotik_firewall.remove_flood_limit`."""
+        return await asyncio.to_thread(self._flood_sync, creds, "remove", None)
+
+    def _flood_sync(
+        self, creds: DeviceCredentials, op: str, limit: int | None
+    ) -> FloodLimitStatus | FloodLimitResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if op == "read":
+                    return _fw.read_flood_limit(api)
+                if op == "apply":
+                    return _fw.apply_flood_limit(api, limit=int(limit or 0))
+                return _fw.remove_flood_limit(api)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except _fw.FirewallPushFailed as exc:
+                raise MikroTikFirewallPushFailedError(
+                    creds.host, str(exc), restored=exc.restored
+                ) from exc
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"{op}_flood_limit: {exc}"
                 ) from exc
         finally:
             self._safe_close(api)
