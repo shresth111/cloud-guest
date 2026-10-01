@@ -140,11 +140,18 @@ class FirewallBandStatusResponse(BaseModel):
     (a push is refused with ``ACCESS_RULES_BAND_MISSING``). ``invalid``:
     something is there but a push would refuse it too. ``reason`` is
     venue-readable text, ``None`` when ready. Carries no RouterOS ``.id``
-    and no rule comment."""
+    and no rule comment.
+
+    ``guest_networks`` are the networks the router serves guests on, and
+    ``guest_dns_servers`` what DHCP hands them (empty = the router itself),
+    read off the router in the same look -- so a venue can be offered "keep
+    guests off your private networks" without typing an address."""
 
     state: Literal["ready", "missing", "invalid"]
     reason: str | None = None
     checked_at: datetime
+    guest_networks: list[str] = []
+    guest_dns_servers: list[str] = []
 
 
 class FirewallRuleListResponse(BaseModel):

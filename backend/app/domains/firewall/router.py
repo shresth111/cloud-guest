@@ -364,7 +364,11 @@ async def get_firewall_band_status(
         router_id, requesting_organization_id=requesting_organization_id
     )
     payload = FirewallBandStatusResponse(
-        state=band.state, reason=band.reason, checked_at=band.checked_at
+        state=band.state,
+        reason=band.reason,
+        checked_at=band.checked_at,
+        guest_networks=list(band.guest_networks),
+        guest_dns_servers=list(band.guest_dns_servers),
     )
     return build_response(
         success=True,

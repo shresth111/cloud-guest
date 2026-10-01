@@ -174,6 +174,8 @@ class FirewallBandState:
     state: str
     reason: str | None
     checked_at: datetime
+    guest_networks: tuple[str, ...] = ()
+    guest_dns_servers: tuple[str, ...] = ()
 
 
 class AuditLogWriter(Protocol):
@@ -624,7 +626,11 @@ class FirewallService:
             else _BAND_REASON_TEXT.get(status.reason or "", _BAND_REASON_FALLBACK)
         )
         return FirewallBandState(
-            state=status.state, reason=reason, checked_at=datetime.now(UTC)
+            state=status.state,
+            reason=reason,
+            checked_at=datetime.now(UTC),
+            guest_networks=tuple(getattr(status, "guest_networks", ())),
+            guest_dns_servers=tuple(getattr(status, "guest_dns_servers", ())),
         )
 
     def _router_lock(self, router_id: uuid.UUID):  # noqa: ANN202

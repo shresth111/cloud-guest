@@ -140,6 +140,7 @@ CHAIN_UNSUPPORTED = "ACCESS_RULES_CHAIN_UNSUPPORTED"
 WOULD_ORPHAN_MANAGEMENT = "ACCESS_RULES_WOULD_ORPHAN_MANAGEMENT"
 WOULD_BREAK_GUEST_PATH = "ACCESS_RULES_WOULD_BREAK_GUEST_PATH"
 RULE_INVALID = "ACCESS_RULES_RULE_INVALID"
+TARGETS_ROUTER = "ACCESS_RULES_TARGETS_ROUTER"
 VERIFY_FAILED = "ACCESS_RULES_VERIFY_FAILED"
 
 _ACTIONS = frozenset({"accept", "drop", "reject"})
@@ -150,6 +151,10 @@ _PORT_PROTOCOLS = frozenset({"tcp", "udp"})
 #: RADIUS CoA, and WireGuard (RouterOS default and the common default).
 _MANAGEMENT_PORTS = frozenset({22, 8291, 8728, 8729, 1812, 1813, 3799, 13231, 51820})
 _BLOCKING_ACTIONS = frozenset({"drop", "reject"})
+# Blocking these to "anywhere" from the whole guest network is the web for
+# every guest, and the cloud captive portal with it (the walled garden is
+# matched by hostname and our band sits below the hotspot's jumps).
+_GUEST_WEB_PORTS = frozenset({80, 443})
 
 #: RouterOS fields this writer owns on its rows, and compares on re-push.
 _MANAGED_KEYS = (
@@ -243,9 +248,41 @@ def _canonical_uuid(rule_id: str) -> str:
         ) from exc
 
 
-def _validate(rules: Sequence[FirewallFilterRuleConfig]) -> list[FirewallFilterRuleConfig]:
+def _network(value: str | None) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    return ipaddress.ip_network(value, strict=False) if value else None
+
+
+def _covers(outer: str | None, inner: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    """Whether a rule address (``None`` = anything) matches the whole of
+    ``inner``."""
+    net = _network(outer)
+    if net is None:
+        return True
+    return net.version == inner.version and inner.subnet_of(net)  # type: ignore[arg-type]
+
+
+def _validate(
+    rules: Sequence[FirewallFilterRuleConfig],
+    *,
+    guest_networks: Sequence[str] = (),
+    router_addresses: Sequence[str] = (),
+) -> list[FirewallFilterRuleConfig]:
     """Every desired rule checked before a single write, and returned in the
-    order they must sit in the band: ascending priority, ties by id."""
+    order they must sit in the band: ascending priority, ties by id.
+
+    ``guest_networks`` and ``router_addresses`` come from the router itself
+    (:func:`read_router_networks`). With them, two more refusals:
+
+    * a Block that covers a whole guest network and goes to anywhere --
+      either everything, or the web ports -- is a venue-wide outage the
+      address-narrowing check cannot see (the source IS narrowed, to the
+      guest LAN): ``ACCESS_RULES_WOULD_BREAK_GUEST_PATH``;
+    * a destination that is one of the router's own addresses never matches
+      in ``forward`` (that traffic is ``input``), so the rule would read back
+      "applied" and do nothing: ``ACCESS_RULES_TARGETS_ROUTER``.
+    """
+    guests = [ipaddress.ip_network(n, strict=False) for n in guest_networks]
+    own = {ipaddress.ip_address(a.split("/", 1)[0]) for a in router_addresses}
     seen: set[str] = set()
     for rule in rules:
         rid = _canonical_uuid(rule.rule_id)
@@ -313,6 +350,33 @@ def _validate(rules: Sequence[FirewallFilterRuleConfig]) -> list[FirewallFilterR
                     "network that is a site-wide outage that reads back as a "
                     "correctly created rule",
                 )
+            dst = _network(addresses[1])
+            to_anywhere = dst is None or dst.prefixlen == 0
+            whole_guest_lan = next((g for g in guests if _covers(addresses[0], g)), None)
+            if to_anywhere and whole_guest_lan is not None:
+                tcp_or_all = rule.protocol in (None, "tcp")
+                everything = rule.dst_port is None and tcp_or_all
+                web = rule.dst_port in _GUEST_WEB_PORTS and tcp_or_all
+                if everything or web:
+                    what = "all" if everything else f"port {rule.dst_port}"
+                    raise FirewallRefusal(
+                        WOULD_BREAK_GUEST_PATH,
+                        f"rule {rid} would {rule.action} {what} traffic from the "
+                        f"whole guest network {whole_guest_lan} to anywhere -- "
+                        "every guest loses the internet and the login page",
+                    )
+        dst_net = _network(addresses[1])
+        if (
+            dst_net is not None
+            and dst_net.num_addresses == 1
+            and dst_net.network_address in own
+        ):
+            raise FirewallRefusal(
+                TARGETS_ROUTER,
+                f"rule {rid} targets {dst_net.network_address}, one of the "
+                "router's own addresses; traffic to the router itself never "
+                "passes the forward chain, so the rule would never match",
+            )
     return sorted(rules, key=lambda r: (r.priority, r.rule_id))
 
 
@@ -350,6 +414,58 @@ def _read(api) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:  # noqa: AN
     rows = [dict(row) for row in api.path(*_FILTER_PATH)]
     forward = [r for r in rows if str(r.get("chain", "")) == _MANAGED_CHAIN]
     return rows, forward
+
+
+def _split_list(value: object) -> list[str]:
+    return [v.strip() for v in str(value or "").split(",") if v.strip()]
+
+
+def read_router_networks(
+    api,  # noqa: ANN001
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """``(guest_networks, router_addresses, guest_dns_servers)``, read-only.
+
+    Guest networks are the networks of the addresses on the interfaces the
+    hotspot serves; a router with no hotspot falls back to the interfaces
+    its DHCP servers serve. DNS servers are what DHCP hands those networks
+    (empty means the router itself). Every value is a plain string; nothing
+    here writes."""
+    addresses = [dict(r) for r in api.path("ip", "address")]
+    router_addresses = tuple(str(r.get("address")) for r in addresses if r.get("address"))
+    served = {
+        str(r.get("interface"))
+        for r in api.path("ip", "hotspot")
+        if r.get("interface") and not _is_truthy(r.get("disabled"))
+    }
+    if not served:
+        served = {
+            str(r.get("interface"))
+            for r in api.path("ip", "dhcp-server")
+            if r.get("interface") and not _is_truthy(r.get("disabled"))
+        }
+    networks: list[str] = []
+    for row in addresses:
+        if str(row.get("interface")) not in served or _is_truthy(row.get("disabled")):
+            continue
+        try:
+            net = str(ipaddress.ip_interface(str(row.get("address"))).network)
+        except ValueError:
+            continue
+        if net not in networks:
+            networks.append(net)
+    nets = [ipaddress.ip_network(n) for n in networks]
+    dns: list[str] = []
+    for row in api.path("ip", "dhcp-server", "network"):
+        try:
+            net = ipaddress.ip_network(str(row.get("address")), strict=False)
+        except ValueError:
+            continue
+        if not any(net.overlaps(n) for n in nets):
+            continue
+        for server in _split_list(row.get("dns-server")):
+            if server not in dns:
+                dns.append(server)
+    return tuple(networks), router_addresses, tuple(dns)
 
 
 def _comment(row: dict[str, Any]) -> str:
@@ -611,7 +727,10 @@ def sync_rules(
     menu = api.path(*_FILTER_PATH)
     rows, forward = _read(api)
     begin, end = _locate_band(forward)
-    desired = _validate(rules)
+    guest_networks, router_addresses, _ = read_router_networks(api)
+    desired = _validate(
+        rules, guest_networks=guest_networks, router_addresses=router_addresses
+    )
     desired_ids = {rule.rule_id for rule in desired}
     known = frozenset(str(k) for k in known_rule_ids)
     _preflight_markers(
@@ -734,9 +853,14 @@ def read_band_status(api) -> FirewallBandStatus:  # noqa: ANN001
     result carries a reason *code*, not the operator detail, because the
     detail names sentinel comments and a venue reads this."""
     _, forward = _read(api)
+    guest_networks, _, dns = read_router_networks(api)
     found = _inspect_band(forward)
     if isinstance(found[0], str):
         reason = str(found[0])
         state = "missing" if reason == BAND_REASON_NOT_PLACED else "invalid"
-        return FirewallBandStatus(state=state, reason=reason)
-    return FirewallBandStatus(state="ready", reason=None)
+        return FirewallBandStatus(
+            state=state, reason=reason, guest_networks=guest_networks, guest_dns_servers=dns
+        )
+    return FirewallBandStatus(
+        state="ready", reason=None, guest_networks=guest_networks, guest_dns_servers=dns
+    )
