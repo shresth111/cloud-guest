@@ -171,18 +171,19 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="zone_to_zone_firewall",
         label="Zone-to-zone firewall",
-        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        availability=SecurityAvailability.AVAILABLE,
         enforcement=(
-            "Planned: /ip firewall filter chain=forward, via the RouterOS API "
-            "on 8728"
+            "/ip firewall filter chain=forward inside the platform's sentinel "
+            "band, pushed over 8728 in priority order"
         ),
         detail=(
-            "Firewall rules can be saved, but nothing pushes them to a "
-            "router yet: the only device path was an SFTP config upload on "
-            "port 22, which the fleet filters. When a writer ships it will "
-            "cover routed traffic between zones that have their own VLAN "
-            "interface and subnet; traffic switched within one subnet never "
-            "reaches chain=forward and stays out of scope."
+            "Routed traffic between zones that have their own VLAN interface "
+            "and subnet, written as source/destination address rules. A "
+            "router must first have its firewall band placed from the "
+            "platform console; until then a push is refused rather than "
+            "guessed. Traffic switched within one subnet never reaches "
+            "chain=forward and is out of scope, and a block must name a "
+            "source or destination address."
         ),
     ),
     SecurityFeature(
@@ -262,26 +263,25 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="web_category_filtering",
         label="Web category filtering",
-        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        availability=SecurityAvailability.AVAILABLE,
         enforcement=(
-            "Planned: Cloudflare Gateway DNS category policies; the router "
-            "forwards its DNS lookups to a Gateway address shared by every "
-            "venue with the same category selection, over "
-            "DNS-over-HTTPS (RouterOS 7.19 or later)"
+            "Cloudflare Gateway DNS category policies; the router forwards "
+            "its DNS lookups to a Gateway address shared by every venue with "
+            "the same category selection, over DNS-over-HTTPS (RouterOS 7.19 "
+            "or later), switched over 8728 with a snapshot, a read-back, a "
+            "lookup probe and an automatic restore if the probe fails"
         ),
         detail=(
             "RouterOS has no category database, so categories are applied by "
-            "Cloudflare Gateway when the router looks a name up. The switch "
-            "is built but not yet available: it needs the platform's "
-            "Cloudflare account to be connected and has not been proven on "
-            "a real router. Limits once it ships: it filters by website "
-            "name only, at the DNS lookup, never the page or content. A "
-            "guest whose device uses its own encrypted DNS (private DNS, "
-            "DNS-over-HTTPS or DNS-over-TLS) or a VPN is not filtered, "
-            "unless the router's optional bypass protection is turned on, "
-            "and even then only encrypted DNS to well-known resolvers is "
-            "stopped. Categories are Cloudflare's, and a site can be "
-            "misclassified."
+            "Cloudflare Gateway when the router looks a name up. It filters "
+            "by website name only, at the DNS lookup, never the page or "
+            "content. A guest whose device uses its own encrypted DNS "
+            "(private DNS, DNS-over-HTTPS or DNS-over-TLS) or a VPN is not "
+            "filtered, unless the router's optional bypass protection is "
+            "turned on, and even then only encrypted DNS to well-known "
+            "resolvers is stopped. Categories are Cloudflare's, and a site "
+            "can be misclassified. Routers older than RouterOS 7.19 cannot "
+            "use it."
         ),
     ),
     SecurityFeature(
