@@ -831,6 +831,44 @@ class HotspotDeviceUnblockResult:
 
 
 @dataclass(frozen=True, slots=True)
+class DhcpLease:
+    """One ``/ip dhcp-server lease`` row, as the router reported it.
+
+    ``dynamic`` is the fact a firewall rule by address cares about: a
+    dynamic lease is the router's own bookkeeping and the device may be
+    handed a different address when it expires; a static (``dynamic`` false)
+    lease is a reservation, and the device gets this address every time.
+
+    ``address`` is the leased address (``active-address`` when RouterOS
+    reports one, else ``address``). ``status`` is RouterOS's own word --
+    ``bound``, ``waiting``, ``offered`` -- passed through, not interpreted.
+    """
+
+    routeros_id: str
+    mac_address: str
+    address: str | None
+    dynamic: bool
+    status: str | None
+    host_name: str | None
+    server: str | None
+    comment: str | None
+    disabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpLeaseKeepResult:
+    """What a router holds after being asked to keep one device on its
+    current address -- read back after the write, never assumed.
+
+    ``changed`` is ``False`` when the lease was already static on that
+    address and nothing was written; ``True`` only when this call turned a
+    dynamic lease static and the second read confirmed it."""
+
+    lease: DhcpLease
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class FloodLimitStatus:
     """What a read of a router's connection-flood limit found.
 
@@ -1998,6 +2036,8 @@ __all__ = [
     "HotspotSessionControl",
     "HotspotDisconnectResult",
     "HotspotDeviceBlockResult",
+    "DhcpLease",
+    "DhcpLeaseKeepResult",
     "HotspotDeviceUnblockResult",
     "FloodLimitStatus",
     "FloodLimitResult",
