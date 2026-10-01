@@ -367,8 +367,9 @@ class TestFirewallRuleCrud:
 class TestEveryRouteRequiresPermission:
     def test_every_firewall_route_has_a_permission_dependency(self) -> None:
         # CRUD (5) + the per-router push + the Master-only band placement
-        # + the read-only band status + the flood-limit read and write.
-        assert len(firewall_router.routes) == 10
+        # + the read-only band status + the flood-limit read and write
+        # + the guest-isolation read and write.
+        assert len(firewall_router.routes) == 12
         for route in firewall_router.routes:
             assert (
                 route.dependencies != []

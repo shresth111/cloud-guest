@@ -862,6 +862,85 @@ class FloodLimitResult:
 
 
 @dataclass(frozen=True, slots=True)
+class GuestIsolationPort:
+    """One member port of a guest (hotspot) bridge, as the isolation reader
+    classified it.
+
+    ``isolatable`` is True for a physical port this platform may put in its
+    split-horizon group; ``excluded_reason`` says why not otherwise
+    (``wan``, ``not_physical``, ``dynamic``, ``disabled``). ``isolated`` is
+    "carries this platform's horizon value now". ``running`` is link-up, the
+    only signal used for "something -- usually an access point -- is plugged
+    in here"."""
+
+    interface: str
+    bridge: str
+    interface_type: str
+    running: bool
+    isolatable: bool
+    isolated: bool
+    horizon: str
+    excluded_reason: str | None = None
+    hw_offload: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestIsolationRadio:
+    """One of the router's OWN radios serving the guest network.
+
+    ``kind`` is ``wireless`` (legacy package, ``default-forwarding``) or
+    ``wifi`` (RouterOS 7 wifi package, ``datapath.client-isolation``)."""
+
+    interface: str
+    kind: str
+    isolated: bool
+    supported: bool = True
+    excluded_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestIsolationStatus:
+    """What a read of a router's guest-isolation switch found. Read-only.
+
+    ``enabled`` is "any trace of this platform's isolation is on the router"
+    (a port carrying our horizon, a radio we changed, our record list, or a
+    routed-guard row). ``between_ports`` is True only when every isolatable
+    guest port carries our horizon and there are at least two of them.
+    ``routed_guard`` is True when every guest network has our drop row at
+    the top of the firewall band. ``consistent`` is the shape a write leaves.
+    ``refusal`` is the ``ISOLATION_*`` code a write would be refused with
+    now, or ``None`` when it could be turned on.
+    """
+
+    enabled: bool
+    consistent: bool
+    between_ports: bool
+    routed_guard: bool
+    band_state: str
+    hotspot_interfaces: tuple[str, ...]
+    guest_bridges: tuple[str, ...]
+    guest_networks: tuple[str, ...]
+    ports: tuple[GuestIsolationPort, ...] = ()
+    radios: tuple[GuestIsolationRadio, ...] = ()
+    refusal: str | None = None
+    refusal_detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestIsolationResult:
+    """What turning guest isolation on or off did, counted from the writes
+    issued and confirmed by a re-read. ``left_alone`` names interfaces this
+    platform once changed but someone has since changed again, which a
+    removal therefore did not touch."""
+
+    ports_changed: tuple[str, ...]
+    radios_changed: tuple[str, ...]
+    guard_rows_added: int
+    guard_rows_removed: int
+    left_alone: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ContentFilterRuleConfig:
     """One content-filtering rule to realize on the device -- either a
     domain to DNS-sinkhole or an IP/CIDR to address-list-and-drop. See
@@ -2001,6 +2080,10 @@ __all__ = [
     "HotspotDeviceUnblockResult",
     "FloodLimitStatus",
     "FloodLimitResult",
+    "GuestIsolationPort",
+    "GuestIsolationRadio",
+    "GuestIsolationResult",
+    "GuestIsolationStatus",
     "HotspotCertificatePush",
     "HotspotCertificatePushResult",
     "ProvisionResult",

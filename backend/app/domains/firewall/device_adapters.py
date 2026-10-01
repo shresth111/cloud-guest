@@ -40,6 +40,8 @@ from wyfy_device_gateway.contract import (
     FirewallSyncResult,
     FloodLimitResult,
     FloodLimitStatus,
+    GuestIsolationResult,
+    GuestIsolationStatus,
 )
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
@@ -117,6 +119,24 @@ class BaseFirewallAdapter(Protocol):
         self, credentials: FirewallCredentials
     ) -> FloodLimitResult:
         """Take every flood-limit row off the router."""
+        ...
+
+    async def read_guest_isolation(
+        self, credentials: FirewallCredentials
+    ) -> GuestIsolationStatus:
+        """Read-only: are guest ports / radios isolated, and how many."""
+        ...
+
+    async def apply_guest_isolation(
+        self, credentials: FirewallCredentials
+    ) -> GuestIsolationResult:
+        """Isolate guests from each other (horizon, radios, guard rows)."""
+        ...
+
+    async def remove_guest_isolation(
+        self, credentials: FirewallCredentials
+    ) -> GuestIsolationResult:
+        """Put back exactly what the apply set."""
         ...
 
 
@@ -234,6 +254,55 @@ class MikroTikFirewallAdapter:
         except MikroTikDeviceError as exc:
             raise FirewallDeviceOperationError(
                 "remove_flood_limit", exc.detail
+            ) from exc
+
+
+    async def read_guest_isolation(
+        self, credentials: FirewallCredentials
+    ) -> GuestIsolationStatus:
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).read_guest_isolation(
+                self._gateway_credentials(credentials)
+            )
+        except MikroTikConnectionError as exc:
+            raise FirewallDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise FirewallDeviceOperationError(
+                "read_guest_isolation", exc.detail
+            ) from exc
+
+    async def apply_guest_isolation(
+        self, credentials: FirewallCredentials
+    ) -> GuestIsolationResult:
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).apply_guest_isolation(
+                self._gateway_credentials(credentials)
+            )
+        except MikroTikConnectionError as exc:
+            raise FirewallDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikFirewallRefusedError as exc:
+            raise FirewallPushRefusedError(exc.code, exc.detail) from exc
+        except MikroTikFirewallPushFailedError as exc:
+            raise FirewallPushFailedError(exc.detail, restored=exc.restored) from exc
+        except MikroTikDeviceError as exc:
+            raise FirewallDeviceOperationError(
+                "apply_guest_isolation", exc.detail
+            ) from exc
+
+    async def remove_guest_isolation(
+        self, credentials: FirewallCredentials
+    ) -> GuestIsolationResult:
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).remove_guest_isolation(
+                self._gateway_credentials(credentials)
+            )
+        except MikroTikConnectionError as exc:
+            raise FirewallDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikFirewallPushFailedError as exc:
+            raise FirewallPushFailedError(exc.detail, restored=exc.restored) from exc
+        except MikroTikDeviceError as exc:
+            raise FirewallDeviceOperationError(
+                "remove_guest_isolation", exc.detail
             ) from exc
 
 

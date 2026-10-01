@@ -1005,6 +1005,9 @@ class AuditAction(StrEnum):
     # The per-router "Limit connection floods" switch was turned on, changed
     # or turned off (``FirewallService.set_flood_limit``).
     FIREWALL_FLOOD_LIMIT_CHANGED = "firewall_flood_limit_changed"
+    # The per-router "Guests can't see each other" switch was turned on or
+    # off (``FirewallService.set_guest_isolation``).
+    FIREWALL_GUEST_ISOLATION_CHANGED = "firewall_guest_isolation_changed"
 
     # Network Device (NAC) domain events -- written through this same
     # table by ``app.domains.network_device.service.NetworkDeviceService``

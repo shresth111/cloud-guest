@@ -201,6 +201,45 @@ class FloodLimitState:
     checked_at: datetime
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class GuestIsolationPortState:
+    interface: str
+    running: bool
+    isolatable: bool
+    isolated: bool
+    excluded_reason: str | None
+    is_radio: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GuestIsolationState:
+    """A router's "Guests can't see each other" switch, read off the router.
+
+    ``between_ports`` is the part the router enforces: guests on different
+    ports of the guest bridge cannot reach each other. ``ap_ports`` counts
+    the guest ports with a link up -- where an access point (or a switch)
+    is plugged in. Guests on the SAME access point are never isolated by the
+    router; ``ap_isolation_needed`` says the owner must turn on the access
+    points' own setting. ``routed_guard`` is the firewall row that stops a
+    guest routing to another through the router; it needs the band.
+    ``refusal`` is the code a turn-on would be refused with now."""
+
+    enabled: bool
+    consistent: bool
+    between_ports: bool
+    routed_guard: bool
+    radios_isolated: bool | None
+    band_state: str
+    guest_ports: int
+    isolated_ports: int
+    ap_ports: int
+    ap_isolation_needed: bool
+    ports: tuple[GuestIsolationPortState, ...]
+    refusal: str | None
+    summary: str
+    checked_at: datetime
+
+
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
@@ -765,6 +804,135 @@ class FirewallService:
             checked_at=datetime.now(UTC),
         )
 
+    # -- guest isolation ("guests can't see each other") --------------------
+
+    async def read_guest_isolation(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> GuestIsolationState:
+        """Read-only, off the router: which guest ports are isolated from
+        each other, how many have an access point on them, and whether the
+        router's own radios isolate their clients. Stored nowhere else, for
+        the same reason as the flood limit. Takes no lock."""
+        router = await self._flood_router(router_id, requesting_organization_id)
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_firewall_adapter(router.vendor)
+        status = await adapter.read_guest_isolation(credentials)
+        return self._isolation_state(status)
+
+    async def set_guest_isolation(
+        self,
+        router_id: uuid.UUID,
+        *,
+        enabled: bool,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> GuestIsolationState:
+        """Turn guest isolation on or off. Under the router's forward-chain
+        lock (it writes the routed-guard rows in that chain). A refusal is a
+        409 with an ``ISOLATION_*`` code and nothing written; a write that
+        failed part-way is a 502 saying whether it was undone. Returns a
+        fresh read."""
+        router = await self._flood_router(router_id, requesting_organization_id)
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_firewall_adapter(router.vendor)
+        async with self._router_lock(router.id):
+            if enabled:
+                result = await adapter.apply_guest_isolation(credentials)
+            else:
+                result = await adapter.remove_guest_isolation(credentials)
+            status = await adapter.read_guest_isolation(credentials)
+        ports_changed = len(getattr(result, "ports_changed", ()))
+        radios_changed = len(getattr(result, "radios_changed", ()))
+        logger.info(
+            "firewall_guest_isolation_changed",
+            extra={
+                "event_router_id": str(router.id),
+                "event_enabled": enabled,
+                "event_ports_changed": ports_changed,
+                "event_radios_changed": radios_changed,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.FIREWALL_GUEST_ISOLATION_CHANGED,
+            entity_id=router.id,
+            entity_type="router",
+            organization_id=router.organization_id,
+            description=(
+                f"Guest isolation on router {router.id} turned "
+                f"{'on' if enabled else 'off'}: {ports_changed} ports and "
+                f"{radios_changed} radios changed, "
+                f"{getattr(result, 'guard_rows_added', 0)} guard rows added, "
+                f"{getattr(result, 'guard_rows_removed', 0)} removed"
+            ),
+        )
+        return self._isolation_state(status)
+
+    @staticmethod
+    def _isolation_state(status: object) -> GuestIsolationState:
+        raw_ports = tuple(getattr(status, "ports", ()))
+        radios = tuple(getattr(status, "radios", ()))
+        radio_names = {getattr(r, "interface", "") for r in radios}
+        ports = tuple(
+            GuestIsolationPortState(
+                interface=str(p.interface),
+                running=bool(p.running),
+                isolatable=bool(p.isolatable),
+                isolated=bool(p.isolated),
+                excluded_reason=p.excluded_reason,
+                is_radio=p.interface in radio_names
+                or str(p.interface_type) in {"wlan", "wifi"},
+            )
+            for p in raw_ports
+        )
+        guest = [p for p in ports if p.isolatable]
+        isolated = [p for p in guest if p.isolated]
+        # Something with a link on a wired guest port is, at a venue, an
+        # access point or a switch feeding them; either way its own clients
+        # are switched inside it, out of the router's sight.
+        ap_ports = sum(1 for p in guest if p.running and not p.is_radio)
+        supported_radios = [r for r in radios if getattr(r, "supported", False)]
+        radios_isolated = (
+            all(bool(r.isolated) for r in supported_radios)
+            if supported_radios
+            else None
+        )
+        between = bool(getattr(status, "between_ports", False))
+        enabled = bool(getattr(status, "enabled", False))
+        # A hotspot on a plain port (no bridge) still has an access point on
+        # it whenever the port is up.
+        ap_isolation_needed = ap_ports > 0 or (
+            not guest and bool(getattr(status, "hotspot_interfaces", ()))
+        )
+        summary = (
+            f"Isolated between ports: {'yes' if between else 'no'}, "
+            f"{ap_ports} AP port{'s' if ap_ports != 1 else ''} found"
+            + (
+                "; same-AP isolation must be set on your access points."
+                if ap_isolation_needed
+                else "."
+            )
+        )
+        return GuestIsolationState(
+            enabled=enabled,
+            consistent=bool(getattr(status, "consistent", False)) or not enabled,
+            between_ports=between,
+            routed_guard=bool(getattr(status, "routed_guard", False)),
+            radios_isolated=radios_isolated,
+            band_state=str(getattr(status, "band_state", "missing")),
+            guest_ports=len(guest),
+            isolated_ports=len(isolated),
+            ap_ports=ap_ports,
+            ap_isolation_needed=ap_isolation_needed,
+            ports=ports,
+            refusal=getattr(status, "refusal", None),
+            summary=summary,
+            checked_at=datetime.now(UTC),
+        )
+
     def _router_lock(self, router_id: uuid.UUID):  # noqa: ANN202
         return router_firewall_lock(
             self._redis,
@@ -828,4 +996,6 @@ __all__ = [
     "FirewallPushOutcome",
     "FloodLimitState",
     "FirewallService",
+    "GuestIsolationPortState",
+    "GuestIsolationState",
 ]

@@ -83,6 +83,7 @@ import librouteros
 from librouteros.exceptions import LibRouterosError
 
 from . import mikrotik_firewall as _fw
+from . import mikrotik_guest_isolation as _iso
 from .contract import (
     ConnectedDevice,
     ContentFilterRuleConfig,
@@ -103,6 +104,8 @@ from .contract import (
     FirewallBandStatus,
     FloodLimitResult,
     FloodLimitStatus,
+    GuestIsolationResult,
+    GuestIsolationStatus,
     FirewallFilterRuleConfig,
     FirewallSyncResult,
     HotspotActiveSession,
@@ -6610,6 +6613,58 @@ class MikroTikAdapter:
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"{op}_flood_limit: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # guest isolation (bridge horizon, own radios, routed guard rows)
+    # ------------------------------------------------------------------
+
+    async def read_guest_isolation(
+        self, creds: DeviceCredentials
+    ) -> GuestIsolationStatus:
+        """Read-only: see :func:`wyfy_device_gateway.mikrotik_guest_isolation
+        .read_guest_isolation`."""
+        return await asyncio.to_thread(self._isolation_sync, creds, "read")
+
+    async def apply_guest_isolation(
+        self, creds: DeviceCredentials
+    ) -> GuestIsolationResult:
+        """Turn guest isolation on. Refused -> :class:`MikroTikFirewallRefusedError`
+        (``ISOLATION_*``, nothing written); failed after writing ->
+        :class:`MikroTikFirewallPushFailedError`. The caller holds the
+        router's firewall lock: this writes forward-chain rows."""
+        return await asyncio.to_thread(self._isolation_sync, creds, "apply")
+
+    async def remove_guest_isolation(
+        self, creds: DeviceCredentials
+    ) -> GuestIsolationResult:
+        """Put back exactly what :meth:`apply_guest_isolation` set."""
+        return await asyncio.to_thread(self._isolation_sync, creds, "remove")
+
+    def _isolation_sync(
+        self, creds: DeviceCredentials, op: str
+    ) -> GuestIsolationStatus | GuestIsolationResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if op == "read":
+                    return _iso.read_guest_isolation(api)
+                if op == "apply":
+                    return _iso.apply_guest_isolation(api)
+                return _iso.remove_guest_isolation(api)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except _fw.FirewallPushFailed as exc:
+                raise MikroTikFirewallPushFailedError(
+                    creds.host, str(exc), restored=exc.restored
+                ) from exc
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"{op}_guest_isolation: {exc}"
                 ) from exc
         finally:
             self._safe_close(api)

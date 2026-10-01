@@ -105,6 +105,14 @@ _AVAILABLE_FEATURE_WRITERS: dict[str, tuple[str, ...]] = {
         "wyfy_device_gateway.mikrotik_adapter:"
         "MikroTikAdapter.unblock_hotspot_device",
     ),
+    "guest_client_isolation": (
+        "app.domains.firewall.device_adapters:"
+        "MikroTikFirewallAdapter.apply_guest_isolation",
+        "app.domains.firewall.service:FirewallService.set_guest_isolation",
+        "wyfy_device_gateway.mikrotik_adapter:MikroTikAdapter.apply_guest_isolation",
+        "wyfy_device_gateway.mikrotik_guest_isolation:apply_guest_isolation",
+        "wyfy_device_gateway.mikrotik_guest_isolation:remove_guest_isolation",
+    ),
     "connection_flood_protection": (
         "app.domains.firewall.device_adapters:"
         "MikroTikFirewallAdapter.apply_flood_limit",
@@ -603,7 +611,7 @@ class TestCapabilityMatrix:
         assert "ip-binding type=blocked" in (device.enforcement or "")
         detail = device.detail.lower()
         assert "randomised" in detail
-        assert "isolating devices" in detail and "not built" in detail
+        assert "guest isolation" in detail
         flood = by_key["connection_flood_protection"]
         assert flood.availability is SecurityAvailability.AVAILABLE
         assert "connection-limit" in (flood.enforcement or "")
@@ -611,6 +619,24 @@ class TestCapabilityMatrix:
         detail = flood.detail.lower()
         assert "break busy apps" in detail
         assert "reduces rather than eliminates" in detail
+
+    def test_guest_isolation_says_it_is_partial(self) -> None:
+        """Offered now that a writer exists (bridge horizon, radio isolation,
+        a guard row). The router cannot see two guests on the same external
+        access point, so the row must say it is partial and that the access
+        points' own setting is needed -- not read as "guests are isolated"."""
+        feature = {f.key: f for f in SECURITY_FEATURES}["guest_client_isolation"]
+        assert feature.availability is SecurityAvailability.AVAILABLE
+        assert "horizon" in (feature.enforcement or "")
+        detail = feature.detail.lower()
+        for phrase in (
+            "partial isolation",
+            "same external access point",
+            "ap isolation",
+            "separate switch",
+            "vlan filtering",
+        ):
+            assert phrase in detail, phrase
 
     def test_category_filtering_names_its_mechanism_and_limits(
         self,
