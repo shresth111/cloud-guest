@@ -224,6 +224,11 @@ from app.domains.router.constants import (
     TASK_RUN_ROUTER_REACHABILITY_SWEEP,
     TASK_RUN_STALE_HEARTBEAT_SWEEP,
 )
+from app.domains.security_activity.constants import (
+    SECURITY_COUNTER_SWEEP_INTERVAL_SECONDS,
+    TASK_COLLECT_SECURITY_COUNTERS_FOR_ROUTER,
+    TASK_RUN_SECURITY_COUNTER_SWEEP,
+)
 
 _settings = get_settings()
 
@@ -281,6 +286,7 @@ celery_app = Celery(
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
         "app.domains.router.tasks",
+        "app.domains.security_activity.tasks",
     ],
 )
 
@@ -395,6 +401,11 @@ celery_app.conf.update(
         # worker must consume it (-Q ...,marketing) -- see
         # app.domains.marketing.tasks.
         TASK_SEND_CAMPAIGN_BATCH: {"queue": MARKETING_QUEUE_NAME},
+        # Security activity: one read-only 8728 session per router per hour
+        # (app.domains.security_activity.tasks). Its coordinator is one DB
+        # query plus N staggered apply_async calls and stays on the default
+        # queue.
+        TASK_COLLECT_SECURITY_COUNTERS_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
         # Guest Marketing: start due campaigns (pure DB, default queue),
@@ -666,6 +677,13 @@ celery_app.conf.update(
         # its first caller: a router that is not being watched has no alert
         # row, raises no error, and was invisible precisely because it was
         # unguarded.
+        # Security activity: hourly read of every agent-managed router's own
+        # protection-rule hit counters, staggered across 30 minutes. Read
+        # only -- see app.domains.security_activity.tasks.
+        "security-counter-sweep": {
+            "task": TASK_RUN_SECURITY_COUNTER_SWEEP,
+            "schedule": SECURITY_COUNTER_SWEEP_INTERVAL_SECONDS,
+        },
         "dhcp-rogue-detection-sweep": {
             "task": TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
             "schedule": ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,

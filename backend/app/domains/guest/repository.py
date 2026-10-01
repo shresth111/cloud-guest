@@ -16,10 +16,10 @@ and must never be a Python-side loop over fetched rows.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from sqlalchemy import (
     DateTime,
@@ -60,6 +60,7 @@ from .models import (
     GuestLoginHistory,
     GuestQuotaUsage,
     GuestSession,
+    GuestSessionEvent,
     RadiusNasClient,
     RadiusNasCodeCounter,
 )
@@ -399,6 +400,36 @@ class GuestRepositoryProtocol(Protocol):
     # -- login history ---------------------------------------------------------
     async def create_login_history(self, **fields: object) -> GuestLoginHistory: ...
 
+    # -- AAA trail -------------------------------------------------------------
+    async def record_session_event(
+        self, *, coalesce_since: datetime | None = None, **fields: Any
+    ) -> GuestSessionEvent: ...
+
+    async def list_session_events(
+        self, *, session_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> list[GuestSessionEvent]: ...
+
+    async def list_unbound_guest_events(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        router_id: uuid.UUID,
+        guest_id: uuid.UUID | None,
+        username: str | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[GuestSessionEvent]: ...
+
+    async def list_login_attempts_for_guest(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        guest_id: uuid.UUID | None,
+        identifier: str | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[GuestLoginHistory]: ...
+
     # -- consents ----------------------------------------------------------------
     async def create_consent(self, **fields: object) -> GuestConsent: ...
 
@@ -533,8 +564,17 @@ class GuestRepository:
     """Concrete, SQLAlchemy-backed implementation of
     ``GuestRepositoryProtocol``."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        independent_session_factory: Callable[[], Any] | None = None,
+    ) -> None:
         self.session = session
+        # See ``create_login_history``: a failed login is recorded in its own
+        # short transaction, because the request's transaction is rolled
+        # back by the very exception that made it a failure.
+        self._independent_session_factory = independent_session_factory
         self.guests = GenericRepository(Guest, session)
         self.devices = GenericRepository(GuestDevice, session)
         self.sessions = GenericRepository(GuestSession, session)
@@ -1532,7 +1572,189 @@ class GuestRepository:
     # -- login history ---------------------------------------------------------
 
     async def create_login_history(self, **fields: object) -> GuestLoginHistory:
+        """A successful login is written in the request's transaction, like
+        everything else it does.
+
+        A **failed** one is not, and cannot be. Every failure path records the
+        attempt and then re-raises, and ``get_db_session`` rolls the request's
+        transaction back on that exception (FastAPI re-raises a handled
+        exception into a ``yield`` dependency -- confirmed against this
+        repo's FastAPI 0.115.6). So every wrong OTP, expired voucher and
+        blocked device was flushed and then discarded: the Login/Access
+        Attempt Log could only ever show successes, and the A of the AAA
+        trail had no failures in it at all.
+
+        Written in its own short transaction instead, the row survives the
+        rollback and nothing else the failed request did is persisted with
+        it."""
+        if fields.get("success") is False:
+            factory = self._independent_session_factory
+            if factory is None:
+                from app.database.session import SessionLocal
+
+                factory = SessionLocal
+            async with factory() as independent:
+                entry = GuestLoginHistory(**fields)
+                independent.add(entry)
+                await independent.commit()
+                await independent.refresh(entry)
+                return entry
         return await self.login_history.create(fields)
+
+    # -- AAA trail (guest_session_events) --------------------------------------
+
+    #: Columns that decide whether a new event is "the same" as an existing
+    #: row it may be coalesced into.
+    _EVENT_IDENTITY = (
+        "event_type",
+        "router_id",
+        "session_id",
+        "username",
+        "calling_station_id",
+        "reason_code",
+    )
+    #: Columns a coalesced row takes from the newest packet when it has them.
+    _EVENT_REFRESHED = (
+        "acct_session_id",
+        "framed_ip_address",
+        "nas_ip_address",
+        "venue_public_ip",
+        "session_time_seconds",
+        "bytes_uploaded_total",
+        "bytes_downloaded_total",
+        "granted",
+        "raw",
+    )
+
+    async def record_session_event(
+        self, *, coalesce_since: datetime | None = None, **fields: Any
+    ) -> GuestSessionEvent:
+        """Append one AAA event, or fold it into the matching row written
+        since ``coalesce_since`` (see ``GuestSessionEvent``'s "Bounded
+        volume"). Runs in a SAVEPOINT so a failed write can never poison the
+        RADIUS request's own transaction -- the caller also swallows any
+        error, because the trail must never change a RADIUS answer."""
+        async with self.session.begin_nested():
+            existing: GuestSessionEvent | None = None
+            if coalesce_since is not None:
+                conditions = [
+                    GuestSessionEvent.organization_id == fields["organization_id"],
+                    GuestSessionEvent.occurred_at >= coalesce_since,
+                ]
+                for key in self._EVENT_IDENTITY:
+                    column = getattr(GuestSessionEvent, key)
+                    value = fields.get(key)
+                    conditions.append(
+                        column.is_(None) if value is None else column == value
+                    )
+                result = await self.session.execute(
+                    select(GuestSessionEvent)
+                    .where(*conditions)
+                    .order_by(GuestSessionEvent.occurred_at.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+                existing = result.scalars().first()
+            if existing is not None:
+                existing.occurred_at = fields["occurred_at"]
+                existing.repeat_count = (existing.repeat_count or 1) + 1
+                for key in self._EVENT_REFRESHED:
+                    value = fields.get(key)
+                    if value is not None:
+                        setattr(existing, key, value)
+                await self.session.flush()
+                return existing
+            event = GuestSessionEvent(
+                first_seen_at=fields["occurred_at"], repeat_count=1, **fields
+            )
+            self.session.add(event)
+            await self.session.flush()
+            return event
+
+    async def list_session_events(
+        self, *, session_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> list[GuestSessionEvent]:
+        """Every event bound to one session. ``organization_id`` is the
+        session's own (already scope-checked by the caller) and is applied
+        again here so this query can never be pointed across tenants."""
+        result = await self.session.execute(
+            select(GuestSessionEvent)
+            .where(
+                GuestSessionEvent.session_id == session_id,
+                GuestSessionEvent.organization_id == organization_id,
+            )
+            .order_by(GuestSessionEvent.occurred_at, GuestSessionEvent.id)
+        )
+        return list(result.scalars().all())
+
+    async def list_unbound_guest_events(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        router_id: uuid.UUID,
+        guest_id: uuid.UUID | None,
+        username: str | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[GuestSessionEvent]:
+        """Events for this guest on this router that no session claimed --
+        the rejects that happened before (or instead of) a session. Matched
+        by guest id, or by the identifier the NAS sent when no guest row
+        resolved."""
+        who = []
+        if guest_id is not None:
+            who.append(GuestSessionEvent.guest_id == guest_id)
+        if username:
+            who.append(GuestSessionEvent.username == username)
+        if not who:
+            return []
+        result = await self.session.execute(
+            select(GuestSessionEvent)
+            .where(
+                GuestSessionEvent.organization_id == organization_id,
+                GuestSessionEvent.router_id == router_id,
+                GuestSessionEvent.session_id.is_(None),
+                GuestSessionEvent.occurred_at >= start,
+                GuestSessionEvent.occurred_at < end,
+                or_(*who),
+            )
+            .order_by(GuestSessionEvent.occurred_at, GuestSessionEvent.id)
+            .limit(200)
+        )
+        return list(result.scalars().all())
+
+    async def list_login_attempts_for_guest(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        guest_id: uuid.UUID | None,
+        identifier: str | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[GuestLoginHistory]:
+        """Portal sign-in attempts by this guest in a window. A failed
+        attempt by a not-yet-known guest has no ``guest_id``, so the
+        identifier is matched too."""
+        who = []
+        if guest_id is not None:
+            who.append(GuestLoginHistory.guest_id == guest_id)
+        if identifier:
+            who.append(GuestLoginHistory.identifier == identifier)
+        if not who:
+            return []
+        result = await self.session.execute(
+            select(GuestLoginHistory)
+            .where(
+                GuestLoginHistory.organization_id == organization_id,
+                GuestLoginHistory.attempted_at >= start,
+                GuestLoginHistory.attempted_at < end,
+                GuestLoginHistory.is_deleted.is_(False),
+                or_(*who),
+            )
+            .order_by(GuestLoginHistory.attempted_at, GuestLoginHistory.id)
+            .limit(200)
+        )
+        return list(result.scalars().all())
 
     # -- consents ----------------------------------------------------------------
 

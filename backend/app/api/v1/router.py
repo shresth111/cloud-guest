@@ -95,6 +95,9 @@ from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.security.router import router as security_router
+from app.domains.security_activity.router import (
+    router as security_activity_router,
+)
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
@@ -233,6 +236,7 @@ api_v1_router.include_router(dns_filtering_router, dependencies=_PAID_WRITES)
 # than silently shipping an ungated write. See app.domains.security.router's
 # own docstring for the same note next to the routes themselves.
 api_v1_router.include_router(security_router)
+api_v1_router.include_router(security_activity_router)
 api_v1_router.include_router(campaigns_guest_router)
 api_v1_router.include_router(campaigns_router, dependencies=_PAID_WRITES)
 # Guest Marketing (contract §5.0): the customer router is licence-gated for

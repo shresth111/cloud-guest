@@ -64,6 +64,7 @@ from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 from app.domains.wireguard.validators import hub_reserved_ip
 
+from .aaa import describe_login_failure
 from .constants import (
     MAX_BULK_DEVICE_LOOKUP_IDS,
     MAX_BULK_VOUCHER_LOOKUP_IDS,
@@ -116,6 +117,7 @@ from .schemas import (
     GuestReviewLinkOpenedResponse,
     GuestSessionListResponse,
     GuestSessionResponse,
+    GuestSessionTimelineResponse,
     GuestSetPasswordRequest,
     GuestSetPasswordResponse,
     GuestSetPinRequest,
@@ -692,6 +694,7 @@ def _login_history_response(entry: GuestLoginHistory) -> GuestLoginHistoryRespon
         auth_method=entry.auth_method,
         success=entry.success,
         failure_reason=entry.failure_reason,
+        failure_reason_text=describe_login_failure(entry.failure_reason),
         attempted_at=entry.attempted_at,
         ip_address=entry.ip_address,
         created_at=entry.created_at,
@@ -1616,6 +1619,62 @@ async def get_guest_session(
                 requesting_organization_id=requesting_organization_id,
             )
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
+    "/guest-sessions/{session_id}/timeline",
+    response_model=ApiResponse[GuestSessionTimelineResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def get_guest_session_timeline(
+    request: Request,
+    session_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    """The AAA trail for one session: sign-in attempts and their reasons
+    (authentication), what the router was told to allow (authorization), and
+    what the router reported (accounting) -- in plain words, with the raw
+    RADIUS values alongside.
+
+    Same permission and the same scoping as ``GET /guest-sessions/{id}``:
+    ``GuestService.get_session`` checks the session against the caller's
+    organization *and* location before anything else is read, and every
+    further query is pinned to the session's own organization."""
+    timeline = await service.get_session_timeline(
+        session_id, requesting_organization_id=requesting_organization_id
+    )
+    session = timeline.session
+    macs = await _resolve_session_macs(
+        [session],
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
+    router_names = await _resolve_router_names([session], service=service)
+    payload = GuestSessionTimelineResponse(
+        session_id=str(session.id),
+        guest_id=str(session.guest_id) if session.guest_id else None,
+        guest_identifier=timeline.guest_identifier,
+        location_id=str(session.location_id),
+        router_id=str(session.router_id),
+        authorization=timeline.authorization,
+        accounting={
+            **timeline.accounting,
+            "device_mac": (
+                macs.get(str(session.device_id)) if session.device_id else None
+            ),
+            "router_name": router_names.get(str(session.router_id)),
+        },
+        entries=timeline.entries,
+        notes=timeline.notes,
+    )
+    return build_response(
+        success=True,
+        message="Guest session timeline retrieved",
+        data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 
@@ -2707,6 +2766,9 @@ async def radius_accounting(
             nas_client=nas_client,
             username=payload.username,
             calling_station_id=payload.calling_station_id,
+            acct_session_id=payload.session_id,
+            framed_ip_address=payload.framed_ip_address,
+            nas_ip_address=payload.nas_ip_address,
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_INTERIM_UPDATE:
         session = await service.accounting_interim_update(
@@ -2726,6 +2788,10 @@ async def radius_accounting(
             # ``RadiusAccountingRequest``'s own docstring for the production
             # measurement.
             calling_station_id=payload.calling_station_id,
+            acct_session_id=payload.session_id,
+            framed_ip_address=payload.framed_ip_address,
+            nas_ip_address=payload.nas_ip_address,
+            session_time_seconds=payload.session_time,
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_STOP:
         session = await service.accounting_stop(
@@ -2735,6 +2801,10 @@ async def radius_accounting(
             bytes_downloaded_total=payload.bytes_downloaded_total,
             disconnect_reason=payload.disconnect_reason,
             calling_station_id=payload.calling_station_id,
+            acct_session_id=payload.session_id,
+            framed_ip_address=payload.framed_ip_address,
+            nas_ip_address=payload.nas_ip_address,
+            session_time_seconds=payload.session_time,
         )
     else:
         # Previously: silently treated as "stop". Any status_type this

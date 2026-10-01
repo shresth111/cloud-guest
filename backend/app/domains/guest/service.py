@@ -235,6 +235,7 @@ replacement for it.
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import logging
 import math
 import secrets
@@ -286,6 +287,13 @@ from app.domains.router.models import Router
 from app.domains.router.vendor_capabilities import is_controller_managed
 from app.domains.voucher.models import Voucher, VoucherBatch
 
+from .aaa import (
+    AuthRejectReason,
+    SessionEventType,
+    build_timeline_entries,
+    describe_auth_method,
+    describe_disconnect_reason,
+)
 from .constants import (
     BYTES_PER_MB,
     DASHBOARD_OS_NAMES,
@@ -2472,6 +2480,18 @@ class GuestLastEndedSessionResult:
     # is venue policy, identical for every guest at the location, so it
     # tells a stranger holding an observed MAC nothing about the guest.
     idle_timeout_minutes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestSessionTimeline:
+    """``GuestService.get_session_timeline``'s result -- see there."""
+
+    session: GuestSession
+    guest_identifier: str | None
+    entries: list[dict]
+    authorization: dict
+    accounting: dict
+    notes: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -5146,6 +5166,128 @@ class GuestService:
         )
         return session
 
+    async def get_session_timeline(
+        self,
+        session_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> GuestSessionTimeline:
+        """The A/A/A story of one session: how the guest got on, what they
+        were granted, and what the router reported.
+
+        Scoped exactly like ``get_session`` -- the caller's organization
+        *and* location -- and every follow-up query is pinned to the
+        session's own ``organization_id`` as well, so nothing here can be
+        steered across tenants by the path id (the defect class in
+        ``wyfy_path_id_scoping_defect``).
+        """
+        session = await self.get_session(
+            session_id, requesting_organization_id=requesting_organization_id
+        )
+        guest = await self.repository.get_guest_by_id(session.guest_id)
+        identifier = guest.identifier if guest is not None else None
+        now = datetime.now(UTC)
+        window_start = session.started_at - timedelta(hours=2)
+        window_end = (session.ended_at or now) + timedelta(minutes=30)
+
+        attempts = await self.repository.list_login_attempts_for_guest(
+            organization_id=session.organization_id,
+            guest_id=session.guest_id,
+            identifier=identifier,
+            start=window_start,
+            end=session.started_at + timedelta(minutes=5),
+        )
+        # Every failure in the lead-up, but only the one success that
+        # actually opened *this* session -- an earlier success opened an
+        # earlier session and belongs on that one's timeline.
+        successes = [a for a in attempts if a.success]
+        opening = successes[-1:] if successes else []
+        attempts = [a for a in attempts if not a.success] + opening
+
+        events = await self.repository.list_session_events(
+            session_id=session.id, organization_id=session.organization_id
+        )
+        unbound = await self.repository.list_unbound_guest_events(
+            organization_id=session.organization_id,
+            router_id=session.router_id,
+            guest_id=session.guest_id,
+            username=identifier,
+            start=window_start,
+            end=window_end,
+        )
+        all_events = sorted([*events, *unbound], key=lambda e: e.occurred_at)
+        entries = build_timeline_entries(
+            session=session, login_attempts=attempts, events=all_events
+        )
+
+        accepts = [e for e in events if e.event_type == SessionEventType.AUTH_ACCEPT]
+        granted = (accepts[-1].granted or {}) if accepts else {}
+        authorization = {
+            "auth_method": session.auth_method,
+            "auth_method_text": describe_auth_method(session.auth_method),
+            "time_limit_minutes": session.session_timeout_minutes,
+            "idle_timeout_minutes": session.idle_timeout_minutes,
+            "data_limit_mb": session.data_limit_mb,
+            "speed_limit": granted.get("rate_limit"),
+            "voucher_id": str(session.voucher_id) if session.voucher_id else None,
+            "router_checked": bool(accepts),
+        }
+
+        def latest(attr: str) -> object:
+            for event in reversed(events):
+                value = getattr(event, attr)
+                if value:
+                    return value
+            return None
+
+        end = session.ended_at or now
+        accounting = {
+            "status": session.status,
+            "started_at": session.started_at,
+            "ended_at": session.ended_at,
+            "duration_seconds": int((end - session.started_at).total_seconds()),
+            "bytes_uploaded": session.bytes_uploaded,
+            "bytes_downloaded": session.bytes_downloaded,
+            "device_ip": session.ip_address or latest("framed_ip_address"),
+            "nas_ip_address": latest("nas_ip_address"),
+            "nas_identifier": latest("nas_identifier"),
+            "router_session_id": latest("acct_session_id"),
+            "venue_public_ip": latest("venue_public_ip"),
+            "end_reason_code": session.disconnect_reason,
+            "end_reason_text": describe_disconnect_reason(session.disconnect_reason),
+            "router_reported": any(
+                e.event_type
+                in (
+                    SessionEventType.ACCT_START,
+                    SessionEventType.ACCT_INTERIM,
+                    SessionEventType.ACCT_STOP,
+                )
+                for e in events
+            ),
+        }
+        notes: list[str] = []
+        if not events:
+            notes.append(
+                "The router has not reported anything about this connection. "
+                "Either it started before Wyfy began keeping this record, or "
+                "this router does not send RADIUS accounting (for example an "
+                "Omada controller using the external login page). The steps "
+                "shown come from Wyfy's own records."
+            )
+        if accounting["venue_public_ip"] is None:
+            notes.append(
+                "Venue public IP is not known for this connection: the router "
+                "did not report a public internet address at the time."
+            )
+        return GuestSessionTimeline(
+            session=session,
+            guest_identifier=identifier,
+            entries=entries,
+            authorization=authorization,
+            accounting=accounting,
+            notes=notes,
+        )
+
     async def list_sessions(
         self,
         *,
@@ -6240,6 +6382,19 @@ class GuestService:
                         "reason": decision.reason,
                     },
                 )
+            # Recorded like every other refused sign-in, so "blocked
+            # device" appears in the Login/Access Attempt Log and the
+            # session timeline. The operator's private ``reason`` note is
+            # not the stored code -- the exception name is.
+            await self._record_login_failure(
+                guest=guest,
+                identifier=identifier,
+                auth_method=auth_method,
+                organization_id=organization_id,
+                location_id=location_id,
+                reason=GuestAccessDeniedError.__name__,
+                ip_address=ip_address,
+            )
             raise GuestAccessDeniedError(decision.reason)
 
         # Whitelist-only, nothing matched. Before refusing, reconcile with
@@ -7306,6 +7461,27 @@ class QueueRateLimitLookupProtocol(Protocol):
     ) -> str | None: ...
 
 
+def _valid_ip(value: str | None) -> str | None:
+    """``value`` if it parses as an IP address, else ``None``. The hub sends
+    an empty string for an attribute the NAS did not include."""
+    if not value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+
+def _routable_ip(value: str | None) -> str | None:
+    """A router's WAN address, only when it is genuinely public -- a LAN or
+    CGNAT address is not the venue's public IP, and recording it as one
+    would put a wrong answer in a connection record."""
+    ip = _valid_ip(value)
+    if ip is None:
+        return None
+    return ip if ipaddress.ip_address(ip).is_global else None
+
+
 class RadiusService:
     """FreeRADIUS ``rlm_rest`` HTTP integration -- see module docstring for
     the full architectural write-up -- extended with real NAS lifecycle
@@ -8004,6 +8180,10 @@ class RadiusService:
         )
 
         session = await self._find_active_session_for_identifier(router, username)
+        # The AAA trail's reason for a reject, when the code below already
+        # knows it; otherwise ``_diagnose_reject`` works it out afterwards.
+        reject_reason: str | None = None
+        rejected_session: GuestSession | None = None
 
         if session is None and calling_station_id:
             try:
@@ -8092,6 +8272,8 @@ class RadiusService:
                 "radius_authorize_session_past_time_limit",
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
+            reject_reason = AuthRejectReason.TIME_LIMIT_REACHED.value
+            rejected_session = session
             session = None
         # A BLOCKLIST rule written after this session was admitted. The
         # device-side removal in ``guest_access.enforcement`` can fail (a
@@ -8106,14 +8288,38 @@ class RadiusService:
                 "radius_authorize_session_blocklisted",
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
+            reject_reason = AuthRejectReason.DEVICE_BLOCKED.value
+            rejected_session = session
             session = None
         if session is None:
+            if reject_reason is None:
+                reject_reason, diagnosed_guest_id = await self._diagnose_reject(
+                    router, username
+                )
+            else:
+                diagnosed_guest_id = None
             logger.info(
                 "radius_authorize_decision",
                 extra={
                     **decision_extra,
                     "event_authorized": False,
                     "event_session_id": None,
+                    "event_reject_reason": reject_reason,
+                },
+            )
+            await self._record_trail(
+                router=router,
+                nas_client=nas_client,
+                event_type=SessionEventType.AUTH_REJECT,
+                session=rejected_session,
+                guest_id=diagnosed_guest_id,
+                username=username,
+                calling_station_id=calling_station_id,
+                reason_code=reject_reason,
+                raw={
+                    "User-Name": username,
+                    "Calling-Station-Id": calling_station_id,
+                    "Auth-Type": "Reject",
                 },
             )
             return RadiusAuthorizeResult(
@@ -8130,7 +8336,7 @@ class RadiusService:
                 "event_session_id": str(session.id),
             },
         )
-        return RadiusAuthorizeResult(
+        accepted = RadiusAuthorizeResult(
             authorized=True,
             # REMAINING time, not the full allowance again.
             #
@@ -8161,6 +8367,131 @@ class RadiusService:
             data_limit_mb=session.data_limit_mb,
             rate_limit=await self._resolve_rate_limit_reply(session.id),
         )
+        await self._record_trail(
+            router=router,
+            nas_client=nas_client,
+            event_type=SessionEventType.AUTH_ACCEPT,
+            session=session,
+            username=username,
+            calling_station_id=calling_station_id,
+            granted={
+                "session_timeout_seconds": accepted.session_timeout_seconds,
+                "idle_timeout_seconds": accepted.idle_timeout_seconds,
+                "data_limit_mb": accepted.data_limit_mb,
+                "rate_limit": accepted.rate_limit,
+                "auth_method": session.auth_method,
+            },
+            raw={
+                "User-Name": username,
+                "Calling-Station-Id": calling_station_id,
+                "Auth-Type": "Accept",
+                "Session-Timeout": accepted.session_timeout_seconds,
+                "Idle-Timeout": accepted.idle_timeout_seconds,
+                "Mikrotik-Rate-Limit": accepted.rate_limit,
+            },
+        )
+        return accepted
+
+    async def _diagnose_reject(
+        self, router: Router, username: str
+    ) -> tuple[str, uuid.UUID | None]:
+        """Why there was no session to accept, in this platform's words.
+        Runs only on the reject path, and never raises: a diagnosis that
+        failed is reported as the least specific true answer."""
+        try:
+            guest = await self.repository.get_guest_by_identifier(
+                router.organization_id, normalize_identifier(username)
+            )
+            if guest is None:
+                return AuthRejectReason.NOT_SIGNED_IN.value, None
+            if guest.is_blocked:
+                return AuthRejectReason.GUEST_BLOCKED.value, guest.id
+            latest = await self.repository.get_latest_session_for_guest(guest.id)
+            if latest is None:
+                return AuthRejectReason.NOT_SIGNED_IN.value, guest.id
+            if latest.is_active() and latest.router_id != router.id:
+                return AuthRejectReason.SIGNED_IN_ELSEWHERE.value, guest.id
+            if not latest.is_active():
+                return AuthRejectReason.SESSION_ENDED.value, guest.id
+            return AuthRejectReason.NOT_SIGNED_IN.value, guest.id
+        except Exception:  # noqa: BLE001 -- see docstring
+            return AuthRejectReason.NOT_SIGNED_IN.value, None
+
+    async def _record_trail(
+        self,
+        *,
+        event_type: SessionEventType,
+        nas_client: RadiusNasClient,
+        router: Router | None = None,
+        session: GuestSession | None = None,
+        guest_id: uuid.UUID | None = None,
+        username: str | None = None,
+        calling_station_id: str | None = None,
+        reason_code: str | None = None,
+        granted: dict[str, object] | None = None,
+        raw: dict[str, object] | None = None,
+        acct_session_id: str | None = None,
+        framed_ip_address: str | None = None,
+        nas_ip_address: str | None = None,
+        session_time_seconds: int | None = None,
+        bytes_uploaded_total: int | None = None,
+        bytes_downloaded_total: int | None = None,
+    ) -> None:
+        """Append one event to the AAA trail (``guest_session_events``).
+
+        **Never changes a RADIUS answer.** Every failure is caught and
+        logged: a guest must not lose internet because the trail could not
+        be written. The write itself runs in a SAVEPOINT (see
+        ``GuestRepository.record_session_event``) so a failed insert cannot
+        poison the transaction the RADIUS reply depends on.
+
+        Interim updates coalesce to one row per session per clock hour;
+        everything else coalesces only exact repeats within a minute (NAS
+        retransmits, a portal that re-POSTs) -- see ``GuestSessionEvent``.
+        """
+        try:
+            if router is None:
+                router = await self.router_lookup.get_router(
+                    nas_client.router_id, include_deleted=True
+                )
+            now = datetime.now(UTC)
+            if event_type is SessionEventType.ACCT_INTERIM:
+                coalesce_since = now.replace(minute=0, second=0, microsecond=0)
+            else:
+                coalesce_since = now - timedelta(seconds=60)
+            await self.repository.record_session_event(
+                coalesce_since=coalesce_since,
+                organization_id=router.organization_id,
+                location_id=router.location_id,
+                router_id=router.id,
+                session_id=session.id if session is not None else None,
+                guest_id=session.guest_id if session is not None else guest_id,
+                event_type=event_type.value,
+                occurred_at=now,
+                username=(username or None) and username[:255],
+                calling_station_id=(calling_station_id or None)
+                and calling_station_id[:64],
+                nas_identifier=(nas_client.nas_identifier or "")[:64] or None,
+                acct_session_id=(acct_session_id or None) and acct_session_id[:64],
+                framed_ip_address=_valid_ip(framed_ip_address),
+                nas_ip_address=_valid_ip(nas_ip_address),
+                venue_public_ip=_routable_ip(router.public_ip_address),
+                session_time_seconds=session_time_seconds,
+                bytes_uploaded_total=bytes_uploaded_total,
+                bytes_downloaded_total=bytes_downloaded_total,
+                reason_code=(reason_code or None) and reason_code[:100],
+                granted=granted,
+                raw={k: v for k, v in (raw or {}).items() if v not in (None, "")},
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                "guest_session_event_record_failed",
+                extra={
+                    "event_type": event_type.value,
+                    "event_nas_identifier": getattr(nas_client, "nas_identifier", None),
+                    "error": str(exc),
+                },
+            )
 
     @staticmethod
     def _remaining_session_seconds(session: GuestSession) -> int | None:
@@ -8239,13 +8570,54 @@ class RadiusService:
         nas_client: RadiusNasClient,
         username: str,
         calling_station_id: str | None = None,
+        acct_session_id: str | None = None,
+        framed_ip_address: str | None = None,
+        nas_ip_address: str | None = None,
     ) -> GuestSession:
         """See module docstring for why this confirms an existing session
         rather than fabricating one."""
         session = await self._get_session_for_nas(
             nas_client, username, calling_station_id=calling_station_id
         )
+        session = await self._heal_session_ip(session, framed_ip_address)
+        await self._record_trail(
+            event_type=SessionEventType.ACCT_START,
+            nas_client=nas_client,
+            session=session,
+            username=username,
+            calling_station_id=calling_station_id,
+            acct_session_id=acct_session_id,
+            framed_ip_address=framed_ip_address,
+            nas_ip_address=nas_ip_address,
+            raw={
+                "Acct-Status-Type": "Start",
+                "User-Name": username,
+                "Calling-Station-Id": calling_station_id,
+                "Acct-Session-Id": acct_session_id,
+                "Framed-IP-Address": framed_ip_address,
+                "NAS-IP-Address": nas_ip_address,
+            },
+        )
         return session
+
+    async def _heal_session_ip(
+        self, session: GuestSession, framed_ip_address: str | None
+    ) -> GuestSession:
+        """Fill ``GuestSession.ip_address`` from the NAS's Framed-IP-Address
+        when the portal never captured one (the device's address is exactly
+        what a connection record must name). Never overwrites an address
+        already on record."""
+        ip = _valid_ip(framed_ip_address)
+        if ip is None or session.ip_address:
+            return session
+        try:
+            return await self.repository.update_session(session, {"ip_address": ip})
+        except Exception as exc:  # noqa: BLE001 -- a repair must not fail accounting
+            logger.warning(
+                "radius_accounting_ip_heal_failed",
+                extra={"event_session_id": str(session.id), "error": str(exc)},
+            )
+            return session
 
     async def accounting_interim_update(
         self,
@@ -8257,6 +8629,10 @@ class RadiusService:
         bytes_uploaded_total: int | None = None,
         bytes_downloaded_total: int | None = None,
         calling_station_id: str | None = None,
+        acct_session_id: str | None = None,
+        framed_ip_address: str | None = None,
+        nas_ip_address: str | None = None,
+        session_time_seconds: int | None = None,
     ) -> GuestSession:
         """Prefers the NAS's cumulative counters over caller-supplied
         deltas, converting them to a delta against what this session has
@@ -8297,11 +8673,37 @@ class RadiusService:
             bytes_downloaded_delta = max(
                 0, bytes_downloaded_total - session.bytes_downloaded
             )
-        return await self.guest_service.record_usage(
+        session = await self._heal_session_ip(session, framed_ip_address)
+        updated = await self.guest_service.record_usage(
             session_id=session.id,
             bytes_uploaded_delta=bytes_uploaded_delta,
             bytes_downloaded_delta=bytes_downloaded_delta,
         )
+        await self._record_trail(
+            event_type=SessionEventType.ACCT_INTERIM,
+            nas_client=nas_client,
+            session=updated,
+            username=username,
+            calling_station_id=calling_station_id,
+            acct_session_id=acct_session_id,
+            framed_ip_address=framed_ip_address,
+            nas_ip_address=nas_ip_address,
+            session_time_seconds=session_time_seconds,
+            bytes_uploaded_total=bytes_uploaded_total,
+            bytes_downloaded_total=bytes_downloaded_total,
+            raw={
+                "Acct-Status-Type": "Interim-Update",
+                "User-Name": username,
+                "Calling-Station-Id": calling_station_id,
+                "Acct-Session-Id": acct_session_id,
+                "Framed-IP-Address": framed_ip_address,
+                "NAS-IP-Address": nas_ip_address,
+                "Acct-Session-Time": session_time_seconds,
+                "Acct-Input-Octets (total)": bytes_uploaded_total,
+                "Acct-Output-Octets (total)": bytes_downloaded_total,
+            },
+        )
+        return updated
 
     async def accounting_stop(
         self,
@@ -8312,9 +8714,39 @@ class RadiusService:
         bytes_downloaded_total: int | None = None,
         disconnect_reason: str | None = None,
         calling_station_id: str | None = None,
+        acct_session_id: str | None = None,
+        framed_ip_address: str | None = None,
+        nas_ip_address: str | None = None,
+        session_time_seconds: int | None = None,
     ) -> GuestSession:
         session = await self._get_session_for_nas(
             nas_client, username, calling_station_id=calling_station_id
+        )
+        await self._record_trail(
+            event_type=SessionEventType.ACCT_STOP,
+            nas_client=nas_client,
+            session=session,
+            username=username,
+            calling_station_id=calling_station_id,
+            acct_session_id=acct_session_id,
+            framed_ip_address=framed_ip_address,
+            nas_ip_address=nas_ip_address,
+            session_time_seconds=session_time_seconds,
+            bytes_uploaded_total=bytes_uploaded_total,
+            bytes_downloaded_total=bytes_downloaded_total,
+            reason_code=disconnect_reason or None,
+            raw={
+                "Acct-Status-Type": "Stop",
+                "User-Name": username,
+                "Calling-Station-Id": calling_station_id,
+                "Acct-Session-Id": acct_session_id,
+                "Framed-IP-Address": framed_ip_address,
+                "NAS-IP-Address": nas_ip_address,
+                "Acct-Session-Time": session_time_seconds,
+                "Acct-Input-Octets (total)": bytes_uploaded_total,
+                "Acct-Output-Octets (total)": bytes_downloaded_total,
+                "Acct-Terminate-Cause": disconnect_reason,
+            },
         )
 
         if bytes_uploaded_total is not None or bytes_downloaded_total is not None:
@@ -8347,11 +8779,18 @@ class RadiusService:
         against ``nas_client.router_id``; see
         ``close_sessions_for_nas_restart``'s own docstring for why no live
         CoA-Disconnect is sent."""
-        return await close_sessions_for_nas_restart(
+        closed = await close_sessions_for_nas_restart(
             self.repository,
             router_id=nas_client.router_id,
             reason="radius_accounting_on",
         )
+        await self._record_trail(
+            event_type=SessionEventType.NAS_REBOOT,
+            nas_client=nas_client,
+            reason_code="radius_accounting_on",
+            raw={"Acct-Status-Type": "Accounting-On", "sessions_closed": len(closed)},
+        )
+        return closed
 
     async def accounting_off(
         self, *, nas_client: RadiusNasClient
@@ -8361,11 +8800,18 @@ class RadiusService:
         no Acct-Session-Id" shape as ``accounting_on`` above, and the
         identical close-not-disconnect handling; see
         ``close_sessions_for_nas_restart``'s own docstring."""
-        return await close_sessions_for_nas_restart(
+        closed = await close_sessions_for_nas_restart(
             self.repository,
             router_id=nas_client.router_id,
             reason="radius_accounting_off",
         )
+        await self._record_trail(
+            event_type=SessionEventType.NAS_REBOOT,
+            nas_client=nas_client,
+            reason_code="radius_accounting_off",
+            raw={"Acct-Status-Type": "Accounting-Off", "sessions_closed": len(closed)},
+        )
+        return closed
 
     async def _get_session_for_nas(
         self,

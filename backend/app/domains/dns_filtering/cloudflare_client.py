@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -327,3 +328,88 @@ class CloudflareGatewayClient:
 
     async def delete_rule(self, rule_id: str) -> None:
         await self._call("delete_rule", "DELETE", f"rules/{rule_id}", missing_ok=True)
+
+    # -- analytics (read-only) -----------------------------------------------
+
+    #: Gateway ``resolverDecision`` codes that mean "this lookup was
+    #: refused": blockedByQueryName, blockedByCategory, blockedAlwaysCategory,
+    #: blockedRule. [UNVERIFIED against a live account: the code numbering is
+    #: from Cloudflare's GraphQL schema docs for
+    #: ``gatewayResolverQueriesAdaptiveGroups``.]
+    BLOCKED_RESOLVER_DECISIONS: frozenset[int] = frozenset({2, 3, 6, 9})
+
+    _BLOCKED_QUERY = (
+        "query GatewayBlocked($accountTag: string!, $start: Time!, $end: Time!,"
+        " $locations: [string!]) { viewer { accounts(filter: {accountTag:"
+        " $accountTag}) { gatewayResolverQueriesAdaptiveGroups(limit: 2000,"
+        " filter: {datetime_geq: $start, datetime_lt: $end, locationId_in:"
+        " $locations}) { count dimensions { locationId resolverDecision } } } } }"
+    )
+
+    async def gateway_blocked_query_counts(
+        self, *, location_ids: list[str], start: datetime, end: datetime
+    ) -> dict[str, int]:
+        """Refused DNS lookups per Gateway location id in ``[start, end)``.
+
+        Read-only: one GraphQL ``query`` against Cloudflare's analytics API.
+        Needs the token to carry **Account Analytics: Read** -- a token with
+        only Zero Trust/Gateway edit rights is refused, and that refusal is
+        raised as ``CloudflareApiError`` for the caller to report honestly.
+        Cloudflare also bounds how far back this data goes by plan; a window
+        older than that comes back empty, not as an error.
+        """
+        if not location_ids:
+            return {}
+        payload = {
+            "query": self._BLOCKED_QUERY,
+            "variables": {
+                "accountTag": self._account_id,
+                "start": start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end": end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "locations": list(location_ids),
+            },
+        }
+        try:
+            response = await self._client.post("/graphql", json=payload)
+        except httpx.HTTPError as exc:
+            detail = redact(f"{type(exc).__name__}: {exc}", self._secret)
+            raise CloudflareApiError("gateway_analytics", detail) from None
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        errors = body.get("errors") if isinstance(body, dict) else None
+        if not response.is_success or errors:
+            if isinstance(errors, list) and errors:
+                message = "; ".join(
+                    str(e.get("message", e)) if isinstance(e, dict) else str(e)
+                    for e in errors
+                )
+            else:
+                message = response.text[:500] or f"HTTP {response.status_code}"
+            raise CloudflareApiError(
+                "gateway_analytics",
+                redact(message, self._secret),
+                status_code=response.status_code,
+            )
+        counts: dict[str, int] = {}
+        try:
+            accounts = body["data"]["viewer"]["accounts"]
+            groups = (
+                accounts[0]["gatewayResolverQueriesAdaptiveGroups"] if accounts else []
+            )
+        except (KeyError, IndexError, TypeError) as exc:
+            raise CloudflareApiError(
+                "gateway_analytics", f"unexpected response shape: {exc}"
+            ) from None
+        for group in groups or []:
+            dims = group.get("dimensions") or {}
+            try:
+                decision = int(dims.get("resolverDecision"))
+            except (TypeError, ValueError):
+                continue
+            if decision not in self.BLOCKED_RESOLVER_DECISIONS:
+                continue
+            location = str(dims.get("locationId") or "")
+            counts[location] = counts.get(location, 0) + int(group.get("count") or 0)
+        return counts
