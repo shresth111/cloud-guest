@@ -46,6 +46,7 @@ for the full write-up):
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import secrets
 import uuid
@@ -135,6 +136,25 @@ class ControllerContext:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_routable_public_ip(address: str) -> bool:
+    """True when ``address`` is suitable to store as ``routers.public_ip_address``.
+
+    Heartbeat reads the WAN interface's IPv4, which is often RFC1918 on a
+    router behind ISP CPE/CGNAT. Treating that as "public" breaks guest
+    session reports and any UI that labels it venue egress."""
+    try:
+        ip = ipaddress.ip_address(address.strip())
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+    )
 
 # Statuses from which an ordinary heartbeat/check-in-style liveness signal
 # may legally move a router toward ONLINE. PENDING_PROVISIONING (must first
@@ -875,7 +895,12 @@ class RouterService:
         # (see app.domains.isp.service._resolve_credentials-style
         # `router.management_ip_address or router.public_ip_address`).
         if public_ip_address is not None:
-            update_data["public_ip_address"] = public_ip_address
+            if _is_routable_public_ip(public_ip_address):
+                update_data["public_ip_address"] = public_ip_address
+            elif router.public_ip_address is not None and not _is_routable_public_ip(
+                str(router.public_ip_address)
+            ):
+                update_data["public_ip_address"] = None
 
         updated = await self.repository.update_router(router, update_data)
         logger.info(
