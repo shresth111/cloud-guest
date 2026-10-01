@@ -837,6 +837,10 @@ class AuditAction(StrEnum):
     # entries recording a real change to a production network.
     DHCP_OPTION_WRITTEN = "dhcp_option_written"
     DHCP_OPTION_REMOVED = "dhcp_option_removed"
+    # A device's DHCP lease made static on its router (the firewall device
+    # picker's "keep this device on the same address"). Audited only when
+    # the device actually changed.
+    DHCP_LEASE_MADE_STATIC = "dhcp_lease_made_static"
 
     # Port Forwarding Management domain events -- written through this
     # same table by

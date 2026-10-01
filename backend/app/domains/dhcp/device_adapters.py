@@ -61,12 +61,16 @@ from wyfy_device_gateway.contract import (
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
     MikroTikDeviceError,
+    MikroTikLeaseConflictError,
+    MikroTikLeaseNotFoundError,
 )
 from wyfy_device_gateway.registry import get_adapter
 
 from .exceptions import (
     DhcpDeviceConnectionError,
     DhcpDeviceOperationError,
+    DhcpLeaseConflictError,
+    DhcpLeaseNotFoundError,
     UnsupportedDhcpVendorError,
 )
 
@@ -206,6 +210,23 @@ class DhcpOptionRemovalReport:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DhcpLeaseReading:
+    """One ``/ip dhcp-server lease`` row, as the device reported it on one
+    read. ``dynamic`` false means a reservation: the device gets
+    ``address`` every time. Independently defined rather than re-exporting
+    the gateway's ``DhcpLease`` -- the same uncoupling as the other
+    readings in this module."""
+
+    mac_address: str
+    address: str | None
+    dynamic: bool
+    status: str | None
+    host_name: str | None
+    server: str | None
+    disabled: bool
+
+
 class BaseDhcpAdapter(Protocol):
     """What a vendor implements to plug real DHCP operations into this
     domain."""
@@ -323,6 +344,24 @@ class BaseDhcpAdapter(Protocol):
         and the DHCP server kept handing out addresses. Idempotent, and the
         server is removed before the pool it references.
         """
+        ...
+
+
+    async def read_dhcp_leases(
+        self, credentials: DhcpCredentials
+    ) -> list[DhcpLeaseReading]:
+        """Every DHCP lease on the router, dynamic and static. Raises on a
+        failed read rather than answering an empty list."""
+        ...
+
+    async def keep_dhcp_lease_address(
+        self, credentials: DhcpCredentials, *, mac_address: str, address: str
+    ) -> tuple[DhcpLeaseReading, bool]:
+        """Make the device's lease static on ``address``, read back.
+        Returns the lease and whether anything was written. Raises
+        :class:`DhcpLeaseNotFoundError`/:class:`DhcpLeaseConflictError`
+        without writing when the device has no lease, or its lease is on
+        another address."""
         ...
 
 
@@ -537,6 +576,58 @@ class MikroTikDhcpAdapter:
         )
 
 
+    @staticmethod
+    def _lease_reading(lease) -> DhcpLeaseReading:  # noqa: ANN001
+        return DhcpLeaseReading(
+            mac_address=lease.mac_address,
+            address=lease.address,
+            dynamic=lease.dynamic,
+            status=lease.status,
+            host_name=lease.host_name,
+            server=lease.server,
+            disabled=lease.disabled,
+        )
+
+    async def read_dhcp_leases(
+        self, credentials: DhcpCredentials
+    ) -> list[DhcpLeaseReading]:
+        creds = self._gateway_credentials(credentials)
+        try:
+            leases = await get_adapter(DeviceVendor.MIKROTIK).read_dhcp_leases(creds)
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError("read_dhcp_leases", exc.detail) from exc
+        return [self._lease_reading(lease) for lease in leases]
+
+    async def keep_dhcp_lease_address(
+        self, credentials: DhcpCredentials, *, mac_address: str, address: str
+    ) -> tuple[DhcpLeaseReading, bool]:
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(
+                DeviceVendor.MIKROTIK
+            ).keep_dhcp_lease_address(creds, mac_address=mac_address, address=address)
+        # Narrowest first: both lease refusals and the connection error
+        # subclass MikroTikDeviceError.
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikLeaseNotFoundError as exc:
+            raise DhcpLeaseNotFoundError(mac_address) from exc
+        except MikroTikLeaseConflictError as exc:
+            raise DhcpLeaseConflictError(
+                mac_address,
+                requested_address=address,
+                reason=exc.reason,
+                current_address=exc.current_address,
+            ) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError(
+                "keep_dhcp_lease_address", exc.detail
+            ) from exc
+        return self._lease_reading(result.lease), result.changed
+
+
 _DHCP_ADAPTERS: dict[str, BaseDhcpAdapter] = {"mikrotik": MikroTikDhcpAdapter()}
 
 
@@ -556,6 +647,7 @@ def list_supported_dhcp_vendors() -> list[str]:
 __all__ = [
     "BaseDhcpAdapter",
     "DhcpCredentials",
+    "DhcpLeaseReading",
     "DhcpOptionReading",
     "DhcpOptionRemovalReport",
     "DhcpOptionSnapshotReading",

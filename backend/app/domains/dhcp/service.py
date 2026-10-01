@@ -67,6 +67,7 @@ from .constants import (
 )
 from .device_adapters import (
     DhcpCredentials,
+    DhcpLeaseReading,
     DhcpOptionSnapshotReading,
     DhcpOptionSpec,
     RogueDhcpInterfaceReading,
@@ -92,7 +93,13 @@ from .exceptions import (
 )
 from .models import DhcpPool, RouterRogueDhcpStatus
 from .repository import DhcpRepositoryProtocol
-from .validators import ranges_overlap, validate_address_range, validate_ip_address
+from .validators import (
+    normalize_lease_mac,
+    ranges_overlap,
+    validate_address_range,
+    validate_ip_address,
+    validate_ipv4_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1006,6 +1013,88 @@ class DhcpService:
                 entity_type="router",
             )
         return convergence
+
+    # ------------------------------------------------------------------
+    # DHCP leases: what the router handed out, and keeping one device on
+    # its address (the firewall device picker's "keep this address")
+    # ------------------------------------------------------------------
+
+    async def list_router_leases(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[DhcpLeaseReading]:
+        """Every DHCP lease on this router, read live over 8728.
+
+        A device read on every call, deliberately: whether a lease is
+        static is the router's fact, and there is no column for it. The
+        connected-devices inventory is a 15-minute snapshot and does not
+        carry it. A failed read raises (502) rather than answering an empty
+        list -- "no leases" and "could not ask" are different answers.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature="Firewall")
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+        return await adapter.read_dhcp_leases(credentials)
+
+    async def keep_lease_address(
+        self,
+        router_id: uuid.UUID,
+        *,
+        mac_address: str,
+        ip_address: str,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> tuple[DhcpLeaseReading, bool]:
+        """Keep one device on ``ip_address``: its dynamic lease is made
+        static on the router and read back. Returns the lease and whether
+        the device changed.
+
+        Idempotent -- an existing reservation on that address is a clean
+        success with nothing written. Refused (409, nothing written) when
+        the device has no lease from this router or its lease is on another
+        address; see :class:`~.exceptions.DhcpLeaseConflictError`.
+
+        Writes no row: the reservation lives on the router, which is the
+        only place it does anything, and a column claiming it would be one
+        more copy to drift. Audited when the device changed.
+        """
+        mac = normalize_lease_mac(mac_address)
+        address = validate_ipv4_host("ip_address", ip_address)
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature="Firewall")
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+        lease, changed = await adapter.keep_dhcp_lease_address(
+            credentials, mac_address=mac, address=address
+        )
+        logger.info(
+            "dhcp_lease_address_kept",
+            extra={
+                "router_id": str(router_id),
+                "address": address,
+                "changed": changed,
+            },
+        )
+        if changed:
+            await self._audit(
+                actor_user_id,
+                AuditAction.DHCP_LEASE_MADE_STATIC,
+                entity_id=router_id,
+                organization_id=router.organization_id,
+                description=(
+                    f"DHCP lease for {mac} kept on {address} (made static) on "
+                    f"router {router_id}"
+                ),
+                entity_type="router",
+            )
+        return lease, changed
 
     def _resolve_device_credentials(self, router: Router) -> DhcpCredentials:
         """Raise rather than guess -- mirrors ``vlan``/``qos``."""

@@ -92,6 +92,8 @@ from .contract import (
     DeviceHealthResult,
     DeviceInterfaceCounters,
     DeviceVendor,
+    DhcpLease,
+    DhcpLeaseKeepResult,
     DhcpOptionBinding,
     DhcpOptionConfig,
     DhcpOptionInfo,
@@ -145,6 +147,7 @@ _DEFAULT_SSH_PORT = 22
 _DHCP_OPTION_PATH = ("ip", "dhcp-server", "option")
 _DHCP_OPTION_SET_PATH = ("ip", "dhcp-server", "option", "sets")
 _DHCP_NETWORK_PATH = ("ip", "dhcp-server", "network")
+_DHCP_LEASE_PATH = ("ip", "dhcp-server", "lease")
 # Every menu whose rows can hand a DHCP option to clients, paired with the
 # field that identifies a row to a human. ``/ip dhcp-server`` itself is
 # deliberately absent: it carries no ``dhcp-option``/``dhcp-option-set``
@@ -661,6 +664,34 @@ class MikroTikImmutableRouteError(MikroTikDeviceError):
     *static* default route per WAN precisely so this case does not arise --
     a router showing this one was not provisioned by it, or has had its
     routes replaced since)."""
+
+
+class MikroTikLeaseNotFoundError(MikroTikDeviceError):
+    """The router holds no ``/ip dhcp-server lease`` for this MAC at all.
+
+    The device has an address the router's DHCP server did not hand out
+    (configured on the device itself, or from another DHCP server), so
+    there is no lease to keep. Not a device failure -- a fact about the
+    device -- and nothing was written."""
+
+
+class MikroTikLeaseConflictError(MikroTikDeviceError):
+    """The lease is not on the address the caller wants kept.
+
+    ``reason`` is ``"moved"`` when the device's lease now carries a
+    different address than the one asked for (the caller's view is stale),
+    and ``"reserved_elsewhere"`` when a static lease for this MAC already
+    reserves a different address. ``current_address`` is that address.
+    Refused rather than resolved: keeping the wrong address would make the
+    firewall rule that asked for it miss the device for good. Nothing was
+    written."""
+
+    def __init__(
+        self, host: str, detail: str, *, reason: str, current_address: str | None
+    ) -> None:
+        super().__init__(host, detail)
+        self.reason = reason
+        self.current_address = current_address
 
 
 def normalize_mac_address(value: object) -> str | None:
@@ -1959,6 +1990,139 @@ class MikroTikAdapter:
             removed_ids=tuple(row.routeros_id for row in matched),
             still_active=still_active,
         )
+
+    # ------------------------------------------------------------------
+    # DHCP leases: read them, and keep one device on its address
+    # ------------------------------------------------------------------
+
+    async def read_dhcp_leases(self, creds: DeviceCredentials) -> list[DhcpLease]:
+        """Every ``/ip dhcp-server lease`` row, dynamic and static. Read-only.
+
+        Unlike :meth:`list_connected_devices` this does not go through
+        ``_safe_query``: a caller asking "is this device's lease static?"
+        must be able to tell "the router has no leases" from "we could not
+        read them", so a failed read raises :class:`MikroTikDeviceError`
+        rather than answering ``[]``.
+        """
+        return await asyncio.to_thread(self._read_dhcp_leases_sync, creds)
+
+    def _read_dhcp_leases_sync(self, creds: DeviceCredentials) -> list[DhcpLease]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(api.path(*_DHCP_LEASE_PATH))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dhcp_leases: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return [lease for row in rows if (lease := _lease_from_row(row)) is not None]
+
+    async def keep_dhcp_lease_address(
+        self, creds: DeviceCredentials, *, mac_address: str, address: str
+    ) -> DhcpLeaseKeepResult:
+        """Keep one device on ``address`` for good: turn its dynamic DHCP
+        lease static (``/ip dhcp-server lease make-static``), then read the
+        lease table again and require a static row for the MAC on that
+        address.
+
+        Why a firewall rule needs this: a rule matches an *address*, and a
+        dynamic lease is free to hand the device a different one when it
+        expires. A static lease is a reservation, so "Front-desk printer"
+        keeps meaning the same address the rule was written against.
+
+        * **Idempotent.** A static lease for the MAC on ``address`` already
+          there is a clean success with ``changed=False`` and no write.
+        * **Refuses rather than guesses** (nothing written in any of these):
+          no lease for the MAC at all (:class:`MikroTikLeaseNotFoundError`);
+          the lease now carries another address, or a static lease already
+          reserves another one (:class:`MikroTikLeaseConflictError`). Keeping
+          the wrong address would make the rule miss the device for good.
+        * **Read back.** ``make-static`` returning cleanly is not taken as
+          success; only the second read is. ``make-static`` is a command on
+          the menu, not a ``set``, so it is issued through the path's own
+          call and the generator is consumed -- an unconsumed librouteros
+          call sends nothing.
+
+        Never removes or edits any other lease.
+        """
+        return await asyncio.to_thread(
+            self._keep_dhcp_lease_address_sync, creds, mac_address, address
+        )
+
+    @staticmethod
+    def _leases_for_mac(menu, mac: str) -> list[DhcpLease]:  # noqa: ANN001
+        leases = [lease for row in menu if (lease := _lease_from_row(row)) is not None]
+        return [lease for lease in leases if lease.mac_address == mac]
+
+    def _keep_dhcp_lease_address_sync(
+        self, creds: DeviceCredentials, mac_address: str, address: str
+    ) -> DhcpLeaseKeepResult:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+        wanted = str(ipaddress.IPv4Address(str(address).strip()))
+        api = self._connect_api(creds)
+        try:
+            try:
+                leases = self._leases_for_mac(api.path(*_DHCP_LEASE_PATH), mac)
+                if not leases:
+                    raise MikroTikLeaseNotFoundError(
+                        creds.host, f"no DHCP lease for {mac}"
+                    )
+                reserved = [
+                    lease for lease in leases if not lease.dynamic and not lease.disabled
+                ]
+                if reserved:
+                    kept = next((x for x in reserved if x.address == wanted), None)
+                    if kept is None:
+                        raise MikroTikLeaseConflictError(
+                            creds.host,
+                            f"{mac} is already reserved at {reserved[0].address}, "
+                            f"not {wanted}",
+                            reason="reserved_elsewhere",
+                            current_address=reserved[0].address,
+                        )
+                    return DhcpLeaseKeepResult(lease=kept, changed=False)
+                target = next(
+                    (x for x in leases if x.dynamic and x.address == wanted), None
+                )
+                if target is None:
+                    current = next((x.address for x in leases if x.address), None)
+                    raise MikroTikLeaseConflictError(
+                        creds.host,
+                        f"{mac} is now leased {current}, not {wanted}",
+                        reason="moved",
+                        current_address=current,
+                    )
+                tuple(
+                    api.path(*_DHCP_LEASE_PATH)(
+                        "make-static", **{".id": target.routeros_id}
+                    )
+                )
+                after = self._leases_for_mac(api.path(*_DHCP_LEASE_PATH), mac)
+                kept = next(
+                    (
+                        x
+                        for x in after
+                        if not x.dynamic and not x.disabled and x.address == wanted
+                    ),
+                    None,
+                )
+                if kept is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"keep_dhcp_lease_address: make-static returned, but no "
+                        f"static lease for {mac} at {wanted} was read back",
+                    )
+                return DhcpLeaseKeepResult(lease=kept, changed=True)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"keep_dhcp_lease_address: {exc}"
+                ) from exc
+        finally:
+            api.close()
 
     # ------------------------------------------------------------------
     # durable per-device block (guest_access device rules)
@@ -7904,6 +8068,28 @@ def _row_mac(row: dict[str, object]) -> str | None:
 # runs -- which is the version gate described in that method's docstring.
 
 
+def _lease_from_row(row: Mapping[str, object]) -> DhcpLease | None:
+    """One ``/ip dhcp-server lease`` row -> :class:`DhcpLease`, or ``None``
+    for a row with no usable MAC or ``.id``. ``address`` prefers the
+    configured ``address`` (on a static lease that is the reservation) and
+    falls back to ``active-address``."""
+    mac = _row_mac(dict(row))
+    routeros_id = _safe_str(row.get(".id"))
+    if mac is None or routeros_id is None:
+        return None
+    return DhcpLease(
+        routeros_id=routeros_id,
+        mac_address=mac,
+        address=_safe_str(row.get("address")) or _safe_str(row.get("active-address")),
+        dynamic=_is_truthy(row.get("dynamic")),
+        status=_safe_str(row.get("status")),
+        host_name=_safe_str(row.get("host-name")),
+        server=_safe_str(row.get("server")),
+        comment=_safe_str(row.get("comment")),
+        disabled=_is_truthy(row.get("disabled")),
+    )
+
+
 def _merge_connected_devices(
     leases: list[dict[str, object]],
     arp_entries: list[dict[str, object]],
@@ -7979,5 +8165,7 @@ __all__ = [
     "MikroTikAdapter",
     "MikroTikDeviceError",
     "MikroTikConnectionError",
+    "MikroTikLeaseConflictError",
+    "MikroTikLeaseNotFoundError",
     "normalize_mac_address",
 ]

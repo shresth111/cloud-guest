@@ -63,6 +63,8 @@ class FakePath:
         here preserves that: a bare, unconsumed call mutates nothing in
         this fake either, exactly as on a device.
         """
+        if cmd == "make-static":
+            return self._make_static(kwargs.get(".id"))
         if cmd != "unset":
             return iter(self._rows)
 
@@ -96,6 +98,25 @@ class FakePath:
             yield  # pragma: no cover - generator marker
 
         return _apply()
+
+    def _make_static(self, target_id: Any):
+        """``/ip dhcp-server lease make-static .id=...`` -- turns a dynamic
+        lease into a static one in place. A generator, like the real call:
+        unconsumed, it changes nothing. A menu listed in
+        ``silently_ignore_commands`` accepts the command and changes nothing,
+        which is the shape a read-back exists to catch."""
+        from librouteros.exceptions import LibRouterosError
+
+        self._recorder.ops.append(("make-static", self._segments, target_id))
+        if ("make-static", self._segments) in self._recorder.silently_ignore_commands:
+            return
+            yield  # pragma: no cover - generator marker
+        row = next((r for r in self._rows if r.get(".id") == target_id), None)
+        if row is None:
+            raise LibRouterosError("no such item")
+        row["dynamic"] = False
+        return
+        yield  # pragma: no cover - generator marker
 
     def add(self, **fields: Any) -> str:
         new_id = self._recorder.mint_id(len(self._rows))
@@ -274,6 +295,9 @@ class FakeRouterOSApi:
         # Menus (as path tuples) whose ``update`` records the call and then
         # does nothing -- see FakePath.update.
         self.silently_ignore_updates: set[tuple[str, ...]] = set()
+        # (command, menu path) pairs a menu accepts and then ignores -- see
+        # FakePath._make_static.
+        self.silently_ignore_commands: set[tuple[str, tuple[str, ...]]] = set()
 
     def mint_id(self, row_count: int) -> str:
         """The ``.id`` a new row gets. ``*<n+1>`` by default, which every
