@@ -746,3 +746,138 @@ class TestReadBandStatus:
         patch_connect(_BrokenReadApi(menus={}))
         with pytest.raises(MikroTikDeviceError):
             await MikroTikAdapter().read_firewall_band_status(mikrotik_creds)
+
+
+# ---------------------------------------------------------------------------
+# Guest-network guardrails (read from the router itself)
+# ---------------------------------------------------------------------------
+
+
+def _venue_menus() -> dict:
+    return {
+        ("ip", "address"): [
+            {".id": "*A1", "address": "192.168.88.1/24", "interface": "bridge"},
+            {".id": "*A2", "address": "192.168.1.20/24", "interface": "ether1"},
+            {".id": "*A3", "address": "10.20.0.31/32", "interface": "wg-cloudguard"},
+        ],
+        ("ip", "hotspot"): [{".id": "*H", "name": "hotspot1", "interface": "bridge"}],
+        ("ip", "dhcp-server", "network"): [
+            {".id": "*N", "address": "192.168.88.0/24", "dns-server": "192.168.88.1"}
+        ],
+    }
+
+
+def _venue_api(**kwargs: Any) -> _Api:
+    menus = {_FILTER: _input_chain() + _lab_forward()}
+    menus.update(_venue_menus())
+    return _Api(menus=menus, **kwargs)
+
+
+class TestGuestGuardrails:
+    def test_networks_are_read_from_the_hotspot_interface(self) -> None:
+        from wyfy_device_gateway.mikrotik_firewall import read_router_networks
+
+        guests, own, dns = read_router_networks(_venue_api())
+        assert guests == ("192.168.88.0/24",)
+        assert "192.168.88.1/24" in own and "192.168.1.20/24" in own
+        assert dns == ("192.168.88.1",)
+
+    def test_without_a_hotspot_the_dhcp_server_interface_is_used(self) -> None:
+        from wyfy_device_gateway.mikrotik_firewall import read_router_networks
+
+        menus = _venue_menus()
+        menus[("ip", "hotspot")] = []
+        menus[("ip", "dhcp-server")] = [{".id": "*S", "interface": "bridge"}]
+        guests, _, _ = read_router_networks(_Api(menus=menus))
+        assert guests == ("192.168.88.0/24",)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param(
+                {"src_address": "192.168.88.0/24", "dst_address": None}, id="all"
+            ),
+            pytest.param(
+                {"src_address": "192.168.0.0/16", "dst_address": None},
+                id="supernet-all",
+            ),
+            pytest.param(
+                {
+                    "src_address": "192.168.88.0/24",
+                    "dst_address": None,
+                    "protocol": "tcp",
+                    "dst_port": 443,
+                },
+                id="https",
+            ),
+            pytest.param(
+                {
+                    "src_address": None,
+                    "dst_address": "0.0.0.0/0",
+                    "protocol": "tcp",
+                    "dst_port": 80,
+                },
+                id="anyone-http-slash-zero",
+            ),
+        ],
+    )
+    async def test_a_block_that_cuts_every_guest_off_is_refused(
+        self, patch_connect, mikrotik_creds, overrides
+    ) -> None:
+        api = _venue_api()
+        before = _rows(api)
+        with pytest.raises(MikroTikFirewallRefusedError) as exc:
+            await _sync(patch_connect, mikrotik_creds, api, [_rule(10, **overrides)])
+        assert exc.value.code == "ACCESS_RULES_WOULD_BREAK_GUEST_PATH"
+        assert _rows(api) == before
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param(
+                {"src_address": "192.168.88.50", "dst_address": None}, id="one-device"
+            ),
+            pytest.param(
+                {"src_address": "192.168.88.0/24", "dst_address": "192.168.0.0/16"},
+                id="private-networks",
+            ),
+            pytest.param(
+                {
+                    "src_address": "192.168.88.0/24",
+                    "dst_address": None,
+                    "protocol": "udp",
+                    "dst_port": 443,
+                },
+                id="quic-only",
+            ),
+        ],
+    )
+    async def test_narrow_blocks_still_apply(
+        self, patch_connect, mikrotik_creds, overrides
+    ) -> None:
+        api = _venue_api()
+        result = await _sync(
+            patch_connect, mikrotik_creds, api, [_rule(10, **overrides)]
+        )
+        assert result.added == 1
+
+    async def test_a_rule_aimed_at_the_router_itself_is_refused(
+        self, patch_connect, mikrotik_creds
+    ) -> None:
+        api = _venue_api()
+        with pytest.raises(MikroTikFirewallRefusedError) as exc:
+            await _sync(
+                patch_connect,
+                mikrotik_creds,
+                api,
+                [_rule(10, src_address=None, dst_address="192.168.88.1")],
+            )
+        assert exc.value.code == "ACCESS_RULES_TARGETS_ROUTER"
+
+    def test_band_status_carries_the_guest_networks(self) -> None:
+        from wyfy_device_gateway.mikrotik_firewall import read_band_status
+
+        status = read_band_status(_venue_api())
+        assert status.state == "ready"
+        assert status.guest_networks == ("192.168.88.0/24",)
+        assert status.guest_dns_servers == ("192.168.88.1",)

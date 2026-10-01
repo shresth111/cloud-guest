@@ -557,13 +557,17 @@ class TestBandStatusRoute:
         assert "firewall.read" in cells
         assert ScopeType.ROUTER in cells
 
-    def test_the_response_shape_is_state_reason_checked_at_only(self) -> None:
+    def test_the_response_shape_carries_no_routeros_internals(self) -> None:
+        """State, reason, when, and the venue's own guest networks and DNS --
+        never a RouterOS ``.id`` or a rule comment."""
         from app.domains.firewall.schemas import FirewallBandStatusResponse
 
         assert set(FirewallBandStatusResponse.model_fields) == {
             "state",
             "reason",
             "checked_at",
+            "guest_networks",
+            "guest_dns_servers",
         }
 
 

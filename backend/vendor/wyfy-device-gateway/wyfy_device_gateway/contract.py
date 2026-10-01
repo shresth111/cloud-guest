@@ -1867,10 +1867,19 @@ class FirewallBandStatus:
     the ``invalid`` shape (``BAND_PARTIAL``, ``BAND_DUPLICATED``,
     ``BAND_INVERTED``, ``BAND_SENTINEL_NOT_PASSTHROUGH``), ``BAND_NOT_PLACED``
     for ``missing``, and ``None`` for ``ready``. Deliberately no ``.id`` and
-    no comment text: a caller shows this to a venue."""
+    no comment text: a caller shows this to a venue.
+
+    ``guest_networks`` / ``guest_dns_servers`` come from the same read (see
+    :func:`wyfy_device_gateway.mikrotik_firewall.read_router_networks`): the
+    networks the hotspot (or, without one, the DHCP server) serves, and the
+    DNS servers DHCP hands those guests. They let a caller offer "keep guests
+    off your private networks" without the owner typing an address. Empty
+    when the router has neither."""
 
     state: str
     reason: str | None
+    guest_networks: tuple[str, ...] = ()
+    guest_dns_servers: tuple[str, ...] = ()
 
 
 __all__ = [
