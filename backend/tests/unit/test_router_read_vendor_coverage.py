@@ -170,6 +170,29 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "and a venue that silently stops reporting is exactly what this term "
         "exists to surface, so a false one costs the whole signal."
     ),
+    # -- security activity ---------------------------------------------------
+    "app/domains/security_activity/repository.py::"
+    "SecurityActivityRepository.list_collection_router_ids": (
+        "The hourly security-counter sweep's fan-out list. Each id is "
+        "dispatched to `collect_security_counters_for_router`, which opens a "
+        "RouterOS API session with the row's own stored credentials to read "
+        "`/ip/firewall/filter` and `/ip/firewall/nat`. A controller has no "
+        "RouterOS API and no such rows, so every tick would be a guaranteed "
+        "failed read; it is never loaded."
+    ),
+    "app/domains/security_activity/repository.py::"
+    "SecurityActivityRepository.get_collection_target": (
+        "The leaf task's own router lookup, narrowed the same way as the list "
+        "that dispatched it, so a router whose vendor changed between dispatch "
+        "and run is skipped rather than dialled."
+    ),
+    "app/domains/security_activity/repository.py::"
+    "SecurityActivityRepository.agent_managed_router_count": (
+        "The denominator of 'N of M routers reported' on the activity page. "
+        "Only agent-managed routers can ever report rule counters; counting a "
+        "controller would show a venue a router that can never report, as "
+        "though it were silent."
+    ),
     "app/domains/security/repository.py::"
     "SecurityRepository.rogue_dhcp_counts.base": (
         "`/ip dhcp-server alert` rows, the rogue-DHCP guard's stored state. A "

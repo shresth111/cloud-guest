@@ -918,6 +918,12 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "marketing-dispatch-due-campaigns",
         "marketing-reap-stuck-recipients",
         "marketing-prune-recipient-addresses",
+        # Security activity: one read-only 8728 session per router per hour,
+        # staggered, reading the hit counters on the platform's own
+        # protection rules. Its absence is a "Security activity" panel that
+        # stops at the last hour anyone ran it by hand. See
+        # app.domains.security_activity.tasks.
+        "security-counter-sweep",
         # Prepaid credits: nightly ledger-vs-wallet reconciliation (§13.2).
         "billing-reconcile-credit-wallets",
         "provisioning-engine-router-health-poll-sweep",

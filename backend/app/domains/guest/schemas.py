@@ -17,8 +17,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.common.masking import MaskedIdentifier, MaskedMac, MaskedName
 
@@ -437,6 +445,9 @@ class GuestLoginHistoryResponse(BaseModel):
     auth_method: str
     success: bool
     failure_reason: str | None
+    #: ``failure_reason`` in plain words (``app.domains.guest.aaa``) --
+    #: the stored value is a machine code such as ``OtpCodeMismatchError``.
+    failure_reason_text: str | None = None
     attempted_at: datetime
     ip_address: str | None
     created_at: datetime
@@ -1040,6 +1051,35 @@ class RadiusAccountingRequest(BaseModel):
     bytes_uploaded_total: int | None = Field(default=None, ge=0)
     bytes_downloaded_total: int | None = Field(default=None, ge=0)
     disconnect_reason: str | None = Field(default=None, max_length=255)
+    # The three fields below complete the accounting half of the AAA trail
+    # (``guest_session_events``). Optional, and absent from the hub's
+    # ``rest.conf`` until it is changed to send them (ops/freeradius/
+    # README.md, "AAA trail fields") -- the backend accepts packets with or
+    # without them, so deploy order between hub and backend does not matter.
+    # Strings in, because ``rlm_rest`` renders an attribute the NAS did not
+    # send as an empty string, and that must not fail validation.
+    framed_ip_address: str | None = Field(
+        default=None,
+        max_length=64,
+        description="RADIUS Framed-IP-Address: the device's address as the "
+        "NAS assigned it.",
+    )
+    nas_ip_address: str | None = Field(
+        default=None, max_length=64, description="RADIUS NAS-IP-Address."
+    )
+    session_time: int | None = Field(
+        default=None,
+        ge=0,
+        description="RADIUS Acct-Session-Time, seconds. An empty string "
+        "(attribute absent) is read as unknown.",
+    )
+
+    @field_validator("session_time", mode="before")
+    @classmethod
+    def _blank_session_time_is_unknown(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @model_validator(mode="after")
     def _require_username_for_session_scoped_status_types(
@@ -1153,3 +1193,70 @@ class GuestDashboardSeriesResponse(BaseModel):
 
 # Re-exported for router.py's status-filter query param.
 GuestSessionStatusQuery = GuestSessionStatus
+
+
+# ============================================================================
+# AAA timeline (GET /guest-sessions/{session_id}/timeline)
+# ============================================================================
+
+
+class GuestSessionTimelineEntry(BaseModel):
+    """One step of a session's story. ``title``/``detail`` are plain words
+    for a venue owner; ``raw`` carries the underlying RADIUS attribute
+    values for the details expander. ``raw`` never carries the guest's
+    phone/email -- that is ``GuestSessionTimelineResponse.guest_identifier``,
+    masked like everywhere else."""
+
+    at: datetime
+    first_seen_at: datetime | None = None
+    phase: Literal["authentication", "authorization", "accounting"]
+    kind: str
+    outcome: Literal["success", "failure", "info"]
+    title: str
+    detail: str | None = None
+    repeat_count: int = 1
+    raw: dict[str, object] = Field(default_factory=dict)
+
+
+class GuestSessionAuthorizationSummary(BaseModel):
+    auth_method: str
+    auth_method_text: str | None
+    time_limit_minutes: int | None
+    idle_timeout_minutes: int | None
+    data_limit_mb: int | None
+    speed_limit: str | None
+    voucher_id: str | None
+    #: Whether the router actually asked Wyfy (RADIUS Access-Request) for
+    #: this session. False for a venue that does not use RADIUS.
+    router_checked: bool
+
+
+class GuestSessionAccountingSummary(BaseModel):
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    duration_seconds: int
+    bytes_uploaded: int
+    bytes_downloaded: int
+    device_ip: str | None
+    device_mac: MaskedMac = None
+    nas_ip_address: str | None
+    nas_identifier: str | None
+    router_name: str | None = None
+    router_session_id: str | None
+    venue_public_ip: str | None
+    end_reason_code: str | None
+    end_reason_text: str | None
+    router_reported: bool
+
+
+class GuestSessionTimelineResponse(BaseModel):
+    session_id: str
+    guest_id: str | None
+    guest_identifier: MaskedIdentifier = None
+    location_id: str
+    router_id: str
+    authorization: GuestSessionAuthorizationSummary
+    accounting: GuestSessionAccountingSummary
+    entries: list[GuestSessionTimelineEntry]
+    notes: list[str] = Field(default_factory=list)

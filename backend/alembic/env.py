@@ -96,6 +96,9 @@ from app.domains.router_agent import models as router_agent_models  # noqa: F401
 from app.domains.router_provisioning import (
     models as router_provisioning_models,  # noqa: F401,E501
 )
+from app.domains.security_activity import (
+    models as security_activity_models,  # noqa: F401,E501
+)
 from app.domains.support_tickets import models as support_tickets_models  # noqa: F401
 from app.domains.system_settings import models as system_settings_models  # noqa: F401
 from app.domains.vlan import models as vlan_models  # noqa: F401

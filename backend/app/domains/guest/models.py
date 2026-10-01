@@ -127,10 +127,10 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.database.base import BaseModel
+from app.database.base import Base, BaseModel, UUIDMixin
 
 from .constants import (
     GuestSessionStatus,
@@ -913,10 +913,146 @@ class RadiusNasCodeCounter(BaseModel):
         )
 
 
+class GuestSessionEvent(UUIDMixin, Base):
+    """One RADIUS-side fact about a guest's connection: an Access-Request we
+    answered (accept or reject, and why), or an Accounting-Request the router
+    sent (start, interim, stop, NAS reboot).
+
+    ## Why this table exists
+
+    ``guest_sessions`` holds the *latest* state of a connection -- running
+    byte totals overwritten on every interim, one ``disconnect_reason`` --
+    and ``guest_login_history`` holds what happened on the captive portal.
+    Neither records what the router and the RADIUS hub said to each other:
+    a reject was a log line, an interim update overwrote the previous one,
+    and the NAS's own session id, the device's address as the NAS saw it and
+    the stop cause it reported were thrown away. This is that record, so a
+    venue can answer "what happened to this guest's login" from the
+    dashboard instead of from ``journalctl`` on the hub.
+
+    ## Retention: a CERT-In table
+
+    Same class as ``guest_sessions``/``guest_login_history``: connection
+    records, kept for at least 180 days. **Never add this table to the
+    retention prune list** (``/usr/local/bin/wyfy-retention.sh``) without
+    legal sign-off.
+
+    ## Bounded volume
+
+    A router sends an Interim-Update every ``Acct-Interim-Interval`` (300s),
+    so one row per packet would be ~100 rows for an 8-hour guest, for ever.
+    Interim updates are therefore *coalesced*: one row per session per clock
+    hour, its totals and ``occurred_at`` advanced in place and
+    ``repeat_count`` counting the packets it stands for. Repeated identical
+    rejects/accepts within a minute are coalesced the same way. Start, stop
+    and reboot are always their own rows.
+
+    Deliberately not a ``BaseModel``: an append-only log has no soft delete,
+    no editor and no optimistic version, and the five indexes those mixins
+    add were exactly the ones found unused (``idx_scan = 0``) and dropped on
+    the other log tables on 2026-09-22.
+    """
+
+    __tablename__ = "guest_session_events"
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # SET NULL, not CASCADE, on everything below: a record that a guest was
+    # online must outlive the router row, the session row and the guest row
+    # it describes.
+    router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("guest_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    guest_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("guests.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    #: First packet this row stands for; ``occurred_at`` is the latest.
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    repeat_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    calling_station_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    nas_identifier: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    acct_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Framed-IP-Address -- the device's address as the NAS assigned it.
+    framed_ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    nas_ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    #: The router's routable WAN address at the time of this event (shared
+    #: NAT egress). Snapshotted, because it changes.
+    venue_public_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    session_time_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bytes_uploaded_total: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    bytes_downloaded_total: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    #: Machine reason: a reject code, a stop's Acct-Terminate-Cause, or an
+    #: exception name. Plain words are derived at read time (``aaa.py``).
+    reason_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    #: What an Accept granted: remaining time, idle timeout, data cap, speed.
+    granted: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    #: The request as received, for the details expander.
+    raw: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_guest_session_events_session_id_occurred_at",
+            "session_id",
+            "occurred_at",
+        ),
+        Index(
+            "ix_guest_session_events_organization_id_occurred_at",
+            "organization_id",
+            "occurred_at",
+        ),
+        Index(
+            "ix_guest_session_events_guest_id_occurred_at",
+            "guest_id",
+            "occurred_at",
+        ),
+        Index(
+            "ix_guest_session_events_router_id_occurred_at",
+            "router_id",
+            "occurred_at",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<GuestSessionEvent(id={self.id}, type={self.event_type}, "
+            f"session_id={self.session_id})>"
+        )
+
+
 __all__ = [
     "Guest",
     "GuestDevice",
     "GuestSession",
+    "GuestSessionEvent",
     "GuestLoginHistory",
     "GuestConsent",
     "RadiusNasClient",

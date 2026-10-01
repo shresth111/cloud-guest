@@ -315,6 +315,17 @@ EXEMPT: dict[str, str] = {
     "router_provisioning": (
         "As `provisioning_engine`: router-named routes and system-run tasks."
     ),
+    "security_activity": (
+        "SecurityCounterSample rows are never reached by their own id: the "
+        "domain's only HTTP surface is `GET /security/activity`, a listing. "
+        "That route applies the confinement itself -- "
+        "`confine_location_filter(CallerLocationScope)` turns 'no venue named' "
+        "into the caller's own sites, and a named venue outside them is a 403 "
+        "-- plus `RequireOrganization`, and the repository filters every query "
+        "by organization and that location set in SQL. A service-layer getter "
+        "would have nothing to guard. Rows are written only by the Celery "
+        "collector, which has no caller."
+    ),
     "analytics": (
         "AnalyticsSnapshot is a precomputed aggregate, and every analytics read "
         "route already carries an explicit `scope=ScopeType.ORGANIZATION` plus "

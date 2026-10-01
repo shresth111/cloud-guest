@@ -379,3 +379,49 @@ echo 'User-Name = guest@example.com
 Acct-Status-Type = Start
 Acct-Session-Id = "test-1"' | radclient -x 127.0.0.1:1813 acct <real-nas-secret>
 ```
+
+## AAA trail fields -- proposed hub change (NOT applied, 2026-10-01)
+
+The backend now records every Authorize answer and every Accounting-Request
+in `guest_session_events` (the AAA trail behind the dashboard's per-session
+timeline). Everything it needs **already reaches the backend** with the
+current hub config -- User-Name, Calling-Station-Id, Acct-Session-Id,
+status type, octet totals, Acct-Terminate-Cause, and the NAS identity from the
+matched `client{}` stanza. Three attributes do not, because `rest.conf`'s
+accounting `data` template does not send them:
+
+| attribute | why it matters | without it |
+|---|---|---|
+| `Framed-IP-Address` | the device's address as the router assigned it -- the CERT-In "who had IP X" fact | the portal-captured `ip_address` is used; a session whose portal never saw the IP has none |
+| `NAS-IP-Address` | which router interface reported | NAS identifier is still recorded |
+| `Acct-Session-Time` | the router's own connected-time | duration is computed from start/end timestamps |
+
+**The change** -- one line, in `mods-available/rest`'s `accounting {}` block
+only. Append three keys to the end of `data` (inside the closing `}`):
+
+```
+, \"framed_ip_address\": \"%{Framed-IP-Address}\", \"nas_ip_address\": \"%{NAS-IP-Address}\", \"session_time\": \"%{Acct-Session-Time}\"
+```
+
+Why it is safe:
+
+* All three are **quoted strings**, so an attribute the NAS did not send
+  renders as `""` -- valid JSON, no `unlang` guard needed (unlike the octet
+  counters, which are bare numbers). The backend treats `""` as unknown.
+* Plain attribute references, no nested `%{...}` -- README bug #2 does not
+  apply.
+* **Deploy order does not matter.** `RadiusAccountingRequest` ignores
+  unknown keys (pydantic default `extra="ignore"`), so a hub that sends them
+  before the backend understands them is a no-op, and a backend that
+  understands them before the hub sends them simply sees `None`.
+* **No restart just for this.** It is optional -- the trail works without
+  it -- so ride the next planned FreeRADIUS restart (`radiusd -XC` first).
+  [UNVERIFIED] whether a HUP (`systemctl reload freeradius`) re-reads
+  `rlm_rest`'s `data` template on 3.2.1; check it on the `/opt/frtest`
+  loopback rig before relying on a reload instead.
+
+Not needed for the trail, recorded for completeness: a reject FreeRADIUS
+issues *itself* (unknown client, bad shared secret) never reaches the backend
+and is visible only in `journalctl -u freeradius`. Making those visible would
+need a `linelog` in `Post-Auth-Type REJECT` shipped somewhere -- out of scope;
+the backend already records every reject *it* decides, with the reason.
