@@ -73,8 +73,11 @@ from app.domains.router.service import RouterService
 
 from .constants import (
     CONTROLLER_BLOCK_RELEASE_MAX_PER_RUN,
+    DEVICE_BLOCK_RELEASE_MAX_PER_RUN,
     TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP,
+    TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP,
 )
+from .device_blocking import RouterDeviceBlocker
 from .enforcement import BlocklistEnforcer
 from .repository import GuestAccessRepository
 
@@ -189,4 +192,64 @@ def run_controller_block_release_sweep() -> dict[str, int]:
         "failed": summary.failed,
     }
     logger.info("guest_access_controller_block_release_sweep_completed", extra=result)
+    return result
+
+
+# ============================================================================
+# Router-side device blocks
+# ============================================================================
+
+
+async def _run_device_block_release_async() -> ControllerBlockReleaseSummary:
+    """Remove the ``type=blocked`` ip-binding from each router still holding
+    one for a device rule that has expired, been deactivated or been deleted.
+
+    The RouterOS twin of the controller sweep above, with the same failure
+    isolation: each row is attempted on its own, a failure is written on the
+    row and counted, and the row stays open for the next tick. The removal is
+    by the binding's own comment and is idempotent, so a retry of a removal
+    that did land costs one read."""
+    async with SessionLocal() as session:
+        try:
+            repository = GuestAccessRepository(session)
+            blocker = RouterDeviceBlocker(router_lookup=_build_router_service(session))
+            now = datetime.now(UTC)
+            open_blocks = await repository.list_open_router_blocks_for_expired_rules(
+                now=now, limit=DEVICE_BLOCK_RELEASE_MAX_PER_RUN
+            )
+            released = 0
+            failed = 0
+            for block, outcome in await blocker.release(open_blocks):
+                await repository.update_router_block(
+                    block,  # type: ignore[arg-type]
+                    {
+                        "cleared_at": now if outcome.released else None,
+                        "release_error": (
+                            None if outcome.released else outcome.error_message
+                        ),
+                    },
+                )
+                if outcome.released:
+                    released += 1
+                else:
+                    failed += 1
+            await session.commit()
+            return ControllerBlockReleaseSummary(
+                considered=len(open_blocks), released=released, failed=failed
+            )
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP)
+def run_device_block_release_sweep() -> dict[str, int]:
+    """Beat-scheduled: take expired/unblocked device blocks off the routers."""
+    summary = run_celery_task(_run_device_block_release_async())
+    result = {
+        "considered": summary.considered,
+        "released": summary.released,
+        "failed": summary.failed,
+    }
+    logger.info("guest_access_device_block_release_sweep_completed", extra=result)
     return result

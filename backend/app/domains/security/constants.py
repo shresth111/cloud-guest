@@ -231,18 +231,22 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="device_isolation",
         label="Device isolation and blocking",
-        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        availability=SecurityAvailability.AVAILABLE,
         enforcement=(
-            "Planned: /ip hotspot ip-binding type=blocked for known hardware; "
-            "address-list drop for an address"
+            "/ip hotspot ip-binding type=blocked per blocked MAC, plus the "
+            "device's /ip hotspot active and host entries removed, written "
+            "over 8728 to every MikroTik router in the rule's scope and read "
+            "back; removed by its own comment on unblock or expiry"
         ),
         detail=(
-            "Blocking a guest today ends their live session and refuses the "
-            "next sign-in; nothing writes a durable per-device block "
-            "(ip-binding) to a router yet. When built it would be durable "
-            "for enrolled hardware; for anonymous guests, MAC randomisation "
-            "means a block is per-identity, and an IP-keyed block lapses "
-            "when the DHCP lease changes."
+            "Blocking a device by its hardware (MAC) address cuts it off the "
+            "router now and on every reconnect, including a device that "
+            "never signs in. It is reliable for hardware the venue knows; an "
+            "anonymous guest can switch on a private (randomised) Wi-Fi "
+            "address and come back as a new device, so blocking a person is "
+            "the sign-in block, not this. Isolating devices from each other "
+            "on the same network is not built. Venues managed through an "
+            "Omada controller keep the controller's own client block."
         ),
     ),
     SecurityFeature(
@@ -255,13 +259,22 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="connection_flood_protection",
         label="Connection and brute-force limits",
-        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
-        enforcement="Planned: /ip firewall filter connection-limit and dst-limit",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "/ip firewall filter chain=forward protocol=tcp connection-state=new "
+            "connection-limit=<N>,32 action=drop, one row per guest network at "
+            "the top of the platform's sentinel band, switched per router over "
+            "8728 (Relaxed 300, Normal 150, Strict 80)"
+        ),
         detail=(
-            "No code writes a connection-limit rule to a router yet. When "
-            "built it is threshold-based, so it reduces rather than "
-            "eliminates the exposure, and it can drop legitimate bursts "
-            "under a tight limit."
+            "Caps how many connections one guest device can hold; its next "
+            "new connection is dropped. It slows floods and scripted "
+            "password-guessing from a guest device against anything past the "
+            "router, and reduces rather than eliminates the exposure. It does "
+            "not cover traffic to the router itself, and no per-second "
+            "connection rate limit is written. A strict limit can break busy "
+            "apps such as cloud sync, video calls and downloads. The router "
+            "must have its firewall band placed first."
         ),
     ),
     SecurityFeature(

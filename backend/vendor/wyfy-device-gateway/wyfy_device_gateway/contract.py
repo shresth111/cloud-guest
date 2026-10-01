@@ -779,6 +779,89 @@ class HotspotDisconnectResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HotspotDeviceBlockResult:
+    """What a router holds after being asked to block one device by MAC.
+
+    A device block is two things on a RouterOS hotspot, and this reports
+    both from a read taken *after* the writes:
+
+    * the durable half -- one ``/ip hotspot ip-binding type=blocked`` row
+      carrying this platform's marker comment, which makes RouterOS drop the
+      device's traffic and refuse it the login page on every reconnect;
+    * the immediate half -- the device's live ``/ip hotspot active`` row
+      (and its ``/ip hotspot host`` entry) removed, so a device already
+      online is cut off now rather than at its next login.
+
+    ``binding_id`` is ``None`` only when ``hotspot_servers == 0``: a router
+    running no hotspot never consults ip-bindings, so nothing is written
+    there and the caller must not report a block.
+
+    ``first_in_order`` says whether our row sits above every other binding
+    on the router -- ahead of a bypass someone else wrote for the same MAC.
+    It is read back, never assumed from the ``place-before`` that was sent.
+
+    ``other_bindings`` lists rows for the same MAC that this platform does
+    not own and therefore left alone (a hand-made bypass, a trusted-device
+    bypass), as ``"<type>:<comment>"``. They are reported because a reader
+    deserves to know the MAC is mentioned twice; they are never removed.
+    """
+
+    hotspot_servers: int
+    binding_id: str | None
+    created: bool
+    first_in_order: bool
+    removed_bypass_ids: tuple[str, ...]
+    other_bindings: tuple[str, ...]
+    sessions_removed: int
+    hosts_removed: int
+    still_active: int
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotDeviceUnblockResult:
+    """What a router holds after being asked to drop this platform's block
+    for one device.
+
+    ``remaining`` is a second read: rows that still carry the marker for
+    this MAC after the removals. Zero is the only value a caller may report
+    as "unblocked"."""
+
+    removed_ids: tuple[str, ...]
+    remaining: int
+
+
+@dataclass(frozen=True, slots=True)
+class FloodLimitStatus:
+    """What a read of a router's connection-flood limit found.
+
+    ``enabled`` is "at least one of our flood rows is on the forward chain";
+    ``limit`` is the per-guest connection cap they carry (``None`` when off,
+    or when two rows disagree). ``consistent`` is True only when every guest
+    network has exactly one enabled row, inside the sentinel band, ahead of
+    every customer rule, and all carry the same limit -- the shape a write
+    produces. ``band_state`` is the same ``ready``/``missing``/``invalid``
+    :class:`FirewallBandStatus` reports."""
+
+    enabled: bool
+    limit: int | None
+    consistent: bool
+    rows: int
+    band_state: str
+    guest_networks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class FloodLimitResult:
+    """What switching the flood limit on, changing it or turning it off did,
+    counted from the writes issued and confirmed by a re-read."""
+
+    added: int
+    removed: int
+    limit: int | None
+    guest_networks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ContentFilterRuleConfig:
     """One content-filtering rule to realize on the device -- either a
     domain to DNS-sinkhole or an IP/CIDR to address-list-and-drop. See
@@ -1914,6 +1997,10 @@ __all__ = [
     "HotspotActiveSession",
     "HotspotSessionControl",
     "HotspotDisconnectResult",
+    "HotspotDeviceBlockResult",
+    "HotspotDeviceUnblockResult",
+    "FloodLimitStatus",
+    "FloodLimitResult",
     "HotspotCertificatePush",
     "HotspotCertificatePushResult",
     "ProvisionResult",

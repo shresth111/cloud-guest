@@ -117,6 +117,11 @@ from .constants import (
     BlockEnforcementStatus,
     GuestRuleImportRejectionCode,
 )
+from .device_blocking import (
+    RouterBlockRecord,
+    RouterDeviceBlockOutcome,
+    RouterDeviceReleaseOutcome,
+)
 from .enforcement import (
     BlockEnforcementReport,
     ControllerBlockRecord,
@@ -146,7 +151,12 @@ from .exceptions import (
     RuleTypeNotImportableError,
     TemporaryRuleRequiresExpiryError,
 )
-from .models import DeviceAccessRule, GuestAccessControllerBlock, GuestAccessRule
+from .models import (
+    DeviceAccessRouterBlock,
+    DeviceAccessRule,
+    GuestAccessControllerBlock,
+    GuestAccessRule,
+)
 from .repository import GuestAccessRepositoryProtocol
 from .validators import (
     canonicalize_rule_identifier,
@@ -595,6 +605,26 @@ class BlockEnforcerProtocol(Protocol):
         ...
 
 
+class DeviceBlockerProtocol(Protocol):
+    """What this service needs to make a ``BLOCKLIST`` *device* rule true on
+    the venue's MikroTik routers -- satisfied by
+    ``device_blocking.RouterDeviceBlocker``. Neither method raises for a
+    device failure; each router's answer comes back."""
+
+    async def block(
+        self,
+        *,
+        rule_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        mac_address: str,
+    ) -> list[RouterDeviceBlockOutcome]: ...
+
+    async def release(
+        self, records: Sequence[RouterBlockRecord]
+    ) -> list[tuple[RouterBlockRecord, RouterDeviceReleaseOutcome]]: ...
+
+
 class GuestAccessService:
     """CRUD over both rule tables, plus ``check_access`` (the read path
     ``GuestService``'s optional hook, and this module's own
@@ -610,8 +640,16 @@ class GuestAccessService:
         location_lookup: LocationLookupProtocol | None,
         audit_writer: AuditLogWriter | None = None,
         caller_location_scope: LocationScope = None,
+        device_blocker: DeviceBlockerProtocol | None = None,
     ) -> None:
         self.repository = repository
+        # Writes a ``BLOCKLIST`` device rule to the venue's MikroTik routers
+        # (``device_blocking``). ``None`` keeps a device rule what it was
+        # before -- a sign-in refusal only -- which is right for the
+        # read-only constructions and the Celery sweeps that build this
+        # service; ``dependencies.get_guest_access_service`` always wires
+        # it, and ``test_guest_access_device_block`` pins that it does.
+        self.device_blocker = device_blocker
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
         # Keyword-only and **without a default**, for exactly the reason
@@ -1623,7 +1661,100 @@ class GuestAccessService:
             organization_id=organization_id,
             location_id=location_id,
         )
+        if rule_type is not AccessRuleType.BLOCKLIST or self.device_blocker is None:
+            return rule
+        # Committed before any router is touched, for the reason
+        # ``create_guest_rule`` gives: refusing the next sign-in is the half
+        # that always works, and it must not be rolled back because a router
+        # was unreachable. Each router's answer is recorded on the rule
+        # (``router_blocks``) and returned with it; a router failure never
+        # turns this create into a 5xx.
+        await self.repository.commit()
+        await self._enforce_device_block(rule)
+        await self.repository.commit()
         return rule
+
+    async def enforce_device_rule(
+        self,
+        *,
+        rule_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> DeviceAccessRule:
+        """Re-runs the router half of a ``BLOCKLIST`` device rule: the retry
+        for a router that was unreachable, and the way to reach a router
+        added to the venue after the block. Idempotent on every router."""
+        rule = await self.get_device_rule(
+            rule_id, requesting_organization_id=requesting_organization_id
+        )
+        if (
+            AccessRuleType(rule.rule_type) is AccessRuleType.BLOCKLIST
+            and rule.is_active
+            and self.device_blocker is not None
+        ):
+            await self._enforce_device_block(rule)
+            await self.repository.commit()
+        return rule
+
+    async def _enforce_device_block(self, rule: DeviceAccessRule) -> None:
+        assert self.device_blocker is not None  # noqa: S101 -- guarded by callers
+        outcomes = await self.device_blocker.block(
+            rule_id=rule.id,
+            organization_id=rule.organization_id,
+            location_id=rule.location_id,
+            mac_address=rule.mac_address,
+        )
+        now = datetime.now(UTC)
+        for outcome in outcomes:
+            await self.repository.record_router_block(
+                rule,
+                router_id=outcome.router_id,
+                organization_id=rule.organization_id,
+                location_id=outcome.location_id,
+                mac_address=rule.mac_address,
+                status=outcome.status,
+                error_message=outcome.error_message,
+                sessions_ended=outcome.sessions_ended,
+                blocked_at=now if outcome.blocked else None,
+            )
+
+    async def _release_router_blocks(
+        self, rule: DeviceAccessRule
+    ) -> list[DeviceAccessRouterBlock]:
+        """Take this rule's bindings off every router still holding one,
+        **before** the rule stops applying -- the rows are found by
+        ``rule_id``, exactly as ``_release_controller_blocks`` explains. A
+        release that did not land leaves the row open, with the reason, for
+        the expiry sweep to retry; it never fails the unblock."""
+        if self.device_blocker is None:
+            return []
+        open_blocks = await self.repository.list_open_router_blocks(rule_id=rule.id)
+        if not open_blocks:
+            return []
+        now = datetime.now(UTC)
+        released: list[DeviceAccessRouterBlock] = []
+        for record, outcome in await self.device_blocker.release(open_blocks):
+            block = cast("DeviceAccessRouterBlock", record)
+            await self.repository.update_router_block(
+                block,
+                {
+                    "cleared_at": now if outcome.released else None,
+                    "release_error": (
+                        None if outcome.released else outcome.error_message
+                    ),
+                },
+            )
+            if outcome.released:
+                released.append(block)
+        logger.info(
+            "device_access_rule_router_blocks_released",
+            extra={
+                "event_rule_id": str(rule.id),
+                "event_blocks_open": len(open_blocks),
+                "event_blocks_released": len(released),
+            },
+        )
+        return released
 
     async def get_device_rule(
         self,
@@ -1680,6 +1811,8 @@ class GuestAccessService:
         rule = await self.get_device_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        # Before the rule stops applying -- see ``_release_router_blocks``.
+        await self._release_router_blocks(rule)
         updated = await self.repository.update_device_rule(
             rule, {"is_active": False, "updated_by": actor_user_id}
         )
@@ -1697,6 +1830,7 @@ class GuestAccessService:
         rule = await self.get_device_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        await self._release_router_blocks(rule)
         await self.repository.delete_device_rule(rule)
         event = AccessRuleDeleted(rule_id=rule.id)
         logger.info("device_access_rule_deleted", extra=_event_extra(event))
@@ -1838,6 +1972,7 @@ __all__ = [
     "RejectedGuestRuleImportRow",
     "GuestRuleImportResult",
     "BlockEnforcerProtocol",
+    "DeviceBlockerProtocol",
     "AccessDecisionResolver",
     "AccessRuleListResult",
     "DeviceRuleListResult",

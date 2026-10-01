@@ -273,6 +273,21 @@ class RouterService:
         await self._enforce_organization_scope(router, requesting_organization_id)
         return router
 
+    async def list_routers_in_scope(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+    ) -> list[Router]:
+        """The routers an access rule scoped to (``organization_id``,
+        ``location_id``) applies at -- every router of the organization when
+        ``location_id`` is ``None``. Not scope-checked here: the caller is a
+        service that has already established the rule belongs to this
+        organization (``guest_access.device_blocking``). Read-only."""
+        return await self.repository.list_routers_in_scope(
+            organization_id=organization_id, location_id=location_id
+        )
+
     async def router_names_for_ids(
         self, router_ids: Sequence[uuid.UUID]
     ) -> dict[uuid.UUID, str]:

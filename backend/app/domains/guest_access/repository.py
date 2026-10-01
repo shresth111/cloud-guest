@@ -29,6 +29,7 @@ from app.database.utils.pagination import PaginationMeta
 
 from .constants import BlockEnforcementStatus
 from .models import (
+    DeviceAccessRouterBlock,
     DeviceAccessRule,
     GuestAccessControllerBlock,
     GuestAccessRule,
@@ -196,6 +197,39 @@ class GuestAccessRepositoryProtocol(Protocol):
         """
         ...
 
+    # -- router-side device blocks ---------------------------------------------
+    async def record_router_block(
+        self,
+        rule: DeviceAccessRule,
+        *,
+        router_id: uuid.UUID,
+        **fields: object,
+    ) -> DeviceAccessRouterBlock:
+        """One row per (device rule, router), created or updated in place --
+        a retry supersedes the previous answer and re-opens the row."""
+        ...
+
+    async def update_router_block(
+        self, block: DeviceAccessRouterBlock, data: dict[str, object]
+    ) -> DeviceAccessRouterBlock: ...
+
+    async def list_open_router_blocks(
+        self, *, rule_id: uuid.UUID
+    ) -> list[DeviceAccessRouterBlock]:
+        """Rows that may still have a binding on a router: ``cleared_at`` is
+        NULL and something was attempted there (``status`` is not
+        ``not_applicable``)."""
+        ...
+
+    async def list_open_router_blocks_for_expired_rules(
+        self, *, now: datetime, limit: int
+    ) -> list[DeviceAccessRouterBlock]:
+        """Open rows whose rule has stopped applying -- expired, deactivated
+        or soft-deleted. The device-rule twin of
+        ``list_open_controller_blocks_for_expired_rules``: expiry is lazy, so
+        without this a one-hour block would stay on the router for good."""
+        ...
+
     # -- transaction -----------------------------------------------------------
     async def commit(self) -> None:
         """Commits the current transaction.
@@ -221,6 +255,7 @@ class GuestAccessRepository:
         self.guest_rules = GenericRepository(GuestAccessRule, session)
         self.device_rules = GenericRepository(DeviceAccessRule, session)
         self.controller_blocks = GenericRepository(GuestAccessControllerBlock, session)
+        self.router_blocks = GenericRepository(DeviceAccessRouterBlock, session)
 
     # -- guest rules -----------------------------------------------------------
 
@@ -577,6 +612,82 @@ class GuestAccessRepository:
                 DeviceAccessRule.expires_at.is_(None),
                 DeviceAccessRule.expires_at > now,
             ),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    # -- router-side device blocks ---------------------------------------------
+
+    async def record_router_block(
+        self,
+        rule: DeviceAccessRule,
+        *,
+        router_id: uuid.UUID,
+        **fields: object,
+    ) -> DeviceAccessRouterBlock:
+        existing = await self.session.execute(
+            select(DeviceAccessRouterBlock).where(
+                DeviceAccessRouterBlock.rule_id == rule.id,
+                DeviceAccessRouterBlock.router_id == router_id,
+                DeviceAccessRouterBlock.is_deleted.is_(False),
+            )
+        )
+        current = existing.scalars().first()
+        if current is not None:
+            return await self.router_blocks.update(
+                current, {**fields, "cleared_at": None, "release_error": None}
+            )
+        block = await self.router_blocks.create(
+            {**fields, "rule_id": rule.id, "router_id": router_id}
+        )
+        # Same reason as ``record_controller_block``: the create response
+        # serializes this rule object, so the new row must be on it now.
+        rule.router_blocks.append(block)
+        return block
+
+    async def update_router_block(
+        self, block: DeviceAccessRouterBlock, data: dict[str, object]
+    ) -> DeviceAccessRouterBlock:
+        return await self.router_blocks.update(block, data)
+
+    async def list_open_router_blocks(
+        self, *, rule_id: uuid.UUID
+    ) -> list[DeviceAccessRouterBlock]:
+        statement = select(DeviceAccessRouterBlock).where(
+            DeviceAccessRouterBlock.rule_id == rule_id,
+            DeviceAccessRouterBlock.status
+            != BlockEnforcementStatus.NOT_APPLICABLE.value,
+            DeviceAccessRouterBlock.cleared_at.is_(None),
+            DeviceAccessRouterBlock.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_open_router_blocks_for_expired_rules(
+        self, *, now: datetime, limit: int
+    ) -> list[DeviceAccessRouterBlock]:
+        statement = (
+            select(DeviceAccessRouterBlock)
+            .join(
+                DeviceAccessRule,
+                DeviceAccessRule.id == DeviceAccessRouterBlock.rule_id,
+            )
+            .where(
+                DeviceAccessRouterBlock.status
+                != BlockEnforcementStatus.NOT_APPLICABLE.value,
+                DeviceAccessRouterBlock.cleared_at.is_(None),
+                DeviceAccessRouterBlock.is_deleted.is_(False),
+                or_(
+                    DeviceAccessRule.is_active.is_(False),
+                    DeviceAccessRule.is_deleted.is_(True),
+                    and_(
+                        DeviceAccessRule.expires_at.is_not(None),
+                        DeviceAccessRule.expires_at <= now,
+                    ),
+                ),
+            )
+            .order_by(DeviceAccessRouterBlock.created_at.asc())
+            .limit(limit)
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())

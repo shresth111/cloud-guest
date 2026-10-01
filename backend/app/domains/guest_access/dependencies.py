@@ -54,9 +54,10 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
+from .device_blocking import RouterDeviceBlocker
 from .enforcement import BlocklistEnforcer
 from .repository import GuestAccessRepository, GuestAccessRepositoryProtocol
-from .service import BlockEnforcerProtocol, GuestAccessService
+from .service import BlockEnforcerProtocol, DeviceBlockerProtocol, GuestAccessService
 
 
 def get_guest_access_repository(
@@ -118,9 +119,21 @@ def get_block_enforcer(
     )
 
 
+def get_device_blocker(
+    router_service: RouterService = Depends(get_router_service),
+) -> DeviceBlockerProtocol:
+    """Writes ``BLOCKLIST`` device rules to the venue's MikroTik routers as
+    ``/ip hotspot ip-binding type=blocked`` (``device_blocking``). Composes
+    the request's own ``RouterService`` -- the same graph the guest-rule
+    enforcer above uses -- for the router list and the decrypted API
+    secret."""
+    return RouterDeviceBlocker(router_lookup=router_service)
+
+
 def get_guest_access_service(
     repository: GuestAccessRepositoryProtocol = Depends(get_guest_access_repository),
     block_enforcer: BlockEnforcerProtocol = Depends(get_block_enforcer),
+    device_blocker: DeviceBlockerProtocol = Depends(get_device_blocker),
     location_service: LocationService = Depends(get_location_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
@@ -141,6 +154,7 @@ def get_guest_access_service(
         location_lookup=location_service,
         audit_writer=audit_repository,
         caller_location_scope=caller_location_scope,
+        device_blocker=device_blocker,
     )
 
 
@@ -165,6 +179,7 @@ def get_access_decision_service(
 __all__ = [
     "get_access_decision_service",
     "get_block_enforcer",
+    "get_device_blocker",
     "get_guest_access_repository",
     "get_guest_access_service",
 ]

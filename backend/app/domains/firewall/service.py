@@ -68,10 +68,13 @@ from app.domains.router.models import Router
 from .constants import (
     DEFAULT_PRIORITY,
     DEVICE_CARRIED_FIELDS,
+    FLOOD_LIMIT_PRESETS,
     FirewallAction,
     FirewallChain,
     FirewallDevicePushStatus,
     FirewallProtocol,
+    FloodLimitPreset,
+    flood_preset_for_limit,
 )
 from .device_adapters import FirewallCredentials, get_firewall_adapter
 from .events import (
@@ -176,6 +179,26 @@ class FirewallBandState:
     checked_at: datetime
     guest_networks: tuple[str, ...] = ()
     guest_dns_servers: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FloodLimitState:
+    """A router's "Limit connection floods" switch, as read off the router.
+
+    ``preset`` is the preset whose cap the router holds, ``off`` when no row
+    is there, and ``None`` when the cap matches no preset (written by hand).
+    ``consistent`` is False when the rows are not in the shape a write leaves
+    -- a guest network without a row, rows that disagree, or rows below a
+    customer rule -- and turning the switch on again repairs it.
+    ``band_state`` is the band status: a write needs ``ready``."""
+
+    preset: FloodLimitPreset | None
+    limit: int | None
+    enabled: bool
+    consistent: bool
+    band_state: str
+    guest_networks: tuple[str, ...]
+    checked_at: datetime
 
 
 class AuditLogWriter(Protocol):
@@ -633,6 +656,115 @@ class FirewallService:
             guest_dns_servers=tuple(getattr(status, "guest_dns_servers", ())),
         )
 
+    # -- connection-flood limit ---------------------------------------------
+
+    async def _flood_router(
+        self, router_id: uuid.UUID, requesting_organization_id: uuid.UUID | None
+    ) -> Router:
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature=_FEATURE_NAME)
+        enforce_entity_location(
+            caller_location_scope=self.caller_location_scope,
+            entity_location_id=router.location_id,
+            error=CrossLocationFirewallRuleAccessError(),
+        )
+        return router
+
+    async def read_flood_limit(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> FloodLimitState:
+        """Read-only: what the router holds right now.
+
+        Stored nowhere else on purpose. The switch's whole state is the rows
+        on the router, so the screen shows what the router does rather than
+        what this platform last asked it to do -- a router that was reset
+        reads "off", truthfully. Gated like every firewall read; takes no
+        lock (it writes nothing)."""
+        router = await self._flood_router(router_id, requesting_organization_id)
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_firewall_adapter(router.vendor)
+        status = await adapter.read_flood_limit(credentials)
+        return self._flood_state(status)
+
+    async def set_flood_limit(
+        self,
+        router_id: uuid.UUID,
+        *,
+        preset: FloodLimitPreset,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> FloodLimitState:
+        """Turn the switch on at ``preset``, change it, or turn it ``off``.
+
+        Under the router's forward-chain lock, like every other writer of
+        that chain. The gateway refuses (409, nothing written) a router whose
+        band is not placed or that serves no guest network; a write that
+        failed part-way is a 502 saying whether it was undone. Turning it off
+        needs no band. The state returned is a fresh read of the router."""
+        router = await self._flood_router(router_id, requesting_organization_id)
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_firewall_adapter(router.vendor)
+        async with self._router_lock(router.id):
+            if preset is FloodLimitPreset.OFF:
+                result = await adapter.remove_flood_limit(credentials)
+            else:
+                result = await adapter.apply_flood_limit(
+                    credentials, limit=FLOOD_LIMIT_PRESETS[preset]
+                )
+            status = await adapter.read_flood_limit(credentials)
+        logger.info(
+            "firewall_flood_limit_changed",
+            extra={
+                "event_router_id": str(router.id),
+                "event_preset": preset.value,
+                "event_added": result.added,
+                "event_removed": result.removed,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.FIREWALL_FLOOD_LIMIT_CHANGED,
+            entity_id=router.id,
+            entity_type="router",
+            organization_id=router.organization_id,
+            description=(
+                f"Connection-flood limit on router {router.id} set to "
+                f"{preset.value}"
+                + (
+                    ""
+                    if preset is FloodLimitPreset.OFF
+                    else f" ({FLOOD_LIMIT_PRESETS[preset]} per guest device)"
+                )
+                + f": {result.added} rows added, {result.removed} removed"
+            ),
+        )
+        return self._flood_state(status)
+
+    @staticmethod
+    def _flood_state(status: object) -> FloodLimitState:
+        enabled = bool(getattr(status, "enabled", False))
+        limit = getattr(status, "limit", None) if enabled else None
+        if not enabled:
+            preset: FloodLimitPreset | None = FloodLimitPreset.OFF
+        elif limit is None:
+            preset = None  # rows that disagree with each other
+        else:
+            preset = flood_preset_for_limit(limit)
+        return FloodLimitState(
+            preset=preset,
+            limit=limit,
+            enabled=enabled,
+            consistent=bool(getattr(status, "consistent", False)) or not enabled,
+            band_state=str(getattr(status, "band_state", "missing")),
+            guest_networks=tuple(getattr(status, "guest_networks", ())),
+            checked_at=datetime.now(UTC),
+        )
+
     def _router_lock(self, router_id: uuid.UUID):  # noqa: ANN202
         return router_firewall_lock(
             self._redis,
@@ -694,5 +826,6 @@ __all__ = [
     "AuditLogWriter",
     "FirewallBandState",
     "FirewallPushOutcome",
+    "FloodLimitState",
     "FirewallService",
 ]

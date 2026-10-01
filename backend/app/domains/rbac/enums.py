@@ -1002,6 +1002,9 @@ class AuditAction(StrEnum):
     FIREWALL_RULES_PUSHED = "firewall_rules_pushed"
     # The forward-chain sentinel band was placed on a router (Master-only).
     FIREWALL_BAND_INSTALLED = "firewall_band_installed"
+    # The per-router "Limit connection floods" switch was turned on, changed
+    # or turned off (``FirewallService.set_flood_limit``).
+    FIREWALL_FLOOD_LIMIT_CHANGED = "firewall_flood_limit_changed"
 
     # Network Device (NAC) domain events -- written through this same
     # table by ``app.domains.network_device.service.NetworkDeviceService``

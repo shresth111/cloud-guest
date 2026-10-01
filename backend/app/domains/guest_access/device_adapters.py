@@ -46,6 +46,9 @@ are not interchangeable:
    phones rotate it per-SSID by default. A binding written for today's
    randomized MAC blocks a stranger next week and stops blocking the
    guest. See ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §2.4.
+   It *is* the primitive for a device rule (``DeviceAccessRule``, keyed on
+   a MAC the owner chose), and :meth:`MikroTikGuestAccessAdapter
+   .block_device` writes it for exactly that -- see ``device_blocking``.
 4. **Terminating this platform's own ``GuestSession`` row.** Necessary --
    without it the next RADIUS re-authorization finds an ``ACTIVE``
    session and re-admits the guest (``RadiusService.authorize`` checks
@@ -177,6 +180,32 @@ class SessionEndOutcome:
         return self.still_active == 0
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceBlockOutcome:
+    """What one router holds after a durable device block was written.
+
+    Mirrors the gateway's ``HotspotDeviceBlockResult``, narrowed to what this
+    domain records. ``binding_written`` is False only when the router runs no
+    hotspot (``hotspot_servers == 0``) -- a binding there would block
+    nothing, so none is written and the caller must not report a block."""
+
+    hotspot_servers: int
+    binding_written: bool
+    first_in_order: bool
+    other_bindings: tuple[str, ...]
+    sessions_removed: int
+    still_active: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceUnblockOutcome:
+    """``remaining`` is a re-read: our binding rows still present for this
+    MAC after the removals. Only zero is a release."""
+
+    removed: int
+    remaining: int
+
+
 class BaseGuestAccessAdapter(Protocol):
     """What a vendor implements to plug real session termination into this
     domain."""
@@ -212,6 +241,30 @@ class BaseGuestAccessAdapter(Protocol):
         Never widens: both identifiers ``None`` ends *zero* sessions, not
         every session on the router.
         """
+        ...
+
+
+    async def block_device(
+        self,
+        credentials: GuestAccessCredentials,
+        *,
+        mac_address: str,
+        marker: str,
+    ) -> DeviceBlockOutcome:
+        """Writes a durable ``type=blocked`` hotspot ip-binding for one MAC,
+        carrying ``marker``, and ends that device's live session. Idempotent
+        on ``marker``; read back before returning."""
+        ...
+
+    async def unblock_device(
+        self,
+        credentials: GuestAccessCredentials,
+        *,
+        mac_address: str,
+        marker: str,
+    ) -> DeviceUnblockOutcome:
+        """Removes exactly the binding(s) carrying ``marker`` for this MAC,
+        and re-reads. Idempotent."""
         ...
 
 
@@ -286,6 +339,58 @@ class MikroTikGuestAccessAdapter:
         )
 
 
+    async def block_device(
+        self,
+        credentials: GuestAccessCredentials,
+        *,
+        mac_address: str,
+        marker: str,
+    ) -> DeviceBlockOutcome:
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).block_hotspot_device(
+                creds, mac_address=mac_address, marker=marker
+            )
+        except MikroTikConnectionError as exc:
+            raise GuestAccessDeviceConnectionError(
+                credentials.host, exc.detail
+            ) from exc
+        except MikroTikDeviceError as exc:
+            raise GuestAccessDeviceOperationError("block_device", exc.detail) from exc
+        return DeviceBlockOutcome(
+            hotspot_servers=result.hotspot_servers,
+            binding_written=result.binding_id is not None,
+            first_in_order=result.first_in_order,
+            other_bindings=result.other_bindings,
+            sessions_removed=result.sessions_removed,
+            still_active=result.still_active,
+        )
+
+    async def unblock_device(
+        self,
+        credentials: GuestAccessCredentials,
+        *,
+        mac_address: str,
+        marker: str,
+    ) -> DeviceUnblockOutcome:
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).unblock_hotspot_device(
+                creds, mac_address=mac_address, marker=marker
+            )
+        except MikroTikConnectionError as exc:
+            raise GuestAccessDeviceConnectionError(
+                credentials.host, exc.detail
+            ) from exc
+        except MikroTikDeviceError as exc:
+            raise GuestAccessDeviceOperationError(
+                "unblock_device", exc.detail
+            ) from exc
+        return DeviceUnblockOutcome(
+            removed=len(result.removed_ids), remaining=result.remaining
+        )
+
+
 _GUEST_ACCESS_ADAPTERS: dict[str, BaseGuestAccessAdapter] = {
     "mikrotik": MikroTikGuestAccessAdapter()
 }
@@ -313,6 +418,8 @@ def list_supported_guest_access_vendors() -> list[str]:
 
 __all__ = [
     "BaseGuestAccessAdapter",
+    "DeviceBlockOutcome",
+    "DeviceUnblockOutcome",
     "GuestAccessCredentials",
     "MikroTikGuestAccessAdapter",
     "SessionControlSnapshot",

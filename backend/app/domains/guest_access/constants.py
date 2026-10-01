@@ -232,8 +232,27 @@ CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS = 600.0
 CONTROLLER_BLOCK_RELEASE_MAX_PER_RUN = 200
 
 
+# ============================================================================
+# Router-side device blocks (MikroTik ip-binding)
+# ============================================================================
+
+# The same lazy-expiry problem as the controller sweep above, on RouterOS: a
+# ``BLOCKLIST`` device rule with an ``expires_at`` writes a durable
+# ``/ip hotspot ip-binding type=blocked`` row that nothing on the router
+# removes. Same interval and bound, for the same reasons; one 8728
+# round trip per open row.
+TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP = (
+    "app.domains.guest_access.tasks.run_device_block_release_sweep"
+)
+DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS = 600.0
+DEVICE_BLOCK_RELEASE_MAX_PER_RUN = 200
+
+
 __all__ = [
     "AccessRuleType",
+    "DEVICE_BLOCK_RELEASE_MAX_PER_RUN",
+    "DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP",
     "CONTROLLER_BLOCK_RELEASE_MAX_PER_RUN",
     "CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP",

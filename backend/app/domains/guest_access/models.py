@@ -175,6 +175,20 @@ class DeviceAccessRule(BaseModel):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # -- router-side durable blocks ----------------------------------------
+    #
+    # One row per MikroTik router a ``BLOCKLIST`` device rule was written to
+    # (``/ip hotspot ip-binding type=blocked``). Eager for the same reason
+    # ``GuestAccessRule.controller_blocks`` is, and for the same reason not
+    # cascaded: these rows are what an unblock and the expiry sweep read to
+    # find the bindings to take off again.
+    router_blocks: Mapped[list[DeviceAccessRouterBlock]] = relationship(
+        "DeviceAccessRouterBlock",
+        lazy="selectin",
+        order_by="DeviceAccessRouterBlock.created_at",
+        viewonly=False,
+    )
+
     __table_args__ = (
         Index("ix_device_access_rules_organization_id", "organization_id"),
         Index("ix_device_access_rules_location_id", "location_id"),
@@ -307,5 +321,83 @@ class GuestAccessControllerBlock(BaseModel):
     def __repr__(self) -> str:
         return (
             f"<GuestAccessControllerBlock(id={self.id}, "
+            f"mac_address={self.mac_address}, status={self.status})>"
+        )
+
+
+class DeviceAccessRouterBlock(BaseModel):
+    """One MikroTik router a ``BLOCKLIST`` :class:`DeviceAccessRule` was
+    written to, and what that router said.
+
+    ## What the row stands for
+
+    A device rule is enforced on the router as a
+    ``/ip hotspot ip-binding type=blocked`` row carrying the comment
+    ``cloudguest-devblock:<rule id>``, plus the device's live session
+    removed. That binding outlives the request -- it is the whole point --
+    so something has to remember it is there in order to take it off again:
+    on unblock, on delete, and when a temporary block expires. This row is
+    that memory, one per router, because a venue with two routers can have
+    the block land on one and not the other.
+
+    ``cleared_at IS NULL`` and ``status != not_applicable`` is this
+    platform's standing claim that a router may still hold the binding. A
+    ``failed`` row is included on purpose: a failure after the binding was
+    written (the session did not end, the read-back was short) still leaves
+    the binding there, and the release is idempotent, so asking a router to
+    remove a binding it never got costs one read.
+
+    ``status`` reuses :class:`~.constants.BlockEnforcementStatus`:
+    ``enforced`` (binding read back, session gone), ``failed`` (could not
+    connect, refused, or the session survived), ``not_applicable`` (the
+    router runs no hotspot, so nothing was written).
+    """
+
+    __tablename__ = "device_access_router_blocks"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    rule_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("device_access_rules.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    mac_address: Mapped[str] = mapped_column(String(17), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sessions_ended: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    blocked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cleared_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    release_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_device_access_router_blocks_rule_id", "rule_id"),
+        Index("ix_device_access_router_blocks_router_id", "router_id"),
+        Index(
+            "ix_device_access_router_blocks_organization_id", "organization_id"
+        ),
+        Index("ix_device_access_router_blocks_open", "cleared_at", "rule_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<DeviceAccessRouterBlock(id={self.id}, router_id={self.router_id}, "
             f"mac_address={self.mac_address}, status={self.status})>"
         )
