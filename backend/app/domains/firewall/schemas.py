@@ -25,6 +25,9 @@ __all__ = [
     "FirewallBandStatusResponse",
     "FloodLimitResponse",
     "FloodLimitUpdateRequest",
+    "GuestIsolationPortResponse",
+    "GuestIsolationResponse",
+    "GuestIsolationUpdateRequest",
 ]
 
 
@@ -191,4 +194,54 @@ class FloodLimitResponse(BaseModel):
     band_state: Literal["ready", "missing", "invalid"]
     guest_networks: list[str] = []
     presets: dict[str, int]
+    checked_at: datetime
+
+
+class GuestIsolationUpdateRequest(BaseModel):
+    """Turn "Guests can't see each other" on or off."""
+
+    enabled: bool
+
+
+class GuestIsolationPortResponse(BaseModel):
+    """One port of the guest network. ``excluded_reason`` is why the router
+    leaves it out (``wan``, ``carries_vlan``, ``has_address``,
+    ``not_physical``, ``dynamic``, ``disabled``)."""
+
+    interface: str
+    running: bool
+    isolatable: bool
+    isolated: bool
+    excluded_reason: str | None = None
+    is_radio: bool = False
+
+
+class GuestIsolationResponse(BaseModel):
+    """A router's "Guests can't see each other" switch, read off the router.
+
+    ``between_ports``: guests on different ports cannot reach each other --
+    what the router enforces. ``ap_ports``: guest ports with an access point
+    (or switch) plugged in. ``ap_isolation_needed``: guests on the SAME
+    access point are switched inside it and the router never sees them; the
+    owner must turn on each access point's own "AP isolation" / "Client
+    isolation". ``routed_guard``: the firewall row that also stops a guest
+    routing to another through the router (needs the firewall band).
+    ``radios_isolated``: the router's own Wi-Fi, ``null`` when it has none.
+    ``refusal``: why it cannot be turned on here, or ``null``.
+    ``summary``: the honest one-line status."""
+
+    router_id: str
+    enabled: bool
+    consistent: bool
+    between_ports: bool
+    routed_guard: bool
+    radios_isolated: bool | None
+    band_state: Literal["ready", "missing", "invalid"]
+    guest_ports: int
+    isolated_ports: int
+    ap_ports: int
+    ap_isolation_needed: bool
+    ports: list[GuestIsolationPortResponse] = []
+    refusal: str | None = None
+    summary: str
     checked_at: datetime

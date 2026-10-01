@@ -244,9 +244,38 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
             "never signs in. It is reliable for hardware the venue knows; an "
             "anonymous guest can switch on a private (randomised) Wi-Fi "
             "address and come back as a new device, so blocking a person is "
-            "the sign-in block, not this. Isolating devices from each other "
-            "on the same network is not built. Venues managed through an "
-            "Omada controller keep the controller's own client block."
+            "the sign-in block, not this. Keeping guests from reaching each "
+            "other is a separate switch (guest isolation). Venues managed "
+            "through an Omada controller keep the controller's own client "
+            "block."
+        ),
+    ),
+    SecurityFeature(
+        key="guest_client_isolation",
+        label="Guest isolation (guests can't see each other)",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "/interface bridge port horizon=<platform group> on the hotspot "
+            "bridge's guest ports (never the uplink, a VLAN-carrying port or "
+            "the bridge itself); the router's own radios set to "
+            "default-forwarding=no (wireless) or datapath.client-isolation=yes "
+            "(wifi); plus a chain=forward guest-to-guest drop row per guest "
+            "network in the sentinel band when it is placed. Switched per "
+            "router over 8728 and read back"
+        ),
+        detail=(
+            "Partial isolation. The router stops guests on different ports "
+            "(different access points) and on its own Wi-Fi from reaching "
+            "each other. Guests connected to the same external access point "
+            "are switched inside that access point and never pass through "
+            "the router, so the owner must also turn on \"AP isolation\" or "
+            "\"Client isolation\" in each access point's own settings. Access "
+            "points joined through a separate switch can still reach each "
+            "other through it. It is refused on a bridge with VLAN filtering "
+            "or a port someone set split-horizon on by hand. Printers or "
+            "casting devices on the guest network stop being reachable by "
+            "guests. Turning it on or off can briefly reset the router's "
+            "switch on some models."
         ),
     ),
     SecurityFeature(

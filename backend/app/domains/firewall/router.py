@@ -52,9 +52,12 @@ from .schemas import (
     FirewallRuleUpdateRequest,
     FloodLimitResponse,
     FloodLimitUpdateRequest,
+    GuestIsolationPortResponse,
+    GuestIsolationResponse,
+    GuestIsolationUpdateRequest,
     MessageResponse,
 )
-from .service import FirewallService, FloodLimitState
+from .service import FirewallService, FloodLimitState, GuestIsolationState
 
 router = APIRouter(prefix="/firewall-rules", tags=["Firewall Rule Management"])
 
@@ -461,6 +464,101 @@ async def set_flood_limit(
             else "Connection-flood limit applied"
         ),
         data=_flood_response(router_id, state).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+def _isolation_response(
+    router_id: uuid.UUID, state: GuestIsolationState
+) -> GuestIsolationResponse:
+    return GuestIsolationResponse(
+        router_id=str(router_id),
+        enabled=state.enabled,
+        consistent=state.consistent,
+        between_ports=state.between_ports,
+        routed_guard=state.routed_guard,
+        radios_isolated=state.radios_isolated,
+        band_state=state.band_state,  # type: ignore[arg-type]
+        guest_ports=state.guest_ports,
+        isolated_ports=state.isolated_ports,
+        ap_ports=state.ap_ports,
+        ap_isolation_needed=state.ap_isolation_needed,
+        ports=[
+            GuestIsolationPortResponse(
+                interface=p.interface,
+                running=p.running,
+                isolatable=p.isolatable,
+                isolated=p.isolated,
+                excluded_reason=p.excluded_reason,
+                is_radio=p.is_radio,
+            )
+            for p in state.ports
+        ],
+        refusal=state.refusal,
+        summary=state.summary,
+        checked_at=state.checked_at,
+    )
+
+
+@router.get(
+    "/routers/{router_id}/guest-isolation",
+    response_model=ApiResponse[GuestIsolationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+)
+async def get_guest_isolation(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Read-only: "Guests can't see each other" for this router, read off
+    the router over 8728. Same gating as the flood-limit read."""
+    state = await service.read_guest_isolation(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Guest isolation retrieved",
+        data=_isolation_response(router_id, state).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/routers/{router_id}/guest-isolation",
+    response_model=ApiResponse[GuestIsolationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
+    ],
+)
+async def set_guest_isolation(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: GuestIsolationUpdateRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Turn "Guests can't see each other" on or off. ``firewall.execute``
+    pinned to ROUTER scope, like the flood limit (it writes the same chain).
+    Refusals are 409 with an ``ISOLATION_*`` code; a write that failed
+    part-way is a 502 carrying ``restored``. Omada venues are refused."""
+    state = await service.set_guest_isolation(
+        router_id,
+        enabled=payload.enabled,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Guest isolation turned on"
+            if payload.enabled
+            else "Guest isolation turned off"
+        ),
+        data=_isolation_response(router_id, state).model_dump(),
         request_id=_request_id(request),
     )
 
