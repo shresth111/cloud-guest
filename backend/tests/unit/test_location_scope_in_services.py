@@ -311,9 +311,15 @@ async def test_two_requests_never_share_a_service_instance() -> None:
     from app.domains.router.dependencies import get_router_service
 
     app = FastAPI()
+    # Keep every instance alive: comparing bare id()s of objects that were
+    # already freed is flaky, because CPython can hand the second request's
+    # service the first one's freed address (CI 2026-10-01 failed exactly so,
+    # with no shared instance anywhere).
+    seen: list[FirewallService] = []
 
     @app.get("/probe")
     async def probe(service: FirewallService = Depends(get_firewall_service)):
+        seen.append(service)
         return {"instance": id(service)}
 
     app.dependency_overrides[get_firewall_repository] = lambda: object()
@@ -325,7 +331,7 @@ async def test_two_requests_never_share_a_service_instance() -> None:
         first = client.get("/probe").json()["instance"]
         second = client.get("/probe").json()["instance"]
 
-    assert first != second, (
+    assert len(seen) == 2 and seen[0] is not seen[1] and first != second, (
         "two requests shared one FirewallService instance -- constructor "
         "injection would leak one caller's location confinement into another's "
         "request"
