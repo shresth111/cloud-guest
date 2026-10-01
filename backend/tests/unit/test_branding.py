@@ -47,7 +47,6 @@ from app.domains.branding.service import (
     _EXTENSION_TO_CONTENT_TYPE,
     BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES,
     BACKGROUND_IMAGE_MAX_BYTES,
-    BACKGROUND_IMAGE_MIN_LONG_EDGE,
     BACKGROUND_IMAGE_RAW_PATH,
     DEFAULT_BRANDING,
     LOGO_MAX_BYTES,
@@ -1056,36 +1055,21 @@ class TestUploadBackgroundImageThroughThePipeline:
         assert stored.background_top_luminance is None
         assert stored.background_entropy is None
 
-    async def test_rejects_an_image_below_the_resolution_floor(self) -> None:
-        """Part 4 item 8: below ~1200px on the long edge, `cover` on a
-        phone is upscaling by 2x or more and no processing recovers the
-        detail. Refused with a reason, never silently accepted."""
-        service, _repository, _storage, _audit = make_service()
-
-        with pytest.raises(InvalidBackgroundImageError) as exc:
-            await service.upload_background_image(
-                uuid.uuid4(),
-                filename="tiny.png",
-                content_type="image/png",
-                content=_png((800, 600)),
-            )
-        assert str(BACKGROUND_IMAGE_MIN_LONG_EDGE) in str(exc.value)
-
-    async def test_accepts_exactly_the_resolution_floor(self) -> None:
+    async def test_accepts_a_small_background_image(self) -> None:
+        """Small uploads are stored (and processed when possible) — no
+        hard resolution floor on ingress."""
         service, repository, _storage, _audit = make_service()
         org_id = uuid.uuid4()
         await service.upload_background_image(
             org_id,
-            filename="ok.png",
+            filename="tiny.png",
             content_type="image/png",
-            content=_png((BACKGROUND_IMAGE_MIN_LONG_EDGE, 700)),
+            content=_png((800, 600)),
         )
-        assert repository._by_org[org_id].background_image_key.endswith(".webp")
+        assert repository._by_org[org_id].background_image_key is not None
 
-    async def test_undecodable_upload_skips_the_resolution_floor(self) -> None:
-        """Refusing a file for being too small when we could not measure
-        it at all would be worse than storing it -- and would break every
-        pre-v7 test that uploads undecodable bytes."""
+    async def test_undecodable_upload_still_stores(self) -> None:
+        """Unreadable bytes take the graceful store-the-original path."""
         service, repository, _storage, _audit = make_service()
         org_id = uuid.uuid4()
         await service.upload_background_image(
