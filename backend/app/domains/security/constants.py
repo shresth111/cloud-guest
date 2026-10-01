@@ -202,15 +202,19 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
         label="Domain blocking (HTTPS hostname)",
         availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
         enforcement=(
-            "Planned: /ip firewall filter tls-host (RouterOS 6.41+), pushed "
-            "over 8728"
+            "Planned: /ip firewall filter tls-host=<domain> and *.<domain> on "
+            "tcp/443, above the established accept, pushed over 8728 with "
+            "every blocked website"
         ),
         detail=(
-            "No code writes a tls-host rule to a router yet; website "
-            "blocking today is the DNS sinkhole only. Once built it would "
-            "match the hostname in the TLS handshake without inspecting "
-            "traffic, lose coverage when Encrypted Client Hello negotiates, "
-            "and see nothing for QUIC, plain HTTP or a VPN."
+            "Built and pushed with every blocked website, but not yet proven "
+            "on a real router, so not offered as working. It matches the "
+            "site name a device sends when it opens a secure connection, "
+            "without decrypting anything, so it can catch a device that "
+            "skipped the DNS block. It sees nothing when Encrypted Client "
+            "Hello hides the name, nothing over QUIC (HTTP/3), plain HTTP or "
+            "a VPN, and RouterOS cannot match a handshake split across "
+            "packets, which current desktop browsers send."
         ),
     ),
     SecurityFeature(
@@ -326,24 +330,37 @@ SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
     SecurityFeature(
         key="application_control",
         label="Application control",
-        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
-        enforcement=None,
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "A curated app catalogue mapped to each app's own hostnames (and, "
+            "for Telegram, its published address ranges), each pushed over "
+            "8728 as an ordinary blocked website or address"
+        ),
         detail=(
-            "Only a subset is reachable today, by matching an application's "
-            "known hostnames over DNS and the TLS hostname. Distinguishing "
-            "one application from another reliably needs deep packet "
-            "inspection, which this platform does not have."
+            "Matches the website names an app uses, not the app itself: there "
+            "is no deep packet inspection. Some apps still get through -- one "
+            "already connected, one that connects by a built-in address, or a "
+            "device with its own DNS or a VPN. Shared services (Google sign-in, "
+            "shared content networks) are deliberately not blocked, so an app "
+            "that leans on them can partly work."
         ),
     ),
     SecurityFeature(
         key="threat_intelligence",
         label="Threat intelligence (malware, phishing, botnet)",
-        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
-        enforcement=None,
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "Cloudflare Gateway's Security threats category in the venue's "
+            "category policy, applied when the router looks a name up over "
+            "DNS-over-HTTPS"
+        ),
         detail=(
-            "Needs a maintained threat feed and a synchronisation pipeline. "
-            "The delivery mechanism (DNS sinkhole, SNI rule, address-list) "
-            "already exists; the intelligence behind it does not."
+            "Uses Cloudflare's maintained list of malware, phishing and "
+            "similar sites, at the DNS lookup. Only on routers with web "
+            "filtering switched on (RouterOS 7.19 or later). A device using "
+            "its own DNS or a VPN, or a harmful server contacted by address "
+            "rather than by name, is not covered, and a site can be "
+            "misclassified."
         ),
     ),
     SecurityFeature(

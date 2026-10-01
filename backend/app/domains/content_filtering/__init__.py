@@ -62,6 +62,18 @@ through the router (blocking outbound port 53 to anything else) already
 has the general-purpose tool to do that -- ``app.domains.firewall`` -- and
 this domain deliberately does not duplicate that capability itself.
 
+## The HTTPS-name layer (``tls-host``)
+
+Since the sinkhole is bypassed by a device with a cached address or its
+own resolver, a domain rule also pushes two ``/ip firewall filter`` drops on
+tcp/443 matching the name in the TLS ClientHello (``tls-host=<domain>`` and
+``*.<domain>``). This reads one cleartext field the client sends; it is not
+TLS interception and decrypts nothing. Its limits are real and stated where
+a customer sees them: Encrypted Client Hello hides the name, QUIC (udp/443)
+is not matched by name and is deliberately not blocked wholesale, and
+RouterOS cannot match a ClientHello split across packets. See
+``wyfy_device_gateway.mikrotik_adapter.configure_content_filter_rule``.
+
 ## Live device push
 
 ``POST /content-filter-rules/{id}/push`` realizes one rule on its own

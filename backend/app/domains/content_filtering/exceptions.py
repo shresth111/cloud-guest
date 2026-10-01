@@ -27,6 +27,8 @@ __all__ = [
     "ContentFilterDeviceConnectionError",
     "ContentFilterDeviceOperationError",
     "ContentFilterPushInProgressError",
+    "UnknownContentFilterAppError",
+    "ContentFilterAppIncompleteError",
 ]
 
 
@@ -197,4 +199,43 @@ class ContentFilterPushInProgressError(ContentFilteringError):
             "try again in a moment",
             status_code=status.HTTP_409_CONFLICT,
             data={"code": FIREWALL_PUSH_IN_PROGRESS, "router_id": str(router_id)},
+        )
+
+
+class UnknownContentFilterAppError(ContentFilteringError):
+    """``app_key`` is not in ``app_catalogue.APP_CATALOGUE``."""
+
+    def __init__(self, app_key: str) -> None:
+        super().__init__(
+            f"Unknown app '{app_key}'",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class ContentFilterAppIncompleteError(ContentFilteringError):
+    """Some of an app's rows could not be pushed (block) or taken off the
+    device (unblock). Each row already records its own outcome; this is the
+    request-level answer, a real 502 rather than a success the frontend
+    interceptor would show as done."""
+
+    def __init__(
+        self,
+        app_key: str,
+        action: str,
+        *,
+        failed: int,
+        total: int,
+        first_error: str,
+    ) -> None:
+        super().__init__(
+            f"Could not {action} {failed} of {total} names for this app on the "
+            f"router. First error: {first_error}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            data={
+                "code": "CONTENT_FILTER_APP_INCOMPLETE",
+                "app_key": app_key,
+                "action": action,
+                "failed": failed,
+                "total": total,
+            },
         )

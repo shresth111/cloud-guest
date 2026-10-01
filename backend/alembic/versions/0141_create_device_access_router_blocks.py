@@ -26,8 +26,8 @@ Additive only. If another branch also adds a migration on top of
 ``0139_add_dns_bypass_layers``, re-point one ``down_revision`` so there is a
 single head.
 
-Revision ID: 0140_create_device_access_router_blocks
-Revises: 0139_add_dns_bypass_layers
+Revision ID: 0141_create_device_access_router_blocks
+Revises: 0140_add_content_filter_app_key
 Create Date: 2026-10-01
 """
 
@@ -36,8 +36,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0140_create_device_access_router_blocks"
-down_revision = "0139_add_dns_bypass_layers"
+revision = "0141_create_device_access_router_blocks"
+down_revision = "0140_add_content_filter_app_key"
 branch_labels = None
 depends_on = None
 

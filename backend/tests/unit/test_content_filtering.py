@@ -499,7 +499,7 @@ class TestContentFilterRuleCrud:
 
 class TestEveryRouteRequiresPermission:
     def test_every_content_filtering_route_has_a_permission_dependency(self) -> None:
-        assert len(content_filtering_router.routes) == 6
+        assert len(content_filtering_router.routes) == 9
         for route in content_filtering_router.routes:
             assert (
                 route.dependencies != []
