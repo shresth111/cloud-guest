@@ -15,6 +15,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
+from app.domains.content_filtering.models import ContentFilterRule
 
 from .constants import RULE_PRECEDENCE_BASE, RouterFilteringState
 from .models import (
@@ -83,6 +84,8 @@ class DnsFilteringRepositoryProtocol(Protocol):
         self, kind: str, data: dict[str, object]
     ) -> DnsBypassBlocklist: ...
     async def list_bypass_hardened(self) -> list[DnsFilteringRouterLocation]: ...
+
+    async def count_website_blocks(self, router_id: uuid.UUID) -> int: ...
 
     async def commit(self) -> None: ...
 
@@ -282,17 +285,34 @@ class DnsFilteringRepository:
         return await self.blocklists.update(existing, data)
 
     async def list_bypass_hardened(self) -> list[DnsFilteringRouterLocation]:
-        """Every router with bypass hardening on and Gateway active -- the
-        candidates for a list push. Platform-wide by design: this is the
-        scheduled sweep, never a tenant request."""
+        """Every router with bypass hardening on -- the candidates for a list
+        push. Gateway need not be active: a router can hold the layers for
+        its website blocks alone (see ``set_bypass_hardening``).
+        Platform-wide by design: this is the scheduled sweep, never a tenant
+        request."""
         result = await self.session.execute(
             select(DnsFilteringRouterLocation).where(
                 DnsFilteringRouterLocation.is_deleted.is_(False),
                 DnsFilteringRouterLocation.bypass_hardening_enabled.is_(True),
-                DnsFilteringRouterLocation.state == RouterFilteringState.ACTIVE.value,
             )
         )
         return list(result.scalars().all())
+
+    async def count_website_blocks(self, router_id: uuid.UUID) -> int:
+        """Switched-on website (domain) blocks on this router -- the
+        content-filtering rows the router enforces through its own DNS, and
+        so the other reason, besides Gateway, to keep guests on that DNS."""
+        result = await self.session.execute(
+            select(func.count())
+            .select_from(ContentFilterRule)
+            .where(
+                ContentFilterRule.router_id == router_id,
+                ContentFilterRule.value_type == "domain",
+                ContentFilterRule.is_enabled.is_(True),
+                ContentFilterRule.is_deleted.is_(False),
+            )
+        )
+        return int(result.scalar_one())
 
     async def commit(self) -> None:
         await self.session.commit()
