@@ -244,6 +244,10 @@ class FakeRepo:
     extra_cf_locations: int = 0
     commits: int = 0
     blocklists: dict[str, Any] = field(default_factory=dict)
+    website_blocks: dict[uuid.UUID, int] = field(default_factory=dict)
+
+    async def count_website_blocks(self, router_id):
+        return self.website_blocks.get(router_id, 0)
 
     async def get_profile(self, profile_id):
         return self.profiles.get(profile_id)
@@ -350,12 +354,7 @@ class FakeRepo:
         return row
 
     async def list_bypass_hardened(self):
-        return [
-            r
-            for r in self.rows.values()
-            if r.bypass_hardening_enabled
-            and r.state == RouterFilteringState.ACTIVE.value
-        ]
+        return [r for r in self.rows.values() if r.bypass_hardening_enabled]
 
     async def commit(self):
         self.commits += 1
@@ -1129,6 +1128,80 @@ class TestLifecycle:
         )
         names = [c[0] for c in adapter.calls]
         assert names.index("remove_bypass_hardening") < names.index("restore_dns")
+
+    async def test_website_blocks_alone_are_a_reason_for_bypass_protection(
+        self, adapter
+    ) -> None:
+        """A router that only blocks websites by name relies on guests using
+        its resolver just as much as Gateway does -- 8.8.8.8 walks past a
+        sinkhole. One switched-on website block is enough; Gateway is not
+        switched on, and the router's DNS is never touched."""
+        h = _harness()
+        org = uuid.uuid4()
+        loc = h.add_location(org)
+        router = h.routers.add(_router(org=org, loc=loc))
+        h.repo.website_blocks[router.id] = 1
+
+        row = await _bypass(h, router, enabled=True)
+
+        assert row.bypass_hardening_status == "active"
+        assert row.state == RouterFilteringState.DISABLED.value
+        assert BypassLayer.VPN_BLOCK.value not in row.bypass_layers
+        names = [c[0] for c in adapter.calls]
+        assert names == ["apply_bypass_hardening"]
+        assert h.gateway.calls == []
+
+        off = await _bypass(h, router, enabled=False)
+        assert off.bypass_hardening_enabled is False
+        assert adapter.calls[-1][0] == "remove_bypass_hardening"
+
+    async def test_vpn_blocking_still_needs_gateway(self, adapter) -> None:
+        h = _harness()
+        org = uuid.uuid4()
+        router = h.routers.add(_router(org=org, loc=h.add_location(org)))
+        h.repo.website_blocks[router.id] = 2
+        with pytest.raises(BypassLayerInvalidError):
+            await _bypass(h, router, enabled=True, layers=[BypassLayer.VPN_BLOCK.value])
+        assert adapter.calls == []
+
+    async def test_switching_gateway_off_keeps_protection_for_website_blocks(
+        self, adapter
+    ) -> None:
+        """Turning category filtering off must not quietly reopen the bypass
+        for the router's website blocks. The layers stay; only the VPN layer
+        (Cloudflare's Anonymizer category) is dropped with Cloudflare."""
+        h = _harness()
+        router = await _active_router(h)
+        await _bypass(
+            h,
+            router,
+            enabled=True,
+            layers=[
+                BypassLayer.PLAIN_DNS_REDIRECT.value,
+                BypassLayer.ENCRYPTED_DNS_PORTS.value,
+                BypassLayer.VPN_BLOCK.value,
+            ],
+        )
+        h.repo.website_blocks[router.id] = 1
+        adapter.calls.clear()
+
+        row = await h.service.disable_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+
+        names = [c[0] for c in adapter.calls]
+        assert "remove_bypass_hardening" not in names
+        assert names.index("apply_bypass_hardening") < names.index("restore_dns")
+        reapplied = dict(adapter.calls)["apply_bypass_hardening"]["layers"]
+        assert reapplied == frozenset(
+            {
+                BypassLayer.PLAIN_DNS_REDIRECT.value,
+                BypassLayer.ENCRYPTED_DNS_PORTS.value,
+            }
+        )
+        assert row.bypass_hardening_enabled is True
+        assert row.state == RouterFilteringState.DISABLED.value
+        assert BypassLayer.VPN_BLOCK.value not in row.bypass_layers
 
     async def test_not_configured_is_503(self, adapter) -> None:
         h = _harness(gateway=False)

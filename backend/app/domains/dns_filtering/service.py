@@ -1142,7 +1142,34 @@ class DnsFilteringService:
 
         adapter = get_dns_filtering_adapter(router.vendor)
         credentials = self._resolve_device_credentials(router)
-        if row.bypass_hardening_enabled:
+        keep_for_websites = (
+            row.bypass_hardening_enabled
+            and await self.repository.count_website_blocks(router.id) > 0
+        )
+        if keep_for_websites:
+            # The router's website blocks still depend on guests using its
+            # resolver, so the layers stay. Only the VPN layer goes: it is
+            # Cloudflare's Anonymizer category, and Cloudflare is leaving.
+            kept = frozenset(row.bypass_layers or []) - {BypassLayer.VPN_BLOCK.value}
+            if kept != frozenset(row.bypass_layers or []):
+                payload = (
+                    await self._bypass_payload() if kept & LIST_BACKED_LAYERS else None
+                )
+                await adapter.apply_bypass_hardening(
+                    credentials,
+                    layers=kept,
+                    doh_ipv4=payload.doh_ipv4 if payload else [],
+                    doh_hostnames=payload.doh_hostnames if payload else [],
+                    sni_hostnames=payload.sni_hostnames if payload else [],
+                )
+                row = await self.repository.update_router_location(
+                    row,
+                    {
+                        "bypass_layers": sorted(kept),
+                        "bypass_lists_sha": payload.sha if payload else None,
+                    },
+                )
+        elif row.bypass_hardening_enabled:
             await adapter.remove_bypass_hardening(credentials)
             row = await self.repository.update_router_location(
                 row,
@@ -1225,9 +1252,15 @@ class DnsFilteringService:
     ) -> DnsFilteringRouterLocation:
         """Opt-in: converge the router's DNS-bypass layers on exactly
         ``layers`` (default: every layer except VPN blocking), or remove all
-        of them when ``enabled`` is false. Only on a router already switched
-        to Gateway -- without it, forcing guests onto the router's resolver
-        buys the category filter nothing.
+        of them when ``enabled`` is false.
+
+        Needs a reason to keep guests on the router's resolver: Gateway
+        switched on (category filtering), or at least one switched-on website
+        block (content filtering's ``/ip dns static`` sinkholes, which a guest
+        who sets 8.8.8.8 or Private DNS simply walks past). With neither,
+        forcing guests onto the router's resolver buys nothing. The VPN layer
+        alone still needs Gateway: it works by adding Cloudflare's Anonymizer
+        category, which a router without Gateway does not have.
 
         Turning the VPN layer on or off also re-points the router between
         its venue's category set and the same set plus Cloudflare's
@@ -1245,7 +1278,29 @@ class DnsFilteringService:
         )
         chosen = self._chosen_layers(enabled, layers)
         row = await self.repository.get_router_location(router.id)
-        if row is None or (enabled and row.state != RouterFilteringState.ACTIVE.value):
+        gateway_active = (
+            row is not None and row.state == RouterFilteringState.ACTIVE.value
+        )
+        if enabled and not gateway_active:
+            if await self.repository.count_website_blocks(router.id) == 0:
+                raise DnsFilteringNotEnabledError(router.id)
+            if BypassLayer.VPN_BLOCK.value in chosen:
+                raise BypassLayerInvalidError(
+                    "Blocking VPN apps needs category filtering (Web filtering) "
+                    "switched on for this router."
+                )
+            if row is None:
+                # A router that only blocks websites has never had a Gateway
+                # row; this one holds its bypass state and stays DISABLED.
+                row = await self.repository.create_router_location(
+                    router_id=router.id,
+                    organization_id=router.organization_id,
+                    location_id=router.location_id,
+                    state=RouterFilteringState.DISABLED.value,
+                    device_push_status=DevicePushStatus.PENDING.value,
+                    created_by=actor_user_id,
+                )
+        if row is None:
             raise DnsFilteringNotEnabledError(router.id)
         adapter = get_dns_filtering_adapter(router.vendor)
         credentials = self._resolve_device_credentials(router)
@@ -1431,11 +1486,7 @@ class DnsFilteringService:
         router = await self.router_lookup.get_router(router_id)
         ensure_not_controller_managed(router, feature=FEATURE_NAME)
         row = await self.repository.get_router_location(router.id)
-        if (
-            row is None
-            or not row.bypass_hardening_enabled
-            or row.state != RouterFilteringState.ACTIVE.value
-        ):
+        if row is None or not row.bypass_hardening_enabled:
             return "skipped"
         layers = frozenset(row.bypass_layers or [])
         if not layers & LIST_BACKED_LAYERS:
