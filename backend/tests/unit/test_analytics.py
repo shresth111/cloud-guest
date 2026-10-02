@@ -987,6 +987,11 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # Omada auth path ever reaches record_usage. See
         # app.domains.network_integration.usage_tasks's own module docstring.
         "omada-usage-sync-sweep",
+        # Aruba Instant On read-only poller: reads AP/client/SSID/alert data
+        # into instant_on_snapshots. Inert unless
+        # CLOUDGUEST_INSTANT_ON_POLLER_ENABLED is true. See
+        # app.domains.network_integration.instant_on_tasks.
+        "instant-on-poll-sweep",
     }
 
 
