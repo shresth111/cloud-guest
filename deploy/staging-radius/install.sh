@@ -4,7 +4,9 @@
 # Run as root on the box, e.g. from a laptop:
 #   ~/wyfy-ops/ssm-run-on.sh i-0a6a08bb87c6f0f84 deploy/staging-radius/install.sh
 # Optional env: REF (git ref of cloud-guest to build, default origin/staging),
-#               SKIP_BACKEND=1 (do not touch backend.env / recreate api).
+#               SKIP_BACKEND=1 (do not touch backend.env / recreate api),
+#               RADSEC_HOST (default staging.wyfyguest.com: the certbot lineage
+#               whose certificate the RadSec listener presents).
 # Never prints a secret: only sha256[:12] fingerprints.
 set -euo pipefail
 REF="${REF:-origin/staging}"
@@ -38,14 +40,57 @@ sed -i "s/^AGENT_BIND_ADDR=.*/AGENT_BIND_ADDR=$GW/" "$BASE/radius.env"
 chown ubuntu:ubuntu "$BASE/radius.env"; chmod 600 "$BASE/radius.env"
 AGENT_SECRET=$(grep '^RADIUS_AGENT_SECRET=' "$BASE/radius.env" | cut -d= -f2-)
 
-# 3. build + start
+# 3a. RadSec material (radsec/README in this dir). Server cert = the certbot
+#     lineage for $RADSEC_HOST (public CA: Instant On has no CA upload).
+#     Client trust = the staging test CA generated here (its key never leaves
+#     $RD/ca) + any device CA dropped into $RD/trust.d by radsec-map.sh.
+RADSEC_HOST="${RADSEC_HOST:-staging.wyfyguest.com}"
+LE=/etc/letsencrypt/live/$RADSEC_HOST
+RD=$BASE/radsec
+[ -s "$LE/fullchain.pem" ] || { echo "no certbot lineage $LE" >&2; exit 1; }
+install -d -m 0755 "$RD"; install -d -m 0750 "$RD/certs" "$RD/trust.d"; install -d -m 0700 "$RD/ca"
+install -d -m 0770 -g 101 "$RD/state"   # 101 = freerad inside the image
+install -m 0644 "$LE/fullchain.pem" "$RD/certs/server.pem"
+install -m 0640 -g 101 "$LE/privkey.pem" "$RD/certs/server.key"
+chgrp 101 "$RD/certs"
+if [ ! -s "$RD/ca/test-ca.key" ]; then
+  ( umask 077
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 825 \
+      -keyout "$RD/ca/test-ca.key" -out "$RD/ca/test-ca.pem" \
+      -subj "/O=Wyfy Guest STAGING/CN=Wyfy RadSec Staging Test CA" \
+      -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null )
+  log "generated the staging RadSec test CA"
+fi
+cat "$RD/ca/test-ca.pem" $(ls "$RD"/trust.d/*.pem 2>/dev/null) > "$RD/certs/trust.pem.new"
+chmod 0644 "$RD/certs/trust.pem.new"; mv "$RD/certs/trust.pem.new" "$RD/certs/trust.pem"
+[ -s "$BASE/radsec.env" ] || printf 'RADSEC_TLS_MAX=1.2\n' > "$BASE/radsec.env"
+chmod 600 "$BASE/radsec.env"
+# certbot renews in place; copy + restart on every renewal of this lineage.
+HOOK=/etc/letsencrypt/renewal-hooks/deploy/wyfy-staging-radsec.sh
+cat > "$HOOK" <<HOOKEOF
+#!/bin/sh
+# installed by cloud-guest deploy/staging-radius/install.sh (STAGING ONLY)
+case " \$RENEWED_DOMAINS " in *" $RADSEC_HOST "*) ;; *) exit 0;; esac
+install -m 0644 "$LE/fullchain.pem" "$RD/certs/server.pem"
+install -m 0640 -g 101 "$LE/privkey.pem" "$RD/certs/server.key"
+docker restart wyfy-staging-radius-radsec-1 >/dev/null
+HOOKEOF
+chmod 0755 "$HOOK"
+log "radsec: server cert $(openssl x509 -in "$RD/certs/server.pem" -noout -subject -enddate | tr '\n' ' ')"
+log "radsec: trust.pem = $(grep -c 'BEGIN CERTIFICATE' "$RD/certs/trust.pem") CA(s); test CA sha256 $(openssl x509 -in "$RD/ca/test-ca.pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | cut -c1-16)"
+
+# 3b. build + start (radius = UDP 1812/1813 on 3.2.1, radsec = TCP 2083 on 3.2.8)
 cd "$BASE/src"
 DC="docker compose -p wyfy-staging-radius -f deploy/staging-radius/docker-compose.yml"
-RADIUS_ENV_FILE="$BASE/radius.env" $DC build -q
-RADIUS_ENV_FILE="$BASE/radius.env" $DC up -d
-for _ in $(seq 1 30); do docker logs wyfy-staging-radius-radius-1 2>&1 | grep -q 'Ready to process requests' && break; sleep 1; done
-docker logs wyfy-staging-radius-radius-1 2>&1 | grep -q 'Ready to process requests' || { docker logs --tail 50 wyfy-staging-radius-radius-1; exit 1; }
-log "freeradius ready; agent on $GW:9092"
+export RADIUS_ENV_FILE="$BASE/radius.env" RADSEC_ENV_FILE="$BASE/radsec.env" RADSEC_DIR="$RD"
+$DC build -q
+$DC up -d
+for c in radius radsec; do
+  for _ in $(seq 1 40); do docker logs wyfy-staging-radius-$c-1 2>&1 | grep -q 'Ready to process requests' && break; sleep 1; done
+  docker logs wyfy-staging-radius-$c-1 2>&1 | grep -q 'Ready to process requests' || { docker logs --tail 50 wyfy-staging-radius-$c-1; exit 1; }
+done
+log "freeradius ready (udp 1812/1813 + radsec tcp 2083); agent on $GW:9092"
+log "listeners: $(ss -Hltnu '( sport = :1812 or sport = :1813 or sport = :2083 )' | awk '{print $1"/"$5}' | sort -u | tr '\n' ' ')"
 
 # 4. staging backend env
 if [ "${SKIP_BACKEND:-0}" != 1 ]; then
