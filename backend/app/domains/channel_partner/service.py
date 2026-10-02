@@ -515,6 +515,55 @@ class ChannelPartnerService:
         )
         return updated
 
+    # -- delete (Master console) ----------------------------------------------
+
+    async def delete_partner(
+        self, channel_partner_id: uuid.UUID, *, actor_user_id: uuid.UUID | None
+    ) -> ChannelPartner:
+        """Soft-deletes one channel partner: the row is flagged, never
+        removed.
+
+        Mirrors ``OrganizationService.archive_organization``: first moves
+        the business-lifecycle ``status`` to its inactive value (with
+        ``updated_by``), then sets the data-lifecycle ``is_deleted``/
+        ``deleted_at`` flag -- so a deleted row read straight from the
+        table is never mistaken for a live, active partner. Nothing else
+        in the schema holds a foreign key to ``channel_partners``, so the
+        flag breaks no reference.
+
+        Deleting a missing or already-deleted partner raises
+        ``ChannelPartnerNotFoundError`` (404), because ``get_partner``
+        already treats an ``is_deleted`` row as absent -- same idempotency
+        call ``QuotationService.delete_quotation`` makes, so a retried
+        click never writes a second ``deleted_at`` or a duplicate audit
+        entry.
+        """
+        partner = await self.get_partner(channel_partner_id)
+        previous_status = partner.status
+        updated = await self.repository.update_partner(
+            partner,
+            {
+                "status": ChannelPartnerStatus.INACTIVE.value,
+                "updated_by": actor_user_id,
+            },
+        )
+        deleted = await self.repository.soft_delete_partner(updated)
+        logger.info(
+            "channel_partner_deleted",
+            extra={"channel_partner_id": str(deleted.id)},
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.CHANNEL_PARTNER_DELETED,
+            deleted,
+            f"Channel partner '{deleted.name}' deleted",
+            event_metadata={
+                "previous_status": previous_status,
+                "gst_number": deleted.gst_number,
+            },
+        )
+        return deleted
+
     async def _audit(
         self,
         actor_user_id: uuid.UUID | None,

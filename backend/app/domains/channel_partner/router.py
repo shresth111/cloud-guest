@@ -17,7 +17,9 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.auth.schemas import MessageResponse
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_channel_partner_service
 from .models import ChannelPartner
@@ -291,6 +293,41 @@ async def revoke_channel_partner(
         success=True,
         message=f"Channel partner '{partner.name}' revoked",
         data=response_payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.delete(
+    "/{channel_partner_id}",
+    response_model=ApiResponse[MessageResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("channel_partners.delete", scope=ScopeType.GLOBAL))
+    ],
+)
+async def delete_channel_partner(
+    request: Request,
+    channel_partner_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: ChannelPartnerService = Depends(get_channel_partner_service),
+):
+    """Soft-deletes one channel partner -- the row is flagged
+    (``is_deleted``/``deleted_at``, status ``inactive``), never removed;
+    see ``service.ChannelPartnerService.delete_partner``. ``404`` for a
+    missing or already-deleted id.
+
+    ``scope=ScopeType.GLOBAL`` is pinned explicitly for the same reason
+    ``app.domains.quotation.router.delete_quotation`` documents: without
+    it ``RequirePermission`` infers the scope from the caller's own scope
+    headers, and a channel partner carries no ``organization_id`` to
+    re-check against, so the permission check is the whole authorization.
+    Pinned, only a GLOBAL grant of ``channel_partners.delete`` passes.
+    """
+    await service.delete_partner(channel_partner_id, actor_user_id=uuid.UUID(user.id))
+    return build_response(
+        success=True,
+        message="Channel partner deleted",
+        data=MessageResponse(message="Channel partner deleted").model_dump(),
         request_id=_request_id(request),
     )
 
