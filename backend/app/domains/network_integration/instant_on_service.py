@@ -353,6 +353,41 @@ class InstantOnReadService:
         await self._audit(site, actor_user_id=actor_user_id, created=False)
         return site
 
+    async def site_in_use(self, site_id: str) -> InstantOnSite | None:
+        """The live mapping (on a live router) for this Instant On site id, or
+        ``None``. A malformed id is ``invalid_site_id``, the same refusal
+        ``configure_site`` gives."""
+        try:
+            clean_site_id = validate_site_id(site_id)
+        except ValueError:
+            raise InstantOnSiteNotConfigurableError("invalid_site_id") from None
+        return await self.repository.get_live_site_by_site_id(clean_site_id)
+
+    async def release_sites_for_router(
+        self, router_id: uuid.UUID, *, actor_user_id: uuid.UUID | None = None
+    ) -> int:
+        """Soft-delete the router's site mapping when the router is
+        decommissioned, audited. Returns how many were released."""
+        sites = await self.repository.soft_delete_sites_for_router(router_id)
+        for site in sites:
+            if self.audit_writer is not None:
+                await self.audit_writer.create_audit_log_entry(
+                    actor_user_id=actor_user_id,
+                    action="instant_on_site.delete",
+                    entity_type="instant_on_site",
+                    entity_id=site.id,
+                    description=(
+                        "Instant On site mapping removed with its fleet device"
+                    ),
+                    organization_id=site.organization_id,
+                    location_id=site.location_id,
+                    event_metadata={
+                        "router_id": str(site.router_id),
+                        "site_id": site.site_id,
+                    },
+                )
+        return len(sites)
+
     async def _audit(
         self, site: InstantOnSite, *, actor_user_id: uuid.UUID | None, created: bool
     ) -> None:
