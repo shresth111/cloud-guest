@@ -106,6 +106,8 @@ __all__ = [
     "SyncStatus",
     "TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP",
     "TASK_RUN_OMADA_USAGE_SYNC_SWEEP",
+    "INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_INSTANT_ON_POLL_SWEEP",
 ]
 
 
@@ -772,6 +774,9 @@ class ErrorCode(StrEnum):
     # more than one SSID there.
     GUEST_SSID_NOT_FOUND = "NETWORK_INTEGRATION_GUEST_SSID_NOT_FOUND"
     GUEST_SSID_AMBIGUOUS = "NETWORK_INTEGRATION_GUEST_SSID_AMBIGUOUS"
+    # Master mapping of a fleet router to an Aruba Instant On site was
+    # refused: not a NAS-only device, no location, or a malformed site id.
+    INSTANT_ON_SITE_NOT_CONFIGURABLE = "INSTANT_ON_SITE_NOT_CONFIGURABLE"
 
 
 # ============================================================================
@@ -957,6 +962,16 @@ OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS = 300.0
 # one tick must not run unbounded and overlap the next. Ordered by
 # ``last_sync_at`` ascending so the most stale venues go first.
 OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN = 50
+
+# Aruba Instant On read-only poller. The Beat tick is the floor of the
+# per-kind cadences (Settings.instant_on_*_poll_seconds): each tick polls
+# only the snapshot kinds whose own period has elapsed, the same "Beat is the
+# floor, the row decides" arrangement as the inventory sync sweep above. See
+# ``app.domains.network_integration.instant_on_tasks``.
+TASK_RUN_INSTANT_ON_POLL_SWEEP = (
+    "app.domains.network_integration.instant_on_tasks.run_instant_on_poll_sweep"
+)
+INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS = 60.0
 
 # ============================================================================
 # Portal authorize rate limiting

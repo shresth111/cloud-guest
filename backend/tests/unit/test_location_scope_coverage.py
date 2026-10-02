@@ -123,7 +123,7 @@ LOCATION_SCOPED: dict[str, str] = {
         "composed into eleven other domains."
     ),
     "network_integration": (
-        "TWO location-bearing models, and the by-id surface is a single "
+        "Location-bearing models, and the by-id surface is a single "
         "chokepoint. `NetworkIntegration` carries a nullable `location_id` "
         "and is reached by `{integration_id}` on fifteen routes; every one "
         "of them funnels through "
@@ -146,7 +146,15 @@ LOCATION_SCOPED: dict[str, str] = {
         "joining WiFi. That route does not use the confinement at all -- it "
         "proves an ACTIVE GuestSession whose own organization AND location "
         "match the body, and resolves the integration from the session's "
-        "venue rather than the caller's."
+        "venue rather than the caller's. "
+        "`InstantOnSite` (Aruba Instant On read cache) is the third: its "
+        "customer routes take only `{location_id}`, resolve the row with the "
+        "caller's organization AND that location in the WHERE, then apply "
+        "`enforce_entity_location` to the row "
+        "(`InstantOnReadService.customer_view`); the service is built by "
+        "`get_instant_on_read_service` with the STRICT `CallerLocationScope`, "
+        "since no guest-facing route composes it. Its by-id reads "
+        "(`{router_id}`) are Master-only, pinned to ScopeType.GLOBAL."
     ),
     "monitoring": (
         "Seven service classes; only one owns a location-bearing row reached "

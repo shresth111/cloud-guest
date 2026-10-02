@@ -54,6 +54,7 @@ __all__ = [
     "GuestSsidAmbiguousError",
     "GuestSsidInUseError",
     "GuestSsidNotFoundError",
+    "InstantOnSiteNotConfigurableError",
     "NetworkIntegrationAlreadyExistsError",
     "NetworkIntegrationCredentialsRequiredError",
     "ClientActionUnavailableError",
@@ -1023,3 +1024,28 @@ PROVIDER_ERRORS_BY_CODE: dict[str, type[ProviderError]] = {
     ErrorCode.TLS_PIN_MISMATCH.value: ProviderTlsPinMismatchError,
     ErrorCode.PERMISSION_DENIED.value: ProviderPermissionDeniedError,
 }
+
+
+class InstantOnSiteNotConfigurableError(NetworkIntegrationError):
+    """The Master console tried to map a fleet router to an Aruba Instant On
+    site and the router cannot be one: it is not a NAS-only (Instant On)
+    device, it has no location, or the site id is not a plain token. 422,
+    with the machine reason in ``data.reason``."""
+
+    _MESSAGES = {
+        "not_nas_only_vendor": "Only an Aruba Instant On device can be mapped "
+        "to an Instant On site.",
+        "no_location": "This device has no location, so its Instant On data "
+        "would belong to no venue.",
+        "invalid_site_id": "That is not a valid Instant On site id.",
+    }
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(
+            self._MESSAGES.get(reason, "This device cannot be mapped to an "
+            "Instant On site."),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code=ErrorCode.INSTANT_ON_SITE_NOT_CONFIGURABLE,
+            data={"reason": reason},
+        )

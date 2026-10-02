@@ -2144,6 +2144,112 @@ class Settings(BaseSettings):
             "elapsed."
         ),
     )
+    # ------------------------------------------------------------------
+    # Aruba Instant On read-only poller (unofficial portal API). See
+    # app/domains/network_integration/instant_on_tasks.py. Nothing here is
+    # a secret: the service account's username/password live in AWS
+    # Secrets Manager and only the ARN is configured.
+    # ------------------------------------------------------------------
+    instant_on_poller_enabled: bool = Field(
+        default=False,
+        description=(
+            "Global kill switch for the Instant On poller. False (the "
+            "default) means the Beat task wakes, does nothing and contacts "
+            "nobody, whatever the per-venue flags say. Override via "
+            "CLOUDGUEST_INSTANT_ON_POLLER_ENABLED."
+        ),
+    )
+    instant_on_service_account_secret_arn: str = Field(
+        default="",
+        description=(
+            "ARN of the AWS Secrets Manager secret holding the Wyfy Instant "
+            "On service account, as JSON {\"username\": ..., \"password\": "
+            "...}. Only the ARN is configured; the values are fetched at "
+            "login time and never logged. Empty means 'not configured' and "
+            "every Instant On read reports auth_failed instead of guessing. "
+            "Override via CLOUDGUEST_INSTANT_ON_SERVICE_ACCOUNT_SECRET_ARN."
+        ),
+    )
+    instant_on_secrets_region: str = Field(
+        default="ap-south-1",
+        description=(
+            "Region of the Secrets Manager secret above. Override via "
+            "CLOUDGUEST_INSTANT_ON_SECRETS_REGION."
+        ),
+    )
+    instant_on_api_base_url: str = Field(
+        default="https://portal.instant-on.hpe.com/api",
+        description="Instant On portal REST base (settings.json restApiUrl).",
+    )
+    instant_on_sso_base_url: str = Field(
+        default="https://sso.arubainstanton.com",
+        description="Instant On SSO base (settings.json ssoFqdn).",
+    )
+    instant_on_sso_client_id: str = Field(
+        default="",
+        description=(
+            "The portal's PUBLIC OAuth client id (settings.json "
+            "ssoClientIdAuthZ; there is no client secret). Empty means "
+            "'read it from the portal's settings.json at login time'."
+        ),
+    )
+    instant_on_sso_redirect_uri: str = Field(
+        default="https://portal.instant-on.hpe.com",
+        description=(
+            "redirect_uri used in the PKCE login. UNVERIFIED until hardware "
+            "check H2 -- the value the portal itself registers."
+        ),
+    )
+    instant_on_api_version: int = Field(
+        default=28,
+        ge=1,
+        le=1000,
+        description=(
+            "Value sent as x-ion-api-version. 28 is what the portal bundle "
+            "sent on 2026-10-02 (22 was also accepted). Pinned so a change "
+            "is a deliberate deploy; a server that stops accepting it is "
+            "reported as api_state=incompatible, never guessed around."
+        ),
+    )
+    instant_on_http_timeout_seconds: float = Field(default=15.0, ge=1, le=60)
+    instant_on_fast_poll_seconds: int = Field(
+        default=60,
+        ge=30,
+        le=3600,
+        description="Cadence for inventory (APs) and clientSummary (clients).",
+    )
+    instant_on_health_poll_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=86400,
+        description="Cadence for systemHealth, networksSummary (SSIDs), alerts.",
+    )
+    instant_on_usage_poll_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=86400,
+        description="Cadence for the rolling 24h per-client usage read.",
+    )
+    instant_on_stale_after_polls: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description=(
+            "A snapshot older than this many of its own poll periods is "
+            "reported as unavailable ('stale'), never as current data."
+        ),
+    )
+    instant_on_auth_failure_cooldown_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=86400,
+        description=(
+            "After a full login fails (wrong password, MFA, captcha, locked "
+            "account) no further login is attempted for this long. Never a "
+            "tight retry loop against somebody else's SSO."
+        ),
+    )
+    instant_on_max_sites_per_run: int = Field(default=200, ge=1, le=5000)
     omada_allow_private_controller_urls: bool = Field(
         default=False,
         description=(

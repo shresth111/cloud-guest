@@ -454,6 +454,16 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "why' instead of 404 at such a venue. Wrapping it in "
         "`agent_managed_only` would make it find nothing, by definition."
     ),
+    "app/domains/network_integration/instant_on_repository.py::"
+    "InstantOnRepository.list_pollable_sites": (
+        "Joins `routers` only to narrow `instant_on_sites` to rows whose fleet "
+        "router is live AND `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant "
+        "On), in the WHERE. Vendor-scoped by construction: the Instant On "
+        "poller can only ever load a NAS-only row, never a MikroTik or Omada "
+        "one, and a router relabelled to another vendor drops out of polling "
+        "without anyone flipping its flag. `agent_managed_only` would make it "
+        "empty by definition."
+    ),
     # -- the router domain's own accessors (names) -------------------------
     "app/domains/router/repository.py::RouterRepository.names_for_routers": (
         "Resolves a page of router ids the caller already holds to their "
