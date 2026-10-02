@@ -1111,6 +1111,11 @@ class AuditAction(StrEnum):
     # for, and the per-channel outcome rides along in ``event_metadata``.
     CHANNEL_PARTNER_REVOKED = "channel_partner_revoked"
     CHANNEL_PARTNER_WELCOME_RESENT = "channel_partner_welcome_resent"
+    # Soft delete (``DELETE /channel-partners/{id}``): removes the partner
+    # from every console read path, so -- exactly as ``QUOTATION_DELETED``
+    # below argues -- "who made this disappear, and when" has no other
+    # source than this entry.
+    CHANNEL_PARTNER_DELETED = "channel_partner_deleted"
 
     # Quotation domain event -- written through this same table by
     # ``app.domains.quotation.service.QuotationService`` via the identical
