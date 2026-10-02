@@ -40,6 +40,7 @@ __all__ = [
     "RadiusNasClientNotFoundError",
     "RadiusNasAuthenticationError",
     "RadiusNasAlreadyRegisteredError",
+    "PublicNasRegistrationRefusedError",
     "RadiusNasNotFoundError",
     "RadiusNasBridgeDeregistrationError",
     "CrossOrganizationNasAccessError",
@@ -177,12 +178,24 @@ class VenueClosedError(GuestError):
     Carries the venue's own ``business_hours_closed_message`` when one is set,
     so the guest sees the words the operator wrote rather than a generic
     refusal.
+
+    Also carries a machine-readable ``data["code"]``, the same contract
+    ``guest_access.exceptions.WhitelistOnlyAccessDeniedError`` already keeps
+    for its own refusal. Without it the only thing distinguishing this from
+    any other 403 on the wire is the message string, so the portal could not
+    route a closed-venue refusal to its own closed screen -- it had to either
+    match the venue's free text (the operator can type anything) or leave the
+    guest on a red line under a field, which is not what "outside those hours,
+    guests see a 'we're closed' message instead of a working login screen"
+    promises. Founder QA: "after complete login should show mentioned
+    message".
     """
 
     def __init__(self, closed_message: str | None = None) -> None:
         super().__init__(
             closed_message or "This WiFi network is closed right now.",
             status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "venue_closed"},
         )
 
 
@@ -349,6 +362,24 @@ class RadiusNasAlreadyRegisteredError(GuestError):
         )
 
 
+class PublicNasRegistrationRefusedError(GuestError):
+    """A public-address NAS registration this platform will not make, with
+    the one concrete reason.
+
+    Raised before anything is written or pushed. ``data.code`` is stable so
+    the Master console can tell this refusal from a hub failure (502).
+    """
+
+    CODE = "PUBLIC_NAS_REGISTRATION_REFUSED"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            detail,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            data={"code": self.CODE},
+        )
+
+
 class RadiusNasNotFoundError(GuestError):
     """No ``RadiusNasClient`` exists with this primary-key id -- the
     admin-facing CRUD 404, distinct from ``RadiusNasClientNotFoundError``
@@ -420,6 +451,14 @@ class InvalidAnalyticsDateRangeError(GuestError):
             "start_date must be before or equal to end_date",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class InvalidDashboardSeriesRangeError(GuestError):
+    """422 for a dashboard-series window that is empty, inverted, or longer
+    than ``constants.MAX_DASHBOARD_SERIES_WINDOW_DAYS``."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
 
 class TooManyDeviceIdsError(GuestError):

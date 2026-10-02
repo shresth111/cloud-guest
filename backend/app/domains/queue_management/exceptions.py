@@ -200,3 +200,28 @@ class QueueMissingCredentialsError(QueueManagementError):
             "(management IP, API username, or API secret)",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class ControllerQueueUnavailableError(QueueManagementError):
+    """A speed limit could not reach a controller-managed venue.
+
+    Emphatically **not** :class:`QueueMissingCredentialsError`, which is what
+    this case used to produce: that error tells an operator to supply a
+    management IP, an API username and an API secret for a device that has
+    none of the three and needs none of the three, so the fix it names is
+    impossible and the real cause is invisible. A controller-managed row is
+    reached through the venue's controller, and when that path is unavailable
+    the honest thing to say is that -- not to send somebody looking for
+    credentials.
+
+    502 rather than 400: the request was correct and there is nothing for the
+    caller to change.
+    """
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            "This venue's network is run from a controller, and this platform "
+            "could not reach it to apply the speed limit. Nothing was "
+            "changed on the venue's network.",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )

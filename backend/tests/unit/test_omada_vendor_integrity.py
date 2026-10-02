@@ -210,7 +210,11 @@ class TestVendorIsAGuardedWrite:
         assert router.vendor == "mikrotik"
 
     def test_the_supported_vocabulary_is_only_what_is_implemented(self) -> None:
-        assert SUPPORTED_ROUTER_VENDORS == ("mikrotik", "tplink_omada")
+        assert SUPPORTED_ROUTER_VENDORS == (
+            "mikrotik",
+            "tplink_omada",
+            "aruba_instant_on",
+        )
 
     async def test_agent_evidence_refuses_a_controller_claim(self) -> None:
         service, repo, locations, orgs, audit = make_service()
@@ -555,10 +559,25 @@ GATED_WRITE_PATHS: tuple[tuple[str, str], ...] = (
     ("queue_management", "create_assignment"),
     ("hotspot", "create_profile"),
     ("firewall", "create_rule"),
+    ("firewall", "push_rules_to_router"),
+    ("firewall", "install_firewall_band"),
+    # Read-only, but it decrypts the router's API secret and dials 8728.
+    ("firewall", "read_firewall_band_state"),
+    ("content_filtering", "create_rule"),
+    ("content_filtering", "push_rule_to_device"),
     ("provisioning_engine", "create_job"),
     ("provisioning_engine", "execute_console_command"),
     ("provisioning_engine", "discover_device"),
     ("network_diagnostics", "_execute"),
+    # Cloudflare Gateway DNS filtering: each of these reaches a router over
+    # 8728 (a whole-router resolver switch, its restore, the bypass rules)
+    # and the first two also create/delete a Cloudflare location.
+    ("dns_filtering", "enable_router"),
+    ("dns_filtering", "disable_router"),
+    ("dns_filtering", "set_bypass_hardening"),
+    # The scheduled DoH-list push re-converges a router's bypass layers
+    # over 8728.
+    ("dns_filtering", "push_bypass_lists_to_router"),
 )
 
 

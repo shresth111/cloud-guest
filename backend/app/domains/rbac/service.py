@@ -38,12 +38,15 @@ from .exceptions import (
     LastGlobalAdminError,
     LastOrganizationOwnerError,
     OverrideEscalationError,
+    OwnerRoleProtectedError,
     PermissionGroupNotFoundError,
     PermissionNotFoundError,
     RoleEscalationError,
     RoleInactiveError,
+    RoleInUseError,
     RoleNotCloneableError,
     RoleNotFoundError,
+    SharedRoleImmutableError,
     SystemRoleImmutableError,
     UserRoleAssignmentNotFoundError,
 )
@@ -146,6 +149,13 @@ class RBACService:
             # Callers with no organization context (the master/platform
             # console managing the full role catalog) are unaffected.
             roles = [role for role in roles if role.scope_type != ScopeType.GLOBAL]
+            hidden = await self._hidden_shared_role_ids(requesting_organization_id)
+            if hidden:
+                roles = [
+                    role
+                    for role in roles
+                    if not (role.organization_id is None and role.id in hidden)
+                ]
         return roles
 
     async def get_role(
@@ -155,7 +165,39 @@ class RBACService:
         if role is None:
             raise RoleNotFoundError(role_id)
         self._enforce_role_tenant_access(role, requesting_organization_id)
+        if (
+            requesting_organization_id is not None
+            and role.organization_id is None
+            and role.id
+            in await self._hidden_shared_role_ids(requesting_organization_id)
+        ):
+            # A shared role this organization deleted (or replaced with its
+            # own edited copy) no longer exists as far as the organization
+            # is concerned -- it can't be assigned, edited or cloned again.
+            raise RoleNotFoundError(role_id)
         return role
+
+    async def _hidden_shared_role_ids(
+        self, organization_id: uuid.UUID
+    ) -> set[uuid.UUID]:
+        """Shared (``organization_id IS NULL``) roles this organization has
+        removed from its own Staff Access, recorded as a disabled
+        ``OrganizationRole`` row -- that table's documented purpose ("which
+        roles are enabled for this org"). The shared role row itself is never
+        touched, so every other organization keeps it."""
+        rows = await self.repository.list_organization_roles(organization_id)
+        return {row.role_id for row in rows if not row.is_enabled}
+
+    @staticmethod
+    def _is_shared_role_in_tenant_context(
+        role: Role, requesting_organization_id: uuid.UUID | None
+    ) -> bool:
+        """True when a caller acting inside one organization targets a role
+        that every organization shares. Mutating that row in place would
+        change it for every customer, so these calls copy-on-write or hide
+        instead. A platform caller with no organization context (the Master
+        console's role catalog) is unaffected."""
+        return requesting_organization_id is not None and role.organization_id is None
 
     def _enforce_role_tenant_access(
         self, role: Role, requesting_organization_id: uuid.UUID | None
@@ -247,6 +289,17 @@ class RBACService:
             role_id, requesting_organization_id=requesting_organization_id
         )
 
+        if self._is_shared_role_in_tenant_context(role, requesting_organization_id):
+            # Copy-on-write: the organization gets its own editable copy of
+            # the shared role, its staff move onto it, and the shared role
+            # disappears from its Staff Access. The edit below then lands on
+            # the copy, never on the row every other organization uses.
+            role = await self._copy_shared_role_into_organization(
+                role,
+                organization_id=requesting_organization_id,  # type: ignore[arg-type]
+                actor_user_id=actor_user_id,
+            )
+
         if role.is_system_role and ({"name", "slug", "scope_type"} & data.keys()):
             raise SystemRoleImmutableError(role.name, "renamed or rescoped")
 
@@ -319,10 +372,21 @@ class RBACService:
         role = await self.get_role(
             role_id, requesting_organization_id=requesting_organization_id
         )
+
+        if self._is_shared_role_in_tenant_context(role, requesting_organization_id):
+            await self._hide_shared_role_for_organization(
+                role,
+                organization_id=requesting_organization_id,  # type: ignore[arg-type]
+                actor_user_id=actor_user_id,
+            )
+            return
+
         if role.is_system_role:
             raise SystemRoleImmutableError(role.name, "deleted")
 
         affected_users = await self.repository.get_user_ids_with_role(role.id)
+        if affected_users:
+            raise RoleInUseError(role.name, len(affected_users))
         await self.repository.soft_delete_role(role)
         await self._invalidate_users(affected_users)
         await self._audit(
@@ -332,6 +396,140 @@ class RBACService:
             entity_id=role.id,
             description=f"Role '{role.name}' deleted",
             organization_id=role.organization_id,
+        )
+
+    async def _copy_shared_role_into_organization(
+        self,
+        source: Role,
+        *,
+        organization_id: uuid.UUID,
+        actor_user_id: uuid.UUID,
+    ) -> Role:
+        """Give ``organization_id`` its own copy of a shared role.
+
+        * Same name, slug, description, scope and permissions, so nothing
+          changes for the staff who hold it until the edit that triggered
+          this is applied to the copy. The slug is kept because slug is how
+          a role is recognised elsewhere; it is unique per organization, so
+          it cannot collide with the shared row.
+        * ``parent_role_id`` is deliberately **not** set to the source (unlike
+          :meth:`clone_role`): the permission resolver inherits every
+          ancestor's grants, so a copy parented on its source could never
+          have a permission removed.
+        * This organization's active assignments move to the copy; every
+          other organization's stay on the shared role.
+        * The shared role is hidden for this organization only.
+        """
+        if source.scope_type == ScopeType.GLOBAL.value:
+            # Platform roles are never listed to a tenant (see list_roles);
+            # there is nothing here for an organization to customize.
+            raise CrossTenantAccessError()
+        if source.slug == _ORGANIZATION_OWNER_ROLE_SLUG:
+            raise OwnerRoleProtectedError(source.name, "edited")
+
+        existing = await self.repository.get_role_by_slug(source.slug, organization_id)
+        if existing is not None:
+            raise DuplicateRoleError(source.slug, organization_id)
+
+        copy = await self.repository.create_role(
+            name=source.name,
+            slug=source.slug,
+            description=source.description,
+            is_system_role=False,
+            is_template=False,
+            is_active=True,
+            scope_type=source.scope_type,
+            organization_id=organization_id,
+            parent_role_id=None,
+            created_by=actor_user_id,
+        )
+        for scope_type_value in await self.repository.get_role_scope_types(source.id):
+            await self.repository.add_role_scope(copy.id, ScopeType(scope_type_value))
+        for row in await self._flattened_permission_rows(source):
+            await self.repository.add_role_permission(
+                copy.id, row.permission_id, granted_by=actor_user_id
+            )
+
+        moved_users = await self.repository.reassign_role_assignments_in_organization(
+            source.id, copy.id, organization_id
+        )
+        await self.repository.upsert_organization_role(
+            organization_id=organization_id,
+            role_id=source.id,
+            is_enabled=False,
+            is_default_for_new_members=False,
+        )
+        await self._invalidate_users(moved_users)
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROLE_CLONED,
+            entity_type="role",
+            entity_id=copy.id,
+            description=(
+                f"Role '{source.name}' customized for this organization "
+                f"({len(moved_users)} staff moved to the copy)"
+            ),
+            organization_id=organization_id,
+            metadata={
+                "source_role_id": str(source.id),
+                "copy_on_write": True,
+                "reassigned_user_count": len(moved_users),
+            },
+        )
+        return copy
+
+    async def _flattened_permission_rows(self, role: Role) -> list[RolePermission]:
+        """A role's own *and inherited* active permission rows, deduplicated
+        by permission -- what a flattened copy must carry to grant exactly
+        what the source grants, given the copy has no parent (see
+        :meth:`_copy_shared_role_into_organization`)."""
+        chain = [role, *await self.repository.get_parent_chain(role.id, max_depth=50)]
+        seen: set[uuid.UUID] = set()
+        rows: list[RolePermission] = []
+        for member in chain:
+            for row in await self.repository.get_role_permissions(member.id):
+                if row.permission is None or not row.permission.is_active:
+                    continue
+                if row.permission_id in seen:
+                    continue
+                seen.add(row.permission_id)
+                rows.append(row)
+        return rows
+
+    async def _hide_shared_role_for_organization(
+        self,
+        role: Role,
+        *,
+        organization_id: uuid.UUID,
+        actor_user_id: uuid.UUID,
+    ) -> None:
+        """ "Delete" a shared role for one organization: record it as disabled
+        for that organization so it stops being listed or assignable there.
+        The shared row and every other organization's use of it are
+        untouched."""
+        if role.scope_type == ScopeType.GLOBAL.value:
+            raise CrossTenantAccessError()
+        if role.slug == _ORGANIZATION_OWNER_ROLE_SLUG:
+            raise OwnerRoleProtectedError(role.name, "deleted")
+        holders = await self.repository.count_active_role_assignments_in_organization(
+            role.id, organization_id
+        )
+        if holders:
+            raise RoleInUseError(role.name, holders)
+        await self.repository.upsert_organization_role(
+            organization_id=organization_id,
+            role_id=role.id,
+            is_enabled=False,
+            is_default_for_new_members=False,
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROLE_DELETED,
+            entity_type="role",
+            entity_id=role.id,
+            description=f"Role '{role.name}' removed from this organization",
+            organization_id=organization_id,
+            metadata={"hidden_for_organization": True},
         )
 
     async def set_role_active(
@@ -345,6 +543,10 @@ class RBACService:
         role = await self.get_role(
             role_id, requesting_organization_id=requesting_organization_id
         )
+        if self._is_shared_role_in_tenant_context(role, requesting_organization_id):
+            raise SharedRoleImmutableError(
+                role.name, "activated" if is_active else "deactivated"
+            )
         updated = await self.repository.update_role(
             role, {"is_active": is_active, "updated_by": actor_user_id}
         )
@@ -448,6 +650,8 @@ class RBACService:
         role = await self.get_role(
             role_id, requesting_organization_id=requesting_organization_id
         )
+        if self._is_shared_role_in_tenant_context(role, requesting_organization_id):
+            raise SharedRoleImmutableError(role.name, "modified directly")
         if role.is_system_role:
             raise SystemRoleImmutableError(
                 role.name, "modified directly (clone it instead)"
@@ -477,6 +681,8 @@ class RBACService:
         role = await self.get_role(
             role_id, requesting_organization_id=requesting_organization_id
         )
+        if self._is_shared_role_in_tenant_context(role, requesting_organization_id):
+            raise SharedRoleImmutableError(role.name, "modified directly")
         if role.is_system_role:
             raise SystemRoleImmutableError(
                 role.name, "modified directly (clone it instead)"

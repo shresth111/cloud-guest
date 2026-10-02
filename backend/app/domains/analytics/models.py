@@ -45,11 +45,45 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
+
+# The natural key of an ``AnalyticsSnapshot`` row -- the tuple that
+# identifies "one rollup", as opposed to "one *write* of that rollup".
+# ``uq_analytics_snapshots_natural_key`` (see ``AnalyticsSnapshot``'s
+# indexing rationale) enforces it, and
+# ``repository.AnalyticsRepository.upsert_snapshot`` names exactly these
+# columns as its ``ON CONFLICT`` arbiter, so the two can never drift.
+SNAPSHOT_NATURAL_KEY_COLUMNS = (
+    "snapshot_type",
+    "organization_id",
+    "location_id",
+    "period_start",
+    "granularity",
+)
+
+# The unique index is PARTIAL, and this is its predicate. It covers exactly
+# the rows the aggregation pipeline can itself produce: a platform snapshot
+# (both scope columns NULL), or any scoped snapshot (``organization_id``
+# set). What it deliberately excludes is an **orphaned** scoped row --
+# ``organization_id IS NULL`` on an ``org_daily_summary``/
+# ``location_daily_summary``, which this codebase has no writer for and
+# which can only be produced by ``ondelete="SET NULL"`` firing when an
+# organization row is hard-deleted out from under its own history.
+#
+# Excluding them matters twice over. Two different deleted organizations'
+# snapshots for the same day are indistinguishable once both scope columns
+# read NULL, so a total index (with ``NULLS NOT DISTINCT``, which is what
+# makes the platform rows dedupe at all) would fold two tenants' real,
+# separate history into one row and call it a duplicate. And it would make
+# deleting an organization that has more than one day of orphanable
+# history fail on a unique violation raised by the FK's own ``SET NULL``.
+SNAPSHOT_NATURAL_KEY_INDEX_WHERE = (
+    "organization_id IS NOT NULL OR snapshot_type = 'platform_daily_summary'"
+)
 
 
 class AnalyticsSnapshot(BaseModel):
@@ -111,6 +145,19 @@ class AnalyticsSnapshot(BaseModel):
 
     ## Indexing rationale
 
+    ``uq_analytics_snapshots_natural_key`` is the one index here that is
+    not about read speed: it is the constraint that makes a rollup
+    converge. ``(snapshot_type, organization_id, location_id,
+    period_start, granularity)`` identifies *one rollup*; the aggregation
+    pipeline recomputes it on every Beat tick (96 times a day for the
+    15-minute rolling window, all of them sharing one ``period_start`` --
+    see ``validators.day_bounds_utc``), and without this index each of
+    those recomputations appended another row instead of replacing the
+    previous one. See ``SNAPSHOT_NATURAL_KEY_INDEX_WHERE`` above for why
+    it is partial and ``NULLS NOT DISTINCT``, and
+    ``repository.AnalyticsRepository.upsert_snapshot`` for the writer that
+    conflicts against it.
+
     This table is explicitly the answer to "how do we query analytics fast
     across millions of underlying rows" -- so its own query pattern must
     itself stay fast regardless of how large it grows. The dashboard read
@@ -159,6 +206,23 @@ class AnalyticsSnapshot(BaseModel):
     computation_duration_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
+        # The natural key -- one row per rollup, not one row per write.
+        # NULLS NOT DISTINCT (Postgres 15+; both docker-compose.yml and
+        # deploy/docker-compose.prod.yml run postgres:17-alpine) is what
+        # makes this index work at all here: a PLATFORM_DAILY_SUMMARY row
+        # has organization_id and location_id both NULL and an
+        # ORG_DAILY_SUMMARY row has location_id NULL, and under the default
+        # NULLS DISTINCT rule Postgres would treat every one of those as
+        # unique against every other -- the index would build, and dedupe
+        # nothing at all for the two snapshot types that most need it.
+        # See SNAPSHOT_NATURAL_KEY_INDEX_WHERE above for why it is partial.
+        Index(
+            "uq_analytics_snapshots_natural_key",
+            *SNAPSHOT_NATURAL_KEY_COLUMNS,
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+            postgresql_where=text(SNAPSHOT_NATURAL_KEY_INDEX_WHERE),
+        ),
         # Primary query pattern -- see docstring's indexing rationale.
         Index(
             "ix_analytics_snapshots_org_type_period_start",
@@ -320,4 +384,10 @@ class ScheduledReport(BaseModel):
         )
 
 
-__all__ = ["AnalyticsSnapshot", "ReportTemplate", "ScheduledReport"]
+__all__ = [
+    "SNAPSHOT_NATURAL_KEY_COLUMNS",
+    "SNAPSHOT_NATURAL_KEY_INDEX_WHERE",
+    "AnalyticsSnapshot",
+    "ReportTemplate",
+    "ScheduledReport",
+]

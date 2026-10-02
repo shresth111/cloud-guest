@@ -187,14 +187,75 @@ class GuestRuleImportRejectionCode(StrEnum):
     INVALID_LOCATION_ID = "invalid_location_id"
     #: The row named a location the caller is not confined to.
     LOCATION_OUT_OF_SCOPE = "location_out_of_scope"
+    #: The row named a well-formed UUID that is not a location of this
+    #: organization. Distinct from ``INVALID_LOCATION_ID`` (not a UUID at
+    #: all) because the operator's fix differs: one is a malformed cell,
+    #: the other is the wrong venue pasted in. Deliberately does not
+    #: distinguish "no such location" from "another tenant's location" --
+    #: see ``exceptions.InvalidAccessRuleLocationError``.
+    UNKNOWN_LOCATION = "unknown_location"
+    #: The row resolved to no location at all -- an organization-wide rule,
+    #: which applies at every venue -- and the caller holds only
+    #: location-level access. See
+    #: ``exceptions.OrganizationWideRuleScopeError``.
+    ORGANIZATION_WIDE_NOT_PERMITTED = "organization_wide_not_permitted"
     #: The optional contact ``email`` column is not email-shaped. Rejected
     #: rather than dropped: half-storing a row someone typed is how the
     #: dashboard's Whitelist form used to lose the email it collected.
     INVALID_CONTACT_EMAIL = "invalid_contact_email"
 
 
+# ============================================================================
+# Controller-side device blocks
+# ============================================================================
+
+# The periodic release of controller blocks whose rule has stopped applying.
+# See ``app.domains.guest_access.tasks`` for the full write-up: the short
+# version is that a rule's ``expires_at`` is evaluated lazily at read time,
+# nothing fires when it passes, and a controller block is durable state on a
+# customer's own hardware that nothing on the controller ever removes.
+TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP = (
+    "app.domains.guest_access.tasks.run_controller_block_release_sweep"
+)
+
+# Ten minutes. Slower than the guest session-timeout sweep because nothing
+# here is time-critical in the way a session cut-off is -- a block that
+# lapsed is a block that should go, not one that must go this second -- and
+# because every row costs a real outbound HTTPS round trip to a
+# customer-owned controller. Fast enough that "until Sunday" means Sunday.
+CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS = 600.0
+
+# Bounded per run so one tick cannot run long enough to overlap the next --
+# the same reasoning ``OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN`` carries.
+# Rows are taken oldest first, so a backlog drains in the order devices were
+# stranded rather than at random.
+CONTROLLER_BLOCK_RELEASE_MAX_PER_RUN = 200
+
+
+# ============================================================================
+# Router-side device blocks (MikroTik ip-binding)
+# ============================================================================
+
+# The same lazy-expiry problem as the controller sweep above, on RouterOS: a
+# ``BLOCKLIST`` device rule with an ``expires_at`` writes a durable
+# ``/ip hotspot ip-binding type=blocked`` row that nothing on the router
+# removes. Same interval and bound, for the same reasons; one 8728
+# round trip per open row.
+TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP = (
+    "app.domains.guest_access.tasks.run_device_block_release_sweep"
+)
+DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS = 600.0
+DEVICE_BLOCK_RELEASE_MAX_PER_RUN = 200
+
+
 __all__ = [
     "AccessRuleType",
+    "DEVICE_BLOCK_RELEASE_MAX_PER_RUN",
+    "DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP",
+    "CONTROLLER_BLOCK_RELEASE_MAX_PER_RUN",
+    "CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP",
     "BlockEnforcementStatus",
     "ACCESS_RULE_TYPE_PRECEDENCE",
     "WHITELIST_ONLY_DENIAL_REASON",

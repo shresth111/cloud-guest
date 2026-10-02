@@ -118,6 +118,7 @@ from app.domains.router.vendor_capabilities import (
 from app.domains.router_provisioning.constants import EnrollmentStatus
 from app.domains.router_provisioning.models import RouterEvent
 
+from .channel_config import ChannelConfigSummary, summarize_channel_config
 from .constants import (
     ALERT_EVENT_LOOKBACK_MINUTES,
     ALERT_TARGET_ISP_LINK,
@@ -129,6 +130,7 @@ from .constants import (
     ALERT_TARGET_ROUTER,
     ALERT_TARGET_ROUTER_REACHABILITY,
     AUDIT_LOG_SOURCE_DOMAIN,
+    CHANNEL_TEST_MESSAGE,
     DEFAULT_EVENT_TIMELINE_LIMIT,
     DEFAULT_FAILURE_SAMPLE_LIMIT,
     DEFAULT_LIST_PAGE,
@@ -152,6 +154,7 @@ from .constants import (
     ROGUE_DHCP_STATE_UNGUARDED,
     ROUTER_EVENT_SOURCE_DOMAIN,
     SOURCE_DOMAIN,
+    AlertSeverity,
     AlertStatus,
     AlertTriggerType,
     EventCategory,
@@ -161,6 +164,8 @@ from .constants import (
     HeartbeatComponentType,
     IncidentStatus,
     NotificationChannelType,
+    NotificationEventCategory,
+    NotificationLogKind,
     NotificationStatus,
     RealtimeMessageType,
     RouterLifecycleStage,
@@ -210,6 +215,7 @@ from .validators import (
     validate_date_range,
     validate_incident_status_transition,
     validate_notification_channel_config,
+    validate_notification_event_categories,
     validate_sla_target_config,
 )
 
@@ -1261,6 +1267,55 @@ def _assert_owned_by(resource, requesting_organization_id: uuid.UUID | None) -> 
         raise CrossOrganizationAccessError()
 
 
+def _assert_may_own(
+    target_organization_id: uuid.UUID | None,
+    requesting_organization_id: uuid.UUID | None,
+) -> None:
+    """Tenant guard for *creating* a monitoring resource, where the target
+    organization arrives in the request body rather than being read off a
+    row that already exists.
+
+    :func:`_assert_owned_by` closes the read side of this: a caller cannot
+    fetch a channel that is not theirs. Nothing closed the write side.
+    ``POST /notifications/channels`` took ``organization_id`` straight from
+    the payload, so a caller holding ``notifications.manage`` could name any
+    organization at all -- and ``NOTIFICATIONS`` is seeded at
+    ``ScopeType.LOCATION`` with ``GrantLevel.OPERATE`` on the ``Office
+    Admin`` and ``Location Manager`` roles, which are front-desk roles at a
+    single venue. Two things followed from that, and the second is the
+    serious one:
+
+    * naming another tenant's organization planted a channel in their
+      console that they did not create and cannot account for; and
+    * naming **no** organization created a ``NULL``-``organization_id``
+      row, which in this domain does not mean "mine, unscoped" -- it means
+      *platform-wide*, the scope a system alert rule like "Database Down"
+      delivers to. A venue's front-office account could therefore attach
+      its own Slack webhook to the platform's own alert stream and receive
+      infrastructure alerts about every tenant on the estate.
+
+    The rules mirror ``_assert_owned_by`` exactly, so what a caller may
+    create is what they may then read back -- including the deliberate
+    absence of an MSP-parent carve-out. A platform-level caller
+    (``requesting_organization_id is None``) may create anything, including
+    a platform-wide channel; anyone else may create a channel for their own
+    organization and nothing else.
+
+    Note what ``requesting_organization_id is None`` now means at the edge:
+    ``CurrentOrganization`` returns ``None`` *only* when the caller
+    explicitly asked for cross-tenant scope and holds a GLOBAL role (see
+    ``app.domains.rbac.organization_scope``), never merely because nobody
+    said. The router additionally refuses to create a channel on such a
+    request without an explicit ``organization_id`` in the body -- "all
+    organizations" is a legitimate breadth for a read and is not a place a
+    channel can be created.
+    """
+    if requesting_organization_id is None:
+        return
+    if target_organization_id != requesting_organization_id:
+        raise CrossOrganizationAccessError()
+
+
 class AlertService:
     """Alert Engine business logic: ``AlertRule`` CRUD, ``Alert`` lifecycle
     (acknowledge/resolve), and ``evaluate_alert_rules`` -- the evaluation
@@ -1339,6 +1394,7 @@ class AlertService:
         monitored_hardware_service: MonitoredHardwareService | None = None,
         caller_location_scope: LocationScope = None,
         platform_alert_emails: Sequence[str] = (),
+        platform_alert_slack_webhook_url: str = "",
     ) -> None:
         self.repository = repository
         self.notification_service = notification_service
@@ -1347,6 +1403,12 @@ class AlertService:
         # Empty (the default, and every existing caller/test) sends nothing
         # extra. See _dispatch_platform_copies.
         self.platform_alert_emails = tuple(platform_alert_emails)
+        # ``Settings.platform_alert_slack_webhook_url`` -- the same copy, to
+        # the team's own Slack channel. Independent of the inboxes above:
+        # either, both or neither may be set, and one being unreachable
+        # never costs the other. Empty (the default, and every existing
+        # caller/test) posts nothing.
+        self.platform_alert_slack_webhook_url = platform_alert_slack_webhook_url
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
         # Real-Time (BE-011 Part 3): optional, additive -- see
@@ -2446,8 +2508,20 @@ class AlertService:
     async def _dispatch_platform_copies(
         self, alert: Alert, *, already_emailed: set[str]
     ) -> None:
-        """Email ``Settings.platform_alert_emails`` about a network-
-        controller alert, naming the organization and venue.
+        """Tell the platform team about a network-controller alert, naming
+        the organization and venue: email ``Settings.platform_alert_emails``
+        and post to ``Settings.platform_alert_slack_webhook_url``.
+
+        ## Two destinations, one copy
+
+        Both carry the same alerts under the same scope, and neither
+        replaces the other or the organization's own channels. Either,
+        both, or neither may be configured. They are dispatched
+        independently and neither can cost the other: a revoked Slack
+        webhook still leaves the email copy, and an unconfigured mailbox
+        still leaves the Slack post (see
+        ``email_provider.UnconfiguredEmailProvider`` for why that case
+        fails per-send rather than at construction).
 
         ## Scope
 
@@ -2467,15 +2541,23 @@ class AlertService:
         failed, a platform address that happens to equal it would otherwise
         lose the only copy anybody got.
 
+        This applies to the email copies only. The Slack post has nothing
+        to de-duplicate against: ``already_emailed`` holds email addresses,
+        and an organization delivering to its own SLACK channel is
+        delivering to its own workspace, not the platform team's.
+
         ## Why no ``notification_logs`` row
 
-        ``notification_logs.channel_id`` is NOT NULL and these recipients
+        ``notification_logs.channel_id`` is NOT NULL and both destinations
         are a setting, not a channel. Inventing a channel row per address
-        would be a second source of truth that drifts from the env the
-        moment somebody edits it. Each copy is a structured log line
-        (``platform_alert_copy_sent`` / ``_failed``) instead.
+        or per webhook would be a second source of truth that drifts from
+        the env the moment somebody edits it. Each copy is a structured log
+        line (``platform_alert_copy_sent`` / ``_failed`` for email,
+        ``platform_alert_slack_sent`` / ``_failed`` for Slack) instead.
         """
-        if not self.platform_alert_emails or self.notification_service is None:
+        if self.notification_service is None:
+            return
+        if not self.platform_alert_emails and not self.platform_alert_slack_webhook_url:
             return
         rule = await self.repository.get_alert_rule(alert.rule_id)
         if (
@@ -2488,7 +2570,7 @@ class AlertService:
             for address in self.platform_alert_emails
             if address.lower() not in already_emailed
         ]
-        if not recipients:
+        if not recipients and not self.platform_alert_slack_webhook_url:
             return
         (
             organization_name,
@@ -2508,6 +2590,13 @@ class AlertService:
             await self.notification_service.send_platform_alert_email(
                 alert=alert,
                 email=address,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+        if self.platform_alert_slack_webhook_url:
+            await self.notification_service.send_platform_alert_slack(
+                alert=alert,
+                webhook_url=self.platform_alert_slack_webhook_url,
                 organization_label=organization_label,
                 venue_label=venue_label,
             )
@@ -2975,6 +3064,27 @@ def _channel_email_address(channel: NotificationChannel) -> str | None:
     return str(email).strip().lower() if email else None
 
 
+def _transient_test_alert(message: str) -> Alert:
+    """An in-memory ``Alert`` carrying a test message, never persisted.
+
+    ``id``/``rule_id``/``triggered_at`` are populated because
+    ``WebhookNotifier.send`` reads them -- it does not receive one of these
+    today, but a future notifier that does must not meet a half-built
+    object. ``severity=INFO`` and ``status=ACTIVE`` are what make
+    ``_format_alert_message`` render ``[INFO] Test notification ...``: a
+    test is not a resolution and is not a critical incident, and the
+    message body says what it is in its first two words.
+    """
+    return Alert(
+        id=uuid.uuid4(),
+        rule_id=uuid.uuid4(),
+        severity=AlertSeverity.INFO.value,
+        status=AlertStatus.TRIGGERED.value,
+        message=message,
+        triggered_at=datetime.now(UTC),
+    )
+
+
 def _format_alert_message(alert: Alert) -> str:
     """The shared, plain-text message body every notifier's payload is
     built from -- one place to change the wording, not duplicated per
@@ -3129,6 +3239,32 @@ class SlackNotifier:
         response = await _post_json(self.http_client, webhook_url, payload)
         return f"HTTP {response.status_code}"
 
+    async def send_platform_copy(
+        self,
+        webhook_url: str,
+        *,
+        alert: Alert,
+        organization_label: str,
+        venue_label: str,
+    ) -> str:
+        """The platform team's copy, led by which tenant and which venue it
+        is about -- the exact counterpart of
+        ``EmailNotifier.send_platform_copy``, and led for the exact same
+        reason: this message arrives for every tenant, so without that line
+        it says a controller is unreachable without saying whose.
+
+        Still a plain ``{"text": ...}`` POST, so a receiver that is not
+        Slack but speaks Slack's incoming-webhook shape keeps working.
+        """
+        payload = {
+            "text": (
+                f"{_format_alert_message(alert)}\n"
+                f"Organization: {organization_label}. Venue: {venue_label}."
+            )
+        }
+        response = await _post_json(self.http_client, webhook_url, payload)
+        return f"HTTP {response.status_code}"
+
 
 class TeamsNotifier:
     """A REAL ``httpx.AsyncClient`` POST to a Microsoft Teams incoming-
@@ -3177,7 +3313,6 @@ class WebhookNotifier:
         self.http_client = http_client
 
     async def send(self, *, alert: Alert, config: dict[str, object]) -> str:
-        url = str(config["url"])
         payload = {
             "event": "alert",
             "alert_id": str(alert.id),
@@ -3187,6 +3322,27 @@ class WebhookNotifier:
             "message": alert.message,
             "triggered_at": alert.triggered_at.isoformat(),
         }
+        return await self._post(url_of(config), payload, config)
+
+    async def send_test(self, *, text: str, config: dict[str, object]) -> str:
+        """A connectivity/credential test over the exact same transport as
+        :meth:`send` -- same URL, same optional auth header, same timeout.
+
+        The **payload** differs, and that is the point. Every other channel
+        type carries a plain human-readable string, so a test is
+        self-describing the moment somebody reads it; a generic webhook
+        carries structured JSON that a receiving system parses and acts
+        on, and ``{"event": "alert"}`` with a synthesised alert id would
+        be a machine instruction to treat a test as a production incident.
+        ``"event": "test"`` is the one honest way to prove the credential
+        without asking the receiver to page somebody.
+        """
+        payload = {"event": "test", "message": text}
+        return await self._post(url_of(config), payload, config)
+
+    async def _post(
+        self, url: str, payload: dict[str, object], config: dict[str, object]
+    ) -> str:
         headers = {}
         header_name = config.get("auth_header_name")
         header_value = config.get("auth_header_value")
@@ -3206,6 +3362,11 @@ class WebhookNotifier:
                 f"HTTP {response.status_code}: {response.text[:200]}"
             )
         return f"HTTP {response.status_code}"
+
+
+def url_of(config: dict[str, object]) -> str:
+    """The generic-webhook config's destination URL."""
+    return str(config["url"])
 
 
 class NotificationService:
@@ -3297,6 +3458,70 @@ class NotificationService:
         )
         return True
 
+    async def send_platform_alert_slack(
+        self,
+        *,
+        alert: Alert,
+        webhook_url: str,
+        organization_label: str,
+        venue_label: str,
+    ) -> bool:
+        """Post the platform team's copy of one alert to one Slack
+        incoming-webhook URL.
+
+        The Slack counterpart of :meth:`send_platform_alert_email`, with
+        the identical contract, for the identical reasons:
+
+        * **Never raises.** A Slack workspace that has revoked the webhook,
+          or is simply unreachable, must not cost the platform team the
+          email copy of the same alert, must not cost the *organization*
+          its own channels, and must not crash the evaluation pass. See
+          this class's docstring.
+        * **Writes no ``NotificationLog``.** ``notification_logs
+          .channel_id`` is NOT NULL and this destination is a setting, not
+          a ``NotificationChannel`` -- inventing a channel row for it would
+          be a second source of truth that drifts from the env the moment
+          somebody edits it. See ``AlertService._dispatch_platform_copies``.
+        * **The outcome is recorded either way**, as a structured log line
+          (``platform_alert_slack_sent`` / ``_failed``) and as this
+          method's return value. A failure is never reported as a success
+          and never silently dropped: the ``_failed`` line carries the real
+          error (``HTTP 404: no_service``, a connect timeout, ...), which
+          is the diagnostic an operator needs to tell "nobody configured
+          it" apart from "the webhook is dead".
+
+        The URL is never logged. It is bearer-equivalent -- anyone holding
+        it can post into the channel -- which is exactly why a tenant's own
+        is Fernet-encrypted at rest in ``config_encrypted``.
+        """
+        notifier = self._notifiers[NotificationChannelType.SLACK.value]
+        try:
+            if not isinstance(notifier, SlackNotifier):
+                raise TypeError("the slack notifier is not a SlackNotifier")
+            response_summary = await notifier.send_platform_copy(
+                webhook_url,
+                alert=alert,
+                organization_label=organization_label,
+                venue_label=venue_label,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see class docstring
+            logger.warning(
+                "platform_alert_slack_failed",
+                extra={
+                    "alert_id": str(alert.id),
+                    "error": str(exc)[:500],
+                },
+            )
+            return False
+        logger.info(
+            "platform_alert_slack_sent",
+            extra={
+                "alert_id": str(alert.id),
+                "response_summary": response_summary,
+            },
+        )
+        return True
+
     async def dispatch_notification(
         self, *, alert: Alert, channel: NotificationChannel
     ) -> NotificationLog:
@@ -3350,8 +3575,22 @@ class NotificationService:
         name: str,
         config: dict[str, object],
         is_active: bool = True,
+        event_categories: list[object] | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> NotificationChannel:
+        """Create one channel, owned by ``organization_id``.
+
+        ``requesting_organization_id`` is the caller's own scope and is
+        what decides whether they may own the row they asked for -- see
+        :func:`_assert_may_own`, which documents the cross-tenant write
+        this parameter closes. It defaults to ``None`` (platform-level,
+        unrestricted) to match every other method on this service, so the
+        internal callers and tests that never had a tenant behind them do
+        not change behaviour; the HTTP layer always passes it.
+        """
+        _assert_may_own(organization_id, requesting_organization_id)
         validate_notification_channel_config(channel_type, config)
+        categories = validate_notification_event_categories(event_categories or [])
         config_encrypted = encrypt_secret(json.dumps(config))
         return await self.repository.create_notification_channel(
             organization_id=organization_id,
@@ -3359,6 +3598,7 @@ class NotificationService:
             name=name,
             config_encrypted=config_encrypted,
             is_active=is_active,
+            event_categories=categories,
         )
 
     async def get_channel(
@@ -3393,6 +3633,13 @@ class NotificationService:
             )
             validate_notification_channel_config(channel_type, config)
             data = {**data, "config_encrypted": encrypt_secret(json.dumps(config))}
+        if "event_categories" in data:
+            data = {
+                **data,
+                "event_categories": validate_notification_event_categories(
+                    data["event_categories"] or []
+                ),
+            }
         return await self.repository.update_notification_channel(channel, data)
 
     async def delete_channel(
@@ -3445,6 +3692,154 @@ class NotificationService:
             status=status,
             page=page,
             page_size=page_size,
+        )
+
+    # ------------------------------------------------------------------
+    # Redaction, routing and the connectivity test
+    # ------------------------------------------------------------------
+
+    async def latest_logs_for_channels(
+        self, channel_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, NotificationLog]:
+        """The most recent delivery on each channel, for the console's
+        per-row status badge. One query for the whole page."""
+        return await self.repository.latest_notification_logs_by_channel(channel_ids)
+
+    def summarize_channel(self, channel: NotificationChannel) -> ChannelConfigSummary:
+        """The redacted view of one channel's credentials -- see
+        ``channel_config.py`` for what is and is not allowed into it.
+
+        This is the **only** place a channel's config is decrypted for
+        presentation, and it hands back a fixed-shape summary rather than
+        the mapping, so no caller further up can serialize a secret it
+        never received. A config that will not decrypt or parse is reported
+        as unconfigured rather than raised: a single corrupt row must not
+        take out the list endpoint that is the operator's way of finding
+        it.
+        """
+        try:
+            config = json.loads(decrypt_secret(channel.config_encrypted))
+        except Exception:  # noqa: BLE001 -- deliberately broad, see docstring
+            logger.warning(
+                "notification_channel_config_unreadable",
+                extra={"channel_id": str(channel.id)},
+            )
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        return summarize_channel_config(channel.channel_type, config)
+
+    async def list_channels_for_category(
+        self,
+        category: NotificationEventCategory,
+        *,
+        organization_id: uuid.UUID | None,
+    ) -> list[NotificationChannel]:
+        """Active channels a non-alert producer in ``category`` delivers to.
+
+        The organization rule is the one that keeps a platform-wide
+        producer from fanning a tenant's event out to every tenant, and it
+        is deliberately asymmetric:
+
+        * an event belonging to one organization goes to **that
+          organization's** subscribed channels and to platform-wide ones
+          (``organization_id IS NULL``), because the platform team is a
+          legitimate recipient of a tenant-affecting event -- this is
+          exactly what ``AlertService._dispatch_platform_copies`` already
+          does for alerts;
+        * an event with no organization behind it goes to platform-wide
+          channels **only**. It never widens to "every organization's
+          channels", which is what a naive read of ``organization_id is
+          None`` as "no filter" would have produced.
+
+        See ``app.domains.rbac.organization_scope`` for why ``None`` at the
+        API edge means "the caller asked for all tenants" -- a breadth that
+        is meaningful for a *read* and is never a delivery instruction.
+        """
+        return await self.repository.list_active_notification_channels_for_category(
+            category=category.value, organization_id=organization_id
+        )
+
+    async def send_test_notification(
+        self, channel: NotificationChannel
+    ) -> NotificationLog:
+        """Deliver one clearly-labelled test message over ``channel`` and
+        record the outcome as a ``kind='test'`` ``NotificationLog`` row.
+
+        ## Why this travels the real path
+
+        For every channel type but ``WEBHOOK`` this builds a transient,
+        never-persisted ``Alert`` and hands it to the same ``Notifier`` a
+        real alert would reach -- same payload shape, same auth, same
+        ``HTTP_NOTIFICATION_TIMEOUT_SECONDS``. A test that used a second,
+        parallel send path would prove that the second path works, which is
+        not the question anybody is asking; this codebase has already been
+        bitten by three configuration paths drifting apart while each one's
+        own tests stayed green. ``WEBHOOK`` is the single exception and
+        says why in ``WebhookNotifier.send_test``.
+
+        The transient ``Alert`` is constructed, never added to a session
+        and never flushed. It exists only to carry ``severity``/``status``/
+        ``message`` into ``_format_alert_message``.
+
+        ## Never raises
+
+        Same contract as ``dispatch_notification`` and for a stronger
+        reason: this runs inside a Celery task, and an exception escaping
+        it would retry a *delivery* -- posting the test again -- rather
+        than reporting the failure the operator asked for. The returned row
+        is the answer, ``SENT`` or ``FAILED``, and the ``FAILED`` row
+        carries the real error (``HTTP 404: no_service``, a connect
+        timeout), which is what distinguishes "nobody configured this" from
+        "the webhook was revoked".
+
+        No part of ``config`` is logged here, or attached to the row: the
+        strings that reach ``error_message``/``response_summary`` come from
+        the transport's own status line. A failing URL is identified in the
+        console by ``ChannelConfigSummary.fingerprint``, never by echoing
+        it back.
+        """
+        text = CHANNEL_TEST_MESSAGE.format(channel=channel.name)
+        try:
+            config = json.loads(decrypt_secret(channel.config_encrypted))
+            notifier = self._notifiers[channel.channel_type]
+            if isinstance(notifier, WebhookNotifier):
+                response_summary = await notifier.send_test(text=text, config=config)
+            else:
+                response_summary = await notifier.send(
+                    alert=_transient_test_alert(text), config=config
+                )
+            status_value = NotificationStatus.SENT
+            error_message = None
+        except Exception as exc:  # noqa: BLE001 -- see docstring
+            status_value = NotificationStatus.FAILED
+            error_message = str(exc)[:500]
+            response_summary = None
+            logger.warning(
+                "notification_channel_test_failed",
+                extra={
+                    "channel_id": str(channel.id),
+                    "channel_type": channel.channel_type,
+                    "error": error_message,
+                },
+            )
+        else:
+            logger.info(
+                "notification_channel_test_sent",
+                extra={
+                    "channel_id": str(channel.id),
+                    "channel_type": channel.channel_type,
+                    "response_summary": response_summary,
+                },
+            )
+        return await self.repository.create_notification_log(
+            channel_id=channel.id,
+            alert_id=None,
+            sent_at=datetime.now(UTC),
+            status=status_value.value,
+            error_message=error_message,
+            response_summary=response_summary,
+            kind=NotificationLogKind.TEST.value,
         )
 
 

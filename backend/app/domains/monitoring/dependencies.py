@@ -113,6 +113,9 @@ def get_alert_service(
         monitored_hardware_service=monitored_hardware_service,
         caller_location_scope=caller_location_scope,
         platform_alert_emails=settings.platform_alert_email_list,
+        platform_alert_slack_webhook_url=(
+            settings.platform_alert_slack_webhook_url
+        ),
     )
 
 

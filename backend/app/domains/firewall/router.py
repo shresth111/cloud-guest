@@ -1,5 +1,6 @@
 """FastAPI routes for the Firewall Rule Management domain: per-router
-packet-filter rule CRUD.
+packet-filter rule CRUD, the per-router device push, and (Master only) the
+sentinel band that push writes into.
 
 Responses use the project's standard envelope (``ApiResponse``/
 ``build_response``), matching every other domain's router. Every endpoint
@@ -30,18 +31,33 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
-from .constants import FirewallAction, FirewallChain, FirewallProtocol
+from .constants import (
+    FLOOD_LIMIT_PRESETS,
+    FirewallAction,
+    FirewallChain,
+    FirewallProtocol,
+    FloodLimitPreset,
+)
 from .dependencies import get_firewall_service
 from .models import FirewallRule
 from .schemas import (
+    FirewallBandResponse,
+    FirewallBandStatusResponse,
+    FirewallPushResponse,
     FirewallRuleCreateRequest,
     FirewallRuleListResponse,
     FirewallRuleResponse,
     FirewallRuleUpdateRequest,
+    FloodLimitResponse,
+    FloodLimitUpdateRequest,
+    GuestIsolationPortResponse,
+    GuestIsolationResponse,
+    GuestIsolationUpdateRequest,
     MessageResponse,
 )
-from .service import FirewallService
+from .service import FirewallService, FloodLimitState, GuestIsolationState
 
 router = APIRouter(prefix="/firewall-rules", tags=["Firewall Rule Management"])
 
@@ -79,6 +95,9 @@ def _rule_response(rule: FirewallRule) -> FirewallRuleResponse:
         priority=rule.priority,
         comment=rule.comment,
         is_enabled=rule.is_enabled,
+        device_push_status=rule.device_push_status,
+        device_push_error=rule.device_push_error,
+        device_pushed_at=rule.device_pushed_at,
         created_at=rule.created_at,
     )
 
@@ -189,7 +208,7 @@ async def update_firewall_rule(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: FirewallService = Depends(get_firewall_service),
 ):
-    fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    fields = payload.changed_fields()
     if "chain" in fields:
         fields["chain"] = FirewallChain(fields["chain"])
     if "action" in fields:
@@ -232,6 +251,314 @@ async def delete_firewall_rule(
         success=True,
         message="Firewall rule deleted",
         data=MessageResponse(message="Firewall rule deleted").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/push",
+    response_model=ApiResponse[FirewallPushResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
+    ],
+)
+async def push_firewall_rules(
+    request: Request,
+    router_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Puts this router's enabled firewall rules on the device, in priority
+    order, and takes off any of ours that are disabled or deleted.
+
+    Per router, not per rule: order is a property of the set.
+
+    ``firewall.execute``, pinned to ROUTER scope so the check is made
+    against *this* router's site and organization and a caller cannot pick a
+    broader level by what headers it sends. The action already exists on the
+    FIREWALL module (port-forwarding's push uses it), so no re-seed is
+    needed.
+
+    No try/except, deliberately: every failure raises a ``FirewallError``
+    with its own status (409 refused with an ``ACCESS_RULES_*`` code, 422
+    unpushable chain or controller-managed venue, 502 device failure with
+    ``restored`` in ``data``), and must reach the caller as a real non-2xx.
+    """
+    outcome = await service.push_rules_to_router(
+        router_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    payload = FirewallPushResponse(
+        router_id=str(router_id),
+        added=outcome.added,
+        removed=outcome.removed,
+        unchanged=outcome.unchanged,
+        rules=[_rule_response(rule) for rule in outcome.rules],
+    )
+    return build_response(
+        success=True,
+        message="Firewall rules applied to the router",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/band",
+    response_model=ApiResponse[FirewallBandResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.manage", scope=ScopeType.GLOBAL))
+    ],
+)
+async def install_firewall_band(
+    request: Request,
+    router_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Master console only: place the router's forward-chain sentinel band.
+
+    Pinned to GLOBAL scope -- only a platform-level grant passes. Where a
+    router's firewall rules may sit is a provisioning decision (PRD §37.2),
+    not something a venue chooses, and a band in the wrong place is a guest
+    network that stops working. Idempotent: an existing band is left alone.
+    """
+    result = await service.install_firewall_band(
+        router_id, actor_user_id=uuid.UUID(actor.id)
+    )
+    payload = FirewallBandResponse(
+        router_id=str(router_id),
+        created=result.created,
+        begin_id=result.begin_id,
+        end_id=result.end_id,
+        anchor_id=result.anchor_id,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Firewall band placed"
+            if result.created
+            else "Firewall band already present"
+        ),
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/band",
+    response_model=ApiResponse[FirewallBandStatusResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+)
+async def get_firewall_band_status(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Read-only: would a push to this router find its sentinel band?
+
+    ``firewall.read`` pinned to ROUTER scope, so a venue can see *why* its
+    push would be refused before pressing it (placing the band stays
+    Master-only, above). Reads the router over 8728 through the same
+    inspector the push uses; writes nothing and takes no lock. Returns
+    ``state`` / ``reason`` / ``checked_at`` only -- never a RouterOS ``.id``
+    or comment. A controller-managed router is refused (422) like every other
+    firewall route; an unreachable router is a 502.
+    """
+    band = await service.read_firewall_band_state(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    payload = FirewallBandStatusResponse(
+        state=band.state,
+        reason=band.reason,
+        checked_at=band.checked_at,
+        guest_networks=list(band.guest_networks),
+        guest_dns_servers=list(band.guest_dns_servers),
+    )
+    return build_response(
+        success=True,
+        message="Firewall band status retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+def _flood_response(router_id: uuid.UUID, state: FloodLimitState) -> FloodLimitResponse:
+    return FloodLimitResponse(
+        router_id=str(router_id),
+        preset=state.preset.value if state.preset is not None else None,
+        limit=state.limit,
+        enabled=state.enabled,
+        consistent=state.consistent,
+        band_state=state.band_state,  # type: ignore[arg-type]
+        guest_networks=list(state.guest_networks),
+        presets={preset.value: value for preset, value in FLOOD_LIMIT_PRESETS.items()},
+        checked_at=state.checked_at,
+    )
+
+
+@router.get(
+    "/routers/{router_id}/flood-limit",
+    response_model=ApiResponse[FloodLimitResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+)
+async def get_flood_limit(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Read-only: is "Limit connection floods" on for this router, and at
+    which preset? Read off the router over 8728 -- the router's rows are the
+    switch's only state. Same gating as the band status read."""
+    state = await service.read_flood_limit(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Connection-flood limit retrieved",
+        data=_flood_response(router_id, state).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/routers/{router_id}/flood-limit",
+    response_model=ApiResponse[FloodLimitResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
+    ],
+)
+async def set_flood_limit(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: FloodLimitUpdateRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Turn "Limit connection floods" on at a preset, change it, or turn it
+    off. ``firewall.execute`` pinned to ROUTER scope, the same grant the rule
+    push takes -- this writes the same chain. Refusals are 409 with an
+    ``ACCESS_RULES_*`` code (band not placed, no guest network); a write
+    that failed part-way is a 502 carrying ``restored``."""
+    state = await service.set_flood_limit(
+        router_id,
+        preset=FloodLimitPreset(payload.preset),
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Connection-flood limit turned off"
+            if not state.enabled
+            else "Connection-flood limit applied"
+        ),
+        data=_flood_response(router_id, state).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+def _isolation_response(
+    router_id: uuid.UUID, state: GuestIsolationState
+) -> GuestIsolationResponse:
+    return GuestIsolationResponse(
+        router_id=str(router_id),
+        enabled=state.enabled,
+        consistent=state.consistent,
+        between_ports=state.between_ports,
+        routed_guard=state.routed_guard,
+        radios_isolated=state.radios_isolated,
+        band_state=state.band_state,  # type: ignore[arg-type]
+        guest_ports=state.guest_ports,
+        isolated_ports=state.isolated_ports,
+        ap_ports=state.ap_ports,
+        ap_isolation_needed=state.ap_isolation_needed,
+        ports=[
+            GuestIsolationPortResponse(
+                interface=p.interface,
+                running=p.running,
+                isolatable=p.isolatable,
+                isolated=p.isolated,
+                excluded_reason=p.excluded_reason,
+                is_radio=p.is_radio,
+            )
+            for p in state.ports
+        ],
+        refusal=state.refusal,
+        summary=state.summary,
+        checked_at=state.checked_at,
+    )
+
+
+@router.get(
+    "/routers/{router_id}/guest-isolation",
+    response_model=ApiResponse[GuestIsolationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+)
+async def get_guest_isolation(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Read-only: "Guests can't see each other" for this router, read off
+    the router over 8728. Same gating as the flood-limit read."""
+    state = await service.read_guest_isolation(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Guest isolation retrieved",
+        data=_isolation_response(router_id, state).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/routers/{router_id}/guest-isolation",
+    response_model=ApiResponse[GuestIsolationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
+    ],
+)
+async def set_guest_isolation(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: GuestIsolationUpdateRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: FirewallService = Depends(get_firewall_service),
+):
+    """Turn "Guests can't see each other" on or off. ``firewall.execute``
+    pinned to ROUTER scope, like the flood limit (it writes the same chain).
+    Refusals are 409 with an ``ISOLATION_*`` code; a write that failed
+    part-way is a 502 carrying ``restored``. Omada venues are refused."""
+    state = await service.set_guest_isolation(
+        router_id,
+        enabled=payload.enabled,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Guest isolation turned on"
+            if payload.enabled
+            else "Guest isolation turned off"
+        ),
+        data=_isolation_response(router_id, state).model_dump(),
         request_id=_request_id(request),
     )
 

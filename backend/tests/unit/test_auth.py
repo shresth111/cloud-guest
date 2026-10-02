@@ -54,6 +54,7 @@ from app.domains.auth.service import (
     MfaRequiredError,
     PasswordChangeRequiredError,
     PasswordReuseError,
+    PasswordTooWeakError,
     UsernameAlreadyExistsError,
 )
 from app.domains.auth.service import InvalidTokenError as ResetTokenInvalidError
@@ -199,13 +200,23 @@ class FakeAuthRepository:
         return self.sessions_by_jti.get(token)
 
     async def rotate_refresh_token(
-        self, session: Session, new_refresh_jti: str
-    ) -> Session:
-        del self.sessions_by_jti[session.refresh_token_jti]
+        self,
+        session: Session,
+        new_refresh_jti: str,
+        *,
+        expected_refresh_jti: str,
+    ) -> bool:
+        """Mirrors the real repository's compare-and-set: only a caller whose
+        expected jti is still the one stored gets to rotate, so a concurrent
+        second refresh of the same token is refused rather than silently
+        orphaning the pair the first one was just handed."""
+        if not session.is_active or session.refresh_token_jti != expected_refresh_jti:
+            return False
+        del self.sessions_by_jti[expected_refresh_jti]
         session.refresh_token_jti = new_refresh_jti
         session.mark_activity()
         self.sessions_by_jti[new_refresh_jti] = session
-        return session
+        return True
 
     async def get_active_sessions(self, user_id: uuid.UUID) -> list[Session]:
         return [
@@ -754,6 +765,75 @@ class TestAuthServicePasswordResetRoundTrip:
 
         assert f"auth:password_reset:{token}" not in redis._store
 
+    async def test_reused_password_leaves_the_reset_link_usable(self) -> None:
+        """A password the service *rejects* must not cost the user their link.
+
+        This is the real-world regression: a customer picked a new password
+        the reuse check refused (400), and the retry they sent seconds later
+        with a different password answered 401 "Reset token is invalid or
+        expired", because the token had already been deleted by the rejected
+        attempt. They could not reset, so they could not log in.
+        """
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+        await service.initiate_password_reset("test@example.com")
+        token = self._extract_token(sender.enqueued[0]["body"])
+
+        with pytest.raises(PasswordReuseError):
+            await service.reset_password(token, STRONG_PASSWORD)
+
+        await service.reset_password(token, "AnotherSecurePass456!@#")
+
+    async def test_too_weak_password_leaves_the_reset_link_usable(self) -> None:
+        """Same as above for the strength check: the frontend only enforces a
+        12-character minimum, so a password that clears it but misses the
+        backend's upper/lower/digit/special rule is an easy 400 to hit."""
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+        await service.initiate_password_reset("test@example.com")
+        token = self._extract_token(sender.enqueued[0]["body"])
+
+        with pytest.raises(PasswordTooWeakError):
+            await service.reset_password(token, "alllowercaseletters")
+
+        await service.reset_password(token, "AnotherSecurePass456!@#")
+
+    async def test_rejected_password_does_not_change_the_stored_password(self) -> None:
+        """The retry in the test above must be the only thing that landed --
+        a burned token would also have meant a half-applied reset."""
+        service, repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+        await service.initiate_password_reset("test@example.com")
+        token = self._extract_token(sender.enqueued[0]["body"])
+
+        with pytest.raises(PasswordReuseError):
+            await service.reset_password(token, STRONG_PASSWORD)
+
+        user = await repository.get_user_by_email("test@example.com")
+        assert user is not None
+        assert PasswordManager.verify(STRONG_PASSWORD, user.password_hash) is True
+
 
 class TestAuthServiceLogin:
     async def test_login_rejects_unknown_email(self) -> None:
@@ -989,6 +1069,42 @@ class TestAuthServiceRefreshAndSessions:
 
         assert new_tokens.access_token != tokens.access_token
         assert new_tokens.refresh_token != tokens.refresh_token
+
+    async def test_second_refresh_of_the_same_token_is_refused(self) -> None:
+        """Two overlapping refreshes must not both be handed a live pair.
+
+        A browser that fires two refresh calls at once (two tabs, or a retry)
+        used to get 200 from both -- but only one of the two tokens was
+        actually stored, so the pair held by whoever lost the race was dead.
+        That is the silent logout a customer reports as "I cannot log in",
+        arriving exactly one access-token lifetime after the duplicate call.
+        """
+        service, _repository, _redis = make_service()
+        _user, tokens, _session_id = await self._login(
+            service, "race@example.com", "raceuser"
+        )
+
+        winner = await service.refresh(tokens.refresh_token)
+
+        with pytest.raises(ResetTokenInvalidError):
+            await service.refresh(tokens.refresh_token)
+
+        # The pair the winner was handed is the one that still works.
+        again = await service.refresh(winner.refresh_token)
+        assert again.access_token
+
+    async def test_refresh_refused_when_session_was_revoked(self) -> None:
+        """``revoke_all_sessions`` (password change/reset) wins the compare-
+        and-set too, so a revoked session cannot come back via a refresh."""
+        service, repository, _redis = make_service()
+        user, tokens, _session_id = await self._login(
+            service, "revoked@example.com", "revokeduser"
+        )
+
+        await repository.revoke_all_sessions(user.id)
+
+        with pytest.raises(ResetTokenInvalidError):
+            await service.refresh(tokens.refresh_token)
 
     async def test_logout_all_revokes_sessions(self) -> None:
         service, repository, _redis = make_service()

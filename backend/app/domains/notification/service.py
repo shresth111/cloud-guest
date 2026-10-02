@@ -39,6 +39,18 @@ purpose), and already has its own delivery record. This domain is a
 generic, **recipient-addressed** outbox (a literal email address/phone
 number the caller already has -- a guest, a user, an organization contact),
 not an ops-configured alert-routing channel.
+
+The one place the two now touch is ``NotificationChannelType.SLACK``,
+added for Master-console onboarding status (see
+``onboarding_slack.py``). That is a deliberate widening of "recipient-
+addressed", not a move of alert routing into this domain: there is
+exactly one destination for all four onboarding events, it is
+platform-wide rather than per-tenant, and it is configured in
+``Settings`` rather than in a ``NotificationChannel`` row. It rides this
+outbox precisely because it wants the property monitoring's dispatch
+deliberately does not have -- an announcement that a customer was
+onboarded is worth retrying through a Slack outage, where a stale alert
+is not.
 """
 
 from __future__ import annotations
@@ -80,6 +92,7 @@ from .exceptions import (
 )
 from .models import NotificationDelivery, NotificationTemplate
 from .repository import NotificationRepositoryProtocol
+from .slack import SlackSenderProtocol, UnconfiguredSlackSender
 from .validators import validate_recipient
 
 logger = logging.getLogger(__name__)
@@ -109,6 +122,7 @@ class NotificationService:
             Mapping[MailIdentity, EmailProviderProtocol] | None
         ) = None,
         sms_provider: SmsProviderProtocol | None = None,
+        slack_sender: SlackSenderProtocol | None = None,
         max_attempts: int = 5,
         retry_backoff_seconds: int = 300,
     ) -> None:
@@ -128,6 +142,19 @@ class NotificationService:
             MailIdentity, EmailProviderProtocol
         ] = dict(email_providers_by_identity or {})
         self.sms_provider: SmsProviderProtocol = sms_provider or LoggingSmsProvider()
+        # No `LoggingSlackSender` counterpart on purpose. An unconfigured
+        # email provider logs and the row goes SENT, which is defensible
+        # for a channel that has a real provider in every deployment that
+        # matters. Slack is optional by design (`Settings
+        # .slack_onboarding_webhook_url` is empty by default), so the same
+        # fallback would quietly mark rows SENT for messages nobody ever
+        # received. `UnconfiguredSlackSender` raises instead, and the only
+        # rows that can reach it are ones enqueued while a webhook existed
+        # that was then removed -- `OnboardingSlackNotifier` writes no row
+        # at all when there is no webhook. See `slack.py`.
+        self.slack_sender: SlackSenderProtocol = (
+            slack_sender or UnconfiguredSlackSender()
+        )
         self.max_attempts = max_attempts
         self.retry_backoff_seconds = retry_backoff_seconds
 
@@ -379,6 +406,12 @@ class NotificationService:
                 await self.email_provider_for_event(delivery.event_type).send(
                     delivery.recipient, delivery.subject or "", delivery.body
                 )
+            elif delivery.channel == NotificationChannelType.SLACK.value:
+                # `delivery.recipient` is the constant channel label, not
+                # an address -- the webhook lives on the sender, which got
+                # it from Settings. It is deliberately NOT passed here, so
+                # no webhook URL is ever read from a database row.
+                await self.slack_sender.send(delivery.body)
             else:
                 await self.sms_provider.send(delivery.recipient, delivery.body)
         except Exception as exc:  # noqa: BLE001 -- a real provider failure must

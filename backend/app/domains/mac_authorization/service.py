@@ -44,9 +44,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
+from app.database.utils.filters import AnyOfOrNull
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 from app.domains.router.models import Router
@@ -109,6 +111,16 @@ class MacImportResult:
     imported_count: int
     imported_ids: list[uuid.UUID] = field(default_factory=list)
     rejected: list[RejectedImportRow] = field(default_factory=list)
+
+
+def _location_matches(entry_location_id: uuid.UUID | None, location_filter) -> bool:
+    """Python mirror of ``apply_filters`` for one ``location_id`` filter value
+    from ``confine_location_filter`` (``None``, one id, or ``AnyOfOrNull``)."""
+    if location_filter is None:
+        return True
+    if isinstance(location_filter, AnyOfOrNull):
+        return entry_location_id is None or entry_location_id in location_filter.values
+    return entry_location_id == location_filter
 
 
 class MacAuthorizationService:
@@ -221,9 +233,18 @@ class MacAuthorizationService:
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[MacAuthorizationEntry], object]:
+        # A listing with no location_id used to return every venue's entries
+        # to a caller whose grants cover one venue. Organization-wide entries
+        # (location_id IS NULL) apply at the caller's venues and stay
+        # visible -- see app.domains.rbac.location_scope.confine_location_filter.
         return await self.repository.list_entries(
             requesting_organization_id=requesting_organization_id,
-            location_id=location_id,
+            location_id=confine_location_filter(
+                requested_location_id=location_id,
+                caller_location_scope=self.caller_location_scope,
+                error=CrossLocationMacAuthorizationAccessError(),
+                include_organization_wide=True,
+            ),
             page=page,
             page_size=page_size,
         )
@@ -339,13 +360,34 @@ class MacAuthorizationService:
         )
 
     async def export_entries_csv(
-        self, *, requesting_organization_id: uuid.UUID | None
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
     ) -> str:
+        """Every entry for this organization as CSV -- confined, like
+        ``list_entries``, to what the caller may see.
+
+        Without the confinement a caller whose grants cover one venue
+        downloaded every venue's MAC list. Organization-wide entries
+        (``location_id IS NULL``) apply at the caller's venues and are kept;
+        an explicit ``location_id`` outside the caller's venues is a 403.
+        """
         if requesting_organization_id is None:
             raise OrganizationRequiredError()
-        entries = await self.repository.list_all_for_organization(
-            requesting_organization_id
+        location_filter = confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationMacAuthorizationAccessError(),
+            include_organization_wide=True,
         )
+        entries = [
+            entry
+            for entry in await self.repository.list_all_for_organization(
+                requesting_organization_id
+            )
+            if _location_matches(entry.location_id, location_filter)
+        ]
         buffer = io.StringIO()
         writer = csv.writer(buffer)
         writer.writerow(

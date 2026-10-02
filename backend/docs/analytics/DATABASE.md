@@ -94,6 +94,7 @@ latter is additionally scoped by `location_id`):
 
 | Index | Columns | Purpose |
 |---|---|---|
+| `uq_analytics_snapshots_natural_key` | `(snapshot_type, organization_id, location_id, period_start, granularity)`, `UNIQUE`, `NULLS NOT DISTINCT`, partial | **One row per rollup**, not one per write -- the `ON CONFLICT` arbiter for `AnalyticsRepository.upsert_snapshot`. `NULLS NOT DISTINCT` because a platform snapshot's scope columns are both NULL by design and an org snapshot's `location_id` is; partial (`organization_id IS NOT NULL OR snapshot_type = 'platform_daily_summary'`) so that rows orphaned by the FKs' own `ON DELETE SET NULL` are not mistaken for each other's duplicates. See migration `0128`. |
 | `ix_analytics_snapshots_org_type_period_start` | `(organization_id, snapshot_type, period_start)` | **Primary query pattern**: "latest/date-ranged snapshots for one org + one type" |
 | `ix_analytics_snapshots_location_id` | `(location_id)` | Location-scoped reads without an explicit `organization_id` |
 | `ix_analytics_snapshots_snapshot_type` | `(snapshot_type)` | |

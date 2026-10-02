@@ -54,8 +54,11 @@ __all__ = [
     "GuestSsidAmbiguousError",
     "GuestSsidInUseError",
     "GuestSsidNotFoundError",
+    "InstantOnSiteNotConfigurableError",
     "NetworkIntegrationAlreadyExistsError",
     "NetworkIntegrationCredentialsRequiredError",
+    "ClientActionUnavailableError",
+    "LocationHasNoControllerError",
     "NetworkIntegrationDeauthorizationUnsupportedError",
     "NetworkIntegrationDisabledError",
     "NetworkIntegrationEncryptionKeyNotConfiguredError",
@@ -77,6 +80,7 @@ __all__ = [
     "ProviderAuthorizationFailedError",
     "ProviderClientNotFoundError",
     "ProviderConnectionFailedError",
+    "ProviderControllerAddressMismatchError",
     "ProviderError",
     "ProviderInvalidControllerError",
     "ProviderPermissionDeniedError",
@@ -507,6 +511,66 @@ class NetworkIntegrationInventoryRequiresOpenApiError(NetworkIntegrationError):
         )
 
 
+class LocationHasNoControllerError(NetworkIntegrationError):
+    """A client-management action named a location with no live Omada
+    integration behind it -- **or a location that is not the caller's**.
+
+    One error for both, on purpose, and it is the whole tenancy story of the
+    customer-facing client routes. The integration is resolved by a query that
+    carries the caller's organization *and* the location id in its WHERE
+    clause (``repository.get_omada_integration_for_location``), so a location
+    belonging to another tenant produces no row -- indistinguishable, here and
+    in the response, from a location of the caller's own that simply has no
+    controller. There is no second code path in which a cross-tenant id is
+    read and then refused, which is precisely the defect class this codebase
+    has found fourteen times: the permission check reads the organization from
+    the header while the handler reads the id from the path.
+
+    The message therefore says nothing that would let a caller probe for
+    another tenant's locations. It names no organization, no controller and no
+    device, and it reads identically whichever of the two situations produced
+    it.
+
+    404, and the same 404 either way.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This location has no network controller connected, so there is "
+            "nothing here to manage devices on.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            code=ErrorCode.NOT_FOUND,
+        )
+
+
+class ClientActionUnavailableError(NetworkIntegrationError):
+    """The venue's controller cannot perform this client action.
+
+    Raised from the capability declaration
+    (``providers.base.ProviderClientCapabilities``) **before** any call goes
+    out, so a venue whose controller is connected with a hotspot operator
+    login is told what would be needed rather than shown a failure that looks
+    like a network problem.
+
+    ``reason`` comes from the provider and is written for the person looking
+    at the disabled control. It is carried in ``data`` as well as in the
+    message so a console can render it beside the control without parsing
+    prose.
+
+    501, matching ``NetworkIntegrationInventoryRequiresOpenApiError``: the
+    request is well-formed and the credentials are correct; the capability is
+    not available for this credential type.
+    """
+
+    def __init__(self, action: str, reason: str) -> None:
+        super().__init__(
+            reason,
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            code=ErrorCode.API_UNSUPPORTED,
+            data={"action": action, "reason": reason},
+        )
+
+
 class NetworkIntegrationDeauthorizationUnsupportedError(NetworkIntegrationError):
     """The provider declined to end one guest's authorization early.
 
@@ -907,6 +971,40 @@ class ProviderSessionExpiredError(ProviderError):
         )
 
 
+class ProviderControllerAddressMismatchError(ProviderError):
+    """A request claimed a controller address that is not the stored one.
+
+    **This is the SSRF refusal**, and it is a ``ProviderError`` only so that
+    ``service.py``'s existing one-branch handling of provider failures picks
+    it up unchanged. Nothing about it came from a controller: no socket was
+    opened, and that is the entire point.
+
+    It exists because the RADIUS portal contract relays the controller's own
+    ``target``/``targetPort``/``scheme`` back to this platform *through the
+    guest's browser*. The URL is therefore built from the integration row
+    and never from those values -- but a request whose claim disagrees with
+    the row is still refused rather than quietly corrected. Quiet correction
+    would work perfectly for the attacker who is probing to find out which
+    address we actually use, and would hide the one honest cause (a venue
+    whose controller moved) from the operator who needs to see it.
+
+    ``400``, not ``502``: the caller's request is what is wrong. The
+    guest-facing route does not surface this -- it answers the same opaque
+    403 as every other portal refusal -- so the status matters only for the
+    operator-facing surfaces.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "This authorization request named a controller address that "
+            "does not match the one recorded for this venue. Nothing was "
+            "sent to it.",
+            code=ErrorCode.RADIUS_PORTAL_ADDRESS_MISMATCH,
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 # Gateway normalized code -> this domain's exception. Used by
 # ``providers/omada.py`` and by nothing else; a code the gateway invents
 # that is not in this table falls back to ``ProviderConnectionFailedError``
@@ -926,3 +1024,28 @@ PROVIDER_ERRORS_BY_CODE: dict[str, type[ProviderError]] = {
     ErrorCode.TLS_PIN_MISMATCH.value: ProviderTlsPinMismatchError,
     ErrorCode.PERMISSION_DENIED.value: ProviderPermissionDeniedError,
 }
+
+
+class InstantOnSiteNotConfigurableError(NetworkIntegrationError):
+    """The Master console tried to map a fleet router to an Aruba Instant On
+    site and the router cannot be one: it is not a NAS-only (Instant On)
+    device, it has no location, or the site id is not a plain token. 422,
+    with the machine reason in ``data.reason``."""
+
+    _MESSAGES = {
+        "not_nas_only_vendor": "Only an Aruba Instant On device can be mapped "
+        "to an Instant On site.",
+        "no_location": "This device has no location, so its Instant On data "
+        "would belong to no venue.",
+        "invalid_site_id": "That is not a valid Instant On site id.",
+    }
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(
+            self._MESSAGES.get(reason, "This device cannot be mapped to an "
+            "Instant On site."),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code=ErrorCode.INSTANT_ON_SITE_NOT_CONFIGURABLE,
+            data={"reason": reason},
+        )

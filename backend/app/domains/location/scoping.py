@@ -36,8 +36,12 @@ Semantics:
   and it keeps a super-admin holding a stale ``X-Location-Id`` from being
   locked out of an unrelated location;
 - a handler that is not narrowing to one location (``target_location_id is
-  None``, e.g. ``GET /guests`` with no filter) has nothing to compare, and the
-  organization-level enforcement in the service still applies;
+  None``, e.g. ``GET /guests`` with no filter) has nothing to compare here.
+  This guard alone does **not** make such a listing safe: without more, it
+  reads as "every location in the organization", including for a caller whose
+  grants cover one site. The listing's service must also apply the caller's
+  grant-derived confinement -- see
+  ``app.domains.rbac.location_scope.confine_location_filter``;
 - a caller whose permission was checked at ORGANIZATION or GLOBAL scope
   (``scope_location_id is None``) is already covered by the organization
   guard. Note that a caller holding *only* a LOCATION-scoped grant cannot

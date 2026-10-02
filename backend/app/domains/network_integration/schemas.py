@@ -73,6 +73,13 @@ ExternalSiteId = Annotated[
 ]
 
 __all__ = [
+    "ClientActionResponse",
+    "ClientCapabilitiesResponse",
+    "ClientCapabilityView",
+    "ControllerLivenessView",
+    "ClientMacRequest",
+    "ClientRateLimitView",
+    "ClientSpeedRequest",
     "ControllerConfigureRequest",
     "ControllerConfigureResponse",
     "ControllerConfigureStepResponse",
@@ -108,6 +115,8 @@ __all__ = [
     "PlatformTestConnectionResponse",
     "PortalAuthorizeRequest",
     "PortalAuthorizeResponse",
+    "PortalRadiusAuthorizeRequest",
+    "PortalRadiusAuthorizeResponse",
     "TestConnectionRequest",
     "TestConnectionResponse",
 ]
@@ -1024,6 +1033,92 @@ class PortalAuthorizeResponse(BaseModel):
     redirect_url: str | None = None
 
 
+class PortalRadiusAuthorizeRequest(BaseModel):
+    """The captive-portal enforcement call for a **RADIUS-mode** venue.
+
+    ## Why this is a second request model and not three optional fields
+
+    Because it is a second *contract*, not a variant of the first. Measured
+    on hardware and recorded in ``RADIUS-PORTAL-MODE.md`` §1.2: the
+    ``authType 2`` redirect carries **no** ``site`` and **no** ``t`` -- the
+    two values ``PortalAuthorizeRequest`` requires and validates -- and adds
+    ``target``/``targetPort``/``scheme``/``originUrl``, which mean nothing on
+    the other path. Merging them would have meant making ``site`` optional
+    on the endpoint a live venue depends on, which is exactly how a required
+    check quietly stops being one.
+
+    ``PortalAuthorizeRequest`` and this model therefore stay separate, and
+    the *stored* ``portal_mode`` still decides which one a venue may use --
+    each endpoint refuses an integration on the other contract.
+
+    ## The three fields that exist only to be refused
+
+    ``target``, ``target_port`` and ``scheme`` are the controller's own claim
+    about where the submit should go, relayed here through the guest's
+    browser. **The server does not build a URL from them.** It builds one
+    from the integration's stored controller address and compares; a
+    disagreement is refused and nothing is sent. Send them if the redirect
+    carried them -- a mismatch is a real signal an operator needs -- but
+    omitting them changes nothing about where the request goes.
+
+    ``origin_url`` is where the controller should send the browser once the
+    gate is open, and it comes back on the response as ``redirect_url``. The
+    caller should send its own post-login destination here rather than
+    echoing the controller's captured ``originUrl``: that is what the
+    MikroTik path does with ``link-orig``, and dropping a guest on a plain
+    website with no session page is the alternative.
+
+    ``client_ip`` is the same CR-004 pass-through as on the other request:
+    captured from the controller's redirect, never derived from the HTTP
+    peer, and absent means absent.
+
+    Note what is NOT here: the guest's identifier. It is the credential this
+    contract submits, and the server resolves it from the session rather
+    than accepting it -- see ``service.authorize_portal_client_via_radius``.
+    """
+
+    session_id: str
+    organization_id: str
+    location_id: str
+    provider: _Provider = "omada"
+    client_mac: str = Field(min_length=12, max_length=32)
+    client_ip: str | None = Field(default=None, max_length=45)
+    ap_mac: str | None = Field(default=None, max_length=32)
+    gateway_mac: str | None = Field(default=None, max_length=32)
+    ssid_name: str | None = Field(default=None, max_length=255)
+    radio_id: int | None = Field(default=None, ge=0, le=16)
+    vid: int | None = Field(default=None, ge=0, le=4094)
+    origin_url: str | None = Field(default=None, max_length=2048)
+    # Cross-check only. See the class docstring.
+    target: str | None = Field(default=None, max_length=255)
+    target_port: int | None = Field(default=None, ge=1, le=65535)
+    scheme: str | None = Field(default=None, max_length=8)
+
+
+class PortalRadiusAuthorizeResponse(BaseModel):
+    """Whether the gate opened, and -- when it did not -- one renderable word.
+
+    ``failure`` is one of ``constants.RadiusPortalFailure`` and is the ONLY
+    thing about a refusal that reaches the guest. The controller's raw
+    ``errorCode`` and its own message are recorded against the integration
+    for the operator and deliberately never returned: the entire reason this
+    call moved server-side is that the browser-submitted version answered a
+    rejected guest by rendering the controller's raw JSON at them.
+
+    ``redirect_url`` is the controller's own ``Location`` on success, handed
+    to the browser to navigate to. This platform never fetches it.
+
+    ``expires_at`` is absent, and its absence is the honest answer: on this
+    contract the controller grants the session from its own RADIUS
+    Access-Accept and never tells us for how long.
+    """
+
+    authorized: bool
+    provider: str
+    redirect_url: str | None = None
+    failure: str | None = None
+
+
 class NetworkIntegrationDisconnectGuestRequest(BaseModel):
     """Ask the controller to end one guest's access now.
 
@@ -1207,6 +1302,165 @@ class ControllerDeviceView(BaseModel):
     firmware_version: str | None = None
     uptime_seconds: int | None = None
     client_count: int | None = None
+
+
+class ClientCapabilityView(BaseModel):
+    """One client action, and whether this venue can perform it.
+
+    ``reason`` is populated only when ``supported`` is ``False``, and is
+    written for the person looking at the disabled control -- a console should
+    render it beside the control rather than paraphrasing it.
+    """
+
+    supported: bool
+    reason: str | None = None
+
+
+class ControllerLivenessView(BaseModel):
+    """Whether this venue's controller is answering, as of the last time
+    anything looked.
+
+    A different question from the capabilities beside it, and the reason
+    this field exists: a capability says what a venue is *configured* to be
+    able to do and stays true while its controller is unplugged. This says
+    whether a real call got through recently.
+
+    ``reachable`` is tri-state and a console should enable a
+    controller-dependent control only on ``True``:
+
+    * ``true`` -- a recent check reached the controller and worked.
+    * ``false`` -- a recent check did not get through.
+    * ``null`` -- nothing has checked recently enough to say. Not the same
+      claim as ``false``, and it degrades the control the same way.
+
+    ``checked_at`` is when that check ran (``null`` if none ever has), and
+    ``reason`` carries a sentence for the person looking at the degraded
+    control whenever ``reachable`` is not ``true``. No live call is made to
+    answer this -- the value is the cached result of the background sync
+    that already polls each controller on its own interval.
+    """
+
+    reachable: bool | None = None
+    checked_at: datetime | None = None
+    reason: str | None = None
+
+
+class ClientCapabilitiesResponse(BaseModel):
+    """Every client action's availability at one location, and separately,
+    whether the controller behind them is answering.
+
+    The per-action entries are answered without contacting the controller,
+    from the integration's own auth mode, so a console can decide what to
+    enable before any live call. ``list_blocked`` is always ``False`` -- see
+    the provider's own note: the block flag is not readable through the
+    connection this platform holds, and an empty list would be a false
+    statement about the venue.
+
+    ``controller`` is the second half and must not be folded into the first.
+    "This venue can set guest speeds" and "this venue's controller is up" are
+    different facts with different lifetimes, and a console that reads only
+    the first renders a fully enabled Bandwidth control at a venue whose
+    controller has been dark for a day. Gate on both.
+    """
+
+    set_rate_limit: ClientCapabilityView
+    clear_rate_limit: ClientCapabilityView
+    block: ClientCapabilityView
+    unblock: ClientCapabilityView
+    list_blocked: ClientCapabilityView
+    disconnect: ClientCapabilityView
+    client_stats: ClientCapabilityView
+    controller: ControllerLivenessView = ControllerLivenessView()
+
+
+class ClientMacRequest(BaseModel):
+    """The device a client action names.
+
+    Plain ``str`` on the way in and ``MaskedMac`` on the way out, the same
+    asymmetry every other MAC field in this module carries -- see the module
+    docstring.
+    """
+
+    client_mac: str = Field(min_length=12, max_length=32)
+
+
+class ClientSpeedRequest(ClientMacRequest):
+    """A per-device speed limit, in kbps.
+
+    kbps because that is ``queue_management.QueueProfile``'s own unit, so a
+    speed profile's numbers reach the controller unchanged.
+
+    ``0`` means "do not limit that direction", matching RouterOS's
+    ``max-limit`` semantics that this platform's kbps vocabulary comes from;
+    omitting a direction means the same. Sending both as ``0`` is not a way to
+    clear a limit -- ``DELETE`` the speed is.
+
+    ``queue_profile_id`` is the other way to say the same thing: name a speed
+    profile and its rates are read from the profile instead. The two are
+    mutually exclusive and one of them is required.
+    """
+
+    down_kbps: int | None = Field(default=None, ge=0)
+    up_kbps: int | None = Field(default=None, ge=0)
+    queue_profile_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> ClientSpeedRequest:
+        named_profile = self.queue_profile_id is not None
+        named_rates = self.down_kbps is not None or self.up_kbps is not None
+        if named_profile and named_rates:
+            raise ValueError(
+                "Give either a speed profile or explicit rates, not both."
+            )
+        if not named_profile and not named_rates:
+            raise ValueError(
+                "Give a speed profile, or a download and/or upload rate."
+            )
+        return self
+
+
+class ClientRateLimitView(BaseModel):
+    """What the controller was actually given.
+
+    ``applied_*`` and ``requested_*`` are separate because they can differ: a
+    controller that holds a limit as a bounded number plus a Kbps/Mbps unit
+    cannot express every kbps value, so 1500 kbps is sent as 1 Mbps -- always
+    rounded **down**, because a cap that came back larger than the one the
+    operator typed is not a cap. ``clamped`` says so explicitly. A console
+    must show the applied figure -- echoing the typed one back would be this
+    platform asserting a limit that is not in force.
+
+    ``None`` on a direction means unlimited in that direction; it is not zero
+    and it is not unknown.
+
+    ``read_back`` is what stops ``applied_*`` being over-read. ``False``
+    means these numbers are the request as this platform encoded it and sent
+    it, not a value fetched back from the controller afterwards -- which on
+    Omada it never is, because that controller's Open API offers a
+    per-client rate-limit write and no matching read. A console rendering
+    these while ``read_back`` is ``False`` should word them as what was sent.
+    """
+
+    enabled: bool
+    applied_down_kbps: int | None = None
+    applied_up_kbps: int | None = None
+    requested_down_kbps: int | None = None
+    requested_up_kbps: int | None = None
+    clamped: bool = False
+    read_back: bool = False
+
+
+class ClientActionResponse(BaseModel):
+    """The outcome of one client action.
+
+    ``performed`` is the controller's own answer. ``rate_limit`` is present
+    only for the speed actions.
+    """
+
+    action: str
+    performed: bool
+    client_mac: MaskedMac
+    rate_limit: ClientRateLimitView | None = None
 
 
 class ControllerInventoryResponse(BaseModel):

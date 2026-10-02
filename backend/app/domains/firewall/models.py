@@ -1,9 +1,8 @@
 """SQLAlchemy ORM model for the Firewall Rule Management domain.
 
-One table -- ``FirewallRule``. A row's own state *is* its current state;
-there is no live device push in this pass (see module docstring --
-realized onto a device later by Network Configuration Management's own
-provisioning pass, not this domain).
+One table -- ``FirewallRule``. The ``device_push_*`` trio records whether
+the rule is on its router: the push is ``FirewallService.push_rules_to_router``,
+over the RouterOS API on 8728, inside the router's sentinel band.
 
 Extends ``app.database.base.BaseModel`` (UUID PK, timestamps, soft-delete,
 audit, version columns) for the same reason every other domain does.
@@ -20,14 +19,21 @@ conflict/uniqueness check is enforced here at all.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import DEFAULT_PRIORITY, FirewallAction, FirewallChain, FirewallProtocol
+from .constants import (
+    DEFAULT_PRIORITY,
+    FirewallAction,
+    FirewallChain,
+    FirewallDevicePushStatus,
+    FirewallProtocol,
+)
 
 
 class FirewallRule(BaseModel):
@@ -70,6 +76,21 @@ class FirewallRule(BaseModel):
     )
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Whether this rule is on its router -- see FirewallDevicePushStatus.
+    # Every row that existed before the push did is truthfully `pending`:
+    # no code path could put one on a device.
+    device_push_status: Mapped[str] = mapped_column(
+        String(20),
+        default=FirewallDevicePushStatus.PENDING.value,
+        server_default=FirewallDevicePushStatus.PENDING.value,
+        nullable=False,
+    )
+    # The raw error from the router's last failed push, verbatim.
+    device_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # NULL until a push put this rule on the device.
+    device_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_firewall_rules_router_id", "router_id"),

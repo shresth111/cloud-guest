@@ -55,9 +55,13 @@ from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
+    "CONTROLLER_RATE_LIMIT_MAX_KBPS",
     "NetworkProvider",
     "ProviderAuthorizationResult",
+    "ProviderCapability",
     "ProviderClient",
+    "ProviderClientCapabilities",
+    "ProviderClientRateLimit",
     "ProviderConnectionConfig",
     "ProviderControllerInfo",
     "ProviderControllerSetupBlock",
@@ -66,6 +70,8 @@ __all__ = [
     "ProviderControllerSetupStep",
     "ProviderDevice",
     "ProviderPortalContext",
+    "ProviderRadiusAuthorizationResult",
+    "ProviderRadiusPortalContext",
     "ProviderSite",
     "ProviderSsid",
     "ProviderTlsObservation",
@@ -208,6 +214,95 @@ class ProviderClient:
     signal_dbm: int | None = None
 
 
+#: The largest per-client rate this platform will ask a controller for, in
+#: kbps. Omada's own specification bounds ``upLimit``/``downLimit`` at
+#: ``1-1024`` with a Kbps/Mbps unit, so 1024 Mbps is the ceiling the vendor
+#: documents. The controller does **not** enforce it -- a ``downLimit`` of
+#: 5000 Mbps was accepted, stored and read back on 2026-09-17 -- but storing a
+#: number is not honouring it, and nobody has evidence an AP honours anything
+#: above the documented range. So the clamp is ours.
+CONTROLLER_RATE_LIMIT_MAX_KBPS = 1024 * 1000
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapability:
+    """Whether one client-management action is available, and if not, why.
+
+    ``reason`` is written for the person looking at the disabled control, not
+    for an engineer: it says what the venue would have to change, or says
+    plainly that the thing cannot be done here at all. It is ``None`` only
+    when ``supported`` is ``True``.
+
+    This exists so a console can render an honestly disabled button instead
+    of an enabled one that fails on click. A capability that is reported
+    ``supported`` and then raises is a worse outcome than either.
+    """
+
+    supported: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderClientCapabilities:
+    """What can be done to one client on this integration, right now.
+
+    Deliberately **not** a static table on the provider class. The gateway's
+    own ``ControllerAdapter`` docstring argues against a ``capabilities()``
+    method on the grounds that the honest answer depends on ``auth_mode`` and
+    firmware, which live in the credentials rather than in the adapter -- and
+    that is exactly right, which is why this is computed from a
+    :class:`ProviderConnectionConfig` rather than declared once per vendor.
+    A ``legacy`` integration and an ``openapi`` integration on the *same*
+    controller get different answers from the same provider instance.
+
+    Each field is one action a venue admin can take from the console.
+    """
+
+    set_rate_limit: ProviderCapability
+    clear_rate_limit: ProviderCapability
+    block: ProviderCapability
+    unblock: ProviderCapability
+    list_blocked: ProviderCapability
+    disconnect: ProviderCapability
+    client_stats: ProviderCapability
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderClientRateLimit:
+    """A per-client rate limit, as the controller was **told** to hold it.
+
+    Returned by set/clear rather than echoing the request, because the two
+    can differ: a vendor that expresses limits as a bounded number plus a
+    unit cannot hold every kbps value, so 1500 kbps may be applied as 1 Mbps
+    (rounded down -- a cap must never exceed what was asked for).
+    ``requested_down_kbps``/``requested_up_kbps`` keep what was asked for, the
+    ``applied_*`` fields say what the controller was given, and ``clamped``
+    says the two differ -- so a console can show the real number rather than
+    the typed one.
+
+    ``None`` on a direction means unlimited in that direction. It is not
+    zero and it is not "unknown".
+
+    ``read_back`` is the difference between "we sent this" and "the
+    controller reports this", and it is ``False`` on every Omada path
+    because that controller's Open API exposes a rate-limit write and no
+    matching read (``GET/PATCH .../clients/{mac}`` answers 405; the route
+    that carries ``rateLimit{}`` is the internal v2 tree, which needs an
+    admin session this platform does not hold). This class used to describe
+    itself as what the controller "actually holds", which nothing here ever
+    asked it. While ``read_back`` is ``False`` the ``applied_*`` numbers are
+    the encoded request, and no surface may present them as a measurement.
+    """
+
+    enabled: bool
+    applied_down_kbps: int | None = None
+    applied_up_kbps: int | None = None
+    requested_down_kbps: int | None = None
+    requested_up_kbps: int | None = None
+    clamped: bool = False
+    read_back: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderPortalContext:
     """The values the controller itself put on the captive-portal redirect.
@@ -270,6 +365,80 @@ class ProviderAuthorizationResult:
     expires_at: datetime | None = None
     provider_code: str | None = None
     request_snapshot: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRadiusPortalContext:
+    """The redirect values for the **RADIUS** captive-portal contract.
+
+    A second context type rather than more optional fields on
+    :class:`ProviderPortalContext`, because the two redirects genuinely carry
+    different things and folding them together would make every field of
+    both optional -- at which point neither shape can be validated at all.
+    What this one carries and the other does not:
+
+    * ``origin_url`` -- where the controller sends the browser once the gate
+      is open. The platform learns the authorization succeeded *by* being
+      handed this back as a redirect target, so it is not decoration.
+    * ``advertised_*`` -- the controller's own claim about where the submit
+      should go, relayed through the guest's browser. **These are never used
+      to build a URL.** They exist so the provider can refuse a request whose
+      claimed target disagrees with the integration's stored address, which
+      is a signal worth refusing on rather than silently ignoring. See
+      ``providers/omada.py``'s address check and ``service.py``'s own.
+
+    And what it does *not* carry, because the redirect does not: ``site`` and
+    ``t``. On this contract the controller sends nothing that identifies the
+    venue, which is why the venue is resolved from the guest's session.
+
+    ``portal_port`` is the operator's explicit override of the port the
+    venue's portal listener answers on, or ``None`` for the provider's
+    documented default. It comes from the integration row, never from a
+    request.
+    """
+
+    client_mac: str
+    client_ip: str | None = None
+    ap_mac: str | None = None
+    gateway_mac: str | None = None
+    ssid_name: str | None = None
+    radio_id: int | None = None
+    vid: int | None = None
+    origin_url: str | None = None
+    #: The guest's own identifier, resolved server-side from the session.
+    #: Never accepted from a request body -- see ``service.py``.
+    username: str = ""
+    #: A placeholder this product's RADIUS server never checks (it authorizes
+    #: by session lookup). ``repr=False`` anyway: it is spelled like a
+    #: credential and would otherwise show up in every traceback.
+    password: str = field(default="", repr=False)
+    portal_port: int | None = None
+    advertised_target: str | None = None
+    advertised_port: int | None = None
+    advertised_scheme: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRadiusAuthorizationResult:
+    """What the controller answered to one ``browserauth`` submit.
+
+    ``authorized`` is the whole verdict. ``landing_url`` is the destination
+    the controller named when it opened the gate, which the caller hands
+    back to the guest's browser and never fetches itself.
+
+    ``failure`` is a **stable, vendor-neutral** reason -- one of
+    ``constants.RadiusPortalFailure`` -- and is the only thing about a
+    refusal that ever reaches a guest. ``provider_code`` is the vendor's raw
+    integer for the operator-facing event feed; it is deliberately not the
+    same value, because a vendor's error numbering is not a contract this
+    platform's frontend should be built on.
+    """
+
+    authorized: bool
+    landing_url: str | None = None
+    failure: str | None = None
+    provider_code: int | None = None
+    http_status: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +627,38 @@ class NetworkProvider(Protocol):
         """
         ...
 
+    async def authorize_guest_via_radius_portal(
+        self,
+        config: ProviderConnectionConfig,
+        context: ProviderRadiusPortalContext,
+    ) -> ProviderRadiusAuthorizationResult:
+        """Open the gate on a venue running the **RADIUS** portal contract.
+
+        Separate from :meth:`authorize_guest` because it is a separate
+        contract, not a mode of one: a different endpoint, a different
+        encoding, no credential of ours on the wire, and a success signal
+        that is an HTTP redirect rather than a response body. A provider
+        whose vendor has no such contract must raise
+        ``ProviderUnsupportedApiError``, never return ``authorized=False``
+        -- the caller has to be able to tell "the controller said no" from
+        "this vendor cannot do this", because only the first is something a
+        guest can retry.
+
+        **Two refusals belong to the provider, not the controller**, and
+        both must raise rather than return:
+
+        * the request's claimed submit address disagrees with the
+          integration's stored controller address
+          (``ProviderControllerAddressMismatchError``) -- the SSRF boundary;
+        * the integration's TLS trust cannot be honoured
+          (``ProviderTlsPinMismatchError``).
+
+        Everything the controller itself answers -- accept, RADIUS reject,
+        RADIUS timeout, malformed body -- comes back as a *result* with a
+        ``failure`` code, because those are outcomes of a call that worked.
+        """
+        ...
+
     async def deauthorize_guest(
         self, config: ProviderConnectionConfig, site_id: str, client_mac: str
     ) -> bool:
@@ -491,5 +692,88 @@ class NetworkProvider(Protocol):
 
         Raises a ``ProviderError`` only for failures before anything was
         written; once writing starts, every failure is reported on its step.
+        """
+        ...
+
+    # -- per-client management --------------------------------------------
+    #
+    # Everything below acts on one already-known client rather than on the
+    # integration. Every method must raise ``ProviderUnsupportedApiError``
+    # where the vendor or the credential cannot do the thing, and must never
+    # report a benign-looking success or an empty result instead: a console
+    # that shows "no blocked guests" because the API could not ask is making
+    # a statement about the venue that nobody verified.
+
+    def client_capabilities(
+        self, config: ProviderConnectionConfig
+    ) -> ProviderClientCapabilities:
+        """What this integration can do to a client, given its credentials.
+
+        Synchronous and free: it contacts nothing. It answers from
+        ``config.auth_mode`` alone, which is the fact that decides most of
+        the matrix, so a console can render its controls before any live
+        call. A capability reported ``supported`` here can still fail at the
+        controller -- the network exists -- but one reported unsupported will
+        certainly fail, and saying so up front is the whole point.
+        """
+        ...
+
+    async def set_client_rate_limit(
+        self,
+        config: ProviderConnectionConfig,
+        site_id: str,
+        client_mac: str,
+        *,
+        down_kbps: int | None = None,
+        up_kbps: int | None = None,
+    ) -> ProviderClientRateLimit:
+        """Throttle one client, at runtime, and report what really applied.
+
+        Not the same mechanism as :meth:`authorize_guest`'s ``down_kbps`` /
+        ``up_kbps``. Those ride on the authorization body and are fixed for
+        the life of that grant; this is a standalone write against the client
+        record that can be changed or removed at any time, including on a
+        client that is offline.
+
+        Rates are kbps, matching ``queue_management.QueueProfile``'s own
+        vocabulary, and ``0`` or ``None`` on a direction means "do not limit
+        that direction" -- for "remove the limit entirely" call
+        :meth:`clear_client_rate_limit`, which is a different request.
+        """
+        ...
+
+    async def clear_client_rate_limit(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> ProviderClientRateLimit:
+        """Remove a per-client rate limit. Idempotent."""
+        ...
+
+    async def block_client(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> bool:
+        """Deny one client on this site until an operator clears it.
+
+        Vendor-side and per-MAC. It is **not** this platform's blocklist:
+        ``guest_access``'s ``BLOCKLIST`` rules and ``guests.is_blocked`` are
+        vendor-neutral, are consulted at login, and remain the mechanism that
+        actually refuses a guest. This is the device-side half, and a caller
+        that has one should generally have both.
+        """
+        ...
+
+    async def unblock_client(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> bool:
+        """Clear a vendor-side block. Idempotent."""
+        ...
+
+    async def list_blocked_clients(
+        self, config: ProviderConnectionConfig, site_id: str
+    ) -> list[ProviderClient]:
+        """Every client this site currently refuses.
+
+        **Must raise rather than return ``[]``** when the vendor cannot
+        answer. An empty list is a claim that the venue has blocked nobody,
+        and a provider that cannot read block state has no basis for it.
         """
         ...

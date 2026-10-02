@@ -136,18 +136,22 @@ and is not papered over here.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..constants import (
     ROUTER_VENDOR_BY_PROVIDER,
     ControllerAuthMode,
     ControllerTlsMode,
     NetworkProviderKind,
+    RadiusPortalFailure,
 )
 from ..exceptions import (
     PROVIDER_ERRORS_BY_CODE,
     ProviderConnectionFailedError,
+    ProviderControllerAddressMismatchError,
     ProviderError,
     ProviderTlsPinMismatchError,
     ProviderUnsupportedApiError,
@@ -155,7 +159,10 @@ from ..exceptions import (
 from ..validators import validate_controller_url
 from .base import (
     ProviderAuthorizationResult,
+    ProviderCapability,
     ProviderClient,
+    ProviderClientCapabilities,
+    ProviderClientRateLimit,
     ProviderConnectionConfig,
     ProviderControllerInfo,
     ProviderControllerSetupBlock,
@@ -164,6 +171,8 @@ from .base import (
     ProviderControllerSetupStep,
     ProviderDevice,
     ProviderPortalContext,
+    ProviderRadiusAuthorizationResult,
+    ProviderRadiusPortalContext,
     ProviderSite,
     ProviderSsid,
     ProviderTlsObservation,
@@ -327,6 +336,44 @@ def _describe_certificate(
     except Exception:  # noqa: BLE001 -- display-only, never fatal
         logger.warning("network_integration_certificate_parse_failed")
         return None, None, None
+
+
+#: Omada ``errorCode`` -> this platform's guest-safe failure vocabulary.
+#:
+#: VERIFIED on Omada Software Controller 5.15.24.19, 2026-09-17 (see
+#: ``/Users/shresth/wyfy-omada/RADIUS-PORTAL-MODE.md`` §1.4)::
+#:
+#:        0   Success.                            (never reaches this table:
+#:                                                 success is a 302, not a body)
+#:   -41501   Failed to authenticate.             generic; also what a
+#:                                                 wrongly-configured RADIUS
+#:                                                 profile returns
+#:   -41529   Incorrect username or password.     a genuine Access-Reject
+#:   -41530   Connecting to the RADIUS server times out.
+#:
+#: This table is in the *provider*, not in ``constants.py``, because reading
+#: a vendor's error numbering is exactly the knowledge the seam exists to
+#: confine. A code that is not here becomes ``CONTROLLER_REFUSED`` -- a
+#: wrong-but-safe classification, with the raw integer carried alongside so
+#: the gap is findable in the event feed rather than invisible.
+_RADIUS_FAILURE_BY_PROVIDER_CODE: dict[int, RadiusPortalFailure] = {
+    -41501: RadiusPortalFailure.CONTROLLER_REFUSED,
+    -41529: RadiusPortalFailure.REJECTED,
+    -41530: RadiusPortalFailure.RADIUS_UNREACHABLE,
+}
+
+#: Which port an Omada controller's captive-portal listener answers on, by
+#: scheme. VERIFIED on 5.15.24.19: ``8843`` https / ``8088`` http, both
+#: distinct from the management API's ``8043``.
+#:
+#: Duplicated from the gateway's own table on purpose. The gateway is a lazy
+#: import that may be absent entirely (see this module's docstring), and the
+#: address check below has to be able to refuse a request *without* it --
+#: refusing only when the gateway happens to be installed would be a
+#: security control with an availability condition on it. The two are
+#: asserted equal in ``tests/unit/test_network_integration_radius_portal.py``
+#: so the duplication cannot drift silently.
+_RADIUS_PORTAL_PORTS: dict[str, int] = {"https": 8843, "http": 8088}
 
 
 def _is_gateway_error(exc: Exception) -> bool:
@@ -595,6 +642,169 @@ class OmadaProvider:
             request_snapshot=snapshot,
         )
 
+    # -- RADIUS portal contract (authType 2) -------------------------------
+
+    @staticmethod
+    def _radius_portal_origin(
+        config: ProviderConnectionConfig, context: ProviderRadiusPortalContext
+    ) -> tuple[str, str, str, int]:
+        """``(base_url, scheme, host, port)`` for the portal submit.
+
+        ## THIS IS THE SSRF BOUNDARY. Read before changing anything here.
+
+        On the RADIUS contract the controller puts ``target``, ``targetPort``
+        and ``scheme`` on the redirect it sends the *guest's browser*, and
+        the guest's browser is what hands them back to this platform. They
+        are therefore attacker-controlled input on an unauthenticated
+        endpoint, and they name the address this platform is about to open a
+        connection to -- carrying this integration's TLS trust decision,
+        which for a self-signed controller means "do not check the chain".
+        Building the URL from them would let any caller aim that at anything
+        the backend can reach.
+
+        So the URL is built from the integration row and only from it:
+
+        * **host and scheme** come from ``config.base_url``, the stored,
+          already-normalized controller address;
+        * **port** comes from the operator's explicit override on the
+          integration, or from :data:`_RADIUS_PORTAL_PORTS`. The vendor's
+          portal listener is on a different port from its management API,
+          which is the *only* reason this method exists rather than the
+          stored ``base_url`` being used verbatim.
+
+        The caller's three claimed values are then compared against what was
+        built, and a disagreement raises. Ignoring them silently was the
+        other option and is worse in both directions: it hides a venue whose
+        controller genuinely moved (the operator sees "guests cannot get
+        online" and nothing else), and it hands a prober a free oracle --
+        every target they try behaves identically, so they learn nothing
+        from a refusal and nothing from a success either, which is only
+        comforting until you notice the request still went somewhere.
+        """
+        parts = urlsplit(config.base_url)
+        scheme = (parts.scheme or "https").lower()
+        host = parts.hostname
+        if not host:
+            raise ProviderControllerAddressMismatchError(
+                "This integration has no usable controller address recorded."
+            )
+        port = context.portal_port or _RADIUS_PORTAL_PORTS.get(scheme)
+        if port is None:
+            raise ProviderControllerAddressMismatchError(
+                "This integration's controller address uses a scheme with no "
+                "known captive-portal port. Record the portal port on the "
+                "integration."
+            )
+
+        claimed_host = (context.advertised_target or "").strip().lower()
+        if claimed_host and claimed_host.strip("[]") != host:
+            raise ProviderControllerAddressMismatchError()
+        claimed_scheme = (context.advertised_scheme or "").strip().lower()
+        if claimed_scheme and claimed_scheme != scheme:
+            raise ProviderControllerAddressMismatchError()
+        if context.advertised_port is not None and context.advertised_port != port:
+            raise ProviderControllerAddressMismatchError()
+
+        rendered = f"[{host}]" if ":" in host else host
+        return f"{scheme}://{rendered}:{port}", scheme, host, port
+
+    async def authorize_guest_via_radius_portal(
+        self,
+        config: ProviderConnectionConfig,
+        context: ProviderRadiusPortalContext,
+    ) -> ProviderRadiusAuthorizationResult:
+        """Form-POST the controller's ``browserauth`` endpoint.
+
+        Everything vendor-shaped about this call is here or in the gateway:
+        the endpoint path, the form encoding, the ``authType 2`` constant,
+        the port, and the meaning of a ``302``. ``service.py`` sees a context
+        in, a result out.
+
+        **Trust is inherited, not re-decided.** The config handed down is the
+        integration's own, with ``base_url`` re-pointed at the portal origin,
+        so ``tls_mode`` and ``tls_pinned_sha256`` apply exactly as they do to
+        every other call -- including :meth:`_creds`' re-validation of the
+        address against the SSRF rules immediately before the socket opens,
+        which is what closes DNS rebinding between the row being written and
+        this request. There is deliberately no "verify off" path here; a
+        venue that needs one already has ``insecure`` recorded on the row,
+        where somebody had to choose it and the audit log says who.
+
+        The one honest caveat, stated rather than buried: a pin captured
+        against the management port is being checked against the portal
+        port. They are the same certificate on the controller measured, and
+        if some deployment ever differs this fails closed with a pin
+        mismatch rather than connecting anyway.
+        """
+        portal_base_url, _scheme, _host, port = self._radius_portal_origin(
+            config, context
+        )
+        portal_config = replace(config, base_url=portal_base_url)
+
+        from wyfy_device_gateway.omada.radius_portal import (  # noqa: PLC0415
+            RadiusPortalContext,
+        )
+
+        gateway_context = RadiusPortalContext(
+            client_mac=context.client_mac,
+            client_ip=context.client_ip,
+            ap_mac=context.ap_mac,
+            gateway_mac=context.gateway_mac,
+            ssid_name=context.ssid_name,
+            radio_id=context.radio_id,
+            vid=context.vid,
+            origin_url=context.origin_url,
+        )
+        result = await self._call(
+            portal_config,
+            "authorize_guest_via_radius_portal",
+            gateway_context,
+            username=context.username,
+            password=context.password,
+            portal_port=port,
+        )
+
+        authorized = bool(getattr(result, "authorized", False))
+        provider_code = getattr(result, "provider_code", None)
+        if not isinstance(provider_code, int) or isinstance(provider_code, bool):
+            provider_code = None
+        http_status = getattr(result, "http_status", None)
+        if authorized:
+            return ProviderRadiusAuthorizationResult(
+                authorized=True,
+                landing_url=getattr(result, "landing_url", None),
+                provider_code=provider_code,
+                http_status=http_status,
+            )
+        return ProviderRadiusAuthorizationResult(
+            authorized=False,
+            failure=self._radius_failure(provider_code, http_status),
+            provider_code=provider_code,
+            http_status=http_status,
+        )
+
+    @staticmethod
+    def _radius_failure(provider_code: int | None, http_status: int | None) -> str:
+        """Vendor answer -> one of ``constants.RadiusPortalFailure``.
+
+        ``400`` outranks the error code: the controller is saying the body
+        was malformed, which is this platform's bug and not a verdict about
+        the guest, and reporting it as "rejected" would send an operator to
+        look at a RADIUS server that is working fine.
+        """
+        if http_status == 400:
+            return RadiusPortalFailure.BAD_REQUEST.value
+        if provider_code is None:
+            return RadiusPortalFailure.CONTROLLER_REFUSED.value
+        mapped = _RADIUS_FAILURE_BY_PROVIDER_CODE.get(provider_code)
+        if mapped is None:
+            logger.warning(
+                "network_integration_unmapped_radius_portal_code",
+                extra={"provider_error_code": provider_code},
+            )
+            return RadiusPortalFailure.CONTROLLER_REFUSED.value
+        return mapped.value
+
     @staticmethod
     def _authorize_snapshot(
         gateway_context: Any,
@@ -681,6 +891,163 @@ class OmadaProvider:
         """
         result = await self._call(config, "deauthorize_guest", site_id, client_mac)
         return bool(result)
+
+    # -- per-client management ---------------------------------------------
+    #
+    # Provenance, because it is not uniform and the difference matters when
+    # somebody writes customer-facing copy (CAPABILITY-MATRIX.md, 2026-09-17):
+    #
+    #   * the *capability* is MEASURED. A full set -> read back -> change ->
+    #     restore cycle for the rate limit, and a block -> idempotent block ->
+    #     unblock -> idempotent unblock cycle, both ran against controller
+    #     5.15.24.19 with verbatim responses recorded, and the block was
+    #     accepted for an *offline* MAC, which is what proves it survives a
+    #     reconnect;
+    #   * the *surface* below is the Open API twin of those calls, which is
+    #     documented in that controller's own /v3/api-docs and has never been
+    #     executed, because this deployment holds no Open API app credential
+    #     on it.
+    #
+    # And one thing is UNMEASURED outright: what a block does to a client
+    # that currently holds a portal authorization. The data model says the
+    # authorization record and the block flag are separate objects with
+    # separate lifecycles, so the *inference* is that the grant survives
+    # while the device can no longer associate -- but that is inference.
+    # Nothing in this platform may tell an operator that blocking cuts off a
+    # guest who is online right now.
+
+    #: Why a ``legacy`` integration gets none of this. Not a configuration
+    #: mistake and not a version problem: a hotspot-operator session reaches
+    #: the portal tree and nothing else, and the client record lives in the
+    #: site tree. There is no fallback to degrade to.
+    _LEGACY_REASON = (
+        "This venue's controller is connected with a hotspot operator login, "
+        "which can let guests on and disconnect them but cannot change a "
+        "device's settings. Add Open API credentials to the controller "
+        "(Settings > Platform Integration > Open API) to turn this on."
+    )
+
+    #: Why "show me every blocked device" is not offered, on either mode.
+    #: The block flag lives on the known-client record and is exposed by the
+    #: controller's *internal* v2 insight endpoint, which this platform does
+    #: not speak; its own ``filters.blocked`` parameter was measured to be
+    #: silently ignored (it returned all six rows, every one unblocked), and
+    #: the Open API client grid carries no block field at all. An empty list
+    #: would be a false statement about the venue, so none is returned.
+    _BLOCKED_LIST_REASON = (
+        "The controller does not offer a list of blocked devices through the "
+        "connection we hold. Blocked guests are listed under Blocked Guests, "
+        "which is this platform's own record and is what actually refuses "
+        "them when they try to sign in again."
+    )
+
+    def client_capabilities(
+        self, config: ProviderConnectionConfig
+    ) -> ProviderClientCapabilities:
+        """Computed from ``auth_mode``, which is the fact that decides it.
+
+        ``disconnect`` is the odd one out and is deliberately reported
+        supported in *both* modes: it runs through
+        :meth:`deauthorize_guest`, whose transport is the hotspot operator
+        session, so it is the one action a ``legacy`` venue keeps. Its own
+        precondition -- that the integration carries operator credentials at
+        all -- is checked by the gateway at call time, because credentials
+        are not on this config in a form this method may inspect.
+        """
+        openapi = config.auth_mode == ControllerAuthMode.OPENAPI.value
+        legacy = ProviderCapability(supported=False, reason=self._LEGACY_REASON)
+        available = ProviderCapability(supported=True)
+        gated = available if openapi else legacy
+        return ProviderClientCapabilities(
+            set_rate_limit=gated,
+            clear_rate_limit=gated,
+            block=gated,
+            unblock=gated,
+            list_blocked=ProviderCapability(
+                supported=False, reason=self._BLOCKED_LIST_REASON
+            ),
+            # Rides the operator session, so it survives legacy mode.
+            disconnect=available,
+            client_stats=gated,
+        )
+
+    async def set_client_rate_limit(
+        self,
+        config: ProviderConnectionConfig,
+        site_id: str,
+        client_mac: str,
+        *,
+        down_kbps: int | None = None,
+        up_kbps: int | None = None,
+    ) -> ProviderClientRateLimit:
+        applied = await self._call(
+            config,
+            "set_client_rate_limit",
+            site_id,
+            client_mac,
+            down_kbps=down_kbps,
+            up_kbps=up_kbps,
+        )
+        return self._rate_limit(
+            applied, requested_down_kbps=down_kbps, requested_up_kbps=up_kbps
+        )
+
+    async def clear_client_rate_limit(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> ProviderClientRateLimit:
+        applied = await self._call(
+            config, "clear_client_rate_limit", site_id, client_mac
+        )
+        return self._rate_limit(
+            applied, requested_down_kbps=None, requested_up_kbps=None
+        )
+
+    async def block_client(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> bool:
+        return bool(await self._call(config, "block_client", site_id, client_mac))
+
+    async def unblock_client(
+        self, config: ProviderConnectionConfig, site_id: str, client_mac: str
+    ) -> bool:
+        return bool(await self._call(config, "unblock_client", site_id, client_mac))
+
+    async def list_blocked_clients(
+        self, config: ProviderConnectionConfig, site_id: str
+    ) -> list[ProviderClient]:
+        """Always raises. See ``_BLOCKED_LIST_REASON``.
+
+        Raising rather than returning ``[]`` is the whole contract of this
+        method (``base.py``): an empty list here would be this platform
+        asserting that the venue has blocked nobody, on the strength of a
+        question it was never able to ask.
+        """
+        raise ProviderUnsupportedApiError(self._BLOCKED_LIST_REASON)
+
+    @staticmethod
+    def _rate_limit(
+        applied: Any,
+        *,
+        requested_down_kbps: int | None,
+        requested_up_kbps: int | None,
+    ) -> ProviderClientRateLimit:
+        """Gateway ``ClientRateLimit`` -> this domain's shape, carrying the
+        requested values alongside the applied ones so a caller can see the
+        clamp rather than infer it.
+
+        ``read_back`` is carried through rather than defaulted here: whether
+        anybody re-read the record is the gateway's fact, and inventing it at
+        this seam is how the claim got made in the first place.
+        """
+        return ProviderClientRateLimit(
+            enabled=bool(getattr(applied, "enabled", False)),
+            applied_down_kbps=getattr(applied, "down_kbps", None),
+            applied_up_kbps=getattr(applied, "up_kbps", None),
+            requested_down_kbps=requested_down_kbps,
+            requested_up_kbps=requested_up_kbps,
+            clamped=bool(getattr(applied, "clamped", False)),
+            read_back=bool(getattr(applied, "read_back", False)),
+        )
 
     async def configure_controller(
         self,

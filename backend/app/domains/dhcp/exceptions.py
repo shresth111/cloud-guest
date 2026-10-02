@@ -31,6 +31,8 @@ __all__ = [
     "DhcpDeviceConnectionError",
     "DhcpDeviceOperationError",
     "DhcpOptionValueRequiredError",
+    "DhcpLeaseNotFoundError",
+    "DhcpLeaseConflictError",
 ]
 
 
@@ -292,4 +294,60 @@ class DhcpOptionValueRequiredError(DhcpError):
             "A DHCP option value is required to write the captive-portal "
             f"option to router {router_id}",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class DhcpLeaseNotFoundError(DhcpError):
+    """The router's DHCP server holds no lease for this device, so there is
+    no lease to keep. The device's address came from somewhere else (set on
+    the device itself, or another DHCP server); nothing was written.
+
+    409 rather than 404: the router exists and answered; this is a fact
+    about the device that the caller has to act on, not a missing route."""
+
+    def __init__(self, mac_address: str) -> None:
+        super().__init__(
+            "This device didn't get its address from the router, so there is "
+            "no address to keep for it.",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"code": "DHCP_LEASE_NOT_FOUND", "mac_address": mac_address},
+        )
+
+
+class DhcpLeaseConflictError(DhcpError):
+    """The device's lease is not on the address the caller asked to keep --
+    it moved (``reason="moved"``), or a reservation already holds another
+    address (``reason="reserved_elsewhere"``). Nothing was written:
+    reserving the wrong address would make the rule that asked for it miss
+    the device for good."""
+
+    def __init__(
+        self,
+        mac_address: str,
+        *,
+        requested_address: str,
+        reason: str,
+        current_address: str | None,
+    ) -> None:
+        if reason == "reserved_elsewhere":
+            message = (
+                f"This device is already kept on {current_address}, not "
+                f"{requested_address}."
+            )
+            code = "DHCP_LEASE_RESERVED_ELSEWHERE"
+        else:
+            message = (
+                f"This device's address changed to {current_address}. Pick it "
+                "again so the rule uses its new address."
+            )
+            code = "DHCP_LEASE_ADDRESS_CHANGED"
+        super().__init__(
+            message,
+            status_code=status.HTTP_409_CONFLICT,
+            data={
+                "code": code,
+                "mac_address": mac_address,
+                "requested_address": requested_address,
+                "current_address": current_address,
+            },
         )

@@ -293,7 +293,7 @@ def make_service(
     window: BookingWindow | None = None,
     now: datetime = NOW,
     notification_service: FakeNotificationService | None = None,
-    notify_email: str = "sales@wyfyguest.com",
+    notify_email: str = "demo@wyfyguest.com",
     redis: FakeRedis | None = None,
     **kwargs,
 ) -> tuple[DemoBookingService, FakeBookingRepository, FakeLeadRepository]:
@@ -867,7 +867,7 @@ class TestConfirmationMail:
         await book(service)
 
         recipients = {str(c.fields["recipient"]) for c in notifications.calls}
-        assert recipients == {"asha@hotelblue.in", "sales@wyfyguest.com"}
+        assert recipients == {"asha@hotelblue.in", "demo@wyfyguest.com"}
 
     async def test_a_failed_confirmation_is_recorded_as_failed_and_the_booking_stands(
         self,
@@ -929,10 +929,10 @@ class TestConfirmationMail:
         assert "11:00 AM" in body
         assert "UTC+05:30" in body
 
-    def test_booking_mail_is_routed_to_the_sales_mailbox(self):
-        """A demo booking is a sales flow. Asserted against the real
-        routing table rather than restated, so moving an event without
-        updating the table fails here."""
+    def test_booking_mail_is_routed_to_the_demo_mailbox(self):
+        """A demo booking is the demo conversation, not the sales one.
+        Asserted against the real routing table rather than restated, so
+        moving an event without updating the table fails here."""
         from app.domains.notification.constants import (
             NotificationEventType,
             mail_identity_for_event,
@@ -944,7 +944,7 @@ class TestConfirmationMail:
             NotificationEventType.DEMO_BOOKING_TEAM_NOTIFICATION,
             NotificationEventType.DEMO_BOOKING_CANCELLED,
         ):
-            assert mail_identity_for_event(event.value) is MailIdentity.DEFAULT
+            assert mail_identity_for_event(event.value) is MailIdentity.DEMO
 
 
 # ==========================================================================

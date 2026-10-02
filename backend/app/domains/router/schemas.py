@@ -38,10 +38,11 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domains.auth.schemas import MessageResponse
 
@@ -57,6 +58,8 @@ __all__ = [
     "RouterVendorChangeRequest",
     "RouterUpdateRequest",
     "RouterManagementAccessRequest",
+    "NasOnlySiteCreateRequest",
+    "NasOnlySiteCreateResponse",
     "ProvisioningTokenResponse",
     "ProvisioningCheckInRequest",
     "ProvisioningCheckInResponse",
@@ -230,7 +233,8 @@ class RouterResponse(BaseModel):
         default=None,
         description=(
             "The state of this platform's connection to the controller "
-            "that runs this device's network: one of not_registered, "
+            "that runs this device's network: one of no_controller_api, "
+            "not_registered, "
             "disabled, credentials_rejected, certificate_unverified, "
             "unreachable, not_mapped, reachable. NULL when this row is not "
             "reached through a controller -- an agent checks in and "
@@ -636,6 +640,85 @@ class RouterVendorChangeRequest(BaseModel):
             "about the device but a live row that depends on this value."
         ),
     )
+
+
+class NasOnlySiteCreateRequest(BaseModel):
+    """``POST /platform/routers/instant-on-sites``: add one Aruba Instant On
+    site as one fleet row (PM_SPEC §0.1 items 1, 4, 5).
+
+    ``organization_id`` travels in the body, not in ``X-Organization-Id``:
+    this is a GLOBAL-scoped ``/platform/`` route, and the service checks the
+    location against it -- the same shape as the Omada
+    ``/network-integrations/platform/onboard`` route.
+
+    ``serial_number`` and ``mac_address`` are optional because
+    ``routers.serial_number``/``routers.mac_address`` are NOT NULL and unique
+    but an operator adding a site may not have the AP in hand. Absent, the
+    service records a visibly synthetic pair (``AIO-`` serial, locally
+    administered MAC) rather than a plausible vendor one.
+
+    ``extra="forbid"``: a mis-shaped body (``site_id`` for
+    ``instant_on_site_id``) is a 422, not a 201 that silently stored nothing
+    -- the Omada credential-shape lesson.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    organization_id: uuid.UUID
+    location_id: uuid.UUID
+    name: str = Field(..., min_length=1, max_length=200)
+    serial_number: str | None = Field(default=None, min_length=1, max_length=100)
+    mac_address: str | None = Field(default=None, min_length=12, max_length=17)
+    # Written to `instant_on_sites` (the poller's table), not to the router
+    # row. A name without an id has nowhere to go there, so it is refused.
+    instant_on_site_id: str | None = Field(default=None, min_length=1, max_length=128)
+    instant_on_site_name: str | None = Field(
+        default=None, min_length=1, max_length=255
+    )
+
+    @model_validator(mode="after")
+    def site_name_needs_site_id(self) -> NasOnlySiteCreateRequest:
+        if self.instant_on_site_name and not self.instant_on_site_id:
+            raise ValueError(
+                "instant_on_site_name needs instant_on_site_id: the site name is "
+                "stored with the site mapping"
+            )
+        return self
+
+    @field_validator(
+        "name", "serial_number", "instant_on_site_id", "instant_on_site_name"
+    )
+    @classmethod
+    def strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+    @field_validator("mac_address")
+    @classmethod
+    def validate_mac_address(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        # Instant On's inventory shows the MAC as `54:f0:b1:c8:a9:0a`; accept
+        # the bare-hex and dashed spellings too and store the fleet's one form.
+        bare = re.sub(r"[:\-.]", "", value.strip())
+        if len(bare) == 12 and re.fullmatch(r"[0-9A-Fa-f]{12}", bare):
+            value = ":".join(bare[i : i + 2] for i in range(0, 12, 2))
+        return _validate_mac(value)
+
+
+class NasOnlySiteCreateResponse(BaseModel):
+    """The row just created, in the Master console's platform view, plus
+    whether its identity was supplied or minted."""
+
+    router: RouterPlatformResponse
+    synthetic_serial_number: bool
+    synthetic_mac_address: bool
+    instant_on_site_id: str | None = None
+    instant_on_site_name: str | None = None
 
 
 class RouterManagementAccessRequest(BaseModel):

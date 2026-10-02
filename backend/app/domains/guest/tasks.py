@@ -67,13 +67,28 @@ from app.domains.queue_management.constants import QueueTargetType
 from .constants import (
     ASSIGN_GUEST_QUEUE_MAX_RETRIES,
     ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS,
+    SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
+    SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY,
+    SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
     TASK_ASSIGN_GUEST_QUEUE,
+    TASK_RECONCILE_ROUTER_SESSION_PRESENCE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
+    TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
+    TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
 )
 from .repository import GuestRepository
-from .service import enforce_session_timeouts, run_fup_time_accrual, run_quota_reset
+from .service import (
+    enforce_open_hours_online_guests,
+    enforce_session_timeouts,
+    enforce_whitelist_only_online_guests,
+    reconcile_sessions_with_router_presence,
+    run_fup_time_accrual,
+    run_quota_reset,
+)
+from .validators import hotspot_is_serving, present_macs_from_hotspot_hosts
 
 logger = get_logger(__name__)
 
@@ -111,7 +126,9 @@ async def _run_session_timeout_sweep_async() -> int:
         try:
             repository = GuestRepository(session)
             expired = await enforce_session_timeouts(
-                repository, _build_session_terminator(session, repository)
+                repository,
+                _build_session_terminator(session, repository),
+                _build_activity_reporting_lookup(session),
             )
             await session.commit()
             return len(expired)
@@ -209,6 +226,154 @@ def run_quota_reset_sweep() -> dict[str, object]:
 
 
 # ============================================================================
+# Only Allowed enforcement sweep -- the sessions a whitelist-only property
+# has already stopped admitting
+# ============================================================================
+
+
+def _build_access_decision_service(session: AsyncSession):
+    """A real ``GuestAccessService`` for a caller that only ever *asks*
+    whether a rule applies -- the same object
+    ``app.domains.guest_access.dependencies.get_access_decision_service``
+    builds for the router agent's poll, and for the same reason it exists
+    there: no enforcer and no audit writer, so this sweep can never open a
+    router connection or write an audit row on a once-every-five-minutes
+    path.
+
+    Imported inside the function to match ``_build_session_terminator``
+    below, which imports the same domain for the same reason."""
+    from app.domains.guest_access.repository import GuestAccessRepository
+    from app.domains.guest_access.service import GuestAccessService
+
+    return GuestAccessService(
+        GuestAccessRepository(session),
+        block_enforcer=None,
+        # Read-only sweep: it expires rules, it never creates one, so there
+        # is no ``location_id`` to verify. Stated rather than defaulted --
+        # the constructor has no default, so a future write added here
+        # cannot silently skip the check.
+        location_lookup=None,
+    )
+
+
+def _build_mac_authorization_service(session: AsyncSession):
+    """A real ``MacAuthorizationService`` with only its repository wired --
+    enough for ``is_mac_authorized``, which is the one method this sweep
+    needs. ``audit_writer``/``router_lookup`` are the other two optional
+    constructor arguments and are only used by the entry-management and
+    config-generation paths, neither of which runs here."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+
+    return MacAuthorizationService(MacAuthorizationRepository(session))
+
+
+def _build_captive_portal_service(session: AsyncSession):
+    """Constructs a real ``CaptivePortalService`` the way
+    ``app.domains.captive_portal.dependencies`` would via ``Depends`` -- the
+    identical hand-built composition ``_build_policy_service`` above already
+    performs, against the same live ``OrganizationService``/``LocationService``
+    pair.
+
+    ``resolve_cache`` is deliberately left unwired: inside a task there is no
+    request-scoped cache to share, and the service degrades to an uncached
+    resolve. That costs one query per location that has guests online, once
+    per sweep -- not one per guest, which is what the sweep's own
+    ``configs_by_location`` memo prevents."""
+    from app.domains.captive_portal.repository import CaptivePortalRepository
+    from app.domains.captive_portal.service import CaptivePortalService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    return CaptivePortalService(
+        CaptivePortalRepository(session), organization_service, location_service
+    )
+
+
+async def _run_whitelist_only_enforcement_sweep_async() -> int:
+    """The actual async work behind ``run_whitelist_only_enforcement_sweep``
+    -- a fresh session per task run, mirroring every other sweep in this
+    module. Returns the number of sessions flipped to ``TERMINATED``."""
+    async with SessionLocal() as session:
+        try:
+            repository = GuestRepository(session)
+            ended = await enforce_whitelist_only_online_guests(
+                repository,
+                captive_portal_lookup=_build_captive_portal_service(session),
+                access_control_hook=_build_access_decision_service(session),
+                mac_authorization_hook=_build_mac_authorization_service(session),
+                terminator=_build_session_terminator(session, repository),
+            )
+            await session.commit()
+            return len(ended)
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP)
+def run_whitelist_only_enforcement_sweep() -> dict[str, object]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``).
+
+    Ends the session of every guest a property with
+    ``whitelist_only_enabled`` would now refuse, at the device as well as in
+    this platform's records (``service.issue_live_disconnect``). Before this
+    task, that flag was answered once at sign-in and never re-asked, so
+    switching it on stopped admitting *new* guests while leaving every guest
+    already online exactly where they were."""
+    ended_count = run_celery_task(_run_whitelist_only_enforcement_sweep_async())
+    logger.info(
+        "guest_task_run_whitelist_only_enforcement_sweep_completed",
+        extra={"ended_count": ended_count},
+    )
+    return {"ended_count": ended_count}
+
+
+async def _run_open_hours_enforcement_sweep_async() -> int:
+    """The actual async work behind ``run_open_hours_enforcement_sweep`` -- a
+    fresh session per task run, mirroring every other sweep in this module.
+    Returns the number of sessions flipped to ``TERMINATED``."""
+    async with SessionLocal() as session:
+        try:
+            repository = GuestRepository(session)
+            ended = await enforce_open_hours_online_guests(
+                repository,
+                captive_portal_lookup=_build_captive_portal_service(session),
+                terminator=_build_session_terminator(session, repository),
+            )
+            await session.commit()
+            return len(ended)
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP)
+def run_open_hours_enforcement_sweep() -> dict[str, object]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``).
+
+    Ends the session of every guest still online at a venue whose own Open
+    Hours say it is closed right now, at the device as well as in this
+    platform's records. Before this task, Open Hours refused new sign-ins and
+    left everyone already connected exactly where they were -- so a venue
+    that closes at 22:00 kept serving the guests it was closing to keep out."""
+    ended_count = run_celery_task(_run_open_hours_enforcement_sweep_async())
+    logger.info(
+        "guest_task_run_open_hours_enforcement_sweep_completed",
+        extra={"ended_count": ended_count},
+    )
+    return {"ended_count": ended_count}
+
+
+# ============================================================================
 # Dynamic bandwidth-queue assignment, off the login request path (§5 S9)
 # ============================================================================
 
@@ -224,7 +389,27 @@ def _build_queue_management_service(session: AsyncSession):
     Imported inside the function rather than at module scope: the router
     domain pulls in a large dependency graph, and this task module is
     imported by the API process too (``GuestService`` enqueues through
-    it), where none of that is needed."""
+    it), where none of that is needed.
+
+    **"The way the dependency would" now includes the controller speed
+    hook, and its absence here was the whole bug.** Every guest login on
+    the real API reaches ``resolve_and_assign_queue`` through *this*
+    factory, never through the FastAPI dependency -- the login request
+    enqueues ``assign_guest_queue`` and returns. So a venue whose network
+    runs from a controller had the one speed path it can use left unwired
+    on the one code path guests actually take: ``create_assignment`` saw
+    ``controller_speed_hook is None``, took that as proof the platform
+    cannot reach the device, and refused with "Speed Limits". The venue's
+    saved policy reached nobody, and nothing said so.
+
+    A factory that composes a service differently from the dependency it
+    claims to mirror is exactly the class of defect that took guest login
+    down platform-wide yesterday, so this one is constructed by a test the
+    way the app constructs it (``tests/unit/test_omada_bandwidth_policy``,
+    ``TestEveryFactoryWiresTheControllerHook``)."""
+    from app.domains.network_integration.client_hooks import (
+        build_controller_speed_hook,
+    )
     from app.domains.queue_management.repository import QueueManagementRepository
     from app.domains.queue_management.service import QueueManagementService
     from app.domains.rbac.repository import RBACRepository
@@ -245,7 +430,41 @@ def _build_queue_management_service(session: AsyncSession):
         router_service,
         _build_policy_service(session),
         audit_writer=RBACRepository(session),
+        controller_speed_hook=build_controller_speed_hook(session),
     )
+
+
+def _build_activity_reporting_lookup(session: AsyncSession):
+    """The venue half of the session-timeout sweep: can this venue report
+    that its guests are still using the network?
+
+    Satisfies ``service.VenueActivityReportingProtocol``. Imported inside
+    the function for the same reason ``_build_session_terminator`` below
+    does it -- this module is imported by the API process too, and the
+    network-integration domain is not needed there.
+
+    Without it, ``enforce_session_timeouts`` measures ``now -
+    last_activity_at`` at a venue where nothing ever moves
+    ``last_activity_at``, and expires guests who are actively browsing. An
+    Omada integration in ``legacy`` (hotspot-operator) auth mode is exactly
+    that venue: the Open-API usage sweep that feeds the column skips it (it
+    selects ``auth_mode == openapi``) and no RADIUS accounting arrives, so
+    the column is frozen at the value the login wrote and "idle for 35
+    minutes" just means "logged in 35 minutes ago".
+
+    This is a real hook against the real repository rather than a flag on
+    the task. It asks two things in order: can this venue's controller
+    report at all (the provider's own capability gate, the same one the
+    speed and block hooks consult), and *has* anything reported here
+    lately. The second question is the one that matters at an ``openapi``
+    venue, where the first is always yes by construction and stayed yes
+    through a day on which the controller sent nothing at all.
+    """
+    from app.domains.network_integration.client_hooks import (
+        build_controller_activity_reporting_lookup,
+    )
+
+    return build_controller_activity_reporting_lookup(session)
 
 
 def _build_session_terminator(session: AsyncSession, repository: GuestRepository):
@@ -278,8 +497,21 @@ def _build_session_terminator(session: AsyncSession, repository: GuestRepository
     router_service = RouterService(
         RouterRepository(session), organization_service, location_service
     )
+    from app.domains.network_integration.client_hooks import (
+        build_controller_session_terminator,
+    )
+
     return LiveSessionTerminator(
-        router_lookup=router_service, device_lookup=repository
+        router_lookup=router_service,
+        device_lookup=repository,
+        # The controller half, and the reason session timeout means anything
+        # at an Omada venue. That controller honours no RADIUS
+        # ``Session-Timeout`` -- its own API specification contains no
+        # occurrence of the attribute -- so unlike a RouterOS venue, where the
+        # reply attribute makes the NAS end the session itself, *this sweep is
+        # the only thing that ever ends a session there*. Without this line it
+        # would expire the row and leave the guest online.
+        controller_terminator=build_controller_session_terminator(session),
     )
 
 
@@ -376,6 +608,190 @@ def assign_guest_queue(
     return {"session_id": session_id}
 
 
+# ============================================================================
+# Session presence reconciliation -- close sessions whose device has left
+# ============================================================================
+
+# The two print-only sections one presence read needs, in one API
+# connection. ``hotspot_servers`` is the precondition (see
+# ``validators.hotspot_is_serving``), ``hotspot_hosts`` the answer.
+_PRESENCE_SECTIONS = ("hotspot_servers", "hotspot_hosts")
+
+
+def _default_presence_reader_factory(creds):  # noqa: ANN001, ANN202
+    """``wyfy_device_gateway.ReadOnlyDeviceReader`` -- imported here, not at
+    module scope, for the same reason ``_build_queue_management_service``
+    defers its imports: the API process imports this module to enqueue
+    queue assignments and never reads a router itself."""
+    from wyfy_device_gateway import ReadOnlyDeviceReader
+
+    return ReadOnlyDeviceReader(creds)
+
+
+async def _load_presence_target(router_id: uuid.UUID):  # noqa: ANN202
+    """``(router, credentials)`` for one router, or ``(router, None)`` with
+    the reason logged when it cannot be read. Its own short-lived DB
+    session, closed before any device I/O starts, so a slow or unreachable
+    router never holds a database connection open for its socket timeout."""
+    from wyfy_device_gateway import DeviceCredentials, DeviceVendor
+
+    from app.domains.router.crypto import decrypt_secret
+    from app.domains.router.repository import RouterRepository
+
+    async with SessionLocal() as session:
+        router = await RouterRepository(session).get_by_id(router_id)
+    if router is None:
+        return None, None
+    if router.vendor != DeviceVendor.MIKROTIK.value:
+        # ``list_routers_with_active_sessions`` already excludes
+        # controller-managed rows; this is the fail-closed backstop for any
+        # other non-RouterOS vendor, which has no ``/ip/hotspot/host``.
+        logger.info(
+            "guest_session_presence_router_skipped_vendor",
+            extra={"router_id": str(router_id), "vendor": router.vendor},
+        )
+        return router, None
+    host = router.management_ip_address or router.public_ip_address
+    if not host or not router.api_username or not router.api_credentials_encrypted:
+        logger.warning(
+            "guest_session_presence_router_skipped_no_credentials",
+            extra={"router_id": str(router_id)},
+        )
+        return router, None
+    creds = DeviceCredentials(
+        vendor=DeviceVendor.MIKROTIK,
+        host=host,
+        username=router.api_username,
+        secret=decrypt_secret(router.api_credentials_encrypted),
+    )
+    return router, creds
+
+
+async def _reconcile_router_session_presence_async(
+    router_id: uuid.UUID,
+    *,
+    reader_factory=_default_presence_reader_factory,  # noqa: ANN001
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """One router: read its hotspot host table, then close every ``ACTIVE``
+    session whose device is not in it (``service
+    .reconcile_sessions_with_router_presence``).
+
+    **Every way this can fail changes nothing.** An unreachable router, a
+    section RouterOS refused, no stored credentials, or a router with no
+    enabled hotspot server all return ``closed: 0`` with a ``skipped``
+    reason. That is the whole safety argument for the sweep: the one input
+    that closes sessions is a *successful* read that lacks the MAC, never
+    the absence of a read."""
+    router, creds = await _load_presence_target(router_id)
+    if router is None:
+        return {"router_id": str(router_id), "closed": 0, "skipped": "not_found"}
+    if creds is None:
+        return {"router_id": str(router_id), "closed": 0, "skipped": "unreadable"}
+
+    try:
+        capture = await reader_factory(creds).read_all(_PRESENCE_SECTIONS)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: fail closed
+        logger.warning(
+            "guest_session_presence_router_read_failed",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+        return {"router_id": str(router_id), "closed": 0, "skipped": "read_failed"}
+    if capture.errors:
+        logger.warning(
+            "guest_session_presence_router_section_failed",
+            extra={"router_id": str(router_id), "errors": dict(capture.errors)},
+        )
+        return {"router_id": str(router_id), "closed": 0, "skipped": "read_failed"}
+    if not hotspot_is_serving(capture.sections.get("hotspot_servers", [])):
+        logger.info(
+            "guest_session_presence_router_skipped_no_hotspot",
+            extra={"router_id": str(router_id)},
+        )
+        return {"router_id": str(router_id), "closed": 0, "skipped": "no_hotspot"}
+
+    present_macs = present_macs_from_hotspot_hosts(
+        capture.sections.get("hotspot_hosts", []),
+        dead_after_seconds=SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
+    )
+    async with SessionLocal() as session:
+        try:
+            closed = await reconcile_sessions_with_router_presence(
+                GuestRepository(session),
+                router_id=router_id,
+                present_macs=present_macs,
+                now=now,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+    return {"router_id": str(router_id), "closed": len(closed), "skipped": None}
+
+
+@celery_app.task(name=TASK_RECONCILE_ROUTER_SESSION_PRESENCE)
+def reconcile_router_session_presence(router_id: str) -> dict[str, object]:
+    """Per-router leaf task dispatched by ``run_session_presence_sweep`` --
+    one RouterOS connection per task, so one slow router never delays the
+    rest (the ``connected_devices.tasks.sync_single_router_devices``
+    fan-out shape)."""
+    result = run_celery_task(
+        _reconcile_router_session_presence_async(uuid.UUID(router_id))
+    )
+    logger.info("guest_task_reconcile_router_session_presence_completed", extra=result)
+    return result
+
+
+async def _dispatch_session_presence_sweep_async() -> dict[str, object]:
+    """Coordinator body: take the overlap lock, list routers with at least
+    one ``ACTIVE`` session, dispatch one leaf task each. A fresh Redis
+    client per run, never the module singleton -- each Celery tick runs its
+    own event loop (see ``connected_devices.tasks
+    ._dispatch_connected_device_sync_sweep_async``)."""
+    from app.database.redis import create_redis_client
+
+    redis = create_redis_client()
+    try:
+        acquired = await redis.set(
+            SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY,
+            "1",
+            nx=True,
+            ex=SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
+        )
+        if not acquired:
+            logger.warning(
+                "guest_task_session_presence_sweep_skipped_locked",
+                extra={"lock_key": SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY},
+            )
+            return {"dispatched": 0, "skipped_locked": True}
+        try:
+            async with SessionLocal() as session:
+                routers = await GuestRepository(
+                    session
+                ).list_routers_with_active_sessions()
+            for router in routers:
+                reconcile_router_session_presence.delay(str(router.id))
+            return {"dispatched": len(routers), "skipped_locked": False}
+        finally:
+            await redis.delete(SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY)
+    finally:
+        await redis.aclose()
+
+
+@celery_app.task(name=TASK_RUN_SESSION_PRESENCE_SWEEP)
+def run_session_presence_sweep() -> dict[str, object]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS``). Closes
+    ``ACTIVE`` sessions whose device the router no longer has on the
+    network -- the exit a bypassed guest never had, because it produces no
+    RADIUS accounting. See ``service.reconcile_sessions_with_router_presence``
+    for the incident and the design."""
+    result = run_celery_task(_dispatch_session_presence_sweep_async())
+    logger.info("guest_task_run_session_presence_sweep_dispatched", extra=result)
+    return result
+
+
 async def enqueue_guest_queue_assignment(
     *,
     organization_id: uuid.UUID | None,
@@ -423,6 +839,8 @@ __all__ = [
     "run_session_timeout_sweep",
     "run_fup_time_accrual_sweep",
     "run_quota_reset_sweep",
+    "run_session_presence_sweep",
+    "reconcile_router_session_presence",
     "assign_guest_queue",
     "enqueue_guest_queue_assignment",
 ]

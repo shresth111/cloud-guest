@@ -119,6 +119,7 @@ from app.domains.network_integration.providers.base import (
     ProviderControllerInfo,
     ProviderDevice,
     ProviderPortalContext,
+    ProviderRadiusAuthorizationResult,
     ProviderSite,
     ProviderSsid,
     ProviderTlsObservation,
@@ -304,6 +305,16 @@ class FakeRepository:
     authorizations: list[NetworkIntegrationAuthorization] = field(
         default_factory=list
     )
+    # (location_id, organization_id) -> vendor, for NAS-only fleet rows
+    # (Aruba Instant On). Empty by default: every existing test sees "none".
+    nas_only_rows: dict[tuple[uuid.UUID, uuid.UUID], str] = field(
+        default_factory=dict
+    )
+
+    async def nas_only_vendor_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> str | None:
+        return self.nas_only_rows.get((location_id, organization_id))
 
     def add(self, integration: NetworkIntegration) -> NetworkIntegration:
         self.integrations[integration.id] = integration
@@ -322,6 +333,30 @@ class FakeRepository:
         if integration is None or (integration.is_deleted and not include_deleted):
             return None
         return integration
+
+    async def get_omada_integration_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None:
+        """Both filters in the "query", exactly as the real one does.
+
+        The organization is matched here, not checked by the caller
+        afterwards, because that is the property the customer-facing client
+        routes depend on: another tenant's location must resolve to nothing
+        rather than to a row somebody later declines to use. A fake that
+        matched on location alone would make every tenancy test pass while
+        the real isolation went untested.
+        """
+        for integration in self.integrations.values():
+            if integration.is_deleted or not integration.is_enabled:
+                continue
+            if integration.provider != NetworkProviderKind.OMADA.value:
+                continue
+            if integration.organization_id != organization_id:
+                continue
+            if getattr(integration, "location_id", None) != location_id:
+                continue
+            return integration
+        return None
 
     async def update_integration(
         self, integration: NetworkIntegration, data: dict[str, object]
@@ -499,6 +534,11 @@ class FakeProvider:
     # vendor it is not allowed to know.
     fleet_device_vendor: str = "tplink_omada"
     raise_on: dict[str, Exception] = field(default_factory=dict)
+    #: (method, site_id, client_mac) per per-client write. Separate from
+    #: calls because these tests assert on the *arguments* -- above all
+    #: that the site id came from the resolved integration and not from the
+    #: caller -- which a list of method names cannot show.
+    client_actions: list[tuple[str, str, str]] = field(default_factory=list)
     calls: list[str] = field(default_factory=list)
     authorize_result: ProviderAuthorizationResult | None = None
     clients: list[ProviderClient] = field(default_factory=list)
@@ -508,6 +548,19 @@ class FakeProvider:
     # pass on -- an assertion on the outcome cannot tell a carried
     # `client_ip` from a dropped one.
     contexts: list[ProviderPortalContext] = field(default_factory=list)
+    # Every `duration_seconds` this fake was asked to authorize for, in
+    # order. Recorded because the number is the controller's whole belief
+    # about how long the guest stays on, and an assertion on the outcome
+    # cannot see it -- which is how a hardcoded 3600 sat next to a venue's
+    # 30-minute policy without any test noticing.
+    authorize_durations: list[int] = field(default_factory=list)
+    # The RADIUS contract's own seam. Separate lists, not a shared one: the
+    # two contexts are different types carrying different fields, and a test
+    # asserting "the stored address was used, not the claimed one" needs the
+    # config as well as the context.
+    radius_contexts: list[Any] = field(default_factory=list)
+    radius_configs: list[Any] = field(default_factory=list)
+    radius_result: ProviderRadiusAuthorizationResult | None = None
     #: Every `ProviderConnectionConfig` handed to an identity call, so a test
     #: can assert what the service actually sent -- `controller_id` in
     #: particular, which a cloud-managed controller cannot work without.
@@ -590,15 +643,115 @@ class FakeProvider:
         self, config, context, *, duration_seconds, down_kbps=None, up_kbps=None
     ) -> ProviderAuthorizationResult:
         self.contexts.append(context)
+        self.authorize_durations.append(duration_seconds)
         self._maybe_raise("authorize_guest")
         return self.authorize_result or ProviderAuthorizationResult(
             authorized=True,
             expires_at=_now() + timedelta(seconds=duration_seconds),
         )
 
+    # -- RADIUS portal contract -------------------------------------------
+    # The fake performs the address check for real rather than accepting
+    # anything: that check is the SSRF boundary, and a fake that waved it
+    # through would let every service-level test pass while the production
+    # provider refused. The port table is duplicated from the real provider
+    # for the same reason its own is duplicated from the gateway's, and
+    # `test_the_port_tables_agree` asserts all three.
+
+    async def authorize_guest_via_radius_portal(
+        self, config, context
+    ) -> ProviderRadiusAuthorizationResult:
+        from app.domains.network_integration.providers.omada import (
+            OmadaProvider,
+        )
+
+        # First, so that `radius_contexts == []` is a true statement about a
+        # refused request: nothing was recorded because nothing got past the
+        # boundary.
+        OmadaProvider._radius_portal_origin(config, context)
+        self.radius_contexts.append(context)
+        self.radius_configs.append(config)
+        self._maybe_raise("authorize_guest_via_radius_portal")
+        return self.radius_result or ProviderRadiusAuthorizationResult(
+            authorized=True, landing_url="https://portal.example.com/connected"
+        )
+
     async def deauthorize_guest(self, config, site_id, client_mac) -> bool:
         self._maybe_raise("deauthorize_guest")
         return True
+
+    # -- per-client management (Protocol members since client management
+    # landed). The capability answer mirrors the real provider's: it is a
+    # function of ``config.auth_mode``, so a legacy-mode config gets the same
+    # refusal here that it would from a real controller.
+
+    def client_capabilities(self, config):
+        from app.domains.network_integration.constants import ControllerAuthMode
+        from app.domains.network_integration.providers.base import (
+            ProviderCapability,
+            ProviderClientCapabilities,
+        )
+
+        openapi = config.auth_mode == ControllerAuthMode.OPENAPI.value
+        available = ProviderCapability(supported=True)
+        refused = ProviderCapability(
+            supported=False, reason="Needs Open API credentials."
+        )
+        gated = available if openapi else refused
+        return ProviderClientCapabilities(
+            set_rate_limit=gated,
+            clear_rate_limit=gated,
+            block=gated,
+            unblock=gated,
+            list_blocked=ProviderCapability(
+                supported=False, reason="No blocked-client list on this surface."
+            ),
+            disconnect=available,
+            client_stats=gated,
+        )
+
+    async def set_client_rate_limit(
+        self, config, site_id, client_mac, *, down_kbps=None, up_kbps=None
+    ):
+        from app.domains.network_integration.providers.base import (
+            ProviderClientRateLimit,
+        )
+
+        self._maybe_raise("set_client_rate_limit")
+        self.client_actions.append(("set_client_rate_limit", site_id, client_mac))
+        return ProviderClientRateLimit(
+            enabled=True,
+            applied_down_kbps=down_kbps,
+            applied_up_kbps=up_kbps,
+            requested_down_kbps=down_kbps,
+            requested_up_kbps=up_kbps,
+        )
+
+    async def clear_client_rate_limit(self, config, site_id, client_mac):
+        from app.domains.network_integration.providers.base import (
+            ProviderClientRateLimit,
+        )
+
+        self._maybe_raise("clear_client_rate_limit")
+        self.client_actions.append(("clear_client_rate_limit", site_id, client_mac))
+        return ProviderClientRateLimit(enabled=False)
+
+    async def block_client(self, config, site_id, client_mac) -> bool:
+        self._maybe_raise("block_client")
+        self.client_actions.append(("block_client", site_id, client_mac))
+        return True
+
+    async def unblock_client(self, config, site_id, client_mac) -> bool:
+        self._maybe_raise("unblock_client")
+        self.client_actions.append(("unblock_client", site_id, client_mac))
+        return True
+
+    async def list_blocked_clients(self, config, site_id):
+        from app.domains.network_integration.exceptions import (
+            ProviderUnsupportedApiError,
+        )
+
+        raise ProviderUnsupportedApiError("No blocked-client list.")
 
     async def configure_controller(self, config, request):
         # Part of the Protocol since automatic controller setup landed. Its
@@ -635,6 +788,20 @@ class FakeGuestSession:
     # missing device binding went unnoticed: a session with no device
     # modelled a guest who could authorize anything.
     device_mac: str | None = "AA:BB:CC:DD:EE:FF"
+    # The RADIUS contract submits the guest's IDENTIFIER as the credential,
+    # and the server resolves it from here rather than from the request
+    # body. Defaulted so the external-portal cases are unaffected; set to
+    # None to model a session whose guest cannot be resolved.
+    guest_id: uuid.UUID | None = field(
+        default_factory=lambda: uuid.uuid5(uuid.NAMESPACE_OID, "guest")
+    )
+    guest_identifier: str | None = "+919876543210"
+    # The venue's SESSION policy as it was resolved for this guest at login
+    # (`GuestService._resolve_session_timeout_minutes`), snapshotted on the
+    # row. `None` -- the default here -- is an unlimited grant or a row
+    # written before the resolver existed, and is what keeps every existing
+    # case on the integration's stored duration.
+    session_timeout_minutes: int | None = None
 
     @property
     def device_id(self):  # noqa: ANN201
@@ -655,6 +822,16 @@ class FakeGuestSessionLookup:
             if session.device_id == device_id:
                 return SimpleNamespace(
                     id=device_id, mac_address=session.device_mac
+                )
+        return None
+
+    async def get_guest_by_id(self, guest_id):  # noqa: ANN001, ANN201
+        for session in self.sessions.values():
+            if session.guest_id == guest_id:
+                if session.guest_identifier is None:
+                    return None
+                return SimpleNamespace(
+                    id=guest_id, identifier=session.guest_identifier
                 )
         return None
 
@@ -4629,18 +4806,26 @@ class TestEveryRouteRequiresPermission:
                 f"network_integration.router must be Master-console-only"
             )
 
-    def test_the_portal_route_is_deliberately_ungated(self) -> None:
+    def test_the_portal_routes_are_deliberately_ungated(self) -> None:
         """A guest holds no roles, so there is no permission to check.
         Allowlisted with that reasoning in
-        ``tests/unit/test_route_permission_coverage.py``."""
-        assert len(portal_router.routes) == 1
-        route = portal_router.routes[0]
-        assert route.path == "/network-integrations/portal/authorize"
-        names = {
-            getattr(dep.call, "__qualname__", "")
-            for dep in route.dependant.dependencies
+        ``tests/unit/test_route_permission_coverage.py``.
+
+        The exact path set is asserted, not just the absence of a guard:
+        this router is the ONE unauthenticated surface in the domain, and a
+        route landing on it by accident is the failure worth catching. Two
+        routes, one per captive-portal contract.
+        """
+        assert {route.path for route in portal_router.routes} == {
+            "/network-integrations/portal/authorize",
+            "/network-integrations/portal/radius-authorize",
         }
-        assert not any(n.startswith("RequirePermission") for n in names)
+        for route in portal_router.routes:
+            names = {
+                getattr(dep.call, "__qualname__", "")
+                for dep in route.dependant.dependencies
+            }
+            assert not any(n.startswith("RequirePermission") for n in names)
 
     def test_the_permission_keys_used_are_all_seeded(self) -> None:
         from app.domains.rbac.enums import PermissionAction, PermissionModule

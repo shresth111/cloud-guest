@@ -14,6 +14,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.common.masking import MaskedMac
 from app.domains.auth.schemas import MessageResponse
 from app.domains.dhcp.constants import DEFAULT_LEASE_TIME_SECONDS
 
@@ -26,6 +27,10 @@ __all__ = [
     "CaptivePortalDhcpOptionRequest",
     "CaptivePortalDhcpOptionStateResponse",
     "CaptivePortalDhcpOptionConvergenceResponse",
+    "DhcpLeaseResponse",
+    "DhcpLeaseListResponse",
+    "DhcpLeaseKeepRequest",
+    "DhcpLeaseKeepResponse",
 ]
 
 
@@ -144,3 +149,39 @@ class CaptivePortalDhcpOptionConvergenceResponse(BaseModel):
     option_sets_removed: list[str]
     option_sets_rewritten: list[str]
     bindings_detached: list[str]
+
+
+class DhcpLeaseResponse(BaseModel):
+    """One DHCP lease as the router reported it just now. ``dynamic`` false
+    is a reservation: the device gets ``address`` every time."""
+
+    mac_address: MaskedMac
+    address: str | None
+    dynamic: bool
+    status: str | None
+    host_name: str | None
+    server: str | None
+    disabled: bool
+
+
+class DhcpLeaseListResponse(BaseModel):
+    router_id: str
+    items: list[DhcpLeaseResponse]
+
+
+class DhcpLeaseKeepRequest(BaseModel):
+    """Keep this device on this address. ``ip_address`` is the address the
+    caller is about to write into a rule; the router refuses (409) if the
+    device's lease is not on it, rather than reserving a different one."""
+
+    mac_address: str = Field(min_length=1, max_length=32)
+    ip_address: str = Field(min_length=1, max_length=45)
+
+
+class DhcpLeaseKeepResponse(BaseModel):
+    """``changed`` is the device's own answer: ``False`` when it was already
+    kept on that address and nothing was written."""
+
+    router_id: str
+    changed: bool
+    lease: DhcpLeaseResponse

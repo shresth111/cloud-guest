@@ -265,7 +265,9 @@ app.domains.analytics.service.AnalyticsService
   |    .compute_and_store_platform_daily_summary
   |      -> aggregation.compute_platform_daily_summary
   v
-AnalyticsRepository.create_snapshot -- INSERT into analytics_snapshots
+AnalyticsRepository.upsert_snapshot -- INSERT ... ON CONFLICT DO UPDATE
+  into analytics_snapshots, arbitrated by uq_analytics_snapshots_natural_key
+  (snapshot_type, organization_id, location_id, period_start, granularity)
   |
   |  (committed by the task's own async bridge function)
   v

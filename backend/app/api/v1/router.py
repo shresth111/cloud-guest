@@ -8,6 +8,12 @@ from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
 from app.domains.auth.router import router as auth_router
+from app.domains.billing.credits_router import (
+    customer_router as marketing_credits_router,
+)
+from app.domains.billing.credits_router import (
+    platform_router as platform_credits_router,
+)
 from app.domains.billing.dependencies import RequireActiveLicenseForWrites
 from app.domains.billing.router import router as billing_router
 from app.domains.branding.router import router as branding_router
@@ -27,6 +33,10 @@ from app.domains.demo_request.router import router as demo_request_router
 from app.domains.device_sync.router import router as device_sync_router
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.dns.router import router as dns_router
+from app.domains.dns_filtering.router import router as dns_filtering_router
+from app.domains.feature_entitlement.router import (
+    platform_router as feature_entitlement_platform_router,
+)
 from app.domains.feature_entitlement.router import router as feature_entitlement_router
 from app.domains.firewall.router import router as firewall_router
 from app.domains.guest.router import admin_router as guest_admin_router
@@ -46,6 +56,16 @@ from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.live_sessions.router import router as live_sessions_router
 from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
+from app.domains.marketing.pricing_router import (
+    platform_pricing_router as marketing_platform_pricing_router,
+)
+from app.domains.marketing.router import guest_router as marketing_guest_router
+from app.domains.marketing.router import (
+    platform_providers_router as marketing_platform_providers_router,
+)
+from app.domains.marketing.router import providers_router as marketing_providers_router
+from app.domains.marketing.router import public_router as marketing_public_router
+from app.domains.marketing.router import router as marketing_router
 from app.domains.monitored_hardware.router import router as monitored_hardware_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
@@ -53,6 +73,12 @@ from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
 from app.domains.network_integration.customer_router import (
     customer_router as network_integration_customer_router,
+)
+from app.domains.network_integration.instant_on_router import (
+    instant_on_customer_router as network_integration_instant_on_customer_router,
+)
+from app.domains.network_integration.instant_on_router import (
+    instant_on_platform_router as network_integration_instant_on_platform_router,
 )
 from app.domains.network_integration.router import (
     portal_router as network_integration_portal_router,
@@ -74,6 +100,7 @@ from app.domains.readiness.router import router as readiness_router
 from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
+from app.domains.security.router import router as security_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
@@ -187,24 +214,68 @@ api_v1_router.include_router(network_device_router, dependencies=_PAID_WRITES)
 # Two routers, one prefix. The customer/platform CRUD half is a paid
 # feature; the guest-facing portal authorize half must never be, for the
 # reason spelled out in the licence-gating note above.
-api_v1_router.include_router(
-    network_integration_router, dependencies=_PAID_WRITES
-)
+api_v1_router.include_router(network_integration_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(network_integration_portal_router)
 # Customer-facing (organization-scoped), read-only controller device
 # inventory -- deliberately NOT on the GLOBAL network_integration_router,
 # and not license-gated for writes because it has none (see its module).
 api_v1_router.include_router(network_integration_customer_router)
+# Aruba Instant On, read-only: customer reads (organization scope, keyed on
+# location) and the Master console's GLOBAL reads plus the one write that
+# maps a NAS-only device to its Instant On site (platform DB only). Not
+# license-gated: nothing here changes a venue's network.
+api_v1_router.include_router(network_integration_instant_on_customer_router)
+api_v1_router.include_router(network_integration_instant_on_platform_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
+# Cloudflare Gateway category filtering: the provider-backed half of the same
+# customer feature, gated on the same licence rule (writes need an active plan).
+api_v1_router.include_router(dns_filtering_router, dependencies=_PAID_WRITES)
+# Security: venue posture (overview, score) and the capability matrix.
+#
+# Deliberately NOT on _PAID_WRITES, and this is a decision rather than an
+# omission. The licence note above is explicit that reads are never gated --
+# a customer whose plan lapsed must still be able to sign in and see what they
+# have. Every route on this router is a read, so gating it would lock a lapsed
+# venue out of the page describing its own exposure.
+#
+# That argument expires the moment this router grows a write endpoint, and the
+# gating decision is not left to whoever adds it: tests/unit/test_security.py
+# asserts this router has no write route, so adding one fails the suite rather
+# than silently shipping an ungated write. See app.domains.security.router's
+# own docstring for the same note next to the routes themselves.
+api_v1_router.include_router(security_router)
 api_v1_router.include_router(campaigns_guest_router)
 api_v1_router.include_router(campaigns_router, dependencies=_PAID_WRITES)
+# Guest Marketing (contract §5.0): the customer router is licence-gated for
+# writes like every other paid surface, and every route on it also carries
+# RequireFeature(GUEST_MARKETING). The unsubscribe page and the portal opt-in
+# are NOT gated: honouring an opt-out is a legal duty whatever the billing
+# state, and the opt-in endpoint refuses on its own when the org is not
+# entitled.
+api_v1_router.include_router(marketing_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(marketing_providers_router, dependencies=_PAID_WRITES)
+# Master read-only own-provider view; pinned GLOBAL, platform surface.
+api_v1_router.include_router(marketing_platform_providers_router)
+# Master price book (spec §13.7); GLOBAL-pinned platform surface.
+api_v1_router.include_router(marketing_platform_pricing_router)
+# Marketing credits (§13): the customer balance/ledger routes live in the
+# billing domain (the ledger is billing's) but carry the same guards as every
+# /marketing route. The Master routes are GLOBAL-pinned platform surface, so
+# not on _PAID_WRITES.
+api_v1_router.include_router(marketing_credits_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(platform_credits_router)
+api_v1_router.include_router(marketing_public_router)
+api_v1_router.include_router(marketing_guest_router)
 api_v1_router.include_router(notification_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(api_keys_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(audit_router)
 api_v1_router.include_router(dashboard_router)
 api_v1_router.include_router(workspace_router)
 api_v1_router.include_router(feature_entitlement_router)
+# Master add-on lock/unlock: every route pinned scope=GLOBAL. Platform
+# surface, so not on _PAID_WRITES.
+api_v1_router.include_router(feature_entitlement_platform_router)
 api_v1_router.include_router(agent_permissions_router)
 api_v1_router.include_router(live_sessions_router)
 api_v1_router.include_router(customer_provisioning_router)

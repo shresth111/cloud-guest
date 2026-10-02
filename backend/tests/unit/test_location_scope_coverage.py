@@ -80,6 +80,35 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "marketing": (
+        "Guest Marketing. Two location-bearing models: MarketingCampaign "
+        "(nullable location_id = org-wide) and GuestMarketingConsent "
+        "(captured_at_location_id, provenance only, never a filter). "
+        "Campaigns are reached by `{campaign_id}` on nine routes, all through "
+        "`MarketingService._get_campaign`, whose repository read filters on "
+        "the caller's organization AND, for a location-scoped caller, "
+        "location_id = theirs (org-wide campaigns are a 404 to them). "
+        "`get_caller_scope` folds X-Location-Id and CallerLocationScope into "
+        "one CallerScope, and `_guard` re-asserts the grant-derived "
+        "confinement at every entry point. Guests are confined by 'has a "
+        "session at the caller's location'. The unauthenticated routes "
+        "(public unsubscribe, guest opt-in) use a separate provider with no "
+        "confinement: they act on a token or the guest's own session."
+    ),
+    "dns_filtering": (
+        "Two location-bearing models. `DnsFilteringPolicy` is reached only "
+        "through `/locations/{location_id}/policy` (RBAC pinned at LOCATION, "
+        "so the path id is the checked id) or `/organizations/"
+        "{organization_id}/policy` (pinned at ORGANIZATION, which a "
+        "location-scoped grant can never satisfy); `_load_location` also "
+        "runs `enforce_entity_location` on the loaded row and reads the "
+        "organization off that row, never off a header. "
+        "`DnsFilteringRouterLocation` is reached only by `{router_id}` "
+        "(pinned at ROUTER), and every router path loads the router "
+        "org-scoped and then enforces its location. There is no by-own-id "
+        "route for either table. `DnsFilteringProfile` is platform-owned, "
+        "carries no location, and has no route at all."
+    ),
     "guest": (
         "The PII surface, done last and alone. THREE getters across TWO "
         "service classes: `_require_guest` (the chokepoint all nine "
@@ -94,7 +123,7 @@ LOCATION_SCOPED: dict[str, str] = {
         "composed into eleven other domains."
     ),
     "network_integration": (
-        "TWO location-bearing models, and the by-id surface is a single "
+        "Location-bearing models, and the by-id surface is a single "
         "chokepoint. `NetworkIntegration` carries a nullable `location_id` "
         "and is reached by `{integration_id}` on fifteen routes; every one "
         "of them funnels through "
@@ -117,7 +146,15 @@ LOCATION_SCOPED: dict[str, str] = {
         "joining WiFi. That route does not use the confinement at all -- it "
         "proves an ACTIVE GuestSession whose own organization AND location "
         "match the body, and resolves the integration from the session's "
-        "venue rather than the caller's."
+        "venue rather than the caller's. "
+        "`InstantOnSite` (Aruba Instant On read cache) is the third: its "
+        "customer routes take only `{location_id}`, resolve the row with the "
+        "caller's organization AND that location in the WHERE, then apply "
+        "`enforce_entity_location` to the row "
+        "(`InstantOnReadService.customer_view`); the service is built by "
+        "`get_instant_on_read_service` with the STRICT `CallerLocationScope`, "
+        "since no guest-facing route composes it. Its by-id reads "
+        "(`{router_id}`) are Master-only, pinned to ScopeType.GLOBAL."
     ),
     "monitoring": (
         "Seven service classes; only one owns a location-bearing row reached "
@@ -168,7 +205,16 @@ LOCATION_SCOPED: dict[str, str] = {
         "have been the `voucher` mistake. Uses the anonymous-tolerant "
         "dependency because this service is composed into `get_guest_service` "
         "as `access_control_hook`, so the strict one would have 401'd guest "
-        "login -- the composition hazard, not a route in this domain."
+        "login -- the composition hazard, not a route in this domain. "
+        "WRITES are enforced too, and separately: a rule carries the "
+        "location it will apply at, so a create is not reached by an id but "
+        "*names* one, and the getters never see it. Both creates and every "
+        "import row pass `_enforce_write_location`, which additionally "
+        "refuses a location-confined caller an org-wide (`location_id = "
+        "NULL`) rule -- that row applies at every venue, so writing one "
+        "needs an organization-level grant. `enforce_entity_location` alone "
+        "cannot express that: its `entity_location_id is None` pass-through "
+        "is correct for reads and deliberately unchanged."
     ),
     "guest_teams": (
         "One entity, `GuestTeam`, addressed by `{team_id}` on the detail, "
@@ -490,6 +536,15 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "via `find_enabled_integration_for_location`, never through the "
         "confined `_load_owned_integration`. Unconfined is correct here "
         "because the caller is a guest acting on their own session."
+    ),
+    ("POST", "/api/v1/network-integrations/portal/radius-authorize"): (
+        "The same guest, the same substitute for a permission check, on the "
+        "other captive-portal contract. It shares the sibling route's "
+        "`_resolve_portal_session`, so the integration is resolved from the "
+        "SESSION's (organization, location) -- never from the caller and "
+        "never from the body -- and the confined `_load_owned_integration` "
+        "is not on this path. Unconfined is correct because the caller is a "
+        "guest acting on their own session."
     ),
     ("POST", "/api/v1/vouchers/redeem"): (
         "A guest redeeming or checking a code handed to them at a front desk -- the "

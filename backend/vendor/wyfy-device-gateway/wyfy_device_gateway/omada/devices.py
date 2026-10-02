@@ -24,12 +24,25 @@ schema, and are left in place only as harmless fallbacks:
   field. ``ControllerDevice.client_count`` will therefore be ``None`` for
   every device. Getting a per-AP client count means grouping the client list
   by ``apMac``, which is a caller's decision, not this parser's.
+
+  ``None`` here is load-bearing and must not be collapsed to ``0`` by any
+  consumer. "This controller's API does not report per-AP client counts" and
+  "this AP has no clients" are different facts, and an inventory table that
+  prints ``0 clients`` under an AP serving forty guests is the worse of the
+  two errors. (The controller-internal v2 device list does carry
+  ``clientNum`` and per-radio counts; this module speaks Open API only, and
+  the fallback key names below are what would pick them up if a firmware
+  ever sent them here.)
 * **uptime as a number.** ``DeviceInfo.uptime`` is typed **string**, not
-  integer. If a controller sends a numeric string, ``coerce_int`` parses it;
-  if it sends a formatted duration ("2day(s) 3h 4m"), ``coerce_int`` returns
-  ``None``. Blank is the right failure here -- a mis-parsed uptime is worse
-  than an absent one -- so this is documented rather than guessed at, and
-  wants confirming against a real controller.
+  integer. A numeric string is parsed by ``coerce_int``; a formatted duration
+  is parsed by ``coerce_duration_seconds``, which accepts only
+  ``<digits><known unit>`` terms and returns ``None`` for anything else. That
+  second parser was added after measuring a real controller (Omada Software
+  Controller 5.15.24.19, 2026-09-18): its device list reports
+  ``"uptime": "8h 26m 42s"`` beside ``"uptimeLong": 30402``, and the parser
+  turns the former into exactly the latter. Blank is still the right failure
+  for an unrecognised string -- a mis-parsed uptime is worse than an absent
+  one.
 
 ## Field names are read defensively, on purpose
 
@@ -54,6 +67,7 @@ from typing import Any
 from ..controller_contract import ControllerDevice
 from .client import OmadaHttpClient
 from .types import (
+    coerce_duration_seconds,
     coerce_int,
     coerce_str,
     normalize_device_status,
@@ -78,6 +92,19 @@ def _first(row: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _uptime_seconds(value: Any) -> int | None:
+    """Seconds of uptime from either shape Omada reports it in.
+
+    Integer first, because that is the confirmed v2 shape and the one a
+    numeric string means; the duration parser only sees values ``coerce_int``
+    has already refused, and refuses in turn anything it does not recognise.
+    """
+    numeric = coerce_int(value)
+    if numeric is not None:
+        return numeric
+    return coerce_duration_seconds(value)
+
+
 def parse_device(row: dict[str, Any]) -> ControllerDevice | None:
     """One device row -> ``ControllerDevice``, or ``None`` if unusable.
 
@@ -100,12 +127,14 @@ def parse_device(row: dict[str, Any]) -> ControllerDevice | None:
         firmware_version=coerce_str(
             _first(row, "firmwareVersion", "version", "swVersion")
         ),
-        # ``uptime`` is seconds. ``uptimeLong`` is only consulted as a
-        # fallback because we have seen the name but not confirmed its unit;
-        # if it turns out to be milliseconds this field is wrong by 1000x for
-        # the firmware that omits ``uptime``, which is why the confirmed key
-        # is tried first.
-        uptime_seconds=coerce_int(_first(row, "uptime", "uptimeLong")),
+        # ``uptime`` is seconds when numeric and a formatted duration when
+        # a string (see the module docstring -- the string form is what the
+        # Open API's own schema types this as, and what a real controller
+        # sends). ``uptimeLong`` is only consulted as a fallback because we
+        # have seen the name but not confirmed its unit; if it turns out to
+        # be milliseconds this field is wrong by 1000x for the firmware that
+        # omits ``uptime``, which is why the confirmed key is tried first.
+        uptime_seconds=_uptime_seconds(_first(row, "uptime", "uptimeLong")),
         client_count=coerce_int(_first(row, "clientNum", "clientCount", "clients")),
     )
 

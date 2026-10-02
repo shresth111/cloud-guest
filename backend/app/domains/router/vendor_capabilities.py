@@ -54,6 +54,10 @@ from typing import Any, TypeVar
 
 __all__ = [
     "AGENT_EVIDENCE_FIELDS",
+    "ARUBA_INSTANT_ON_VENDOR",
+    "NAS_ONLY_VENDORS",
+    "has_controller_api",
+    "is_nas_only",
     "ControllerState",
     "controller_state_for",
     "CONTROLLER_MANAGED_VENDORS",
@@ -83,7 +87,33 @@ _Row = TypeVar("_Row")
 # make those domains fail to import whenever it is mid-edit. The values are
 # the ``routers.vendor`` column's vocabulary, whose single translation table
 # is ``app.domains.network_integration.constants.ROUTER_VENDOR_BY_PROVIDER``.
-CONTROLLER_MANAGED_VENDORS: frozenset[str] = frozenset({"tplink_omada"})
+CONTROLLER_MANAGED_VENDORS: frozenset[str] = frozenset(
+    {"tplink_omada", "aruba_instant_on"}
+)
+
+#: Aruba Instant On (AP11/AP21/AP22/...). Not the ``aruba`` stub: that one is
+#: Aruba Instant / AOS, a different product with a different management
+#: plane, and it stays a stub.
+ARUBA_INSTANT_ON_VENDOR = "aruba_instant_on"
+
+# Controller-managed vendors whose controller this platform has NO API to.
+#
+# Aruba Instant On is run entirely from Aruba's own cloud (web portal and
+# mobile app), and there is nothing there this platform can call: no
+# test-connection, no site or SSID to map, no client verbs. So it is
+# controller-managed in every sense the gates above care about -- no agent,
+# no WireGuard peer, no RouterOS, configured somewhere else -- but it has no
+# ``network_integrations`` row and never will.
+#
+# The only thing such a device does with this platform is act as a RADIUS NAS:
+# its guest network sends the browser to our portal, and the AP asks our
+# FreeRADIUS whether the identifier the browser posted back is signed in.
+# Everything that would otherwise go through a controller API (speed limits,
+# disconnect, client lists) is simply unavailable, and callers must say so
+# rather than try.
+#
+# Always a subset of CONTROLLER_MANAGED_VENDORS (asserted in the tests).
+NAS_ONLY_VENDORS: frozenset[str] = frozenset({ARUBA_INSTANT_ON_VENDOR})
 
 
 # The closed vocabulary `routers.vendor` may be *written* with.
@@ -101,7 +131,11 @@ CONTROLLER_MANAGED_VENDORS: frozenset[str] = frozenset({"tplink_omada"})
 # hold: this is a gate on new claims, not a retroactive assertion about old
 # ones. `mikrotik` first, so the ordering in the error message reads as the
 # default it is.
-SUPPORTED_ROUTER_VENDORS: tuple[str, ...] = ("mikrotik", "tplink_omada")
+SUPPORTED_ROUTER_VENDORS: tuple[str, ...] = (
+    "mikrotik",
+    "tplink_omada",
+    ARUBA_INSTANT_ON_VENDOR,
+)
 
 
 # Substrings that identify MikroTik hardware from `routers.model` alone.
@@ -171,6 +205,25 @@ def vendor_of(value: Any) -> str:
 def is_controller_managed(value: Any) -> bool:
     """True if this device is reached only through a vendor controller."""
     return vendor_of(value) in CONTROLLER_MANAGED_VENDORS
+
+
+def is_nas_only(value: Any) -> bool:
+    """True if this device reaches us only as a RADIUS NAS.
+
+    See :data:`NAS_ONLY_VENDORS`. A label question, like
+    :func:`is_controller_managed`: it decides which *machinery* may be
+    attempted, and over-refusing machinery that cannot work is free.
+    """
+    return vendor_of(value) in NAS_ONLY_VENDORS
+
+
+def has_controller_api(value: Any) -> bool:
+    """True if this device's controller is one this platform can call.
+
+    False for every agent-managed vendor (there is no controller) and for
+    every NAS-only vendor (there is one, and we cannot reach it).
+    """
+    return is_controller_managed(value) and not is_nas_only(value)
 
 
 def is_agent_managed(value: Any) -> bool:
@@ -343,7 +396,7 @@ def agent_managed_rows(rows: Iterable[_Row]) -> list[_Row]:
 
 class ControllerState(StrEnum):
     """The state of THIS PLATFORM'S CONNECTION TO THE CONTROLLER that runs a
-    fleet row's network. Seven values, in precedence order; the first that
+    fleet row's network. Eight values, in precedence order; the first that
     applies wins.
 
     ## What this is not
@@ -387,6 +440,12 @@ class ControllerState(StrEnum):
     3. ``reachable`` is a claim about us reaching the controller. Not about
        the venue's access points, and not about a guest's internet.
     """
+
+    NO_CONTROLLER_API = "no_controller_api"
+    """The vendor's controller exists and this platform has no API to it
+    (:data:`NAS_ONLY_VENDORS`). Not a fault and not "not registered":
+    there is nothing to register. The device talks to us only over RADIUS,
+    and nothing here measures it."""
 
     NOT_REGISTERED = "not_registered"
     DISABLED = "disabled"
@@ -443,6 +502,13 @@ def controller_state_for(row: Any, integration: Any) -> tuple[str, str] | None:
     """
     if not is_controller_managed_row(row):
         return None
+
+    # Before the integration questions, because none of them apply: a
+    # NAS-only vendor never has an integration row, and reporting that as
+    # `not_registered` would tell an operator to register something that
+    # cannot exist.
+    if is_nas_only(row):
+        return (ControllerState.NO_CONTROLLER_API.value, "vendor_has_no_api")
 
     if integration is None:
         return (ControllerState.NOT_REGISTERED.value, "no_integration")

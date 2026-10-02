@@ -82,6 +82,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import Settings, get_settings
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import AuthUser
 
@@ -99,6 +100,14 @@ from app.domains.guest.radius_bridge import (
     validate_controller_nas_address,
 )
 from app.domains.guest.service import RadiusService
+from app.domains.notification.dependencies import get_onboarding_slack_notifier
+from app.domains.notification.onboarding_slack import (
+    OnboardingSlackNotifier,
+    controller_onboarded_notice,
+)
+from app.domains.notification.tasks import dispatch_onboarding_failure
+from app.domains.organization.dependencies import get_organization_service
+from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -144,6 +153,8 @@ from .schemas import (
     PlatformTestConnectionResponse,
     PortalAuthorizeRequest,
     PortalAuthorizeResponse,
+    PortalRadiusAuthorizeRequest,
+    PortalRadiusAuthorizeResponse,
     TestConnectionRequest,
     TestConnectionResponse,
 )
@@ -1042,6 +1053,9 @@ async def onboard_platform_integration(
     payload: PlatformOnboardRequest,
     actor: AuthUser = Depends(CurrentUser),
     service: NetworkIntegrationService = Depends(get_network_integration_service),
+    organization_service: OrganizationService = Depends(get_organization_service),
+    onboarding_slack: OnboardingSlackNotifier = Depends(get_onboarding_slack_notifier),
+    settings: Settings = Depends(get_settings),
 ):
     """Register a customer's controller *and* its fleet device row.
 
@@ -1060,32 +1074,97 @@ async def onboard_platform_integration(
     Customer self-service (``POST /network-integrations``) writes the same
     pair once the integration names a venue -- see
     ``service.ensure_fleet_device``.
+
+    The Slack notice composed below is the third and last step of the
+    Master console's onboarding flow -- the wizard calls this endpoint
+    right after ``POST /locations/provision`` returns, as a separate
+    request, so a controller that fails to onboard leaves a provisioned
+    venue with no equipment and nothing else would say so. Success is
+    enqueued on this request's own session; failure goes to Celery
+    because this one is about to be rolled back. See
+    ``app.domains.notification.onboarding_slack``.
     """
-    integration, fleet_device = await service.create_integration_with_fleet_device(
-        actor_user_id=_actor_id(actor),
-        organization_id=payload.organization_id,
-        location_id=payload.location_id,
-        provider=payload.provider,
-        name=payload.name,
-        base_url=payload.base_url,
-        auth_mode=payload.auth_mode,
-        controller_id=payload.controller_id,
-        controller_model=payload.controller_model,
-        serial_number=payload.serial_number,
-        mac_address=payload.mac_address,
-        external_site_id=payload.external_site_id,
-        external_site_name=payload.external_site_name,
-        guest_ssid_id=payload.guest_ssid_id,
-        guest_ssid_name=payload.guest_ssid_name,
-        session_duration_seconds=payload.session_duration_seconds,
-        sync_interval_seconds=payload.sync_interval_seconds,
-        is_enabled=payload.is_enabled,
-        tls_mode=payload.tls_mode,
-        tls_pinned_sha256=payload.tls_pinned_sha256,
-        client_id=payload.client_id,
-        client_secret=payload.client_secret,
-        username=payload.username,
-        password=payload.password,
+    actor_user_id = _actor_id(actor)
+    try:
+        integration, fleet_device = await service.create_integration_with_fleet_device(
+            actor_user_id=actor_user_id,
+            organization_id=payload.organization_id,
+            location_id=payload.location_id,
+            provider=payload.provider,
+            name=payload.name,
+            base_url=payload.base_url,
+            auth_mode=payload.auth_mode,
+            controller_id=payload.controller_id,
+            controller_model=payload.controller_model,
+            serial_number=payload.serial_number,
+            mac_address=payload.mac_address,
+            external_site_id=payload.external_site_id,
+            external_site_name=payload.external_site_name,
+            guest_ssid_id=payload.guest_ssid_id,
+            guest_ssid_name=payload.guest_ssid_name,
+            session_duration_seconds=payload.session_duration_seconds,
+            sync_interval_seconds=payload.sync_interval_seconds,
+            is_enabled=payload.is_enabled,
+            tls_mode=payload.tls_mode,
+            tls_pinned_sha256=payload.tls_pinned_sha256,
+            client_id=payload.client_id,
+            client_secret=payload.client_secret,
+            username=payload.username,
+            password=payload.password,
+        )
+    except Exception as exc:
+        dispatch_onboarding_failure(
+            settings=settings,
+            stage="Controller onboarding",
+            # The body's organization id, not a header-derived one: this
+            # route is GLOBAL-scoped and the tenant is named in the body
+            # (see this endpoint's own docstring). No lookup here -- the
+            # pairing has NOT been validated on this branch, and reading a
+            # name off an id the request only claimed is how the
+            # check-the-header/read-the-path defect gets reproduced.
+            organization_name=f"organization {payload.organization_id}",
+            organization_id=payload.organization_id,
+            error=exc,
+            actor_user_id=actor_user_id,
+            request_id=_request_id(request),
+            # The controller's name, which the operator typed. Not
+            # `base_url` (a customer's internal address), not
+            # `client_secret`/`password`, and nothing SSID-shaped.
+            details=[
+                ("Controller", payload.name),
+                ("Vendor", payload.provider),
+            ],
+        )
+        raise
+
+    # Only now: `create_integration_with_fleet_device` has resolved the
+    # location *with* this organization id and refused a location
+    # belonging to anyone else, so the pairing in the body is verified
+    # and reading the organization's own name is not a cross-tenant read.
+    #
+    # Guarded all the same. The controller IS onboarded at this point --
+    # a 404 raised by a lookup that exists only to put a nicer name in a
+    # Slack message would turn a succeeded request into a failed
+    # response, which is the exact inversion this whole feature is
+    # supposed to avoid.
+    try:
+        organization_name = (
+            await organization_service.get_organization(payload.organization_id)
+        ).name
+    except Exception:  # noqa: BLE001 -- see above
+        organization_name = f"organization {payload.organization_id}"
+    await onboarding_slack.notify(
+        controller_onboarded_notice(
+            organization_id=payload.organization_id,
+            organization_name=organization_name,
+            controller_name=payload.name,
+            provider=payload.provider,
+            site_name=payload.external_site_name,
+            synthetic_identity=bool(
+                (fleet_device.settings or {}).get("synthetic_identity", False)
+            ),
+            actor_user_id=actor_user_id,
+        )
     )
     response = PlatformOnboardResponse(
         integration=_integration_response(
@@ -2051,6 +2130,97 @@ async def authorize_portal_client(
             "Guest authorized on the network controller"
             if outcome.authorized
             else "The network controller declined the authorization"
+        ),
+        data=response.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@portal_router.post(
+    "/portal/radius-authorize",
+    response_model=ApiResponse[PortalRadiusAuthorizeResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def authorize_portal_client_via_radius(
+    request: Request,
+    payload: PortalRadiusAuthorizeRequest,
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Authorize a guest at a venue on the **RADIUS** captive-portal contract.
+
+    **Public and unauthenticated, for exactly the same reason and with
+    exactly the same substitute** as ``POST /portal/authorize`` immediately
+    above: a guest joining WiFi holds no login and no grants, and what
+    stands in for a permission check is proof of a genuine ``GuestSession``
+    -- ACTIVE, its own organization *and* location matching the body, its
+    bound device's MAC matching the MAC being authorized, and the
+    integration resolved from the session's venue rather than the body's.
+    That check is literally the same code
+    (``NetworkIntegrationService._resolve_portal_session``), not a second
+    implementation of it.
+
+    This is a **separate route rather than a mode of that one** because it
+    is a separate contract: the ``authType 2`` redirect carries no ``site``
+    and no ``t`` (both required there) and adds ``target``/``targetPort``/
+    ``scheme``/``originUrl`` (meaningless there). Each route refuses an
+    integration whose stored ``portal_mode`` belongs to the other, so the
+    live external-portal venue cannot be reached through this one.
+
+    ## Why the call is here and not in the guest's browser
+
+    The guest's browser used to form-POST the controller's own
+    ``/portal/radius/browserauth``. That target is the controller's HTTPS
+    portal port with a self-signed ``CN=localhost`` certificate, and
+    **Android refuses it** -- measured on a real phone. Every self-hosted
+    controller has its own such certificate, so nothing about that scales.
+    The controller does not care who sends the request (verified on
+    hardware: a third machine's curl, carrying the guest's MAC, opened the
+    gate), so the platform sends it instead.
+
+    The guest's browser therefore never talks to the controller and never
+    sees its raw JSON error body, which is what it used to be shown on a
+    rejection.
+
+    Same two rate-limit layers as the sibling route: per client IP in
+    ``app.middleware.rate_limit``, per guest session in this domain's
+    service.
+    """
+    outcome = await service.authorize_portal_client_via_radius(
+        session_id=uuid.UUID(payload.session_id),
+        organization_id=uuid.UUID(payload.organization_id),
+        location_id=uuid.UUID(payload.location_id),
+        provider=payload.provider,
+        client_mac=payload.client_mac,
+        # CR-004, as on the sibling route: whatever ``clientIp`` the
+        # controller's own redirect carried, and never ``request.client.host``
+        # or an ``X-Forwarded-For`` hop.
+        client_ip=payload.client_ip,
+        ap_mac=payload.ap_mac,
+        ssid_name=payload.ssid_name,
+        radio_id=payload.radio_id,
+        gateway_mac=payload.gateway_mac,
+        vid=payload.vid,
+        origin_url=payload.origin_url,
+        # Passed through ONLY to be checked against the integration's stored
+        # controller address. The service builds no URL from them -- see its
+        # SSRF section. Not defaulted from anything here either: a value this
+        # layer invented would be a value that always matched.
+        target=payload.target,
+        target_port=payload.target_port,
+        scheme=payload.scheme,
+    )
+    response = PortalRadiusAuthorizeResponse(
+        authorized=outcome.authorized,
+        provider=outcome.provider,
+        redirect_url=outcome.redirect_url,
+        failure=outcome.failure,
+    )
+    return build_response(
+        success=outcome.authorized,
+        message=(
+            "Guest authorized on the network controller"
+            if outcome.authorized
+            else "The network controller did not authorize this guest"
         ),
         data=response.model_dump(),
         request_id=_request_id(request),

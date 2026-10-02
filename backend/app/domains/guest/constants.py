@@ -201,6 +201,16 @@ TERMINATION_RECONNECT_COOLDOWN_MINUTES = 60
 # and its honest scope limitation around voucher re-validation.
 RECONNECT_GRACE_MINUTES = 30
 
+#: How many of a guest's most recent sessions RADIUS accounting scans when
+#: the NAS names the device it is reporting on (``Calling-Station-Id``). It
+#: only has to cover the sessions a guest can hold at once on one router --
+#: ``DEFAULT_MAX_DEVICES_PER_GUEST`` plus the recently-ended rows a
+#: retransmitted Accounting-Stop can still legitimately land on -- so 20 is
+#: generous. Bounded rather than unbounded because this runs on every
+#: accounting packet from every venue, and an unbounded scan of a regular's
+#: whole session history is a cost that grows with loyalty.
+RADIUS_ACCOUNTING_DEVICE_MATCH_SCAN_LIMIT = 20
+
 BYTES_PER_MB = 1024 * 1024
 
 # How long, after an OTP-authenticated ``GuestSession`` is created, its
@@ -355,12 +365,154 @@ MAX_BULK_DEVICE_LOOKUP_IDS = 100
 
 MAX_BULK_VOUCHER_LOOKUP_IDS = 100
 
+
+# ============================================================================
+# Customer dashboard series (GET /guest-analytics/dashboard-series)
+# ============================================================================
+
+
+class DashboardSeriesBucket(StrEnum):
+    """Bucket width for ``GuestAnalyticsService.get_dashboard_series``.
+
+    Both widths are fixed-length (3600s / 86400s) because the caller's
+    timezone arrives as a fixed UTC offset, not a named zone -- so a "day"
+    bucket can never be 23 or 25 hours long and bucket arithmetic stays
+    exact integer division in SQL."""
+
+    HOUR = "hour"
+    DAY = "day"
+
+
+DASHBOARD_SERIES_BUCKET_SECONDS: dict[DashboardSeriesBucket, int] = {
+    DashboardSeriesBucket.HOUR: 3600,
+    DashboardSeriesBucket.DAY: 86400,
+}
+
+# Longest window the dashboard series accepts. 31 days keeps a one-month view
+# possible while bounding the hourly series at 744 buckets.
+MAX_DASHBOARD_SERIES_WINDOW_DAYS = 31
+
+# Real-world UTC offsets run from UTC-12:00 to UTC+14:00.
+MIN_DASHBOARD_TZ_OFFSET_MINUTES = -720
+MAX_DASHBOARD_TZ_OFFSET_MINUTES = 840
+
+# OS labels, in classifier precedence order. Also the tie-break order when two
+# labels have the same count, so the response order is deterministic.
+DASHBOARD_OS_NAMES: tuple[str, ...] = (
+    "iOS",
+    "Android",
+    "Windows",
+    "macOS",
+    "Linux",
+    "Other",
+)
+
 # Every 5 minutes -- shorter than analytics' 15-minute rolling aggregation
 # cadence (``SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS``-adjacent), because an
 # expired-but-not-yet-flipped session is guest-facing/operationally visible
 # (an admin's "live sessions" view showing a session that is, in practice,
 # long idle) rather than merely a reporting staleness window.
 SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS = 300.0
+
+# Slack the stale-session sweep adds on top of a session's own idle / time
+# limit before it flips an ``ACTIVE`` row to ``EXPIRED``.
+#
+# ``last_activity_at`` only moves when an accounting producer reports in:
+# RADIUS Interim-Update every 300s (``Acct-Interim-Interval`` in the
+# Authorize reply) or the Omada usage sync every 300s. A guest who is
+# genuinely browsing can therefore look up to one full interval "idle" at
+# the moment the sweep runs. Without slack, a venue with a 5-minute idle
+# timeout would have its busy guests expired between two interim updates.
+# Two intervals tolerates one late or dropped update while still clearing a
+# session whose NAS has gone silent (lost Accounting-Stop, router rebooted
+# without Accounting-On, no accounting at all) within minutes rather than
+# hours. The router's own idle/session timers are unaffected -- they fire
+# first and report an Accounting-Stop; this only matters when that report
+# never arrives.
+SESSION_ACTIVITY_GRACE_MINUTES = 10
+
+# How far back the sweep looks for *evidence that this venue is reported on
+# at all* before it is willing to measure a guest's idleness.
+#
+# Not the same question as the grace above, which asks how late one venue's
+# next update may be. This one asks whether any update is arriving here, and
+# is answered by ``GuestRepository.venue_activity_was_reported_since``: has
+# anything moved ``last_activity_at`` past ``started_at`` at this venue
+# inside this window. Both producers report every 300s (RADIUS
+# ``Acct-Interim-Interval``, and the Omada usage poll's
+# ``OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS``), so three intervals tolerates
+# two consecutive misses before a venue is treated as unreported -- and
+# being treated as unreported is not a failure state: it only drops the
+# idle half of the rule, leaving the absolute ``session_timeout_minutes``
+# ceiling, which is measured from ``started_at`` and needs no reporting to
+# be true.
+#
+# Erring long is the safe direction here. A window that is too short calls
+# a healthy venue unreported and lets its idle guests linger until the
+# ceiling; a window that is too long resumes expiring guests for inactivity
+# on the strength of accounting that stopped arriving, which is the defect
+# this exists to close.
+VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES = 15
+
+# ============================================================================
+# Session presence reconciliation -- closes ``ACTIVE`` sessions whose device
+# is no longer on the router at all. See ``service
+# .reconcile_sessions_with_router_presence``'s docstring for the incident
+# and the full design; these are only its tunables.
+#
+# The short version of why this has to exist: on this fleet a guest is let
+# through the hotspot by an ``/ip hotspot ip-binding type=bypassed`` row
+# (``GET /agent/authorized-macs``), not by a hotspot login. A bypassed host
+# never becomes an ``/ip hotspot active`` session, so RouterOS sends no
+# RADIUS Accounting-Start/Interim-Update/Stop for it -- nothing ever tells
+# the platform that guest left, and the only remaining exit was the idle
+# sweep above at ``session_timeout_minutes`` (240 at the venue that
+# reported it). And because ``/agent/authorized-macs`` returns every
+# ``ACTIVE`` session's MAC, the stale row also kept the bypass itself alive.
+# ============================================================================
+
+TASK_RUN_SESSION_PRESENCE_SWEEP = "app.domains.guest.tasks.run_session_presence_sweep"
+TASK_RECONCILE_ROUTER_SESSION_PRESENCE = (
+    "app.domains.guest.tasks.reconcile_router_session_presence"
+)
+
+# Same 5-minute cadence as the timeout sweep: a stale "connected" row is
+# exactly as operator-visible, and each tick is one print-only RouterOS API
+# connection per router that currently has an active session -- not per
+# router in the fleet.
+SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS = 300.0
+
+# A session younger than this (by both ``started_at`` and
+# ``last_activity_at``) is never judged. It covers the window between a
+# guest's OTP verify and their device's first frame through the hotspot,
+# and a portal re-POST that has just refreshed the row. Twice the sweep
+# interval, so a session is always looked at by at least one full tick
+# before it can be closed.
+SESSION_PRESENCE_GRACE_MINUTES = 10
+
+# A host row that is still listed but whose ``host-dead-time`` (time since
+# RouterOS last heard from that MAC) has reached this is treated as gone.
+# Normally RouterOS drops a silent host from ``/ip/hotspot/host`` on its
+# own (the hotspot server's ``idle-timeout``, default 5m); this is the
+# belt-and-braces for a server configured with ``idle-timeout=none``, where
+# a departed bypassed host can otherwise sit in the table indefinitely.
+# Deliberately well above RouterOS's own default so a phone that is merely
+# dozing -- still associated, still answering ARP -- is never mistaken for
+# a departed one.
+SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS = 15 * 60
+
+# Written to ``GuestSession.disconnect_reason``. ``DISCONNECTED`` rather
+# than ``EXPIRED``: leaving the venue is the textbook "normal,
+# non-punitive end of use" that status is defined as, and it is what lets
+# the portal greet a returning device with "sign in again".
+SESSION_PRESENCE_DISCONNECT_REASON = "device_left_network"
+
+# Overlap-prevention lock for the coordinator -- same SETNX shape, and the
+# same "crash-safety backstop, not the normal release path" TTL semantics,
+# as ``app.domains.connected_devices.constants
+# .CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY``.
+SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY = "cloudguest:guest:session-presence-sweep:lock"
+SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS = 240
 
 # ============================================================================
 # Fair Usage Policy (FUP) quota tracking -- Phase 1 BhaiFi-parity.
@@ -415,6 +567,52 @@ FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS = 300.0
 TASK_RUN_QUOTA_RESET_SWEEP = "app.domains.guest.tasks.run_quota_reset_sweep"
 
 QUOTA_RESET_SWEEP_INTERVAL_SECONDS = 3600.0
+
+
+# ============================================================================
+# Only Allowed enforcement sweep -- Celery Beat task wiring.
+# ============================================================================
+# ``whitelist_only_enabled`` is answered once, at sign-in
+# (``service.GuestService._enforce_access_control``, reached from every login
+# method and from the OTP-request gate). Nothing re-asked it afterwards, so a
+# venue that switched it on kept serving every guest who was *already* online
+# -- and the guests it exists to refuse are the ones with a session in hand.
+# Founder QA: "Always allowed not working" / "turning it on doesn't cut off
+# guests already online".
+#
+# Same 5-minute cadence as the other guest sweeps in this module: a venue
+# closing its doors wants the venue empty promptly, and five minutes is the
+# cadence this fleet already treats as "promptly" for a session that should
+# have ended (see ``SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS``).
+# ============================================================================
+
+TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP = (
+    "app.domains.guest.tasks.run_whitelist_only_enforcement_sweep"
+)
+
+WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS = 300.0
+
+
+# ============================================================================
+# Open Hours enforcement sweep -- Celery Beat task wiring.
+# ============================================================================
+# Open Hours was a *sign-in* gate only. ``_require_venue_open`` refuses a
+# login outside the venue's own schedule, and nothing ever revisited a guest
+# who was already connected -- so a venue that closes at 22:00 stops admitting
+# anyone at 22:00 and keeps serving everyone who was already online. From the
+# venue's side that is the feature not working. Founder QA: "Open Hours not
+# working, internet still working".
+#
+# Same 5-minute cadence as the other guest sweeps: a venue closing its doors
+# wants the venue empty promptly, and this fleet already treats five minutes
+# as "promptly" for a session that should have ended.
+# ============================================================================
+
+TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP = (
+    "app.domains.guest.tasks.run_open_hours_enforcement_sweep"
+)
+
+OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS = 300.0
 
 # ============================================================================
 # Dynamic bandwidth-queue assignment, off the login request path
@@ -608,9 +806,22 @@ __all__ = [
     "QuotaPeriodType",
     "TASK_RUN_SESSION_TIMEOUT_SWEEP",
     "SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS",
+    "VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES",
+    "TASK_RUN_SESSION_PRESENCE_SWEEP",
+    "TASK_RECONCILE_ROUTER_SESSION_PRESENCE",
+    "SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS",
+    "SESSION_PRESENCE_GRACE_MINUTES",
+    "SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS",
+    "SESSION_PRESENCE_DISCONNECT_REASON",
+    "SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY",
+    "SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS",
     "TASK_RUN_FUP_TIME_ACCRUAL_SWEEP",
     "FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_QUOTA_RESET_SWEEP",
+    "TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP",
+    "WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP",
+    "OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
     "TASK_ASSIGN_GUEST_QUEUE",
     "ASSIGN_GUEST_QUEUE_MAX_RETRIES",
     "ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS",
@@ -687,7 +898,7 @@ class GuestSessionEndedReason(StrEnum):
     * the portal's own prose (``"guest tapped disconnect"``).
 
     So the mapping keys off ``GuestSessionStatus`` -- an enum this domain
-    owns -- and nothing else. Four members:
+    owns -- and nothing else. Five members:
 
     * ``TIMED_OUT`` -- ``EXPIRED``: ``enforce_session_timeouts`` swept the
       session because ``last_activity_at`` fell further behind than
@@ -705,6 +916,18 @@ class GuestSessionEndedReason(StrEnum):
       allowance. Distinct from ``TIMED_OUT`` because the two need
       opposite advice: one guest can sign straight back in, the other
       cannot until the period rolls over.
+    * ``DATA_LIMIT_REACHED`` -- ``EXPIRED`` carrying one of
+      ``service.FUP_DATA_QUOTA_DISCONNECT_REASONS``: ``record_usage``
+      expired the session because the guest has spent their
+      venue-configured daily/weekly/monthly *data* allowance. Shares
+      ``TIME_LIMIT_REACHED``'s consequence (``_enforce_fup_quota``
+      refuses the next login, so the portal offers no sign-in button)
+      and not its sentence: "you have used today's WiFi time" is simply
+      untrue of a guest who used ten minutes and two gigabytes. Added
+      when the dashboard's "Add a data limit" control was wired to the
+      FUP policy that enforcement actually reads -- before that, no
+      screen could produce this ending, and copy for an unreachable
+      state would have been a guess.
     * ``DISCONNECTED`` -- ``DISCONNECTED``: a normal, non-punitive end.
       The NAS reported an Accounting-Stop, the router rebooted
       (``close_sessions_for_nas_restart``), or the guest tapped
@@ -712,7 +935,7 @@ class GuestSessionEndedReason(StrEnum):
       that could split them is the free text above, and guessing a
       cause from it would be a confident lie rather than a message.
 
-    The two added members do not weaken the "no free text ever reaches a
+    The three added members do not weaken the "no free text ever reaches a
     guest" guarantee that the original two-member vocabulary was built
     on. Both are still *derived*: the mapping compares
     ``disconnect_reason`` against string literals written in this
@@ -730,6 +953,7 @@ class GuestSessionEndedReason(StrEnum):
     TIMED_OUT = "timed_out"
     IDLE_TIMED_OUT = "idle_timed_out"
     TIME_LIMIT_REACHED = "time_limit_reached"
+    DATA_LIMIT_REACHED = "data_limit_reached"
     DISCONNECTED = "disconnected"
 
 

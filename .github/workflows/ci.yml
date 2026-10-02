@@ -14,6 +14,18 @@ on:
   # The gates stay defined once, here, and a deploy cannot pass a version of
   # them that has drifted from the one PRs run.
   workflow_call:
+    # Declared so the notify job below has a name to reference at all -- a
+    # reusable workflow can only see secrets that are declared here or passed
+    # with `secrets: inherit`.
+    #
+    # cd.yml deliberately does NOT pass it. A CD run posts one message for the
+    # whole pipeline, including the case where this CI is what failed, so the
+    # nested CI must stay quiet; otherwise every failed deploy would arrive in
+    # Slack twice. Unpassed means the input is empty, which the action treats
+    # as "do nothing" -- the same quiet path a fork's pull request takes.
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
 
 defaults:
   run:
@@ -153,13 +165,20 @@ jobs:
       # target -- a floor that drifts down with the suite protects nothing.
       - name: Assert the suite did not shrink
         env:
-          # Raised from 2900 on 2026-09-11. The suite had grown to 5,130
-          # while this floor stayed where it was set, so it would have
-          # passed a branch that silently lost 2,200 tests -- precisely the
-          # green-but-smaller failure described above, with the guard in
-          # place and asleep. Kept just below the real count so a
-          # legitimate small removal does not fail the build.
-          MIN_TESTS: "5100"
+          # Raised from 2900 on 2026-09-11, then from 5100 on 2026-09-22.
+          # The suite had grown to 5,130 while this floor stayed where it was
+          # set, so it would have passed a branch that silently lost 2,200
+          # tests -- precisely the green-but-smaller failure described above,
+          # with the guard in place and asleep. Kept just below the real count
+          # so a legitimate small removal does not fail the build.
+          #
+          # The 2026-09-22 raise is from a measured collection of 6,278 (6,251
+          # passed, 11 failed, 16 skipped -- the 11 are a local-only artifact of
+          # a venv shared between worktrees whose editable install of
+          # `wyfy-device-gateway` resolves to another checkout's older vendor
+          # tree; they pass in CI). 6,200 leaves room for a genuine small
+          # removal without letting another 1,100 tests disappear unnoticed.
+          MIN_TESTS: "6200"
         run: |
           total=$(python - <<'EOF'
           import xml.etree.ElementTree as ET
@@ -174,3 +193,60 @@ jobs:
             echo "Either tests were deleted, or collection failed silently for part of the suite."
             exit 1
           fi
+
+  # ---------------------------------------------------------------------------
+  # Slack
+  # ---------------------------------------------------------------------------
+  # FAILURE ONLY, and that is the whole design decision.
+  #
+  # This workflow runs on every push and every pull request. A green CI is the
+  # expected state; a message saying so carries no information and, at this
+  # repository's rate, would bury the one message that does. A channel people
+  # mute is worse than no channel. So: nothing on success.
+  #
+  # Nothing on cancellation either. A cancelled run is somebody's intent --
+  # a superseded push, or a human hitting the button -- not an incident, and
+  # `contains(needs.*.result, 'failure')` below is what keeps the two apart.
+  # (The action renders a cancellation perfectly well; CD wants that, CI does
+  # not.)
+  #
+  # What this deliberately gives up: a "main is green again" recovery ping.
+  # That needs the previous run's conclusion, which means another API call and
+  # another way for this to be wrong; the deploy notification for the fixing
+  # commit already says main builds. If the silence turns out to be a problem,
+  # that is the thing to add.
+  notify:
+    name: Tell Slack the build broke
+    needs: [lint-and-test]
+    # `always()` so the job is not skipped along with everything else, then an
+    # explicit failure test so a cancelled run stays silent. `failure()` alone
+    # would be nearly right; this says what it means.
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    # Belt and braces. The action is written never to exit non-zero, but this
+    # workflow is also called by cd.yml via workflow_call, where a failing job
+    # here would mean a notification breaking a deploy.
+    continue-on-error: true
+    # Narrower than the workflow default: `actions: read` is what the action
+    # needs to read this run's start time, and nothing else is required.
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # The action lives in this repository, so it has to be on disk before it
+      # can be used. Sparse-checked-out: this job wants one action.yml, not a
+      # backend, a node_modules-sized frontend, or a vendored gateway.
+      - name: Check out the composite action
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Notify
+        uses: ./.github/actions/slack-notify
+        with:
+          # Absent on a fork's pull request, and absent until the secret is
+          # created. Both cases skip quietly; see the action.
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          needs_json: ${{ toJSON(needs) }}
+          kind: CI

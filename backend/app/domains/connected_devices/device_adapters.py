@@ -167,6 +167,17 @@ class PingResult:
     avg_rtt_ms: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class ArpPingResult:
+    """An ARP ping from the router (``/tool/ping arp-ping=yes``).
+    ``replied_macs`` is every normalized MAC that answered -- the sweep only
+    counts a reply from the MAC it is checking."""
+
+    sent: int
+    received: int
+    replied_macs: frozenset[str]
+
+
 class BaseConnectedDeviceAdapter(Protocol):
     """What a vendor implements to plug real device discovery/disconnect
     into the Connected Device Management domain. A new vendor is
@@ -197,6 +208,14 @@ class BaseConnectedDeviceAdapter(Protocol):
         2 in the caller so a single dropped packet on a wired link is not
         a false DOWN (see ``constants
         .MONITORED_HARDWARE_LIVENESS_PING_COUNT``)."""
+        ...
+
+    async def arp_ping(
+        self, credentials: DeviceCredentials, *, target: str, interface: str, count: int
+    ) -> ArpPingResult:
+        """An L2 probe at ``target`` on ``interface`` from the router. For
+        devices that drop ICMP but must still answer ARP to be on the LAN
+        at all -- see the gateway's ``MikroTikAdapter.arp_ping``."""
         ...
 
     async def disconnect_device(
@@ -277,6 +296,24 @@ class MikroTikConnectedDeviceAdapter:
             avg_rtt_ms=result.avg_rtt_ms,
         )
 
+    async def arp_ping(
+        self, credentials: DeviceCredentials, *, target: str, interface: str, count: int
+    ) -> ArpPingResult:
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).arp_ping(
+                creds, target=target, interface=interface, count=count
+            )
+        except MikroTikConnectionError as exc:
+            raise ConnectedDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ConnectedDeviceOperationError("arp_ping", exc.detail) from exc
+        return ArpPingResult(
+            sent=result.sent,
+            received=result.received,
+            replied_macs=result.replied_macs,
+        )
+
     async def disconnect_device(
         self, credentials: DeviceCredentials, *, mac_address: str, interface: str | None
     ) -> None:
@@ -314,6 +351,7 @@ def list_supported_connected_device_vendors() -> list[str]:
 __all__ = [
     "DeviceCredentials",
     "DiscoveredDevice",
+    "ArpPingResult",
     "PingResult",
     "BaseConnectedDeviceAdapter",
     "MikroTikConnectedDeviceAdapter",

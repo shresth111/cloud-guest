@@ -155,6 +155,33 @@ class NotificationChannelNotFoundError(MonitoringError):
         )
 
 
+class UnspecifiedChannelOwnerError(MonitoringError):
+    """A cross-tenant caller tried to create a channel without saying which
+    organization owns it.
+
+    ``CurrentOrganization`` resolving to ``None`` means the caller holds a
+    GLOBAL role and explicitly asked for cross-tenant breadth (see
+    ``app.domains.rbac.organization_scope``). That is a coherent answer to
+    "which tenants am I reading?" and an incoherent one to "which tenant
+    owns the row I am creating?" -- there is no such thing as a channel
+    belonging to all organizations, and resolving the ambiguity silently is
+    how a platform-wide channel gets created by accident and starts
+    receiving every tenant's alerts.
+
+    The caller fixes this by naming ``organization_id`` in the body --
+    including an explicit ``null`` for a deliberately platform-wide
+    channel, which is a different statement from omitting the field.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "A cross-organization request must name organization_id "
+            "explicitly when creating a notification channel -- use null "
+            "for a deliberately platform-wide channel.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class InvalidNotificationChannelConfigError(MonitoringError):
     """Raised by ``validators.validate_notification_channel_config`` when a
     channel's ``config`` does not match the required per-``channel_type``

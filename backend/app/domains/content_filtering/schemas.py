@@ -19,6 +19,9 @@ __all__ = [
     "ContentFilterRuleUpdateRequest",
     "ContentFilterRuleResponse",
     "ContentFilterRuleListResponse",
+    "ContentFilterAppTargetResponse",
+    "ContentFilterAppResponse",
+    "ContentFilterAppListResponse",
 ]
 
 
@@ -51,6 +54,10 @@ class ContentFilterRuleResponse(BaseModel):
     value_type: str
     value: str
     comment: str | None
+    # The catalogue app whose toggle created this row, or None for a website
+    # blocked by hand. The "Specific websites" list hides app rows; the
+    # "Apps" section shows them.
+    app_key: str | None = None
     is_enabled: bool
     # Whether this rule has ever reached a real router, and what happened.
     # Independent of is_enabled: a rule can be enabled for months and never
@@ -71,3 +78,32 @@ class ContentFilterRuleListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class ContentFilterAppTargetResponse(BaseModel):
+    value_type: str
+    value: str
+    rule_id: str | None
+    owned: bool
+    is_enabled: bool
+    device_push_status: str | None
+    device_push_error: str | None
+
+
+class ContentFilterAppResponse(BaseModel):
+    key: str
+    name: str
+    category: str
+    note: str | None
+    #: blocked | partly_blocked | not_blocked -- intent, from rows.
+    state: str
+    #: active | pending | failed | None -- whether the device holds them.
+    push_status: str | None
+    targets: list[ContentFilterAppTargetResponse]
+
+
+class ContentFilterAppListResponse(BaseModel):
+    router_id: str
+    items: list[ContentFilterAppResponse]
+    #: Plain-language limits, shown with the toggles.
+    limitations: list[str]

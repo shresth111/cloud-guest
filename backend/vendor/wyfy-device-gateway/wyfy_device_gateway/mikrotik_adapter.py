@@ -82,6 +82,8 @@ import asyncssh
 import librouteros
 from librouteros.exceptions import LibRouterosError
 
+from . import mikrotik_firewall as _fw
+from . import mikrotik_guest_isolation as _iso
 from .contract import (
     ConnectedDevice,
     ContentFilterRuleConfig,
@@ -91,6 +93,8 @@ from .contract import (
     DeviceHealthResult,
     DeviceInterfaceCounters,
     DeviceVendor,
+    DhcpLease,
+    DhcpLeaseKeepResult,
     DhcpOptionBinding,
     DhcpOptionConfig,
     DhcpOptionInfo,
@@ -98,15 +102,26 @@ from .contract import (
     DhcpOptionSetInfo,
     DhcpOptionSnapshot,
     DhcpPoolConfig,
+    FirewallBandResult,
+    FirewallBandStatus,
+    FloodLimitResult,
+    FloodLimitStatus,
+    GuestIsolationResult,
+    GuestIsolationStatus,
+    FirewallFilterRuleConfig,
+    FirewallSyncResult,
     HotspotActiveSession,
     HotspotCertificatePush,
     HotspotCertificatePushResult,
+    HotspotDeviceBlockResult,
+    HotspotDeviceUnblockResult,
     HotspotDisconnectResult,
     HotspotSessionControl,
     InterfaceInfo,
     IpAddressInfo,
     NatRuleConfig,
     NetworkSnapshot,
+    ArpPingResult,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
@@ -135,6 +150,7 @@ _DEFAULT_SSH_PORT = 22
 _DHCP_OPTION_PATH = ("ip", "dhcp-server", "option")
 _DHCP_OPTION_SET_PATH = ("ip", "dhcp-server", "option", "sets")
 _DHCP_NETWORK_PATH = ("ip", "dhcp-server", "network")
+_DHCP_LEASE_PATH = ("ip", "dhcp-server", "lease")
 # Every menu whose rows can hand a DHCP option to clients, paired with the
 # field that identifies a row to a human. ``/ip dhcp-server`` itself is
 # deliberately absent: it carries no ``dhcp-option``/``dhcp-option-set``
@@ -194,6 +210,25 @@ _CONTENT_FILTER_RULE_COMMENT_PREFIX = "WyfyGuest content filter "
 # Appended to the marker of the second, subdomain-matching DNS entry, so the
 # two entries one domain rule creates stay individually addressable.
 _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX = " (subdomains)"
+# The HTTPS-name half of a domain rule: two ``/ip firewall filter`` drops on
+# tcp/443 matching ``tls-host=<domain>`` and ``tls-host=*.<domain>``. Same
+# rule-id marker family as the DNS entries, so one identity finds, corrects
+# and removes all four of a domain rule's objects. None of these four
+# markers is a prefix of another: they branch at ``": "``, ``" (s"`` and
+# ``" (h"``, and the two https markers at ``")"`` versus ``" "``.
+_CONTENT_FILTER_HTTPS_MARKER_SUFFIX = " (https)"
+_CONTENT_FILTER_HTTPS_SUBDOMAIN_MARKER_SUFFIX = " (https subdomains)"
+# Where the tls-host drops go: directly above the platform's own pre-login
+# DoT drop, exactly where ``mikrotik_dns_filtering``'s ``doh_hostnames``
+# tls-host rows go. That is below the hotspot's dynamic ``jump`` rules and
+# above both the firewall sentinel band and
+# ``cloudguest-fw-fwd-established``. Above the established accept is not a
+# preference: a ClientHello is sent *after* the TCP handshake, on a
+# connection conntrack already calls established, so a tls-host drop below
+# that accept never sees a single ClientHello and blocks nothing. Duplicated
+# as a literal (not imported) because ``mikrotik_dns_filtering`` imports
+# this module.
+_CONTENT_FILTER_SNI_ANCHOR_COMMENT = "cloudguest-block-dot-udp"
 # NAT / internet access: the marker that makes one VLAN's masquerade rule
 # findable again on the next push. It is deliberately the rule's *identity*
 # rather than any of its RouterOS fields -- ``src-address`` is exactly what
@@ -347,16 +382,56 @@ def _qos_mangle_fields(rule: QosPacketMarkConfig) -> dict[str, str]:
     return fields
 
 
-def _content_filter_marker(rule_id: str, *, subdomains: bool = False) -> str:
+def _content_filter_marker(
+    rule_id: str, *, subdomains: bool = False, https: bool = False
+) -> str:
     """The identity half of a content-filtering object's comment.
 
     Ends in ``": "`` so the customer's own label can follow it in the same
     field without the marker ever being a prefix of another rule's -- and
     so the non-subdomain marker is not a prefix of the subdomain one, which
     branches at ``" ("`` before the colon is reached.
+
+    ``https`` selects the marker of a ``tls-host`` filter row rather than a
+    DNS entry; see :data:`_CONTENT_FILTER_HTTPS_MARKER_SUFFIX`.
     """
-    suffix = _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX if subdomains else ""
+    if https:
+        suffix = (
+            _CONTENT_FILTER_HTTPS_SUBDOMAIN_MARKER_SUFFIX
+            if subdomains
+            else _CONTENT_FILTER_HTTPS_MARKER_SUFFIX
+        )
+    else:
+        suffix = _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX if subdomains else ""
     return f"{_CONTENT_FILTER_RULE_COMMENT_PREFIX}{rule_id}{suffix}: "
+
+
+def _content_filter_sni_rows(
+    rule_id: str, domain: str, label: str
+) -> tuple[tuple[str, dict[str, str]], ...]:
+    """``(marker, desired row)`` for the two ``tls-host`` drops one blocked
+    domain becomes: the name itself, and every subdomain of it.
+
+    ``tls-host`` takes a glob, so ``*.<domain>`` is the subdomain match --
+    the counterpart of the DNS entry's ``regexp=``. Two rows rather than
+    one ``*<domain>`` glob because that would also match
+    ``notfacebook.com``. ``chain=forward`` only: the router's own traffic
+    (its management path, its API, its DNS upstream) is input/output and
+    can never match these.
+    """
+
+    def row(subdomains: bool) -> tuple[str, dict[str, str]]:
+        marker = _content_filter_marker(rule_id, subdomains=subdomains, https=True)
+        return marker, {
+            "chain": "forward",
+            "protocol": "tcp",
+            "dst-port": "443",
+            "tls-host": f"*.{domain}" if subdomains else domain,
+            "action": "drop",
+            "comment": f"{marker}{label}",
+        }
+
+    return (row(False), row(True))
 
 
 def _content_filter_comment(
@@ -371,6 +446,46 @@ def _content_filter_comment(
     the rename cannot touch.
     """
     return f"{_content_filter_marker(rule_id, subdomains=subdomains)}{label}"
+
+
+def _owns_content_filter_comment(comment: object, base: str) -> bool:
+    """Whether a comment carries any of one rule's markers. ``base`` is the
+    prefix plus the rule id; a marker continues with ``": "`` or ``" ("``,
+    never another id character, so a rule whose id merely starts the same
+    way is not claimed."""
+    if not isinstance(comment, str) or not comment.startswith(base):
+        return False
+    return comment[len(base) :].startswith((": ", " ("))
+
+
+def _content_filter_sni_anchor(
+    forward: list[dict],
+) -> tuple[str | None, int | None]:
+    """``(place-before id, index of the first accept)`` for a ``tls-host``
+    drop, over the ``forward`` rows in order.
+
+    The id is :data:`_CONTENT_FILTER_SNI_ANCHOR_COMMENT`'s row when it sits
+    above the first accept, else the first accept itself, else ``None``
+    (append: nothing in ``forward`` accepts, so nothing can be above the
+    drop that lets a ClientHello through).
+    """
+    accept_index = next(
+        (i for i, r in enumerate(forward) if str(r.get("action", "")) == "accept"),
+        None,
+    )
+    anchor = next(
+        (
+            i
+            for i, r in enumerate(forward)
+            if r.get("comment") == _CONTENT_FILTER_SNI_ANCHOR_COMMENT
+        ),
+        None,
+    )
+    if anchor is not None and (accept_index is None or anchor < accept_index):
+        return forward[anchor][".id"], accept_index
+    if accept_index is not None:
+        return forward[accept_index][".id"], accept_index
+    return None, None
 
 
 class _HotspotNames:
@@ -552,6 +667,34 @@ class MikroTikImmutableRouteError(MikroTikDeviceError):
     *static* default route per WAN precisely so this case does not arise --
     a router showing this one was not provisioned by it, or has had its
     routes replaced since)."""
+
+
+class MikroTikLeaseNotFoundError(MikroTikDeviceError):
+    """The router holds no ``/ip dhcp-server lease`` for this MAC at all.
+
+    The device has an address the router's DHCP server did not hand out
+    (configured on the device itself, or from another DHCP server), so
+    there is no lease to keep. Not a device failure -- a fact about the
+    device -- and nothing was written."""
+
+
+class MikroTikLeaseConflictError(MikroTikDeviceError):
+    """The lease is not on the address the caller wants kept.
+
+    ``reason`` is ``"moved"`` when the device's lease now carries a
+    different address than the one asked for (the caller's view is stale),
+    and ``"reserved_elsewhere"`` when a static lease for this MAC already
+    reserves a different address. ``current_address`` is that address.
+    Refused rather than resolved: keeping the wrong address would make the
+    firewall rule that asked for it miss the device for good. Nothing was
+    written."""
+
+    def __init__(
+        self, host: str, detail: str, *, reason: str, current_address: str | None
+    ) -> None:
+        super().__init__(host, detail)
+        self.reason = reason
+        self.current_address = current_address
 
 
 def normalize_mac_address(value: object) -> str | None:
@@ -1128,6 +1271,44 @@ def _smallest_enclosing_network(
         if start_ip in candidate and end_ip in candidate:
             return candidate
     return ipaddress.ip_network(f"{start_ip}/0", strict=False)
+
+
+#: ``comment=`` on the session bypass the router's own authorized-MAC loop
+#: writes (``cloudguest-authmac-sched``, see
+#: docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md §1.4). The one binding a
+#: device block removes that it did not write itself.
+_AUTHMAC_BINDING_COMMENT = "cloudguest-authmac"
+#: ``cloudguest-devblock:<device rule uuid>`` -- the only shape
+#: :meth:`MikroTikAdapter.block_hotspot_device` writes or removes.
+DEVICE_BLOCK_MARKER_PREFIX = "cloudguest-devblock:"
+_DEVICE_BLOCK_MARKER_RE = re.compile(
+    r"^cloudguest-devblock:"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+class MikroTikFirewallRefusedError(MikroTikDeviceError):
+    """A firewall push or band placement was refused before any write.
+
+    ``code`` is one of the ``ACCESS_RULES_*`` codes in
+    :mod:`wyfy_device_gateway.mikrotik_firewall` (``ACCESS_RULES_BAND_MISSING``
+    first among them). Nothing on the device changed."""
+
+    def __init__(self, host: str, code: str, detail: str) -> None:
+        self.code = code
+        super().__init__(host, f"{code}: {detail}")
+
+
+class MikroTikFirewallPushFailedError(MikroTikDeviceError):
+    """A firewall push failed after writing began.
+
+    ``restored`` is True only when the pre-push snapshot of this platform's
+    own marked rules was put back in full. False means the router may hold a
+    partial rule set and needs a look -- it is never reported as success."""
+
+    def __init__(self, host: str, detail: str, *, restored: bool) -> None:
+        self.restored = restored
+        super().__init__(host, detail)
 
 
 class MikroTikAdapter:
@@ -1814,6 +1995,389 @@ class MikroTikAdapter:
         )
 
     # ------------------------------------------------------------------
+    # DHCP leases: read them, and keep one device on its address
+    # ------------------------------------------------------------------
+
+    async def read_dhcp_leases(self, creds: DeviceCredentials) -> list[DhcpLease]:
+        """Every ``/ip dhcp-server lease`` row, dynamic and static. Read-only.
+
+        Unlike :meth:`list_connected_devices` this does not go through
+        ``_safe_query``: a caller asking "is this device's lease static?"
+        must be able to tell "the router has no leases" from "we could not
+        read them", so a failed read raises :class:`MikroTikDeviceError`
+        rather than answering ``[]``.
+        """
+        return await asyncio.to_thread(self._read_dhcp_leases_sync, creds)
+
+    def _read_dhcp_leases_sync(self, creds: DeviceCredentials) -> list[DhcpLease]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(api.path(*_DHCP_LEASE_PATH))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dhcp_leases: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return [lease for row in rows if (lease := _lease_from_row(row)) is not None]
+
+    async def keep_dhcp_lease_address(
+        self, creds: DeviceCredentials, *, mac_address: str, address: str
+    ) -> DhcpLeaseKeepResult:
+        """Keep one device on ``address`` for good: turn its dynamic DHCP
+        lease static (``/ip dhcp-server lease make-static``), then read the
+        lease table again and require a static row for the MAC on that
+        address.
+
+        Why a firewall rule needs this: a rule matches an *address*, and a
+        dynamic lease is free to hand the device a different one when it
+        expires. A static lease is a reservation, so "Front-desk printer"
+        keeps meaning the same address the rule was written against.
+
+        * **Idempotent.** A static lease for the MAC on ``address`` already
+          there is a clean success with ``changed=False`` and no write.
+        * **Refuses rather than guesses** (nothing written in any of these):
+          no lease for the MAC at all (:class:`MikroTikLeaseNotFoundError`);
+          the lease now carries another address, or a static lease already
+          reserves another one (:class:`MikroTikLeaseConflictError`). Keeping
+          the wrong address would make the rule miss the device for good.
+        * **Read back.** ``make-static`` returning cleanly is not taken as
+          success; only the second read is. ``make-static`` is a command on
+          the menu, not a ``set``, so it is issued through the path's own
+          call and the generator is consumed -- an unconsumed librouteros
+          call sends nothing.
+
+        Never removes or edits any other lease.
+        """
+        return await asyncio.to_thread(
+            self._keep_dhcp_lease_address_sync, creds, mac_address, address
+        )
+
+    @staticmethod
+    def _leases_for_mac(menu, mac: str) -> list[DhcpLease]:  # noqa: ANN001
+        leases = [lease for row in menu if (lease := _lease_from_row(row)) is not None]
+        return [lease for lease in leases if lease.mac_address == mac]
+
+    def _keep_dhcp_lease_address_sync(
+        self, creds: DeviceCredentials, mac_address: str, address: str
+    ) -> DhcpLeaseKeepResult:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+        wanted = str(ipaddress.IPv4Address(str(address).strip()))
+        api = self._connect_api(creds)
+        try:
+            try:
+                leases = self._leases_for_mac(api.path(*_DHCP_LEASE_PATH), mac)
+                if not leases:
+                    raise MikroTikLeaseNotFoundError(
+                        creds.host, f"no DHCP lease for {mac}"
+                    )
+                reserved = [
+                    lease for lease in leases if not lease.dynamic and not lease.disabled
+                ]
+                if reserved:
+                    kept = next((x for x in reserved if x.address == wanted), None)
+                    if kept is None:
+                        raise MikroTikLeaseConflictError(
+                            creds.host,
+                            f"{mac} is already reserved at {reserved[0].address}, "
+                            f"not {wanted}",
+                            reason="reserved_elsewhere",
+                            current_address=reserved[0].address,
+                        )
+                    return DhcpLeaseKeepResult(lease=kept, changed=False)
+                target = next(
+                    (x for x in leases if x.dynamic and x.address == wanted), None
+                )
+                if target is None:
+                    current = next((x.address for x in leases if x.address), None)
+                    raise MikroTikLeaseConflictError(
+                        creds.host,
+                        f"{mac} is now leased {current}, not {wanted}",
+                        reason="moved",
+                        current_address=current,
+                    )
+                tuple(
+                    api.path(*_DHCP_LEASE_PATH)(
+                        "make-static", **{".id": target.routeros_id}
+                    )
+                )
+                after = self._leases_for_mac(api.path(*_DHCP_LEASE_PATH), mac)
+                kept = next(
+                    (
+                        x
+                        for x in after
+                        if not x.dynamic and not x.disabled and x.address == wanted
+                    ),
+                    None,
+                )
+                if kept is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"keep_dhcp_lease_address: make-static returned, but no "
+                        f"static lease for {mac} at {wanted} was read back",
+                    )
+                return DhcpLeaseKeepResult(lease=kept, changed=True)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"keep_dhcp_lease_address: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    # ------------------------------------------------------------------
+    # durable per-device block (guest_access device rules)
+    # ------------------------------------------------------------------
+
+    async def block_hotspot_device(
+        self, creds: DeviceCredentials, *, mac_address: str, marker: str
+    ) -> HotspotDeviceBlockResult:
+        """Cut one device off this router by MAC, now and on every reconnect.
+
+        Two halves, both read back (see :class:`HotspotDeviceBlockResult`):
+
+        1. **The binding.** One ``/ip hotspot ip-binding`` row,
+           ``mac-address=<mac> type=blocked comment=<marker>``. RouterOS
+           documents ``blocked`` as "translation is not performed and packets
+           from a host are dropped", so the device gets neither the internet
+           nor the login page for as long as the row exists -- which is what
+           the login-gate refusal alone never did for a device that was
+           already signed in, or one the venue had bypassed.
+
+           Idempotent by ``comment``: an existing enabled ``type=blocked`` row
+           with our marker and this MAC is kept, and duplicates of it are
+           removed. Added ``place-before`` the router's first binding, so a
+           bypass written earlier for the same MAC cannot win; whether it
+           landed first is read back, never assumed.
+
+           The one row for this MAC this method *does* remove that it did not
+           write is the session bypass the router's own authorized-MAC loop
+           adds (``comment=cloudguest-authmac``): it exists only to let a
+           signed-in guest through, a blocked device is by definition not
+           one, and that loop re-adds a MAC only when ``[find where
+           mac-address=...]`` is empty -- which our row now guarantees it is
+           not. Every other row for the MAC (a hand-made bypass, a
+           trusted-device bypass) is left alone and reported.
+
+        2. **The live session.** Every ``/ip hotspot active`` row and
+           ``/ip hotspot host`` row for the MAC is removed per ``.id``, and
+           the active table is read again.
+
+        A router running no hotspot gets no write at all: ip-bindings are a
+        hotspot table, and a row there would read back as a block that
+        blocks nothing.
+        """
+        return await asyncio.to_thread(
+            self._block_hotspot_device_sync, creds, mac_address, marker
+        )
+
+    async def unblock_hotspot_device(
+        self, creds: DeviceCredentials, *, mac_address: str, marker: str
+    ) -> HotspotDeviceUnblockResult:
+        """Remove exactly the binding(s) :meth:`block_hotspot_device` wrote
+        for this MAC and marker, and nothing else; re-read and report what
+        is left. Idempotent: nothing to remove is a clean success."""
+        return await asyncio.to_thread(
+            self._unblock_hotspot_device_sync, creds, mac_address, marker
+        )
+
+    @staticmethod
+    def _device_block_args(mac_address: str, marker: str) -> str:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+        if not _DEVICE_BLOCK_MARKER_RE.match(marker or ""):
+            raise ValueError(f"not a device-block marker: {marker!r}")
+        return mac
+
+    def _block_hotspot_device_sync(
+        self, creds: DeviceCredentials, mac_address: str, marker: str
+    ) -> HotspotDeviceBlockResult:
+        mac = self._device_block_args(mac_address, marker)
+        api = self._connect_api(creds)
+        try:
+            control = self._hotspot_session_control(api, creds.host)
+            if not control.hotspot_servers:
+                return HotspotDeviceBlockResult(
+                    hotspot_servers=0,
+                    binding_id=None,
+                    created=False,
+                    first_in_order=False,
+                    removed_bypass_ids=(),
+                    other_bindings=(),
+                    sessions_removed=0,
+                    hosts_removed=0,
+                    still_active=0,
+                )
+            try:
+                bindings = api.path("ip", "hotspot", "ip-binding")
+                rows = [dict(r) for r in bindings]
+                for_mac = [
+                    r for r in rows if normalize_mac_address(r.get("mac-address")) == mac
+                ]
+                ours = [
+                    r
+                    for r in for_mac
+                    if _safe_str(r.get("comment")) == marker
+                    and _safe_str(r.get("type")) == "blocked"
+                    and not _is_truthy(r.get("disabled"))
+                ]
+                created = False
+                if ours:
+                    binding_id = str(ours[0][".id"])
+                else:
+                    fields = {
+                        "mac-address": mac,
+                        "type": "blocked",
+                        "comment": marker,
+                        "disabled": "no",
+                    }
+                    first = next((str(r[".id"]) for r in rows if r.get(".id")), None)
+                    if first is not None:
+                        try:
+                            binding_id = str(
+                                bindings.add(**fields, **{"place-before": first})
+                            )
+                        except LibRouterosError as exc:
+                            # Not expected (ip-binding is an ordered list that
+                            # accepts place-before), but an add that fails only
+                            # on position must still block. ``first_in_order``
+                            # below reports where it really landed.
+                            logger.warning(
+                                "mikrotik_ip_binding_place_before_refused",
+                                extra={"host": creds.host, "detail": str(exc)},
+                            )
+                            binding_id = str(bindings.add(**fields))
+                    else:
+                        binding_id = str(bindings.add(**fields))
+                    created = True
+                # Our own stale copies (a disabled row, a duplicate, a row whose
+                # type someone changed) and the session bypass the agent loop
+                # wrote. Removed only after our blocked row exists, so the MAC
+                # is never momentarily free.
+                removable = [
+                    str(r[".id"])
+                    for r in for_mac
+                    if str(r.get(".id")) != binding_id
+                    and _safe_str(r.get("comment")) in (marker, _AUTHMAC_BINDING_COMMENT)
+                ]
+                for row_id in removable:
+                    bindings.remove(row_id)
+                removed_bypass = tuple(
+                    str(r[".id"])
+                    for r in for_mac
+                    if _safe_str(r.get("comment")) == _AUTHMAC_BINDING_COMMENT
+                )
+
+                after = [dict(r) for r in api.path("ip", "hotspot", "ip-binding")]
+                mine = [r for r in after if str(r.get(".id")) == binding_id]
+                if (
+                    len(mine) != 1
+                    or normalize_mac_address(mine[0].get("mac-address")) != mac
+                    or _safe_str(mine[0].get("type")) != "blocked"
+                    or _safe_str(mine[0].get("comment")) != marker
+                    or _is_truthy(mine[0].get("disabled"))
+                ):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "block_hotspot_device: the blocked ip-binding was not "
+                        "found on the router after writing it",
+                    )
+                others = tuple(
+                    f"{_safe_str(r.get('type')) or 'regular'}:"
+                    f"{_safe_str(r.get('comment')) or ''}"
+                    for r in after
+                    if normalize_mac_address(r.get("mac-address")) == mac
+                    and str(r.get(".id")) != binding_id
+                    and _safe_str(r.get("comment")) != marker
+                )
+                ordered = [str(r.get(".id")) for r in after]
+                first_in_order = bool(ordered) and ordered[0] == binding_id
+
+                active = api.path("ip", "hotspot", "active")
+                session_ids = [
+                    str(r[".id"])
+                    for r in active
+                    if normalize_mac_address(r.get("mac-address")) == mac and r.get(".id")
+                ]
+                for row_id in session_ids:
+                    active.remove(row_id)
+                still_active = sum(
+                    1
+                    for r in api.path("ip", "hotspot", "active")
+                    if normalize_mac_address(r.get("mac-address")) == mac
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"block_hotspot_device: {exc}"
+                ) from exc
+
+            hosts_removed = 0
+            try:
+                hosts = api.path("ip", "hotspot", "host")
+                host_ids = [
+                    str(r[".id"])
+                    for r in hosts
+                    if normalize_mac_address(r.get("mac-address")) == mac and r.get(".id")
+                ]
+                for row_id in host_ids:
+                    hosts.remove(row_id)
+                hosts_removed = len(host_ids)
+            except LibRouterosError as exc:
+                # RouterOS usually drops the host itself once the binding says
+                # blocked; this is the belt to that. Its failure does not undo
+                # the block above, so it is logged, not raised.
+                logger.info(
+                    "mikrotik_hotspot_host_remove_failed",
+                    extra={"host": creds.host, "detail": str(exc)},
+                )
+        finally:
+            self._safe_close(api)
+        return HotspotDeviceBlockResult(
+            hotspot_servers=control.hotspot_servers,
+            binding_id=binding_id,
+            created=created,
+            first_in_order=first_in_order,
+            removed_bypass_ids=removed_bypass,
+            other_bindings=others,
+            sessions_removed=len(session_ids),
+            hosts_removed=hosts_removed,
+            still_active=still_active,
+        )
+
+    def _unblock_hotspot_device_sync(
+        self, creds: DeviceCredentials, mac_address: str, marker: str
+    ) -> HotspotDeviceUnblockResult:
+        mac = self._device_block_args(mac_address, marker)
+        api = self._connect_api(creds)
+        try:
+            try:
+                bindings = api.path("ip", "hotspot", "ip-binding")
+
+                def _ours(rows: object) -> list[str]:
+                    return [
+                        str(r[".id"])
+                        for r in rows  # type: ignore[attr-defined]
+                        if _safe_str(r.get("comment")) == marker
+                        and normalize_mac_address(r.get("mac-address")) == mac
+                        and r.get(".id")
+                    ]
+
+                removed = _ours(list(bindings))
+                for row_id in removed:
+                    bindings.remove(row_id)
+                remaining = len(_ours(list(api.path("ip", "hotspot", "ip-binding"))))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"unblock_hotspot_device: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+        return HotspotDeviceUnblockResult(removed_ids=tuple(removed), remaining=remaining)
+
+    # ------------------------------------------------------------------
     # diagnostics (shared by network_diagnostics + isp call sites)
     # ------------------------------------------------------------------
 
@@ -1869,6 +2433,56 @@ class MikroTikAdapter:
             packet_loss_percentage=packet_loss,
             avg_rtt_ms=avg_rtt_ms,
         )
+
+    async def arp_ping(
+        self, creds: DeviceCredentials, *, target: str, interface: str, count: int
+    ) -> ArpPingResult:
+        """``/tool/ping arp-ping=yes interface=...``: an L2 probe that any
+        live IP host must answer, whatever its firewall does with ICMP.
+
+        Exists for monitored-hardware liveness. Measured 2026-09-17 on a
+        hEX lite (RouterOS 7.23.3) against a TP-Link TL-WR845N used as a
+        venue AP: ICMP 0/2 (the WR845N drops ping on its WAN port by
+        default), ARP ping 3/3 with ``host`` = the AP's own MAC, and an
+        unused address on the same bridge 0/3. So a device that ignores
+        ICMP read DOWN forever while serving guests.
+
+        ``interface`` must be the L3 interface the target's subnet lives on
+        (``bridge``), not the bridge port. ``replied_macs`` carries every
+        ``host`` MAC seen, so the caller can check the answer came from the
+        device it means rather than something else holding that IP."""
+        return await asyncio.to_thread(
+            self._arp_ping_sync, creds, target, interface, count
+        )
+
+    def _arp_ping_sync(
+        self, creds: DeviceCredentials, target: str, interface: str, count: int
+    ) -> ArpPingResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(
+                    api(
+                        "/tool/ping",
+                        address=target,
+                        count=str(count),
+                        **{"arp-ping": "yes", "interface": interface},
+                    )
+                )
+            except (LibRouterosError, OSError) as exc:
+                # Same OSError reasoning as _ping_sync.
+                raise MikroTikDeviceError(
+                    creds.host, f"arp ping failed: {_describe_exception(exc)}"
+                ) from exc
+        finally:
+            api.close()
+        sent, received, _loss, _rtt = _parse_ping_rows(rows, requested_count=count)
+        # A timed-out row carries the target IP in ``host``, not a MAC;
+        # normalize_mac_address drops it.
+        replied_macs = frozenset(
+            mac for row in rows if (mac := normalize_mac_address(row.get("host")))
+        )
+        return ArpPingResult(sent=sent, received=received, replied_macs=replied_macs)
 
     async def traceroute(
         self,
@@ -5443,6 +6057,47 @@ class MikroTikAdapter:
         out and fixed for its own whitelist entries before this addition
         existed.
 
+        ## A domain is also blocked by its HTTPS name (``tls-host``)
+
+        The sinkhole only binds a guest who asks this router for the name.
+        A guest with the address already cached, or with their own
+        resolver, connects straight past it. So a domain rule also writes
+        two ``/ip firewall filter`` drops on tcp/443 --
+        ``tls-host=<domain>`` and ``tls-host=*.<domain>`` -- which match the
+        site name the browser sends in the clear in its TLS ClientHello.
+        Nothing is decrypted or inspected beyond that one field.
+
+        **Where they sit is the whole feature.** A ClientHello travels on a
+        connection conntrack already calls *established* (it follows the
+        TCP handshake), so a drop below
+        ``cloudguest-fw-fwd-established`` never sees one. They go directly
+        above :data:`_CONTENT_FILTER_SNI_ANCHOR_COMMENT` -- the same place
+        ``mikrotik_dns_filtering``'s ``doh_hostnames`` tls-host rows go:
+        under the hotspot's dynamic jumps, above the firewall band (so a
+        customer allow rule cannot re-open a blocked site) and above the
+        established accept. A router without that anchor gets them above
+        the first ``accept`` in ``forward``, the rule
+        :meth:`_ensure_content_filter_enforcement_rule` already uses; a
+        row found below the first accept is re-added above it and the old
+        one removed after, so the chain is never without the drop.
+
+        **Read back after writing.** Every object this rule should own is
+        re-read once the writes are done; a write that returned cleanly and
+        changed nothing (a known RouterOS shape) fails the push instead of
+        reporting a block that is not there.
+
+        What it cannot see, stated rather than implied: Encrypted Client
+        Hello hides the name (Cloudflare-fronted sites with a current
+        browser); QUIC (HTTP/3 on udp/443) carries no name this matcher
+        reads; RouterOS documents that ``tls-host`` cannot match a
+        ClientHello split across TCP segments, which is what a browser
+        with post-quantum key exchange sends -- so this layer may not fire
+        for current desktop Chrome at all and must be proven on hardware.
+        QUIC is deliberately not blocked wholesale: dropping udp/443
+        changes every guest's traffic to every site to stop a guest who
+        already bypassed the sinkhole, and that is a venue-wide decision a
+        single "block this site" press must not make.
+
         ## What this deliberately does not do
 
         No Layer7 protocol matching, no ``/ip proxy`` web-proxy, and --
@@ -5495,10 +6150,11 @@ class MikroTikAdapter:
             try:
                 if rule.value_type == "ip_cidr":
                     # A rule re-typed from "domain" leaves two DNS entries
-                    # still answering for a name nobody is blocking any
-                    # more; the objects this rule no longer uses come off
-                    # before the ones it does go on.
+                    # and two tls-host drops still blocking a name nobody
+                    # is blocking any more; the objects this rule no longer
+                    # uses come off before the ones it does go on.
                     self._remove_content_filter_dns_entries(api, rule.rule_id)
+                    self._remove_content_filter_sni_rows(api, rule.rule_id)
                     self._ensure_content_filter_address_list_entry(api, rule)
                     self._ensure_content_filter_enforcement_rule(api)
                 else:
@@ -5509,10 +6165,18 @@ class MikroTikAdapter:
                         _content_filter_marker(rule.rule_id),
                     )
                     self._ensure_content_filter_dns_entries(api, rule)
+                    self._ensure_content_filter_sni_rows(api, rule)
+                problems = self._content_filter_readback_problems(api, rule)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_content_filter_rule: {exc}"
                 ) from exc
+            if problems:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "configure_content_filter_rule: read-back after writing "
+                    "found " + "; ".join(problems),
+                )
         finally:
             api.close()
 
@@ -5613,6 +6277,148 @@ class MikroTikAdapter:
             return
         menu.add(**desired, disabled="no")
 
+    def _ensure_content_filter_sni_rows(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> None:  # noqa: ANN001
+        """The two ``tls-host`` drops of one blocked domain, made to exist
+        exactly once each, field-correct, enabled, and above the first
+        ``accept`` in ``forward``.
+
+        Found by marker like every other content-filter object. A row that
+        is present but below the first accept is the one case an update
+        cannot fix (``librouteros`` has no ``move``), so it is re-added at
+        the anchor and the old row removed *after* -- a window with two
+        identical drops, never one with none. Only rows carrying this
+        rule's own two markers are ever written or removed.
+        """
+        menu = api.path("ip", "firewall", "filter")
+        for marker, desired in _content_filter_sni_rows(
+            rule.rule_id, rule.value, rule.label
+        ):
+            forward = [
+                dict(row) for row in menu if str(row.get("chain", "")) == "forward"
+            ]
+            anchor_id, accept_index = _content_filter_sni_anchor(forward)
+            mine = [
+                (index, row)
+                for index, row in enumerate(forward)
+                if str(row.get("comment", "")).startswith(marker)
+            ]
+            placed = [
+                (index, row)
+                for index, row in mine
+                if accept_index is None or index < accept_index
+            ]
+            if not placed:
+                fields = dict(desired, disabled="no")
+                if anchor_id is not None:
+                    fields["place-before"] = anchor_id
+                menu.add(**fields)
+                stale = [row[".id"] for _, row in mine]
+            else:
+                keep = placed[0][1]
+                changed = {
+                    key: value
+                    for key, value in desired.items()
+                    if str(keep.get(key, "")) != value
+                }
+                if _is_truthy(keep.get("disabled")):
+                    changed["disabled"] = "no"
+                if changed:
+                    menu.update(**{".id": keep[".id"], **changed})
+                stale = [row[".id"] for _, row in mine if row is not keep]
+            for row_id in stale:
+                menu.remove(row_id)
+
+    def _remove_content_filter_sni_rows(self, api, rule_id: str) -> None:  # noqa: ANN001
+        """Both of one rule's ``tls-host`` drops, by their own two markers."""
+        for subdomains in (False, True):
+            self._remove_where_prefixed(
+                api,
+                ("ip", "firewall", "filter"),
+                "comment",
+                _content_filter_marker(rule_id, subdomains=subdomains, https=True),
+            )
+
+    def _content_filter_readback_problems(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> list[str]:  # noqa: ANN001
+        """What the device holds for this rule, compared against what the
+        push just wrote. Empty means every object is present once, carries
+        the intended values, is enabled, and -- for a filter row -- sits
+        above the first ``accept`` in ``forward``.
+
+        Read fresh, after every write, because "no exception" is not "it is
+        there": a ``set`` that returns cleanly and changes nothing is a
+        known RouterOS shape (``tests/fake_write_transport.py``'s
+        ``silently_ignore_updates``).
+        """
+        problems: list[str] = []
+
+        def check(
+            rows: list[dict], marker: str, desired: dict[str, str], what: str
+        ) -> int | None:
+            mine = [
+                (i, r)
+                for i, r in enumerate(rows)
+                if str(r.get("comment", "")).startswith(marker)
+            ]
+            if len(mine) != 1:
+                problems.append(f"{len(mine)} {what} (expected 1)")
+                return None
+            index, row = mine[0]
+            wrong = sorted(
+                key
+                for key, value in desired.items()
+                if key != "comment" and str(row.get(key, "")) != value
+            )
+            if wrong:
+                problems.append(f"{what} has wrong {', '.join(wrong)}")
+            if _is_truthy(row.get("disabled")):
+                problems.append(f"{what} is disabled")
+            return index
+
+        if rule.value_type == "ip_cidr":
+            entries = [dict(r) for r in api.path("ip", "firewall", "address-list")]
+            check(
+                entries,
+                _content_filter_marker(rule.rule_id),
+                {"list": _CONTENT_FILTER_ADDRESS_LIST_NAME, "address": rule.value},
+                "address-list entry",
+            )
+            return problems
+
+        static = [dict(r) for r in api.path("ip", "dns", "static")]
+        check(
+            static,
+            _content_filter_marker(rule.rule_id),
+            {"name": rule.value, "address": _CONTENT_FILTER_SINKHOLE_ADDRESS},
+            "DNS entry",
+        )
+        check(
+            static,
+            _content_filter_marker(rule.rule_id, subdomains=True),
+            {
+                "regexp": _domain_subdomain_regex(rule.value),
+                "address": _CONTENT_FILTER_SINKHOLE_ADDRESS,
+            },
+            "subdomain DNS entry",
+        )
+        forward = [
+            dict(r)
+            for r in api.path("ip", "firewall", "filter")
+            if str(r.get("chain", "")) == "forward"
+        ]
+        _, accept_index = _content_filter_sni_anchor(forward)
+        for marker, desired in _content_filter_sni_rows(
+            rule.rule_id, rule.value, rule.label
+        ):
+            what = f"HTTPS-name drop for {desired['tls-host']}"
+            index = check(forward, marker, desired, what)
+            if index is not None and accept_index is not None and index > accept_index:
+                problems.append(f"{what} sits below the first accept in forward")
+        return problems
+
     def _remove_content_filter_dns_entries(self, api, rule_id: str) -> None:
         """Both of one rule's DNS entries, by their own two markers."""
         for subdomains in (False, True):
@@ -5669,10 +6475,31 @@ class MikroTikAdapter:
                     _content_filter_marker(rule.rule_id),
                 )
                 self._remove_content_filter_dns_entries(api, rule.rule_id)
+                self._remove_content_filter_sni_rows(api, rule.rule_id)
+                # Read back: an unblock that left anything of this rule's on
+                # the device is a site still blocked with no row to show
+                # for it, so it fails rather than reports done.
+                base = f"{_CONTENT_FILTER_RULE_COMMENT_PREFIX}{rule.rule_id}"
+                leftover = [
+                    "/".join(segments)
+                    for segments in (
+                        ("ip", "firewall", "address-list"),
+                        ("ip", "dns", "static"),
+                        ("ip", "firewall", "filter"),
+                    )
+                    for row in api.path(*segments)
+                    if _owns_content_filter_comment(row.get("comment"), base)
+                ]
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"delete_content_filter_rule: {exc}"
                 ) from exc
+            if leftover:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "delete_content_filter_rule: read-back after removing "
+                    f"still found this rule's objects in {sorted(set(leftover))}",
+                )
         finally:
             api.close()
 
@@ -5806,6 +6633,205 @@ class MikroTikAdapter:
         if anchor_id is not None:
             fields["place-before"] = anchor_id
         menu.add(**fields)
+
+    # ------------------------------------------------------------------
+    # Customer firewall rules, inside the sentinel band (chain=forward)
+    # ------------------------------------------------------------------
+
+    async def sync_firewall_rules(
+        self,
+        creds: DeviceCredentials,
+        *,
+        rules: Sequence[FirewallFilterRuleConfig],
+        known_rule_ids: Sequence[str],
+    ) -> FirewallSyncResult:
+        """Converge this router's ``cloudguest-fw:`` rules onto ``rules``.
+
+        The whole algorithm, its refusals and its limits live in
+        :mod:`wyfy_device_gateway.mikrotik_firewall`; this method owns the
+        connection and translates its two failure types into this module's
+        exception family. Refused -> :class:`MikroTikFirewallRefusedError`,
+        nothing written. Failed after writing began ->
+        :class:`MikroTikFirewallPushFailedError`, with ``restored`` saying
+        whether the pre-push snapshot was put back."""
+        return await asyncio.to_thread(
+            self._sync_firewall_rules_sync, creds, tuple(rules), tuple(known_rule_ids)
+        )
+
+    def _sync_firewall_rules_sync(
+        self,
+        creds: DeviceCredentials,
+        rules: tuple[FirewallFilterRuleConfig, ...],
+        known_rule_ids: tuple[str, ...],
+    ) -> FirewallSyncResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return _fw.sync_rules(api, rules, known_rule_ids=known_rule_ids)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except _fw.FirewallPushFailed as exc:
+                raise MikroTikFirewallPushFailedError(
+                    creds.host, str(exc), restored=exc.restored
+                ) from exc
+            except LibRouterosError as exc:
+                # Raised by the initial read, before any write.
+                raise MikroTikDeviceError(
+                    creds.host, f"sync_firewall_rules: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    async def install_firewall_band(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandResult:
+        """Place the forward-chain sentinel band once, directly above
+        ``cloudguest-fw-fwd-established``; leave an existing band alone. See
+        :func:`wyfy_device_gateway.mikrotik_firewall.install_band`."""
+        return await asyncio.to_thread(self._install_firewall_band_sync, creds)
+
+    def _install_firewall_band_sync(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return _fw.install_band(api)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"install_firewall_band: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    async def read_firewall_band_status(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandStatus:
+        """Read-only: whether the router's sentinel band is ready for a
+        push. One read, no writes -- see
+        :func:`wyfy_device_gateway.mikrotik_firewall.read_band_status`."""
+        return await asyncio.to_thread(self._read_firewall_band_status_sync, creds)
+
+    def _read_firewall_band_status_sync(
+        self, creds: DeviceCredentials
+    ) -> FirewallBandStatus:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return _fw.read_band_status(api)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_firewall_band_status: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # connection-flood limit (forward chain, inside the sentinel band)
+    # ------------------------------------------------------------------
+
+    async def read_flood_limit(self, creds: DeviceCredentials) -> FloodLimitStatus:
+        """Read-only: see :func:`wyfy_device_gateway.mikrotik_firewall
+        .read_flood_limit`."""
+        return await asyncio.to_thread(self._flood_sync, creds, "read", None)
+
+    async def apply_flood_limit(
+        self, creds: DeviceCredentials, *, limit: int
+    ) -> FloodLimitResult:
+        """Turn the per-guest connection cap on, or change it. Refused ->
+        :class:`MikroTikFirewallRefusedError` (nothing written); failed after
+        writing -> :class:`MikroTikFirewallPushFailedError`. See
+        :func:`wyfy_device_gateway.mikrotik_firewall.apply_flood_limit`."""
+        return await asyncio.to_thread(self._flood_sync, creds, "apply", limit)
+
+    async def remove_flood_limit(self, creds: DeviceCredentials) -> FloodLimitResult:
+        """Take every flood-limit row off; see
+        :func:`wyfy_device_gateway.mikrotik_firewall.remove_flood_limit`."""
+        return await asyncio.to_thread(self._flood_sync, creds, "remove", None)
+
+    def _flood_sync(
+        self, creds: DeviceCredentials, op: str, limit: int | None
+    ) -> FloodLimitStatus | FloodLimitResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if op == "read":
+                    return _fw.read_flood_limit(api)
+                if op == "apply":
+                    return _fw.apply_flood_limit(api, limit=int(limit or 0))
+                return _fw.remove_flood_limit(api)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except _fw.FirewallPushFailed as exc:
+                raise MikroTikFirewallPushFailedError(
+                    creds.host, str(exc), restored=exc.restored
+                ) from exc
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"{op}_flood_limit: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # guest isolation (bridge horizon, own radios, routed guard rows)
+    # ------------------------------------------------------------------
+
+    async def read_guest_isolation(
+        self, creds: DeviceCredentials
+    ) -> GuestIsolationStatus:
+        """Read-only: see :func:`wyfy_device_gateway.mikrotik_guest_isolation
+        .read_guest_isolation`."""
+        return await asyncio.to_thread(self._isolation_sync, creds, "read")
+
+    async def apply_guest_isolation(
+        self, creds: DeviceCredentials
+    ) -> GuestIsolationResult:
+        """Turn guest isolation on. Refused -> :class:`MikroTikFirewallRefusedError`
+        (``ISOLATION_*``, nothing written); failed after writing ->
+        :class:`MikroTikFirewallPushFailedError`. The caller holds the
+        router's firewall lock: this writes forward-chain rows."""
+        return await asyncio.to_thread(self._isolation_sync, creds, "apply")
+
+    async def remove_guest_isolation(
+        self, creds: DeviceCredentials
+    ) -> GuestIsolationResult:
+        """Put back exactly what :meth:`apply_guest_isolation` set."""
+        return await asyncio.to_thread(self._isolation_sync, creds, "remove")
+
+    def _isolation_sync(
+        self, creds: DeviceCredentials, op: str
+    ) -> GuestIsolationStatus | GuestIsolationResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if op == "read":
+                    return _iso.read_guest_isolation(api)
+                if op == "apply":
+                    return _iso.apply_guest_isolation(api)
+                return _iso.remove_guest_isolation(api)
+            except _fw.FirewallRefusal as exc:
+                raise MikroTikFirewallRefusedError(
+                    creds.host, exc.code, exc.detail
+                ) from exc
+            except _fw.FirewallPushFailed as exc:
+                raise MikroTikFirewallPushFailedError(
+                    creds.host, str(exc), restored=exc.restored
+                ) from exc
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"{op}_guest_isolation: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
 
     # ------------------------------------------------------------------
     # QoS: the packet-mark half
@@ -7097,6 +8123,28 @@ def _row_mac(row: dict[str, object]) -> str | None:
 # runs -- which is the version gate described in that method's docstring.
 
 
+def _lease_from_row(row: Mapping[str, object]) -> DhcpLease | None:
+    """One ``/ip dhcp-server lease`` row -> :class:`DhcpLease`, or ``None``
+    for a row with no usable MAC or ``.id``. ``address`` prefers the
+    configured ``address`` (on a static lease that is the reservation) and
+    falls back to ``active-address``."""
+    mac = _row_mac(dict(row))
+    routeros_id = _safe_str(row.get(".id"))
+    if mac is None or routeros_id is None:
+        return None
+    return DhcpLease(
+        routeros_id=routeros_id,
+        mac_address=mac,
+        address=_safe_str(row.get("address")) or _safe_str(row.get("active-address")),
+        dynamic=_is_truthy(row.get("dynamic")),
+        status=_safe_str(row.get("status")),
+        host_name=_safe_str(row.get("host-name")),
+        server=_safe_str(row.get("server")),
+        comment=_safe_str(row.get("comment")),
+        disabled=_is_truthy(row.get("disabled")),
+    )
+
+
 def _merge_connected_devices(
     leases: list[dict[str, object]],
     arp_entries: list[dict[str, object]],
@@ -7167,8 +8215,12 @@ def _merge_connected_devices(
 
 
 __all__ = [
+    "MikroTikFirewallPushFailedError",
+    "MikroTikFirewallRefusedError",
     "MikroTikAdapter",
     "MikroTikDeviceError",
     "MikroTikConnectionError",
+    "MikroTikLeaseConflictError",
+    "MikroTikLeaseNotFoundError",
     "normalize_mac_address",
 ]

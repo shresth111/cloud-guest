@@ -199,6 +199,59 @@ async def test_device_without_a_mac_is_dropped():
     assert await _adapter(controller).list_devices(make_creds(), SITE_ID) == []
 
 
+class TestUptimeIsParsedOrLeftBlank:
+    """Open API types ``DeviceInfo.uptime`` as a **string**, so an AP
+    inventory built on it showed a blank uptime for every device. These pin
+    what the parser will and will not accept.
+    """
+
+    def test_the_measured_controller_string_parses_to_its_own_integer(self):
+        """The cross-check that makes this parser evidence rather than a
+        guess: Omada Software Controller 5.15.24.19 reported
+        ``"uptime": "8h 26m 42s"`` and ``"uptimeLong": 30402`` on the same
+        device row (measured 2026-09-18). The string must yield the integer.
+        """
+        parsed = parse_device({"mac": "AABBCCDDEEFF", "uptime": "8h 26m 42s"})
+        assert parsed is not None
+        assert parsed.uptime_seconds == 30402
+
+    def test_tplink_documented_rendering_parses(self):
+        parsed = parse_device({"mac": "AABBCCDDEEFF", "uptime": "2day(s) 3h 4m"})
+        assert parsed is not None
+        assert parsed.uptime_seconds == 2 * 86400 + 3 * 3600 + 4 * 60
+
+    def test_an_integer_uptime_is_unchanged(self):
+        parsed = parse_device({"mac": "AABBCCDDEEFF", "uptime": 86400})
+        assert parsed is not None
+        assert parsed.uptime_seconds == 86400
+
+    def test_a_numeric_string_is_still_seconds(self):
+        parsed = parse_device({"mac": "AABBCCDDEEFF", "uptime": "86400"})
+        assert parsed is not None
+        assert parsed.uptime_seconds == 86400
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["yesterday", "5x", "up 3 fortnights", "2026-09-18T10:00:00Z", ""],
+    )
+    def test_an_unrecognised_string_stays_blank_rather_than_guessing(self, raw):
+        """A mis-parsed uptime is worse than an absent one -- the whole
+        reason this field was left blank before the parser existed."""
+        parsed = parse_device({"mac": "AABBCCDDEEFF", "uptime": raw})
+        assert parsed is not None
+        assert parsed.uptime_seconds is None
+
+
+def test_client_count_is_none_not_zero_when_the_api_omits_it():
+    """Open API's ``DeviceInfo`` has no client-count field at all. ``None``
+    means "this controller does not report it"; ``0`` would mean "this AP has
+    no clients", and printing the second when the first is true is the
+    inventory lie this asserts against."""
+    parsed = parse_device({"mac": "AABBCCDDEEFF", "type": "ap"})
+    assert parsed is not None
+    assert parsed.client_count is None
+
+
 def test_unknown_device_type_and_status_become_unknown_not_a_raw_code():
     parsed = parse_device({"mac": "AABBCCDDEEFF", "type": "toaster", "status": 77})
     assert parsed is not None

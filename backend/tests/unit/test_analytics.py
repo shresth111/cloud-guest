@@ -30,7 +30,10 @@ from app.domains.analytics.aggregation import (
 )
 from app.domains.analytics.constants import AnalyticsGranularity, AnalyticsSnapshotType
 from app.domains.analytics.exceptions import AnalyticsOrganizationNotFoundError
-from app.domains.analytics.models import AnalyticsSnapshot
+from app.domains.analytics.models import (
+    SNAPSHOT_NATURAL_KEY_COLUMNS,
+    AnalyticsSnapshot,
+)
 from app.domains.analytics.service import AnalyticsService
 from app.domains.analytics.validators import day_bounds_utc, validate_date_range
 from app.domains.router.enums import RouterStatus
@@ -89,6 +92,16 @@ class FakeGuestAnalyticsService:
         return self.summaries[(organization_id, location_id)]
 
 
+def _natural_key(**fields: object) -> tuple[object, ...]:
+    """The tuple ``uq_analytics_snapshots_natural_key`` is unique over --
+    see ``app.domains.analytics.models.SNAPSHOT_NATURAL_KEY_COLUMNS``."""
+    return tuple(fields.get(column) for column in SNAPSHOT_NATURAL_KEY_COLUMNS)
+
+
+def _natural_key_of(snapshot: AnalyticsSnapshot) -> tuple[object, ...]:
+    return tuple(getattr(snapshot, column) for column in SNAPSHOT_NATURAL_KEY_COLUMNS)
+
+
 @dataclass
 class FakeAnalyticsRepository:
     """Stand-in for ``AnalyticsRepositoryProtocol``."""
@@ -109,11 +122,16 @@ class FakeAnalyticsRepository:
     existing_organization_ids: set[uuid.UUID] = field(default_factory=set)
     snapshots: list[AnalyticsSnapshot] = field(default_factory=list)
     # Simulates one organization's aggregation genuinely failing (e.g. a bad
-    # row) -- create_snapshot raises when persisting this organization's own
+    # row) -- upsert_snapshot raises when persisting this organization's own
     # ORG_DAILY_SUMMARY row.
     fail_organization_id: uuid.UUID | None = None
 
-    async def create_snapshot(self, **fields: object) -> AnalyticsSnapshot:
+    async def upsert_snapshot(self, **fields: object) -> AnalyticsSnapshot:
+        """Keyed on the same natural key ``uq_analytics_snapshots_natural_
+        key`` enforces, so that a test which runs the aggregation twice
+        sees what the database would do rather than what a list would.
+        ``tests/unit/test_analytics_snapshot_upsert.py`` is what proves
+        this fake and the real ``ON CONFLICT`` agree."""
         is_org_summary = (
             fields.get("snapshot_type") == AnalyticsSnapshotType.ORG_DAILY_SUMMARY.value
         )
@@ -123,6 +141,15 @@ class FakeAnalyticsRepository:
             and is_org_summary
         ):
             raise RuntimeError("simulated aggregation failure for this organization")
+        key = _natural_key(**fields)
+        existing = next((s for s in self.snapshots if _natural_key_of(s) == key), None)
+        if existing is not None:
+            existing.metrics = fields["metrics"]
+            existing.computed_at = fields["computed_at"]
+            existing.computation_duration_ms = fields.get("computation_duration_ms")
+            existing.period_end = fields["period_end"]
+            existing.version += 1
+            return existing
         snapshot = AnalyticsSnapshot(**_base_fields(**fields))
         self.snapshots.append(snapshot)
         return snapshot
@@ -589,7 +616,7 @@ async def test_list_snapshots_is_tenant_scoped():
     service = _service_with(repository, guest_analytics)
 
     start, end = _period()
-    await repository.create_snapshot(
+    await repository.upsert_snapshot(
         organization_id=org_a,
         location_id=None,
         snapshot_type=AnalyticsSnapshotType.ORG_DAILY_SUMMARY.value,
@@ -600,7 +627,7 @@ async def test_list_snapshots_is_tenant_scoped():
         computed_at=_now(),
         computation_duration_ms=1.0,
     )
-    await repository.create_snapshot(
+    await repository.upsert_snapshot(
         organization_id=org_b,
         location_id=None,
         snapshot_type=AnalyticsSnapshotType.ORG_DAILY_SUMMARY.value,
@@ -841,10 +868,38 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "billing-subscription-renewal-sweep",
         "billing-invoice-overdue-sweep",
         "guest-session-timeout-sweep",
+        # Its absence is a guest who left hours ago still listed as
+        # connected: a guest admitted by an authorized-MAC bypass sends no
+        # RADIUS accounting, so nothing else ever notices they have gone.
+        "guest-session-presence-sweep",
         "provisioning-engine-drain-queue",
         "queue-management-sweep-schedule-transitions",
         "guest-fup-time-accrual-sweep",
         "guest-quota-reset-sweep",
+        # Only Allowed. The flag used to be answered once, at sign-in, and
+        # never re-asked -- so switching it on stopped admitting new guests
+        # and left every guest already online exactly where they were, with
+        # the venue believing it was running closed. Its absence from this
+        # set is a property whose dashboard says "only listed guests can
+        # connect" while the people it exists to refuse keep streaming. See
+        # app.domains.guest.tasks.run_whitelist_only_enforcement_sweep.
+        "guest-whitelist-only-enforcement-sweep",
+        # Open Hours. It was a sign-in gate only, so a venue that closes at
+        # 22:00 stopped admitting anyone at 22:00 and kept serving everyone
+        # who was already online -- the feature appearing not to work. Its
+        # absence from this set is a venue whose advertised closing time does
+        # not close anything. See
+        # app.domains.guest.tasks.run_open_hours_enforcement_sweep.
+        "guest-open-hours-enforcement-sweep",
+        # Releasing a controller-side device block when its rule stops
+        # applying. `expires_at` is evaluated lazily at read time and
+        # nothing fires on it, so a rule written as "blocked until
+        # Sunday" simply stops matching while the device stays blocked
+        # on the venue's controller -- and the controller offers no way
+        # to ask what it is holding. Its absence from this set is a
+        # permanent block nobody can find, from a temporary one.
+        "guest-access-controller-block-release-sweep",
+        "guest-access-device-block-release-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         # Monitored hardware liveness: the fast ping-driven UP/DOWN path
@@ -859,6 +914,12 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # still holds a lease for a dead device".
         "monitored-hardware-liveness-sweep",
         "campaigns-sweep-status-transitions",
+        # Guest Marketing: dispatcher, at-most-once reaper, PII retention.
+        "marketing-dispatch-due-campaigns",
+        "marketing-reap-stuck-recipients",
+        "marketing-prune-recipient-addresses",
+        # Prepaid credits: nightly ledger-vs-wallet reconciliation (§13.2).
+        "billing-reconcile-credit-wallets",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
         # Its absence from this set is not a missing schedule entry, it is
@@ -903,6 +964,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # exactly like one that is -- there is no alert row, no error, and
         # nothing anywhere that says so.
         "dhcp-rogue-detection-sweep",
+        # Refreshes the platform's public DoH lists once, then pushes them
+        # to routers that turned on a list-backed DNS bypass layer. See
+        # app.domains.dns_filtering.tasks.
+        "dns-bypass-blocklist-refresh",
         # Polls each enabled network integration's controller for status,
         # devices, clients and guest sessions, on that integration's own
         # configured interval. Its absence from this set is not a missing
@@ -922,6 +987,11 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # Omada auth path ever reaches record_usage. See
         # app.domains.network_integration.usage_tasks's own module docstring.
         "omada-usage-sync-sweep",
+        # Aruba Instant On read-only poller: reads AP/client/SSID/alert data
+        # into instant_on_snapshots. Inert unless
+        # CLOUDGUEST_INSTANT_ON_POLLER_ENABLED is true. See
+        # app.domains.network_integration.instant_on_tasks.
+        "instant-on-poll-sweep",
     }
 
 

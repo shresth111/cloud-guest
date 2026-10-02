@@ -35,10 +35,19 @@ For every non-deleted organization it calls
   somebody.
 
 It never touches a rule that already exists -- not its severity, not its
-active flag, not its channel links. An operator who retuned or switched off
-a default rule meant to, and re-running this must not argue with them. The
-consequence is stated rather than hidden: a rule someone disabled stays
-disabled, and this script will report it as already-present.
+active flag, and not its channels *when it already has some*. An operator who
+retuned, switched off or re-pointed a default rule meant to, and re-running
+this must not argue with them. The consequence is stated rather than hidden:
+a rule someone disabled stays disabled, and this script will report it as
+already-present.
+
+The one exception is the hole this backfill exists to close, and it closes it
+for rules that already exist too: a rule with **no** channel at all notifies
+nobody -- the ``Alert`` row appears, the dashboard lights up, and
+``_dispatch_for_alert`` returns -- so an existing default rule with zero
+channels is linked to the organization's default channel. That is filling a
+hole, not overruling a choice: a rule that points at *some* channel is still
+left completely alone, whatever it points at.
 
 Organizations with no usable ``contact_email`` get their rules but no
 channel, and are printed as **NOT NOTIFIABLE** so the gap is visible rather

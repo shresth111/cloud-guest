@@ -97,6 +97,8 @@ from app.domains.network_config.constants import (
     REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES,
     BootstrapMode,
 )
+from app.domains.network_integration.dependencies import get_instant_on_read_service
+from app.domains.network_integration.instant_on_service import InstantOnReadService
 from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
 from app.domains.provisioning_engine.planner.dependencies import (
     get_configuration_plan_service,
@@ -153,6 +155,7 @@ from .device_adapters import (
     reboot_device,
 )
 from .enums import RouterStatus
+from .exceptions import NasOnlySiteRefusedError
 from .models import Router
 from .schemas import (
     BootstrapScriptPreviewResponse,
@@ -161,6 +164,8 @@ from .schemas import (
     DeviceInterfacesResponse,
     HeartbeatRequest,
     MessageResponse,
+    NasOnlySiteCreateRequest,
+    NasOnlySiteCreateResponse,
     ProvisioningCheckInRequest,
     ProvisioningCheckInResponse,
     ProvisioningTokenResponse,
@@ -175,6 +180,7 @@ from .schemas import (
     redact_customer_router_settings,
 )
 from .service import ControllerContext, RouterService
+from .vendor_capabilities import is_nas_only
 
 router = APIRouter(tags=["Routers"])
 
@@ -358,6 +364,18 @@ async def create_router(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     router_service: RouterService = Depends(get_router_service),
 ):
+    # A NAS-only vendor (Aruba Instant On) is never added here. This route is
+    # `routers.create` at ORGANIZATION scope, held in full by every venue
+    # owner, and all Instant On onboarding is Master-only (PM_SPEC §0.1 item
+    # 2): the GLOBAL-pinned `POST /platform/routers/instant-on-sites` is the
+    # one way in, and it enforces one row per site and no mixed venues.
+    if is_nas_only(payload.vendor):
+        raise NasOnlySiteRefusedError(
+            "Aruba Instant On sites are added from the Master console "
+            "(Router Fleet > Add Instant On site), not here.",
+            reason="master_console_only",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
     created = await router_service.create_router(
         actor_user_id=uuid.UUID(user.id),
         location_id=location_id,
@@ -531,6 +549,91 @@ async def change_router_vendor(
     )
 
 
+@router.post(
+    "/platform/routers/instant-on-sites",
+    response_model=ApiResponse[NasOnlySiteCreateResponse],
+    status_code=status.HTTP_201_CREATED,
+    # GLOBAL, pinned. `routers.create` is held at ORGANIZATION scope by every
+    # venue owner; without the pin the caller would choose their own check
+    # level (`RequirePermission` infers scope from the request). Same action
+    # as the org-scoped create, so no new RBAC key and no re-seed.
+    dependencies=[Depends(RequirePermission("routers.create", scope=ScopeType.GLOBAL))],
+)
+async def create_instant_on_site(
+    request: Request,
+    payload: NasOnlySiteCreateRequest,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+    instant_on_service: InstantOnReadService = Depends(get_instant_on_read_service),
+):
+    """Add one Aruba Instant On site as one ``aruba_instant_on`` fleet row.
+
+    The Master console's only way to create an Instant On row (PM_SPEC §0.1
+    item 3: Router Fleet is the Wave 1 entry point). Creates the row and
+    nothing else -- no agent, WireGuard, RouterOS or RADIUS side effect; the
+    setup panel's Register (``POST /platform/radius/nas/register-public/
+    {router_id}``) is the next step.
+
+    No ``CurrentOrganization``: the tenant is ``organization_id`` in the
+    body, and ``RouterService.create_nas_only_site`` refuses a location that
+    is not that organization's own (422), a location that already has an
+    Instant On row (409, with ``existing_router_id``), and a location with
+    any other device or a network integration (409). See that method for
+    why.
+
+    **The Instant On site id lives in ``instant_on_sites``** (the poller's
+    table, #327), not on the router row: one source of truth. When
+    ``instant_on_site_id`` is given, a live mapping of that site to another
+    live router is refused first (409 ``site_already_onboarded``), and after
+    the row is created the mapping is written through
+    ``InstantOnReadService.configure_site`` with polling and the customer
+    view both OFF -- turning either on stays a deliberate Master action
+    (``PUT /platform/instant-on/routers/{router_id}/site``). Both writes share
+    the request's session, so a failure in the second rolls back the first.
+    """
+    if payload.instant_on_site_id:
+        in_use = await instant_on_service.site_in_use(payload.instant_on_site_id)
+        if in_use is not None:
+            raise NasOnlySiteRefusedError(
+                f"Instant On site {payload.instant_on_site_id} is already "
+                "mapped to another fleet device. One Instant On site is one "
+                "fleet row.",
+                reason="site_already_onboarded",
+                existing_router_id=in_use.router_id,
+            )
+    result = await router_service.create_nas_only_site(
+        actor_user_id=uuid.UUID(user.id),
+        organization_id=payload.organization_id,
+        location_id=payload.location_id,
+        name=payload.name,
+        serial_number=payload.serial_number,
+        mac_address=payload.mac_address,
+    )
+    created, synthetic_serial, synthetic_mac = result
+    if payload.instant_on_site_id:
+        await instant_on_service.configure_site(
+            router_id=created.id,
+            site_id=payload.instant_on_site_id,
+            site_name=payload.instant_on_site_name,
+            poll_enabled=False,
+            customer_visible=False,
+            router_lookup=router_service,
+            actor_user_id=uuid.UUID(user.id),
+        )
+    return build_response(
+        success=True,
+        message="Instant On site added",
+        data=NasOnlySiteCreateResponse(
+            router=await _one_platform(created, router_service),
+            synthetic_serial_number=synthetic_serial,
+            synthetic_mac_address=synthetic_mac,
+            instant_on_site_id=payload.instant_on_site_id,
+            instant_on_site_name=payload.instant_on_site_name,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @router.put(
     "/platform/routers/{router_id}/management-access",
     response_model=ApiResponse[RouterPlatformResponse],
@@ -596,6 +699,9 @@ async def decommission_router(
     router_service: RouterService = Depends(get_router_service),
     radius_service: RadiusService = Depends(get_radius_service),
     wireguard_service: WireGuardService = Depends(get_wireguard_service),
+    instant_on_service: InstantOnReadService | None = Depends(
+        get_instant_on_read_service
+    ),
 ):
     # RADIUS first, before anything else is touched. A decommissioned
     # router's RadiusNasClient row used to outlive decommissioning
@@ -658,6 +764,17 @@ async def decommission_router(
         logger.warning(
             "router_decommission_wireguard_revoke_failed",
             extra={"router_id": str(router_id)},
+        )
+
+    # An Aruba Instant On row's site mapping (`instant_on_sites`, #327) goes
+    # with it. The poller already skips sites whose router is deleted, but the
+    # venue reads (`get_site_for_location`) do not, so a stale mapping would
+    # answer for the venue's next Instant On row, and would block re-adding
+    # the same site. Same session as the decommission below: both or neither.
+    # `None` only when a test calls this function directly.
+    if instant_on_service is not None:
+        await instant_on_service.release_sites_for_router(
+            router_id, actor_user_id=uuid.UUID(user.id)
         )
 
     await router_service.decommission_router(

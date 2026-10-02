@@ -102,9 +102,7 @@ class FakeNiRepository:
         self._integrations = integrations
         self.limit_seen: int | None = None
 
-    async def list_omada_openapi_for_usage_sync(
-        self, *, limit: int
-    ) -> list[object]:
+    async def list_omada_openapi_for_usage_sync(self, *, limit: int) -> list[object]:
         self.limit_seen = limit
         return list(self._integrations)
 
@@ -549,3 +547,73 @@ class TestSyncOmadaSessionUsage:
         assert summary.integrations_synced == 1
         assert summary.sessions_updated == 1
         assert recorder.calls == [(session_id, 100, 200)]
+
+
+class TestTheSweepsGuestServiceActuallyConstructs:
+    """The factory is built here the way the worker builds it.
+
+    Every test above this one hands ``sync_omada_session_usage`` a
+    ``RecordingUsageRecorder`` -- a fake that records deltas and never
+    disconnects anyone. That is the right fake for the delta arithmetic, and
+    it is exactly why the missing ``session_end_hook`` was invisible: no test
+    ever called ``_build_guest_service``, so nothing ever looked at what the
+    real worker would hold.
+
+    A dependency factory nothing constructs in a test is how a deploy 500'd
+    guest login at every venue: a factory passed an argument its constructor
+    did not accept, and no test called the factory. So this calls it, with
+    nothing stubbed out, and asserts on the object that comes back.
+
+    No database is needed and none is used: every collaborator in this graph
+    stores the session and issues no I/O until a method is awaited.
+    """
+
+    def test_it_builds_with_the_real_collaborators(self) -> None:
+        """Construction alone, asserted separately. If a signature drifts,
+        this fails with a TypeError naming the argument rather than with an
+        AttributeError three assertions later."""
+        from app.domains.network_integration.usage_tasks import _build_guest_service
+
+        service = _build_guest_service(object())
+
+        assert service.repository is not None
+        assert (
+            service.policy_lookup is not None
+        ), "without a policy lookup the FUP data cap silently stops resolving"
+
+    def test_a_capped_omada_guest_can_actually_be_disconnected(self) -> None:
+        """The defect. ``record_usage`` expires a capped session and then
+        calls ``issue_live_disconnect``; with no ``session_end_hook`` that
+        call takes the ``terminator is None`` branch, records
+        ``disconnect_enforced=False`` and returns. The row said the guest's
+        data had run out and the guest stayed online -- and at an Omada venue
+        there is no NAS-side cap to catch it, so that was the only outcome.
+        """
+        from app.domains.network_integration.usage_tasks import _build_guest_service
+
+        service = _build_guest_service(object())
+
+        assert service.session_end_hook is not None, (
+            "a data cap that expires the row and leaves the guest online is "
+            "worse than no cap: the platform reports enforcement it did not "
+            "perform"
+        )
+        assert service.session_end_hook.controller_terminator is not None, (
+            "an Omada venue is reached only through its controller; without "
+            "this the terminator has no way to end the session at all"
+        )
+
+    def test_the_terminator_is_the_one_the_timeout_sweep_uses(self) -> None:
+        """Not a parallel composition. A data cap and a time cap must
+        disconnect through the same object, or the two drift and only one of
+        them keeps working."""
+        from app.domains.guest.tasks import _build_session_terminator
+        from app.domains.network_integration.usage_tasks import _build_guest_service
+
+        service = _build_guest_service(object())
+        reference = _build_session_terminator(object(), object())
+
+        assert type(service.session_end_hook) is type(reference)
+        # The repository the service holds is the terminator's device lookup,
+        # which is what makes a MAC resolvable when the cap fires.
+        assert service.session_end_hook.device_lookup is service.repository

@@ -18,8 +18,14 @@ from app.common.exceptions import CloudGuestError
 class BillingError(CloudGuestError):
     """Base exception for Billing domain errors."""
 
-    def __init__(self, message: str, *, status_code: int) -> None:
-        super().__init__(message, status_code=status_code)
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        data: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, data=data)
 
 
 # -- Plan ---------------------------------------------------------------------
@@ -107,6 +113,10 @@ class LicenseNotActiveError(BillingError):
         super().__init__(
             f"Organization {organization_id}'s license is not usable: {reason}",
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            # Machine-readable, so a frontend can tell "lapsed licence" apart
+            # from "locked add-on" (FeatureNotEntitledError) without parsing
+            # the message.
+            data={"error_code": "license_not_active"},
         )
 
 
@@ -120,6 +130,7 @@ class FeatureNotEntitledError(BillingError):
             f"Organization {organization_id}'s plan does not include "
             f"the '{feature_key}' feature",
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            data={"error_code": "feature_not_entitled", "feature_key": feature_key},
         )
 
 

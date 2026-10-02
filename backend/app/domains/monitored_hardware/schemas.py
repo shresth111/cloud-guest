@@ -48,6 +48,18 @@ class MonitoredHardwareResponse(BaseModel):
     # cannot. Null for "down"/"unknown"/never-observed rows -- never
     # fabricated from ``last_seen_at``.
     connected_at: datetime | None
+    # "measured" / "unmeasured" -- whether this platform probes this device
+    # at all, which is a different question from what the probe found. A
+    # venue whose network is run by a vendor controller has no RouterOS
+    # session to probe through, so its rows are permanently "unknown" and
+    # must say WHY, instead of letting "unknown" be read as "we looked and
+    # never saw it". See `constants.StatusSource`.
+    status_source: str
+    # "liveness_probe" / "never_observed" / "controller_managed" -- a
+    # machine-readable code. The console owns the words (see
+    # `@/lib/device-liveness`); a sentence composed here would be a second
+    # copy of them, free to drift.
+    status_reason: str
     created_at: datetime
 
 

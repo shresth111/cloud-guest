@@ -94,6 +94,15 @@ class PermissionModule(StrEnum):
     OTP = "otp"
     VOUCHER = "voucher"
     CAMPAIGNS = "campaigns"
+    # Guest Marketing: outbound WhatsApp/SMS/email campaigns to opted-in
+    # guests (``app.domains.marketing``). Its own module, not CAMPAIGNS:
+    # bulk-messaging guests' personal contacts is a bigger act than editing
+    # a portal banner and needs its own grant (``marketing.execute``).
+    MARKETING = "marketing"
+    # Guest Marketing bring-your-own providers (spec §12.3): who may see and
+    # change a venue's own SMS/WhatsApp/email credentials. Organization-level
+    # only -- never grantable at a location.
+    MARKETING_PROVIDERS = "marketing_providers"
     RADIUS = "radius"
     WIREGUARD = "wireguard"
     FIREWALL = "firewall"
@@ -135,6 +144,19 @@ class PermissionModule(StrEnum):
     # for the full, honest RouterOS scope decision this module composes
     # into the network_config push pipeline.
     CONTENT_FILTERING = "content_filtering"
+    # Security: the venue-level security posture surface (overview, score)
+    # and the capability matrix recording what this platform can and cannot
+    # enforce -- see app.domains.security's own module docstring.
+    #
+    # Deliberately a separate module from CONTENT_FILTERING/FIREWALL rather
+    # than folded into either. Those two are per-rule/per-router CRUD at
+    # ScopeType.ROUTER; this one answers a venue-level question ("what is
+    # this location's security posture, and which features can it actually
+    # have?") at ScopeType.LOCATION, and its read set spans the fleet,
+    # blocking, devices, tunnels and alerts at once. A venue owner deciding
+    # whether to trust the number is not doing the same job as an engineer
+    # editing one filter rule, and one permission key cannot describe both.
+    SECURITY = "security"
     # Sales quotations: a branded PDF quotation an operator generates and
     # emails to a prospective/existing client -- see
     # app.domains.quotation's own module docstring. GLOBAL-only, same
@@ -815,6 +837,10 @@ class AuditAction(StrEnum):
     # entries recording a real change to a production network.
     DHCP_OPTION_WRITTEN = "dhcp_option_written"
     DHCP_OPTION_REMOVED = "dhcp_option_removed"
+    # A device's DHCP lease made static on its router (the firewall device
+    # picker's "keep this device on the same address"). Audited only when
+    # the device actually changed.
+    DHCP_LEASE_MADE_STATIC = "dhcp_lease_made_static"
 
     # Port Forwarding Management domain events -- written through this
     # same table by
@@ -918,6 +944,44 @@ class AuditAction(StrEnum):
     CAMPAIGN_DELETED = "campaign_deleted"
     CAMPAIGN_CLONED = "campaign_cloned"
 
+    # Per-organization add-on overrides (billing's
+    # ``OrganizationFeatureOverride``), written by the GLOBAL-pinned Master
+    # ``/platform/organizations/{id}/addons`` routes.
+    ORGANIZATION_FEATURE_OVERRIDE_SET = "organization_feature_override_set"
+    ORGANIZATION_FEATURE_OVERRIDE_CLEARED = "organization_feature_override_cleared"
+
+    # Prepaid credits (billing's ``CreditLedgerEntry``), written by the
+    # GLOBAL-pinned Master ``/platform/organizations/{id}/credits`` routes.
+    # One row per ledger entry a human posted; system entries (reserve,
+    # release, debit) are their own audit trail in the append-only ledger.
+    CREDITS_TOPUP = "credits_topup"
+    CREDITS_ADJUSTED = "credits_adjusted"
+    CREDITS_REFUNDED = "credits_refunded"
+    CREDITS_SETTINGS_UPDATED = "credits_settings_updated"
+    # Marketing price book (spec §13.3), GLOBAL-pinned Master routes.
+    MARKETING_PRICE_BOOK_UPDATED = "marketing_price_book_updated"
+    MARKETING_ORG_PRICES_UPDATED = "marketing_org_prices_updated"
+
+    # Guest Marketing domain events (``app.domains.marketing``).
+    MARKETING_TEMPLATE_CREATED = "marketing_template_created"
+    MARKETING_TEMPLATE_UPDATED = "marketing_template_updated"
+    MARKETING_TEMPLATE_DELETED = "marketing_template_deleted"
+    MARKETING_CAMPAIGN_CREATED = "marketing_campaign_created"
+    MARKETING_CAMPAIGN_UPDATED = "marketing_campaign_updated"
+    MARKETING_CAMPAIGN_DELETED = "marketing_campaign_deleted"
+    MARKETING_CAMPAIGN_STATUS_CHANGED = "marketing_campaign_status_changed"
+    MARKETING_CAMPAIGN_SCHEDULED = "marketing_campaign_scheduled"
+    MARKETING_CAMPAIGN_CANCELLED = "marketing_campaign_cancelled"
+    MARKETING_CAMPAIGN_TEST_SENT = "marketing_campaign_test_sent"
+    MARKETING_CONSENT_STAFF_OPT_OUT = "marketing_consent_staff_opt_out"
+    MARKETING_PORTAL_CONSENT_UPDATED = "marketing_portal_consent_updated"
+    MARKETING_PROVIDER_UPDATED = "marketing_provider_updated"
+    MARKETING_PROVIDER_DELETED = "marketing_provider_deleted"
+    MARKETING_PROVIDER_VERIFIED = "marketing_provider_verified"
+    MARKETING_PROVIDER_ENABLED = "marketing_provider_enabled"
+    MARKETING_PROVIDER_TRIPPED = "marketing_provider_tripped"
+    MARKETING_PROVIDER_TEMPLATES_SYNCED = "marketing_provider_templates_synced"
+
     # DNS Management domain events -- written through this same table by
     # ``app.domains.dns.service.DnsService`` via the same narrow
     # ``AuditLogWriter`` protocol shape every other domain's service
@@ -937,6 +1001,17 @@ class AuditAction(StrEnum):
     FIREWALL_RULE_CREATED = "firewall_rule_created"
     FIREWALL_RULE_UPDATED = "firewall_rule_updated"
     FIREWALL_RULE_DELETED = "firewall_rule_deleted"
+    # A router's whole firewall rule set converged onto the device over
+    # 8728 -- not one row, because band order is a property of the set.
+    FIREWALL_RULES_PUSHED = "firewall_rules_pushed"
+    # The forward-chain sentinel band was placed on a router (Master-only).
+    FIREWALL_BAND_INSTALLED = "firewall_band_installed"
+    # The per-router "Limit connection floods" switch was turned on, changed
+    # or turned off (``FirewallService.set_flood_limit``).
+    FIREWALL_FLOOD_LIMIT_CHANGED = "firewall_flood_limit_changed"
+    # The per-router "Guests can't see each other" switch was turned on or
+    # off (``FirewallService.set_guest_isolation``).
+    FIREWALL_GUEST_ISOLATION_CHANGED = "firewall_guest_isolation_changed"
 
     # Network Device (NAC) domain events -- written through this same
     # table by ``app.domains.network_device.service.NetworkDeviceService``
@@ -977,6 +1052,16 @@ class AuditAction(StrEnum):
     # exists" on a dashboard that showed it as enforced. Same distinction,
     # and the same reason, as DHCP_POOL_PUSHED and VLAN_PUSHED above.
     CONTENT_FILTER_RULE_PUSHED = "content_filter_rule_pushed"
+
+    # Cloudflare Gateway DNS (category) filtering -- written by
+    # ``app.domains.dns_filtering.service.DnsFilteringService``. ENABLED and
+    # DISABLED are whole-router DNS changes (the router's resolver was
+    # switched to, or restored from, a Gateway DoH endpoint), which is why
+    # they are recorded separately from the policy edit.
+    DNS_FILTERING_POLICY_UPDATED = "dns_filtering_policy_updated"
+    DNS_FILTERING_ENABLED = "dns_filtering_enabled"
+    DNS_FILTERING_DISABLED = "dns_filtering_disabled"
+    DNS_FILTERING_BYPASS_HARDENING_CHANGED = "dns_filtering_bypass_hardening_changed"
 
     # Support Tickets domain events -- written through this same table by
     # ``app.domains.support_tickets.service.TicketService`` via the same
@@ -1026,6 +1111,17 @@ class AuditAction(StrEnum):
     # for, and the per-channel outcome rides along in ``event_metadata``.
     CHANNEL_PARTNER_REVOKED = "channel_partner_revoked"
     CHANNEL_PARTNER_WELCOME_RESENT = "channel_partner_welcome_resent"
+
+    # Quotation domain event -- written through this same table by
+    # ``app.domains.quotation.service.QuotationService`` via the identical
+    # narrow ``AuditLogWriter`` protocol the Channel Partner domain above
+    # uses. Only the destructive transition is audited, not creation: a
+    # quotation's creation is reconstructable from the row's own
+    # ``created_at``/``created_by``, but a soft delete removes it from
+    # every read path in the console, so "who made this disappear, and
+    # when" has no other source. Same split, same reasoning, as
+    # ``CHANNEL_PARTNER_REVOKED`` directly above.
+    QUOTATION_DELETED = "quotation_deleted"
 
     # System Settings domain event -- the platform-wide (GLOBAL-scope)
     # configuration store (``app.domains.system_settings``), written through

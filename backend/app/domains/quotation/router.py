@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_quotation_service
 from .models import Quotation, QuotationLineItem
@@ -208,6 +209,59 @@ async def download_quotation_pdf(
                 f'attachment; filename="{quotation.quotation_number}.pdf"'
             )
         },
+    )
+
+
+@router.delete(
+    "/{quotation_id}",
+    response_model=ApiResponse[QuotationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("quotations.delete", scope=ScopeType.GLOBAL))
+    ],
+)
+async def delete_quotation(
+    request: Request,
+    quotation_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: QuotationService = Depends(get_quotation_service),
+):
+    """Soft-deletes one quotation -- the row is flagged, never removed (see
+    ``service.QuotationService.delete_quotation``).
+
+    ## Why ``scope=ScopeType.GLOBAL`` is spelled out here
+
+    ``RequirePermission`` with no ``scope=`` infers one from whichever
+    scope headers the *caller* sent (``dependencies._infer_scope_type``),
+    so an ``X-Organization-Id`` on the request turns this into an
+    ORGANIZATION-level check -- the caller choosing the level their own
+    permission is evaluated at. A quotation carries no ``organization_id``
+    (``models.py``), so unlike every org-owned resource in this codebase
+    there is no second, entity-derived scope for the handler to re-check
+    the caller against; the permission check is the *whole* authorization.
+    Pinning it to GLOBAL is what makes that sound: ``ScopeResolver``
+    refuses any grant narrower than the level being checked, so only a
+    GLOBAL grant of ``quotations.delete`` passes, and an organization- or
+    location-scoped grant of the same key can never delete a quotation
+    belonging to the platform's sales pipeline. This mirrors
+    ``app.domains.network_integration.router``'s own explicit
+    ``scope=ScopeType.GLOBAL`` on its delete, the other GLOBAL-only domain
+    here.
+
+    Returns the soft-deleted quotation (with its ``is_deleted``-driven
+    absence from every subsequent read) rather than a bare message, so the
+    console can reconcile its list from the response the way
+    ``network_integration``'s delete already lets it.
+    """
+    quotation = await service.delete_quotation(
+        quotation_id, actor_user_id=uuid.UUID(user.id)
+    )
+    response_payload = await _quotation_response(quotation, service)
+    return build_response(
+        success=True,
+        message=f"Quotation {quotation.quotation_number} deleted",
+        data=response_payload.model_dump(mode="json"),
+        request_id=_request_id(request),
     )
 
 

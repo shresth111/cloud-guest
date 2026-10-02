@@ -97,6 +97,12 @@ NARROWING_HELPERS = frozenset({"agent_managed_only", "agent_managed_vendor_crite
 # ---------------------------------------------------------------------------
 
 AGENT_MANAGED_ONLY: dict[str, str] = {
+    "app/domains/router/repository.py::RouterRepository.list_routers_in_scope": (
+        "The routers a blocklist device rule is written to "
+        "(`guest_access.device_blocking`): each row gets an 8728 session and "
+        "an ip-binding write with its own stored credentials. A controller's "
+        "synthetic row has none and keeps its own per-client block path."
+    ),
     "app/domains/connected_devices/repository.py::"
     "ConnectedDeviceRepository.list_routers_for_sync": (
         "Fleet-wide DHCP-lease discovery. Each row is dispatched to "
@@ -107,12 +113,22 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "isolation into a `routers_failed` count and a warning log."
     ),
     "app/domains/connected_devices/repository.py::"
-    "ConnectedDeviceRepository.list_routers_with_monitored_hardware": (
-        "The monitored-hardware liveness sweep's fan-out list. Same "
-        "device-I/O reason as `list_routers_for_sync`, and worse in one "
-        "respect: the target list is built by joining on `location_id`, so "
-        "a controller-managed row at a shared site would be handed another "
-        "vendor's hardware to ping through a session it can never open."
+    "ConnectedDeviceRepository.list_monitored_targets": (
+        "The monitored-hardware liveness sweep's actual target list -- the "
+        "one the sweep really calls. Each row is dialled: the sweep opens a "
+        "RouterOS session against `ConnectedDevice.router_id` and pings the "
+        "device's management IP through it, then writes an UP/DOWN verdict "
+        "to the customer's dashboard. So the filter asks about that "
+        "router's vendor, and the row is never loaded rather than skipped "
+        "later. It was previously safe only as a consequence of "
+        "`list_routers_for_sync`'s filter (no sync, so no `ConnectedDevice` "
+        "rows for a controller, so nothing to join) -- an argument about a "
+        "different function's WHERE clause, and one that any future "
+        "controller-sourced writer of `connected_devices` would quietly "
+        "invalidate. Label-based, matching `list_routers_for_sync` and "
+        "matching the question `MonitoredHardwareService.with_status` asks "
+        "to decide whether to call a status measured, so the prober and the "
+        "reporter can never disagree about which rows are probed."
     ),
     "app/domains/dashboard/repository.py::"
     "DashboardFleetRepository.count_agent_managed_routers": (
@@ -123,6 +139,16 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "Online' on a venue where it can only ever read 0 of 1. Narrowed in "
         "SQL rather than filtered afterwards so the row is never loaded."
     ),
+    "app/domains/guest/repository.py::"
+    "GuestRepository.list_routers_with_active_sessions": (
+        "The session presence sweep's fan-out list. Each row is dispatched "
+        "to `reconcile_router_session_presence`, which opens a RouterOS API "
+        "session with the row's own stored credentials to read "
+        "`/ip/hotspot/host` -- NULL credentials and no hotspot table on a "
+        "controller, so every tick would be a guaranteed failed read. "
+        "Presence for a controller-managed venue is not something this "
+        "RouterOS read can answer and is deliberately out of its scope."
+    ),
     "app/domains/dhcp/repository.py::DhcpRepository.list_all_router_ids": (
         "The captive-portal DHCP-option convergence sweep. Every id goes "
         "straight to a RouterOS write. Note this method's docstring "
@@ -130,6 +156,28 @@ AGENT_MANAGED_ONLY: dict[str, str] = {
         "router this platform never configured must stay in it. 'Cannot "
         "run RouterOS at all' is the different question, and the one this "
         "filter answers."
+    ),
+    # -- security posture ---------------------------------------------------
+    "app/domains/security/repository.py::"
+    "SecurityRepository._agent_managed_router_count_base": (
+        "The one `routers` read in the security domain, and the base every one "
+        "of its fleet counts is built from -- so the vendor question is "
+        "answered once rather than re-decided per count. It measures "
+        "'gateways reporting' from `router_agent_credentials.last_used_at`, "
+        "which is agent-shaped by definition: a controller-managed venue has "
+        "no agent credential and so no heartbeat that can be late. Counted "
+        "here, a working controller venue would be reported as a silent one -- "
+        "and a venue that silently stops reporting is exactly what this term "
+        "exists to surface, so a false one costs the whole signal."
+    ),
+    "app/domains/security/repository.py::"
+    "SecurityRepository.rogue_dhcp_counts.base": (
+        "`/ip dhcp-server alert` rows, the rogue-DHCP guard's stored state. A "
+        "RouterOS construct with no controller equivalent, and the row set has "
+        "no organization column, so it joins `routers` for tenancy and is "
+        "narrowed here. Left unnarrowed, a controller venue would report its "
+        "interfaces as unguarded -- an exposed network reported for a venue "
+        "whose guard was never applicable to it."
     ),
 }
 
@@ -149,6 +197,17 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- security -----------------------------------------------------------
+    "app/domains/security/repository.py::SecurityRepository.fleet_counts": (
+        "Narrowing happened upstream and this method cannot undo it: every "
+        "statement here starts from `_agent_managed_router_count_base`, which "
+        "applies `agent_managed_only`, and this method only adds a predicate "
+        "to that already-filtered statement. It appears in this list rather "
+        "than AGENT_MANAGED_ONLY because it does not call the filter itself, "
+        "and putting it there would make that bucket's own test fail -- which "
+        "is the correct outcome, since a bucket claiming a filter is applied "
+        "here would be documentation that lies about the SQL."
+    ),
     # -- dashboard ----------------------------------------------------------
     "app/domains/dashboard/repository.py::DashboardFleetRepository.count_routers": (
         "The denominator next to `count_agent_managed_routers` above, and "
@@ -344,6 +403,21 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "reached it through `sync_router`, which the gated "
         "`list_routers_for_sync` no longer dispatches for a controller."
     ),
+    # -- monitored hardware -------------------------------------------------
+    "app/domains/monitored_hardware/repository.py::"
+    "MonitoredHardwareRepository.router_vendors_for_locations": (
+        "This read IS the vendor question, so it cannot be narrowed by the "
+        "answer to it. It returns `{location_id: {router_id: vendor}}` -- "
+        "vendor strings, never a row, and nothing is dialled, judged or "
+        "configured off the result. `with_status` uses it to tell three "
+        "genuinely different venues apart: one with an agent-managed uplink "
+        "(status is measured), one whose only fleet rows are controllers "
+        "(nothing probes this device, and the row must say so instead of "
+        "letting `unknown` read as 'we looked and never saw it'), and one "
+        "with no fleet row at all (absent from the result entirely). "
+        "`agent_managed_only` here would collapse the last two into each "
+        "other and re-create the exact lie the field was added to remove."
+    ),
     # -- network integration ------------------------------------------------
     "app/domains/network_integration/repository.py::"
     "NetworkIntegrationRepository.get_omada_openapi_integration_for_location": (
@@ -357,6 +431,39 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "Every integration row it returns genuinely belongs (the caller's own "
         "Omada integration for their own location)."
     ),
+    "app/domains/network_integration/repository.py::"
+    "NetworkIntegrationRepository.get_omada_integration_for_location": (
+        "The auth-mode-agnostic sibling of the read above, and joined to "
+        "Router for the same single reason: to resolve `Router.location_id` "
+        "as a filter key. It returns a `NetworkIntegration` row, not a "
+        "router, and is narrowed to `provider == omada` in the WHERE, so it "
+        "is vendor-scoped by construction and a controller row is precisely "
+        "what it must reach. It deliberately does NOT filter on auth_mode: "
+        "the client-management surface has to be able to tell a venue that "
+        "its hotspot-operator login cannot do this, and it cannot say that "
+        "if a legacy integration is invisible to the query and the venue "
+        "reads as having no controller at all."
+    ),
+    "app/domains/network_integration/repository.py::"
+    "NetworkIntegrationRepository.nas_only_vendor_for_location": (
+        "Narrowed to `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant On) "
+        "in the WHERE, so it is vendor-scoped by construction: it can only "
+        "ever return a controller-managed, NAS-only row, which is exactly "
+        "what it exists to find. It feeds no device work -- it lets the "
+        "client-capabilities read answer 'every action unsupported, here is "
+        "why' instead of 404 at such a venue. Wrapping it in "
+        "`agent_managed_only` would make it find nothing, by definition."
+    ),
+    "app/domains/network_integration/instant_on_repository.py::"
+    "InstantOnRepository.list_pollable_sites": (
+        "Joins `routers` only to narrow `instant_on_sites` to rows whose fleet "
+        "router is live AND `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant "
+        "On), in the WHERE. Vendor-scoped by construction: the Instant On "
+        "poller can only ever load a NAS-only row, never a MikroTik or Omada "
+        "one, and a router relabelled to another vendor drops out of polling "
+        "without anyone flipping its flag. `agent_managed_only` would make it "
+        "empty by definition."
+    ),
     # -- the router domain's own accessors (names) -------------------------
     "app/domains/router/repository.py::RouterRepository.names_for_routers": (
         "Resolves a page of router ids the caller already holds to their "
@@ -366,6 +473,21 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "name is a better label for it than a bare id, and a vendor filter "
         "would make an Omada venue's own controller show as an unlabelled "
         "uuid. Read-only, every row genuinely belongs."
+    ),
+    "app/domains/network_integration/instant_on_repository.py::"
+    "InstantOnRepository.get_live_site_by_site_id": (
+        "'Is this Instant On site already mapped to a live fleet device?' "
+        "Joins `routers` only to require the mapped router is not deleted. "
+        "Only NAS-only rows ever get an `instant_on_sites` mapping "
+        "(`configure_site` refuses anything else), so `agent_managed_only` "
+        "would make it empty by definition. Feeds a refusal, never device work."
+    ),
+    "app/domains/router/repository.py::RouterRepository.routers_holding_identity": (
+        "The uniqueness check before an Instant On row is inserted: every row "
+        "-- soft-deleted ones too -- that already owns this serial or MAC. "
+        "The unique indexes are vendor-blind, so the read must be too: a "
+        "MikroTik or a controller holding the value is exactly the conflict "
+        "to report. Nothing is dispatched to a device from it."
     ),
 }
 

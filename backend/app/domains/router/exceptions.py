@@ -32,6 +32,7 @@ __all__ = [
     "RouterVendorNotSupportedError",
     "RouterVendorChangeRefusedError",
     "RouterLiveCredentialRotationFailedError",
+    "NasOnlySiteRefusedError",
 ]
 
 
@@ -304,3 +305,39 @@ class RouterVendorChangeRefusedError(RouterError):
             "reason -- the override is recorded in the audit trail.",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
+
+
+class NasOnlySiteRefusedError(RouterError):
+    """An Instant On site this platform will not add, with the one concrete
+    reason.
+
+    Raised by ``RouterService.create_nas_only_site`` before anything is
+    written. ``data.code`` is stable and ``data.reason`` says which rule
+    refused, so the Master console can act on it (``already_onboarded``
+    carries ``existing_router_id``, the row to open instead) rather than
+    parse the sentence.
+
+    ``status_code`` varies with the reason: a location outside the named
+    organization is a malformed request (422); everything else is a
+    conflict with a row that already exists (409).
+    """
+
+    CODE = "NAS_ONLY_SITE_REFUSED"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        status_code: int = status.HTTP_409_CONFLICT,
+        existing_router_id: uuid.UUID | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.reason = reason
+        self.data = {
+            "code": self.CODE,
+            "reason": reason,
+            "existing_router_id": (
+                str(existing_router_id) if existing_router_id else None
+            ),
+        }

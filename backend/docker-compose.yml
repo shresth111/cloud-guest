@@ -24,6 +24,10 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: cloudguest-celery-worker
+    # -Q celery,device_io,marketing: Guest Marketing send batches run on
+    # their own `marketing` queue (app.domains.marketing.tasks); a worker
+    # that does not consume it leaves campaigns in `sending` until the
+    # dispatcher fails them with last_error="no_worker".
     # -Q celery,device_io: this one worker process consumes both the
     # default queue (every pure-DB Beat sweep) and the device_io queue
     # (app.core.celery_app.DEVICE_IO_QUEUE_NAME -- the real per-router/
@@ -45,7 +49,7 @@ services:
         "worker",
         "--loglevel=info",
         "-Q",
-        "celery,device_io",
+        "celery,device_io,marketing",
       ]
     env_file:
       - .env

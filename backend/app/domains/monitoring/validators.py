@@ -42,6 +42,7 @@ from .constants import (
     HealthStatus,
     IncidentStatus,
     NotificationChannelType,
+    NotificationEventCategory,
     RouterLifecycleStage,
     ThresholdMetric,
     ThresholdOperator,
@@ -293,6 +294,38 @@ def validate_notification_channel_config(
         )
 
 
+def validate_notification_event_categories(
+    categories: list[object] | tuple[object, ...],
+) -> list[str]:
+    """Normalise and check a channel's ``event_categories``.
+
+    Returns the canonical list to persist: de-duplicated, order-preserving,
+    every member a real ``NotificationEventCategory`` value.
+
+    Rejecting an unknown member rather than dropping it is deliberate.
+    These strings are a *routing* instruction, and a typo that is silently
+    discarded produces a channel the console shows as subscribed to
+    something while nothing is ever delivered to it -- the exact
+    failure-that-looks-like-success this domain exists to make impossible.
+    A 400 at write time is the only point where anyone is still looking.
+    """
+    seen: dict[str, None] = {}
+    for raw in categories:
+        if not isinstance(raw, str):
+            raise InvalidNotificationChannelConfigError(
+                f"event_categories must be strings, got {type(raw).__name__}"
+            )
+        try:
+            known = NotificationEventCategory(raw)
+        except ValueError:
+            allowed = ", ".join(sorted(c.value for c in NotificationEventCategory))
+            raise InvalidNotificationChannelConfigError(
+                f"unknown event category '{raw}' -- allowed: {allowed}"
+            ) from None
+        seen[known.value] = None
+    return list(seen)
+
+
 # ============================================================================
 # Incident Engine
 # ============================================================================
@@ -466,6 +499,7 @@ __all__ = [
     "validate_alert_status_transition",
     "compare_threshold",
     "validate_notification_channel_config",
+    "validate_notification_event_categories",
     "validate_incident_status_transition",
     "validate_sla_target_config",
     "compute_lifecycle_stage",

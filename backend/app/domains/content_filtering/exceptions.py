@@ -13,6 +13,7 @@ import uuid
 from fastapi import status
 
 from app.common.exceptions import CloudGuestError
+from app.common.router_firewall_lock import FIREWALL_PUSH_IN_PROGRESS
 
 __all__ = [
     "ContentFilteringError",
@@ -25,6 +26,9 @@ __all__ = [
     "UnsupportedContentFilterVendorError",
     "ContentFilterDeviceConnectionError",
     "ContentFilterDeviceOperationError",
+    "ContentFilterPushInProgressError",
+    "UnknownContentFilterAppError",
+    "ContentFilterAppIncompleteError",
 ]
 
 
@@ -179,4 +183,59 @@ class ContentFilterDeviceOperationError(ContentFilteringError):
         super().__init__(
             f"Device operation '{operation}' failed: {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class ContentFilterPushInProgressError(ContentFilteringError):
+    """A firewall push or band placement (or another content-filter push)
+    holds this router's forward-chain lock. The content-filter drop is
+    positioned in that same chain, so it waits its turn -- see
+    ``app.common.router_firewall_lock``. Same code as the firewall's 409 on
+    purpose: it is the same lock and the same remedy."""
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            "Another change to this router's firewall is in progress; "
+            "try again in a moment",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"code": FIREWALL_PUSH_IN_PROGRESS, "router_id": str(router_id)},
+        )
+
+
+class UnknownContentFilterAppError(ContentFilteringError):
+    """``app_key`` is not in ``app_catalogue.APP_CATALOGUE``."""
+
+    def __init__(self, app_key: str) -> None:
+        super().__init__(
+            f"Unknown app '{app_key}'",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class ContentFilterAppIncompleteError(ContentFilteringError):
+    """Some of an app's rows could not be pushed (block) or taken off the
+    device (unblock). Each row already records its own outcome; this is the
+    request-level answer, a real 502 rather than a success the frontend
+    interceptor would show as done."""
+
+    def __init__(
+        self,
+        app_key: str,
+        action: str,
+        *,
+        failed: int,
+        total: int,
+        first_error: str,
+    ) -> None:
+        super().__init__(
+            f"Could not {action} {failed} of {total} names for this app on the "
+            f"router. First error: {first_error}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            data={
+                "code": "CONTENT_FILTER_APP_INCOMPLETE",
+                "app_key": app_key,
+                "action": action,
+                "failed": failed,
+                "total": total,
+            },
         )

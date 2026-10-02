@@ -8,8 +8,10 @@ mirrors ``app.domains.dhcp.dependencies``'s identical shape.
 from __future__ import annotations
 
 from fastapi import Depends
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.location_scope import CallerLocationScope, LocationScope
@@ -32,12 +34,16 @@ def get_firewall_service(
     router_service: RouterService = Depends(get_router_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    # The per-router forward-chain lock (app.common.router_firewall_lock) --
+    # the same app.database.redis singleton every other Redis user here takes.
+    redis: Redis = Depends(get_redis_client),
 ) -> FirewallService:
     return FirewallService(
         repository,
         router_service,
         audit_writer=audit_repository,
         caller_location_scope=caller_location_scope,
+        redis=redis,
     )
 
 

@@ -33,10 +33,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Protocol
 
-from sqlalchemy import Date, Integer, case, cast, func, select
+from sqlalchemy import Date, Integer, case, cast, func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
@@ -58,7 +59,11 @@ from app.domains.router_provisioning.models import RouterHealthSnapshot
 from app.domains.voucher.models import Voucher, VoucherBatch
 from app.domains.wireguard.models import WireGuardPeer
 
-from .models import AnalyticsSnapshot
+from .models import (
+    SNAPSHOT_NATURAL_KEY_COLUMNS,
+    SNAPSHOT_NATURAL_KEY_INDEX_WHERE,
+    AnalyticsSnapshot,
+)
 
 # ============================================================================
 # BE-012 Part 2: dashboard read-models
@@ -204,7 +209,7 @@ class RouterHealthHistoryRow:
 
 class AnalyticsRepositoryProtocol(Protocol):
     # -- AnalyticsSnapshot CRUD/query ---------------------------------------
-    async def create_snapshot(self, **fields: object) -> AnalyticsSnapshot: ...
+    async def upsert_snapshot(self, **fields: object) -> AnalyticsSnapshot: ...
 
     async def get_snapshot(
         self, snapshot_id: uuid.UUID
@@ -494,8 +499,76 @@ class AnalyticsRepository:
 
     # -- AnalyticsSnapshot CRUD/query ---------------------------------------
 
-    async def create_snapshot(self, **fields: object) -> AnalyticsSnapshot:
-        return await self.snapshots.create(fields)
+    async def upsert_snapshot(self, **fields: object) -> AnalyticsSnapshot:
+        """Persist one rollup, keyed on its natural key -- an ``INSERT ...
+        ON CONFLICT DO UPDATE`` against
+        ``uq_analytics_snapshots_natural_key``, never a plain ``INSERT``.
+
+        Recomputing a period is the normal case, not an exception: the
+        15-minute rolling tick recomputes today's window 96 times a day,
+        every one of those writes carrying the same ``period_start``
+        (``validators.day_bounds_utc`` pins it to UTC midnight and moves
+        only ``period_end``), and the 00:10 "finalize yesterday" tick then
+        recomputes that same day's key once more with its now-closed
+        window. A plain ``INSERT`` made each of those a new row: production
+        held 68,501 rows carrying 789 distinct rollups on 2026-09-22, 98.8%
+        of them byte-identical copies, and the dashboard's own snapshot
+        reads had degraded into a sequential scan over them.
+
+        ``period_end`` is in the ``SET`` list on purpose -- it is the one
+        natural-key-adjacent column that legitimately moves within a key.
+        The rolling window's ``period_end`` advances on every tick, and the
+        finalize tick's closed ``[midnight, next midnight)`` window is
+        what must survive as the authoritative row for that day. (Note that
+        this is *not* what ``app.core.celery_app``'s beat-schedule
+        docstring claims: it says the rolling and finalize rows "differ by
+        period_start/period_end, so both can coexist". They do not differ
+        by ``period_start`` -- it is the same UTC midnight for both -- so
+        the final, closed window now replaces the last partial one for that
+        day rather than sitting beside it, which is what a reader asking
+        for "yesterday's numbers" wanted from the pair all along.)
+
+        ``is_deleted``/``deleted_at`` are reset because a recomputed period
+        is by definition a live rollup; without that, a single soft-delete
+        of a snapshot row would silently swallow every future
+        recomputation of that period into a row no reader can see.
+        """
+        values = {
+            "id": uuid.uuid4(),
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+            "is_deleted": False,
+            "version": 1,
+            **fields,
+        }
+        statement = (
+            pg_insert(AnalyticsSnapshot)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=list(SNAPSHOT_NATURAL_KEY_COLUMNS),
+                index_where=text(SNAPSHOT_NATURAL_KEY_INDEX_WHERE),
+                set_={
+                    "metrics": values["metrics"],
+                    "computed_at": values["computed_at"],
+                    "computation_duration_ms": values.get("computation_duration_ms"),
+                    "period_end": values["period_end"],
+                    "updated_at": values["updated_at"],
+                    "is_deleted": False,
+                    "deleted_at": None,
+                    "version": AnalyticsSnapshot.version + 1,
+                },
+            )
+            .returning(AnalyticsSnapshot)
+            # The conflicting row may already be in this session's identity
+            # map from an earlier tick in the same transaction; without
+            # this the ORM hands back that stale instance instead of the
+            # columns the database just returned.
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(statement)
+        snapshot = result.scalars().one()
+        await self.session.flush()
+        return snapshot
 
     async def get_snapshot(self, snapshot_id: uuid.UUID) -> AnalyticsSnapshot | None:
         return await self.snapshots.get_by_id(snapshot_id)

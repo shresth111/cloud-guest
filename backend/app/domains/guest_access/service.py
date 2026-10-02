@@ -42,9 +42,15 @@ forwarding -- the same class of lie as the original bug.
 
 The outcome is recorded on the rule
 (``enforcement_status``/``enforcement_error``/``enforced_at``/
-``sessions_ended``, mirroring ``Vlan.device_push_*``) and, when the device
-cannot be made to agree, raised as a typed non-2xx rather than returned as
-a success envelope. The block itself is committed *first*, so a guest
+``sessions_ended``, mirroring ``Vlan.device_push_*``). When the device
+cannot be made to agree, the *create* still answers with the created rule
+carrying ``enforcement_status="failed"`` (the rule exists -- a 5xx made the
+dashboard re-submit it), while the retry endpoint raises a typed non-2xx.
+Independently of the device, ``is_blocklisted`` is consulted by every path
+that keeps an already-admitted guest online (RADIUS re-Authorize, the
+agent bypass list, the portal's "already connected" check), so a failed
+device removal no longer leaves those paths re-admitting the guest. The
+block itself is committed *first*, so a guest
 whose live session could not be cut is still barred from signing in again
 and an operator can retry the device half alone -- ``enforce_guest_rule``,
 the same "retry the push without re-submitting the form" separation
@@ -88,15 +94,18 @@ import io
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, cast
 
 from app.common.spreadsheet_safety import sanitize_spreadsheet_cell
 from app.database.utils.pagination import PaginationMeta
+from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 
@@ -108,7 +117,16 @@ from .constants import (
     BlockEnforcementStatus,
     GuestRuleImportRejectionCode,
 )
-from .enforcement import BlockEnforcementReport
+from .device_blocking import (
+    RouterBlockRecord,
+    RouterDeviceBlockOutcome,
+    RouterDeviceReleaseOutcome,
+)
+from .enforcement import (
+    BlockEnforcementReport,
+    ControllerBlockRecord,
+    ControllerReleaseOutcome,
+)
 from .events import (
     AccessRuleCreated,
     AccessRuleDeactivated,
@@ -118,19 +136,27 @@ from .events import (
     WhitelistOnlyAccessDenied,
 )
 from .exceptions import (
+    AccessRuleLocationUnverifiableError,
     AccessRuleNotFoundError,
     CountryCodeRequiredError,
     CrossLocationAccessRuleError,
     CrossOrganizationAccessRuleError,
     GuestAccessError,
+    InvalidAccessRuleLocationError,
     InvalidGuestIdentifierError,
     InvalidImportCellError,
     InvalidRuleExpiryError,
     OrganizationRequiredError,
+    OrganizationWideRuleScopeError,
     RuleTypeNotImportableError,
     TemporaryRuleRequiresExpiryError,
 )
-from .models import DeviceAccessRule, GuestAccessRule
+from .models import (
+    DeviceAccessRouterBlock,
+    DeviceAccessRule,
+    GuestAccessControllerBlock,
+    GuestAccessRule,
+)
 from .repository import GuestAccessRepositoryProtocol
 from .validators import (
     canonicalize_rule_identifier,
@@ -197,6 +223,88 @@ class AccessDecision:
         ``matched_rule_id`` says another.
         """
         return not self.allowed and self.rule_type is None
+
+    @property
+    def is_blocklist_denial(self) -> bool:
+        """Whether an operator's ``BLOCKLIST`` rule refused this guest --
+        the only refusal that must also withdraw access a guest *already
+        holds* (a live session, a bypass binding), as opposed to
+        whitelist-only mode, which only ever gates a new sign-in."""
+        return not self.allowed and self.rule_type is AccessRuleType.BLOCKLIST
+
+
+class AccessCheckProtocol(Protocol):
+    """The one method ``is_blocklisted`` needs -- satisfied by
+    ``GuestAccessService`` itself and by every test double of it."""
+
+    async def check_access(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        identifier: str | None,
+        mac_address: str | None,
+        whitelist_only_enabled: bool = False,
+    ) -> AccessDecision: ...
+
+
+#: Prefix of the synthetic identity ``login_via_mac_whitelist`` gives a
+#: device that signed in by MAC alone. It is not a phone number or email
+#: address, so no identifier-keyed rule can name it; its MAC is checked
+#: instead.
+_MAC_IDENTITY_PREFIX = "mac:"
+
+
+async def is_blocklisted(
+    access: AccessCheckProtocol,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+    identifier: str | None,
+    mac_address: str | None,
+) -> bool:
+    """Is a guest who is *already* admitted now barred by a ``BLOCKLIST``
+    rule, for their identifier or their device's MAC, at this location?
+
+    The login gate (``GuestService._enforce_access_control``) only runs
+    when a guest signs in. Everything that keeps an already-admitted guest
+    online -- a RADIUS re-Authorize that finds their ``ACTIVE`` session,
+    the ``/agent/authorized-macs`` bypass list, the portal's "you are
+    already connected" check -- read session status and nothing else, so a
+    block whose device-side session removal failed left every one of them
+    still saying yes. This is the question those paths now ask.
+
+    **Fails open, loudly.** These paths run for every connected guest on
+    every poll; a rule lookup that raises must not turn a database blip
+    into every guest at a venue losing their bypass binding at once. A
+    failure degrades to the behaviour before this check existed, with a
+    WARNING saying when.
+    """
+    if identifier is not None and identifier.startswith(_MAC_IDENTITY_PREFIX):
+        identifier = None
+    if identifier is None and mac_address is None:
+        return False
+    try:
+        decision = await access.check_access(
+            organization_id=organization_id,
+            requesting_organization_id=organization_id,
+            location_id=location_id,
+            identifier=identifier,
+            mac_address=mac_address,
+            whitelist_only_enabled=False,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: fail open
+        logger.warning(
+            "guest_access_live_block_check_failed",
+            extra={
+                "event_organization_id": str(organization_id),
+                "event_location_id": str(location_id),
+                "error": repr(exc),
+            },
+        )
+        return False
+    return decision.is_blocklist_denial
 
 
 _DEFAULT_ALLOW = AccessDecision(
@@ -349,6 +457,10 @@ _IMPORT_REJECTION_CODES: dict[type[Exception], GuestRuleImportRejectionCode] = {
     TemporaryRuleRequiresExpiryError: GuestRuleImportRejectionCode.INVALID_EXPIRY,
     InvalidRuleExpiryError: GuestRuleImportRejectionCode.INVALID_EXPIRY,
     CrossLocationAccessRuleError: (GuestRuleImportRejectionCode.LOCATION_OUT_OF_SCOPE),
+    InvalidAccessRuleLocationError: (GuestRuleImportRejectionCode.UNKNOWN_LOCATION),
+    OrganizationWideRuleScopeError: (
+        GuestRuleImportRejectionCode.ORGANIZATION_WIDE_NOT_PERMITTED
+    ),
 }
 
 # ``InvalidImportCellError`` is one exception covering several columns, so
@@ -440,6 +552,28 @@ def _import_rejection_code(exc: Exception) -> GuestRuleImportRejectionCode:
     )
 
 
+class LocationLookupProtocol(Protocol):
+    """The subset of ``app.domains.location.service.LocationService`` this
+    module needs to establish that a rule's ``location_id`` names a real
+    location of the rule's own organization.
+
+    A narrow duck-typed protocol rather than a concrete import, the same
+    composition-over-duplication shape ``app.domains.support_tickets.service``
+    and ``app.domains.campaigns.service`` already use for this identical
+    need -- resolved to the real ``LocationService`` at the DI layer (see
+    ``dependencies.py``). This module still imports nothing from
+    ``app.domains.location`` but that domain's leaf exception module.
+    """
+
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> object: ...
+
+
 class BlockEnforcerProtocol(Protocol):
     """What this service needs to make a ``BLOCKLIST`` rule true on the
     device -- satisfied by ``enforcement.BlocklistEnforcer``.
@@ -457,7 +591,38 @@ class BlockEnforcerProtocol(Protocol):
         identifier: str,
         reason: str | None,
         actor_user_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
     ) -> BlockEnforcementReport: ...
+
+    async def release_devices(
+        self,
+        records: Sequence[ControllerBlockRecord],
+    ) -> list[tuple[ControllerBlockRecord, ControllerReleaseOutcome]]:
+        """Undo the controller-side half. Never raises -- see the
+        implementation's own docstring for why a release that did not land
+        must leave the stored row uncleared rather than fail the unblock the
+        operator asked for."""
+        ...
+
+
+class DeviceBlockerProtocol(Protocol):
+    """What this service needs to make a ``BLOCKLIST`` *device* rule true on
+    the venue's MikroTik routers -- satisfied by
+    ``device_blocking.RouterDeviceBlocker``. Neither method raises for a
+    device failure; each router's answer comes back."""
+
+    async def block(
+        self,
+        *,
+        rule_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        mac_address: str,
+    ) -> list[RouterDeviceBlockOutcome]: ...
+
+    async def release(
+        self, records: Sequence[RouterBlockRecord]
+    ) -> list[tuple[RouterBlockRecord, RouterDeviceReleaseOutcome]]: ...
 
 
 class GuestAccessService:
@@ -472,12 +637,33 @@ class GuestAccessService:
         repository: GuestAccessRepositoryProtocol,
         *,
         block_enforcer: BlockEnforcerProtocol | None,
+        location_lookup: LocationLookupProtocol | None,
         audit_writer: AuditLogWriter | None = None,
         caller_location_scope: LocationScope = None,
+        device_blocker: DeviceBlockerProtocol | None = None,
     ) -> None:
         self.repository = repository
+        # Writes a ``BLOCKLIST`` device rule to the venue's MikroTik routers
+        # (``device_blocking``). ``None`` keeps a device rule what it was
+        # before -- a sign-in refusal only -- which is right for the
+        # read-only constructions and the Celery sweeps that build this
+        # service; ``dependencies.get_guest_access_service`` always wires
+        # it, and ``test_guest_access_device_block`` pins that it does.
+        self.device_blocker = device_blocker
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
+        # Keyword-only and **without a default**, for exactly the reason
+        # ``block_enforcer`` is: a default of ``None`` is how the defect
+        # this closes would come back. An unverified ``location_id`` does
+        # not fail loudly -- it writes a rule that matches nobody and looks
+        # identical to one that works -- so a mis-wired construction must
+        # be impossible to produce by omission. Passing ``None`` is still
+        # allowed for the read-only constructions (the router agent's
+        # decision service, the Celery sweeps), but it has to be written
+        # down at the call site, and a write attempted through one raises
+        # ``AccessRuleLocationUnverifiableError`` rather than skipping the
+        # check.
+        self.location_lookup = location_lookup
         # Keyword-only and **without a default**, deliberately. A default
         # of ``None`` is how the original defect would come back: a
         # mis-wired construction would silently create blocks that end no
@@ -489,6 +675,92 @@ class GuestAccessService:
         self.block_enforcer = block_enforcer
         self.audit_writer = audit_writer
         self.resolver = AccessDecisionResolver()
+
+    # -- the write-path location gate ----------------------------------------
+
+    async def _enforce_write_location(
+        self,
+        *,
+        location_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        verified: set[uuid.UUID] | None = None,
+    ) -> None:
+        """May this caller write a rule scoped to ``location_id``, and is
+        ``location_id`` somewhere a rule can actually apply?
+
+        Every path that *creates* a rule goes through here -- both create
+        methods and every row of an import. The read paths (``get_guest_rule``,
+        ``get_device_rule``, ``_may_export``) deliberately do not: they call
+        ``enforce_entity_location`` directly, because what a caller may
+        **see** and what a caller may **write** are different questions, and
+        this method answers only the second.
+
+        ## Why the org-wide case needs its own answer
+
+        ``enforce_entity_location`` treats ``entity_location_id is None`` as
+        a pass-through. For a read that is correct and must stay correct: a
+        rule with no location applies at every venue in the organization, so
+        it applies at *yours*, and you must be able to see it. Roughly twenty
+        domains depend on that behaviour, which is why the write rule is
+        expressed here rather than by changing the shared helper.
+
+        For a write it is the opposite. ``location_id = NULL`` is not "no
+        location"; ``repository.list_matching_guest_rules`` ORs
+        ``location_id IS NULL`` against the venue being matched, so a NULL
+        rule is the **broadest** rule this domain can express. Writing one
+        is an organization-level act:
+
+        * ``caller_location_scope is None`` -- the caller holds a GLOBAL or
+          ORGANIZATION role (see ``app.domains.rbac.location_scope``). They
+          are entitled to every venue already, so an org-wide rule grants
+          them nothing they did not have. Allowed.
+        * ``caller_location_scope`` is a set -- the caller holds nothing
+          broader than a location. An org-wide rule would reach venues they
+          cannot see, list or administer. Refused
+          (``OrganizationWideRuleScopeError``).
+
+        That was previously implicit -- nothing said it either way -- and
+        implicit is how it hid: a dashboard defect that dropped
+        ``location_id`` turned single-venue blocks into account-wide bans
+        and no server-side check noticed.
+
+        ## Order: scope first, existence second
+
+        Deliberate, and it is what keeps this from being an enumeration
+        oracle. A confined caller is refused by scope before any lookup runs,
+        so every id outside their grants answers identically whether or not
+        it exists. Only a caller already entitled to the whole organization
+        reaches the existence check, and that check collapses "no such
+        location" and "another tenant's location" into one
+        ``InvalidAccessRuleLocationError`` -- so no caller, confined or not,
+        learns anything about location ids belonging to other organizations.
+
+        ``verified`` lets an import amortise the lookup across a batch:
+        a 200-row upload naming one venue is one query, not two hundred.
+        """
+        if location_id is None:
+            if self.caller_location_scope is not None:
+                raise OrganizationWideRuleScopeError()
+            return
+
+        enforce_entity_location(
+            entity_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAccessRuleError(),
+        )
+
+        if verified is not None and location_id in verified:
+            return
+        if self.location_lookup is None:
+            raise AccessRuleLocationUnverifiableError()
+        try:
+            location = await self.location_lookup.get_location(location_id)
+        except LocationNotFoundError as exc:
+            raise InvalidAccessRuleLocationError() from exc
+        if getattr(location, "organization_id", None) != organization_id:
+            raise InvalidAccessRuleLocationError()
+        if verified is not None:
+            verified.add(location_id)
 
     # -- guest (identifier-keyed) rules --------------------------------------
 
@@ -506,6 +778,13 @@ class GuestAccessService:
         actor_user_id: uuid.UUID | None,
     ) -> GuestAccessRule:
         self._enforce_tenant_scope(organization_id, requesting_organization_id)
+        # The organization half alone is not tenancy. Before this, a caller
+        # confined to one venue could name another venue's id -- or no venue
+        # at all, which is every venue -- and the write succeeded. See
+        # ``_enforce_write_location``.
+        await self._enforce_write_location(
+            location_id=location_id, organization_id=organization_id
+        )
         # Canonicalize before validating, and store what was validated --
         # this is the write half of the 2026-09 "Always Allowed matches
         # nobody" fix. A phone number lands in the table as E.164 or does
@@ -555,7 +834,23 @@ class GuestAccessService:
         # can always deliver; it should not be forfeited because a router
         # was unreachable.
         await self.repository.commit()
-        return await self._enforce_block(rule, actor_user_id=actor_user_id)
+        try:
+            return await self._enforce_block(rule, actor_user_id=actor_user_id)
+        except Exception:  # noqa: BLE001 -- recorded on the rule, see below
+            # The rule exists and is committed, and ``_enforce_block`` has
+            # already recorded ``FAILED`` plus the error on it. Answering
+            # this *create* with a 5xx told the dashboard the block had not
+            # been saved: it showed "Could not block", left the row out of
+            # the list, and the owner submitted the same number again --
+            # in production, four rules for one guest in about a minute,
+            # three of them then deleted by hand. The resource was created,
+            # so the response is the resource, carrying
+            # ``enforcement_status="failed"``, which the dashboard's
+            # ``blockOutcomeMessage`` already turns into "blocked, but we
+            # could not take them off the WiFi". The retry endpoint
+            # (``enforce_guest_rule``) still raises: it creates nothing,
+            # and its only result is the device operation.
+            return rule
 
     def _initial_enforcement_status(
         self, rule_type: AccessRuleType
@@ -644,6 +939,7 @@ class GuestAccessService:
                 identifier=rule.identifier,
                 reason=rule.reason,
                 actor_user_id=actor_user_id,
+                location_id=rule.location_id,
             )
         except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
             await self.repository.update_guest_rule(
@@ -674,8 +970,104 @@ class GuestAccessService:
                 "sessions_ended": report.sessions_ended,
             },
         )
+        await self._record_device_blocks(updated, report)
         await self.repository.commit()
         return updated
+
+    async def _record_device_blocks(
+        self, rule: GuestAccessRule, report: BlockEnforcementReport
+    ) -> None:
+        """Write down every device block the controller confirmed, before
+        anybody is told it happened.
+
+        **Why this is not optional bookkeeping.** There is no readable list
+        of blocked clients through the connection this platform holds -- the
+        controller's own blocked filter is silently ignored and the Open API
+        client grid carries no block field at all (measured; see
+        ``network_integration.providers.omada`` and CAPABILITY-MATRIX §4.4).
+        A MAC blocked and not recorded is therefore a device that cannot be
+        found again from either side: not from the controller, which will
+        not list it, and not from here, which never wrote it down. The
+        customer's device stays off their own network with no row anywhere
+        explaining why.
+
+        Only confirmed blocks become releasable rows. The rest are recorded
+        too -- a refusal and a device the controller has never seen are both
+        facts the console must be able to show -- but they are not things to
+        ask a controller to undo later, and
+        ``repository.list_open_controller_blocks`` is what draws that line.
+
+        ``enforcement_status`` on the rule itself is deliberately **not**
+        touched here. It is the ladder the dashboard already reads
+        (``src/lib/block-outcome.ts``), and what it means is "what happened
+        to the sessions this guest was in" -- the promise the Blocked Guests
+        form actually makes. Folding a refused device block into it would
+        make an owner read "we could not take them off the WiFi" about a
+        guest who was taken off the WiFi. The per-device answers travel
+        beside it, in their own rows, where a partial result can be said
+        as one.
+        """
+        if not report.device_blocks:
+            return
+        now = datetime.now(UTC)
+        for outcome in report.device_blocks:
+            await self.repository.record_controller_block(
+                rule,
+                location_id=outcome.location_id,
+                mac_address=outcome.mac_address,
+                organization_id=rule.organization_id,
+                status=outcome.status,
+                error_code=outcome.error_code,
+                error_message=outcome.error_message,
+                blocked_at=now if outcome.blocked else None,
+            )
+
+    async def _release_controller_blocks(
+        self, rule: GuestAccessRule
+    ) -> list[GuestAccessControllerBlock]:
+        """Ask every venue that is still holding a block for this rule to
+        let the device go, and record what came back.
+
+        Runs **before** the rule stops applying, not after, and the ordering
+        is the whole safety property: the rows are found by ``rule_id``, so
+        a release attempted after the rule had been removed would be a
+        release nobody could start. It is also why the delete is a soft
+        delete and why nothing cascades these rows away.
+
+        A release that did not land leaves ``cleared_at`` NULL and writes
+        the reason onto the row. That row stays in the set the expiry sweep
+        retries, which is the only reason a temporarily unreachable
+        controller does not turn into a permanently blocked customer device.
+        """
+        if self.block_enforcer is None:
+            return []
+        open_blocks = await self.repository.list_open_controller_blocks(rule_id=rule.id)
+        if not open_blocks:
+            return []
+        now = datetime.now(UTC)
+        released: list[GuestAccessControllerBlock] = []
+        for record, outcome in await self.block_enforcer.release_devices(open_blocks):
+            block = cast("GuestAccessControllerBlock", record)
+            await self.repository.update_controller_block(
+                block,
+                {
+                    "cleared_at": now if outcome.released else None,
+                    "release_error": (
+                        None if outcome.released else outcome.error_message
+                    ),
+                },
+            )
+            if outcome.released:
+                released.append(block)
+        logger.info(
+            "guest_access_controller_blocks_released",
+            extra={
+                "event_rule_id": str(rule.id),
+                "event_blocks_open": len(open_blocks),
+                "event_blocks_released": len(released),
+            },
+        )
+        return released
 
     async def get_guest_rule(
         self,
@@ -697,6 +1089,22 @@ class GuestAccessService:
         )
         return rule
 
+    def _confined_location_filter(self, location_id: uuid.UUID | None) -> object:
+        """The ``location_id`` filter a rule listing applies for this caller.
+
+        Without it, a listing with no ``location_id`` returned every venue's
+        rules to a caller whose grants cover one venue. Organization-wide
+        rules (``location_id IS NULL``) stay visible: they apply at the
+        caller's venues too -- see ``_enforce_write_location``'s read/write
+        note and ``app.domains.rbac.location_scope.confine_location_filter``.
+        """
+        return confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAccessRuleError(),
+            include_organization_wide=True,
+        )
+
     async def list_guest_rules(
         self,
         *,
@@ -710,8 +1118,9 @@ class GuestAccessService:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
-        if location_id is not None:
-            filters["location_id"] = location_id
+        location_filter = self._confined_location_filter(location_id)
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         if identifier is not None:
             # Strip-only, deliberately: this is a dashboard list filter,
             # not an access decision. ``canonicalize_rule_identifier``
@@ -739,11 +1148,30 @@ class GuestAccessService:
         rule = await self.get_guest_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        # Before the rule stops applying, not after. An unblock that only
+        # flipped ``is_active`` would let the person sign in again and leave
+        # their phone unable to associate -- a guest who is un-blocked
+        # everywhere this platform can see and still off the WiFi, with the
+        # only record of why sitting in a table nobody would think to read.
+        #
+        # Deliberately unconditional on rule type. A ``WHITELIST`` rule has
+        # no open blocks, so this is one indexed query that finds nothing --
+        # and asking the question of every rule is cheaper than trusting
+        # that no rule ever changed type.
+        await self._release_controller_blocks(rule)
         updated = await self.repository.update_guest_rule(
             rule, {"is_active": False, "updated_by": actor_user_id}
         )
         event = AccessRuleDeactivated(rule_id=updated.id)
         logger.info("guest_access_rule_deactivated", extra=_event_extra(event))
+        # No explicit commit, unlike ``_enforce_block``. That one commits
+        # because it is about to re-raise and ``get_db_session`` rolls back
+        # on any exception, so the failure record would be discarded. Here
+        # there is nothing to lose in the same way: a release that landed on
+        # the controller but rolled back here leaves the row open, and the
+        # sweep retries an unblock the controller treats as idempotent
+        # (measured -- a second unblock returns ``errorCode 0``). Under-
+        # claiming is the safe direction, and it is this one.
         return updated
 
     async def delete_guest_rule(
@@ -756,6 +1184,13 @@ class GuestAccessService:
         rule = await self.get_guest_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        # Same ordering as ``deactivate_guest_rule``, and here it is not
+        # merely tidy: the open blocks are found by ``rule_id``, and a rule
+        # that has been removed is a rule nobody can start a release from.
+        # ``delete_guest_rule`` is a soft delete precisely so the row --
+        # and the blocks pointing at it -- survive to be released, including
+        # by the sweep if this attempt does not land.
+        await self._release_controller_blocks(rule)
         await self.repository.delete_guest_rule(rule)
         event = AccessRuleDeleted(rule_id=rule.id)
         logger.info("guest_access_rule_deleted", extra=_event_extra(event))
@@ -892,6 +1327,12 @@ class GuestAccessService:
         imported_ids: list[uuid.UUID] = []
         updated_ids: list[uuid.UUID] = []
         rejected: list[RejectedGuestRuleImportRow] = []
+        # Location ids already established as this organization's, for this
+        # batch only. A 200-room upload naming one venue costs one lookup
+        # rather than two hundred. Scoped to the call, never to the
+        # instance: a cache that outlived the request would answer for a
+        # location deleted in between.
+        verified_locations: set[uuid.UUID] = set()
 
         for row_number, raw in enumerate(rows, start=1):
             raw_identifier = str(raw.get("identifier") or "")
@@ -935,10 +1376,14 @@ class GuestAccessService:
                 # write another site's list, and checking the *effective*
                 # location per row (rather than once against the batch
                 # default) is what stops row 137 from smuggling one there.
-                enforce_entity_location(
-                    entity_location_id=location_id,
-                    caller_location_scope=self.caller_location_scope,
-                    error=CrossLocationAccessRuleError(),
+                # The same gate the single-rule creates use, so an upload
+                # cannot reach past what the form can: a row naming a
+                # location that does not exist, or resolving to no location
+                # at all (every location), is refused here too.
+                await self._enforce_write_location(
+                    location_id=location_id,
+                    organization_id=organization_id,
+                    verified=verified_locations,
                 )
             except (GuestAccessError, ValueError) as exc:
                 rejected.append(
@@ -1179,6 +1624,13 @@ class GuestAccessService:
         actor_user_id: uuid.UUID | None,
     ) -> DeviceAccessRule:
         self._enforce_tenant_scope(organization_id, requesting_organization_id)
+        # Both entities in this domain are written, not only read, so both
+        # writes gate. Gating the guest rule and not the device rule would
+        # be the `voucher` mistake in the other direction -- a MAC-keyed
+        # block is the same account-wide ban by another key.
+        await self._enforce_write_location(
+            location_id=location_id, organization_id=organization_id
+        )
         mac_address = normalize_mac_address(mac_address)
         now = datetime.now(UTC)
         validate_rule_expiry(rule_type=rule_type, expires_at=expires_at, now=now)
@@ -1209,7 +1661,100 @@ class GuestAccessService:
             organization_id=organization_id,
             location_id=location_id,
         )
+        if rule_type is not AccessRuleType.BLOCKLIST or self.device_blocker is None:
+            return rule
+        # Committed before any router is touched, for the reason
+        # ``create_guest_rule`` gives: refusing the next sign-in is the half
+        # that always works, and it must not be rolled back because a router
+        # was unreachable. Each router's answer is recorded on the rule
+        # (``router_blocks``) and returned with it; a router failure never
+        # turns this create into a 5xx.
+        await self.repository.commit()
+        await self._enforce_device_block(rule)
+        await self.repository.commit()
         return rule
+
+    async def enforce_device_rule(
+        self,
+        *,
+        rule_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> DeviceAccessRule:
+        """Re-runs the router half of a ``BLOCKLIST`` device rule: the retry
+        for a router that was unreachable, and the way to reach a router
+        added to the venue after the block. Idempotent on every router."""
+        rule = await self.get_device_rule(
+            rule_id, requesting_organization_id=requesting_organization_id
+        )
+        if (
+            AccessRuleType(rule.rule_type) is AccessRuleType.BLOCKLIST
+            and rule.is_active
+            and self.device_blocker is not None
+        ):
+            await self._enforce_device_block(rule)
+            await self.repository.commit()
+        return rule
+
+    async def _enforce_device_block(self, rule: DeviceAccessRule) -> None:
+        assert self.device_blocker is not None  # noqa: S101 -- guarded by callers
+        outcomes = await self.device_blocker.block(
+            rule_id=rule.id,
+            organization_id=rule.organization_id,
+            location_id=rule.location_id,
+            mac_address=rule.mac_address,
+        )
+        now = datetime.now(UTC)
+        for outcome in outcomes:
+            await self.repository.record_router_block(
+                rule,
+                router_id=outcome.router_id,
+                organization_id=rule.organization_id,
+                location_id=outcome.location_id,
+                mac_address=rule.mac_address,
+                status=outcome.status,
+                error_message=outcome.error_message,
+                sessions_ended=outcome.sessions_ended,
+                blocked_at=now if outcome.blocked else None,
+            )
+
+    async def _release_router_blocks(
+        self, rule: DeviceAccessRule
+    ) -> list[DeviceAccessRouterBlock]:
+        """Take this rule's bindings off every router still holding one,
+        **before** the rule stops applying -- the rows are found by
+        ``rule_id``, exactly as ``_release_controller_blocks`` explains. A
+        release that did not land leaves the row open, with the reason, for
+        the expiry sweep to retry; it never fails the unblock."""
+        if self.device_blocker is None:
+            return []
+        open_blocks = await self.repository.list_open_router_blocks(rule_id=rule.id)
+        if not open_blocks:
+            return []
+        now = datetime.now(UTC)
+        released: list[DeviceAccessRouterBlock] = []
+        for record, outcome in await self.device_blocker.release(open_blocks):
+            block = cast("DeviceAccessRouterBlock", record)
+            await self.repository.update_router_block(
+                block,
+                {
+                    "cleared_at": now if outcome.released else None,
+                    "release_error": (
+                        None if outcome.released else outcome.error_message
+                    ),
+                },
+            )
+            if outcome.released:
+                released.append(block)
+        logger.info(
+            "device_access_rule_router_blocks_released",
+            extra={
+                "event_rule_id": str(rule.id),
+                "event_blocks_open": len(open_blocks),
+                "event_blocks_released": len(released),
+            },
+        )
+        return released
 
     async def get_device_rule(
         self,
@@ -1244,8 +1789,9 @@ class GuestAccessService:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
-        if location_id is not None:
-            filters["location_id"] = location_id
+        location_filter = self._confined_location_filter(location_id)
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         if mac_address is not None:
             filters["mac_address"] = normalize_mac_address(mac_address)
         if rule_type is not None:
@@ -1265,6 +1811,8 @@ class GuestAccessService:
         rule = await self.get_device_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        # Before the rule stops applying -- see ``_release_router_blocks``.
+        await self._release_router_blocks(rule)
         updated = await self.repository.update_device_rule(
             rule, {"is_active": False, "updated_by": actor_user_id}
         )
@@ -1282,6 +1830,7 @@ class GuestAccessService:
         rule = await self.get_device_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        await self._release_router_blocks(rule)
         await self.repository.delete_device_rule(rule)
         event = AccessRuleDeleted(rule_id=rule.id)
         logger.info("device_access_rule_deleted", extra=_event_extra(event))
@@ -1423,6 +1972,7 @@ __all__ = [
     "RejectedGuestRuleImportRow",
     "GuestRuleImportResult",
     "BlockEnforcerProtocol",
+    "DeviceBlockerProtocol",
     "AccessDecisionResolver",
     "AccessRuleListResult",
     "DeviceRuleListResult",

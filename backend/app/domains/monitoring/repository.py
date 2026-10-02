@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import delete, distinct, func, select
+from sqlalchemy import delete, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
@@ -303,6 +303,14 @@ class MonitoringRepositoryProtocol(Protocol):
     async def get_notification_channels_by_ids(
         self, channel_ids: list[uuid.UUID]
     ) -> list[NotificationChannel]: ...
+
+    async def list_active_notification_channels_for_category(
+        self, *, category: str, organization_id: uuid.UUID | None
+    ) -> list[NotificationChannel]: ...
+
+    async def latest_notification_logs_by_channel(
+        self, channel_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, NotificationLog]: ...
 
     # -- notification logs ---------------------------------------------------
     async def create_notification_log(self, **fields: object) -> NotificationLog: ...
@@ -1155,6 +1163,44 @@ class MonitoringRepository:
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 
+    async def list_active_notification_channels_for_category(
+        self, *, category: str, organization_id: uuid.UUID | None
+    ) -> list[NotificationChannel]:
+        """Active channels subscribed to ``category``, scoped as
+        ``NotificationService.list_channels_for_category`` documents.
+
+        The organization predicate is spelled out rather than handed to
+        ``apply_filters`` precisely because ``apply_filters`` drops a
+        ``None`` and would leave no WHERE clause at all -- "every
+        organization" -- which is the widening this method exists to
+        prevent. ``organization_id IS NULL`` here means the platform-wide
+        channels, and they are *included* alongside a named tenant's own,
+        never instead of them.
+
+        ``jsonb @> '["category"]'`` is a containment test, so it matches a
+        channel listing several categories and cannot be satisfied by a
+        substring of a longer category name the way a ``LIKE`` would.
+        """
+        contains_category = NotificationChannel.event_categories.contains(
+            [category]
+        )
+        scope = (
+            NotificationChannel.organization_id.is_(None)
+            if organization_id is None
+            else or_(
+                NotificationChannel.organization_id == organization_id,
+                NotificationChannel.organization_id.is_(None),
+            )
+        )
+        statement = select(NotificationChannel).where(
+            NotificationChannel.is_deleted.is_(False),
+            NotificationChannel.is_active.is_(True),
+            contains_category,
+            scope,
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
     # -- notification logs ---------------------------------------------------
 
     async def create_notification_log(self, **fields: object) -> NotificationLog:
@@ -1176,6 +1222,37 @@ class MonitoringRepository:
             sort_by="sent_at",
             sort_order=SortOrder.DESC,
         )
+
+    async def latest_notification_logs_by_channel(
+        self, channel_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, NotificationLog]:
+        """The single most recent delivery on each of ``channel_ids``.
+
+        One ``DISTINCT ON`` query for the whole page rather than one query
+        per row: the console's channel list renders a last-delivery badge
+        on every row, and the per-row shape is the N+1 that turns a
+        25-row page into 26 round trips.
+
+        Served by ``ix_notification_logs_channel_id_sent_at`` (migration
+        0129), whose column order matches this ``ORDER BY`` exactly.
+        """
+        if not channel_ids:
+            return {}
+        statement = (
+            select(NotificationLog)
+            .where(
+                NotificationLog.channel_id.in_(channel_ids),
+                NotificationLog.is_deleted.is_(False),
+            )
+            .distinct(NotificationLog.channel_id)
+            .order_by(
+                NotificationLog.channel_id,
+                NotificationLog.sent_at.desc(),
+                NotificationLog.id.desc(),
+            )
+        )
+        result = await self.session.execute(statement)
+        return {row.channel_id: row for row in result.scalars().all()}
 
     # -- incidents -------------------------------------------------------------
 

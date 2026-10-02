@@ -1,0 +1,457 @@
+"""Enumerations, the security-score model, and the honest capability matrix
+for the Security domain.
+
+## What this module is, and deliberately is not
+
+``app.domains.security`` is a **read-only** aggregation domain. It owns no
+tables and writes nothing, to any database and to no device. It exists to
+answer one question honestly: *what is this venue's security posture, and
+which security features can this platform actually enforce for it?*
+
+It owns no tables on purpose. Every number it reports is already stored by
+the domain that produced it -- ``routers``/``router_health_snapshots`` for
+fleet health, ``content_filter_rules`` for blocking, ``device_access_rules``
+for blocked devices, ``firewall_rules`` for rules,
+``router_rogue_dhcp_statuses`` for the DHCP guard, ``alerts`` for alert
+pressure. A second copy of any of those numbers would be a number that
+can disagree with its own source, and this codebase has already paid for that
+class of bug once -- see ``app.domains.content_filtering.device_adapters``
+module docstring, where a dashboard reported "blocked" for a rule that had
+never reached a device.
+
+## The score is a diagnostic of *our own configuration*, not a threat score
+
+Nothing here can observe an attack. So the score is defined as the absence of
+known-good hygiene, computed only from facts this platform already stores and
+can re-derive: whether the fleet is reporting, whether enabled blocks actually
+reached a device, whether the DHCP guard is on, whether anything is already
+alerting.
+
+## What this domain never shows a venue
+
+The platform's management tunnel (WireGuard, hub to router) is not a venue's
+security control and is not something a venue can act on; it is this
+platform's own plumbing. It is deliberately absent from both the score and the
+capability matrix, because everything here is served to the customer
+dashboard. Tunnel health belongs to the Master console and the backend's own
+monitoring, which already read ``wireguard_peers`` directly.
+
+That definition is what makes the number honest, and it is also what bounds
+it -- see ``SCORE_FACTOR_WEIGHTS``'s own comment. A venue that has done
+nothing wrong scores 100 of 100; it does not score "secure".
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+# The score is presented as "out of 100" and is a pure subtraction from a
+# clean slate, so the maximum is also the starting value.
+SECURITY_SCORE_MAX = 100
+
+# A venue with no agent-managed gateway at all has no posture to score.
+# Returning 100 for it would be the worst kind of lie -- an empty venue
+# reading as a hardened one. See SecurityOverviewService.build_score.
+MIN_ROUTERS_FOR_SCORE = 1
+
+
+class SecurityScoreBand(StrEnum):
+    """The band a score falls into, for the dashboard's colour/label.
+
+    Thresholds are exposed rather than inlined so the frontend and the
+    documentation cannot drift from what the API actually returns."""
+
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    FAIR = "fair"
+    POOR = "poor"
+
+
+SCORE_BAND_THRESHOLDS: tuple[tuple[int, SecurityScoreBand], ...] = (
+    (90, SecurityScoreBand.EXCELLENT),
+    (75, SecurityScoreBand.GOOD),
+    (50, SecurityScoreBand.FAIR),
+    (0, SecurityScoreBand.POOR),
+)
+
+
+def score_band_for(score: int) -> SecurityScoreBand:
+    """The band for ``score`` -- highest threshold that does not exceed it."""
+    for threshold, band in SCORE_BAND_THRESHOLDS:
+        if score >= threshold:
+            return band
+    return SecurityScoreBand.POOR
+
+
+class ScoreFactorKey(StrEnum):
+    """One term in the score. Each is a real, already-stored fact."""
+
+    FLEET_REPORTING = "fleet_reporting"
+    BLOCK_PUSH_INTEGRITY = "block_push_integrity"
+    ROGUE_DHCP_GUARD = "rogue_dhcp_guard"
+    ALERT_PRESSURE = "alert_pressure"
+
+
+#: Per-failure penalty, and the cap that stops one bad factor from consuming
+#: the whole score. Both are module constants rather than tunables: a score
+#: whose weights are configurable is a score nobody can reproduce, and this
+#: number is meant to be explainable to a venue owner, not tuned.
+#:
+#: The caps matter more than the weights. Without them, a single venue with
+#: 400 stale DHCP records scores 0 and the number stops distinguishing
+#: between "one thing is wrong" and "everything is wrong".
+SCORE_FACTOR_WEIGHTS: dict[ScoreFactorKey, tuple[int, int]] = {
+    # (per-occurrence penalty as a share of affected routers, max penalty)
+    ScoreFactorKey.FLEET_REPORTING: (60, 40),
+    ScoreFactorKey.BLOCK_PUSH_INTEGRITY: (30, 25),
+    ScoreFactorKey.ROGUE_DHCP_GUARD: (10, 15),
+    ScoreFactorKey.ALERT_PRESSURE: (5, 10),
+}
+
+# There is deliberately no staleness threshold here. The platform's own single
+# source of truth for "this gateway has stopped reporting" is
+# ``app.domains.monitoring.constants.ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES``,
+# and a second threshold in this domain would be a second answer to the same
+# question -- the class of drift ``app.common.device_push``'s module docstring
+# was written to stop. ``SecurityOverviewService`` imports that constant rather
+# than defining one.
+
+
+class SecurityAvailability(StrEnum):
+    """Whether a security feature can be honoured, or only displayed.
+
+    This is the enum the whole module exists to make enumerable. The brief's
+    own requirement is that a feature must not be presented as supported
+    merely because a dashboard can render it, and the separation it asks for
+    (available now / requires additional technology / future) is exactly
+    these three values."""
+
+    #: Enforceable on the fleet this platform already manages, today.
+    AVAILABLE = "available"
+    #: Real, but needs something this platform does not have yet -- a
+    #: maintained category database, a threat feed, DPI, a DNS filtering
+    #: provider, or simply the device writer that would put the rule on a
+    #: router. Usable only after that dependency exists. Where the mechanism
+    #: is known, ``enforcement`` names it prefixed ``"Planned: "``, so the
+    #: API never presents an intended mechanism as a working one.
+    REQUIRES_ADDITIONAL_TECHNOLOGY = "requires_additional_technology"
+    #: Not honestly deliverable on the current architecture at all. Rendered
+    #: so the gap is visible and explained rather than silently absent.
+    NOT_SUPPORTED = "not_supported"
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityFeature:
+    """One row of the capability matrix.
+
+    ``enforcement`` names the real mechanism where one exists, because
+    "available" without a mechanism is the claim this module refuses to make.
+    """
+
+    key: str
+    label: str
+    availability: SecurityAvailability
+    enforcement: str | None
+    detail: str
+
+
+#: The honest matrix. Kept as data, not prose, so the API returns it, the
+#: dashboard renders it, and a test can assert the exclusions stay excluded.
+#:
+#: Every ``AVAILABLE`` entry here is enforced by something that already ships
+#: in this codebase, and ``tests/unit/test_security.py`` holds the map from
+#: each one to the function that writes it to a router -- so an entry cannot
+#: be promoted to ``AVAILABLE`` without naming a writer that imports.
+#:
+#: Every exclusion states what is missing, not that the feature is hard --
+#: a distinction that matters when someone later asks "why can't I block
+#: Instagram?".
+SECURITY_FEATURES: tuple[SecurityFeature, ...] = (
+    SecurityFeature(
+        key="zone_to_zone_firewall",
+        label="Zone-to-zone firewall",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "/ip firewall filter chain=forward inside the platform's sentinel "
+            "band, pushed over 8728 in priority order"
+        ),
+        detail=(
+            "Routed traffic between zones that have their own VLAN interface "
+            "and subnet, written as source/destination address rules. A "
+            "router must first have its firewall band placed from the "
+            "platform console; until then a push is refused rather than "
+            "guessed. Traffic switched within one subnet never reaches "
+            "chain=forward and is out of scope, and a block must name a "
+            "source or destination address."
+        ),
+    ),
+    SecurityFeature(
+        key="domain_blocking_dns",
+        label="Domain blocking (DNS)",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement="/ip dns static sinkhole, pushed over 8728",
+        detail=(
+            "Applies to clients that use this router as their resolver. A "
+            "client with its own DNS settings, or DNS-over-HTTPS once "
+            "authenticated, is not covered."
+        ),
+    ),
+    SecurityFeature(
+        key="domain_blocking_sni",
+        label="Domain blocking (HTTPS hostname)",
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        enforcement=(
+            "Planned: /ip firewall filter tls-host=<domain> and *.<domain> on "
+            "tcp/443, above the established accept, pushed over 8728 with "
+            "every blocked website"
+        ),
+        detail=(
+            "Built and pushed with every blocked website, but not yet proven "
+            "on a real router, so not offered as working. It matches the "
+            "site name a device sends when it opens a secure connection, "
+            "without decrypting anything, so it can catch a device that "
+            "skipped the DNS block. It sees nothing when Encrypted Client "
+            "Hello hides the name, nothing over QUIC (HTTP/3), plain HTTP or "
+            "a VPN, and RouterOS cannot match a handshake split across "
+            "packets, which current desktop browsers send."
+        ),
+    ),
+    SecurityFeature(
+        key="ip_and_cidr_blocking",
+        label="IP and CIDR blocking",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement="/ip firewall address-list plus one positioned drop rule",
+        detail=(
+            "Inbound and outbound both work for literal addresses. It is not "
+            "a substitute for domain blocking: services behind rotating CDN "
+            "addresses cannot be maintained as an IP list."
+        ),
+    ),
+    SecurityFeature(
+        key="device_isolation",
+        label="Device isolation and blocking",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "/ip hotspot ip-binding type=blocked per blocked MAC, plus the "
+            "device's /ip hotspot active and host entries removed, written "
+            "over 8728 to every MikroTik router in the rule's scope and read "
+            "back; removed by its own comment on unblock or expiry"
+        ),
+        detail=(
+            "Blocking a device by its hardware (MAC) address cuts it off the "
+            "router now and on every reconnect, including a device that "
+            "never signs in. It is reliable for hardware the venue knows; an "
+            "anonymous guest can switch on a private (randomised) Wi-Fi "
+            "address and come back as a new device, so blocking a person is "
+            "the sign-in block, not this. Keeping guests from reaching each "
+            "other is a separate switch (guest isolation). Venues managed "
+            "through an Omada controller keep the controller's own client "
+            "block."
+        ),
+    ),
+    SecurityFeature(
+        key="guest_client_isolation",
+        label="Guest isolation (guests can't see each other)",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "/interface bridge port horizon=<platform group> on the hotspot "
+            "bridge's guest ports (never the uplink, a VLAN-carrying port or "
+            "the bridge itself); the router's own radios set to "
+            "default-forwarding=no (wireless) or datapath.client-isolation=yes "
+            "(wifi); plus a chain=forward guest-to-guest drop row per guest "
+            "network in the sentinel band when it is placed. Switched per "
+            "router over 8728 and read back"
+        ),
+        detail=(
+            "Partial isolation. The router stops guests on different ports "
+            "(different access points) and on its own Wi-Fi from reaching "
+            "each other. Guests connected to the same external access point "
+            "are switched inside that access point and never pass through "
+            "the router, so the owner must also turn on \"AP isolation\" or "
+            "\"Client isolation\" in each access point's own settings. Access "
+            "points joined through a separate switch can still reach each "
+            "other through it. It is refused on a bridge with VLAN filtering "
+            "or a port someone set split-horizon on by hand. Printers or "
+            "casting devices on the guest network stop being reachable by "
+            "guests. Turning it on or off can briefly reset the router's "
+            "switch on some models."
+        ),
+    ),
+    SecurityFeature(
+        key="rogue_dhcp_detection",
+        label="Rogue DHCP detection",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement="/ip dhcp-server alert, with state recorded per router interface",
+        detail="Already implemented and already monitored.",
+    ),
+    SecurityFeature(
+        key="connection_flood_protection",
+        label="Connection and brute-force limits",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "/ip firewall filter chain=forward protocol=tcp connection-state=new "
+            "connection-limit=<N>,32 action=drop, one row per guest network at "
+            "the top of the platform's sentinel band, switched per router over "
+            "8728 (Relaxed 300, Normal 150, Strict 80)"
+        ),
+        detail=(
+            "Caps how many connections one guest device can hold; its next "
+            "new connection is dropped. It slows floods and scripted "
+            "password-guessing from a guest device against anything past the "
+            "router, and reduces rather than eliminates the exposure. It does "
+            "not cover traffic to the router itself, and no per-second "
+            "connection rate limit is written. A strict limit can break busy "
+            "apps such as cloud sync, video calls and downloads. The router "
+            "must have its firewall band placed first."
+        ),
+    ),
+    SecurityFeature(
+        key="web_category_filtering",
+        label="Web category filtering",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "Cloudflare Gateway DNS category policies; the router forwards "
+            "its DNS lookups to a Gateway address shared by every venue with "
+            "the same category selection, over DNS-over-HTTPS (RouterOS 7.19 "
+            "or later), switched over 8728 with a snapshot, a read-back, a "
+            "lookup probe and an automatic restore if the probe fails"
+        ),
+        detail=(
+            "RouterOS has no category database, so categories are applied by "
+            "Cloudflare Gateway when the router looks a name up. It filters "
+            "by website name only, at the DNS lookup, never the page or "
+            "content. A guest whose device uses its own encrypted DNS "
+            "(private DNS, DNS-over-HTTPS or DNS-over-TLS) or a VPN is not "
+            "filtered, unless the router's optional bypass protection is "
+            "turned on, and even then only encrypted DNS to well-known "
+            "resolvers is stopped. Categories are Cloudflare's, and a site "
+            "can be misclassified. Routers older than RouterOS 7.19 cannot "
+            "use it."
+        ),
+    ),
+    SecurityFeature(
+        key="dns_bypass_protection",
+        label="DNS bypass protection",
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        enforcement=(
+            "Planned: per-router layers over 8728 for signed-in guests -- "
+            "'does not exist' answers for the Firefox and iCloud Private Relay "
+            "opt-out names, DNS-over-TLS/QUIC port drops, a DNS-over-HTTPS "
+            "server address list refreshed from a public source, known "
+            "DNS-over-HTTPS names blocked by lookup and by TLS hostname, and, "
+            "only if a venue turns it on, common VPN ports"
+        ),
+        detail=(
+            "Built, not yet proven on a real router, so not offered as "
+            "working. It stops default settings and casual workarounds: "
+            "Firefox's automatic encrypted DNS and iCloud Private Relay stand "
+            "down on the venue network, and encrypted DNS to well-known "
+            "providers is blocked. It cannot stop an encrypted DNS server or "
+            "a VPN that runs on the normal web port with no recognisable name "
+            "(or with Encrypted Client Hello), a resolver the guest runs "
+            "themselves, or a phone on mobile data. No guest WiFi product "
+            "stops a determined user with a disguised VPN. VPN blocking is "
+            "off unless the venue turns it on, because business guests "
+            "use work VPNs."
+        ),
+    ),
+    SecurityFeature(
+        key="application_control",
+        label="Application control",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "A curated app catalogue mapped to each app's own hostnames (and, "
+            "for Telegram, its published address ranges), each pushed over "
+            "8728 as an ordinary blocked website or address"
+        ),
+        detail=(
+            "Matches the website names an app uses, not the app itself: there "
+            "is no deep packet inspection. Some apps still get through -- one "
+            "already connected, one that connects by a built-in address, or a "
+            "device with its own DNS or a VPN. Shared services (Google sign-in, "
+            "shared content networks) are deliberately not blocked, so an app "
+            "that leans on them can partly work."
+        ),
+    ),
+    SecurityFeature(
+        key="threat_intelligence",
+        label="Threat intelligence (malware, phishing, botnet)",
+        availability=SecurityAvailability.AVAILABLE,
+        enforcement=(
+            "Cloudflare Gateway's Security threats category in the venue's "
+            "category policy, applied when the router looks a name up over "
+            "DNS-over-HTTPS"
+        ),
+        detail=(
+            "Uses Cloudflare's maintained list of malware, phishing and "
+            "similar sites, at the DNS lookup. Only on routers with web "
+            "filtering switched on (RouterOS 7.19 or later). A device using "
+            "its own DNS or a VPN, or a harmful server contacted by address "
+            "rather than by name, is not covered, and a site can be "
+            "misclassified."
+        ),
+    ),
+    SecurityFeature(
+        key="geo_blocking",
+        label="Geo blocking",
+        availability=SecurityAvailability.REQUIRES_ADDITIONAL_TECHNOLOGY,
+        enforcement=None,
+        detail=(
+            "Needs a GeoIP database plus a periodic per-country CIDR sync. "
+            "Inbound would be reliable; outbound would not, because CDN "
+            "edges resolve into many countries."
+        ),
+    ),
+    SecurityFeature(
+        key="per_application_traffic",
+        label="Per-application traffic accounting",
+        availability=SecurityAvailability.NOT_SUPPORTED,
+        enforcement=None,
+        detail=(
+            "Needs deep packet inspection or flow export plus a collector. "
+            "This platform can attribute bytes per guest, device, zone and "
+            "session, and cannot attribute them per application."
+        ),
+    ),
+    SecurityFeature(
+        key="ids_ips",
+        label="Intrusion detection and prevention",
+        availability=SecurityAvailability.NOT_SUPPORTED,
+        enforcement=None,
+        detail=(
+            "RouterOS is not an intrusion-detection system. A UI for this "
+            "would display signatures nothing evaluates."
+        ),
+    ),
+    SecurityFeature(
+        key="url_path_filtering",
+        label="URL path and keyword filtering",
+        availability=SecurityAvailability.NOT_SUPPORTED,
+        enforcement=None,
+        detail=(
+            "Would need TLS interception, which breaks the certificate "
+            "trust of every guest device on the network. Filtering is "
+            "hostname-level by design."
+        ),
+    ),
+)
+
+
+def feature_by_key() -> dict[str, SecurityFeature]:
+    return {feature.key: feature for feature in SECURITY_FEATURES}
+
+
+__all__ = [
+    "SECURITY_SCORE_MAX",
+    "MIN_ROUTERS_FOR_SCORE",
+    "SCORE_BAND_THRESHOLDS",
+    "SCORE_FACTOR_WEIGHTS",
+    "SECURITY_FEATURES",
+    "SecurityAvailability",
+    "SecurityFeature",
+    "SecurityScoreBand",
+    "ScoreFactorKey",
+    "feature_by_key",
+    "score_band_for",
+]

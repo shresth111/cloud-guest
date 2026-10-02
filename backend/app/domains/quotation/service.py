@@ -36,6 +36,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Protocol
 
 from app.core.email_layout import esc, heading, info_box, paragraph, render_email
 from app.database.utils.pagination import PaginationMeta
@@ -44,6 +45,7 @@ from app.domains.otp.service import (
     EmailProviderProtocol,
     LoggingEmailProvider,
 )
+from app.domains.rbac.enums import AuditAction
 
 from .constants import QUOTATION_NUMBER_PREFIX, QUOTATION_PRODUCT_NAME, QuotationStatus
 from .exceptions import QuotationNotFoundError
@@ -54,6 +56,16 @@ from .repository import QuotationRepositoryProtocol
 logger = logging.getLogger(__name__)
 
 PdfRenderer = Callable[[Quotation, list[QuotationLineItem]], bytes]
+
+
+class AuditLogWriter(Protocol):
+    """The minimal surface this service needs to write into RBAC's shared
+    ``audit_log_entries`` table, without depending on the rest of
+    ``RBACRepositoryProtocol`` -- mirrors
+    ``app.domains.channel_partner.service.AuditLogWriter``'s identical
+    narrow protocol shape exactly."""
+
+    async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
 @dataclass
@@ -86,9 +98,15 @@ class QuotationService:
         *,
         email_provider: EmailProviderProtocol | None = None,
         pdf_renderer: PdfRenderer | None = None,
+        audit_writer: AuditLogWriter | None = None,
     ) -> None:
         self.repository = repository
         self.email_provider = email_provider
+        # Optional for the same reason ``ChannelPartnerService``'s is: a
+        # unit test exercising the create/send composition has no RBAC
+        # repository to hand, and a missing writer must never be the reason
+        # a real operator action fails. ``None`` means "do not audit".
+        self.audit_writer = audit_writer
         # Defaults to the real reportlab renderer; tests inject a stub that
         # returns fixed bytes so PDF byte generation is never re-exercised
         # by every service-layer test (only quotation_pdf.py's own tests
@@ -317,10 +335,103 @@ class QuotationService:
         )
         return QuotationListResult(items=items, meta=meta)
 
+    # -- delete (Master console) ---------------------------------------------
+
+    async def delete_quotation(
+        self, quotation_id: uuid.UUID, *, actor_user_id: uuid.UUID | None
+    ) -> Quotation:
+        """Soft-deletes one quotation: the row is flagged, never removed.
+
+        ## Soft, not hard
+
+        ``Quotation`` inherits ``SoftDeleteMixin`` and this domain already
+        reads through the flag on both of its read paths
+        (``get_quotation`` below tests ``is_deleted``;
+        ``repository._list_filters`` filters on it) -- the write half was
+        simply never built. Flagging it is what those two existing checks
+        were written against, and it is what
+        ``app.domains.monitored_hardware.service.delete_device`` does for
+        the same kind of operator-initiated removal. A real row deletion
+        would additionally destroy the ``quotation_line_items`` children
+        via their ``ON DELETE CASCADE``, which is exactly the
+        irreversibility the flag exists to avoid.
+
+        ## No status guard
+
+        There is deliberately none. ``constants.QuotationStatus`` has
+        exactly three members -- DRAFT, SENT, FAILED -- and none of them is
+        a terminal commercial state: this domain has no accepted/converted/
+        invoiced transition, and no other domain references a quotation row
+        (``models.py``'s own docstring: no FK to ``Plan``, no
+        ``organization_id``, nothing links an ``Invoice`` back to a
+        quotation). So there is no state in which deleting one would break
+        an invariant, and inventing one -- "a SENT quotation may not be
+        removed" -- would be a product rule this codebase does not state
+        anywhere. What ``SENT`` does mean is that a PDF already reached the
+        client's inbox; deleting the row does not recall that email, which
+        is the operator's to know and is said plainly at the confirmation
+        step in the console rather than enforced here.
+
+        Idempotency: deleting an already-deleted quotation raises
+        ``QuotationNotFoundError`` (a 404), because ``get_quotation``
+        already treats an ``is_deleted`` row as absent. A retried click
+        therefore reports "not found" rather than writing a second
+        ``deleted_at`` and a duplicate audit entry.
+        """
+        quotation = await self.get_quotation(quotation_id)
+        deleted = await self.repository.soft_delete_quotation(quotation)
+        logger.info(
+            "quotation_deleted",
+            extra={
+                "quotation_id": str(deleted.id),
+                "quotation_number": deleted.quotation_number,
+                "status": deleted.status,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.QUOTATION_DELETED,
+            deleted,
+            f"Quotation '{deleted.quotation_number}' deleted",
+        )
+        return deleted
+
+    async def _audit(
+        self,
+        actor_user_id: uuid.UUID | None,
+        action: AuditAction,
+        quotation: Quotation,
+        description: str,
+        *,
+        event_metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Writes into RBAC's shared ``audit_log_entries``.
+
+        Creation is still not audited (it is reconstructable from the row's
+        own ``created_at``/``created_by``) -- only this destructive
+        transition is, the same split
+        ``app.domains.channel_partner.service`` draws between onboarding
+        and revoking. ``organization_id``/``location_id`` are ``None``
+        because a quotation belongs to neither (see ``models.py``).
+        """
+        if self.audit_writer is None:
+            return
+        await self.audit_writer.create_audit_log_entry(
+            actor_user_id=actor_user_id,
+            action=action.value,
+            entity_type="quotation",
+            entity_id=quotation.id,
+            description=description,
+            event_metadata=event_metadata or {},
+            organization_id=None,
+            location_id=None,
+        )
+
 
 __all__ = [
     "QuotationService",
     "QuotationListResult",
     "LineItemInput",
+    "AuditLogWriter",
     "EmailProviderProtocol",
 ]

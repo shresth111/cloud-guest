@@ -44,6 +44,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         if app_settings.strict_production_secrets:
             app_settings.validate_no_public_secrets()
+        # Guest Marketing own-provider credentials are encrypted under
+        # router_encryption_key. Logged loudly rather than raised (a crash
+        # loop here would take guest WiFi login down); every write of such
+        # credentials is refused while the key is the public default.
+        from app.domains.marketing.providers import assert_provider_key_safe
+
+        assert_provider_key_safe(app_settings)
         # WARNING, not CRITICAL: unlike a public default key this exposes
         # nothing, it just means an alert copy nobody asked for out loud is
         # not being sent. Logged for the same reason as the block above --

@@ -177,9 +177,7 @@ def _canonical_mac(raw: str | None) -> str | None:
     simply fails to match rather than matching the wrong device."""
     if not raw:
         return None
-    hex_only = (
-        raw.strip().upper().replace(":", "").replace("-", "").replace(".", "")
-    )
+    hex_only = raw.strip().upper().replace(":", "").replace("-", "").replace(".", "")
     if len(hex_only) != 12:
         return None
     if any(ch not in "0123456789ABCDEF" for ch in hex_only):
@@ -397,14 +395,17 @@ async def sync_omada_session_usage(
 
         cursors = await _load_cursors(redis, [s.id for s in active_sessions])
         try:
-            updated, up_applied, down_applied, new_cursors = (
-                await apply_controller_usage(
-                    clients=clients,
-                    active_sessions=active_sessions,
-                    devices_by_id=devices_by_id,
-                    guest_service=guest_service,
-                    cursors=cursors,
-                )
+            (
+                updated,
+                up_applied,
+                down_applied,
+                new_cursors,
+            ) = await apply_controller_usage(
+                clients=clients,
+                active_sessions=active_sessions,
+                devices_by_id=devices_by_id,
+                guest_service=guest_service,
+                cursors=cursors,
             )
         except Exception:  # noqa: BLE001 -- one venue must not stop the sweep
             logger.exception(
@@ -445,7 +446,26 @@ def _build_guest_service(session: AsyncSession) -> GuestService:
     cap mid-session is cut off exactly as a MikroTik guest already is; leaving
     it out would keep the byte counters live but silently drop that
     enforcement.
+
+    ``session_end_hook`` is wired for the same reason, and its absence used
+    to make the sentence above false. ``record_usage`` ends a capped session
+    in two steps -- flip the row to ``EXPIRED``, then
+    ``issue_live_disconnect`` -- and that second call takes the
+    ``terminator is None`` branch when no hook is wired: it logs
+    ``guest_live_disconnect_no_terminator``, writes
+    ``disconnect_enforced=False`` and returns. So the cap was arithmetic
+    only. The guest's row said the data ran out and the guest kept
+    browsing, which at an Omada venue is the *only* outcome there was,
+    because nothing on that path ends a session but this platform.
+
+    It is deliberately ``guest.tasks._build_session_terminator``, not a
+    second hand-rolled composition. That function is what the session-timeout
+    and FUP-time sweeps already use; building a parallel one here is how the
+    two silently drift, and a data cap that disconnects through a different
+    object than a time cap is a difference nobody would ever mean to ship.
     """
+    from app.domains.guest.tasks import _build_session_terminator
+
     organization_service = OrganizationService(OrganizationRepository(session))
     location_service = LocationService(
         LocationRepository(session),
@@ -455,13 +475,17 @@ def _build_guest_service(session: AsyncSession) -> GuestService:
     policy_service = PolicyService(
         PolicyRepository(session), organization_service, location_service
     )
+    repository = GuestRepository(session)
     return GuestService(
-        GuestRepository(session),
+        repository,
         None,  # otp_service -- provably unused by record_usage
         None,  # voucher_service -- provably unused by record_usage
         None,  # captive_portal_service -- provably unused by record_usage
         None,  # router_lookup -- provably unused by record_usage
         policy_lookup=policy_service,
+        # The same repository the service holds, which is what that factory
+        # documents as doubling for the terminator's device lookup.
+        session_end_hook=_build_session_terminator(session, repository),
     )
 
 

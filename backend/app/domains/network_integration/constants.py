@@ -81,12 +81,15 @@ __all__ = [
     "MAX_SYNC_INTERVAL_SECONDS",
     "MIN_SESSION_DURATION_SECONDS",
     "MIN_SYNC_INTERVAL_SECONDS",
+    "CONTROLLER_LIVENESS_STALE_INTERVALS",
     "NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS",
     "OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN",
     "OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS",
     "NetworkProviderKind",
     "PORTAL_READINESS_GAP_LABELS",
     "PortalReadinessGap",
+    "RADIUS_PORTAL_METADATA_PORT_KEY",
+    "RadiusPortalFailure",
     "ROUTER_VENDOR_BY_PROVIDER",
     "FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER",
     "GUEST_OPERATOR_CREDENTIAL_FIELDS",
@@ -103,6 +106,8 @@ __all__ = [
     "SyncStatus",
     "TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP",
     "TASK_RUN_OMADA_USAGE_SYNC_SWEEP",
+    "INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_INSTANT_ON_POLL_SWEEP",
 ]
 
 
@@ -233,6 +238,69 @@ class PortalAuthMode(StrEnum):
 # migration's backfill and the "is this venue on the proven path" checks
 # cannot drift apart.
 DEFAULT_PORTAL_AUTH_MODE: PortalAuthMode = PortalAuthMode.EXTERNAL_PORTAL
+
+
+class RadiusPortalFailure(StrEnum):
+    """Why a RADIUS-mode authorization did not open the gate.
+
+    **This enum is an API contract with the guest portal**, which renders a
+    message per value. Every value is therefore guest-safe by construction:
+    no vendor name, no error number, no controller prose, nothing that
+    distinguishes one venue's misconfiguration from another's. The
+    controller's raw ``errorCode`` and its own message are recorded in the
+    integration's event feed, where an operator can see them, and are never
+    put in the response -- the whole reason this call moved server-side is
+    that the guest used to be shown the controller's raw JSON.
+
+    Coarser than the vendor's numbering on purpose. A guest can act on
+    exactly three things -- try again, wait, or ask staff -- so a fourth and
+    fifth distinction would be a distinction the page cannot use. Where two
+    vendor codes lead to the same advice they get the same value here, and
+    the event feed keeps the difference.
+    """
+
+    #: The RADIUS server answered and refused. On this platform that means
+    #: the guest's session is gone (our RADIUS authorizes by session lookup
+    #: and never checks the password), so the honest guest-facing advice is
+    #: "sign in again", not "check your password".
+    REJECTED = "rejected"
+    #: The controller could not reach this platform's RADIUS server at all.
+    #: Nothing the guest did is wrong and retrying will not help until
+    #: somebody fixes the network path.
+    RADIUS_UNREACHABLE = "radius_unreachable"
+    #: This platform could not reach the venue's controller -- timeout,
+    #: refused connection, or a certificate this integration will not trust.
+    #: Explicitly NOT a 500: the call was made, it failed, and the page has
+    #: something true to say.
+    CONTROLLER_UNREACHABLE = "controller_unreachable"
+    #: The controller answered and refused for a reason it did not name, or
+    #: named with a code this platform does not map. A retry is reasonable.
+    CONTROLLER_REFUSED = "controller_refused"
+    #: The controller rejected the shape of the request (HTTP 400). Always
+    #: this platform's bug, never the guest's, and the value exists so that
+    #: it shows up as itself in logs instead of hiding inside "refused".
+    BAD_REQUEST = "bad_request"
+
+
+
+# The vendor's own ``errorCode`` numbering is deliberately NOT mapped here.
+# That translation is the one part of this flow that knows a vendor's wire
+# format, so it lives with the vendor -- see
+# ``providers/omada.py``'s ``_RADIUS_FAILURE_BY_PROVIDER_CODE``.
+
+# WHERE THE PORTAL SUBMIT PORT IS OVERRIDDEN, WHEN IT HAS TO BE.
+#
+# `provider_metadata` rather than a column, so this needs no migration and
+# so an override that is never set costs nothing. Absent (the normal case)
+# means "use the provider's documented default for the stored scheme", which
+# is resolved inside the provider because a port number is vendor knowledge.
+#
+# It is deliberately an INTEGRATION field and not a request field. The
+# controller's redirect does name a submit port, and that name reaches this
+# platform through the guest's browser; honouring it would mean a caller
+# choosing where this platform's HTTP client connects. See
+# `service.authorize_portal_client_via_radius`'s SSRF section.
+RADIUS_PORTAL_METADATA_PORT_KEY = "radius_portal_port"
 
 
 class ControllerAuthMode(StrEnum):
@@ -542,6 +610,12 @@ class IntegrationEventType(StrEnum):
     SYNC = "sync"
     PORTAL_AUTHORIZE = "portal_authorize"
     PORTAL_DEAUTHORIZE = "portal_deauthorize"
+    # One row per per-client action a venue admin took: block, unblock,
+    # speed set, speed cleared. Its own member rather than reusing
+    # PORTAL_DEAUTHORIZE, which names a different thing: a speed limit is
+    # not a deauthorization, and a feed that called it one would mislead
+    # whoever reads the venue's timeline to work out what happened.
+    CLIENT_MANAGED = "client_managed"
     # One row per real (non-dry) "Configure controller automatically" run,
     # carrying the per-step report. A dry run writes nothing, this included.
     CONTROLLER_CONFIGURED = "controller_configured"
@@ -632,6 +706,24 @@ class ErrorCode(StrEnum):
     # not wrong about the operation, only about which integration to run it
     # on, and the frontend hides the control rather than explaining it.
     GUEST_OPERATOR_REQUIRED = "NETWORK_INTEGRATION_GUEST_OPERATOR_REQUIRED"
+    # A RADIUS-mode authorize request claimed a submit address that is not
+    # the one the integration holds. The claim reaches this platform through
+    # the guest's browser, so this is an SSRF refusal, not a typo report:
+    # the request is refused and the stored address is never overridden. Its
+    # own code because "somebody is pointing us at an address we do not
+    # own" and "the controller said no" are not the same incident, and only
+    # the first one is worth waking anybody for. Never returned to the
+    # guest -- the endpoint answers the same opaque 403 as every other
+    # refusal -- it is what the integration's event feed records.
+    RADIUS_PORTAL_ADDRESS_MISMATCH = (
+        "NETWORK_INTEGRATION_RADIUS_PORTAL_ADDRESS_MISMATCH"
+    )
+    # The RADIUS-mode submit reached the controller and did not open the
+    # gate. The accompanying event context carries the vendor's own raw
+    # ``errorCode`` and the guest-safe ``RadiusPortalFailure`` it mapped to;
+    # this code says only "the call was made and the guest is not online",
+    # which is the thing an operator greps for.
+    RADIUS_PORTAL_NOT_AUTHORIZED = "NETWORK_INTEGRATION_RADIUS_PORTAL_NOT_AUTHORIZED"
 
     AUTH_FAILED = "OMADA_AUTH_FAILED"
     CONNECTION_FAILED = "OMADA_CONNECTION_FAILED"
@@ -682,6 +774,9 @@ class ErrorCode(StrEnum):
     # more than one SSID there.
     GUEST_SSID_NOT_FOUND = "NETWORK_INTEGRATION_GUEST_SSID_NOT_FOUND"
     GUEST_SSID_AMBIGUOUS = "NETWORK_INTEGRATION_GUEST_SSID_AMBIGUOUS"
+    # Master mapping of a fleet router to an Aruba Instant On site was
+    # refused: not a NAS-only device, no location, or a malformed site id.
+    INSTANT_ON_SITE_NOT_CONFIGURABLE = "INSTANT_ON_SITE_NOT_CONFIGURABLE"
 
 
 # ============================================================================
@@ -755,6 +850,19 @@ DEFAULT_SYNC_INTERVAL_SECONDS = 300
 # them point this platform at their own hardware as a load generator.
 MIN_SYNC_INTERVAL_SECONDS = 60
 MAX_SYNC_INTERVAL_SECONDS = 86_400
+
+# How many of an integration's own sync intervals may pass before its last
+# successful sync stops counting as an answer to "is this controller
+# reachable right now" (``service.NetworkIntegrationService
+# ._controller_liveness``).
+#
+# Three, so a venue's console does not flap on one or two missed ticks --
+# a Beat worker restart, a sync that ran long, a controller that was busy.
+# Past that the honest answer is ``None``: not "unreachable", which would
+# be a claim nothing measured, but "nobody has looked recently enough to
+# say". A caller that needs the controller treats both the same way and
+# degrades; only a fresh success enables the control.
+CONTROLLER_LIVENESS_STALE_INTERVALS = 3
 
 # Controller ports this platform will connect to. Software controller
 # HTTPS is 8043; OC-series hardware controllers answer on 443; 8843/8088
@@ -854,6 +962,16 @@ OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS = 300.0
 # one tick must not run unbounded and overlap the next. Ordered by
 # ``last_sync_at`` ascending so the most stale venues go first.
 OMADA_USAGE_SYNC_MAX_INTEGRATIONS_PER_RUN = 50
+
+# Aruba Instant On read-only poller. The Beat tick is the floor of the
+# per-kind cadences (Settings.instant_on_*_poll_seconds): each tick polls
+# only the snapshot kinds whose own period has elapsed, the same "Beat is the
+# floor, the row decides" arrangement as the inventory sync sweep above. See
+# ``app.domains.network_integration.instant_on_tasks``.
+TASK_RUN_INSTANT_ON_POLL_SWEEP = (
+    "app.domains.network_integration.instant_on_tasks.run_instant_on_poll_sweep"
+)
+INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS = 60.0
 
 # ============================================================================
 # Portal authorize rate limiting

@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from email_validator import EmailNotValidError, validate_email
-from pydantic import Field, PostgresDsn, RedisDsn, field_validator
+from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The default for every Fernet key below. It is base64 of the ASCII string
@@ -365,6 +365,18 @@ class Settings(BaseSettings):
             "app.domains.guest.router.register_external_radius_nas. See "
             "hub_wg_agent_url for why this is private-address-by-default and "
             "why it stopped being a constant."
+        ),
+    )
+    hub_radius_public_address: str = Field(
+        default="",
+        description=(
+            "The RADIUS hub's PUBLIC address (IP or DNS name), as a venue's "
+            "own access point must be told it: the value an operator types "
+            "into Aruba Instant On's RADIUS profile. Only NAS-only vendors "
+            "need it -- every other NAS reaches the hub over WireGuard or "
+            "the VPC. Empty means 'not configured', and the Master setup "
+            "panel lists that as a gap instead of inventing an address. "
+            "Override via CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS."
         ),
     )
     hub_radius_agent_secret: str = Field(
@@ -1182,23 +1194,36 @@ class Settings(BaseSettings):
     invoice_smtp_from_address: str = Field(default="")
 
     # ------------------------------------------------------------------
-    # Second named sending identity: the admin mailbox
+    # Named sending identities: one mailbox per job
     # ------------------------------------------------------------------
-    # Outgoing mail is deliberately split across two real mailboxes:
+    # Outgoing mail is deliberately split across real mailboxes:
     #
-    #   admin@wyfyguest.com  -- guest OTP, password reset, new-location
-    #                           welcome  (this `admin_smtp_*` block,
-    #                           `MailIdentity.ADMIN`)
-    #   sales@wyfyguest.com  -- demo-request notifications, channel-partner
-    #                           welcome, quotations  (the general `smtp_*`
-    #                           block above, `MailIdentity.DEFAULT`, which
-    #                           is also what every other sender -- alerts,
-    #                           invites, voucher exports -- keeps using)
+    #   admin@wyfyguest.com    -- guest OTP, password reset, new-location
+    #                             welcome  (this `admin_smtp_*` block,
+    #                             `MailIdentity.ADMIN`)
+    #   demo@wyfyguest.com     -- the whole Book-a-Demo conversation
+    #                             (`demo_smtp_*`, `MailIdentity.DEMO`)
+    #   alert@wyfyguest.com    -- platform and controller alerting
+    #                             (`alert_smtp_*`, `MailIdentity.ALERT`)
+    #   support@wyfyguest.com  -- nothing yet; the block exists so the
+    #                             mailbox is addressable (`support_smtp_*`,
+    #                             `MailIdentity.SUPPORT`)
+    #   sales@wyfyguest.com    -- everything else: quotations,
+    #                             channel-partner welcome, user invites,
+    #                             voucher exports, reminders (the general
+    #                             `smtp_*` block above,
+    #                             `MailIdentity.DEFAULT`)
+    #
+    # A demo enquiry and a quotation want different replies, and an alert
+    # wants to be filterable and never auto-replied to; sharing one mailbox
+    # between them is what makes all three impossible.
     #
     # The routing table that decides which flow gets which identity is
-    # `app.domains.otp.service.MailIdentity` plus
-    # `app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE`;
-    # read those two to answer "which mailbox does X come from?".
+    # `app.domains.otp.service.MailIdentity` (which block backs which
+    # member) plus
+    # `app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE`
+    # (which outbox event is sent as whom); read those two to answer "which
+    # mailbox does X come from?".
     #
     # This is a NEW, separately named block rather than a reuse of
     # `invoice_smtp_*` above on purpose: `invoice_smtp_*` means "the
@@ -1230,8 +1255,172 @@ class Settings(BaseSettings):
             "admin_smtp_username -- an identity always sends as the account "
             "it authenticated as unless deliberately told otherwise, and "
             "SmtpIdentity rejects a From that belongs to a different "
-            "account (Zoho answers that mismatch with '553 Sender is not "
-            "allowed to relay emails')."
+            "account (Google Workspace answers that mismatch with '550 "
+            "Sender address rejected')."
+        ),
+    )
+
+    demo_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server hostname for the demo@ sending identity (every "
+            "public 'Book a Demo' submission, and the booking "
+            "confirmations/cancellations that follow it). Empty = fall back "
+            "to the general smtp_* identity."
+        ),
+    )
+    demo_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    demo_smtp_username: str = Field(default="")
+    demo_smtp_password: str = Field(default="")
+    demo_smtp_use_tls: bool = Field(default=True)
+    demo_smtp_from_address: str = Field(
+        default="",
+        description=(
+            "From address for the demo@ identity. Empty defaults to "
+            "demo_smtp_username -- see admin_smtp_from_address for why a "
+            "different mailbox here is rejected rather than honoured."
+        ),
+    )
+
+    support_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server hostname for the support@ sending identity. "
+            "Configured so the mailbox is addressable from day one, but "
+            "nothing sends as it yet -- app.domains.support_tickets sends "
+            "no mail at all today (see otp.service.MailIdentity.SUPPORT). "
+            "Empty = fall back to the general smtp_* identity."
+        ),
+    )
+    support_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    support_smtp_username: str = Field(default="")
+    support_smtp_password: str = Field(default="")
+    support_smtp_use_tls: bool = Field(default=True)
+    support_smtp_from_address: str = Field(
+        default="",
+        description=(
+            "From address for the support@ identity. Empty defaults to "
+            "support_smtp_username."
+        ),
+    )
+
+    alert_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server hostname for the alert@ sending identity "
+            "(platform and WiFi-controller alerting, "
+            "app.domains.monitoring). Empty = fall back to the general "
+            "smtp_* identity."
+        ),
+    )
+    alert_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    alert_smtp_username: str = Field(default="")
+    alert_smtp_password: str = Field(default="")
+    alert_smtp_use_tls: bool = Field(default=True)
+    alert_smtp_from_address: str = Field(
+        default="",
+        description=(
+            "From address for the alert@ identity. Empty defaults to "
+            "alert_smtp_username."
+        ),
+    )
+
+    # ========================================================================
+    # Guest Marketing (app.domains.marketing) -- its OWN settings block.
+    #
+    # Hard rule (spec §7): marketing never uses the OTP sender settings.
+    # Promotional traffic on the transactional/OTP DLT header, marketing
+    # volume on the OTP WhatsApp number, or a spam-complaint spike on the
+    # admin@ mailbox can get that sender blocked -- and then guests cannot
+    # log in to WiFi. Everything below defaults to "unconfigured", and
+    # "logging" is reported as NOT configured: a marketing send must never
+    # look like it happened when nothing went out. Provider *credentials*
+    # (Ping4SMS key, Exotel account, Twilio account, SES keys) are shared
+    # with the account; the sender identity (header / number / mailbox) is
+    # not, and ``marketing.senders`` refuses a sender that equals the OTP one.
+    # ========================================================================
+    marketing_sms_provider: str = Field(
+        default="unconfigured",
+        description="'unconfigured' (default) | 'ping4sms' | 'exotel'.",
+    )
+    marketing_sms_sender_id: str = Field(
+        default="",
+        description=(
+            "Promotional DLT header (Ping4SMS sender) or Exotel From number "
+            "for marketing SMS. Must differ from the OTP sender."
+        ),
+    )
+    marketing_ping4sms_route: str = Field(
+        default="", description="Ping4SMS promotional route id."
+    )
+    marketing_dlt_entity_id: str = Field(
+        default="", description="TRAI DLT Principal Entity id for marketing SMS."
+    )
+    marketing_whatsapp_provider: str = Field(
+        default="unconfigured", description="'unconfigured' (default) | 'twilio'."
+    )
+    marketing_whatsapp_from_number: str = Field(
+        default="",
+        description=(
+            "Production WhatsApp sender for marketing (E.164). Must differ "
+            "from whatsapp_twilio_from_number, the OTP sender."
+        ),
+    )
+    marketing_email_provider: str = Field(
+        default="unconfigured",
+        description="'unconfigured' (default) | 'ses' | 'smtp'.",
+    )
+    marketing_email_from_address: str = Field(
+        default="",
+        description=(
+            "From address for marketing mail via SES, e.g. "
+            "offers@offers.wyfyguest.com. The display name is the venue's."
+        ),
+    )
+    marketing_email_unsubscribe_mailto: str = Field(
+        default="",
+        description=(
+            "Optional mailto: target for the List-Unsubscribe header, e.g. "
+            "unsubscribe@offers.wyfyguest.com."
+        ),
+    )
+    marketing_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server for MailIdentity.MARKETING when "
+            "marketing_email_provider='smtp'. Never the admin@/sales@ mailbox."
+        ),
+    )
+    marketing_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    marketing_smtp_username: str = Field(default="")
+    marketing_smtp_password: str = Field(default="")
+    marketing_smtp_use_tls: bool = Field(default=True)
+    marketing_smtp_from_address: str = Field(default="")
+    marketing_unsubscribe_base_url: str = Field(
+        default="",
+        description=(
+            "Public origin the unsubscribe link is built on "
+            "({base}/u/{token}). Empty = frontend_base_url."
+        ),
+    )
+    marketing_quiet_hours_start: str = Field(default="21:00")
+    marketing_quiet_hours_end: str = Field(default="09:00")
+    marketing_max_recipients_per_campaign: int = Field(default=5000, ge=1)
+    marketing_test_sends_per_day: int = Field(default=20, ge=0)
+    marketing_rate_per_sec_sms: float = Field(default=10.0, gt=0)
+    marketing_rate_per_sec_whatsapp: float = Field(default=20.0, gt=0)
+    marketing_rate_per_sec_email: float = Field(default=10.0, gt=0)
+    # Bring-your-own providers (spec §12). Own providers get their own
+    # per-organization Redis bucket so Wyfy's shared bucket never throttles
+    # a venue paying its own provider.
+    marketing_own_rate_per_sec: float = Field(default=5.0, gt=0)
+    marketing_smtp_blocked_cidrs: str = Field(
+        default="",
+        description=(
+            "Extra comma-separated CIDRs a customer SMTP host may never "
+            "resolve to (the platform's own VPC, if it is not RFC 1918). "
+            "Loopback, private, link-local (incl. 169.254.169.254), CGNAT, "
+            "multicast and reserved ranges are always refused."
         ),
     )
 
@@ -1297,6 +1486,58 @@ class Settings(BaseSettings):
         return tuple(
             address for address in self.platform_alert_emails.split(",") if address
         )
+
+    platform_alert_slack_webhook_url: str = Field(
+        default="",
+        description=(
+            "Slack incoming-webhook URL the WyFy platform team's own copy of "
+            "every WiFi-controller (TP-Link Omada) alert is ALSO posted to, "
+            "for every organization -- the exact same alerts, the exact same "
+            "network_controller* scope and the exact same 'in addition to, "
+            "never instead of, the organization's own channels' rule as "
+            "platform_alert_emails directly above. See "
+            "app.domains.monitoring.service.AlertService"
+            "._dispatch_platform_copies. Empty (the default) posts nothing.\n"
+            "\n"
+            "Why a Setting rather than a NotificationChannel row: a "
+            "NotificationChannel is per-organization and is delivered to only "
+            "because an AlertRule is linked to it, so putting the team's own "
+            "Slack channel there would mean linking one channel to every rule "
+            "of every tenant -- a fleet-wide write (130 rules across 17 "
+            "organizations, measured in production on 2026-09-22) to "
+            "express one platform-team preference, which would then drift "
+            "the moment anybody adds a rule. The team's "
+            "destination is deployment configuration, exactly like "
+            "platform_alert_emails, so it lives in exactly the same place.\n"
+            "\n"
+            "An incoming-webhook URL, not a bot token: this is the credential "
+            "app.domains.monitoring.service.SlackNotifier already posts to "
+            "for tenant-owned SLACK channels, it needs no OAuth install, no "
+            "token refresh and no scope negotiation, and it is generated free "
+            "in seconds. A bot token would buy channel selection at send time "
+            "-- which a single fixed platform-ops channel does not need."
+        ),
+    )
+
+    @field_validator("platform_alert_slack_webhook_url")
+    @classmethod
+    def _normalize_platform_alert_slack_webhook_url(cls, value: str) -> str:
+        """Same posture as ``_normalize_platform_alert_emails``: malformed
+        stops the process from starting rather than silently posting
+        nowhere. ``https://`` only, matching
+        ``validators.validate_notification_channel_config``'s rule for a
+        tenant's own SLACK channel exactly -- and deliberately NOT a
+        ``hooks.slack.com`` host check, because Slack's own webhook URLs
+        live under more than one path and Slack-compatible receivers
+        (Mattermost, Rocket.Chat) accept the identical payload.
+        """
+        url = (value or "").strip()
+        if url and not url.startswith("https://"):
+            raise ValueError(
+                "platform_alert_slack_webhook_url must start with https:// "
+                f"(got {url!r})"
+            )
+        return url
 
     # ======================================================================
     # Demo booking calendar (app.domains.demo_booking)
@@ -1624,6 +1865,180 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Slack: Master-console onboarding status posts
+    # ------------------------------------------------------------------
+    # One incoming-webhook URL, one internal ops channel. This is NOT a
+    # per-tenant setting and deliberately has no database column and no
+    # customer-facing UI: the messages describe Master/GLOBAL-scope
+    # operator work ("we onboarded customer X"), so there is exactly one
+    # destination for all of them and it belongs to the platform, not to
+    # any organization. See
+    # app.domains.notification.onboarding_slack for the full write-up.
+    #
+    # Empty (the default) means the feature is INERT: nothing is enqueued,
+    # nothing is posted, nothing fails. That is the same "empty = honestly
+    # unconfigured" posture stripe_secret_key/razorpay_key_id/
+    # admin_smtp_host above already establish, and it is load-bearing here
+    # -- a deployment with no webhook must still be able to onboard
+    # customers, so "no webhook" can never be an error.
+    #
+    # An incoming-webhook URL is a bearer credential: anyone holding it can
+    # post to the channel. It therefore follows the same route the SMTP
+    # passwords take and for the same reason (these repositories are
+    # public): AWS Secrets Manager -> deploy/remote-deploy.sh's
+    # `materialise_slack_env` -> ~/deploy/slack.env -> compose `env_file`.
+    # It is never committed, never written to the database, and never
+    # logged -- app.domains.notification.slack logs the webhook's host and
+    # path length, never the URL.
+    slack_onboarding_webhook_url: str = Field(
+        default="",
+        description=(
+            "Slack incoming-webhook URL that Master-console customer-"
+            "onboarding status messages are posted to "
+            "(https://hooks.slack.com/services/...). Empty = the feature "
+            "is inert: no NotificationDelivery rows are written and "
+            "onboarding is unaffected. Set via "
+            "CLOUDGUEST_SLACK_ONBOARDING_WEBHOOK_URL, sourced from the "
+            "'cloudguest/prod/slack' Secrets Manager secret in production "
+            "-- never commit it."
+        ),
+    )
+    slack_webhook_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+        description=(
+            "Per-request timeout for the outbound POST to "
+            "slack_onboarding_webhook_url. Matches app.domains.monitoring"
+            ".constants.HTTP_NOTIFICATION_TIMEOUT_SECONDS, for the same "
+            "reason: one slow webhook endpoint must not hold a dispatch "
+            "sweep worker open indefinitely."
+        ),
+    )
+    # -- Cloudflare Gateway DNS filtering (app.domains.dns_filtering) ------
+    #
+    # One platform-owned Cloudflare account; this platform is the operator
+    # and every venue is a Gateway DNS location inside it. Same posture as
+    # slack_onboarding_webhook_url above: empty = the feature is INERT (every
+    # dns-filtering route that needs Cloudflare answers 503 "not
+    # configured"), never an error at startup. The token is a bearer
+    # credential with Zero Trust Gateway edit rights over every venue's
+    # filtering, so it is a SecretStr (never in a repr or a log line), is
+    # sourced from Secrets Manager in production, and is never committed.
+    cloudflare_api_token: SecretStr = Field(
+        default=SecretStr(""),
+        description=(
+            "Cloudflare API token with Zero Trust Gateway edit scope on "
+            "cloudflare_account_id. Set via CLOUDGUEST_CLOUDFLARE_API_TOKEN. "
+            "Empty = Cloudflare DNS filtering is not configured."
+        ),
+    )
+    cloudflare_account_id: str = Field(
+        default="",
+        description=(
+            "The Cloudflare account (Zero Trust organization) id Gateway "
+            "locations and DNS policies are created in. Not a secret, but "
+            "set per deployment via CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID."
+        ),
+    )
+    cloudflare_api_base_url: str = Field(
+        default="https://api.cloudflare.com/client/v4"
+    )
+    cloudflare_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
+    # How many Gateway DNS locations the platform may hold. Locations are
+    # allocated per distinct category set (dns_filtering profile), not per
+    # router, so this is the number of different category selections that
+    # can be live at once. The *plan* allowance is what binds, not the 250
+    # in Cloudflare's account-limits doc (an upper bound): Zero Trust
+    # Standard lists 25 DNS filtering locations, Free lists none (plan page
+    # checked 2026-09-24). Default 3 is deliberately conservative until the
+    # real allowance is measured on the platform's account; keep it at
+    # least one below the plan's number, because moving a venue between
+    # sets creates the new location before releasing the old one. A new
+    # distinct set past this is refused with a 409 naming the nearest set
+    # in use -- never silently merged.
+    cloudflare_gateway_max_locations: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Max Cloudflare Gateway DNS locations (= distinct category "
+            "selections live at once). Set via "
+            "CLOUDGUEST_CLOUDFLARE_GATEWAY_MAX_LOCATIONS to the plan's "
+            "allowance minus one."
+        ),
+    )
+    # Cloudflare's published per-account DNS policy limit. One rule per
+    # location now, so the location cap binds first; kept as a backstop.
+    cloudflare_gateway_max_dns_rules: int = Field(default=500, ge=1)
+    # The name a router must be able to resolve through Gateway after the
+    # switch. Must be a name no plausible category selection blocks.
+    dns_filtering_probe_hostname: str = Field(default="cloudflare.com")
+    # -- DNS bypass layers: the platform's public DoH lists -----------------
+    #
+    # Fetched once for the whole platform by a Beat task, validated, and
+    # pushed to every router with the DoH-by-IP / DoH-by-hostname layer on.
+    # Source: github.com/dibdot/DoH-IP-blocklists (GPL-3.0; regenerated by
+    # its own GitHub Action roughly hourly, master domain list curated
+    # about monthly). The URLs are pinned here -- never tenant-supplied --
+    # must be https, and redirects are not followed. The content is trusted
+    # for nothing but IP/hostname literals.
+    dns_bypass_doh_ipv4_url: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/"
+            "master/doh-ipv4.txt"
+        )
+    )
+    dns_bypass_doh_ipv6_url: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/"
+            "master/doh-ipv6.txt"
+        )
+    )
+    dns_bypass_doh_domains_url: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/"
+            "master/doh-domains.txt"
+        )
+    )
+    dns_bypass_list_timeout_seconds: float = Field(default=20.0, ge=1.0, le=120.0)
+    # Entries after validation and dedupe. A list over the cap is refused
+    # whole (never truncated -- which entries a truncation keeps is
+    # arbitrary), and the last good list stays in force.
+    dns_bypass_list_max_entries: int = Field(default=5000, ge=1, le=20000)
+    # Refuse a refresh that shrinks a list below this share of the last
+    # good one: a half-empty upstream file is far likelier than half the
+    # world's DoH servers vanishing overnight.
+    dns_bypass_list_min_keep_ratio: float = Field(default=0.5, gt=0.0, le=1.0)
+    # Never put these on the DoH-IP list, whatever the source says. The
+    # source list DOES carry Cloudflare Gateway resolver addresses (seen:
+    # 162.159.36.5/.20 under "<id>.cloudflare-gateway.com"), and
+    # 172.64.36.1/.2 are Gateway's documented shared resolver IPs. The
+    # router's own upstream queries leave in chain=output and cannot match
+    # the forward-chain drop, but this is kept out explicitly anyway.
+    dns_bypass_ip_exclusions: list[str] = Field(
+        default_factory=lambda: ["172.64.36.0/24", "162.159.36.0/24"]
+    )
+    # Never sinkholed by name (the router's own Gateway DoH upstream lives
+    # under this suffix; /ip dns static answers the router's own lookups).
+    dns_bypass_hostname_exclusions: list[str] = Field(
+        default_factory=lambda: ["cloudflare-gateway.com"]
+    )
+    master_console_base_url: str = Field(
+        default="",
+        description=(
+            "Public origin of the Master console, used to build the "
+            "'open in Master' deep link on an onboarding Slack message. "
+            "Empty (the default) falls back to frontend_base_url, which is "
+            "correct today -- the Master console and the customer "
+            "dashboard are served from the same cloudguest-foundation "
+            "build. It exists as its own field so that splitting them onto "
+            "separate hosts later is a config change, not a code change. "
+            "When neither is set to a real origin the Slack message simply "
+            "carries no link rather than a fabricated one."
+        ),
+    )
+
     # ========================================================================
     # Network integrations (TP-Link Omada)
     # ========================================================================
@@ -1690,6 +2105,24 @@ class Settings(BaseSettings):
             "where an unbounded wait is a guest staring at a spinner."
         ),
     )
+    radius_portal_submit_password: str = Field(
+        default="welcome123",
+        min_length=1,
+        max_length=128,
+        description=(
+            "The password sent alongside the guest's identifier when this "
+            "platform submits an Omada RADIUS-mode captive-portal "
+            "authorization (POST /portal/radius/browserauth). It is a "
+            "PLACEHOLDER, not a secret, and the default is deliberately the "
+            "same literal the MikroTik hotspot path has always sent: this "
+            "product's FreeRADIUS authorizes by guest-session lookup and "
+            "never checks the password (see GuestService.authorize), while "
+            "the controller's form API rejects a body with the field "
+            "missing. Settable only so that a deployment whose RADIUS "
+            "server DOES check it can say so; there is no code path in "
+            "which changing it grants or denies anybody access here."
+        ),
+    )
     omada_sync_interval_seconds: int = Field(
         default=300,
         ge=60,
@@ -1711,6 +2144,112 @@ class Settings(BaseSettings):
             "elapsed."
         ),
     )
+    # ------------------------------------------------------------------
+    # Aruba Instant On read-only poller (unofficial portal API). See
+    # app/domains/network_integration/instant_on_tasks.py. Nothing here is
+    # a secret: the service account's username/password live in AWS
+    # Secrets Manager and only the ARN is configured.
+    # ------------------------------------------------------------------
+    instant_on_poller_enabled: bool = Field(
+        default=False,
+        description=(
+            "Global kill switch for the Instant On poller. False (the "
+            "default) means the Beat task wakes, does nothing and contacts "
+            "nobody, whatever the per-venue flags say. Override via "
+            "CLOUDGUEST_INSTANT_ON_POLLER_ENABLED."
+        ),
+    )
+    instant_on_service_account_secret_arn: str = Field(
+        default="",
+        description=(
+            "ARN of the AWS Secrets Manager secret holding the Wyfy Instant "
+            "On service account, as JSON {\"username\": ..., \"password\": "
+            "...}. Only the ARN is configured; the values are fetched at "
+            "login time and never logged. Empty means 'not configured' and "
+            "every Instant On read reports auth_failed instead of guessing. "
+            "Override via CLOUDGUEST_INSTANT_ON_SERVICE_ACCOUNT_SECRET_ARN."
+        ),
+    )
+    instant_on_secrets_region: str = Field(
+        default="ap-south-1",
+        description=(
+            "Region of the Secrets Manager secret above. Override via "
+            "CLOUDGUEST_INSTANT_ON_SECRETS_REGION."
+        ),
+    )
+    instant_on_api_base_url: str = Field(
+        default="https://portal.instant-on.hpe.com/api",
+        description="Instant On portal REST base (settings.json restApiUrl).",
+    )
+    instant_on_sso_base_url: str = Field(
+        default="https://sso.arubainstanton.com",
+        description="Instant On SSO base (settings.json ssoFqdn).",
+    )
+    instant_on_sso_client_id: str = Field(
+        default="",
+        description=(
+            "The portal's PUBLIC OAuth client id (settings.json "
+            "ssoClientIdAuthZ; there is no client secret). Empty means "
+            "'read it from the portal's settings.json at login time'."
+        ),
+    )
+    instant_on_sso_redirect_uri: str = Field(
+        default="https://portal.instant-on.hpe.com",
+        description=(
+            "redirect_uri used in the PKCE login. UNVERIFIED until hardware "
+            "check H2 -- the value the portal itself registers."
+        ),
+    )
+    instant_on_api_version: int = Field(
+        default=28,
+        ge=1,
+        le=1000,
+        description=(
+            "Value sent as x-ion-api-version. 28 is what the portal bundle "
+            "sent on 2026-10-02 (22 was also accepted). Pinned so a change "
+            "is a deliberate deploy; a server that stops accepting it is "
+            "reported as api_state=incompatible, never guessed around."
+        ),
+    )
+    instant_on_http_timeout_seconds: float = Field(default=15.0, ge=1, le=60)
+    instant_on_fast_poll_seconds: int = Field(
+        default=60,
+        ge=30,
+        le=3600,
+        description="Cadence for inventory (APs) and clientSummary (clients).",
+    )
+    instant_on_health_poll_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=86400,
+        description="Cadence for systemHealth, networksSummary (SSIDs), alerts.",
+    )
+    instant_on_usage_poll_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=86400,
+        description="Cadence for the rolling 24h per-client usage read.",
+    )
+    instant_on_stale_after_polls: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description=(
+            "A snapshot older than this many of its own poll periods is "
+            "reported as unavailable ('stale'), never as current data."
+        ),
+    )
+    instant_on_auth_failure_cooldown_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=86400,
+        description=(
+            "After a full login fails (wrong password, MFA, captcha, locked "
+            "account) no further login is attempted for this long. Never a "
+            "tight retry loop against somebody else's SSO."
+        ),
+    )
+    instant_on_max_sites_per_run: int = Field(default=200, ge=1, le=5000)
     omada_allow_private_controller_urls: bool = Field(
         default=False,
         description=(
@@ -1901,12 +2440,26 @@ class Settings(BaseSettings):
         This is not a claim that the setting is required. Sending no
         platform copy is a legitimate choice; it just has to be a visible
         one.
+
+        ## Why the two platform-copy destinations are one gap, not two
+
+        ``platform_alert_emails`` and ``platform_alert_slack_webhook_url``
+        are two ways to deliver the *same* copy of the *same* alerts. A
+        deployment that has set one of them is not missing anything, so
+        naming the other one every startup would be a warning that is
+        simply untrue -- and a warning an operator learns to ignore is
+        worse than no warning, which is the exact failure mode this method
+        exists to prevent. The gap is "the platform team is told nowhere",
+        and it names both env vars because either one closes it.
         """
         if self.is_local_environment:
             return []
         gaps: list[str] = []
-        if not self.platform_alert_email_list:
+        if not self.platform_alert_email_list and (
+            not self.platform_alert_slack_webhook_url
+        ):
             gaps.append("CLOUDGUEST_PLATFORM_ALERT_EMAILS")
+            gaps.append("CLOUDGUEST_PLATFORM_ALERT_SLACK_WEBHOOK_URL")
         return gaps
 
     def uses_public_network_integration_key(self) -> bool:

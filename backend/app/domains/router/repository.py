@@ -37,6 +37,7 @@ from app.domains.network_integration.models import NetworkIntegration
 from app.domains.router_agent.models import RouterAgentCredential
 
 from .enums import RouterStatus
+from .fleet_scope import agent_managed_only
 from .models import Router, RouterProvisioningToken
 
 
@@ -172,6 +173,21 @@ class RouterRepositoryProtocol(Protocol):
         search: str | None = None,
         status: str | None = None,
     ) -> tuple[list[Router], PaginationMeta]: ...
+
+    async def list_routers_in_scope(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+    ) -> list[Router]: ...
+
+    async def routers_holding_identity(
+        self, *, serial_number: str, mac_address: str
+    ) -> list[Router]: ...
+
+    async def count_live_integrations_at_location(
+        self, location_id: uuid.UUID
+    ) -> int: ...
 
     async def create_provisioning_token(
         self, **fields: object
@@ -378,6 +394,42 @@ class RouterRepository:
         rows = list(result.scalars().all())
         return rows, PaginationMeta.from_total(params, total_items)
 
+    async def routers_holding_identity(
+        self, *, serial_number: str, mac_address: str
+    ) -> list[Router]:
+        """Every row -- soft-deleted ones INCLUDED -- whose serial or MAC is
+        one of these.
+
+        ``get_by_serial_number``/``get_by_mac_address`` skip soft-deleted
+        rows, but ``uq_routers_serial_number``/``uq_routers_mac_address``
+        do not: a decommissioned row still owns its identity, and inserting
+        it again is an ``IntegrityError`` (a 500), not the 409 those lookups
+        promise. Adding a mistaken Instant On row, removing it and adding it
+        again with the AP's real serial is exactly that sequence.
+        """
+        statement = select(Router).where(
+            or_(
+                Router.serial_number == serial_number,
+                Router.mac_address == mac_address,
+            )
+        )
+        return list((await self.session.execute(statement)).scalars().all())
+
+    async def count_live_integrations_at_location(
+        self, location_id: uuid.UUID
+    ) -> int:
+        """Live network integrations (Omada) serving this location, whether
+        or not they have a fleet row yet."""
+        statement = (
+            select(func.count())
+            .select_from(NetworkIntegration)
+            .where(
+                NetworkIntegration.location_id == location_id,
+                NetworkIntegration.is_deleted.is_(False),
+            )
+        )
+        return int((await self.session.execute(statement)).scalar_one())
+
     # -- provisioning tokens -----------------------------------------------------
 
     async def create_provisioning_token(
@@ -427,6 +479,30 @@ class RouterRepository:
             # with what was just committed, without a second round trip.
             token.used_at = used_at
         return consumed
+
+    async def list_routers_in_scope(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+    ) -> list[Router]:
+        """Every non-deleted router of one organization, narrowed to one
+        location when ``location_id`` is given -- the routers an access rule
+        scoped that way applies at. Unpaginated on purpose: the caller writes
+        to each, and a page boundary would silently skip a router."""
+        conditions = [
+            Router.is_deleted.is_(False),
+            Router.organization_id == organization_id,
+        ]
+        if location_id is not None:
+            conditions.append(Router.location_id == location_id)
+        # Agent-managed only: every caller writes to each row over the
+        # RouterOS API, which a controller's synthetic row cannot take.
+        statement = agent_managed_only(
+            select(Router).where(*conditions).order_by(Router.created_at.asc())
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def list_expired_unused_provisioning_tokens(
         self, *, now: datetime

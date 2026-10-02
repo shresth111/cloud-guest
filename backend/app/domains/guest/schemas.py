@@ -18,7 +18,14 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.common.masking import MaskedIdentifier, MaskedMac, MaskedName
 
@@ -27,10 +34,12 @@ from .constants import (
     RADIUS_ACCT_STATUS_INTERIM_UPDATE,
     RADIUS_ACCT_STATUS_START,
     RADIUS_ACCT_STATUS_STOP,
+    DashboardSeriesBucket,
     GuestAuthMethod,
     GuestSessionEndedReason,
     GuestSessionStatus,
 )
+from .validators import canonicalize_calling_station_id
 
 __all__ = [
     "GuestOtpLoginRequest",
@@ -83,6 +92,9 @@ __all__ = [
     "TopDevicesResponse",
     "OtpSuccessRateResponse",
     "VoucherUsageResponse",
+    "DashboardSeriesPointResponse",
+    "DashboardOsCountResponse",
+    "GuestDashboardSeriesResponse",
 ]
 
 
@@ -610,6 +622,11 @@ class GuestLoginResponse(BaseModel):
     # See ``models.Guest.review_link_opened_at`` for why the difference
     # matters and why this can never be counted as reviews.
     has_opened_review_link: bool
+    # Guest Marketing (contract §5.8): non-null only when the venue's portal
+    # has the opt-in turned on, the organization is entitled to the
+    # add-on, and this guest has no consent row yet. The portal renders an
+    # UNTICKED checkbox from it and never blocks access on it.
+    marketing_consent_offer: dict[str, str] | None = None
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
 
@@ -646,12 +663,20 @@ class GuestLastEndedSessionResponse(BaseModel):
 
     What is left is safe on its own terms:
 
-    * ``reason`` is a closed two-member enum
-      (:class:`~.constants.GuestSessionEndedReason`) derived from
-      ``GuestSession.status``, never the ``disconnect_reason`` string. No
-      operator-, NAS- or guest-authored text can travel through it,
-      because the only values it can hold are the two written in this
-      repository's own source.
+    * ``reason`` is a closed, derived enum
+      (:class:`~.constants.GuestSessionEndedReason`), never the
+      ``disconnect_reason`` string. No operator-, NAS- or guest-authored
+      text can travel through it, because the only values it can hold are
+      the ones written in this repository's own source.
+
+      Deliberately no member count here. This sentence said "two-member"
+      and "the two" for two releases after the vocabulary had grown to
+      four, because a count restated in prose has no reader that can
+      check it. The pinned set lives in one place that fails when it is
+      wrong -- ``test_guest_last_ended_session``'s own
+      ``test_the_reason_is_one_of_five_closed_values`` -- and the
+      guarantee this bullet exists to state is about derivation, which
+      does not change when a member is added.
     * ``session_timeout_minutes`` is venue policy, not guest data: every
       guest at a location gets the same number, so it tells a stranger
       nothing about the guest. It earns its place because it is what
@@ -846,6 +871,109 @@ class RadiusNasCreatedResponse(RadiusNasResponse):
     shared_secret: str
 
 
+class PublicNasRegistrationRequest(BaseModel):
+    """Register a NAS-only device (Aruba Instant On) as a RADIUS client keyed
+    on the public address its Access-Requests arrive from.
+
+    There is no ``shared_secret`` field, for the reason
+    ``ControllerRadiusNasRequest`` gives: the platform mints it and returns
+    it once; a secret never travels in a body somebody typed.
+    """
+
+    nas_ip: str = Field(
+        ...,
+        min_length=1,
+        max_length=45,
+        description=(
+            "The venue's PUBLIC egress IP -- the source address the access "
+            "point's RADIUS packets reach the hub from after the venue's NAT. "
+            "Literal, global unicast; a hostname is refused because "
+            "clients.conf resolves one only at FreeRADIUS start-up."
+        ),
+    )
+
+
+class PublicPortalUrlView(BaseModel):
+    """The portal URL, whole and split the way Instant On's Guest portal form
+    asks for it (Server host / Server URL path / Server port / Use HTTPS)."""
+
+    url: str
+    server_host: str
+    server_url_path: str = Field(
+        description="Path AND query, e.g. '/portal?organizationId=...'."
+    )
+    server_port: int = 443
+    use_https: bool = True
+
+
+class RadiusServerView(BaseModel):
+    """What the access point's RADIUS profile must point at."""
+
+    host: str
+    auth_port: int = 1812
+    accounting_port: int = 1813
+
+
+class PublicNasRegistrationResponse(BaseModel):
+    """What was registered, and the one-time secret.
+
+    ``shared_secret`` appears here and on the rotate response ONLY. Every
+    later read carries ``secret_fingerprint``/``secret_length`` instead.
+    ``hub_confirmed`` is what the hub agent answered, not what was intended.
+    """
+
+    router_id: str
+    nas_id: str
+    vendor: str
+    nas_identifier: str
+    nas_ip: str
+    shared_secret: str
+    secret_fingerprint: str
+    secret_length: int
+    hub_confirmed: bool
+    rotated: bool = Field(
+        description="True when an existing registration was rotated (and, if "
+        "the IP changed, moved) rather than created."
+    )
+    portal_url: PublicPortalUrlView | None = None
+
+
+class PublicNasStatusResponse(BaseModel):
+    """Everything the Master setup panel for a NAS-only device renders.
+
+    ``gaps`` is the closed list of reasons the panel must show INSTEAD of a
+    copyable portal URL; ``portal_url`` is null whenever ``gaps`` is not
+    empty, so a console cannot render a URL beside a warning.
+
+    Gap codes: ``not_nas_only_vendor``, ``no_location``,
+    ``nas_not_registered``, ``hub_not_confirmed``,
+    ``radius_server_address_not_configured``.
+    """
+
+    router_id: str
+    vendor: str
+    vendor_label: str
+    serial_number: str | None
+    mac_address: str | None
+    registered: bool
+    nas_id: str | None = None
+    nas_identifier: str | None = None
+    nas_ip: str | None = None
+    nas_status: str | None = None
+    secret_fingerprint: str | None = None
+    secret_length: int | None = None
+    hub_confirmed: bool = False
+    radius_server: RadiusServerView | None = None
+    allowed_domains: list[str] = Field(
+        default_factory=list,
+        description="Every host a not-yet-signed-in guest's browser must "
+        "reach, derived from the same constants the portal is served from. "
+        "Goes into Instant On's Guest portal > Allowed domains.",
+    )
+    portal_url: PublicPortalUrlView | None = None
+    gaps: list[str] = Field(default_factory=list)
+
+
 # The device half of a rotation, stated rather than implied.
 #
 # A rotate touches two of the three places that must agree -- the database
@@ -864,6 +992,15 @@ NAS_SECRET_ROTATION_DEVICE_ACTION = (
     "router. The platform cannot do that -- open the router in WinBox and "
     "re-paste the RADIUS client configuration with the secret above. Until "
     "then every guest login will be rejected."
+)
+
+
+# The NAS-only (Aruba Instant On) wording of the same instruction: there is
+# no WinBox and no router, the secret lives in the vendor's own app.
+NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY = (
+    "Guest WiFi at this venue is DOWN until this secret is entered in the "
+    "Instant On app (Site > RADIUS > the Wyfy profile > Shared secret). The "
+    "platform cannot do that. Until then every guest sign-in will time out."
 )
 
 
@@ -931,6 +1068,12 @@ class RadiusAuthorizeRequest(BaseModel):
         ),
     )
 
+    @field_validator("calling_station_id")
+    @classmethod
+    def _canonicalize_calling_station_id(cls, value: str | None) -> str | None:
+        # Aruba sends bare hex; see `canonicalize_calling_station_id`.
+        return canonicalize_calling_station_id(value)
+
 
 class RadiusAuthorizeResponse(BaseModel):
     authorized: bool
@@ -971,6 +1114,18 @@ class RadiusAccountingRequest(BaseModel):
     username-based lookup ``RadiusService.authorize`` already uses is what
     actually finds the session.
 
+    ``username`` alone is **not** enough to name a session, though, and
+    ``calling_station_id`` is what completes it. One guest can hold two
+    concurrent sessions on one router -- two phones, or one phone whose
+    per-SSID randomized MAC changed between logins -- and resolving by
+    identifier alone hands every Accounting-Request to whichever of them
+    started last. Measured on production 2026-09-18: the hub's accounting
+    detail file reported exactly one session, ``26-79-94-B5-24-D9``, for
+    1,181,973,763 bytes, and that figure landed to the byte on the guest's
+    *other* session, whose device MAC appears nowhere in that file. The
+    venue's data cap then counted 2.36 GB against 1.18 GB actually moved, on
+    the wrong device.
+
     ``username``/``session_id`` are optional (unlike the original
     three-status-type shape) because Accounting-On/Accounting-Off (RFC
     2866 §5.13) are NAS-level events, not session-level ones -- the real
@@ -998,11 +1153,25 @@ class RadiusAccountingRequest(BaseModel):
         "kept only for logging/correlation. Never this platform's "
         "GuestSession id, and never used to look one up.",
     )
+    calling_station_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="The device's MAC (RADIUS Calling-Station-Id, RFC 2865 "
+        "s5.31) -- which of this guest's devices these octets belong to. "
+        "Optional so a NAS or hub that does not send it keeps resolving by "
+        "username alone, exactly as before.",
+    )
     bytes_uploaded_delta: int = Field(default=0, ge=0)
     bytes_downloaded_delta: int = Field(default=0, ge=0)
     bytes_uploaded_total: int | None = Field(default=None, ge=0)
     bytes_downloaded_total: int | None = Field(default=None, ge=0)
     disconnect_reason: str | None = Field(default=None, max_length=255)
+
+    @field_validator("calling_station_id")
+    @classmethod
+    def _canonicalize_calling_station_id(cls, value: str | None) -> str | None:
+        # Aruba sends bare hex; see `canonicalize_calling_station_id`.
+        return canonicalize_calling_station_id(value)
 
     @model_validator(mode="after")
     def _require_username_for_session_scoped_status_types(
@@ -1084,6 +1253,34 @@ class VoucherUsageResponse(BaseModel):
     sessions: int
     unique_guests: int
     total_bandwidth_bytes: int
+
+
+class DashboardSeriesPointResponse(BaseModel):
+    bucket_start: datetime
+    # Sessions started in this bucket.
+    arrivals: int
+    # Distinct sessions open at any point during this bucket.
+    online: int
+
+
+class DashboardOsCountResponse(BaseModel):
+    name: str
+    count: int
+
+
+class GuestDashboardSeriesResponse(BaseModel):
+    """``GET /guest-analytics/dashboard-series`` -- see
+    ``GuestAnalyticsService.get_dashboard_series``."""
+
+    start: datetime
+    end: datetime
+    bucket: DashboardSeriesBucket
+    guests: int
+    sessions: int
+    avg_session_seconds: int | None
+    peak_online: int
+    series: list[DashboardSeriesPointResponse]
+    os_breakdown: list[DashboardOsCountResponse]
 
 
 # Re-exported for router.py's status-filter query param.

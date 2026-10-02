@@ -48,6 +48,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -66,9 +67,11 @@ from .constants import (
     AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED,
     BILLING_DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE,
     BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES,
+    BOOLEAN_FEATURE_KEYS,
     BYTES_PER_MB,
     CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT,
     CUSTOMER_DASHBOARD_RECENT_PAYMENTS_LIMIT,
+    FEATURE_REQUIRES,
     MAX_DASHBOARD_REVENUE_TREND_MONTHS,
     MIN_DASHBOARD_REVENUE_TREND_MONTHS,
     USAGE_METRIC_TO_LIMIT_FEATURE,
@@ -674,6 +677,15 @@ class EntitlementSnapshotSource(Protocol):
     ) -> EntitlementSnapshot: ...
 
 
+class FeatureOverrideSourceProtocol(Protocol):
+    """Satisfied by ``repository.FeatureOverrideRepository``."""
+
+    async def list_for_organization(self, organization_id: uuid.UUID) -> list: ...
+
+
+_BOOLEAN_FEATURE_KEY_VALUES = frozenset(key.value for key in BOOLEAN_FEATURE_KEYS)
+
+
 class EntitlementChecker:
     """Cache-or-fetch resolver of an organization's current
     :class:`EntitlementSnapshot` -- mirrors
@@ -720,9 +732,17 @@ class LicenseService:
         # the old plan, which is the (broken) pre-fix behaviour. See
         # ``_sync_subscription_plan`` for what it is actually for.
         subscription_repository: SubscriptionRepositoryProtocol | None = None,
+        # Per-organization add-on overrides (``OrganizationFeatureOverride``),
+        # merged into ``get_entitlement_snapshot``. Optional so every
+        # existing construction site keeps compiling; the request-time
+        # wiring (``dependencies.get_license_service``) and every path that
+        # gates on entitlements must pass it, or an unlocked add-on reads
+        # as locked there.
+        feature_overrides: FeatureOverrideSourceProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.plan_repository = plan_repository
+        self.feature_overrides = feature_overrides
         self.organization_sync = organization_sync
         self.usage_validator = usage_validator
         self.audit_writer = audit_writer
@@ -785,6 +805,9 @@ class LicenseService:
             if feature.feature_type == PlanFeatureType.TIER.value
             and feature.tier_value is not None
         }
+        enabled_features = await self._apply_feature_overrides(
+            organization_id, enabled_features
+        )
         return EntitlementSnapshot(
             organization_id=organization_id,
             plan_id=license_.plan_id,
@@ -793,6 +816,48 @@ class LicenseService:
             enabled_features=enabled_features,
             limits=limits,
             tiers=tiers,
+        )
+
+    async def _apply_feature_overrides(
+        self, organization_id: uuid.UUID, enabled_features: frozenset[str]
+    ) -> frozenset[str]:
+        """``effective(org, key) = override.is_enabled`` when a live override
+        row exists, the plan's value otherwise. Only BOOLEAN keys can be
+        overridden, so only ``enabled_features`` is touched. The license
+        must still be active for any of this to matter: ``RequireFeature``
+        runs ``RequireActiveLicense`` first."""
+        effective = set(enabled_features)
+        if self.feature_overrides is not None:
+            overrides = await self.feature_overrides.list_for_organization(
+                organization_id
+            )
+            for override in overrides:
+                if override.feature_key not in _BOOLEAN_FEATURE_KEY_VALUES:
+                    continue
+                if override.is_enabled:
+                    effective.add(override.feature_key)
+                else:
+                    effective.discard(override.feature_key)
+        for dependent, prerequisite in FEATURE_REQUIRES.items():
+            if prerequisite.value not in effective:
+                effective.discard(dependent.value)
+        return frozenset(effective)
+
+    async def get_plan_feature_enabled(
+        self, organization_id: uuid.UUID, feature_key: PlanFeatureKey
+    ) -> bool:
+        """What the organization's plan alone says about a BOOLEAN feature,
+        ignoring overrides. ``False`` when the organization has no license."""
+        try:
+            license_ = await self.get_license_for_organization(organization_id)
+        except LicenseNotFoundError:
+            return False
+        features = await self.plan_repository.list_plan_features(license_.plan_id)
+        return any(
+            feature.feature_key == feature_key.value
+            and feature.feature_type == PlanFeatureType.BOOLEAN.value
+            and bool(feature.is_enabled)
+            for feature in features
         )
 
     async def _invalidate_entitlement_cache(self, organization_id: uuid.UUID) -> None:
@@ -3759,7 +3824,86 @@ class InvoiceService:
         )
         if billing_profile is None:
             raise BillingProfileNotFoundError(organization_id)
+        return await self._issue_invoice_from_lines(
+            organization_id=organization_id,
+            billing_profile=billing_profile,
+            line_items=line_items,
+            status=InvoiceStatus.ISSUED,
+            actor_user_id=None,
+            audit_description=lambda invoice: (
+                f"Invoice {invoice.invoice_number} manually created "
+                f"for organization {organization_id}"
+            ),
+        )
 
+    async def generate_invoice_for_credit_topup(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        amount_paid_minor_inr: int,
+        credits_minor: int,
+        reference: str | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> Invoice:
+        """A GST tax invoice for a prepaid-credits top-up (§13.9).
+
+        Same machinery as ``create_manual_invoice`` -- the organization's
+        ``BillingProfile``, the active ``TaxRate``, the CGST/SGST-vs-IGST
+        split in ``compute_tax_breakdown``, the ``InvoiceNumberCounter``
+        sequence, the frozen ``billing_snapshot`` -- with ``subscription_id``
+        NULL and one line item, "Marketing credits: N credits".
+
+        ``amount_paid_minor_inr`` is the **taxable value actually paid**, in
+        paise, which may differ from ``credits_minor`` (a bonus). GST is
+        charged on it, once, at top-up; consumption is never invoiced again.
+        Issued straight to ``PAID``: the money was received before the
+        operator posted the top-up.
+
+        Raises ``BillingProfileMissingError`` (409 ``billing_profile_missing``)
+        rather than the generic 404, because here the caller can still post
+        the top-up without an invoice. Nothing is committed.
+        """
+        from .credits_constants import MINOR_PER_CREDIT
+        from .credits_exceptions import BillingProfileMissingError
+
+        billing_profile = await self.billing_profile_repository.get_by_organization_id(
+            organization_id
+        )
+        if billing_profile is None:
+            raise BillingProfileMissingError(organization_id)
+        taxable = (Decimal(amount_paid_minor_inr) / Decimal(100)).quantize(
+            Decimal("0.01")
+        )
+        whole, part = divmod(credits_minor, MINOR_PER_CREDIT)
+        credits_label = f"{whole:,}" + (f".{part:02d}" if part else "")
+        description = f"Marketing credits: {credits_label} credits"
+        if reference:
+            description += f" (ref {reference})"
+        return await self._issue_invoice_from_lines(
+            organization_id=organization_id,
+            billing_profile=billing_profile,
+            line_items=[(description, Decimal("1"), taxable)],
+            status=InvoiceStatus.PAID,
+            actor_user_id=actor_user_id,
+            audit_description=lambda invoice: (
+                f"Invoice {invoice.invoice_number} issued for a marketing "
+                f"credits top-up ({credits_label} credits)"
+            ),
+        )
+
+    async def _issue_invoice_from_lines(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        billing_profile: BillingProfile,
+        line_items: list[tuple[str, Decimal, Decimal]],
+        status: InvoiceStatus,
+        actor_user_id: uuid.UUID | None,
+        audit_description: Callable[[Invoice], str],
+    ) -> Invoice:
+        """The shared body of ``create_manual_invoice`` and
+        ``generate_invoice_for_credit_topup``: tax, number, snapshot, items,
+        audit. ``due_date`` is ``now`` for an invoice issued already paid."""
         subtotal = sum(
             (
                 quantity * unit_price
@@ -3809,9 +3953,13 @@ class InvoiceService:
             subscription_id=None,
             payment_id=None,
             invoice_number=invoice_number,
-            status=InvoiceStatus.ISSUED.value,
+            status=status.value,
             issue_date=now,
-            due_date=now + timedelta(days=self.invoice_due_days),
+            due_date=(
+                now
+                if status == InvoiceStatus.PAID
+                else now + timedelta(days=self.invoice_due_days)
+            ),
             subtotal=subtotal,
             cgst_amount=breakdown.cgst_amount,
             sgst_amount=breakdown.sgst_amount,
@@ -3834,13 +3982,10 @@ class InvoiceService:
             )
 
         await self._audit(
-            None,
+            actor_user_id,
             AuditAction.INVOICE_GENERATED,
             invoice,
-            description=(
-                f"Invoice {invoice.invoice_number} manually created "
-                f"for organization {organization_id}"
-            ),
+            description=audit_description(invoice),
         )
         return invoice
 

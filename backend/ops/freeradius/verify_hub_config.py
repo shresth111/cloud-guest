@@ -43,6 +43,11 @@ actually shipped, named with the date it bit.
 |   |                                          | exactly when a guest has  |
 |   |                                          | used the most             |
 +---+------------------------------------------+---------------------------+
+| 10| the accounting payload sends             | one guest's two devices   |
+|   | ``Calling-Station-Id``                   | are indistinguishable, so |
+|   |                                          | usage lands on whichever  |
+|   |                                          | session started last      |
++---+------------------------------------------+---------------------------+
 | 8 | no ``client{}`` stanza is a catch-all    | any host that reaches     |
 |   |                                          | 1812 and knows one secret |
 |   |                                          | is a trusted NAS          |
@@ -253,6 +258,23 @@ def check_tree(root: Path, expect_api_cidr: str | None = None) -> list[Finding]:
                 "a running TOTAL (RFC 2866 s5.3), and the backend ADDS a "
                 "delta, so every interim update re-adds the whole session to "
                 "date and usage grows quadratically with uptime"
+            ),
+        )
+        names_device = "Calling-Station-Id" in body
+        add(
+            "rest accounting names the device (Calling-Station-Id)",
+            names_device,
+            "payload carries calling_station_id"
+            if names_device
+            else (
+                "payload carries only User-Name -- that names a PERSON, and "
+                "one person routinely holds two sessions on one router (two "
+                "phones, or one phone whose randomized MAC changed between "
+                "logins), so the backend credits every packet to whichever "
+                "started last. Measured 2026-09-18: 1,181,973,763 bytes "
+                "reported for 26-79-94-B5-24-D9 landed to the byte on the "
+                "guest's other session, and the data cap aimed at the wrong "
+                "device"
             ),
         )
         #  Gigawords may be reassembled in rest.conf's data template or, on

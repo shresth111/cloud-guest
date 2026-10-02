@@ -36,11 +36,16 @@ from .constants import (
     CAPTIVE_PORTAL_DHCP_OPTION_NAME,
 )
 from .dependencies import get_dhcp_service
+from .device_adapters import DhcpLeaseReading
 from .models import DhcpPool
 from .schemas import (
     CaptivePortalDhcpOptionConvergenceResponse,
     CaptivePortalDhcpOptionRequest,
     CaptivePortalDhcpOptionStateResponse,
+    DhcpLeaseKeepRequest,
+    DhcpLeaseKeepResponse,
+    DhcpLeaseListResponse,
+    DhcpLeaseResponse,
     DhcpPoolCreateRequest,
     DhcpPoolListResponse,
     DhcpPoolResponse,
@@ -440,6 +445,102 @@ async def write_captive_portal_dhcp_option(
         success=True,
         message="Captive-portal DHCP option written to device",
         data=_convergence_response(convergence).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# DHCP leases -- read, and keep one device on its address
+# ============================================================================
+#
+# Same shape and the same tenancy posture as the captive-portal option above:
+# router id from the path, organization from the header, both handed to the
+# service, which resolves the router through ``get_router(...,
+# requesting_organization_id=)``. Controller-managed routers are refused in
+# the service before any device call.
+
+
+def _lease_response(lease: DhcpLeaseReading) -> DhcpLeaseResponse:
+    return DhcpLeaseResponse(
+        mac_address=lease.mac_address,
+        address=lease.address,
+        dynamic=lease.dynamic,
+        status=lease.status,
+        host_name=lease.host_name,
+        server=lease.server,
+        disabled=lease.disabled,
+    )
+
+
+@router.get(
+    "/routers/{router_id}/leases",
+    response_model=ApiResponse[DhcpLeaseListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("dhcp.read"))],
+)
+async def list_router_dhcp_leases(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: DhcpService = Depends(get_dhcp_service),
+):
+    """Every DHCP lease on this router, read live -- which devices are kept
+    on a fixed address (static) and which may move (dynamic). The firewall
+    device picker reads it to decide whether to offer "keep this device on
+    the same address"."""
+    leases = await service.list_router_leases(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="DHCP leases read from device",
+        data=DhcpLeaseListResponse(
+            router_id=str(router_id),
+            items=[_lease_response(lease) for lease in leases],
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/leases/keep-address",
+    response_model=ApiResponse[DhcpLeaseKeepResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("dhcp.execute"))],
+)
+async def keep_router_dhcp_lease_address(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: DhcpLeaseKeepRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: DhcpService = Depends(get_dhcp_service),
+):
+    """Keep one device on its current address: its dynamic lease is made
+    static on the router, then read back.
+
+    ``dhcp.execute`` -- it changes the live router. Idempotent; 409 with a
+    ``code`` (``DHCP_LEASE_NOT_FOUND``, ``DHCP_LEASE_ADDRESS_CHANGED``,
+    ``DHCP_LEASE_RESERVED_ELSEWHERE``) and nothing written when the device
+    has no lease here or its lease is on another address; 502 when the
+    router cannot be reached or did not keep the change. No try/except, for
+    the reason given on ``push_dhcp_pool``.
+    """
+    lease, changed = await service.keep_lease_address(
+        router_id,
+        mac_address=payload.mac_address,
+        ip_address=payload.ip_address,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Device kept on its address" if changed else "Device was already kept"
+        ),
+        data=DhcpLeaseKeepResponse(
+            router_id=str(router_id), changed=changed, lease=_lease_response(lease)
+        ).model_dump(),
         request_id=_request_id(request),
     )
 

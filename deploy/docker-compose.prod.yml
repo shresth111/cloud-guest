@@ -69,6 +69,28 @@ services:
     # changes nothing.
     env_file:
       - ${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}
+      # ...then the mail identities, which come from Secrets Manager via
+      # remote-deploy.sh. Listed AFTER the base file on purpose: compose
+      # applies env_file entries in order, so a later file overrides an
+      # earlier one for the same key -- exactly these keys and no others.
+      # The deploy always creates the file (empty when the secret has no
+      # mailbox filled in yet), so this path cannot go missing.
+      - ${MAIL_ENV_FILE:-./mail.env}
+      # ...and the Slack webhook for Master-console onboarding status,
+      # from cloudguest/prod/slack via the same script's
+      # `materialise_slack_env`. Same ordering rule, same "the deploy
+      # always creates it" guarantee -- but only from the first `api`
+      # deploy that runs the updated script. When applying this compose
+      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # ~/deploy/slack.env` first, or compose refuses to start on a path
+      # that does not exist yet. An empty file is the correct steady
+      # state until a webhook is actually configured.
+      - ${SLACK_ENV_FILE:-./slack.env}
+      # ...and the Cloudflare Gateway token + account id for DNS category
+      # filtering, from cloudguest/prod/cloudflare via
+      # `materialise_cloudflare_env`. Same rules as slack.env, including
+      # `touch ~/deploy/cloudflare.env` before adding this line by hand.
+      - ${CLOUDFLARE_ENV_FILE:-./cloudflare.env}
     ports:
       - "8000:8000"
     depends_on:
@@ -91,9 +113,31 @@ services:
     # left on the old code after `alembic upgrade head` has already run is a
     # worker executing against a schema it does not know.
     image: ${API_IMAGE:?API_IMAGE is unset -- see ~/deploy/.deploy.env}
-    command: ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info", "-Q", "celery,device_io"]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info", "-Q", "celery,device_io,marketing"]
     env_file:
       - ${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}
+      # ...then the mail identities, which come from Secrets Manager via
+      # remote-deploy.sh. Listed AFTER the base file on purpose: compose
+      # applies env_file entries in order, so a later file overrides an
+      # earlier one for the same key -- exactly these keys and no others.
+      # The deploy always creates the file (empty when the secret has no
+      # mailbox filled in yet), so this path cannot go missing.
+      - ${MAIL_ENV_FILE:-./mail.env}
+      # ...and the Slack webhook for Master-console onboarding status,
+      # from cloudguest/prod/slack via the same script's
+      # `materialise_slack_env`. Same ordering rule, same "the deploy
+      # always creates it" guarantee -- but only from the first `api`
+      # deploy that runs the updated script. When applying this compose
+      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # ~/deploy/slack.env` first, or compose refuses to start on a path
+      # that does not exist yet. An empty file is the correct steady
+      # state until a webhook is actually configured.
+      - ${SLACK_ENV_FILE:-./slack.env}
+      # ...and the Cloudflare Gateway token + account id for DNS category
+      # filtering, from cloudguest/prod/cloudflare via
+      # `materialise_cloudflare_env`. Same rules as slack.env, including
+      # `touch ~/deploy/cloudflare.env` before adding this line by hand.
+      - ${CLOUDFLARE_ENV_FILE:-./cloudflare.env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,6 +169,28 @@ services:
     command: ["celery", "-A", "app.core.celery_app", "beat", "--loglevel=info", "--pidfile=/tmp/celerybeat.pid"]
     env_file:
       - ${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}
+      # ...then the mail identities, which come from Secrets Manager via
+      # remote-deploy.sh. Listed AFTER the base file on purpose: compose
+      # applies env_file entries in order, so a later file overrides an
+      # earlier one for the same key -- exactly these keys and no others.
+      # The deploy always creates the file (empty when the secret has no
+      # mailbox filled in yet), so this path cannot go missing.
+      - ${MAIL_ENV_FILE:-./mail.env}
+      # ...and the Slack webhook for Master-console onboarding status,
+      # from cloudguest/prod/slack via the same script's
+      # `materialise_slack_env`. Same ordering rule, same "the deploy
+      # always creates it" guarantee -- but only from the first `api`
+      # deploy that runs the updated script. When applying this compose
+      # change to ~/deploy/docker-compose.yml by hand, `touch
+      # ~/deploy/slack.env` first, or compose refuses to start on a path
+      # that does not exist yet. An empty file is the correct steady
+      # state until a webhook is actually configured.
+      - ${SLACK_ENV_FILE:-./slack.env}
+      # ...and the Cloudflare Gateway token + account id for DNS category
+      # filtering, from cloudguest/prod/cloudflare via
+      # `materialise_cloudflare_env`. Same rules as slack.env, including
+      # `touch ~/deploy/cloudflare.env` before adding this line by hand.
+      - ${CLOUDFLARE_ENV_FILE:-./cloudflare.env}
     depends_on:
       postgres:
         condition: service_healthy

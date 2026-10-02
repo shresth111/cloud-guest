@@ -34,7 +34,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
@@ -90,8 +90,8 @@ class AuthRepositoryProtocol(Protocol):
     async def get_session_by_refresh_token(self, token: str) -> Session | None: ...
 
     async def rotate_refresh_token(
-        self, session: Session, new_refresh_jti: str
-    ) -> Session: ...
+        self, session: Session, new_refresh_jti: str, *, expected_refresh_jti: str
+    ) -> bool: ...
 
     async def get_active_sessions(self, user_id: uuid.UUID) -> list[Session]: ...
 
@@ -279,16 +279,49 @@ class AuthRepository:
         return results[0] if results else None
 
     async def rotate_refresh_token(
-        self, session: Session, new_refresh_jti: str
-    ) -> Session:
-        session.mark_activity()
-        return await self.sessions.update(
-            session,
-            {
-                "refresh_token_jti": new_refresh_jti,
-                "last_activity_at": session.last_activity_at,
-            },
+        self,
+        session: Session,
+        new_refresh_jti: str,
+        *,
+        expected_refresh_jti: str,
+    ) -> bool:
+        """Swap the session's refresh token, but only if it is still the one
+        that was read.
+
+        ``GenericRepository.update`` made this a read-modify-write: two
+        concurrent ``AuthService.refresh`` calls bearing the *same* refresh
+        token both read the old jti before either write landed, so both were
+        handed a fresh token pair while only one of the two jtis actually
+        ended up stored. The other caller's pair was dead on arrival, and the
+        browser holding it was signed out without explanation the moment its
+        access token expired -- an unexplained logout with a working password,
+        which is exactly what a customer then reports as "I cannot log in".
+
+        Gating the write on the jti being unchanged makes the call that loses
+        that race return ``False``, so the caller can refuse the rotation it
+        did not win rather than hand out a pair it has just orphaned (the same
+        ``UPDATE ... WHERE`` + rowcount compare-and-set
+        ``RouterRepository.consume_provisioning_token`` uses).
+        """
+        now = datetime.now(UTC)
+        statement = (
+            update(Session)
+            .where(
+                Session.id == session.id,
+                Session.refresh_token_jti == expected_refresh_jti,
+                Session.is_active.is_(True),
+            )
+            .values(refresh_token_jti=new_refresh_jti, last_activity_at=now)
         )
+        result = await self.session.execute(statement)
+        await self.session.flush()
+        rotated = int(result.rowcount or 0) > 0
+        if rotated:
+            # Keep the in-memory instance the caller already holds in sync
+            # with what was just committed, without a second round trip.
+            session.refresh_token_jti = new_refresh_jti
+            session.last_activity_at = now
+        return rotated
 
     async def get_session_by_id(self, session_id: uuid.UUID) -> Session | None:
         return await self.sessions.get_by_id(session_id)

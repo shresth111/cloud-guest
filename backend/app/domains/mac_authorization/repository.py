@@ -44,7 +44,9 @@ class MacAuthorizationRepositoryProtocol(Protocol):
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
-        location_id: uuid.UUID | None = None,
+        # A single id, or a confinement from ``confine_location_filter``
+        # (``AnyOfOrNull``) -- passed straight into ``apply_filters``.
+        location_id: object = None,
         page: int,
         page_size: int,
         sort_by: str = DEFAULT_SORT_FIELD,
@@ -95,7 +97,9 @@ class MacAuthorizationRepository:
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
-        location_id: uuid.UUID | None = None,
+        # A single id, or a confinement from ``confine_location_filter``
+        # (``AnyOfOrNull``) -- passed straight into ``apply_filters``.
+        location_id: object = None,
         page: int,
         page_size: int,
         sort_by: str = DEFAULT_SORT_FIELD,

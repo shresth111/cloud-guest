@@ -35,8 +35,12 @@ from app.domains.rbac.exceptions import (
     LastGlobalAdminError,
     LastOrganizationOwnerError,
     OverrideEscalationError,
+    OwnerRoleProtectedError,
     PermissionDeniedError,
     RoleEscalationError,
+    RoleInUseError,
+    RoleNotFoundError,
+    SharedRoleImmutableError,
     SystemRoleImmutableError,
 )
 from app.domains.rbac.models import (
@@ -401,6 +405,24 @@ class FakeRBACRepository:
             and not row.is_deleted
             and row.id != exclude_assignment_id
         )
+
+    async def reassign_role_assignments_in_organization(
+        self,
+        from_role_id: uuid.UUID,
+        to_role_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> list[uuid.UUID]:
+        moved = [
+            row
+            for row in self.user_role_rows
+            if row.role_id == from_role_id
+            and row.organization_id == organization_id
+            and row.is_active
+            and not row.is_deleted
+        ]
+        for row in moved:
+            row.role_id = to_role_id
+        return list({row.user_id for row in moved})
 
     # -- permission overrides ------------------------------------------------
 
@@ -1161,7 +1183,7 @@ class TestRoleAssignment:
         assert any(entry.action == "role_revoked" for entry in repo.audit_log_rows)
 
     async def test_revoke_role_blocks_sole_organization_owner(self) -> None:
-        """"owner kbhi agent nahi hoga": revoking an organization's last
+        """ "owner kbhi agent nahi hoga": revoking an organization's last
         active 'organization-owner' assignment must fail loudly, not
         silently leave the organization with nobody able to administer it
         (confirmed against a real deployment: doing this locked the owner
@@ -1420,6 +1442,437 @@ class TestCrossTenantIsolation:
         )
 
         assert role.name == "Global Role"
+
+
+# ============================================================================
+# Staff Access: editing and deleting existing (shared and own) roles
+# ============================================================================
+
+
+async def _shared_role_with_permissions(
+    repo: FakeRBACRepository,
+    name: str,
+    keys: tuple[str, ...],
+    *,
+    is_system_role: bool = True,
+    scope_type: ScopeType = ScopeType.LOCATION,
+) -> Role:
+    """A role every organization sees (``organization_id IS NULL``), like
+    the seeded Location Manager / Reception Staff / Read-Only roles."""
+    role = await make_role(
+        repo, name, scope_type=scope_type, is_system_role=is_system_role
+    )
+    for key in keys:
+        module, action = key.split(".")
+        permission = await repo.get_permission_by_key(key) or await make_permission(
+            repo, module, action
+        )
+        await repo.add_role_permission(role.id, permission.id, granted_by=None)
+    return role
+
+
+async def _role_keys(repo: FakeRBACRepository, role: Role) -> set[str]:
+    return {row.permission.key for row in await repo.get_role_permissions(role.id)}
+
+
+class TestEditExistingRoles:
+    async def test_editing_a_shared_role_copies_it_for_the_organization_only(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        org_a, org_b = uuid.uuid4(), uuid.uuid4()
+        shared = await _shared_role_with_permissions(
+            repo, "Location Manager", ("vouchers.read", "vouchers.create")
+        )
+        await make_permission(repo, "reports", "read")
+        staff_a = await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=shared,
+            scope_type=ScopeType.LOCATION,
+            organization_id=org_a,
+            location_id=uuid.uuid4(),
+        )
+        staff_b = await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=shared,
+            scope_type=ScopeType.LOCATION,
+            organization_id=org_b,
+            location_id=uuid.uuid4(),
+        )
+
+        copy = await service.update_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=shared.id,
+            requesting_organization_id=org_a,
+            data={
+                "name": "Venue Manager",
+                "permission_keys": ["vouchers.read", "reports.read"],
+            },
+        )
+
+        # Org A got its own, edited, non-system copy...
+        assert copy.id != shared.id
+        assert copy.organization_id == org_a
+        assert copy.is_system_role is False
+        assert copy.name == "Venue Manager"
+        assert copy.slug == shared.slug
+        assert copy.scope_type == shared.scope_type
+        # ...with no parent, or the resolver would re-inherit the removed key.
+        assert copy.parent_role_id is None
+        assert await _role_keys(repo, copy) == {"vouchers.read", "reports.read"}
+        assert await service.resolver.resolve_role_permission_keys(copy.id) == {
+            "vouchers.read",
+            "reports.read",
+        }
+        # The shared row every other organization uses is untouched.
+        assert shared.name == "Location Manager"
+        assert shared.is_system_role is True
+        assert await _role_keys(repo, shared) == {"vouchers.read", "vouchers.create"}
+        # Only org A's staff moved.
+        assert staff_a.role_id == copy.id
+        assert staff_b.role_id == shared.id
+
+    async def test_after_copy_the_org_lists_only_its_copy_and_others_keep_shared(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        org_a, org_b = uuid.uuid4(), uuid.uuid4()
+        shared = await _shared_role_with_permissions(
+            repo, "Reception Staff", ("vouchers.read",)
+        )
+
+        copy = await service.update_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=shared.id,
+            requesting_organization_id=org_a,
+            data={"description": "Front desk"},
+        )
+
+        org_a_ids = {
+            r.id for r in await service.list_roles(requesting_organization_id=org_a)
+        }
+        org_b_ids = {
+            r.id for r in await service.list_roles(requesting_organization_id=org_b)
+        }
+        assert copy.id in org_a_ids and shared.id not in org_a_ids
+        assert shared.id in org_b_ids and copy.id not in org_b_ids
+        # The hidden shared role can no longer be reached from org A.
+        with pytest.raises(RoleNotFoundError):
+            await service.get_role(shared.id, requesting_organization_id=org_a)
+        # Editing it again from org A cannot create a second copy.
+        with pytest.raises(RoleNotFoundError):
+            await service.update_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=shared.id,
+                requesting_organization_id=org_a,
+                data={"name": "Again"},
+            )
+
+    async def test_copy_flattens_inherited_permissions(self) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        parent = await _shared_role_with_permissions(
+            repo, "Base Role", ("vouchers.read",)
+        )
+        child = await _shared_role_with_permissions(
+            repo, "Child Role", ("reports.read",)
+        )
+        child.parent_role_id = parent.id
+
+        copy = await service.update_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=child.id,
+            requesting_organization_id=org_a,
+            data={"description": "customized"},
+        )
+
+        assert await _role_keys(repo, copy) == {"vouchers.read", "reports.read"}
+
+    async def test_editing_a_shared_non_system_role_is_also_copy_on_write(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        shared = await _shared_role_with_permissions(
+            repo, "Template Role", ("vouchers.read",), is_system_role=False
+        )
+
+        copy = await service.update_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=shared.id,
+            requesting_organization_id=org_a,
+            data={"name": "Renamed"},
+        )
+
+        assert copy.id != shared.id
+        assert shared.name == "Template Role"
+
+    async def test_organization_owner_role_cannot_be_edited(self) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        owner = await _shared_role_with_permissions(
+            repo,
+            "Organization Owner",
+            ("roles.update",),
+            scope_type=ScopeType.ORGANIZATION,
+        )
+
+        with pytest.raises(OwnerRoleProtectedError):
+            await service.update_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=owner.id,
+                requesting_organization_id=org_a,
+                data={"permission_keys": []},
+            )
+        assert len(repo.roles) == 1
+        assert repo.organization_role_rows == []
+
+    async def test_platform_global_role_cannot_be_copied_by_a_tenant(self) -> None:
+        service, repo, _cache = make_service()
+        platform = await _shared_role_with_permissions(
+            repo, "Platform Admin", ("vouchers.read",), scope_type=ScopeType.GLOBAL
+        )
+
+        with pytest.raises(CrossTenantAccessError):
+            await service.update_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=platform.id,
+                requesting_organization_id=uuid.uuid4(),
+                data={"name": "Mine now"},
+            )
+
+    async def test_editing_own_role_updates_in_place(self) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        await make_permission(repo, "vouchers", "read")
+        own = await make_role(
+            repo,
+            "Night Shift",
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_a,
+        )
+
+        updated = await service.update_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=own.id,
+            requesting_organization_id=org_a,
+            data={"name": "Late Shift", "permission_keys": ["vouchers.read"]},
+        )
+
+        assert updated.id == own.id
+        assert updated.name == "Late Shift"
+        assert await _role_keys(repo, updated) == {"vouchers.read"}
+
+    async def test_org_a_cannot_edit_org_b_role(self) -> None:
+        service, repo, _cache = make_service()
+        org_a, org_b = uuid.uuid4(), uuid.uuid4()
+        role_b = await make_role(
+            repo, "Org B Role", scope_type=ScopeType.ORGANIZATION, organization_id=org_b
+        )
+
+        with pytest.raises(CrossTenantAccessError):
+            await service.update_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=role_b.id,
+                requesting_organization_id=org_a,
+                data={"name": "Hijacked"},
+            )
+        assert role_b.name == "Org B Role"
+
+    async def test_shared_role_cannot_be_deactivated_or_repermissioned_in_place(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        shared = await _shared_role_with_permissions(
+            repo, "Helpdesk", ("vouchers.read",), is_system_role=False
+        )
+        await make_permission(repo, "reports", "read")
+
+        with pytest.raises(SharedRoleImmutableError):
+            await service.set_role_active(
+                actor_user_id=uuid.uuid4(),
+                role_id=shared.id,
+                requesting_organization_id=org_a,
+                is_active=False,
+            )
+        with pytest.raises(SharedRoleImmutableError):
+            await service.assign_permission_to_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=shared.id,
+                permission_key="reports.read",
+                requesting_organization_id=org_a,
+            )
+        with pytest.raises(SharedRoleImmutableError):
+            await service.remove_permission_from_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=shared.id,
+                permission_key="vouchers.read",
+                requesting_organization_id=org_a,
+            )
+        assert shared.is_active is True
+        assert await _role_keys(repo, shared) == {"vouchers.read"}
+
+
+class TestDeleteExistingRoles:
+    async def test_deleting_an_unused_shared_role_hides_it_for_that_org_only(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        org_a, org_b = uuid.uuid4(), uuid.uuid4()
+        shared = await _shared_role_with_permissions(repo, "Auditor", ("reports.read",))
+        # Held in another organization -- must not block org A.
+        await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=shared,
+            scope_type=ScopeType.LOCATION,
+            organization_id=org_b,
+        )
+
+        await service.delete_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=shared.id,
+            requesting_organization_id=org_a,
+        )
+
+        assert shared.is_deleted is False
+        assert shared.id not in {
+            r.id for r in await service.list_roles(requesting_organization_id=org_a)
+        }
+        assert shared.id in {
+            r.id for r in await service.list_roles(requesting_organization_id=org_b)
+        }
+        with pytest.raises(RoleNotFoundError):
+            await service.assign_role_to_user(
+                actor_user_id=uuid.uuid4(),
+                target_user_id=uuid.uuid4(),
+                role_id=shared.id,
+                scope_type=ScopeType.LOCATION,
+                requesting_organization_id=org_a,
+                organization_id=org_a,
+                location_id=uuid.uuid4(),
+            )
+
+    async def test_deleting_a_shared_role_still_held_in_the_org_is_refused(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        shared = await _shared_role_with_permissions(
+            repo, "Reception Staff", ("vouchers.read",)
+        )
+        for _ in range(2):
+            await assign_role(
+                repo,
+                user_id=uuid.uuid4(),
+                role=shared,
+                scope_type=ScopeType.LOCATION,
+                organization_id=org_a,
+            )
+
+        with pytest.raises(RoleInUseError) as excinfo:
+            await service.delete_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=shared.id,
+                requesting_organization_id=org_a,
+            )
+
+        assert "2 staff members" in excinfo.value.message
+        assert repo.organization_role_rows == []
+
+    async def test_deleting_own_role_with_staff_is_refused_with_count(self) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        own = await make_role(
+            repo,
+            "Night Shift",
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_a,
+        )
+        await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=own,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_a,
+        )
+
+        with pytest.raises(RoleInUseError) as excinfo:
+            await service.delete_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=own.id,
+                requesting_organization_id=org_a,
+            )
+
+        assert "1 staff member." in excinfo.value.message
+        assert own.is_deleted is False
+
+    async def test_deleting_own_unused_role_soft_deletes_it(self) -> None:
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        own = await make_role(
+            repo,
+            "Night Shift",
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_a,
+        )
+
+        await service.delete_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=own.id,
+            requesting_organization_id=org_a,
+        )
+
+        assert own.is_deleted is True
+
+    async def test_organization_owner_role_cannot_be_deleted(self) -> None:
+        service, repo, _cache = make_service()
+        owner = await _shared_role_with_permissions(
+            repo,
+            "Organization Owner",
+            ("roles.update",),
+            scope_type=ScopeType.ORGANIZATION,
+        )
+
+        with pytest.raises(OwnerRoleProtectedError):
+            await service.delete_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=owner.id,
+                requesting_organization_id=uuid.uuid4(),
+            )
+        assert repo.organization_role_rows == []
+
+    async def test_org_a_cannot_delete_org_b_role(self) -> None:
+        service, repo, _cache = make_service()
+        org_a, org_b = uuid.uuid4(), uuid.uuid4()
+        role_b = await make_role(
+            repo, "Org B Role", scope_type=ScopeType.ORGANIZATION, organization_id=org_b
+        )
+
+        with pytest.raises(CrossTenantAccessError):
+            await service.delete_role(
+                actor_user_id=uuid.uuid4(),
+                role_id=role_b.id,
+                requesting_organization_id=org_a,
+            )
+        assert role_b.is_deleted is False
+
+    async def test_hiding_in_org_a_does_not_hide_in_org_b(self) -> None:
+        service, repo, _cache = make_service()
+        org_a, org_b = uuid.uuid4(), uuid.uuid4()
+        shared = await _shared_role_with_permissions(repo, "Auditor", ("reports.read",))
+
+        await service.delete_role(
+            actor_user_id=uuid.uuid4(),
+            role_id=shared.id,
+            requesting_organization_id=org_a,
+        )
+
+        role = await service.get_role(shared.id, requesting_organization_id=org_b)
+        assert role.id == shared.id
 
 
 # ============================================================================

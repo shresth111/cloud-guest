@@ -184,6 +184,21 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXPORT,
         _A.MANAGE,
     ),
+    # Guest Marketing: EXECUTE is the send/schedule/cancel/test-send act and
+    # is deliberately its own action -- it falls inside OPERATE, so only
+    # roles explicitly given MARKETING: OPERATE (Location Manager) or a
+    # broader default (Organization Owner/Admin, MSP roles) can send.
+    PermissionModule.MARKETING: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
+    # Own-provider credentials (spec §12.3): read the masked view, or manage
+    # (create/update/delete/verify/sync). Two keys only, by design.
+    PermissionModule.MARKETING_PROVIDERS: (_A.READ, _A.MANAGE),
     PermissionModule.RADIUS: (
         _A.CREATE,
         _A.READ,
@@ -487,13 +502,52 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # Security: the venue-level posture surface (overview, score) and the
+    # capability matrix. READ is this module's ONLY action in this pass, and
+    # deliberately so: ``app.domains.security`` is read-only, so seeding
+    # create/update/delete/execute/manage here would mint five permission
+    # keys that no route checks -- which this file's own NETWORK_INTEGRATIONS
+    # entry calls out as "dead permission data that reads like a capability".
+    # The write actions arrive with the endpoints that check them.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook -- the identical trap
+    # PermissionModule.CONTENT_FILTERING's own comment above records. This
+    # one is sharper than most: with no ``security.read`` permission row,
+    # *no* role can hold it, and RequirePermission has no super-admin bypass
+    # to fall through to, so shipping these endpoints without re-running the
+    # seed gives every caller including Super Admin a 403.
+    PermissionModule.SECURITY: (_A.READ,),
     # Quotations: CREATE covers the one-shot "generate the PDF + email it"
     # action (there is no separate draft-then-send step), READ covers
-    # list/get/PDF-download, MANAGE is the catch-all for any future
-    # void/resend action -- mirrors DEMO_REQUESTS's own simple shape, plus
-    # CREATE since (unlike a demo request) a quotation is always
-    # operator-initiated, never a public submission.
-    PermissionModule.QUOTATIONS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # list/get/PDF-download, DELETE gates the soft delete, MANAGE is the
+    # catch-all for any future void/resend action -- mirrors
+    # DEMO_REQUESTS's own simple shape, plus CREATE since (unlike a demo
+    # request) a quotation is always operator-initiated, never a public
+    # submission.
+    #
+    # DELETE is its own action rather than more work folded into MANAGE,
+    # even though this module's comment used to call MANAGE "the catch-all
+    # for any future void/resend action". Two reasons. Every other module
+    # in this file that exposes a real delete endpoint gates it on
+    # ``<module>.delete`` (MONITORED_HARDWARE, NETWORK_INTEGRATIONS,
+    # CONTENT_FILTERING...), so reusing MANAGE here would make quotations
+    # the one domain where an operator has to know that "manage" silently
+    # includes destruction. And ``expand_grant_level`` excludes DELETE from
+    # GrantLevel.OPERATE while including everything else -- so as a
+    # separate action, a role granted OPERATE on quotations can generate
+    # and read them but cannot remove them, which is the distinction worth
+    # having and the one MANAGE cannot express.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook -- the identical trap
+    # PermissionModule.CONTENT_FILTERING's own comment above records.
+    # Shipping the DELETE /quotations/{id} endpoint without re-running the
+    # seed gives every operator a 403 on it, and the console's Delete
+    # button (gated on `quotations.delete` via GET /me/permissions) will
+    # not render at all. expand_grant_level already folds DELETE into FULL,
+    # so no role table changes are needed.
+    PermissionModule.QUOTATIONS: (_A.CREATE, _A.READ, _A.DELETE, _A.MANAGE),
     # Router Readiness Checklist: READ covers the checklist itself
     # (auto-detected items are recomputed live on every read, no separate
     # EXECUTE step needed), MANAGE covers confirming/overriding an item by
@@ -550,6 +604,8 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.OTP: "OTP",
     PermissionModule.VOUCHER: "Voucher",
     PermissionModule.CAMPAIGNS: "Campaigns",
+    PermissionModule.MARKETING: "Marketing",
+    PermissionModule.MARKETING_PROVIDERS: "Marketing Providers",
     PermissionModule.RADIUS: "Radius",
     PermissionModule.WIREGUARD: "WireGuard",
     PermissionModule.FIREWALL: "Firewall",
@@ -587,6 +643,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.SUPPORT_TICKETS: "Support Tickets",
     PermissionModule.DEMO_REQUESTS: "Demo Requests",
     PermissionModule.CONTENT_FILTERING: "Content Filtering",
+    PermissionModule.SECURITY: "Security",
     PermissionModule.QUOTATIONS: "Quotations",
     PermissionModule.READINESS: "Router Readiness Checklist",
     PermissionModule.CHANNEL_PARTNERS: "Channel Partners",
@@ -615,6 +672,8 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     PermissionModule.OTP: ScopeType.LOCATION,
     PermissionModule.VOUCHER: ScopeType.LOCATION,
     PermissionModule.CAMPAIGNS: ScopeType.LOCATION,
+    PermissionModule.MARKETING: ScopeType.LOCATION,
+    PermissionModule.MARKETING_PROVIDERS: ScopeType.ORGANIZATION,
     PermissionModule.RADIUS: ScopeType.ROUTER,
     PermissionModule.WIREGUARD: ScopeType.ROUTER,
     PermissionModule.FIREWALL: ScopeType.ROUTER,
@@ -705,6 +764,14 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # config -- identical ScopeType.ROUTER reasoning as
     # PermissionModule.QOS/FIREWALL/DHCP/VLAN above.
     PermissionModule.CONTENT_FILTERING: ScopeType.ROUTER,
+    # Security's unit of work is a venue's posture, not one device's config:
+    # the overview reads the location's whole fleet, its blocks, its devices,
+    # its tunnels and its alerts at once. ScopeType.LOCATION therefore, the
+    # same "the narrowest scope this is *meaningful* at" reasoning
+    # PermissionModule.POLICY/POLICY's own entry above uses -- not
+    # ScopeType.ROUTER, which would say a venue owner cannot see their own
+    # venue's security unless they happen to be scoped to one gateway.
+    PermissionModule.SECURITY: ScopeType.LOCATION,
     # A quotation belongs to no organization/location/router at all -- its
     # client is very often a prospect who is not yet a platform user or
     # member of any organization (see app.domains.quotation.models's own
@@ -947,6 +1014,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.ORGANIZATION,
         default_level=_L.OPERATE,
         overrides={
+            # Own-provider credentials are the venue org's own business (MVP).
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ORGANIZATIONS: _L.FULL,
             _M.LOCATIONS: _L.FULL,
             _M.ROUTERS: _L.FULL,
@@ -990,6 +1059,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.ORGANIZATION,
         default_level=_L.OPERATE,
         overrides={
+            # Own-provider credentials are the venue org's own business (MVP).
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROLES: _L.OPERATE,
             _M.BILLING: _L.READ,
             _M.SYSTEM_SETTINGS: _L.NONE,
@@ -1063,6 +1134,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.ORGANIZATION,
         default_level=_L.OPERATE,
         overrides={
+            # FULL, not the OPERATE default: OPERATE excludes MANAGE, and
+            # managing the org's own providers is this role's job.
+            _M.MARKETING_PROVIDERS: _L.FULL,
             _M.ORGANIZATIONS: _L.READ,
             _M.PERMISSIONS: _L.READ,
             _M.ROLES: _L.READ,
@@ -1096,6 +1170,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.FULL,
             _M.ROUTER_PROVISIONING: _L.FULL,
             _M.PROVISIONING_ENGINE: _L.FULL,
@@ -1120,6 +1196,15 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_CONFIG: _L.FULL,
             _M.QOS: _L.FULL,
             _M.CONTENT_FILTERING: _L.FULL,
+            # Security: FULL, which today resolves to _A.READ alone, because
+            # READ is that module's only seeded action (see its MODULE_ACTIONS
+            # entry). Written at FULL rather than READ deliberately: this role
+            # already holds FIREWALL/VLAN/DHCP full technical control at this
+            # location, so when the security write actions land -- deploy a
+            # block, isolate a device -- this role must have them without a
+            # second edit here. Nothing is over-granted in the meantime,
+            # because expand_grant_level is bounded by MODULE_ACTIONS.
+            _M.SECURITY: _L.FULL,
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
             _M.READINESS: _L.FULL,
             _M.NETWORK_DEVICE: _L.FULL,
@@ -1159,6 +1244,68 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         },
     ),
     SystemRoleDefinition(
+        name="Security Administrator",
+        slug="security-administrator",
+        description=(
+            "Owns a single location's security posture: what is blocked, which "
+            "devices are isolated, and which security features this venue can "
+            "actually use."
+        ),
+        scope_type=ScopeType.LOCATION,
+        default_level=_L.NONE,
+        overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
+            # The posture surface itself.
+            _M.SECURITY: _L.FULL,
+            # The two enforcement halves of a security decision. Blocking a
+            # domain or an address is CONTENT_FILTERING; blocking or isolating
+            # a device is GUEST_ACCESS. A role that can decide what to block
+            # but cannot carry it out would be a read-only role with a
+            # misleading name.
+            _M.CONTENT_FILTERING: _L.FULL,
+            _M.GUEST_ACCESS: _L.FULL,
+            # OPERATE, not FULL: applying a rule is this role's job, rolling
+            # the whole ruleset back is not. That is the same boundary
+            # network-engineer draws, and it is the reason OPERATE exists as
+            # a level rather than being folded into FULL.
+            _M.FIREWALL: _L.OPERATE,
+            # Read-only context for what a policy is written against: which
+            # zones exist, what is connected, and which MACs are already
+            # trusted. None of these is this role's to change.
+            _M.VLAN: _L.READ,
+            _M.CONNECTED_DEVICES: _L.READ,
+            _M.MAC_AUTHORIZATION: _L.READ,
+            _M.MONITORING: _L.READ,
+            # Alerts are the output of this role's own work, so it owns them
+            # (acknowledge/resolve) rather than only reading them.
+            _M.ALERTS: _L.FULL,
+            _M.ANALYTICS: _L.READ,
+            _M.REPORTS: _L.READ,
+            _M.DASHBOARD: _L.READ,
+            # Deliberately absent, and it is not an oversight:
+            #
+            # * AUDIT_LOGS is ORGANIZATION-scoped, so a LOCATION role cannot
+            #   hold it at all -- ``allowed_scope_types_for_module`` would
+            #   refuse the row, and the seed would raise
+            #   InvalidScopeAssignmentError. An auditor at organization scope
+            #   already covers this.
+            # * DEVICE_CONSOLE stays with Super Admin and Network
+            #   Administrator (see that module's own MODULE_ACTIONS comment).
+            #   A security role does not need a raw command line to do its
+            #   job, and widening who holds one is not a security improvement.
+            _M.DEVICE_CONSOLE: _L.NONE,
+            # The GLOBAL-only modules, spelled out for the same reason every
+            # other non-GLOBAL role here spells them out: so a reader can tell
+            # "deliberately not granted" from "not yet considered".
+            _M.SYSTEM_SETTINGS: _L.NONE,
+            _M.DEMO_REQUESTS: _L.NONE,
+            _M.QUOTATIONS: _L.NONE,
+            _M.CHANNEL_PARTNERS: _L.NONE,
+            _M.NETWORK_INTEGRATIONS: _L.NONE,
+        },
+    ),
+    SystemRoleDefinition(
         name="Network Engineer",
         slug="network-engineer",
         description=(
@@ -1170,6 +1317,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.OPERATE,
             _M.WIREGUARD: _L.OPERATE,
             _M.FIREWALL: _L.OPERATE,
@@ -1181,6 +1330,13 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_CONFIG: _L.OPERATE,
             _M.QOS: _L.OPERATE,
             _M.CONTENT_FILTERING: _L.OPERATE,
+            # Security: OPERATE, the same tier as the rule CRUD above.
+            # OPERATE excludes DELETE and MANAGE, so this role will be able to
+            # apply a security change but not roll one back or remove it --
+            # the same distinction this file's QUOTATIONS entry spells out.
+            # See Network Administrator's own entry for why this is written as
+            # a level rather than as _A.READ.
+            _M.SECURITY: _L.OPERATE,
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
             _M.READINESS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
@@ -1229,6 +1385,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.LOCATIONS: _L.OPERATE,
             _M.POLICY: _L.OPERATE,
             _M.NOTIFICATIONS: _L.OPERATE,
@@ -1249,6 +1407,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.LOCATIONS: _L.OPERATE,
             _M.GUEST_WIFI: _L.OPERATE,
             _M.GUEST_USERS: _L.OPERATE,
@@ -1259,6 +1419,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.CAPTIVE_PORTAL: _L.OPERATE,
             _M.VOUCHER: _L.OPERATE,
             _M.CAMPAIGNS: _L.OPERATE,
+            # Guest Marketing: a site manager may build and send campaigns
+            # to their own site's opted-in guests (service-layer location
+            # confinement keeps it to their site).
+            _M.MARKETING: _L.OPERATE,
             _M.OTP: _L.OPERATE,
             _M.POLICY: _L.OPERATE,
             _M.DASHBOARD: _L.READ,
@@ -1281,6 +1445,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.OPERATE,
@@ -1301,6 +1467,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.GUEST_USERS: _L.READ,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.READ,
@@ -1382,6 +1550,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # ORGANIZATION-only module; never at a location.
+            _M.MARKETING_PROVIDERS: _L.NONE,
             _M.GUEST_WIFI: _L.OPERATE,
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,
@@ -1620,8 +1790,34 @@ def generate_permission_matrix_markdown() -> str:
 
 
 async def _main() -> None:
-    """``python -m app.domains.rbac.seed`` entrypoint."""
+    """``python -m app.domains.rbac.seed`` entrypoint.
+
+    The model imports below look unused and are not. ``Role.organization_id``
+    carries a ForeignKey to ``organizations.id``, and SQLAlchemy resolves that
+    target lazily, when a mapper is first configured. Importing this module on
+    its own registers only the RBAC models, so the first write -- in practice
+    ``remove_role_permission`` partway through the reconcile -- fails with::
+
+        Foreign key associated with column 'roles.organization_id' could not
+        find table 'organizations' with which to generate a foreign key to
+        target column 'id'
+
+    i.e. the documented entrypoint could not run standalone at all, and failed
+    late enough to look like a data problem rather than a missing import.
+    ``scripts.seed`` never hit this because it imports the same models (also
+    with ``# noqa: F401``) for the same reason.
+
+    They are imported inside this function rather than at module scope on
+    purpose: they are needed only by this CLI path, and at module scope every
+    importer of ``rbac.seed`` -- the app, the test suite, ``scripts.seed`` --
+    would pull in four unrelated model modules to run a function that does not
+    reference them.
+    """
     from app.database.session import SessionLocal
+    from app.domains.auth.models import User  # noqa: F401
+    from app.domains.location.models import Location  # noqa: F401
+    from app.domains.organization.models import Organization  # noqa: F401
+    from app.domains.router.models import Router  # noqa: F401
 
     async with SessionLocal() as session:
         summary = await seed_rbac(session)

@@ -779,6 +779,206 @@ class HotspotDisconnectResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HotspotDeviceBlockResult:
+    """What a router holds after being asked to block one device by MAC.
+
+    A device block is two things on a RouterOS hotspot, and this reports
+    both from a read taken *after* the writes:
+
+    * the durable half -- one ``/ip hotspot ip-binding type=blocked`` row
+      carrying this platform's marker comment, which makes RouterOS drop the
+      device's traffic and refuse it the login page on every reconnect;
+    * the immediate half -- the device's live ``/ip hotspot active`` row
+      (and its ``/ip hotspot host`` entry) removed, so a device already
+      online is cut off now rather than at its next login.
+
+    ``binding_id`` is ``None`` only when ``hotspot_servers == 0``: a router
+    running no hotspot never consults ip-bindings, so nothing is written
+    there and the caller must not report a block.
+
+    ``first_in_order`` says whether our row sits above every other binding
+    on the router -- ahead of a bypass someone else wrote for the same MAC.
+    It is read back, never assumed from the ``place-before`` that was sent.
+
+    ``other_bindings`` lists rows for the same MAC that this platform does
+    not own and therefore left alone (a hand-made bypass, a trusted-device
+    bypass), as ``"<type>:<comment>"``. They are reported because a reader
+    deserves to know the MAC is mentioned twice; they are never removed.
+    """
+
+    hotspot_servers: int
+    binding_id: str | None
+    created: bool
+    first_in_order: bool
+    removed_bypass_ids: tuple[str, ...]
+    other_bindings: tuple[str, ...]
+    sessions_removed: int
+    hosts_removed: int
+    still_active: int
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotDeviceUnblockResult:
+    """What a router holds after being asked to drop this platform's block
+    for one device.
+
+    ``remaining`` is a second read: rows that still carry the marker for
+    this MAC after the removals. Zero is the only value a caller may report
+    as "unblocked"."""
+
+    removed_ids: tuple[str, ...]
+    remaining: int
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpLease:
+    """One ``/ip dhcp-server lease`` row, as the router reported it.
+
+    ``dynamic`` is the fact a firewall rule by address cares about: a
+    dynamic lease is the router's own bookkeeping and the device may be
+    handed a different address when it expires; a static (``dynamic`` false)
+    lease is a reservation, and the device gets this address every time.
+
+    ``address`` is the leased address (``active-address`` when RouterOS
+    reports one, else ``address``). ``status`` is RouterOS's own word --
+    ``bound``, ``waiting``, ``offered`` -- passed through, not interpreted.
+    """
+
+    routeros_id: str
+    mac_address: str
+    address: str | None
+    dynamic: bool
+    status: str | None
+    host_name: str | None
+    server: str | None
+    comment: str | None
+    disabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpLeaseKeepResult:
+    """What a router holds after being asked to keep one device on its
+    current address -- read back after the write, never assumed.
+
+    ``changed`` is ``False`` when the lease was already static on that
+    address and nothing was written; ``True`` only when this call turned a
+    dynamic lease static and the second read confirmed it."""
+
+    lease: DhcpLease
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FloodLimitStatus:
+    """What a read of a router's connection-flood limit found.
+
+    ``enabled`` is "at least one of our flood rows is on the forward chain";
+    ``limit`` is the per-guest connection cap they carry (``None`` when off,
+    or when two rows disagree). ``consistent`` is True only when every guest
+    network has exactly one enabled row, inside the sentinel band, ahead of
+    every customer rule, and all carry the same limit -- the shape a write
+    produces. ``band_state`` is the same ``ready``/``missing``/``invalid``
+    :class:`FirewallBandStatus` reports."""
+
+    enabled: bool
+    limit: int | None
+    consistent: bool
+    rows: int
+    band_state: str
+    guest_networks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class FloodLimitResult:
+    """What switching the flood limit on, changing it or turning it off did,
+    counted from the writes issued and confirmed by a re-read."""
+
+    added: int
+    removed: int
+    limit: int | None
+    guest_networks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GuestIsolationPort:
+    """One member port of a guest (hotspot) bridge, as the isolation reader
+    classified it.
+
+    ``isolatable`` is True for a physical port this platform may put in its
+    split-horizon group; ``excluded_reason`` says why not otherwise
+    (``wan``, ``not_physical``, ``dynamic``, ``disabled``). ``isolated`` is
+    "carries this platform's horizon value now". ``running`` is link-up, the
+    only signal used for "something -- usually an access point -- is plugged
+    in here"."""
+
+    interface: str
+    bridge: str
+    interface_type: str
+    running: bool
+    isolatable: bool
+    isolated: bool
+    horizon: str
+    excluded_reason: str | None = None
+    hw_offload: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestIsolationRadio:
+    """One of the router's OWN radios serving the guest network.
+
+    ``kind`` is ``wireless`` (legacy package, ``default-forwarding``) or
+    ``wifi`` (RouterOS 7 wifi package, ``datapath.client-isolation``)."""
+
+    interface: str
+    kind: str
+    isolated: bool
+    supported: bool = True
+    excluded_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestIsolationStatus:
+    """What a read of a router's guest-isolation switch found. Read-only.
+
+    ``enabled`` is "any trace of this platform's isolation is on the router"
+    (a port carrying our horizon, a radio we changed, our record list, or a
+    routed-guard row). ``between_ports`` is True only when every isolatable
+    guest port carries our horizon and there are at least two of them.
+    ``routed_guard`` is True when every guest network has our drop row at
+    the top of the firewall band. ``consistent`` is the shape a write leaves.
+    ``refusal`` is the ``ISOLATION_*`` code a write would be refused with
+    now, or ``None`` when it could be turned on.
+    """
+
+    enabled: bool
+    consistent: bool
+    between_ports: bool
+    routed_guard: bool
+    band_state: str
+    hotspot_interfaces: tuple[str, ...]
+    guest_bridges: tuple[str, ...]
+    guest_networks: tuple[str, ...]
+    ports: tuple[GuestIsolationPort, ...] = ()
+    radios: tuple[GuestIsolationRadio, ...] = ()
+    refusal: str | None = None
+    refusal_detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestIsolationResult:
+    """What turning guest isolation on or off did, counted from the writes
+    issued and confirmed by a re-read. ``left_alone`` names interfaces this
+    platform once changed but someone has since changed again, which a
+    removal therefore did not touch."""
+
+    ports_changed: tuple[str, ...]
+    radios_changed: tuple[str, ...]
+    guard_rows_added: int
+    guard_rows_removed: int
+    left_alone: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ContentFilterRuleConfig:
     """One content-filtering rule to realize on the device -- either a
     domain to DNS-sinkhole or an IP/CIDR to address-list-and-drop. See
@@ -825,6 +1025,17 @@ class PingResult:
     received: int
     packet_loss_percentage: float
     avg_rtt_ms: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ArpPingResult:
+    """Result of an ARP ping (``/tool/ping arp-ping=yes``) -- see
+    ``MikroTikAdapter.arp_ping``. ``replied_macs`` is every MAC that
+    answered, normalized; empty when nothing did."""
+
+    sent: int
+    received: int
+    replied_macs: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1780,8 +1991,103 @@ class DeviceGatewayAdapter(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# Firewall filter rules (MikroTik only, over 8728)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallFilterRuleConfig:
+    """One ``/ip firewall filter`` rule this platform owns on a router.
+
+    ``rule_id`` is the rule's identity and nothing else: it becomes the
+    device comment ``cloudguest-fw:<rule_id>`` and is how a later push finds
+    the row again. The customer's own name and free-text comment are
+    deliberately NOT carried -- putting customer text into the comment field
+    would hand the customer control of this platform's identity scheme (see
+    ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §5.3).
+
+    ``priority`` decides order inside the sentinel band (lower first) and is
+    never turned into a chain index. Ties are broken by ``rule_id`` so the
+    order is a pure function of the desired set.
+
+    ``protocol=None`` means "any" and omits ``protocol=`` entirely, the
+    RouterOS equivalent. Ports are only valid with ``tcp``/``udp``; the
+    writer refuses the combination before any write rather than letting
+    RouterOS reject it mid-push.
+    """
+
+    rule_id: str
+    chain: str
+    action: str  # "accept" | "drop" | "reject"
+    priority: int
+    protocol: str | None = None  # "tcp" | "udp" | "icmp" | None (any)
+    src_address: str | None = None
+    dst_address: str | None = None
+    src_port: int | None = None
+    dst_port: int | None = None
+    in_interface: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallSyncResult:
+    """What a converging push did, counted from the writes it issued.
+
+    ``unchanged`` rules produced no write at all -- a re-push of the same
+    desired set is expected to report every rule here and nothing else.
+    """
+
+    added: int
+    removed: int
+    unchanged: int
+    #: The desired rule ids now on the device, in band order. Read back
+    #: after the writes, not echoed from the input.
+    ordered_rule_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallBandResult:
+    """Outcome of placing (or finding) the forward-chain sentinel band."""
+
+    created: bool
+    begin_id: str
+    end_id: str
+    #: The ``.id`` the band was placed immediately above when it was
+    #: created, or ``None`` when it already existed and was left alone.
+    anchor_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FirewallBandStatus:
+    """What a read-only look at the forward-chain sentinel band found.
+
+    ``state`` is ``"ready"`` (a push would find it), ``"missing"`` (neither
+    sentinel exists: the band was never placed) or ``"invalid"`` (something
+    is there, but a push would refuse it). ``reason`` is a stable code for
+    the ``invalid`` shape (``BAND_PARTIAL``, ``BAND_DUPLICATED``,
+    ``BAND_INVERTED``, ``BAND_SENTINEL_NOT_PASSTHROUGH``), ``BAND_NOT_PLACED``
+    for ``missing``, and ``None`` for ``ready``. Deliberately no ``.id`` and
+    no comment text: a caller shows this to a venue.
+
+    ``guest_networks`` / ``guest_dns_servers`` come from the same read (see
+    :func:`wyfy_device_gateway.mikrotik_firewall.read_router_networks`): the
+    networks the hotspot (or, without one, the DHCP server) serves, and the
+    DNS servers DHCP hands those guests. They let a caller offer "keep guests
+    off your private networks" without the owner typing an address. Empty
+    when the router has neither."""
+
+    state: str
+    reason: str | None
+    guest_networks: tuple[str, ...] = ()
+    guest_dns_servers: tuple[str, ...] = ()
+
+
 __all__ = [
     "DeviceVendor",
+    "FirewallBandResult",
+    "FirewallBandStatus",
+    "FirewallFilterRuleConfig",
+    "FirewallSyncResult",
     "UnsupportedVendorError",
     "DeviceCredentials",
     "InterfaceInfo",
@@ -1808,10 +2114,21 @@ __all__ = [
     "HotspotActiveSession",
     "HotspotSessionControl",
     "HotspotDisconnectResult",
+    "HotspotDeviceBlockResult",
+    "DhcpLease",
+    "DhcpLeaseKeepResult",
+    "HotspotDeviceUnblockResult",
+    "FloodLimitStatus",
+    "FloodLimitResult",
+    "GuestIsolationPort",
+    "GuestIsolationRadio",
+    "GuestIsolationResult",
+    "GuestIsolationStatus",
     "HotspotCertificatePush",
     "HotspotCertificatePushResult",
     "ProvisionResult",
     "SpeedTestResult",
+    "ArpPingResult",
     "PingResult",
     "TracerouteHop",
     "TracerouteResult",

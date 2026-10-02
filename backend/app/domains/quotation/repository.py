@@ -36,6 +36,8 @@ class QuotationRepositoryProtocol(Protocol):
         self, quotation: Quotation, data: dict[str, object]
     ) -> Quotation: ...
 
+    async def soft_delete_quotation(self, quotation: Quotation) -> Quotation: ...
+
     async def list_quotations(
         self,
         *,
@@ -75,6 +77,25 @@ class QuotationRepository:
         self, quotation: Quotation, data: dict[str, object]
     ) -> Quotation:
         return await self.quotations.update(quotation, data)
+
+    async def soft_delete_quotation(self, quotation: Quotation) -> Quotation:
+        """Flags the row ``is_deleted``/``deleted_at`` -- never a row
+        removal. Same ``GenericRepository.soft_delete`` call
+        ``app.domains.monitored_hardware.repository``'s own
+        ``soft_delete_device`` makes, and the reason this domain already
+        needs it on the read path: ``_list_filters`` below and
+        ``service.QuotationService.get_quotation`` both already exclude
+        ``is_deleted`` rows, so the whole read surface honours the flag the
+        moment it is set.
+
+        The line items are deliberately left alone. They are only ever
+        reached through their parent (``list_items`` is called with a
+        ``quotation_id`` the caller already resolved through
+        ``get_quotation``), so a soft-deleted parent already hides them,
+        and flagging them too would mean a second write whose only effect
+        is to make an eventual restore a two-step undo.
+        """
+        return await self.quotations.soft_delete(quotation)
 
     def _list_filters(self, *, status: str | None, search: str | None) -> list:
         filters = [Quotation.is_deleted.is_(False)]

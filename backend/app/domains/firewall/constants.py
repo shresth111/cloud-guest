@@ -49,7 +49,96 @@ class FirewallProtocol(StrEnum):
     ALL = "all"
 
 
+class FirewallDevicePushStatus(StrEnum):
+    """Whether this rule is on its router right now, as a
+    :class:`~.models.FirewallRule`'s own device push last left it.
+
+    Same three values and the same meaning as
+    ``content_filtering.constants.ContentFilterDevicePushStatus``, with one
+    difference that follows from how this domain pushes: a push is per
+    *router*, because a rule's position in the chain is a property of the
+    whole set (``priority`` orders them inside the sentinel band), so every
+    enabled rule on the router lands together or not at all.
+
+    * ``PENDING`` -- not on the device: never pushed, edited since, or
+      disabled (a disabled rule is taken off the router by the next push).
+    * ``ACTIVE`` -- the last push put exactly this rule, with these fields,
+      inside the router's sentinel band, and read it back there. A claim
+      about the chain's contents, not that a packet was ever matched.
+    * ``FAILED`` -- the last push attempt for this router raised;
+      ``device_push_error`` holds the device's or the refusal's own words.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
+#: Columns the push writes onto the router. Changing one on an ``ACTIVE``
+#: row demotes it to ``PENDING`` (``app.common.device_push``).
+#:
+#: ``is_enabled`` IS listed here, unlike every other domain's copy of this
+#: tuple, and deliberately: this push is a desired-state push of the router's
+#: whole rule set, so disabling a rule is exactly what removes it from the
+#: device at the next push. Until then the router still carries it, and an
+#: ``ACTIVE`` badge on a disabled rule would be a claim the device contradicts.
+#: ``name`` and ``comment`` are absent: neither reaches the device -- the
+#: device comment is the rule's id, never the customer's text.
+DEVICE_CARRIED_FIELDS: tuple[str, ...] = (
+    "chain",
+    "action",
+    "protocol",
+    "source_address",
+    "destination_address",
+    "source_port",
+    "destination_port",
+    "in_interface",
+    "priority",
+    "is_enabled",
+)
+
+
+class FloodLimitPreset(StrEnum):
+    """The per-router "Limit connection floods" switch's settings.
+
+    Each is a cap on how many connections one guest device may hold before
+    its next new TCP connection is dropped (RouterOS ``connection-limit=N,32``
+    on ``chain=forward``, per guest address). ``off`` removes the rows."""
+
+    OFF = "off"
+    RELAXED = "relaxed"
+    NORMAL = "normal"
+    STRICT = "strict"
+
+
+#: Connections one guest device may hold. A phone with a browser, a few
+#: messaging apps and a video stream sits in the tens; a laptop syncing a
+#: cloud drive or running a torrent client goes into the hundreds, which is
+#: why "strict" can break busy apps and the venue is told so.
+FLOOD_LIMIT_PRESETS: dict[FloodLimitPreset, int] = {
+    FloodLimitPreset.RELAXED: 300,
+    FloodLimitPreset.NORMAL: 150,
+    FloodLimitPreset.STRICT: 80,
+}
+
+
+def flood_preset_for_limit(limit: int | None) -> FloodLimitPreset | None:
+    """The preset a cap read off a router corresponds to; ``None`` for a cap
+    none of them writes (set by hand, or by an older build)."""
+    if limit is None:
+        return FloodLimitPreset.OFF
+    for preset, value in FLOOD_LIMIT_PRESETS.items():
+        if value == limit:
+            return preset
+    return None
+
+
 __all__ = [
+    "FLOOD_LIMIT_PRESETS",
+    "FloodLimitPreset",
+    "flood_preset_for_limit",
+    "DEVICE_CARRIED_FIELDS",
+    "FirewallDevicePushStatus",
     "MIN_PORT",
     "MAX_PORT",
     "DEFAULT_PRIORITY",

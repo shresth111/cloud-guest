@@ -35,6 +35,34 @@ class NotificationEventType(StrEnum):
     DEMO_BOOKING_CONFIRMED = "demo_booking_confirmed"
     DEMO_BOOKING_TEAM_NOTIFICATION = "demo_booking_team_notification"
     DEMO_BOOKING_CANCELLED = "demo_booking_cancelled"
+    # app.domains.customer_provisioning / app.domains.location
+    # (provisioning_service) / app.domains.network_integration -- the three
+    # requests the Master console's customer-onboarding flow actually makes,
+    # plus the one failure event. These are the only members delivered over
+    # NotificationChannelType.SLACK; see `onboarding_slack.py` for why these
+    # four and not a finer-grained set.
+    ONBOARDING_CUSTOMER_CREATED = "onboarding_customer_created"
+    ONBOARDING_LOCATION_PROVISIONED = "onboarding_location_provisioned"
+    ONBOARDING_CONTROLLER_ONBOARDED = "onboarding_controller_onboarded"
+    ONBOARDING_FAILED = "onboarding_failed"
+    # app.domains.billing.credits_notifications -- the marketing credits
+    # balance fell below the org's alert level (spec §13.5). Once per
+    # crossing, to Organization.contact_email, from MailIdentity.DEFAULT.
+    MARKETING_CREDITS_LOW = "marketing_credits_low"
+
+
+# Every event above that is delivered to Slack rather than to a person.
+# Used by `validators.validate_recipient` (a Slack row's recipient is a
+# channel label, not an email address) and by the router/service wiring
+# that must never accidentally address one of these to a customer.
+ONBOARDING_SLACK_EVENT_TYPES: frozenset[NotificationEventType] = frozenset(
+    {
+        NotificationEventType.ONBOARDING_CUSTOMER_CREATED,
+        NotificationEventType.ONBOARDING_LOCATION_PROVISIONED,
+        NotificationEventType.ONBOARDING_CONTROLLER_ONBOARDED,
+        NotificationEventType.ONBOARDING_FAILED,
+    }
+)
 
 
 # ============================================================================
@@ -44,8 +72,9 @@ class NotificationEventType(StrEnum):
 # one table, no tracing. Read it with app.domains.otp.service.MailIdentity,
 # which documents what each identity resolves to.
 #
-#   MailIdentity.ADMIN   -> Settings.admin_smtp_* -> admin@wyfyguest.com
-#   MailIdentity.DEFAULT -> Settings.smtp_*       -> sales@wyfyguest.com
+#   MailIdentity.ADMIN   -> Settings.admin_smtp_*   -> admin@wyfyguest.com
+#   MailIdentity.DEMO    -> Settings.demo_smtp_*    -> demo@wyfyguest.com
+#   MailIdentity.DEFAULT -> Settings.smtp_*         -> sales@wyfyguest.com
 #
 # Only events that are deliberately routed appear here. Anything absent
 # uses MailIdentity.DEFAULT, i.e. exactly the identity it used before this
@@ -55,6 +84,12 @@ class NotificationEventType(StrEnum):
 # The ADMIN entries below are the two outbox halves of the three-flow admin@
 # split; the third (guest OTP) is not an outbox event at all and names its
 # identity directly in app.domains.otp.dependencies.get_otp_service.
+#
+# The DEMO entries were DEFAULT (sales@) until the demo mailbox was given
+# its own credentials. They are listed explicitly for the reason every row
+# here is: the routing is a presence, never an absence, so the next person
+# asking "which mailbox does a demo confirmation come from?" reads it here
+# instead of inferring it from what is missing.
 MAIL_IDENTITY_BY_EVENT_TYPE: Mapping[NotificationEventType, MailIdentity] = (
     MappingProxyType(
         {
@@ -62,22 +97,16 @@ MAIL_IDENTITY_BY_EVENT_TYPE: Mapping[NotificationEventType, MailIdentity] = (
             # addressed to a person using the product.
             NotificationEventType.PASSWORD_RESET: MailIdentity.ADMIN,
             NotificationEventType.LOCATION_WELCOME_EMAIL: MailIdentity.ADMIN,
-            # sales@wyfyguest.com -- a commercial lead landing in the
-            # mailbox that should reply to it. This is the identity it
-            # already used; it is listed explicitly so the sales half of
-            # the split is visible here rather than being an absence.
-            NotificationEventType.DEMO_REQUEST_RECEIVED: MailIdentity.DEFAULT,
-            # A demo booking is the same commercial conversation as the
-            # demo request above -- the visitor's confirmation should come
-            # from, and be replyable to, the mailbox that will actually run
-            # the call. Listed explicitly for the same reason
-            # DEMO_REQUEST_RECEIVED is: the sales half of the split stays
-            # visible as a presence rather than an absence.
-            NotificationEventType.DEMO_BOOKING_CONFIRMED: MailIdentity.DEFAULT,
+            # demo@wyfyguest.com -- one commercial conversation with its own
+            # mailbox: the enquiry, the confirmation, the internal heads-up
+            # and the cancellation all belong in the same thread, and none of
+            # them belongs in the sales mailbox that also carries quotations.
+            NotificationEventType.DEMO_REQUEST_RECEIVED: MailIdentity.DEMO,
+            NotificationEventType.DEMO_BOOKING_CONFIRMED: MailIdentity.DEMO,
             NotificationEventType.DEMO_BOOKING_TEAM_NOTIFICATION: (
-                MailIdentity.DEFAULT
+                MailIdentity.DEMO
             ),
-            NotificationEventType.DEMO_BOOKING_CANCELLED: MailIdentity.DEFAULT,
+            NotificationEventType.DEMO_BOOKING_CANCELLED: MailIdentity.DEMO,
         }
     )
 )
@@ -105,11 +134,29 @@ class NotificationChannelType(StrEnum):
     narrower than ``app.domains.monitoring.constants.NotificationChannelType``
     (EMAIL/SMS/WHATSAPP/SLACK/TEAMS/DISCORD/WEBHOOK) -- this domain is a
     recipient-addressed outbox (a literal email/phone number), not an
-    ops-configured alert-routing channel, so Slack/Teams/Discord/Webhook/
-    WhatsApp don't apply here. See module docstring."""
+    ops-configured alert-routing channel, so Teams/Discord/Webhook/
+    WhatsApp don't apply here. See module docstring.
+
+    ``SLACK`` is the one deliberate widening of that rule, and it is
+    narrow on purpose. It carries exactly the four
+    ``ONBOARDING_SLACK_EVENT_TYPES`` above: Master-console onboarding
+    status, which has one fixed internal destination for the whole
+    platform rather than a per-tenant configuration. Its ``recipient`` is
+    therefore a constant, non-secret channel label
+    (``SLACK_ONBOARDING_RECIPIENT``) and never a URL -- the webhook is a
+    bearer credential and is resolved from ``Settings`` at dispatch time,
+    so it never reaches this table. See ``onboarding_slack.py``.
+
+    It is still not ``app.domains.monitoring``'s Notification Engine and
+    does not replace it: that domain routes *alerts* through per-
+    organization ``NotificationChannel`` rows with their own encrypted
+    config, immediately and without retry. This one rides the outbox, so
+    an onboarding announcement survives a Slack outage and is retried,
+    which is the property that matters for a record of work."""
 
     EMAIL = "email"
     SMS = "sms"
+    SLACK = "slack"
 
 
 class NotificationDeliveryStatus(StrEnum):
@@ -134,3 +181,15 @@ TASK_RUN_NOTIFICATION_DISPATCH_SWEEP = "notification.run_notification_dispatch_s
 # app.core.celery_app.CELERY_HEALTH_CHECK_TIMEOUT_SECONDS's own "narrow,
 # single-purpose constant, not a new Settings knob" precedent.
 DISPATCH_SWEEP_BATCH_SIZE = 200
+
+# Celery task name for the ONE onboarding Slack notice that cannot be
+# enqueued inside the request's own transaction -- the failure notice. See
+# `app.domains.notification.tasks.record_onboarding_failure` and
+# `onboarding_slack.py`'s "Why failures go through Celery" section.
+TASK_RECORD_ONBOARDING_FAILURE = "notification.record_onboarding_failure"
+
+# The `recipient` written on every Slack onboarding outbox row. A stable,
+# non-secret label for a human reading `notification_deliveries` back --
+# deliberately NOT the webhook URL, which is a bearer credential and is
+# resolved from Settings at dispatch time instead.
+SLACK_ONBOARDING_RECIPIENT = "slack:master-onboarding"

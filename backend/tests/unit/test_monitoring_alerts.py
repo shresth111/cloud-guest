@@ -3375,7 +3375,7 @@ def test_a_broken_smtp_setting_no_longer_kills_the_whole_sweep():
 
     settings = Settings(
         email_delivery_provider="smtp",
-        smtp_host="smtp.zoho.in",
+        smtp_host="smtp.gmail.com",
         smtp_username="alerts@example.com",
         smtp_password="hunter2",
         # The default, and a different mailbox from the username -- the

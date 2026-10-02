@@ -6,8 +6,14 @@ easy to unit-test in isolation (mirrors every other domain's own
 from __future__ import annotations
 
 import ipaddress
+import re
 
 from .exceptions import InvalidAddressRangeError, InvalidIpAddressError
+
+_MAC_PATTERN = re.compile(
+    r"^([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]"
+    r"([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})$"
+)
 
 
 def validate_ip_address(field_name: str, value: str | None) -> None:
@@ -56,4 +62,28 @@ def ranges_overlap(start_a: str, end_a: str, start_b: str, end_b: str) -> bool:
     ) and int(ipaddress.ip_address(start_b)) <= int(ipaddress.ip_address(end_a))
 
 
-__all__ = ["validate_ip_address", "validate_address_range", "ranges_overlap"]
+def normalize_lease_mac(value: str) -> str:
+    """Canonical uppercase colon form of a MAC address, or
+    :class:`~.exceptions.InvalidIpAddressError` naming ``mac_address``."""
+    match = _MAC_PATTERN.match((value or "").strip())
+    if match is None:
+        raise InvalidIpAddressError("mac_address", value)
+    return ":".join(octet.upper() for octet in match.groups())
+
+
+def validate_ipv4_host(field_name: str, value: str) -> str:
+    """One IPv4 address -- not a range, not IPv6 (a DHCP lease is one
+    IPv4 address). Returns its canonical text."""
+    try:
+        return str(ipaddress.IPv4Address((value or "").strip()))
+    except ValueError as exc:
+        raise InvalidIpAddressError(field_name, value) from exc
+
+
+__all__ = [
+    "validate_ip_address",
+    "validate_address_range",
+    "ranges_overlap",
+    "normalize_lease_mac",
+    "validate_ipv4_host",
+]

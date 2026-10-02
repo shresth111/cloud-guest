@@ -302,6 +302,21 @@ async def test_redirects_are_not_followed():
         assert client._http.follow_redirects is False
 
 
+async def test_a_redirect_on_an_unauthenticated_probe_is_an_invalid_controller():
+    """A 3xx on a call that carries no session says "this address is not an
+    Omada API", not "your session expired" -- the identity probe is how an
+    operator finds out they typed the wrong URL, and it must keep saying so.
+    """
+    controller = FakeOmadaController()
+    controller.handler_override = lambda r: httpx.Response(
+        302, headers={"Location": "/login"}, content=b""
+    )
+
+    async with _client(controller) as client:
+        with pytest.raises(OmadaInvalidControllerError):
+            await client.request("GET", "/api/info", authenticated=False)
+
+
 # --- errorCode 0 is the only success --------------------------------------
 
 

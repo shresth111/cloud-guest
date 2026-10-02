@@ -43,17 +43,23 @@ former away to eliminate the latter, not the other way round.
 
 ## Mail
 
-A demo booking is a sales flow, so all of its mail goes out from
-``sales@wyfyguest.com`` -- ``MailIdentity.DEFAULT``, declared explicitly in
-``app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE`` next to
-``DEMO_REQUEST_RECEIVED`` rather than left to the default, so the sales
-half of the two-mailbox split stays visible as a presence and not an
-absence. It goes through the existing ``app.domains.notification`` outbox
--- no parallel send path -- which is also what makes "a confirmation that
-failed to send is recorded as failed, never as sent" true rather than
-aspirational: ``enqueue`` writes a ``PENDING`` row, the dispatch sweep
-moves it to ``SENT`` or ``RETRYING``/``FAILED`` from a real provider
-result, and the booking response says only ``queued``.
+A demo booking is its own commercial conversation, so all of its mail goes
+out from ``demo@wyfyguest.com`` -- ``MailIdentity.DEMO``, declared explicitly
+in ``app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE`` next
+to ``DEMO_REQUEST_RECEIVED`` rather than left to the default, so the routing
+stays visible as a presence and not an absence. (It was ``DEFAULT``, i.e.
+``sales@``, until the demo mailbox was given its own credentials: an enquiry
+and a quotation want different replies and should not share an inbox.) It
+goes through the existing ``app.domains.notification`` outbox -- no parallel
+send path -- which is also what makes "a confirmation that failed to send is
+recorded as failed, never as sent" true rather than aspirational:
+``enqueue`` writes a ``PENDING`` row, the dispatch sweep moves it to ``SENT``
+or ``RETRYING``/``FAILED`` from a real provider result, and the booking
+response says only ``queued``.
+
+The internal heads-up goes to ``Settings.demo_request_notify_email``, the
+same inbox a public "Book a Demo" submission notifies -- one venue for the
+whole demo conversation, sender and recipient alike.
 
 Failure to enqueue never fails the booking, for the same reason
 ``DemoRequestService._notify_team`` never fails a submission -- but unlike

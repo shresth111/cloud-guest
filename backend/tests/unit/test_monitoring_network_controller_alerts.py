@@ -14,6 +14,8 @@ the real repository builds.
 
 from __future__ import annotations
 
+import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -632,19 +634,48 @@ class CapturingEmailProvider:
         self.sent.append((email, subject, body))
 
 
+@dataclass
+class CapturingSlackWebhook:
+    """Stands in for the platform team's Slack workspace.
+
+    Passed *into* ``_platform_harness`` rather than returned from it so the
+    five email-only tests above keep their existing four-value unpacking --
+    a Slack assertion is opt-in, and a test that does not ask for one is
+    unchanged.
+    """
+
+    status_code: int = 200
+    body: str = ""
+    posts: list[dict[str, Any]] = field(default_factory=list)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.posts.append(
+            {"url": str(request.url), "json": json.loads(request.content)}
+        )
+        return httpx.Response(self.status_code, text=self.body)
+
+    @property
+    def texts(self) -> list[str]:
+        return [str(post["json"]["text"]) for post in self.posts]
+
+
+PLATFORM_SLACK_WEBHOOK = "https://hooks.slack.com/services/T000/B000/platform-ops"
+
+
 async def _platform_harness(
     *,
     platform_emails: tuple[str, ...],
     org_email: str | None = "owner@venue.example",
     org_channel_active: bool = True,
     target: str = ALERT_TARGET_NETWORK_CONTROLLER,
+    platform_slack_webhook_url: str = "",
+    slack: CapturingSlackWebhook | None = None,
 ) -> tuple[FakeRepository, AlertService, CapturingEmailProvider, FakeIntegration]:
     org_id = uuid.uuid4()
     repo = FakeRepository()
     provider = CapturingEmailProvider()
-    http_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda request: httpx.Response(200))
-    )
+    responder = slack or CapturingSlackWebhook()
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
     notification_service = NotificationService(
         repo, http_client, email_provider=provider
     )
@@ -680,6 +711,7 @@ async def _platform_harness(
         repo,
         notification_service=notification_service,
         platform_alert_emails=platform_emails,
+        platform_alert_slack_webhook_url=platform_slack_webhook_url,
     )
     return repo, service, provider, integration
 
@@ -766,3 +798,225 @@ async def test_other_alerts_stay_the_organizations_own_business() -> None:
 
     assert len(result.triggered) == 1
     assert [email for email, _, _ in provider.sent] == ["owner@venue.example"]
+
+
+# ============================================================================
+# The same copy, in Slack (Settings.platform_alert_slack_webhook_url)
+#
+# Slack delivery for a *tenant's own* alerts already existed before any of
+# this: NotificationChannelType.SLACK, SlackNotifier's real httpx POST, and
+# the Fernet-encrypted webhook_url in NotificationChannel.config_encrypted --
+# all covered in test_monitoring_alerts.py. What did not exist is the
+# platform team's own destination, which is deployment configuration rather
+# than a per-organization channel (see the Setting's own docstring for why
+# it cannot be a NotificationChannel without a fleet-wide write across every
+# tenant's rules).
+# ============================================================================
+
+
+def test_the_slack_setting_is_empty_by_default_and_https_only() -> None:
+    assert Settings().platform_alert_slack_webhook_url == ""
+    assert (
+        Settings(
+            platform_alert_slack_webhook_url=f"  {PLATFORM_SLACK_WEBHOOK}  "
+        ).platform_alert_slack_webhook_url
+        == PLATFORM_SLACK_WEBHOOK
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(platform_alert_slack_webhook_url="http://hooks.slack.com/services/x")
+    assert "https://" in str(exc_info.value)
+
+
+def test_a_platform_copy_destination_is_one_gap_not_two() -> None:
+    """Either setting closes the gap, because both deliver the same copy."""
+    neither = Settings(environment="production")
+    assert neither.alerting_delivery_gaps() == [
+        "CLOUDGUEST_PLATFORM_ALERT_EMAILS",
+        "CLOUDGUEST_PLATFORM_ALERT_SLACK_WEBHOOK_URL",
+    ]
+    slack_only = Settings(
+        environment="production",
+        platform_alert_slack_webhook_url=PLATFORM_SLACK_WEBHOOK,
+    )
+    assert slack_only.alerting_delivery_gaps() == []
+    email_only = Settings(
+        environment="production", platform_alert_emails="ops@wyfy.example"
+    )
+    assert email_only.alerting_delivery_gaps() == []
+    assert Settings(environment="local").alerting_delivery_gaps() == []
+
+
+async def test_the_team_gets_the_same_copy_in_slack_naming_tenant_and_venue() -> None:
+    slack = CapturingSlackWebhook()
+    _, service, provider, integration = await _platform_harness(
+        platform_emails=("ops@wyfy.example",),
+        platform_slack_webhook_url=PLATFORM_SLACK_WEBHOOK,
+        slack=slack,
+    )
+
+    await service.evaluate_alert_rules()
+
+    assert [post["url"] for post in slack.posts] == [PLATFORM_SLACK_WEBHOOK]
+    (text,) = slack.texts
+    assert text.startswith("[CRITICAL]")
+    assert "Lobby Omada" in text
+    assert "Organization: Seaview Hotels. Venue: Seaview Goa." in text
+    # In addition to, never instead of: both email copies still went.
+    assert sorted(email for email, _, _ in provider.sent) == [
+        "ops@wyfy.example",
+        "owner@venue.example",
+    ]
+
+    # Recovery reaches the channel too.
+    integration.recovered()
+    slack.posts.clear()
+    await service.evaluate_alert_rules()
+    (resolved,) = slack.texts
+    assert resolved.startswith("[RESOLVED]")
+    assert "Organization: Seaview Hotels. Venue: Seaview Goa." in resolved
+
+
+async def test_an_empty_slack_setting_posts_nothing() -> None:
+    slack = CapturingSlackWebhook()
+    _, service, provider, _ = await _platform_harness(
+        platform_emails=("ops@wyfy.example",), slack=slack
+    )
+
+    await service.evaluate_alert_rules()
+
+    assert slack.posts == []
+    assert sorted(email for email, _, _ in provider.sent) == [
+        "ops@wyfy.example",
+        "owner@venue.example",
+    ]
+
+
+async def test_slack_alone_needs_no_platform_mailbox() -> None:
+    """The two destinations are independent: the team can be told in Slack
+    and nowhere else."""
+    slack = CapturingSlackWebhook()
+    _, service, provider, _ = await _platform_harness(
+        platform_emails=(),
+        platform_slack_webhook_url=PLATFORM_SLACK_WEBHOOK,
+        slack=slack,
+    )
+
+    await service.evaluate_alert_rules()
+
+    assert len(slack.posts) == 1
+    # The organization's own channel is untouched by any of this.
+    assert [email for email, _, _ in provider.sent] == ["owner@venue.example"]
+
+
+async def test_other_alerts_are_not_posted_to_the_teams_channel_either() -> None:
+    """Same network_controller*-only scope as the email copy -- a venue's
+    own router going down is not the platform team's Slack channel."""
+    slack = CapturingSlackWebhook()
+    repo, service, provider, integration = await _platform_harness(
+        platform_emails=("ops@wyfy.example",),
+        target=ALERT_TARGET_ROUTER_REACHABILITY,
+        platform_slack_webhook_url=PLATFORM_SLACK_WEBHOOK,
+        slack=slack,
+    )
+    repo.network_integrations.clear()
+    repo.routers.append(
+        FakeRouter(
+            id=uuid.uuid4(),
+            organization_id=integration.organization_id,
+            location_id=integration.location_id,
+            name="hEX lite",
+            health_status="healthy",
+            reachability_state="unreachable",
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert slack.posts == []
+    assert [email for email, _, _ in provider.sent] == ["owner@venue.example"]
+
+
+async def test_a_dead_slack_webhook_is_recorded_and_costs_nobody_else(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The failure path, which is the one that decides whether this is
+    trustworthy: a revoked webhook must not be reported as delivered, must
+    not be swallowed, and must not cost the email copies or the alert."""
+    slack = CapturingSlackWebhook(status_code=404, body="no_service")
+    repo, service, provider, _ = await _platform_harness(
+        platform_emails=("ops@wyfy.example",),
+        platform_slack_webhook_url=PLATFORM_SLACK_WEBHOOK,
+        slack=slack,
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.domains.monitoring.service"):
+        result = await service.evaluate_alert_rules()
+
+    # It was attempted, and it failed.
+    assert len(slack.posts) == 1
+    failures = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "platform_alert_slack_failed"
+    ]
+    assert len(failures) == 1
+    assert "HTTP 404" in failures[0].error
+    assert "no_service" in failures[0].error
+    # Never fabricated as a success, in either place an outcome is recorded.
+    assert not [
+        record
+        for record in caplog.records
+        if record.getMessage() == "platform_alert_slack_sent"
+    ]
+    # The only notification_logs row is the organization's own email
+    # channel's. A platform-copy destination is a setting, not a channel, so
+    # it never writes one -- least of all a 'sent' one it did not earn.
+    (only_log,) = repo.notification_logs
+    assert only_log.status == "sent"
+    assert repo.notification_channels[only_log.channel_id].channel_type == "email"
+    # And nothing else was lost: the alert stands, both mailboxes got theirs.
+    assert len(result.triggered) == 1
+    assert sorted(email for email, _, _ in provider.sent) == [
+        "ops@wyfy.example",
+        "owner@venue.example",
+    ]
+
+
+async def test_an_unreachable_slack_workspace_never_raises() -> None:
+    """A transport-level failure (DNS, connect timeout) takes the same path
+    as a non-2xx: NotificationDeliveryError, caught, logged, never out."""
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    repo = FakeRepository()
+    provider = CapturingEmailProvider()
+    org_id = uuid.uuid4()
+    notification_service = NotificationService(
+        repo,
+        httpx.AsyncClient(transport=httpx.MockTransport(refuse)),
+        email_provider=provider,
+    )
+    rule = await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_NETWORK_CONTROLLER,
+            condition_config={"expected_status": NETWORK_CONTROLLER_STATE_FAILING},
+            organization_id=org_id,
+        )
+    )
+    repo.rule_channels[rule.id] = []
+    integration = FakeIntegration(organization_id=org_id, name="Lobby Omada")
+    integration.failing(IntegrationStatus.CONNECTION_FAILED, 3)
+    repo.network_integrations.append(integration)
+    service = AlertService(
+        repo,
+        notification_service=notification_service,
+        platform_alert_slack_webhook_url=PLATFORM_SLACK_WEBHOOK,
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert repo.notification_logs == []

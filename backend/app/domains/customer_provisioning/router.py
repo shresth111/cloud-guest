@@ -38,7 +38,14 @@ import uuid
 from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import Settings, get_settings
 from app.domains.auth.models import AuthUser
+from app.domains.notification.dependencies import get_onboarding_slack_notifier
+from app.domains.notification.onboarding_slack import (
+    OnboardingSlackNotifier,
+    customer_created_notice,
+)
+from app.domains.notification.tasks import dispatch_onboarding_failure
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
 
 from .dependencies import get_customer_provisioning_service
@@ -63,8 +70,47 @@ async def onboard_customer(
     body: OnboardRequest,
     user: AuthUser = Depends(CurrentUser),
     service: CustomerProvisioningService = Depends(get_customer_provisioning_service),
+    onboarding_slack: OnboardingSlackNotifier = Depends(get_onboarding_slack_notifier),
+    settings: Settings = Depends(get_settings),
 ):
-    payload = await service.onboard(body, uuid.UUID(user.id))
+    """Composed at the router layer, not inside
+    ``CustomerProvisioningService``: the Slack notice is an ops concern,
+    the service has no business knowing what Slack is, and this is the
+    same placement this domain already uses for ``ensure_default_alerting``
+    (see ``dependencies.py``).
+
+    Position matters in both branches. The success ``notify`` runs on the
+    same request-scoped session as the onboarding, so the outbox row
+    commits with the organization or is rolled back with it. The failure
+    dispatch happens before the ``raise``, and goes to Celery precisely
+    because the session it is standing in is about to be rolled back --
+    see ``app.domains.notification.onboarding_slack``.
+    """
+    actor_user_id = uuid.UUID(user.id)
+    try:
+        payload = await service.onboard(body, actor_user_id)
+    except Exception as exc:
+        dispatch_onboarding_failure(
+            settings=settings,
+            stage="Customer creation",
+            organization_name=body.organization_name,
+            # Nothing was created, so there is no id to name. The
+            # organization does not exist at either end of this branch.
+            organization_id=None,
+            error=exc,
+            actor_user_id=actor_user_id,
+            request_id=_request_id(request),
+        )
+        raise
+    await onboarding_slack.notify(
+        customer_created_notice(
+            organization_id=uuid.UUID(payload.organization_id),
+            organization_name=body.organization_name,
+            organization_slug=body.organization_slug,
+            location_created=payload.location_id is not None,
+            actor_user_id=actor_user_id,
+        )
+    )
     return build_response(
         success=True,
         message=payload.message,

@@ -77,8 +77,9 @@ class TestEnforceTargetLocation:
 
     def test_unfiltered_listing_is_allowed(self) -> None:
         """``GET /guests`` with no ``location_id`` narrows to nothing, so there
-        is no target to compare; the service's organization scoping still
-        applies."""
+        is no target to compare here. The service confines the listing to the
+        caller's granted sites instead -- see
+        ``test_guest_list_location_confinement.py``."""
         enforce_target_location(
             target_location_id=None,
             scope_location_id=uuid.uuid4(),
@@ -311,6 +312,7 @@ _LOCATION_NARROWING_ROUTES = [
     ("/api/v1/guest-analytics/summary", "GET"),
     ("/api/v1/guest-analytics/otp-success-rate", "GET"),
     ("/api/v1/guest-analytics/voucher-usage", "GET"),
+    ("/api/v1/guest-analytics/dashboard-series", "GET"),
 ]
 
 

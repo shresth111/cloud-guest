@@ -23,6 +23,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,7 +40,11 @@ from app.domains.guest_access.exceptions import (
     RouterHasNoHotspotError,
     SessionStillActiveOnDeviceError,
 )
-from app.domains.guest_access.models import DeviceAccessRule, GuestAccessRule
+from app.domains.guest_access.models import (
+    DeviceAccessRule,
+    GuestAccessControllerBlock,
+    GuestAccessRule,
+)
 from app.domains.guest_access.service import GuestAccessService
 
 # The value ``dependencies.get_block_enforcer`` injects in the running app.
@@ -83,6 +88,63 @@ class FakeGuestAccessRepository:
     #: a failure record written just before a re-raise is discarded unless
     #: it is committed first.
     commits: int = 0
+    #: Every controller-side device block this repository was asked to
+    #: record. At a MikroTik venue this list must stay empty: that vendor's
+    #: block path writes nothing to any device beyond removing the guest
+    #: from ``/ip hotspot active``, and an empty list here is what proves
+    #: the controller work added alongside it never reaches RouterOS.
+    controller_blocks: list[GuestAccessControllerBlock] = field(default_factory=list)
+
+    async def record_controller_block(
+        self,
+        rule: GuestAccessRule,
+        *,
+        location_id: uuid.UUID,
+        mac_address: str,
+        **fields: object,
+    ) -> GuestAccessControllerBlock:
+        for existing in self.controller_blocks:
+            if (
+                existing.rule_id == rule.id
+                and existing.location_id == location_id
+                and existing.mac_address == mac_address
+            ):
+                for key, value in {
+                    **fields,
+                    "cleared_at": None,
+                    "release_error": None,
+                }.items():
+                    setattr(existing, key, value)
+                return existing
+        block = GuestAccessControllerBlock(
+            **_base_fields(
+                rule_id=rule.id,
+                location_id=location_id,
+                mac_address=mac_address,
+                **fields,
+            )
+        )
+        self.controller_blocks.append(block)
+        rule.controller_blocks.append(block)
+        return block
+
+    async def update_controller_block(
+        self, block: GuestAccessControllerBlock, data: dict[str, object]
+    ) -> GuestAccessControllerBlock:
+        for key, value in data.items():
+            setattr(block, key, value)
+        return block
+
+    async def list_open_controller_blocks(
+        self, *, rule_id: uuid.UUID
+    ) -> list[GuestAccessControllerBlock]:
+        return [
+            block
+            for block in self.controller_blocks
+            if block.rule_id == rule_id
+            and block.status == BlockEnforcementStatus.ENFORCED.value
+            and block.cleared_at is None
+        ]
 
     async def create_guest_rule(self, **fields: object) -> GuestAccessRule:
         rule = GuestAccessRule(**_base_fields(**fields))
@@ -98,6 +160,13 @@ class FakeGuestAccessRepository:
         for key, value in data.items():
             setattr(rule, key, value)
         return rule
+
+    async def delete_guest_rule(self, rule: GuestAccessRule) -> None:
+        # Soft delete, exactly as ``GuestAccessRepository`` does it -- the
+        # row (and the controller blocks pointing at it) has to survive to
+        # be released.
+        rule.is_deleted = True
+        rule.deleted_at = _now()
 
     async def commit(self) -> None:
         self.commits += 1
@@ -130,6 +199,7 @@ class FakeSession:
     id: uuid.UUID
     router_id: uuid.UUID
     device_id: uuid.UUID | None
+    location_id: uuid.UUID = field(default_factory=uuid.uuid4)
     status: str = ACTIVE
     ended_at: datetime | None = None
     disconnect_reason: str | None = None
@@ -328,7 +398,10 @@ def _build(
         else None
     )
     service = GuestAccessService(
-        repository, block_enforcer=enforcer, audit_writer=audit
+        repository,
+        block_enforcer=enforcer,
+        location_lookup=_AnyLocationOfThisOrg(organization_id),
+        audit_writer=audit,
     )
     return Fixture(
         service=service,
@@ -342,6 +415,30 @@ def _build(
         guest_id=guest_id,
         identifier=identifier,
     )
+
+
+class _AnyLocationOfThisOrg:
+    """Every location id is a real location of ``organization_id``.
+
+    This suite is about what a block does to a *device and a session*, not
+    about who may write one -- the venues it invents with ``uuid.uuid4()``
+    stand for real venues. Whether an unknown or out-of-scope location is
+    refused is covered where it belongs, in
+    ``test_guest_access.TestWhoMayWriteARule``, against a fake that really
+    does refuse.
+    """
+
+    def __init__(self, organization_id: uuid.UUID) -> None:
+        self.organization_id = organization_id
+
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> object:
+        return SimpleNamespace(id=location_id, organization_id=self.organization_id)
 
 
 async def _block(fx: Fixture, **overrides: object) -> GuestAccessRule:
@@ -465,7 +562,24 @@ class TestBlockingEndsTheSession:
 
 
 class TestFailuresAreReported:
-    async def test_a_session_still_on_the_device_is_an_error_not_a_green_toast(
+    """Two callers, two contracts.
+
+    ``create_guest_rule`` answers with the rule it created, carrying
+    ``enforcement_status="failed"`` and the error: the rule exists, and a
+    5xx here made the dashboard say "Could not block" and the owner submit
+    the same guest again. ``enforce_guest_rule`` -- the retry, which
+    creates nothing -- raises the typed error, because the device operation
+    is its only result.
+    """
+
+    async def _retry(self, fx: Fixture, rule: GuestAccessRule) -> GuestAccessRule:
+        return await fx.service.enforce_guest_rule(
+            rule_id=rule.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+
+    async def test_a_session_still_on_the_device_is_reported_not_a_green_toast(
         self,
     ) -> None:
         """The router accepted the removal and kept the session. The guest
@@ -473,8 +587,11 @@ class TestFailuresAreReported:
         which the caller must be told."""
         fx = _build(adapter=FakeDeviceAdapter(refuse_removal=True))
 
+        rule = await _block(fx)
+
+        assert rule.enforcement_status == BlockEnforcementStatus.FAILED.value
         with pytest.raises(SessionStillActiveOnDeviceError):
-            await _block(fx)
+            await self._retry(fx, rule)
 
     async def test_the_error_names_coa_availability_read_from_that_router(
         self,
@@ -484,8 +601,12 @@ class TestFailuresAreReported:
         believes it configured."""
         fx = _build(adapter=FakeDeviceAdapter(refuse_removal=True, coa_accept=False))
 
+        rule = await _block(fx)
+        assert "does not accept RADIUS Disconnect-Requests" in (
+            rule.enforcement_error or ""
+        )
         with pytest.raises(SessionStillActiveOnDeviceError) as excinfo:
-            await _block(fx)
+            await self._retry(fx, rule)
 
         assert "does not accept RADIUS Disconnect-Requests" in str(excinfo.value)
         assert excinfo.value.status_code == 502
@@ -497,10 +618,11 @@ class TestFailuresAreReported:
             )
         )
 
-        with pytest.raises(SessionStillActiveOnDeviceError) as excinfo:
-            await _block(fx)
+        rule = await _block(fx)
 
-        assert "accepts RADIUS Disconnect-Requests on port 3799" in str(excinfo.value)
+        assert "accepts RADIUS Disconnect-Requests on port 3799" in (
+            rule.enforcement_error or ""
+        )
 
     async def test_a_router_with_no_captive_portal_is_refused_not_reported_clean(
         self,
@@ -511,10 +633,13 @@ class TestFailuresAreReported:
         the stronger one."""
         fx = _build(adapter=FakeDeviceAdapter(hotspot_servers=0))
 
-        with pytest.raises(RouterHasNoHotspotError):
-            await _block(fx)
+        rule = await _block(fx)
 
-    async def test_an_unreachable_router_raises_rather_than_reporting_success(
+        assert rule.enforcement_status == BlockEnforcementStatus.FAILED.value
+        with pytest.raises(RouterHasNoHotspotError):
+            await self._retry(fx, rule)
+
+    async def test_an_unreachable_router_is_recorded_rather_than_reported_success(
         self,
     ) -> None:
         fx = _build(
@@ -523,31 +648,62 @@ class TestFailuresAreReported:
             )
         )
 
-        with pytest.raises(GuestAccessDeviceConnectionError):
-            await _block(fx)
+        rule = await _block(fx)
 
-    async def test_missing_router_credentials_raise_rather_than_guess(self) -> None:
+        assert rule.enforcement_status == BlockEnforcementStatus.FAILED.value
+        assert rule.enforcement_status != BlockEnforcementStatus.ENFORCED.value
+        with pytest.raises(GuestAccessDeviceConnectionError):
+            await self._retry(fx, rule)
+
+    async def test_rejected_router_credentials_are_recorded_on_the_rule(
+        self,
+    ) -> None:
+        """The production case: the router refused the stored API
+        credentials. The create must still hand back the rule, so the
+        dashboard shows it as blocked-but-still-online instead of
+        "Could not block"."""
+        fx = _build(
+            adapter=FakeDeviceAdapter(
+                raises=GuestAccessDeviceConnectionError(
+                    "10.20.0.6", "invalid user name or password (6)"
+                )
+            )
+        )
+
+        rule = await _block(fx)
+
+        assert rule.enforcement_status == BlockEnforcementStatus.FAILED.value
+        assert "invalid user name or password" in (rule.enforcement_error or "")
+        assert rule.sessions_ended == 0
+        assert len(fx.repository.guest_rules) == 1
+
+    async def test_missing_router_credentials_are_recorded_rather_than_guessed(
+        self,
+    ) -> None:
         fx = _build(secret=None)
 
-        with pytest.raises(BlockEnforcementMissingCredentialsError):
-            await _block(fx)
+        rule = await _block(fx)
 
-    async def test_a_failure_is_recorded_committed_and_re_raised(self) -> None:
+        assert rule.enforcement_status == BlockEnforcementStatus.FAILED.value
+        with pytest.raises(BlockEnforcementMissingCredentialsError):
+            await self._retry(fx, rule)
+
+    async def test_a_failure_is_recorded_and_committed(self) -> None:
         """The commit is the point. ``GenericRepository.update`` only
         ``flush()``es and ``get_db_session`` rolls back on any exception,
         so without an explicit commit the failure record is discarded and
         the row reads as though the block had reached the device."""
         fx = _build(adapter=FakeDeviceAdapter(refuse_removal=True))
 
-        with pytest.raises(SessionStillActiveOnDeviceError):
-            await _block(fx)
+        returned = await _block(fx)
 
         rule = next(iter(fx.repository.guest_rules.values()))
+        assert returned is rule
         assert rule.enforcement_status == BlockEnforcementStatus.FAILED.value
         assert rule.enforcement_error
         assert rule.sessions_ended == 0
         # Two: the block itself, committed before any socket is opened, and
-        # the failure record, committed before the re-raise.
+        # the failure record.
         assert fx.repository.commits == 2
 
     async def test_the_block_itself_survives_a_device_failure(self) -> None:
@@ -561,8 +717,7 @@ class TestFailuresAreReported:
             )
         )
 
-        with pytest.raises(GuestAccessDeviceConnectionError):
-            await _block(fx)
+        await _block(fx)
 
         rule = next(iter(fx.repository.guest_rules.values()))
         assert rule.is_active is True
@@ -572,15 +727,53 @@ class TestFailuresAreReported:
         """The safe direction to be wrong in. A record that still says
         ``ACTIVE`` under-claims; a record saying ``TERMINATED`` over a
         guest the device is still forwarding is the exact falsehood being
-        fixed."""
+        fixed. (The ``ACTIVE`` row no longer re-admits the guest: every
+        path that reads it also asks ``is_blocklisted``.)"""
         fx = _build(adapter=FakeDeviceAdapter(refuse_removal=True))
         session = fx.session_lookup.sessions[fx.guest_id][0]
 
-        with pytest.raises(SessionStillActiveOnDeviceError):
-            await _block(fx)
+        await _block(fx)
 
         assert session.status == ACTIVE
         assert session.ended_at is None
+
+
+class TestLocationScopedBlocks:
+    async def test_a_venue_scoped_block_ends_only_that_venues_session(self) -> None:
+        """A rule for one venue is applied at that venue or nowhere by the
+        login gate, so ending the guest's session at a sibling venue would
+        enforce a block nobody wrote there."""
+        fx = _build()
+        here = fx.session_lookup.sessions[fx.guest_id][0]
+        elsewhere = FakeSession(
+            id=uuid.uuid4(),
+            router_id=fx.router_id,
+            device_id=None,
+            location_id=uuid.uuid4(),
+        )
+        fx.session_lookup.sessions[fx.guest_id].append(elsewhere)
+
+        rule = await _block(fx, location_id=here.location_id)
+
+        assert rule.enforcement_status == BlockEnforcementStatus.ENFORCED.value
+        assert here.status == TERMINATED
+        assert elsewhere.status == ACTIVE
+        assert rule.sessions_ended == 1
+
+    async def test_an_org_wide_block_ends_sessions_at_every_venue(self) -> None:
+        fx = _build()
+        elsewhere = FakeSession(
+            id=uuid.uuid4(),
+            router_id=fx.router_id,
+            device_id=None,
+            location_id=uuid.uuid4(),
+        )
+        fx.session_lookup.sessions[fx.guest_id].append(elsewhere)
+
+        rule = await _block(fx, location_id=None)
+
+        assert rule.sessions_ended == 2
+        assert elsewhere.status == TERMINATED
 
 
 # ============================================================================
@@ -648,8 +841,7 @@ class TestRetryAndUnblock:
         adapter = FakeDeviceAdapter(refuse_removal=True)
         fx = _build(adapter=adapter)
 
-        with pytest.raises(SessionStillActiveOnDeviceError):
-            await _block(fx)
+        await _block(fx)
         rule = next(iter(fx.repository.guest_rules.values()))
         assert rule.enforcement_status == BlockEnforcementStatus.FAILED.value
 
@@ -690,6 +882,11 @@ class TestRetryAndUnblock:
 
         assert rule.is_active is False
         assert len(fx.adapter.calls) == calls_after_block
+        # And nothing was written for a controller to hold either, so there
+        # is nothing for the release path to go looking for. This is the
+        # MikroTik half of the 2026-09-18 controller-block work: that change
+        # must be invisible here.
+        assert fx.repository.controller_blocks == []
 
     async def test_an_unblocked_guest_is_allowed_again_by_the_decision_path(
         self,
@@ -854,3 +1051,48 @@ class TestLegacySpellingRules:
         assert enforced.sessions_ended == 0
         assert fx.adapter.active_users == {fx.identifier}
         assert fx.session_lookup.sessions[fx.guest_id][0].status == ACTIVE
+
+
+class TestTheDependencyActuallyConstructs:
+    """The wiring itself, because the wiring is what broke.
+
+    ``get_block_enforcer`` passed ``controller_terminator=`` to
+    ``BlocklistEnforcer``, which did not accept it. Every route that
+    reaches this dependency -- block, unblock, and the whole
+    ``guest_access`` write surface, at **every** venue, MikroTik included
+    -- answered ``500 TypeError`` in production, on an image whose full
+    suite was green.
+
+    It was green because nothing in this suite ever called the factory:
+    each test above constructs ``BlocklistEnforcer`` by hand with
+    hand-picked arguments, which is exactly the reading that cannot see a
+    mismatch between the constructor and its only real caller. The
+    argument list is the contract, and it was tested on one side only.
+    """
+
+    def test_get_block_enforcer_builds_a_real_enforcer(self) -> None:
+        from app.domains.guest_access.dependencies import get_block_enforcer
+
+        enforcer = get_block_enforcer(db=object(), router_service=object())
+
+        assert isinstance(enforcer, BlocklistEnforcer)
+
+    def test_the_controller_terminator_reaches_the_terminator_that_uses_it(
+        self,
+    ) -> None:
+        """Constructing is not enough: the hook has to arrive where the
+        device work happens. ``BlocklistEnforcer`` does none itself -- it
+        delegates to ``LiveSessionTerminator`` -- so a version that
+        accepted the argument and dropped it would construct fine, pass
+        the test above, and still leave a controller venue unable to end
+        anything."""
+        sentinel = object()
+
+        enforcer = BlocklistEnforcer(
+            session_lookup=object(),
+            router_lookup=object(),
+            terminated_session_status=TERMINATED,
+            controller_terminator=sentinel,
+        )
+
+        assert enforcer.terminator.controller_terminator is sentinel

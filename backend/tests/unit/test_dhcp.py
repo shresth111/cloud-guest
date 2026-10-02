@@ -540,7 +540,7 @@ class TestListPoolsForRouter:
 
 class TestEveryRouteRequiresPermission:
     def test_every_dhcp_route_has_a_permission_dependency(self) -> None:
-        assert len(dhcp_router.routes) == 9
+        assert len(dhcp_router.routes) == 11
         for route in dhcp_router.routes:
             assert (
                 route.dependencies != []
@@ -2006,3 +2006,293 @@ class TestCaptivePortalDhcpOptionLeafReachability:
             DhcpDeviceConnectionError("10.20.0.19", "timed out"),
         ):
             assert self._run_leaf(monkeypatch, exc)["changed"] is False
+
+
+
+# ============================================================================
+# DHCP leases -- the firewall device picker's "keep this device on the same
+# address". A rule by address is only as stable as the lease under it.
+# ============================================================================
+
+
+@dataclass
+class FakeLeaseAdapter:
+    vendor: str = "mikrotik"
+    leases: list = field(default_factory=list)
+    keeps: list[dict[str, object]] = field(default_factory=list)
+    changed: bool = True
+    raises: Exception | None = None
+
+    async def read_dhcp_leases(self, credentials):
+        if self.raises is not None:
+            raise self.raises
+        return list(self.leases)
+
+    async def keep_dhcp_lease_address(self, credentials, *, mac_address, address):
+        self.keeps.append(
+            {"host": credentials.host, "mac_address": mac_address, "address": address}
+        )
+        if self.raises is not None:
+            raise self.raises
+        from app.domains.dhcp.device_adapters import DhcpLeaseReading
+
+        return (
+            DhcpLeaseReading(
+                mac_address=mac_address,
+                address=address,
+                dynamic=False,
+                status="bound",
+                host_name="printer",
+                server="dhcp-lan",
+                disabled=False,
+            ),
+            self.changed,
+        )
+
+
+@pytest.fixture
+def lease_adapter(monkeypatch: pytest.MonkeyPatch) -> FakeLeaseAdapter:
+    fake = FakeLeaseAdapter()
+    monkeypatch.setattr(
+        "app.domains.dhcp.service.get_dhcp_adapter", lambda vendor: fake
+    )
+    return fake
+
+
+class TestKeepLeaseAddress:
+    async def test_keeps_the_address_and_audits_the_change(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        lease, changed = await h.service.keep_lease_address(
+            router.id,
+            mac_address="aa-bb-cc-00-00-20",
+            ip_address=" 192.168.88.20 ",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert changed is True
+        assert lease.dynamic is False
+        # Normalized before it reaches the device.
+        assert lease_adapter.keeps == [
+            {
+                "host": "10.0.0.1",
+                "mac_address": "AA:BB:CC:00:00:20",
+                "address": "192.168.88.20",
+            }
+        ]
+        assert [e["action"] for e in h.audit_writer.entries] == [
+            AuditAction.DHCP_LEASE_MADE_STATIC.value
+        ]
+        assert h.audit_writer.entries[0]["entity_type"] == "router"
+
+    async def test_already_kept_is_not_audited(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.changed = False
+
+        _, changed = await h.service.keep_lease_address(
+            router.id,
+            mac_address="AA:BB:CC:00:00:20",
+            ip_address="192.168.88.20",
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert changed is False
+        assert h.audit_writer.entries == []
+
+    async def test_another_tenants_router_is_not_found(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.keep_lease_address(
+                router.id,
+                mac_address="AA:BB:CC:00:00:20",
+                ip_address="192.168.88.20",
+                actor_user_id=None,
+                requesting_organization_id=uuid.uuid4(),
+            )
+        assert lease_adapter.keeps == []
+
+    @pytest.mark.parametrize(
+        ("mac", "ip"),
+        [
+            ("not-a-mac", "192.168.88.20"),
+            ("AA:BB:CC:00:00:20", "192.168.88.0/24"),
+            ("AA:BB:CC:00:00:20", "fe80::1"),
+            ("AA:BB:CC:00:00:20", "printer"),
+        ],
+    )
+    async def test_bad_input_is_refused_before_the_device(
+        self, lease_adapter: FakeLeaseAdapter, mac: str, ip: str
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(InvalidIpAddressError):
+            await h.service.keep_lease_address(
+                router.id,
+                mac_address=mac,
+                ip_address=ip,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert lease_adapter.keeps == []
+
+    async def test_controller_managed_router_is_refused_before_the_device(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        from app.domains.router.device_domain_gate import (
+            ControllerManagedFeatureUnavailableError,
+        )
+
+        h = make_harness()
+        router = _make_router()
+        router.vendor = "tplink_omada"
+        h.router_lookup.add(router)
+
+        with pytest.raises(ControllerManagedFeatureUnavailableError):
+            await h.service.keep_lease_address(
+                router.id,
+                mac_address="AA:BB:CC:00:00:20",
+                ip_address="192.168.88.20",
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        with pytest.raises(ControllerManagedFeatureUnavailableError):
+            await h.service.list_router_leases(
+                router.id, requesting_organization_id=router.organization_id
+            )
+        assert lease_adapter.keeps == []
+
+    async def test_missing_credentials_are_refused(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        h.router_lookup.secret = None
+
+        with pytest.raises(DhcpMissingCredentialsError):
+            await h.service.keep_lease_address(
+                router.id,
+                mac_address="AA:BB:CC:00:00:20",
+                ip_address="192.168.88.20",
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+    async def test_list_router_leases_reads_the_device(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        from app.domains.dhcp.device_adapters import DhcpLeaseReading
+
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.leases = [
+            DhcpLeaseReading(
+                mac_address="AA:BB:CC:00:00:20",
+                address="192.168.88.20",
+                dynamic=True,
+                status="bound",
+                host_name="printer",
+                server="dhcp-lan",
+                disabled=False,
+            )
+        ]
+
+        leases = await h.service.list_router_leases(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert [(x.mac_address, x.dynamic) for x in leases] == [
+            ("AA:BB:CC:00:00:20", True)
+        ]
+
+    async def test_a_failed_read_is_an_error_not_an_empty_list(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.raises = DhcpDeviceConnectionError("10.0.0.1", "timed out")
+
+        with pytest.raises(DhcpDeviceConnectionError):
+            await h.service.list_router_leases(
+                router.id, requesting_organization_id=router.organization_id
+            )
+
+
+class TestMikroTikLeaseAdapterTranslatesRefusals:
+    """The gateway's two lease refusals become 409s with a code the
+    frontend can name; everything else stays a 502."""
+
+    async def _keep(self, monkeypatch: pytest.MonkeyPatch, exc: Exception):
+        from app.domains.dhcp import device_adapters as mod
+
+        class _Gateway:
+            async def keep_dhcp_lease_address(self, creds, *, mac_address, address):
+                raise exc
+
+        monkeypatch.setattr(mod, "get_adapter", lambda vendor: _Gateway())
+        return await mod.MikroTikDhcpAdapter().keep_dhcp_lease_address(
+            mod.DhcpCredentials(host="10.0.0.1", username="u", password="p"),
+            mac_address="AA:BB:CC:00:00:20",
+            address="192.168.88.20",
+        )
+
+    async def test_no_lease_is_a_409_with_a_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from wyfy_device_gateway.mikrotik_adapter import MikroTikLeaseNotFoundError
+
+        from app.domains.dhcp.exceptions import DhcpLeaseNotFoundError
+
+        with pytest.raises(DhcpLeaseNotFoundError) as info:
+            await self._keep(
+                monkeypatch, MikroTikLeaseNotFoundError("10.0.0.1", "no lease")
+            )
+        assert info.value.status_code == 409
+        assert info.value.data["code"] == "DHCP_LEASE_NOT_FOUND"
+
+    @pytest.mark.parametrize(
+        ("reason", "code"),
+        [
+            ("moved", "DHCP_LEASE_ADDRESS_CHANGED"),
+            ("reserved_elsewhere", "DHCP_LEASE_RESERVED_ELSEWHERE"),
+        ],
+    )
+    async def test_conflicts_carry_the_current_address(
+        self, monkeypatch: pytest.MonkeyPatch, reason: str, code: str
+    ) -> None:
+        from wyfy_device_gateway.mikrotik_adapter import MikroTikLeaseConflictError
+
+        from app.domains.dhcp.exceptions import DhcpLeaseConflictError
+
+        with pytest.raises(DhcpLeaseConflictError) as info:
+            await self._keep(
+                monkeypatch,
+                MikroTikLeaseConflictError(
+                    "10.0.0.1", "x", reason=reason, current_address="192.168.88.55"
+                ),
+            )
+        assert info.value.status_code == 409
+        assert info.value.data["code"] == code
+        assert info.value.data["current_address"] == "192.168.88.55"
+
+    async def test_a_device_failure_stays_a_502(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from wyfy_device_gateway.mikrotik_adapter import MikroTikDeviceError
+
+        with pytest.raises(DhcpDeviceOperationError):
+            await self._keep(
+                monkeypatch, MikroTikDeviceError("10.0.0.1", "not read back")
+            )

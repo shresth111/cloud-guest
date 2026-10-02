@@ -111,6 +111,7 @@ import httpx
 
 from ..controller_contract import (
     AuthorizationResult,
+    ClientRateLimit,
     ControllerAuthMode,
     ControllerClient,
     ControllerCredentials,
@@ -124,11 +125,13 @@ from ..controller_contract import (
     PortalSetupReport,
     PortalSetupSpec,
 )
+from . import client_control as client_control_module
 from . import clients as clients_module
 from . import deauth as deauth_module
 from . import devices as devices_module
 from . import portal as portal_module
 from . import portal_setup as portal_setup_module
+from . import radius_portal as radius_portal_module
 from . import sites as sites_module
 from .auth import SessionCache
 from .client import OmadaHttpClient, SleepFn
@@ -215,6 +218,31 @@ class OmadaControllerAdapter:
                 "which can authorize guests but cannot read the controller's "
                 "inventory. Add Open API credentials (controller v5.13+, "
                 "Settings > Platform Integration > Open API) to enable it."
+            )
+
+    @staticmethod
+    def _require_openapi_action(creds: ControllerCredentials, action: str) -> None:
+        """The write-shaped twin of :meth:`_require_openapi`.
+
+        Same refusal, phrased for an action rather than a listing: "Listing
+        blocking a client needs Open API access" is not a sentence. Kept
+        separate rather than reworded in place so the inventory reads keep
+        the exact message their own callers and tests already expect.
+
+        This is a genuine capability boundary, not a configuration mistake.
+        Per-client rate limits and block/unblock live in the site tree behind
+        an admin or Open API session; the hotspot-operator session a
+        ``legacy`` integration holds reaches the portal and nothing else
+        (CAPABILITY-MATRIX section 7). There is no fallback to offer.
+        """
+        if creds.auth_mode != ControllerAuthMode.OPENAPI:
+            raise OmadaUnsupportedApiError(
+                f"{action} needs Omada Open API access. This integration is "
+                "configured with a hotspot operator login, which can "
+                "authorize and disconnect guests but cannot change a client's "
+                "settings on the controller. Add Open API credentials "
+                "(controller v5.13+, Settings > Platform Integration > Open "
+                "API) to enable it."
             )
 
     # -- identity ---------------------------------------------------------
@@ -425,6 +453,50 @@ class OmadaControllerAdapter:
                 now=self._clock() if self._clock else None,
             )
 
+    async def authorize_guest_via_radius_portal(
+        self,
+        creds: ControllerCredentials,
+        ctx: radius_portal_module.RadiusPortalContext,
+        *,
+        username: str,
+        password: str,
+        portal_port: int | None = None,
+    ) -> radius_portal_module.RadiusBrowserAuthResult:
+        """The ``authType 2`` gate-opener: form-POST ``browserauth``.
+
+        A different contract from :meth:`authorize_guest`, not a variant of
+        it -- see ``radius_portal.py``. In particular it needs **no
+        credential of ours at all**: no operator login, no Open API secret,
+        no session. ``username`` is the guest's own identifier, which this
+        product's RADIUS server authorizes by session lookup.
+
+        ``creds.base_url`` is the controller's *management* address as
+        stored on the integration. The portal listener is a different port,
+        and this method is where that is resolved -- from the stored scheme
+        plus ``portal_port`` (an explicit operator override) or the
+        documented default. It is never taken from the request that
+        triggered the call; :func:`radius_portal.resolve_portal_origin` is
+        the SSRF boundary and says why at length.
+
+        Everything else about trust is inherited untouched: the credentials
+        are re-pointed at the portal origin and handed to the same
+        ``tls.py`` machinery every other call uses, so ``tls_mode`` and
+        ``tls_pinned_sha256`` mean exactly what they mean everywhere else.
+        """
+        portal_creds = replace(
+            creds,
+            base_url=radius_portal_module.resolve_portal_origin(
+                creds.base_url, portal_port
+            ),
+        )
+        return await radius_portal_module.submit_browserauth(
+            portal_creds,
+            ctx,
+            username=username,
+            password=password,
+            transport=self._transport,
+        )
+
     async def deauthorize_guest(
         self, creds: ControllerCredentials, site_id: str, client_mac: str
     ) -> bool:
@@ -474,6 +546,69 @@ class OmadaControllerAdapter:
         async with self._client(portal_creds) as client:
             omadac_id = await client.resolve_omadac_id()
             return await deauth_module.deauthorize_client(
+                client, omadac_id, site_id, client_mac
+            )
+
+    # -- per-client control (Open API only) --------------------------------
+
+    async def set_client_rate_limit(
+        self,
+        creds: ControllerCredentials,
+        site_id: str,
+        client_mac: str,
+        *,
+        down_kbps: int | None = None,
+        up_kbps: int | None = None,
+    ) -> ClientRateLimit:
+        """See ``client_control.py`` for the provenance of the endpoint and
+        for why the 1-1024 range is clamped on our side rather than the
+        controller's.
+
+        ``_require_openapi`` rather than the operator-session pattern
+        ``deauthorize_guest`` uses: this write lives on the client record in
+        the site tree, not in the hotspot tree, and a hotspot operator
+        session cannot reach it at all. That is the refusal a ``legacy``
+        integration gets, and it is a real one -- there is no fallback.
+        """
+        self._require_openapi_action(creds, "Setting a client's speed limit")
+        async with self._client(creds) as client:
+            omadac_id = await client.resolve_omadac_id()
+            return await client_control_module.set_client_rate_limit(
+                client,
+                omadac_id,
+                site_id,
+                client_mac,
+                down_kbps=down_kbps,
+                up_kbps=up_kbps,
+            )
+
+    async def clear_client_rate_limit(
+        self, creds: ControllerCredentials, site_id: str, client_mac: str
+    ) -> ClientRateLimit:
+        self._require_openapi_action(creds, "Setting a client's speed limit")
+        async with self._client(creds) as client:
+            omadac_id = await client.resolve_omadac_id()
+            return await client_control_module.clear_client_rate_limit(
+                client, omadac_id, site_id, client_mac
+            )
+
+    async def block_client(
+        self, creds: ControllerCredentials, site_id: str, client_mac: str
+    ) -> bool:
+        self._require_openapi_action(creds, "Blocking a client")
+        async with self._client(creds) as client:
+            omadac_id = await client.resolve_omadac_id()
+            return await client_control_module.block_client(
+                client, omadac_id, site_id, client_mac
+            )
+
+    async def unblock_client(
+        self, creds: ControllerCredentials, site_id: str, client_mac: str
+    ) -> bool:
+        self._require_openapi_action(creds, "Unblocking a client")
+        async with self._client(creds) as client:
+            omadac_id = await client.resolve_omadac_id()
+            return await client_control_module.unblock_client(
                 client, omadac_id, site_id, client_mac
             )
 

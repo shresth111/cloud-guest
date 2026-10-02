@@ -21,7 +21,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import (
+    DateTime,
+    Integer,
+    and_,
+    case,
+    cast,
+    exists,
+    func,
+    literal,
+    or_,
+    select,
+    true,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
@@ -33,8 +45,14 @@ from app.domains.connected_devices.models import ConnectedDevice
 from app.domains.guest_access.validators import identifier_match_terms
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
+from app.domains.router.fleet_scope import agent_managed_only
+from app.domains.router.models import Router
 
-from .constants import GuestSessionStatus
+from .constants import (
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
+    SESSION_ACTIVITY_GRACE_MINUTES,
+    GuestSessionStatus,
+)
 from .models import (
     Guest,
     GuestConsent,
@@ -74,6 +92,22 @@ class SessionAggregate:
     unique_guests: int
     avg_duration_seconds: float | None
     total_bandwidth_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardSeriesAggregate:
+    """Raw aggregates behind ``GET /guest-analytics/dashboard-series``.
+
+    ``arrivals_by_bucket``/``online_by_bucket`` are sparse -- keyed by bucket
+    index (0 = the first bucket start the service computed), holding only
+    buckets with a non-zero count. The service zero-fills."""
+
+    guests: int
+    sessions: int
+    avg_session_seconds: float | None
+    arrivals_by_bucket: dict[int, int]
+    online_by_bucket: dict[int, int]
+    os_counts: dict[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +164,18 @@ class QuotaUsageWithOrgTimezone:
 
     usage: GuestQuotaUsage
     organization_timezone: str
+
+
+def _location_condition(
+    column: ColumnElement, location_id: uuid.UUID | Sequence[uuid.UUID]
+) -> ColumnElement[bool]:
+    """``column == id`` for one location, ``column IN (...)`` for several --
+    the hand-written counterpart of ``apply_filters``' list handling, so a
+    caller confined to particular sites (``GuestService
+    ._confined_location_filter``) can be expressed on these range queries."""
+    if isinstance(location_id, uuid.UUID):
+        return column == location_id
+    return column.in_(list(location_id))
 
 
 def guest_identifier_clause(
@@ -269,7 +315,7 @@ class GuestRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -305,6 +351,14 @@ class GuestRepositoryProtocol(Protocol):
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]: ...
 
+    async def venue_activity_was_reported_since(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        since: datetime,
+    ) -> bool: ...
+
     async def list_active_sessions_for_guest(
         self, guest_id: uuid.UUID
     ) -> list[GuestSession]: ...
@@ -312,6 +366,12 @@ class GuestRepositoryProtocol(Protocol):
     async def list_active_sessions_for_router(
         self, router_id: uuid.UUID
     ) -> list[GuestSession]: ...
+
+    async def list_active_sessions_for_location(
+        self, *, organization_id: uuid.UUID, location_id: uuid.UUID
+    ) -> list[GuestSession]: ...
+
+    async def list_routers_with_active_sessions(self) -> list[Router]: ...
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]: ...
 
@@ -434,11 +494,24 @@ class GuestRepositoryProtocol(Protocol):
         auth_method: str,
     ) -> SessionAggregate: ...
 
+    async def get_dashboard_series(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        first_bucket_start: datetime,
+        bucket_seconds: int,
+        bucket_count: int,
+        now: datetime,
+    ) -> DashboardSeriesAggregate: ...
+
     async def list_login_history(
         self,
         *,
         organization_id: uuid.UUID | None,
-        location_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None = None,
         guest_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
@@ -448,7 +521,7 @@ class GuestRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -996,7 +1069,7 @@ class GuestRepository:
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -1023,7 +1096,9 @@ class GuestRepository:
             GuestSession.is_deleted.is_(False),
         ]
         if location_id is not None:
-            conditions.append(GuestSession.location_id == location_id)
+            conditions.append(
+                _location_condition(GuestSession.location_id, location_id)
+            )
 
         count_statement = (
             select(func.count()).select_from(GuestSession).where(*conditions)
@@ -1172,23 +1247,99 @@ class GuestRepository:
         return result.scalars().first()
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
-        """Active sessions whose ``last_activity_at`` plus their own
-        ``session_timeout_minutes`` has already passed ``now`` -- a
-        per-row-varying comparison ``GenericRepository``'s equality-filter
-        support cannot express, hence hand-written here. Uses Postgres's
-        ``make_interval`` so the comparison happens entirely server-side
-        (real SQL, not a Python-side scan) regardless of how many active
-        sessions exist."""
+        """Active sessions ``validators.is_session_stale`` would expire, as
+        one server-side query (real SQL, not a Python-side scan):
+
+        * no reported activity for longer than the idle cutoff -- the
+          smaller of ``idle_timeout_minutes``/``session_timeout_minutes``
+          (Postgres ``LEAST`` ignores NULLs), else
+          ``DEFAULT_IDLE_TIMEOUT_MINUTES`` -- plus the grace; or
+        * open longer than ``session_timeout_minutes`` plus the grace.
+
+        A per-row-varying comparison ``GenericRepository``'s equality-filter
+        support cannot express, hence hand-written here. Keep it in lockstep
+        with ``validators.session_idle_cutoff_minutes``."""
+        idle_cutoff = func.coalesce(
+            func.least(
+                GuestSession.idle_timeout_minutes,
+                GuestSession.session_timeout_minutes,
+            ),
+            DEFAULT_IDLE_TIMEOUT_MINUTES,
+        )
+        idle_expired = (
+            GuestSession.last_activity_at
+            + func.make_interval(
+                0, 0, 0, 0, 0, idle_cutoff + SESSION_ACTIVITY_GRACE_MINUTES
+            )
+            < now
+        )
+        time_limit_overrun = and_(
+            GuestSession.session_timeout_minutes.isnot(None),
+            GuestSession.started_at
+            + func.make_interval(
+                0,
+                0,
+                0,
+                0,
+                0,
+                GuestSession.session_timeout_minutes + SESSION_ACTIVITY_GRACE_MINUTES,
+            )
+            < now,
+        )
         statement = select(GuestSession).where(
             GuestSession.status == GuestSessionStatus.ACTIVE.value,
-            GuestSession.session_timeout_minutes.isnot(None),
             GuestSession.is_deleted.is_(False),
-            GuestSession.last_activity_at
-            + func.make_interval(0, 0, 0, 0, 0, GuestSession.session_timeout_minutes)
-            < now,
+            or_(idle_expired, time_limit_overrun),
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def venue_activity_was_reported_since(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        since: datetime,
+    ) -> bool:
+        """Has anything actually moved ``last_activity_at`` at this venue
+        since ``since``? One indexed EXISTS, no network call.
+
+        **This is an observation, not a declaration**, and the difference is
+        the whole point. ``client_capabilities`` can say a venue's controller
+        is *able* to report per-client traffic; it cannot say anything is
+        reporting, because it contacts nothing. This can: the idle half of
+        the timeout sweep reads ``now - last_activity_at``, so the honest
+        precondition for applying it is that something writes that column
+        here.
+
+        ``last_activity_at > started_at`` is the discriminator and it is
+        load-bearing. The column is *initialised* to ``now`` when a session
+        is created, so "recent ``last_activity_at``" on its own is satisfied
+        by a login and proves nothing. Only a later write moves it past
+        ``started_at``, and the writers are the two producers the sweep
+        depends on -- RADIUS accounting Interim-Updates and the Omada
+        Open-API usage poll, both through ``GuestService.record_usage``,
+        which bumps the column on every interim regardless of byte deltas,
+        so this measures *reporting* rather than how busy the guests are.
+        (``resume_session``/``extend_session`` also touch it; an operator
+        extending a session at this venue in the last few minutes is a
+        false positive, and a rare, bounded and self-clearing one -- it can
+        only make the sweep behave as it did before this existed.)
+
+        Ended sessions count. A venue whose guests all left ten minutes ago
+        was still being reported on, and excluding them would make a quiet
+        venue look unreported.
+        """
+        statement = select(
+            exists().where(
+                GuestSession.organization_id == organization_id,
+                GuestSession.location_id == location_id,
+                GuestSession.is_deleted.is_(False),
+                GuestSession.last_activity_at >= since,
+                GuestSession.last_activity_at > GuestSession.started_at,
+            )
+        )
+        return bool(await self.session.scalar(statement))
 
     async def list_active_sessions_for_guest(
         self, guest_id: uuid.UUID
@@ -1213,6 +1364,61 @@ class GuestRepository:
         return await self.sessions.get_all(
             filters={"router_id": router_id, "status": GuestSessionStatus.ACTIVE.value}
         )
+
+    async def list_active_sessions_for_location(
+        self, *, organization_id: uuid.UUID, location_id: uuid.UUID
+    ) -> list[GuestSession]:
+        """Every currently ``ACTIVE`` session at one venue -- the Open Hours
+        sweep's entire working set (``service.enforce_open_hours_online_guests``).
+
+        Scoped by ``organization_id`` as well as ``location_id`` rather than by
+        location alone. Both columns are denormalized onto ``guest_sessions``
+        (see that model's own note), so neither costs a join; matching a
+        location id without its tenant is the shape a cross-tenant read takes
+        the day a location id is wrong or reused, and this is a query whose
+        result gets *terminated*, so it is worth the second predicate.
+
+        Ordered by ``started_at`` so a sweep over a venue reads its guests in
+        the order they arrived -- a stable order costs nothing and makes the
+        log lines from one run line up with the next."""
+        statement = (
+            select(GuestSession)
+            .where(
+                GuestSession.organization_id == organization_id,
+                GuestSession.location_id == location_id,
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+                GuestSession.is_deleted.is_(False),
+            )
+            .order_by(GuestSession.started_at)
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_routers_with_active_sessions(self) -> list[Router]:
+        """Every agent-managed, non-deleted router that currently has at
+        least one ``ACTIVE`` session -- the presence sweep's fan-out list
+        (``tasks.run_session_presence_sweep``).
+
+        Narrowed two ways in SQL, for two different reasons. By active
+        session: a router nobody is signed in on has nothing to reconcile,
+        so it is never dialled. By ``agent_managed_only``: every row returned
+        here is handed to a RouterOS API read with the row's own stored
+        credentials, which a controller-managed row (an Omada controller)
+        has NULL by construction -- see ``app.domains.router.fleet_scope``."""
+        has_active_session = (
+            select(GuestSession.id)
+            .where(
+                GuestSession.router_id == Router.id,
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+                GuestSession.is_deleted.is_(False),
+            )
+            .exists()
+        )
+        statement = agent_managed_only(
+            select(Router).where(Router.is_deleted.is_(False), has_active_session)
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
         """Every distinct ``(guest_id, organization_id, location_id)``
@@ -1586,7 +1792,7 @@ class GuestRepository:
         self,
         *,
         organization_id: uuid.UUID | None,
-        location_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None = None,
         guest_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
@@ -1616,7 +1822,7 @@ class GuestRepository:
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
         start: datetime,
         end: datetime,
         page: int,
@@ -1634,7 +1840,9 @@ class GuestRepository:
             GuestLoginHistory.is_deleted.is_(False),
         ]
         if location_id is not None:
-            conditions.append(GuestLoginHistory.location_id == location_id)
+            conditions.append(
+                _location_condition(GuestLoginHistory.location_id, location_id)
+            )
 
         count_statement = (
             select(func.count()).select_from(GuestLoginHistory).where(*conditions)
@@ -1693,6 +1901,160 @@ class GuestRepository:
             if avg_duration is not None
             else None,
             total_bandwidth_bytes=int(total_bandwidth or 0),
+        )
+
+    async def get_dashboard_series(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        first_bucket_start: datetime,
+        bucket_seconds: int,
+        bucket_count: int,
+        now: datetime,
+    ) -> DashboardSeriesAggregate:
+        """Four bounded SQL aggregates for one location's ``[start, end)``.
+
+        Tenant scope is ``organization_id`` AND ``location_id`` on every
+        statement, so a location id belonging to another organization simply
+        matches no rows.
+
+        Buckets are fixed-width (``bucket_seconds``) from
+        ``first_bucket_start``, so a timestamp's bucket index is integer
+        arithmetic on its epoch offset. That lets the *online* series expand
+        each session into only the bucket indexes it actually spans
+        (``generate_series(i_min, i_max)`` per session) instead of
+        cross-joining every session against every bucket: rows produced are
+        proportional to session-bucket overlaps, not sessions x buckets.
+        Every returned row set is at most ``bucket_count`` rows (or six, for
+        the OS breakdown) -- no per-session rows ever reach Python.
+
+        Semantics, bucket ``i`` clipped to the window as
+        ``[lo_i, hi_i) = [max(bucket_start_i, start), min(bucket_end_i, end))``:
+
+        * arrival: ``lo_i <= started_at < hi_i``;
+        * online: ``started_at < hi_i AND coalesce(ended_at, now) > lo_i`` --
+          an open session is treated as ending ``now``, so it is never counted
+          in a bucket that starts at or after ``now``.
+
+        ``i_min`` is the bucket holding ``max(started_at, start)``; ``i_max`` is
+        the last bucket whose start is strictly before the effective end
+        (``ceil(offset / width) - 1``), capped at the final bucket.
+        """
+        first = literal(first_bucket_start, DateTime(timezone=True))
+        width = literal(bucket_seconds, Integer)
+        start_ts = literal(start, DateTime(timezone=True))
+        end_ts = literal(end, DateTime(timezone=True))
+        now_ts = literal(now, DateTime(timezone=True))
+
+        def bucket_index(timestamp, rounding) -> object:
+            offset_seconds = func.extract("epoch", timestamp - first)
+            return cast(rounding(offset_seconds / width), Integer)
+
+        tenant = (
+            GuestSession.organization_id == organization_id,
+            GuestSession.location_id == location_id,
+            GuestSession.is_deleted.is_(False),
+        )
+        started_in_window = (
+            *tenant,
+            GuestSession.started_at >= start_ts,
+            GuestSession.started_at < end_ts,
+        )
+        effective_end = func.coalesce(GuestSession.ended_at, now_ts)
+
+        # -- totals over sessions started in the window ----------------------
+        measured_end = func.coalesce(GuestSession.ended_at, func.least(now_ts, end_ts))
+        duration_seconds = func.greatest(
+            func.extract("epoch", measured_end - GuestSession.started_at), 0
+        )
+        totals_statement = select(
+            func.count(GuestSession.id),
+            func.count(
+                func.distinct(
+                    func.coalesce(GuestSession.guest_id, GuestSession.device_id)
+                )
+            ),
+            func.avg(duration_seconds),
+        ).where(*started_in_window)
+        sessions, guests, avg_duration = (
+            await self.session.execute(totals_statement)
+        ).one()
+
+        # -- arrivals per bucket ----------------------------------------------
+        arrivals_subquery = (
+            select(bucket_index(GuestSession.started_at, func.floor).label("i"))
+            .where(*started_in_window)
+            .subquery()
+        )
+        arrivals_statement = select(arrivals_subquery.c.i, func.count()).group_by(
+            arrivals_subquery.c.i
+        )
+        arrivals_rows = (await self.session.execute(arrivals_statement)).all()
+
+        # -- online per bucket ------------------------------------------------
+        spans_subquery = (
+            select(
+                bucket_index(
+                    func.greatest(GuestSession.started_at, start_ts), func.floor
+                ).label("i_min"),
+                func.least(
+                    bucket_index(effective_end, func.ceil) - 1,
+                    literal(bucket_count - 1, Integer),
+                ).label("i_max"),
+            )
+            .where(
+                *tenant,
+                GuestSession.started_at < end_ts,
+                effective_end > start_ts,
+            )
+            .subquery()
+        )
+        bucket_indexes = (
+            func.generate_series(spans_subquery.c.i_min, spans_subquery.c.i_max)
+            .table_valued("i")
+            .render_derived(name="spanned")
+            .lateral()
+        )
+        online_statement = (
+            select(bucket_indexes.c.i, func.count())
+            .select_from(spans_subquery)
+            .join(bucket_indexes, true())
+            .group_by(bucket_indexes.c.i)
+        )
+        online_rows = (await self.session.execute(online_statement)).all()
+
+        # -- OS breakdown over sessions started in the window -----------------
+        # Must stay identical to validators.classify_dashboard_os.
+        ua = func.lower(func.coalesce(GuestSession.user_agent, ""))
+        os_name = case(
+            (
+                or_(ua.contains("iphone"), ua.contains("ipad"), ua.contains("ios")),
+                "iOS",
+            ),
+            (ua.contains("android"), "Android"),
+            (ua.contains("windows"), "Windows"),
+            (or_(ua.contains("mac os"), ua.contains("macintosh")), "macOS"),
+            (ua.contains("linux"), "Linux"),
+            else_="Other",
+        )
+        os_subquery = select(os_name.label("name")).where(*started_in_window).subquery()
+        os_statement = select(os_subquery.c.name, func.count()).group_by(
+            os_subquery.c.name
+        )
+        os_rows = (await self.session.execute(os_statement)).all()
+
+        return DashboardSeriesAggregate(
+            guests=int(guests or 0),
+            sessions=int(sessions or 0),
+            avg_session_seconds=float(avg_duration)
+            if avg_duration is not None
+            else None,
+            arrivals_by_bucket={int(i): int(n) for i, n in arrivals_rows},
+            online_by_bucket={int(i): int(n) for i, n in online_rows},
+            os_counts={str(name): int(n) for name, n in os_rows},
         )
 
 

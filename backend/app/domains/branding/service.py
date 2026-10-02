@@ -273,14 +273,6 @@ _BACKGROUND_METRICS_SAMPLE_EDGE = 512
 # alike.
 _MAX_HISTOGRAM_ENTROPY_BITS = 8.0
 
-# Hard resolution floor for an *accepted* upload (spec Part 4 item 8).
-# Below this, `cover` on a 1170x2532 phone is upscaling by 2x or more
-# and no amount of processing recovers the detail -- the founder's
-# "photos look soft" complaint in physical form. Rejected loudly with a
-# reason the dashboard renders, never silently accepted-and-degraded.
-BACKGROUND_IMAGE_MIN_LONG_EDGE = 1200
-
-
 @dataclass(frozen=True, slots=True)
 class BackgroundImageMetrics:
     """What ``_process_background_image`` measured about the image, for
@@ -340,31 +332,6 @@ def _measure_background(image: Image.Image) -> BackgroundImageMetrics:
         top_luminance=_luminance_percent(top_band),
         entropy=entropy,
     )
-
-
-def _background_image_long_edge(content: bytes) -> int | None:
-    """Reads just the header of ``content`` to get its long edge, without
-    decoding any pixels -- so the ``BACKGROUND_IMAGE_MIN_LONG_EDGE``
-    rejection is answered before the (comparatively expensive) real
-    processing pass runs.
-
-    Returns ``None`` when the header cannot be read at all. That is not
-    an error here: an undecodable upload takes the same graceful
-    "store the original unchanged" path ``_process_background_image``
-    documents, and rejecting a file for being too small when we could
-    not measure it would be worse than storing it. Same enumerated
-    ``except`` list, same reasoning, as ``_process_logo``."""
-    try:
-        with Image.open(io.BytesIO(content)) as img:
-            return max(img.size)
-    except (
-        UnidentifiedImageError,
-        OSError,
-        SyntaxError,
-        ValueError,
-        Image.DecompressionBombError,
-    ):
-        return None
 
 
 def _process_background_image(
@@ -561,25 +528,6 @@ class BrandingService:
         if len(content) > BACKGROUND_IMAGE_MAX_BYTES:
             max_mb = BACKGROUND_IMAGE_MAX_BYTES // (1024 * 1024)
             raise InvalidBackgroundImageError(f"file exceeds the {max_mb}MB limit")
-
-        # Hard resolution floor (v7 spec Part 4 item 8), checked off the
-        # header only so we reject before doing any real work. Skipped
-        # when the header can't be read -- that upload takes the
-        # graceful fallback below instead, and refusing a file we could
-        # not even measure would be strictly worse.
-        source_long_edge = await asyncio.to_thread(
-            _background_image_long_edge, content
-        )
-        if (
-            source_long_edge is not None
-            and source_long_edge < BACKGROUND_IMAGE_MIN_LONG_EDGE
-        ):
-            raise InvalidBackgroundImageError(
-                f"image is only {source_long_edge}px on its longest edge -- a "
-                f"background needs at least {BACKGROUND_IMAGE_MIN_LONG_EDGE}px, "
-                "otherwise it is upscaled to fill a phone screen and looks "
-                "blurry"
-            )
 
         # Deliberately *after* the 5 MiB check: that cap is on ingress
         # bytes, not on post-compression bytes. Checking it afterwards

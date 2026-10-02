@@ -348,6 +348,25 @@ class FakeRouterRepository:
         paged = values[params.offset : params.offset + params.page_size]
         return paged, PaginationMeta.from_total(params, len(values))
 
+    async def routers_holding_identity(
+        self, *, serial_number: str, mac_address: str
+    ) -> list[Router]:
+        """Mirrors the real read: soft-deleted rows INCLUDED, because the
+        unique indexes include them."""
+        return [
+            r
+            for r in self.routers.values()
+            if r.serial_number == serial_number or r.mac_address == mac_address
+        ]
+
+    # location_id -> live network integrations there. A test sets it.
+    location_integration_counts: dict[uuid.UUID, int] = field(default_factory=dict)
+
+    async def count_live_integrations_at_location(
+        self, location_id: uuid.UUID
+    ) -> int:
+        return self.location_integration_counts.get(location_id, 0)
+
     async def create_provisioning_token(
         self, **fields: object
     ) -> RouterProvisioningToken:

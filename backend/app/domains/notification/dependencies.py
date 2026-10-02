@@ -19,8 +19,13 @@ from app.domains.otp.service import (
     get_configured_sms_provider,
 )
 
+from .onboarding_slack import (
+    OnboardingSlackNotifier,
+    resolve_master_console_base_url,
+)
 from .repository import NotificationRepository, NotificationRepositoryProtocol
 from .service import NotificationService
+from .slack import get_configured_slack_sender
 
 
 def get_notification_repository(
@@ -47,9 +52,43 @@ def get_notification_service(
             settings
         ),
         sms_provider=get_configured_sms_provider(settings),
+        # None when no webhook is configured, which is the default. The
+        # service then falls back to `UnconfiguredSlackSender`, and in
+        # practice no Slack row is ever enqueued in that state anyway --
+        # `get_onboarding_slack_notifier` below is disabled by the same
+        # condition.
+        slack_sender=get_configured_slack_sender(settings),
         max_attempts=settings.notification_max_delivery_attempts,
         retry_backoff_seconds=settings.notification_retry_backoff_seconds,
     )
 
 
-__all__ = ["get_notification_repository", "get_notification_service"]
+def get_onboarding_slack_notifier(
+    notification_service: NotificationService = Depends(get_notification_service),
+    settings: Settings = Depends(get_settings),
+) -> OnboardingSlackNotifier:
+    """The Master-console onboarding notifier, wired to the same
+    request-scoped ``NotificationService`` (and therefore the same
+    ``AsyncSession``) as everything else in the request.
+
+    That shared session is the point: a success notice enqueued through
+    this notifier commits with the onboarding it describes, or is rolled
+    back with it. See ``onboarding_slack.py``'s "Why success rides the
+    transaction and failure rides Celery".
+
+    ``enabled`` is decided here, once, from configuration -- the routers
+    that call ``notify`` never test for it and never need to know whether
+    Slack is set up.
+    """
+    return OnboardingSlackNotifier(
+        notification_service=notification_service,
+        enabled=bool(settings.slack_onboarding_webhook_url.strip()),
+        master_base_url=resolve_master_console_base_url(settings),
+    )
+
+
+__all__ = [
+    "get_notification_repository",
+    "get_notification_service",
+    "get_onboarding_slack_notifier",
+]

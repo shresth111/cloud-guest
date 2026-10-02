@@ -115,6 +115,11 @@ from app.domains.billing.constants import (
     TASK_RUN_INVOICE_OVERDUE_SWEEP,
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
+from app.domains.billing.credits_constants import (
+    RECONCILE_CREDIT_WALLETS_HOUR_UTC,
+    RECONCILE_CREDIT_WALLETS_MINUTE_UTC,
+    TASK_RECONCILE_CREDIT_WALLETS,
+)
 from app.domains.campaigns.constants import (
     CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS,
     TASK_SWEEP_CAMPAIGN_STATUS_TRANSITIONS,
@@ -132,13 +137,30 @@ from app.domains.dhcp.constants import (
     TASK_DETECT_ROGUE_DHCP_FOR_ROUTER,
     TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
 )
+from app.domains.dns_filtering.constants import (
+    DNS_BYPASS_REFRESH_INTERVAL_SECONDS,
+    TASK_PUSH_DNS_BYPASS_LISTS_FOR_ROUTER,
+    TASK_REFRESH_DNS_BYPASS_BLOCKLISTS,
+)
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
+    OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
     QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
+    SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS,
     SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
+    TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
+    TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
+    WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
+)
+from app.domains.guest_access.constants import (
+    CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+    DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP,
+    TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP,
 )
 from app.domains.hub_reconciliation.constants import (
     HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
@@ -147,6 +169,22 @@ from app.domains.hub_reconciliation.constants import (
 from app.domains.isp.constants import (
     ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
+)
+from app.domains.marketing.constants import (
+    DISPATCH_SWEEP_INTERVAL_SECONDS as MARKETING_DISPATCH_SWEEP_INTERVAL_SECONDS,
+)
+from app.domains.marketing.constants import (
+    MARKETING_QUEUE_NAME,
+    TASK_DISPATCH_DUE_CAMPAIGNS,
+    TASK_PRUNE_RECIPIENT_ADDRESSES,
+    TASK_REAP_STUCK_RECIPIENTS,
+    TASK_SEND_CAMPAIGN_BATCH,
+)
+from app.domains.marketing.constants import (
+    PRUNE_SWEEP_INTERVAL_SECONDS as MARKETING_PRUNE_SWEEP_INTERVAL_SECONDS,
+)
+from app.domains.marketing.constants import (
+    REAP_SWEEP_INTERVAL_SECONDS as MARKETING_REAP_SWEEP_INTERVAL_SECONDS,
 )
 from app.domains.monitoring.constants import (
     ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
@@ -159,8 +197,10 @@ from app.domains.network_diagnostics.constants import (
     TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
 )
 from app.domains.network_integration.constants import (
+    INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS,
     NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
     OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_INSTANT_ON_POLL_SWEEP,
     TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
     TASK_RUN_OMADA_USAGE_SYNC_SWEEP,
 )
@@ -229,13 +269,17 @@ celery_app = Celery(
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
         "app.domains.dhcp.tasks",
+        "app.domains.dns_filtering.tasks",
         "app.domains.guest.tasks",
+        "app.domains.guest_access.tasks",
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
+        "app.domains.marketing.tasks",
         "app.domains.monitoring.tasks",
         "app.domains.network_diagnostics.tasks",
         "app.domains.network_integration.tasks",
         "app.domains.network_integration.usage_tasks",
+        "app.domains.network_integration.instant_on_tasks",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
@@ -307,6 +351,10 @@ celery_app.conf.update(
         # left off -- one DB query plus N .delay() calls, no device I/O of
         # its own.
         TASK_DETECT_ROGUE_DHCP_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The DNS-bypass list push -- one real RouterOS round trip per
+        # opted-in router. Its coordinator (the list refresh) does outbound
+        # HTTPS to GitHub and no device I/O, so it stays on the default queue.
+        TASK_PUSH_DNS_BYPASS_LISTS_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
         # The captive-portal DHCP-option converger -- one real RouterOS
         # write per router, so it belongs here for the same reason. Routed
         # but NOT Beat-scheduled: see the constant's own note on why a
@@ -333,8 +381,42 @@ celery_app.conf.update(
         # unreachable controller must not starve the pure-DB sweeps sharing
         # the default queue.
         TASK_RUN_OMADA_USAGE_SYNC_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Outbound HTTPS to the Instant On cloud on every tick.
+        TASK_RUN_INSTANT_ON_POLL_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Releasing a controller-side device block is one real outbound
+        # HTTPS write per stranded device to a customer-owned controller --
+        # the same class of I/O as the two sweeps above and on this queue
+        # for the identical reason: one unreachable controller must not
+        # starve the pure-DB sweeps sharing the default queue. It is also
+        # the sweep it matters most to keep unblocked, because every tick it
+        # misses is a customer's own device still refused by their own WiFi.
+        TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Its RouterOS twin: one 8728 round trip per stranded device block.
+        TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Guest Marketing sends: real provider HTTP round trips (SMS,
+        # WhatsApp, email) paced by a rate limiter, so a batch can hold a
+        # worker for minutes. Their own queue keeps a large campaign from
+        # starving the pure-DB sweeps AND the device-I/O queue. The prod
+        # worker must consume it (-Q ...,marketing) -- see
+        # app.domains.marketing.tasks.
+        TASK_SEND_CAMPAIGN_BATCH: {"queue": MARKETING_QUEUE_NAME},
     },
     beat_schedule={
+        # Guest Marketing: start due campaigns (pure DB, default queue),
+        # reap rows a dead worker left in `sending` (at-most-once), and
+        # null recipient addresses after 180 days (retention).
+        "marketing-dispatch-due-campaigns": {
+            "task": TASK_DISPATCH_DUE_CAMPAIGNS,
+            "schedule": MARKETING_DISPATCH_SWEEP_INTERVAL_SECONDS,
+        },
+        "marketing-reap-stuck-recipients": {
+            "task": TASK_REAP_STUCK_RECIPIENTS,
+            "schedule": MARKETING_REAP_SWEEP_INTERVAL_SECONDS,
+        },
+        "marketing-prune-recipient-addresses": {
+            "task": TASK_PRUNE_RECIPIENT_ADDRESSES,
+            "schedule": MARKETING_PRUNE_SWEEP_INTERVAL_SECONDS,
+        },
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
         # this schedule alongside the guest session-timeout sweep, and for
         # a stronger reason than any of them: the state it repairs is one
@@ -428,6 +510,18 @@ celery_app.conf.update(
             "task": TASK_RUN_INVOICE_OVERDUE_SWEEP,
             "schedule": crontab(hour=1, minute=0),
         },
+        # Prepaid credits (spec §13.2): nightly, read-only check that every
+        # wallet equals the sum of its append-only ledger and that no
+        # finished campaign still holds a reservation. A mismatch is logged
+        # (`credit_wallet_mismatch`) and sent to the platform alert
+        # destinations; it is never auto-corrected.
+        "billing-reconcile-credit-wallets": {
+            "task": TASK_RECONCILE_CREDIT_WALLETS,
+            "schedule": crontab(
+                hour=RECONCILE_CREDIT_WALLETS_HOUR_UTC,
+                minute=RECONCILE_CREDIT_WALLETS_MINUTE_UTC,
+            ),
+        },
         # Guest Session Engine (Phase 1): the session-timeout sweep --
         # every 5 minutes, shorter than every other cadence in this
         # schedule, because a stale ``ACTIVE`` session is guest-facing/
@@ -443,6 +537,18 @@ celery_app.conf.update(
         "guest-session-timeout-sweep": {
             "task": TASK_RUN_SESSION_TIMEOUT_SWEEP,
             "schedule": SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+        },
+        # Session presence: closes ACTIVE sessions whose device is no longer
+        # in the router's own /ip/hotspot/host table. The timeout sweep above
+        # cannot do this for a guest admitted by an authorized-MAC bypass --
+        # a bypassed host sends no RADIUS accounting, so last_activity_at
+        # never moves and "idle" collapses into the full session timeout.
+        # Print-only RouterOS reads, one per router with an active session,
+        # and fail-closed on any read failure. See
+        # ``app.domains.guest.service.reconcile_sessions_with_router_presence``.
+        "guest-session-presence-sweep": {
+            "task": TASK_RUN_SESSION_PRESENCE_SWEEP,
+            "schedule": SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS,
         },
         # Phase 1 BhaiFi-parity: FUP (Fair Usage Policy) time-quota accrual
         # -- every 5 minutes, the same cadence as the session-timeout sweep
@@ -465,6 +571,31 @@ celery_app.conf.update(
         "guest-quota-reset-sweep": {
             "task": TASK_RUN_QUOTA_RESET_SWEEP,
             "schedule": QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
+        },
+        # Only Allowed: ends the session of every guest a property with
+        # ``whitelist_only_enabled`` would now refuse. That flag used to be
+        # answered once, at sign-in, and never re-asked -- so switching it on
+        # stopped admitting new guests and left everyone already online
+        # exactly where they were. Every 5 minutes, the same "promptly" tier
+        # as the timeout sweep above. See ``app.domains.guest.tasks
+        # .run_whitelist_only_enforcement_sweep``'s own docstring and
+        # ``app.domains.guest.constants
+        # .WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``.
+        "guest-whitelist-only-enforcement-sweep": {
+            "task": TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
+            "schedule": WHITELIST_ONLY_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
+        },
+        # Open Hours: ends the session of every guest still online at a venue
+        # whose own schedule says it is closed right now. Open Hours used to
+        # refuse new sign-ins only, so a venue that closes at 22:00 kept
+        # serving everyone already connected -- the feature appearing not to
+        # work. Same 5-minute tier as the timeout sweep above. See
+        # ``app.domains.guest.tasks.run_open_hours_enforcement_sweep``'s own
+        # docstring and ``app.domains.guest.constants
+        # .OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS``.
+        "guest-open-hours-enforcement-sweep": {
+            "task": TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
+            "schedule": OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
         },
         # Provisioning Engine: drains the real "Postgres row + Redis
         # wake-up signal" queue app.domains.provisioning_engine
@@ -543,6 +674,13 @@ celery_app.conf.update(
         "dhcp-rogue-detection-sweep": {
             "task": TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
             "schedule": ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
+        },
+        # DNS bypass layers: refresh the platform's public DoH lists (once,
+        # platform-wide) and push them to routers that opted in. See
+        # app.domains.dns_filtering.tasks. Six hours.
+        "dns-bypass-blocklist-refresh": {
+            "task": TASK_REFRESH_DNS_BYPASS_BLOCKLISTS,
+            "schedule": DNS_BYPASS_REFRESH_INTERVAL_SECONDS,
         },
         # Queue Management Engine: re-evaluates every ACTIVE/SUSPENDED
         # QueueAssignment scoped to a QueueSchedule and flips its device
@@ -760,6 +898,34 @@ celery_app.conf.update(
             "task": TASK_RUN_OMADA_USAGE_SYNC_SWEEP,
             "schedule": OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS,
         },
+        # Aruba Instant On read-only poller. The tick is the floor of the
+        # per-kind cadences (Settings.instant_on_*_poll_seconds); each tick
+        # reads only the kinds whose own period elapsed. Does nothing at all
+        # unless CLOUDGUEST_INSTANT_ON_POLLER_ENABLED is true. Routed onto
+        # DEVICE_IO_QUEUE_NAME above.
+        "instant-on-poll-sweep": {
+            "task": TASK_RUN_INSTANT_ON_POLL_SWEEP,
+            "schedule": INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS,
+        },
+        # Controller-side block release. The only scheduled thing standing
+        # between a time-bound block and a permanently blocked customer
+        # device: a rule's ``expires_at`` is evaluated lazily at read time,
+        # so nothing fires when it passes, while the block itself is durable
+        # state on the venue's own hardware that nothing on the controller
+        # ever removes. It is also the retry behind the two inline releases
+        # (deactivate and delete), which leave a row open on purpose when
+        # the controller could not be reached at that moment.
+        "guest-access-controller-block-release-sweep": {
+            "task": TASK_RUN_CONTROLLER_BLOCK_RELEASE_SWEEP,
+            "schedule": CONTROLLER_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+        },
+        # Takes a device rule's ``type=blocked`` ip-binding back off each
+        # MikroTik router once the rule expires, or when an unblock could not
+        # reach the router at the time.
+        "guest-access-device-block-release-sweep": {
+            "task": TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP,
+            "schedule": DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+        },
     },
 )
 
@@ -789,6 +955,29 @@ def ping_celery_workers(
     fakes rather than a real Postgres/Redis in every unit test.
     """
     return celery_app.control.inspect(timeout=timeout).ping()
+
+
+from celery.signals import worker_ready  # noqa: E402
+
+
+@worker_ready.connect
+def _log_consumed_queues(sender=None, **_kwargs):  # noqa: ANN001
+    """Startup line naming the queues this worker consumes. A worker that
+    does not list ``marketing`` will never send a campaign (spec §9 deploy
+    trap) -- this makes that visible in the first line of its log."""
+    try:
+        queues = sorted(q.name for q in sender.app.amqp.queues.consume_from.values())
+    except Exception:  # noqa: BLE001
+        queues = []
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "celery_worker_consuming_queues",
+        extra={
+            "queues": queues,
+            "marketing_consumed": MARKETING_QUEUE_NAME in queues,
+        },
+    )
 
 
 __all__ = [

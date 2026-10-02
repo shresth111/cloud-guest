@@ -32,6 +32,55 @@ class HardwareStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class StatusSource(StrEnum):
+    """Whether this platform measures this device's liveness at all.
+
+    Not a fourth :class:`HardwareStatus`. It answers a question that is
+    upstream of the status and stays true whatever the status happens to
+    be: *does anything here ever look at this device?*
+
+    The failure it exists to stop is the one ``router-vendors.ts``'s
+    ``routerLivenessIsMeasured`` already stops one screen over. A
+    monitored-hardware row's UP/DOWN is derived from a ``ConnectedDevice``
+    row that only two writers ever touch, and both of them reach the venue
+    through a RouterOS session: the DHCP-lease discovery sync and the
+    ICMP/ARP liveness sweep. At a venue whose network is run by a vendor
+    controller there is no RouterOS session to open, so neither writer ever
+    runs -- and the row sat at ``unknown`` forever, which on the screen read
+    as "we looked and never saw it". Nothing here ever looked.
+
+    ``MEASURED`` therefore means "a probe path exists", not "a probe has
+    succeeded". A brand-new row at a MikroTik venue is ``MEASURED`` /
+    ``NEVER_OBSERVED`` from the moment it is registered, which is exactly
+    the pre-existing meaning of its ``unknown`` status and is why that
+    venue's behaviour is unchanged by this field existing.
+    """
+
+    MEASURED = "measured"
+    UNMEASURED = "unmeasured"
+
+
+class StatusReason(StrEnum):
+    """Why the status is what it is -- a machine-readable code, never prose.
+
+    Prose belongs to the console (``@/lib/device-liveness``), for the same
+    reason ``vendor_capabilities.controller_state_for`` gives: a sentence
+    composed here would be a second copy of the words, free to drift from
+    the ones a customer actually reads.
+    """
+
+    #: UP/DOWN derived from a real sighting -- the discovery sync's
+    #: ``is_active`` as re-judged by the ICMP/ARP liveness sweep.
+    LIVENESS_PROBE = "liveness_probe"
+    #: A probe path exists and has never produced a sighting of this MAC.
+    #: The pre-existing meaning of ``unknown`` at an agent-managed venue.
+    NEVER_OBSERVED = "never_observed"
+    #: No probe path exists: the router that would have to run the probe is
+    #: reached only through its vendor's controller. See
+    #: ``app.domains.router.vendor_capabilities``.
+    CONTROLLER_MANAGED = "controller_managed"
+
+
 #: How old a connected-device sighting may be before an ``is_active`` row
 #: stops meaning "UP". The device-sync sweep refreshes a genuinely live
 #: device's ``last_seen_at`` every
@@ -49,4 +98,10 @@ class HardwareStatus(StrEnum):
 STALE_SIGHTING_AFTER_SECONDS = 2 * 900 + 60  # two sweeps + a one-minute grace
 
 
-__all__ = ["HardwareStatus", "HardwareType", "STALE_SIGHTING_AFTER_SECONDS"]
+__all__ = [
+    "HardwareStatus",
+    "HardwareType",
+    "StatusReason",
+    "StatusSource",
+    "STALE_SIGHTING_AFTER_SECONDS",
+]

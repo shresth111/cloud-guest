@@ -38,6 +38,7 @@ from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest.constants import (
     BYTES_PER_MB,
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
@@ -46,6 +47,7 @@ from app.domains.guest.constants import (
     PIN_MAX_ATTEMPTS,
     PIN_STALE_AFTER_DAYS,
     RECONNECT_GRACE_MINUTES,
+    SESSION_ACTIVITY_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     WHITELIST_ONLY_LOGIN_FAILURE_REASON,
@@ -83,6 +85,7 @@ from app.domains.guest.exceptions import (
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
+    VenueClosedError,
 )
 from app.domains.guest.models import (
     Guest,
@@ -118,7 +121,9 @@ from app.domains.guest.validators import (
     is_device_limit_reached,
     is_fup_usage_exceeded,
     is_quota_exceeded,
+    is_session_stale,
     is_session_timed_out,
+    session_idle_cutoff_minutes,
     validate_nas_status_transition,
 )
 from app.domains.guest_access.constants import (
@@ -318,6 +323,16 @@ class FakeCaptivePortalService:
         collect_guest_email: bool = True,
         whitelist_only_enabled: bool = False,
         whitelist_only_denied_message: str | None = None,
+        # Open Hours. Set explicitly for the same reason
+        # `whitelist_only_enabled` is spelled out below: a
+        # `CaptivePortalConfig` constructed in memory never sees a column's
+        # server default, so an attribute left unset is `None` -- which is
+        # falsy and would let a venue read as "hours off" for the wrong
+        # reason. `is_open_now` treats a disabled schedule as always-open, so
+        # these defaults describe a venue that is open around the clock.
+        business_hours_enabled: bool = False,
+        business_hours_timezone: str = "UTC",
+        business_hours_schedule: dict[str, dict[str, object]] | None = None,
     ) -> CaptivePortalConfig:
         config = CaptivePortalConfig(
             **_base_fields(
@@ -364,6 +379,13 @@ class FakeCaptivePortalService:
                 # reason.
                 whitelist_only_enabled=whitelist_only_enabled,
                 whitelist_only_denied_message=whitelist_only_denied_message,
+                business_hours_enabled=business_hours_enabled,
+                business_hours_timezone=business_hours_timezone,
+                business_hours_schedule=(
+                    business_hours_schedule
+                    if business_hours_schedule is not None
+                    else {}
+                ),
             )
         )
         self.configs_by_org[organization_id] = config
@@ -1189,8 +1211,7 @@ class FakeGuestRepository:
             s
             for s in self.sessions.values()
             if s.status == GuestSessionStatus.ACTIVE.value
-            and s.session_timeout_minutes is not None
-            and is_session_timed_out(s, now=now)
+            and is_session_stale(s, now=now)
         ]
 
     async def list_active_sessions_for_guest(
@@ -1638,6 +1659,9 @@ def make_fixture(
     collect_guest_email: bool = True,
     whitelist_only_enabled: bool = False,
     whitelist_only_denied_message: str | None = None,
+    business_hours_enabled: bool = False,
+    business_hours_timezone: str = "UTC",
+    business_hours_schedule: dict[str, dict[str, object]] | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -1662,6 +1686,9 @@ def make_fixture(
         collect_guest_email=collect_guest_email,
         whitelist_only_enabled=whitelist_only_enabled,
         whitelist_only_denied_message=whitelist_only_denied_message,
+        business_hours_enabled=business_hours_enabled,
+        business_hours_timezone=business_hours_timezone,
+        business_hours_schedule=business_hours_schedule,
     )
     captive_portal_service.add_location(location_id, organization_id)
     router = router_service.add(organization_id=organization_id, status=router_status)
@@ -2035,9 +2062,10 @@ class TestConcurrentSessionCreationRace:
             self._reuse(fx, guest=guest, device=device),
         )
 
-        assert {first[1], second[1]} == {True, False}, (
-            "exactly one of the two concurrent logins may create a session"
-        )
+        assert {first[1], second[1]} == {
+            True,
+            False,
+        }, "exactly one of the two concurrent logins may create a session"
         assert first[0].id == second[0].id
         assert len(fx.repository.sessions) == 1
         (only_session,) = fx.repository.sessions.values()
@@ -3172,7 +3200,6 @@ class TestMacWhitelistLogin:
         assert resolved.config.username_password_enabled is True
 
 
-
 class TestGuestQueueAssignmentIsOffTheRequestPath:
     """Design spec §5 S9. ``_assign_guest_queue`` opened a fresh TCP
     connection to the venue's MikroTik -- no pooling, 10-second timeout --
@@ -3590,9 +3617,7 @@ class TestFupQuotaReadsAreBatched:
         """A period nothing limits was skipped by the old loop too --
         batching must not turn it into a row this path writes."""
         fx = make_fixture(
-            policy_lookup=FakeFupPolicyLookup(
-                fup_rules={"daily_data_limit_mb": 1000}
-            )
+            policy_lookup=FakeFupPolicyLookup(fup_rules={"daily_data_limit_mb": 1000})
         )
         batched: list[list[str]] = []
         original = fx.repository.get_quota_usages
@@ -4075,6 +4100,43 @@ class TestBulkDeviceLookup:
 # ============================================================================
 
 
+_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+#: Every weekday closed, and every weekday 00:00-23:59. The only two spellings
+#: of "definitely closed" / "definitely open" that do not depend on which day
+#: the suite happens to run on -- `is_open_now` reads the *current* weekday's
+#: entry, so a schedule with one closed day in it would pass on a Tuesday and
+#: fail on a Wednesday.
+_ALWAYS_CLOSED_SCHEDULE: dict[str, dict[str, object]] = {
+    day: {"open": False} for day in _WEEKDAYS
+}
+_ALWAYS_OPEN_SCHEDULE: dict[str, dict[str, object]] = {
+    day: {"open": True, "start": "00:00", "end": "23:59"} for day in _WEEKDAYS
+}
+
+
+def _shut_the_venue(fx: Fixture) -> None:
+    """Close this venue's own Open Hours, after the fact.
+
+    Mutating the resolved config rather than building the fixture closed is
+    deliberate: a venue that is already shut refuses the *login* these tests
+    need in order to have a prior session to reconnect from (``login_via_otp``
+    -> ``_require_method_enabled`` -> ``_require_venue_open``). "The venue
+    closed while the guest was online" is also the shape that actually
+    happens, and the one the sweeps exist for."""
+    config = fx.captive_portal_service.configs_by_org[fx.organization_id]
+    config.business_hours_enabled = True
+    config.business_hours_schedule = _ALWAYS_CLOSED_SCHEDULE
+
+
 class TestSessionLifecycle:
     async def _login(
         self, fx: Fixture, identifier: str = "+15551110000"
@@ -4210,6 +4272,126 @@ class TestSessionLifecycle:
         terminated.ended_at = _now() - timedelta(
             minutes=TERMINATION_RECONNECT_COOLDOWN_MINUTES + 1
         )
+        reconnected = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert reconnected.status == GuestSessionStatus.ACTIVE.value
+
+    # -- the venue gates, re-checked on the second door in ------------------
+    #
+    # `reconnect` creates a real, new ACTIVE session, and it had neither of
+    # the gates every login path runs. So a guest refused at sign-in -- not on
+    # a whitelist-only property's list, or outside its Open Hours -- could
+    # walk straight back in through it and stay online. It is also the one
+    # door reachable without credentials.
+
+    async def test_reconnect_is_refused_at_a_venue_that_is_closed(self) -> None:
+        fx = make_fixture(
+            business_hours_enabled=True,
+            business_hours_schedule=_ALWAYS_OPEN_SCHEDULE,
+        )
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+        _shut_the_venue(fx)
+
+        with pytest.raises(VenueClosedError):
+            await fx.guest_service.reconnect(
+                guest_id=session.guest_id,
+                router_id=fx.router.id,
+                location_id=fx.location_id,
+            )
+        # Refused before the new session existed, and the prior one was not
+        # disturbed by the attempt.
+        assert len(fx.repository.sessions) == 1
+
+    async def test_reconnect_still_works_outside_a_closed_venue(self) -> None:
+        """The gate must not become a second way to strand a guest: a venue
+        whose hours are on but which is open right now reconnects exactly as
+        it always did."""
+        fx = make_fixture(
+            business_hours_enabled=True,
+            business_hours_schedule=_ALWAYS_OPEN_SCHEDULE,
+        )
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+
+        reconnected = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert reconnected.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_reconnect_is_refused_for_a_guest_not_on_a_whitelist_only_list(
+        self,
+    ) -> None:
+        """The hook is attached *after* the login, on purpose: the login is
+        what creates the prior session this test reconnects from, and a
+        property that turned the list on while a guest was online is exactly
+        the real-world shape being pinned."""
+        fx = make_fixture(whitelist_only_enabled=True)
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+
+        hook = FakeAccessControlHook()
+        fx.guest_service.access_control_hook = hook
+
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.reconnect(
+                guest_id=session.guest_id,
+                router_id=fx.router.id,
+                location_id=fx.location_id,
+            )
+        assert hook.calls[0]["whitelist_only_enabled"] is True
+
+    async def test_reconnect_is_allowed_for_a_guest_on_the_list(self) -> None:
+        fx = make_fixture(whitelist_only_enabled=True)
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+
+        hook = FakeAccessControlHook()
+        hook.allow(identifier="+15551110000")
+        fx.guest_service.access_control_hook = hook
+
+        reconnected = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert reconnected.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_reconnect_an_already_active_session_is_answered_not_refused(
+        self,
+    ) -> None:
+        """The gate sits *after* the idempotent return, deliberately: a guest
+        who is already online is already online, and handing back that same
+        session is the honest reply. Ending it is the sweeps' job."""
+        fx = make_fixture(
+            business_hours_enabled=True,
+            business_hours_schedule=_ALWAYS_OPEN_SCHEDULE,
+        )
+        session = await self._login(fx)
+        _shut_the_venue(fx)
+
+        returned = await fx.guest_service.reconnect(
+            guest_id=session.guest_id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert returned.id == session.id
+        assert len(fx.repository.sessions) == 1
+
+    async def test_reconnect_fails_open_when_no_portal_config_resolves(self) -> None:
+        """A venue mid-setup has no config to read a flag or a schedule from.
+        Fail open, as the OTP-request gate already does -- the login path is
+        where a genuinely unconfigured venue gets refused."""
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+        fx.captive_portal_service.configs_by_org.clear()
+
         reconnected = await fx.guest_service.reconnect(
             guest_id=session.guest_id,
             router_id=fx.router.id,
@@ -4650,7 +4832,8 @@ class TestTimeoutAndQuota:
         )
         session = result.session
         session.session_timeout_minutes = 5
-        session.last_activity_at = _now() - timedelta(minutes=10)
+        # Past the 5-minute limit *and* SESSION_ACTIVITY_GRACE_MINUTES.
+        session.last_activity_at = _now() - timedelta(minutes=20)
 
         expired = await fx.guest_service.enforce_timeouts()
         assert len(expired) == 1
@@ -4671,6 +4854,153 @@ class TestTimeoutAndQuota:
         result.session.session_timeout_minutes = 240
         expired = await fx.guest_service.enforce_timeouts()
         assert expired == []
+
+    async def _sweep_candidate(
+        self,
+        fx,
+        identifier: str,
+        *,
+        idle_timeout_minutes: int | None,
+        session_timeout_minutes: int | None,
+        idle_for: int,
+        open_for: int | None = None,
+    ) -> GuestSession:
+        result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        session = result.session
+        session.idle_timeout_minutes = idle_timeout_minutes
+        session.session_timeout_minutes = session_timeout_minutes
+        now = _now()
+        session.started_at = now - timedelta(minutes=open_for or idle_for)
+        session.last_activity_at = now - timedelta(minutes=idle_for)
+        return session
+
+    async def test_sweep_uses_idle_timeout_not_session_length(self) -> None:
+        """Production 2026-09-15: an Omada guest (idle 30, session 240) with
+        no accounting stayed "online" 242 minutes after their last activity,
+        because the sweep measured idleness against the 240-minute session
+        length. The idle timeout is the number that answers "how long may a
+        guest pass no traffic"."""
+        fx = make_fixture()
+        gone = await self._sweep_candidate(
+            fx,
+            "+15552220001",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=240,
+            idle_for=45,
+        )
+        expired = await fx.guest_service.enforce_timeouts()
+        assert [s.id for s in expired] == [gone.id]
+        assert gone.status == GuestSessionStatus.EXPIRED.value
+        assert gone.ended_at is not None
+        assert gone.disconnect_reason == "inactivity_timeout"
+
+    async def test_sweep_leaves_guest_inside_idle_timeout_plus_grace(self) -> None:
+        fx = make_fixture()
+        session = await self._sweep_candidate(
+            fx,
+            "+15552220002",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=240,
+            idle_for=35,
+        )
+        assert await fx.guest_service.enforce_timeouts() == []
+        assert session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_short_idle_timeout_does_not_expire_between_interim_updates(
+        self,
+    ) -> None:
+        """Interim-Updates arrive every 300s, so a busy guest at a venue
+        with a 5-minute idle timeout routinely looks 5-6 minutes idle when
+        the sweep runs. The grace must absorb that."""
+        fx = make_fixture()
+        session = await self._sweep_candidate(
+            fx,
+            "+15552220003",
+            idle_timeout_minutes=5,
+            session_timeout_minutes=30,
+            idle_for=6,
+        )
+        assert await fx.guest_service.enforce_timeouts() == []
+        assert session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_session_with_no_recorded_timeouts_is_not_exempt(self) -> None:
+        """A row with neither timeout used to be treated as unbounded and
+        stayed ACTIVE forever (one on production has shown online for 22
+        days). It now falls back to DEFAULT_IDLE_TIMEOUT_MINUTES."""
+        fx = make_fixture()
+        idle = await self._sweep_candidate(
+            fx,
+            "+15552220004",
+            idle_timeout_minutes=None,
+            session_timeout_minutes=None,
+            idle_for=DEFAULT_IDLE_TIMEOUT_MINUTES + SESSION_ACTIVITY_GRACE_MINUTES + 1,
+        )
+        expired = await fx.guest_service.enforce_timeouts()
+        assert [s.id for s in expired] == [idle.id]
+
+    async def test_sweep_expires_session_past_its_time_limit_without_a_stop(
+        self,
+    ) -> None:
+        """The router ends a session at Session-Timeout and reports a Stop.
+        If that Stop is lost, the row must not stay online just because its
+        last activity is recent."""
+        fx = make_fixture()
+        overrun = await self._sweep_candidate(
+            fx,
+            "+15552220005",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=30,
+            idle_for=2,
+            open_for=30 + SESSION_ACTIVITY_GRACE_MINUTES + 1,
+        )
+        inside = await self._sweep_candidate(
+            fx,
+            "+15552220006",
+            idle_timeout_minutes=30,
+            session_timeout_minutes=30,
+            idle_for=2,
+            open_for=35,
+        )
+        expired = await fx.guest_service.enforce_timeouts()
+        assert [s.id for s in expired] == [overrun.id]
+        assert inside.status == GuestSessionStatus.ACTIVE.value
+
+    def test_idle_cutoff_prefers_the_smaller_recorded_timeout(self) -> None:
+        now = _now()
+        session = GuestSession(
+            **_base_fields(
+                guest_id=uuid.uuid4(),
+                device_id=None,
+                router_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                auth_method="otp_sms",
+                voucher_id=None,
+                status="active",
+                started_at=now,
+                ended_at=None,
+                last_activity_at=now,
+                ip_address=None,
+                bytes_uploaded=0,
+                bytes_downloaded=0,
+                data_limit_mb=None,
+                session_timeout_minutes=240,
+                idle_timeout_minutes=30,
+                disconnect_reason=None,
+            )
+        )
+        assert session_idle_cutoff_minutes(session) == 30
+        session.idle_timeout_minutes = None
+        assert session_idle_cutoff_minutes(session) == 240
+        session.session_timeout_minutes = None
+        assert session_idle_cutoff_minutes(session) == DEFAULT_IDLE_TIMEOUT_MINUTES
 
     async def test_record_usage_expires_session_on_quota_breach(self) -> None:
         fx = make_fixture()
@@ -5652,6 +5982,115 @@ class TestRecordUsageFupTracking:
         assert updated.status == GuestSessionStatus.EXPIRED.value
         assert updated.disconnect_reason == "fup_data_quota_exceeded_weekly"
 
+    async def test_the_mid_session_cap_resolves_with_the_sessions_location(
+        self,
+    ) -> None:
+        """Mid-session data tracking used to resolve with a hardcoded
+        ``location_id=None`` -- the third sighting of the defect
+        ``_enforce_fup_quota`` and ``run_fup_time_accrual`` each already
+        carry a docstring about.
+
+        LOCATION is the only scope the dashboard's Guest WiFi Limits
+        screen can produce, so a venue that sets "2 GB per guest" there
+        got a cap that no interim update could see. And this is the half
+        that decides whether the feature does anything a guest notices:
+        ``_enforce_fup_quota`` only gates the NEXT login, so a cap
+        resolved there and not here lets a guest keep browsing on the
+        session they already hold, indefinitely, until they happen to
+        sign in again. The screen would show a live limit and no session
+        would ever end.
+
+        Asserts on the argument, not only the outcome: a cap that
+        happened to resolve through an organization-scoped policy would
+        satisfy an outcome-only test and still leave every
+        location-scoped venue broken."""
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_data_limit_mb": 1}
+        )
+        fx = make_fixture(policy_lookup=policy_lookup)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990034",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup.location_ids_seen.clear()
+
+        updated = await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=BYTES_PER_MB,
+            bytes_downloaded_delta=0,
+        )
+
+        assert policy_lookup.location_ids_seen == [fx.location_id]
+        assert updated.status == GuestSessionStatus.EXPIRED.value
+        assert updated.disconnect_reason == "fup_data_quota_exceeded_daily"
+
+    async def test_a_location_scoped_cap_also_ends_the_session_on_the_device(
+        self,
+    ) -> None:
+        """The other half of #274's lesson: expiring the row is not
+        disconnecting the guest.
+
+        A data cap that flips ``status`` to ``EXPIRED`` and stops there
+        leaves the guest browsing -- that is exactly what #274 had to fix
+        for the Omada sweep. Now that a venue can set a data cap from the
+        dashboard, that failure is reachable by a supported path rather
+        than only by a hand-written policy, so it gets its own assertion:
+        the live disconnect is issued, and the session records that it
+        really was enforced."""
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_data_limit_mb": 1}
+        )
+        fx = make_fixture(policy_lookup=policy_lookup)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990035",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+        ended: list[str] = []
+
+        from app.domains.guest_access.device_adapters import (
+            SessionControlSnapshot,
+            SessionEndOutcome,
+        )
+
+        class _SpyTerminator:
+            """Returns what the real ``LiveSessionTerminator`` returns -- a
+            ``SessionEndOutcome`` reporting the row it removed. A spy that
+            returned ``None`` would no longer make ``disconnect_enforced``
+            true, and correctly so: that column records a removal the device
+            reported, not the absence of an exception."""
+
+            async def end_on_router(self, *, session, identifier, organization_id=None):
+                ended.append(identifier)
+                return SessionEndOutcome(
+                    control=SessionControlSnapshot(
+                        hotspot_servers=1, coa_accept=False, coa_port=None
+                    ),
+                    matched=1,
+                    removed=1,
+                    still_active=0,
+                )
+
+        fx.guest_service.session_end_hook = _SpyTerminator()
+
+        updated = await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=BYTES_PER_MB,
+            bytes_downloaded_delta=0,
+        )
+
+        assert updated.status == GuestSessionStatus.EXPIRED.value
+        assert ended == ["+15559990035"]
+        assert updated.disconnect_enforced is True
+
     async def test_never_raises_when_the_policy_lookup_itself_fails(self) -> None:
         class ExplodingPolicyLookup:
             async def resolve_effective_policy(self, **kwargs: object):
@@ -5693,6 +6132,7 @@ class TestRecordUsageFupTracking:
 # it is handed -- never a session's own timestamps -- so pinning this does not
 # desynchronize it from the sessions the fixtures create at the real clock.
 _FUP_NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
 
 class TestRunFupTimeAccrual:
     async def test_the_sweep_resolves_with_the_guests_real_location(self) -> None:
@@ -5845,9 +6285,7 @@ class TestRunFupTimeAccrual:
             router_id=fx.router.id,
         )
         policy_lookup = FakeFupPolicyLookup(fup_rules={})
-        summary = await run_fup_time_accrual(
-            fx.repository, policy_lookup, now=_FUP_NOW
-        )
+        summary = await run_fup_time_accrual(fx.repository, policy_lookup, now=_FUP_NOW)
         assert summary == {"accrued_rows": 0, "expired_sessions": 0}
         assert (
             await fx.repository.get_quota_usage(
@@ -6202,7 +6640,7 @@ class TestWhitelistOnlyLoginGate:
         assert result.session.status == GuestSessionStatus.ACTIVE.value
 
     async def test_the_refusal_is_not_the_blocklist_error(self) -> None:
-        """"You are barred" and "this venue admits only listed guests" are
+        """ "You are barred" and "this venue admits only listed guests" are
         different facts and must not raise the same exception -- the portal
         has to be able to say different things.
 
@@ -6485,10 +6923,7 @@ class TestWhitelistOnlyRefusalsAreRecorded:
                 location_id=fx.location_id,
                 router_id=fx.router.id,
             )
-        assert (
-            fx.repository.login_history[0].failure_reason
-            != "GuestAccessDeniedError"
-        )
+        assert fx.repository.login_history[0].failure_reason != "GuestAccessDeniedError"
         assert (
             fx.repository.login_history[0].failure_reason
             == WhitelistOnlyAccessDeniedError.__name__
@@ -6497,9 +6932,7 @@ class TestWhitelistOnlyRefusalsAreRecorded:
     async def test_an_admitted_guest_writes_no_refusal(self) -> None:
         access_hook = FakeAccessControlHook()
         access_hook.allow(identifier="+15559994003")
-        fx = make_fixture(
-            access_control_hook=access_hook, whitelist_only_enabled=True
-        )
+        fx = make_fixture(access_control_hook=access_hook, whitelist_only_enabled=True)
         await fx.guest_service.login_via_otp(
             identifier="+15559994003",
             code="GOOD",
@@ -7441,9 +7874,7 @@ class TestRadiusAccountingOnOff:
         called: list[str] = []
 
         class _SpyTerminator:
-            async def end_on_router(
-                self, *, session, identifier, organization_id=None
-            ):
+            async def end_on_router(self, *, session, identifier, organization_id=None):
                 called.append(identifier)
 
         fx.guest_service.session_end_hook = _SpyTerminator()
@@ -7973,9 +8404,9 @@ class TestNasLifecycle:
         reintroduce the defect by simply not thinking about the hub."""
         import inspect
 
-        param = inspect.signature(
-            RadiusService.regenerate_secret
-        ).parameters["push_secret"]
+        param = inspect.signature(RadiusService.regenerate_secret).parameters[
+            "push_secret"
+        ]
         assert param.default is inspect.Parameter.empty
         assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
@@ -8576,7 +9007,7 @@ class TestSessionTimeoutSweep:
             router_id=fx.router.id,
         )
         result.session.session_timeout_minutes = 5
-        result.session.last_activity_at = _now() - timedelta(minutes=10)
+        result.session.last_activity_at = _now() - timedelta(minutes=20)
 
         expired = await enforce_session_timeouts(fx.repository)
         assert len(expired) == 1
