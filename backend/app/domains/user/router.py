@@ -25,17 +25,8 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
-from app.domains.auth.models import AuthUser, User
-from app.domains.otp.constants import OtpChannel, OtpPurpose
-from app.domains.otp.dependencies import get_otp_service
-from app.domains.otp.service import OtpService
-from app.domains.rbac.dependencies import (
-    CurrentOrganization,
-    CurrentUser,
-    RequirePermission,
-)
-from app.domains.rbac.enums import ScopeType
 from app.domains.auth.dependencies import get_role_resolver as get_login_role_resolver
+from app.domains.auth.models import AuthUser, User
 from app.domains.auth.router import (
     _organization_membership_summaries,
     _role_assignment_summaries,
@@ -44,7 +35,16 @@ from app.domains.billing.dependencies import get_license_service
 from app.domains.billing.service import LicenseService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
+from app.domains.otp.constants import OtpChannel, OtpPurpose
+from app.domains.otp.dependencies import get_otp_service
+from app.domains.otp.service import OtpService
 from app.domains.rbac.authorization import RoleResolver
+from app.domains.rbac.dependencies import (
+    CurrentOrganization,
+    CurrentUser,
+    RequirePermission,
+)
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_user_service
 from .schemas import (

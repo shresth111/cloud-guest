@@ -103,7 +103,9 @@ class TestImpersonateResponseCarriesTargetGrants:
                 )
             ]
 
-        monkeypatch.setattr(user_router_module, "_role_assignment_summaries", fake_roles)
+        monkeypatch.setattr(
+            user_router_module, "_role_assignment_summaries", fake_roles
+        )
         monkeypatch.setattr(
             user_router_module, "_organization_membership_summaries", fake_orgs
         )
@@ -113,7 +115,9 @@ class TestImpersonateResponseCarriesTargetGrants:
         )
 
         class FakeUserService:
-            async def impersonate_user(self, *, actor_user_id, actor_email, user_id, reason):
+            async def impersonate_user(
+                self, *, actor_user_id, actor_email, user_id, reason
+            ):
                 assert actor_user_id == operator_id
                 assert user_id == target_id
                 return ImpersonationResult(
@@ -196,14 +200,18 @@ class TestImpersonationTokenIdentity:
         # are attributed to the identity the request was authorized as.
         assert get_masking_context().user_id == str(target.id)
 
-    async def test_normal_login_token_has_no_impersonator(self, request_context) -> None:
+    async def test_normal_login_token_has_no_impersonator(
+        self, request_context
+    ) -> None:
         service, identity, *_rest = make_service()
         user = await service.create_user(**_create_kwargs())
         token, _jti = JWTManager.create_access_token(str(user.id), user.email)
 
         await get_current_user(
             request=_request(),
-            credentials=HTTPAuthorizationCredentials(scheme="Bearer", credentials=token),
+            credentials=HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials=token
+            ),
             repository=identity,
             api_key_service=None,
         )
@@ -249,7 +257,9 @@ class TestAuditRowsNameTheOperator:
         assert entry.event_metadata["field"] == "name"
         assert entry.actor_user_id == customer_actor
 
-    def test_row_written_by_a_normal_session_is_untouched(self, request_context) -> None:
+    def test_row_written_by_a_normal_session_is_untouched(
+        self, request_context
+    ) -> None:
         entry = _entry({"field": "name"})
         _stamp_impersonating_operator(None, None, entry)
         assert entry.event_metadata == {"field": "name"}
@@ -257,4 +267,6 @@ class TestAuditRowsNameTheOperator:
     def test_listener_is_registered_on_insert(self) -> None:
         from sqlalchemy import event
 
-        assert event.contains(AuditLogEntry, "before_insert", _stamp_impersonating_operator)
+        assert event.contains(
+            AuditLogEntry, "before_insert", _stamp_impersonating_operator
+        )

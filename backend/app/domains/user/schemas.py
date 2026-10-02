@@ -22,11 +22,10 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.domains.auth.schemas import MessageResponse
+from app.domains.auth.schemas import MessageResponse, RoleAssignmentSummary
 from app.domains.auth.schemas import (
     OrganizationMembershipSummary as LoginOrganizationMembershipSummary,
 )
-from app.domains.auth.schemas import RoleAssignmentSummary
 from app.domains.rbac.enums import ScopeType
 
 __all__ = [
