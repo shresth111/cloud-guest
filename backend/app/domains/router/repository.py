@@ -181,6 +181,18 @@ class RouterRepositoryProtocol(Protocol):
         location_id: uuid.UUID | None,
     ) -> list[Router]: ...
 
+    async def routers_holding_identity(
+        self, *, serial_number: str, mac_address: str
+    ) -> list[Router]: ...
+
+    async def live_nas_only_routers_for_site(
+        self, instant_on_site_id: str
+    ) -> list[Router]: ...
+
+    async def count_live_integrations_at_location(
+        self, location_id: uuid.UUID
+    ) -> int: ...
+
     async def create_provisioning_token(
         self, **fields: object
     ) -> RouterProvisioningToken: ...
@@ -385,6 +397,56 @@ class RouterRepository:
         result = await self.session.execute(paginate(statement, params))
         rows = list(result.scalars().all())
         return rows, PaginationMeta.from_total(params, total_items)
+
+    async def routers_holding_identity(
+        self, *, serial_number: str, mac_address: str
+    ) -> list[Router]:
+        """Every row -- soft-deleted ones INCLUDED -- whose serial or MAC is
+        one of these.
+
+        ``get_by_serial_number``/``get_by_mac_address`` skip soft-deleted
+        rows, but ``uq_routers_serial_number``/``uq_routers_mac_address``
+        do not: a decommissioned row still owns its identity, and inserting
+        it again is an ``IntegrityError`` (a 500), not the 409 those lookups
+        promise. Adding a mistaken Instant On row, removing it and adding it
+        again with the AP's real serial is exactly that sequence.
+        """
+        statement = select(Router).where(
+            or_(
+                Router.serial_number == serial_number,
+                Router.mac_address == mac_address,
+            )
+        )
+        return list((await self.session.execute(statement)).scalars().all())
+
+    async def live_nas_only_routers_for_site(
+        self, instant_on_site_id: str
+    ) -> list[Router]:
+        """Live NAS-only rows recorded against this Instant On site id
+        (``settings.instant_on_site_id``). Wave 1 allows one row per site."""
+        from .vendor_capabilities import NAS_ONLY_VENDORS
+
+        statement = select(Router).where(
+            Router.is_deleted.is_(False),
+            Router.vendor.in_(sorted(NAS_ONLY_VENDORS)),
+            Router.settings["instant_on_site_id"].astext == instant_on_site_id,
+        )
+        return list((await self.session.execute(statement)).scalars().all())
+
+    async def count_live_integrations_at_location(
+        self, location_id: uuid.UUID
+    ) -> int:
+        """Live network integrations (Omada) serving this location, whether
+        or not they have a fleet row yet."""
+        statement = (
+            select(func.count())
+            .select_from(NetworkIntegration)
+            .where(
+                NetworkIntegration.location_id == location_id,
+                NetworkIntegration.is_deleted.is_(False),
+            )
+        )
+        return int((await self.session.execute(statement)).scalar_one())
 
     # -- provisioning tokens -----------------------------------------------------
 

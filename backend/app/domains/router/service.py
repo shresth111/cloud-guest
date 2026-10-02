@@ -94,6 +94,7 @@ from .exceptions import (
     DuplicateMacAddressError,
     DuplicateSerialNumberError,
     InvalidRouterStatusTransitionError,
+    NasOnlySiteRefusedError,
     ProvisioningTokenAlreadyUsedError,
     ProvisioningTokenExpiredError,
     ProvisioningTokenGenerationNotAllowedError,
@@ -111,9 +112,11 @@ from .models import Router, RouterProvisioningToken
 from .repository import RouterRepositoryProtocol
 from .vendor_capabilities import (
     AGENT_EVIDENCE_FIELDS,
+    ARUBA_INSTANT_ON_VENDOR,
     SUPPORTED_ROUTER_VENDORS,
     controller_state_for,
     is_controller_managed,
+    is_nas_only,
     looks_like_mikrotik_hardware,
     supports_zero_touch_provisioning,
     vendor_claim_is_contradicted,
@@ -231,6 +234,33 @@ def _hash_token(plaintext: str) -> str:
 
 def _normalize_mac(mac_address: str) -> str:
     return mac_address.strip().upper()
+
+
+#: Prefix for a minted Instant On serial, so a human reading the fleet table
+#: sees at a glance it was not read off a device (the Omada ``OMADA-`` rule).
+NAS_ONLY_SYNTHETIC_SERIAL_PREFIX = "AIO-"
+
+#: What a NAS-only fleet row's ``model`` column says. Deliberately free of
+#: every ``MIKROTIK_MODEL_MARKERS`` substring, so the row can never trip the
+#: "model says MikroTik" contradiction check.
+NAS_ONLY_SITE_MODEL = "Aruba Instant On"
+
+
+def synthesize_nas_only_identity(seed: uuid.UUID) -> tuple[str, str]:
+    """``(serial_number, mac_address)`` for a NAS-only row whose operator
+    supplied neither, or for releasing a decommissioned row's real one.
+
+    Same rules as ``network_integration.validators.synthesize_fleet_identity``
+    with a different prefix: the MAC is locally administered (bit 1 of the
+    first octet set, multicast bit clear), which no manufacturer may burn
+    into hardware, so it can never collide with a real AP; the serial is
+    hashed, so it does not leak a database key.
+    """
+    digest = hashlib.sha256(b"nas-only-identity:" + seed.bytes).digest()
+    serial = f"{NAS_ONLY_SYNTHETIC_SERIAL_PREFIX}{digest[:6].hex().upper()}"
+    first_octet = (digest[6] & 0b1111_1100) | 0b10
+    mac = ":".join(f"{octet:02X}" for octet in (first_octet, *digest[7:12]))
+    return serial, mac
 
 
 class RouterService:
@@ -453,6 +483,207 @@ class RouterService:
             description=f"Router '{router.name}' ({router.serial_number}) created",
         )
         return router
+
+    async def create_nas_only_site(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        name: str,
+        serial_number: str | None = None,
+        mac_address: str | None = None,
+        instant_on_site_id: str | None = None,
+        instant_on_site_name: str | None = None,
+    ) -> tuple[Router, bool, bool]:
+        """Add one Aruba Instant On site as one ``aruba_instant_on`` fleet row.
+
+        Returns ``(router, synthetic_serial, synthetic_mac)``.
+
+        Master-only (the route is GLOBAL-pinned). Writes the row and an audit
+        entry, and nothing else: no agent credential, no provisioning token,
+        no WireGuard peer, no RouterOS call, no RADIUS registration (that is
+        ``register-public``, the setup panel's next step), no
+        ``network_integrations`` row (PM_SPEC §0.1 item 1).
+
+        Refusals, all before anything is written:
+
+        * **Cross-tenant.** The location must belong to ``organization_id``
+          itself -- not to a child of it. ``get_location`` with a requesting
+          organization would accept an MSP parent; a platform operator naming
+          the wrong customer is a mistake to refuse, not a hierarchy to walk.
+        * **One row per site** (PM_SPEC §0.1 items 4-5). A second NAS-only row
+          at the location, or a second live row carrying the same
+          ``instant_on_site_id``, is refused with the existing row's id.
+        * **No mixed venues.** A location that already has any other live
+          fleet row, or a live network integration, is refused. The customer
+          dashboard treats a venue as Instant On only when EVERY row there is
+          NAS-only (``locationIsNasOnly``), and the RADIUS/client-capability
+          reads pick one NAS-only row per location; a mixed location would
+          show the Aruba guests MikroTik/Omada controls that do nothing.
+          An AP behind a MikroTik gateway needs no row of its own -- the
+          MikroTik is the NAS there.
+        """
+        location = await self.location_lookup.get_location(
+            location_id, requesting_organization_id=None
+        )
+        if location.organization_id != organization_id:
+            raise NasOnlySiteRefusedError(
+                f"Location {location_id} does not belong to organization "
+                f"{organization_id}. Choose a location of that customer.",
+                reason="location_not_in_organization",
+                status_code=422,
+            )
+        if location.status == LocationStatus.ARCHIVED.value:
+            raise LocationArchivedError(location_id)
+
+        existing, _meta = await self.repository.list_routers(
+            location_id=location_id, page=1, page_size=100
+        )
+        nas_only_here = next((r for r in existing if is_nas_only(r)), None)
+        if nas_only_here is not None:
+            raise NasOnlySiteRefusedError(
+                f"This location already has an Instant On site "
+                f"('{nas_only_here.name}'). One Instant On site maps to one "
+                "location; open that row's Instant On setup instead.",
+                reason="already_onboarded",
+                existing_router_id=nas_only_here.id,
+            )
+        if existing:
+            names = ", ".join(f"'{r.name}' ({r.vendor})" for r in existing[:5])
+            raise NasOnlySiteRefusedError(
+                f"This location already has {len(existing)} other device(s): "
+                f"{names}. An Instant On site needs a location of its own: "
+                "every device at a venue must be Instant On for its guests to "
+                "see the right controls. Create a new location for the "
+                "Instant On site, or decommission the other device first. An "
+                "Instant On AP behind a MikroTik gateway needs no row of its "
+                "own.",
+                reason="location_has_other_devices",
+                existing_router_id=existing[0].id,
+            )
+        if await self.repository.count_live_integrations_at_location(location_id):
+            raise NasOnlySiteRefusedError(
+                "This location already has a network integration (a TP-Link "
+                "Omada controller). An Instant On site needs a location of "
+                "its own.",
+                reason="location_has_network_integration",
+            )
+        if instant_on_site_id:
+            same_site = await self.repository.live_nas_only_routers_for_site(
+                instant_on_site_id
+            )
+            if same_site:
+                raise NasOnlySiteRefusedError(
+                    f"Instant On site {instant_on_site_id} is already in the "
+                    f"fleet as '{same_site[0].name}'. One Instant On site is "
+                    "one fleet row.",
+                    reason="site_already_onboarded",
+                    existing_router_id=same_site[0].id,
+                )
+
+        minted_serial, minted_mac = synthesize_nas_only_identity(uuid.uuid4())
+        synthetic_serial = serial_number is None
+        synthetic_mac = mac_address is None
+        serial = minted_serial if synthetic_serial else serial_number.strip()
+        mac = minted_mac if synthetic_mac else _normalize_mac(mac_address)
+        await self._release_decommissioned_identity(
+            actor_user_id, serial_number=serial, mac_address=mac
+        )
+
+        settings: dict[str, Any] = {
+            "synthetic_identity": synthetic_serial or synthetic_mac,
+        }
+        if instant_on_site_id:
+            settings["instant_on_site_id"] = instant_on_site_id
+        if instant_on_site_name:
+            settings["instant_on_site_name"] = instant_on_site_name
+
+        router = await self.repository.create_router(
+            location_id=location_id,
+            organization_id=location.organization_id,
+            name=name,
+            serial_number=serial,
+            mac_address=mac,
+            model=NAS_ONLY_SITE_MODEL,
+            vendor=ARUBA_INSTANT_ON_VENDOR,
+            status=RouterStatus.PENDING_PROVISIONING.value,
+            # Explicit, as `create_router` does: nothing here may enable an
+            # agent-shaped path (no credentials, no SNMP, no addresses).
+            snmp_enabled=False,
+            settings=settings,
+            created_by=actor_user_id,
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_CREATED,
+            router=router,
+            description=(
+                f"Aruba Instant On site '{router.name}' ({router.serial_number}) "
+                "added from the Master console"
+            ),
+            metadata={
+                "vendor": ARUBA_INSTANT_ON_VENDOR,
+                "synthetic_serial_number": synthetic_serial,
+                "synthetic_mac_address": synthetic_mac,
+                "instant_on_site_id": instant_on_site_id,
+                "instant_on_site_name": instant_on_site_name,
+            },
+        )
+        return router, synthetic_serial, synthetic_mac
+
+    async def _release_decommissioned_identity(
+        self,
+        actor_user_id: uuid.UUID | None,
+        *,
+        serial_number: str,
+        mac_address: str,
+    ) -> None:
+        """Make ``serial_number``/``mac_address`` insertable, or refuse.
+
+        A live holder is a real duplicate: 409, as ``create_router`` does.
+
+        A *decommissioned* holder still owns the value under the unique
+        index, so a straight insert would be an ``IntegrityError``. When that
+        holder is itself a NAS-only row -- the "added at the wrong location,
+        removed, adding again" sequence the Master remove action exists for
+        -- its identity is moved to a minted one (audited, the real values
+        kept in the audit metadata) so the AP's real serial can be recorded
+        on the new row. A decommissioned row of any other vendor is not
+        touched; that is refused with the same 409 as a live one.
+        """
+        holders = await self.repository.routers_holding_identity(
+            serial_number=serial_number, mac_address=mac_address
+        )
+        for holder in holders:
+            if not holder.is_deleted or not is_nas_only(holder):
+                if holder.serial_number == serial_number:
+                    raise DuplicateSerialNumberError(serial_number)
+                raise DuplicateMacAddressError(mac_address)
+        for holder in holders:
+            released_serial, released_mac = synthesize_nas_only_identity(holder.id)
+            old_serial, old_mac = holder.serial_number, holder.mac_address
+            await self.repository.update_router(
+                holder,
+                {
+                    "serial_number": released_serial,
+                    "mac_address": released_mac,
+                    "updated_by": actor_user_id,
+                },
+            )
+            await self._audit(
+                actor_user_id,
+                AuditAction.ROUTER_UPDATED,
+                router=holder,
+                description=(
+                    f"Decommissioned Instant On row '{holder.name}' released "
+                    f"its serial/MAC ({old_serial}, {old_mac}) for a new row"
+                ),
+                metadata={
+                    "released_serial_number": old_serial,
+                    "released_mac_address": old_mac,
+                },
+            )
 
     async def update_router(
         self,
