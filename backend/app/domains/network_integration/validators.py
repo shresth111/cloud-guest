@@ -1097,6 +1097,37 @@ def build_external_portal_url(
         scheme="https",
         host_and_query=f"{_GUEST_PORTAL_HOST}{_GUEST_PORTAL_PATH}?{query}",
     )
+
+
+def build_nas_only_portal_url(
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+    router_id: uuid.UUID | None,
+    vendor: str,
+) -> ExternalPortalUrl | None:
+    """The external captive-portal URL for a NAS-only vendor's device
+    (Aruba Instant On).
+
+    The SAME URL the Omada RADIUS-mode venue gets -- same host, same
+    ``/portal`` route, same three ids -- with ``netProvider`` set to the
+    fleet row's vendor and ``portalMode=radius``, because the contract is
+    the RADIUS one: the guest's browser hands the identifier to the AP, and
+    the AP asks our FreeRADIUS. Built by :func:`build_external_portal_url`
+    so the two cannot drift; ``None`` for the same reason that function
+    returns it (no location or no fleet row means a guest could not be
+    given a session).
+    """
+    return build_external_portal_url(
+        organization_id=organization_id,
+        location_id=location_id,
+        router_id=router_id,
+        provider=vendor,
+        portal_mode=PortalAuthMode.RADIUS.value,
+    )
+
+
+# ============================================================================
 # Portal-redirect diagnostics
 # ============================================================================
 #

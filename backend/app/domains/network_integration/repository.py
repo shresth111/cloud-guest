@@ -113,6 +113,10 @@ class NetworkIntegrationRepositoryProtocol(Protocol):
         self, *, location_id: uuid.UUID, organization_id: uuid.UUID
     ) -> NetworkIntegration | None: ...
 
+    async def nas_only_vendor_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> str | None: ...
+
     async def list_live_integrations_on_controller_site(
         self,
         *,
@@ -288,6 +292,32 @@ class NetworkIntegrationRepository:
                 NetworkIntegration.external_site_id.is_not(None),
             )
             .order_by(NetworkIntegration.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(statement)).scalars().first()
+
+    async def nas_only_vendor_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> str | None:
+        """The vendor of a live NAS-only fleet row at this location (Aruba
+        Instant On), or ``None``.
+
+        Tenant-scoped exactly like ``get_omada_integration_for_location``:
+        organization and location are both in the WHERE clause, so another
+        tenant's location resolves to nothing rather than to a row somebody
+        later declines to describe.
+        """
+        from app.domains.router.models import Router
+        from app.domains.router.vendor_capabilities import NAS_ONLY_VENDORS
+
+        statement = (
+            select(Router.vendor)
+            .where(
+                Router.location_id == location_id,
+                Router.organization_id == organization_id,
+                Router.is_deleted.is_(False),
+                Router.vendor.in_(sorted(NAS_ONLY_VENDORS)),
+            )
             .limit(1)
         )
         return (await self.session.execute(statement)).scalars().first()

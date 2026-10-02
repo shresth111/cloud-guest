@@ -283,7 +283,10 @@ from app.domains.router.crypto import (
 )
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
-from app.domains.router.vendor_capabilities import is_controller_managed
+from app.domains.router.vendor_capabilities import (
+    is_controller_managed,
+    is_nas_only,
+)
 from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
@@ -395,6 +398,7 @@ from .nas_number_generator import (
     NasCodeCounterRepositoryProtocol,
     generate_nas_code,
     generate_shared_secret,
+    secret_fingerprint,
 )
 from .repository import (
     ActiveGuestOrgPair,
@@ -2892,6 +2896,13 @@ class GuestService:
         """
         if not is_controller_managed(router):
             return session.ip_address
+        if is_nas_only(router):
+            # A venue whose controller we have no API to (Aruba Instant On).
+            # There is no device-side write a speed could ever reach, so the
+            # honest outcome is the one this docstring already names: no
+            # identifier, nothing assigned. Attempting one would only file a
+            # controller-hook failure against every login at the venue.
+            return None
         if session.device_id is None:
             return None
         device = await self.repository.get_device_by_id(session.device_id)
@@ -7762,6 +7773,20 @@ class RadiusService:
         )
         return updated
 
+    def shared_secret_fingerprint(self, nas_client: RadiusNasClient) -> tuple[str, int]:
+        """``(sha256[:12], length)`` of the stored secret -- what a console
+        shows after the one-time reveal. Never the secret itself."""
+        plaintext = decrypt_secret(nas_client.shared_secret_encrypted)
+        return secret_fingerprint(plaintext), len(plaintext)
+
+    async def nas_clients_at_address(self, address: str) -> list[RadiusNasClient]:
+        """Every live NAS row keyed on ``address`` (unscoped: a platform
+        check that two venues are not about to share one public IP)."""
+        items, _meta = await self.repository.list_nas_clients(
+            page=1, page_size=10, filters={"ip_address": address}
+        )
+        return list(items)
+
     async def regenerate_secret(
         self,
         *,
@@ -7770,6 +7795,7 @@ class RadiusService:
         actor_user_id: uuid.UUID | None,
         push_secret: NasSecretPushProtocol,
         length_bytes: int = NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
+        new_secret: str | None = None,
     ) -> RadiusNasSecretRegenerationResult:
         """Generates a brand-new shared secret, **hands it to the hub
         first**, and only then overwrites ``shared_secret_encrypted`` -- the
@@ -7823,7 +7849,11 @@ class RadiusService:
         nas_client = await self.get_nas_client(
             nas_id, requesting_organization_id=requesting_organization_id
         )
-        plaintext_secret = generate_shared_secret(length_bytes)
+        # `new_secret` lets a caller choose the secret's alphabet (a
+        # public-address NAS gets a 32-char alphanumeric one, see
+        # `nas_number_generator.generate_alphanumeric_shared_secret`); every
+        # existing caller passes nothing and gets exactly what it got before.
+        plaintext_secret = new_secret or generate_shared_secret(length_bytes)
         # Raises straight through on failure -- deliberately not caught and
         # not translated. Nothing below this line has run, so there is
         # nothing to undo.
@@ -8159,7 +8189,16 @@ class RadiusService:
                 else None
             ),
             data_limit_mb=session.data_limit_mb,
-            rate_limit=await self._resolve_rate_limit_reply(session.id),
+            # `Mikrotik-Rate-Limit` is a MikroTik VSA (vendor 14988). A
+            # NAS-only vendor (Aruba Instant On) has no speed path through
+            # this platform at all -- its rate limits live in the vendor's
+            # own UI -- so nothing is resolved and nothing is sent. Every
+            # other vendor is unchanged.
+            rate_limit=(
+                None
+                if is_nas_only(router)
+                else await self._resolve_rate_limit_reply(session.id)
+            ),
         )
 
     @staticmethod

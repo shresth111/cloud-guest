@@ -94,6 +94,7 @@ class ControllerManagedFeatureUnavailableError(CloudGuestError):
 # than to a mangled identifier.
 _VENDOR_NOUNS: dict[str, str] = {
     "tplink_omada": "TP-Link Omada controller",
+    "aruba_instant_on": "Aruba Instant On cloud",
 }
 
 

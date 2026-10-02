@@ -88,6 +88,33 @@ def normalize_mac_address(mac_address: str) -> str:
     return mac_address.strip().upper()
 
 
+_BARE_HEX_MAC = re.compile(r"^[0-9A-Fa-f]{12}$")
+
+
+def canonicalize_calling_station_id(raw: str | None) -> str | None:
+    """Turn a separator-less MAC into ``AA:BB:CC:DD:EE:FF``; leave every
+    other spelling exactly as the NAS sent it.
+
+    Aruba's access points send ``Calling-Station-Id`` as bare hex
+    (``aabbccddeeff``) by default. Every MAC parser on the authorize path
+    (``mac_authorization.validators.normalize_mac_address``, used for the
+    whitelist auto-connect and for adopting the NAS-asserted device) accepts
+    colon- or dash-separated forms only, so a bare-hex value would silently
+    skip both.
+
+    Deliberately narrow: only a value that is *exactly* twelve hex digits is
+    rewritten. MikroTik's ``AA:BB:..`` and Omada's ``AA-BB-..`` never match,
+    so the value those vendors' requests carry is byte-identical to before.
+    """
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not _BARE_HEX_MAC.match(stripped):
+        return raw
+    upper = stripped.upper()
+    return ":".join(upper[i : i + 2] for i in range(0, 12, 2))
+
+
 def canonical_mac_key(raw: str | None) -> str | None:
     """Bare uppercase hex (``"AABBCCDDEEFF"``), or ``None`` when ``raw`` is
     not a six-octet MAC.

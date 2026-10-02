@@ -230,7 +230,8 @@ class RouterResponse(BaseModel):
         default=None,
         description=(
             "The state of this platform's connection to the controller "
-            "that runs this device's network: one of not_registered, "
+            "that runs this device's network: one of no_controller_api, "
+            "not_registered, "
             "disabled, credentials_rejected, certificate_unverified, "
             "unreachable, not_mapped, reachable. NULL when this row is not "
             "reached through a controller -- an agent checks in and "
