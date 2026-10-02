@@ -22,10 +22,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 from app.domains.billing.constants import PlanFeatureKey
+from app.domains.router.schemas import NasOnlySiteFields
 
 from .enums import PropertyType
 
 __all__ = [
+    "InstantOnSiteInputSchema",
     "NewOrganizationInputSchema",
     "ProvisionLocationRequest",
     "ProvisionLocationResponse",
@@ -100,6 +102,17 @@ class RouterInputSchema(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
+class InstantOnSiteInputSchema(NasOnlySiteFields):
+    """The Add Customer wizard's Aruba Instant On option (PM_SPEC §5 Wave 2):
+    one ``aruba_instant_on`` fleet row for the new location, created inside
+    the provisioning transaction.
+
+    Exactly the fields -- and the validation -- of Router Fleet's "Add
+    Instant On site" (``POST /platform/routers/instant-on-sites``), minus
+    ``organization_id``/``location_id``, which this request is creating.
+    ``extra="forbid"`` is inherited: a mis-shaped body is a 422."""
+
+
 class FeatureOverrideInputSchema(BaseModel):
     """One Super-Admin-selected divergence from the selected Plan's own
     stock ``PlanFeature`` defaults -- see
@@ -141,6 +154,19 @@ class ProvisionLocationRequest(BaseModel):
             "config template, no WireGuard peer."
         ),
     )
+    instant_on_site: InstantOnSiteInputSchema | None = Field(
+        default=None,
+        description=(
+            "The venue's Aruba Instant On site, for a venue whose access "
+            "points are managed in the Instant On app. Creates one NAS-only "
+            "`aruba_instant_on` fleet row (and, with `instant_on_site_id`, "
+            "its `instant_on_sites` mapping) in this same transaction -- the "
+            "same rules as `POST /platform/routers/instant-on-sites`, and "
+            "nothing router-shaped: no config template, no WireGuard peer, "
+            "no agent, no RADIUS NAS (that is the setup panel's Register "
+            "step). Mutually exclusive with `router`."
+        ),
+    )
     router_config_template_id: str | None = Field(
         default=None,
         description=(
@@ -180,6 +206,21 @@ class ProvisionLocationRequest(BaseModel):
                 "router_config_template_id was supplied without a router -- "
                 "a config template can only be applied to a router. Either "
                 "include `router`, or omit router_config_template_id."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_one_device_kind(self) -> ProvisionLocationRequest:
+        """A venue is MikroTik or Instant On, never both: the customer
+        dashboard treats a location as Instant On only when every row there
+        is NAS-only, and ``create_nas_only_site`` refuses a location that
+        already has another device. Refused here so it is a 422 before
+        anything is written."""
+        if self.router is not None and self.instant_on_site is not None:
+            raise ValueError(
+                "router and instant_on_site were both supplied -- a venue's "
+                "first device is either a MikroTik router or an Aruba "
+                "Instant On site, not both. Send one of them."
             )
         return self
 
@@ -234,6 +275,12 @@ class ProvisionLocationResponse(BaseModel):
     router_id: str | None = None
     router_name: str | None = None
     tunnel_ip_address: str | None = None
+    # The created fleet row's vendor ("mikrotik" / "aruba_instant_on"), null
+    # with no device. The wizard reads it to offer the right next step (the
+    # Instant On setup panel for an Aruba row).
+    router_vendor: str | None = None
+    # Echoes the Instant On site id the mapping was written with, if any.
+    instant_on_site_id: str | None = None
     owner_user_id: str
     owner_name: str
     owner_username: str
