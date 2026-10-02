@@ -25,6 +25,10 @@ concurrency:
 permissions:
   id-token: write   # required to mint the OIDC token
   contents: read
+  # Same as cd.yml: this workflow CALLS ci.yml, whose notify job asks for
+  # `actions: read`. A called workflow cannot request a scope its caller did
+  # not grant, so without this line every run dies with `startup_failure`.
+  actions: read
 
 env:
   AWS_REGION: ap-south-1
