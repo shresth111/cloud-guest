@@ -493,8 +493,6 @@ class RouterService:
         name: str,
         serial_number: str | None = None,
         mac_address: str | None = None,
-        instant_on_site_id: str | None = None,
-        instant_on_site_name: str | None = None,
     ) -> tuple[Router, bool, bool]:
         """Add one Aruba Instant On site as one ``aruba_instant_on`` fleet row.
 
@@ -512,9 +510,10 @@ class RouterService:
           itself -- not to a child of it. ``get_location`` with a requesting
           organization would accept an MSP parent; a platform operator naming
           the wrong customer is a mistake to refuse, not a hierarchy to walk.
-        * **One row per site** (PM_SPEC §0.1 items 4-5). A second NAS-only row
-          at the location, or a second live row carrying the same
-          ``instant_on_site_id``, is refused with the existing row's id.
+        * **One row per location** (PM_SPEC §0.1 items 4-5). A second NAS-only
+          row at the location is refused with the existing row's id. (One row
+          per Instant On *site id* is the route's check against
+          ``instant_on_sites``, the poller's table, which owns that mapping.)
         * **No mixed venues.** A location that already has any other live
           fleet row, or a live network integration, is refused. The customer
           dashboard treats a venue as Instant On only when EVERY row there is
@@ -569,19 +568,6 @@ class RouterService:
                 "its own.",
                 reason="location_has_network_integration",
             )
-        if instant_on_site_id:
-            same_site = await self.repository.live_nas_only_routers_for_site(
-                instant_on_site_id
-            )
-            if same_site:
-                raise NasOnlySiteRefusedError(
-                    f"Instant On site {instant_on_site_id} is already in the "
-                    f"fleet as '{same_site[0].name}'. One Instant On site is "
-                    "one fleet row.",
-                    reason="site_already_onboarded",
-                    existing_router_id=same_site[0].id,
-                )
-
         minted_serial, minted_mac = synthesize_nas_only_identity(uuid.uuid4())
         synthetic_serial = serial_number is None
         synthetic_mac = mac_address is None
@@ -594,10 +580,6 @@ class RouterService:
         settings: dict[str, Any] = {
             "synthetic_identity": synthetic_serial or synthetic_mac,
         }
-        if instant_on_site_id:
-            settings["instant_on_site_id"] = instant_on_site_id
-        if instant_on_site_name:
-            settings["instant_on_site_name"] = instant_on_site_name
 
         router = await self.repository.create_router(
             location_id=location_id,
@@ -626,8 +608,6 @@ class RouterService:
                 "vendor": ARUBA_INSTANT_ON_VENDOR,
                 "synthetic_serial_number": synthetic_serial,
                 "synthetic_mac_address": synthetic_mac,
-                "instant_on_site_id": instant_on_site_id,
-                "instant_on_site_name": instant_on_site_name,
             },
         )
         return router, synthetic_serial, synthetic_mac

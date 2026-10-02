@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -39,6 +40,7 @@ from pydantic import ValidationError
 from app.common.exceptions import register_exception_handlers
 from app.domains.auth.models import AuthUser
 from app.domains.location.exceptions import LocationNotFoundError
+from app.domains.network_integration.instant_on_service import InstantOnReadService
 from app.domains.organization.enums import OrganizationType
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
@@ -210,41 +212,6 @@ class TestOneRowPerSite:
         assert exc.value.data["code"] == "NAS_ONLY_SITE_REFUSED"
         assert len(repo.routers) == 1
 
-    async def test_same_instant_on_site_id_at_another_location_is_refused(
-        self,
-    ) -> None:
-        service, repo, locations, _orgs, _audit, org, location = _setup()
-        first, _s, _m = await _create(
-            service, org, location, instant_on_site_id=_SITE_ID
-        )
-        second_location = locations.add(organization_id=org.id)
-
-        with pytest.raises(NasOnlySiteRefusedError) as exc:
-            await _create(
-                service, org, second_location, instant_on_site_id=_SITE_ID
-            )
-
-        assert exc.value.data["reason"] == "site_already_onboarded"
-        assert exc.value.data["existing_router_id"] == str(first.id)
-        assert len(repo.routers) == 1
-
-    async def test_a_removed_site_can_be_added_again(self) -> None:
-        service, repo, _locations, _orgs, _audit, org, location = _setup()
-        first, _s, _m = await _create(
-            service, org, location, instant_on_site_id=_SITE_ID
-        )
-        await service.decommission_router(
-            actor_user_id=_ACTOR_ID,
-            router_id=first.id,
-            requesting_organization_id=None,
-        )
-
-        second, _s, _m = await _create(
-            service, org, location, instant_on_site_id=_SITE_ID
-        )
-        assert second.id != first.id
-        assert not second.is_deleted
-
 
 # ---------------------------------------------------------------------------
 # 4. Mixed-vendor locations
@@ -367,20 +334,6 @@ class TestNoSideEffects:
             "get_router_provisioning_service",
         ):
             assert forbidden not in names
-
-    async def test_site_details_are_recorded_on_the_row(self) -> None:
-        service, _repo, _locations, _orgs, audit, org, location = _setup()
-        router, _s, _m = await _create(
-            service,
-            org,
-            location,
-            instant_on_site_id=_SITE_ID,
-            instant_on_site_name="inhouse-office",
-        )
-        assert router.settings["instant_on_site_id"] == _SITE_ID
-        assert router.settings["instant_on_site_name"] == "inhouse-office"
-        assert audit.entries[0]["event_metadata"]["instant_on_site_id"] == _SITE_ID
-
 
 # ---------------------------------------------------------------------------
 # 6. Identity
@@ -543,10 +496,65 @@ class _PermitAll:
         return None
 
 
-def _app(service) -> FastAPI:  # noqa: ANN001
+class _SiteRepo:
+    """In-memory `InstantOnRepositoryProtocol` for the parts this route and
+    decommission use. `routers` is the router fake's dict, so "is the mapped
+    router still live" is answered the way the real join answers it."""
+
+    def __init__(self, routers: dict) -> None:
+        self.routers = routers
+        self.sites: list[SimpleNamespace] = []
+
+    async def get_site_for_router(self, router_id):  # noqa: ANN001, ANN201
+        return next(
+            (s for s in self.sites if s.router_id == router_id and not s.is_deleted),
+            None,
+        )
+
+    async def get_live_site_by_site_id(self, site_id):  # noqa: ANN001, ANN201
+        return next(
+            (
+                s
+                for s in self.sites
+                if s.site_id == site_id
+                and not s.is_deleted
+                and s.router_id in self.routers
+                and not self.routers[s.router_id].is_deleted
+            ),
+            None,
+        )
+
+    async def create_site(self, data):  # noqa: ANN001, ANN201
+        site = SimpleNamespace(id=uuid.uuid4(), is_deleted=False, **data)
+        self.sites.append(site)
+        return site
+
+    async def update_site(self, site, data):  # noqa: ANN001, ANN201
+        for k, v in data.items():
+            setattr(site, k, v)
+        return site
+
+    async def soft_delete_sites_for_router(self, router_id):  # noqa: ANN001, ANN201
+        hit = [s for s in self.sites if s.router_id == router_id and not s.is_deleted]
+        for site in hit:
+            site.is_deleted = True
+        return hit
+
+
+def _instant_on(repo: _SiteRepo, audit=None) -> InstantOnReadService:  # noqa: ANN001
+    return InstantOnReadService(repo, audit_writer=audit)
+
+
+def _app(service, instant_on: InstantOnReadService | None = None) -> FastAPI:  # noqa: ANN001
+    from app.domains.network_integration.dependencies import (
+        get_instant_on_read_service,
+    )
     from app.domains.router.router import router as router_router
 
+    if instant_on is None:
+        instant_on = _instant_on(_SiteRepo(service.repository.routers))
     app = FastAPI()
+    app.dependency_overrides[get_instant_on_read_service] = lambda: instant_on
     register_exception_handlers(app)
     app.include_router(router_router, prefix="/api/v1")
     app.dependency_overrides[get_router_service] = lambda: service
@@ -575,7 +583,6 @@ class TestHttp:
                 "location_id": str(location.id),
                 "name": "Aruba AP21 VNV5M1K1M6",
                 "serial_number": _AP21_SERIAL,
-                "instant_on_site_name": "inhouse-office",
             },
         )
         assert status == 201, body
@@ -585,7 +592,7 @@ class TestHttp:
         assert data["router"]["location_id"] == str(location.id)
         assert data["synthetic_serial_number"] is False
         assert data["synthetic_mac_address"] is True
-        assert data["instant_on_site_name"] == "inhouse-office"
+        assert data["instant_on_site_id"] is None
 
     async def test_409_carries_the_reason_and_the_existing_row(self) -> None:
         service, _repo, _locations, _orgs, _audit, org, location = _setup()
@@ -619,6 +626,154 @@ class TestHttp:
         assert status == 422
         assert body["data"]["reason"] == "location_not_in_organization"
         assert repo.routers == {}
+
+async def _add(app, org, location, **extra):  # noqa: ANN001, ANN003, ANN202
+    return await _post(
+        app,
+        "/api/v1/platform/routers/instant-on-sites",
+        {
+            "organization_id": str(org.id),
+            "location_id": str(location.id),
+            "name": "Aruba AP21",
+            **extra,
+        },
+    )
+
+
+class TestInstantOnSiteMapping:
+    """The site id goes to `instant_on_sites` (#327's table), never to the
+    router row, so there is one source of truth for "which site is this"."""
+
+    async def test_site_id_is_written_to_instant_on_sites_with_both_flags_off(
+        self,
+    ) -> None:
+        service, repo, _locations, _orgs, audit, org, location = _setup()
+        sites = _SiteRepo(repo.routers)
+        status, body = await _add(
+            _app(service, _instant_on(sites, audit)),
+            org,
+            location,
+            instant_on_site_id=_SITE_ID,
+            instant_on_site_name="inhouse-office",
+        )
+        assert status == 201, body
+        router_id = uuid.UUID(body["data"]["router"]["id"])
+        [site] = sites.sites
+        assert site.router_id == router_id
+        assert site.site_id == _SITE_ID
+        assert site.site_name == "inhouse-office"
+        assert site.poll_enabled is False
+        assert site.customer_visible is False
+        # Copied from the router, not from the body.
+        assert site.organization_id == org.id
+        assert site.location_id == location.id
+        router = repo.routers[router_id]
+        assert "instant_on_site_id" not in router.settings
+        assert "instant_on_site_name" not in router.settings
+        assert "instant_on_site.create" in [e["action"] for e in audit.entries]
+
+    async def test_no_site_id_writes_no_mapping(self) -> None:
+        service, repo, _locations, _orgs, _audit, org, location = _setup()
+        sites = _SiteRepo(repo.routers)
+        status, _body = await _add(_app(service, _instant_on(sites)), org, location)
+        assert status == 201
+        assert sites.sites == []
+
+    async def test_a_site_mapped_to_a_live_router_is_refused(self) -> None:
+        service, repo, locations, _orgs, _audit, org, location = _setup()
+        sites = _SiteRepo(repo.routers)
+        app = _app(service, _instant_on(sites))
+        status, first = await _add(app, org, location, instant_on_site_id=_SITE_ID)
+        assert status == 201
+        elsewhere = locations.add(organization_id=org.id)
+
+        status, body = await _add(app, org, elsewhere, instant_on_site_id=_SITE_ID)
+
+        assert status == 409
+        assert body["data"]["reason"] == "site_already_onboarded"
+        assert body["data"]["existing_router_id"] == first["data"]["router"]["id"]
+        assert len(repo.routers) == 1
+        assert len(sites.sites) == 1
+
+    async def test_a_site_left_on_a_decommissioned_router_does_not_block(
+        self,
+    ) -> None:
+        """Belt and braces: decommission releases the mapping (below), and the
+        lookup also ignores a mapping whose router is gone."""
+        service, repo, locations, _orgs, _audit, org, location = _setup()
+        sites = _SiteRepo(repo.routers)
+        app = _app(service, _instant_on(sites))
+        status, first = await _add(app, org, location, instant_on_site_id=_SITE_ID)
+        await service.decommission_router(
+            actor_user_id=_ACTOR_ID,
+            router_id=uuid.UUID(first["data"]["router"]["id"]),
+            requesting_organization_id=None,
+        )
+        status, body = await _add(
+            app, org, locations.add(organization_id=org.id), instant_on_site_id=_SITE_ID
+        )
+        assert status == 201, body
+
+    async def test_malformed_site_id_is_refused_before_any_write(self) -> None:
+        service, repo, _locations, _orgs, _audit, org, location = _setup()
+        sites = _SiteRepo(repo.routers)
+        status, body = await _add(
+            _app(service, _instant_on(sites)),
+            org,
+            location,
+            instant_on_site_id="../sites/x",
+        )
+        assert status == 422
+        assert body["data"]["reason"] == "invalid_site_id"
+        assert repo.routers == {}
+        assert sites.sites == []
+
+    def test_site_name_without_site_id_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            NasOnlySiteCreateRequest(
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                name="AP",
+                instant_on_site_name="inhouse-office",
+            )
+
+    async def test_real_lookup_query_requires_a_live_router(self) -> None:
+        """The real `get_live_site_by_site_id`, against a session that records
+        the statement: it must join `routers` and require it not deleted."""
+        from sqlalchemy.dialects import postgresql
+
+        from app.domains.network_integration.instant_on_repository import (
+            InstantOnRepository,
+        )
+
+        seen: list[str] = []
+
+        class _Result:
+            def scalars(self):  # noqa: ANN202
+                return self
+
+            def first(self) -> None:
+                return None
+
+        class _Session:
+            async def execute(self, statement):  # noqa: ANN001, ANN202
+                seen.append(
+                    str(
+                        statement.compile(
+                            dialect=postgresql.dialect(),
+                            compile_kwargs={"literal_binds": True},
+                        )
+                    )
+                )
+                return _Result()
+
+        await InstantOnRepository(_Session()).get_live_site_by_site_id(_SITE_ID)
+        [sql] = seen
+        assert "JOIN routers ON routers.id = instant_on_sites.router_id" in sql
+        assert "routers.is_deleted IS false" in sql
+        assert "instant_on_sites.is_deleted IS false" in sql
+        assert f"instant_on_sites.site_id = '{_SITE_ID}'" in sql
+
 
     async def test_org_scoped_create_refuses_the_nas_only_vendor(self) -> None:
         """Called directly rather than over HTTP: the org-scoped route's
@@ -713,6 +868,7 @@ class TestRemoveDeregistersTheNasFirst:
                 router_service=router_service,
                 radius_service=fx.radius_service,
                 wireguard_service=wireguard,
+                instant_on_service=None,
             )
         assert router_service.decommissioned == []
 
@@ -736,6 +892,76 @@ class TestRemoveDeregistersTheNasFirst:
                 router_service=router_service,
                 radius_service=fx.radius_service,
                 wireguard_service=wireguard,
+                instant_on_service=None,
             )
         assert stub.calls[0]["json"] == {"nas_identifier": _NAS_IDENTIFIER}
         assert router_service.decommissioned == [fx.router.id]
+
+    async def test_success_releases_the_instant_on_site_mapping(self) -> None:
+        from app.domains.router.router import decommission_router
+
+        from .test_radius_nas_deregistration import _AGENT_OK_ONE_REMOVED, bridge
+        from .test_router import FakeAuditLogWriter
+
+        fx = await self._aruba_with_nas()
+        sites = _SiteRepo({})
+        await sites.create_site(
+            {"router_id": fx.router.id, "site_id": _SITE_ID, "site_name": "x",
+             "organization_id": uuid.uuid4(), "location_id": uuid.uuid4()}
+        )
+        audit = FakeAuditLogWriter()
+        request, router_service, wireguard = self._fakes()
+        with bridge(_AGENT_OK_ONE_REMOVED):
+            await decommission_router(
+                request,
+                fx.router.id,
+                user=_ACTOR,
+                requesting_organization_id=None,
+                router_service=router_service,
+                radius_service=fx.radius_service,
+                wireguard_service=wireguard,
+                instant_on_service=_instant_on(sites, audit),
+            )
+        assert sites.sites[0].is_deleted is True
+        assert [e["action"] for e in audit.entries] == ["instant_on_site.delete"]
+        assert router_service.decommissioned == [fx.router.id]
+
+    async def test_hub_refusal_leaves_the_mapping_in_place(self) -> None:
+        from app.domains.guest.exceptions import RadiusNasBridgeDeregistrationError
+        from app.domains.router.router import decommission_router
+
+        from .test_radius_nas_deregistration import _AGENT_501, bridge
+
+        fx = await self._aruba_with_nas()
+        sites = _SiteRepo({})
+        await sites.create_site(
+            {"router_id": fx.router.id, "site_id": _SITE_ID, "site_name": None,
+             "organization_id": uuid.uuid4(), "location_id": uuid.uuid4()}
+        )
+        request, router_service, wireguard = self._fakes()
+        with bridge(_AGENT_501), pytest.raises(RadiusNasBridgeDeregistrationError):
+            await decommission_router(
+                request,
+                fx.router.id,
+                user=_ACTOR,
+                requesting_organization_id=None,
+                router_service=router_service,
+                radius_service=fx.radius_service,
+                wireguard_service=wireguard,
+                instant_on_service=_instant_on(sites),
+            )
+        assert sites.sites[0].is_deleted is False
+
+    def test_the_poller_already_skips_sites_of_deleted_routers(self) -> None:
+        """Pins the second guard #327 provides: `list_pollable_sites` joins on
+        the router and requires it live, so even a mapping that somehow
+        survived decommission is never polled."""
+        import inspect
+
+        from app.domains.network_integration.instant_on_repository import (
+            InstantOnRepository,
+        )
+
+        src = inspect.getsource(InstantOnRepository.list_pollable_sites)
+        assert "Router.is_deleted.is_(False)" in src
+

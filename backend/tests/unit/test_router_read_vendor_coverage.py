@@ -474,20 +474,20 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "would make an Omada venue's own controller show as an unlabelled "
         "uuid. Read-only, every row genuinely belongs."
     ),
+    "app/domains/network_integration/instant_on_repository.py::"
+    "InstantOnRepository.get_live_site_by_site_id": (
+        "'Is this Instant On site already mapped to a live fleet device?' "
+        "Joins `routers` only to require the mapped router is not deleted. "
+        "Only NAS-only rows ever get an `instant_on_sites` mapping "
+        "(`configure_site` refuses anything else), so `agent_managed_only` "
+        "would make it empty by definition. Feeds a refusal, never device work."
+    ),
     "app/domains/router/repository.py::RouterRepository.routers_holding_identity": (
         "The uniqueness check before an Instant On row is inserted: every row "
         "-- soft-deleted ones too -- that already owns this serial or MAC. "
         "The unique indexes are vendor-blind, so the read must be too: a "
         "MikroTik or a controller holding the value is exactly the conflict "
         "to report. Nothing is dispatched to a device from it."
-    ),
-    "app/domains/router/repository.py::"
-    "RouterRepository.live_nas_only_routers_for_site": (
-        "'Is this Instant On site already in the fleet?' Narrowed to "
-        "NAS_ONLY_VENDORS in its WHERE clause (the site id only exists on "
-        "those rows), so `agent_managed_only` would make it empty by "
-        "definition -- same posture as `nas_only_vendor_for_location`. Feeds "
-        "a refusal, never device work."
     ),
 }
 

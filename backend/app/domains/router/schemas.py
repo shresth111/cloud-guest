@@ -42,7 +42,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domains.auth.schemas import MessageResponse
 
@@ -669,10 +669,21 @@ class NasOnlySiteCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     serial_number: str | None = Field(default=None, min_length=1, max_length=100)
     mac_address: str | None = Field(default=None, min_length=12, max_length=17)
-    instant_on_site_id: str | None = Field(default=None, min_length=1, max_length=100)
+    # Written to `instant_on_sites` (the poller's table), not to the router
+    # row. A name without an id has nowhere to go there, so it is refused.
+    instant_on_site_id: str | None = Field(default=None, min_length=1, max_length=128)
     instant_on_site_name: str | None = Field(
-        default=None, min_length=1, max_length=200
+        default=None, min_length=1, max_length=255
     )
+
+    @model_validator(mode="after")
+    def site_name_needs_site_id(self) -> NasOnlySiteCreateRequest:
+        if self.instant_on_site_name and not self.instant_on_site_id:
+            raise ValueError(
+                "instant_on_site_name needs instant_on_site_id: the site name is "
+                "stored with the site mapping"
+            )
+        return self
 
     @field_validator(
         "name", "serial_number", "instant_on_site_id", "instant_on_site_name"

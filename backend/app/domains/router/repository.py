@@ -185,10 +185,6 @@ class RouterRepositoryProtocol(Protocol):
         self, *, serial_number: str, mac_address: str
     ) -> list[Router]: ...
 
-    async def live_nas_only_routers_for_site(
-        self, instant_on_site_id: str
-    ) -> list[Router]: ...
-
     async def count_live_integrations_at_location(
         self, location_id: uuid.UUID
     ) -> int: ...
@@ -416,20 +412,6 @@ class RouterRepository:
                 Router.serial_number == serial_number,
                 Router.mac_address == mac_address,
             )
-        )
-        return list((await self.session.execute(statement)).scalars().all())
-
-    async def live_nas_only_routers_for_site(
-        self, instant_on_site_id: str
-    ) -> list[Router]:
-        """Live NAS-only rows recorded against this Instant On site id
-        (``settings.instant_on_site_id``). Wave 1 allows one row per site."""
-        from .vendor_capabilities import NAS_ONLY_VENDORS
-
-        statement = select(Router).where(
-            Router.is_deleted.is_(False),
-            Router.vendor.in_(sorted(NAS_ONLY_VENDORS)),
-            Router.settings["instant_on_site_id"].astext == instant_on_site_id,
         )
         return list((await self.session.execute(statement)).scalars().all())
 

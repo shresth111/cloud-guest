@@ -97,6 +97,8 @@ from app.domains.network_config.constants import (
     REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES,
     BootstrapMode,
 )
+from app.domains.network_integration.dependencies import get_instant_on_read_service
+from app.domains.network_integration.instant_on_service import InstantOnReadService
 from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
 from app.domains.provisioning_engine.planner.dependencies import (
     get_configuration_plan_service,
@@ -562,6 +564,7 @@ async def create_instant_on_site(
     payload: NasOnlySiteCreateRequest,
     user: AuthUser = Depends(CurrentUser),
     router_service: RouterService = Depends(get_router_service),
+    instant_on_service: InstantOnReadService = Depends(get_instant_on_read_service),
 ):
     """Add one Aruba Instant On site as one ``aruba_instant_on`` fleet row.
 
@@ -574,10 +577,30 @@ async def create_instant_on_site(
     No ``CurrentOrganization``: the tenant is ``organization_id`` in the
     body, and ``RouterService.create_nas_only_site`` refuses a location that
     is not that organization's own (422), a location that already has an
-    Instant On row or the same Instant On site id (409, with
-    ``existing_router_id``), and a location with any other device or a
-    network integration (409). See that method for why.
+    Instant On row (409, with ``existing_router_id``), and a location with
+    any other device or a network integration (409). See that method for
+    why.
+
+    **The Instant On site id lives in ``instant_on_sites``** (the poller's
+    table, #327), not on the router row: one source of truth. When
+    ``instant_on_site_id`` is given, a live mapping of that site to another
+    live router is refused first (409 ``site_already_onboarded``), and after
+    the row is created the mapping is written through
+    ``InstantOnReadService.configure_site`` with polling and the customer
+    view both OFF -- turning either on stays a deliberate Master action
+    (``PUT /platform/instant-on/routers/{router_id}/site``). Both writes share
+    the request's session, so a failure in the second rolls back the first.
     """
+    if payload.instant_on_site_id:
+        in_use = await instant_on_service.site_in_use(payload.instant_on_site_id)
+        if in_use is not None:
+            raise NasOnlySiteRefusedError(
+                f"Instant On site {payload.instant_on_site_id} is already "
+                "mapped to another fleet device. One Instant On site is one "
+                "fleet row.",
+                reason="site_already_onboarded",
+                existing_router_id=in_use.router_id,
+            )
     result = await router_service.create_nas_only_site(
         actor_user_id=uuid.UUID(user.id),
         organization_id=payload.organization_id,
@@ -585,10 +608,18 @@ async def create_instant_on_site(
         name=payload.name,
         serial_number=payload.serial_number,
         mac_address=payload.mac_address,
-        instant_on_site_id=payload.instant_on_site_id,
-        instant_on_site_name=payload.instant_on_site_name,
     )
     created, synthetic_serial, synthetic_mac = result
+    if payload.instant_on_site_id:
+        await instant_on_service.configure_site(
+            router_id=created.id,
+            site_id=payload.instant_on_site_id,
+            site_name=payload.instant_on_site_name,
+            poll_enabled=False,
+            customer_visible=False,
+            router_lookup=router_service,
+            actor_user_id=uuid.UUID(user.id),
+        )
     return build_response(
         success=True,
         message="Instant On site added",
@@ -668,6 +699,9 @@ async def decommission_router(
     router_service: RouterService = Depends(get_router_service),
     radius_service: RadiusService = Depends(get_radius_service),
     wireguard_service: WireGuardService = Depends(get_wireguard_service),
+    instant_on_service: InstantOnReadService | None = Depends(
+        get_instant_on_read_service
+    ),
 ):
     # RADIUS first, before anything else is touched. A decommissioned
     # router's RadiusNasClient row used to outlive decommissioning
@@ -730,6 +764,17 @@ async def decommission_router(
         logger.warning(
             "router_decommission_wireguard_revoke_failed",
             extra={"router_id": str(router_id)},
+        )
+
+    # An Aruba Instant On row's site mapping (`instant_on_sites`, #327) goes
+    # with it. The poller already skips sites whose router is deleted, but the
+    # venue reads (`get_site_for_location`) do not, so a stale mapping would
+    # answer for the venue's next Instant On row, and would block re-adding
+    # the same site. Same session as the decommission below: both or neither.
+    # `None` only when a test calls this function directly.
+    if instant_on_service is not None:
+        await instant_on_service.release_sites_for_router(
+            router_id, actor_user_id=uuid.UUID(user.id)
         )
 
     await router_service.decommission_router(

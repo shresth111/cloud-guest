@@ -359,19 +359,6 @@ class FakeRouterRepository:
             if r.serial_number == serial_number or r.mac_address == mac_address
         ]
 
-    async def live_nas_only_routers_for_site(
-        self, instant_on_site_id: str
-    ) -> list[Router]:
-        from app.domains.router.vendor_capabilities import NAS_ONLY_VENDORS
-
-        return [
-            r
-            for r in self.routers.values()
-            if not r.is_deleted
-            and r.vendor in NAS_ONLY_VENDORS
-            and (r.settings or {}).get("instant_on_site_id") == instant_on_site_id
-        ]
-
     # location_id -> live network integrations there. A test sets it.
     location_integration_counts: dict[uuid.UUID, int] = field(default_factory=dict)
 

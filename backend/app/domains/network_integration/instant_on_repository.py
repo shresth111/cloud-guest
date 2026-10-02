@@ -57,6 +57,12 @@ class InstantOnRepositoryProtocol(Protocol):
         self, site: InstantOnSite
     ) -> dict[str, InstantOnSnapshot]: ...
 
+    async def get_live_site_by_site_id(self, site_id: str) -> InstantOnSite | None: ...
+
+    async def soft_delete_sites_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[InstantOnSite]: ...
+
     async def create_site(self, data: dict[str, Any]) -> InstantOnSite: ...
 
     async def update_site(
@@ -149,6 +155,48 @@ class InstantOnRepository:
         )
         rows = (await self.session.execute(statement)).scalars().all()
         return {row.kind: row for row in rows}
+
+    async def get_live_site_by_site_id(self, site_id: str) -> InstantOnSite | None:
+        """The live mapping for this Instant On site whose fleet router is
+        still live, or ``None``. One Instant On site is one fleet row (PM_SPEC
+        §0.1 items 4-5); the Master "Add Instant On site" route refuses a
+        second. A mapping left behind by a decommissioned router does not
+        count -- decommission soft-deletes it, and the join makes that hold
+        for any row that predates the cleanup."""
+        from app.domains.router.models import Router
+
+        statement = (
+            select(InstantOnSite)
+            .join(Router, Router.id == InstantOnSite.router_id)
+            .where(
+                InstantOnSite.site_id == site_id,
+                InstantOnSite.is_deleted.is_(False),
+                Router.is_deleted.is_(False),
+            )
+            .order_by(InstantOnSite.created_at.asc())
+            .limit(1)
+        )
+        return (await self.session.execute(statement)).scalars().first()
+
+    async def soft_delete_sites_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[InstantOnSite]:
+        """Soft-delete this router's live site mapping(s); returns them.
+
+        Called when the router is decommissioned. The poller already skips
+        sites whose router is deleted (``list_pollable_sites`` joins on it),
+        but ``get_site_for_location`` and ``list_sites`` do not, so a stale
+        mapping would answer for the venue's NEXT Instant On row."""
+        statement = select(InstantOnSite).where(
+            InstantOnSite.router_id == router_id,
+            InstantOnSite.is_deleted.is_(False),
+        )
+        sites = list((await self.session.execute(statement)).scalars().all())
+        for site in sites:
+            site.mark_deleted()
+        if sites:
+            await self.session.flush()
+        return sites
 
     async def create_site(self, data: dict[str, Any]) -> InstantOnSite:
         site = InstantOnSite(**data)

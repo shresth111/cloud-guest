@@ -448,6 +448,7 @@ class TestDecommissionRouterCleansUpRadius:
                 router_service=router_service,
                 radius_service=fx.radius_service,
                 wireguard_service=wireguard_service,
+                instant_on_service=None,
             )
 
         #  Nothing was mutated: the router is still there, the tunnel is
@@ -472,6 +473,7 @@ class TestDecommissionRouterCleansUpRadius:
                 router_service=router_service,
                 radius_service=fx.radius_service,
                 wireguard_service=wireguard_service,
+                instant_on_service=None,
             )
 
         assert stub.calls[0]["json"] == {"nas_identifier": _NAS_IDENTIFIER}
@@ -495,6 +497,7 @@ class TestDecommissionRouterCleansUpRadius:
                 router_service=router_service,
                 radius_service=fx.radius_service,
                 wireguard_service=wireguard_service,
+                instant_on_service=None,
             )
 
         assert stub.calls == []
