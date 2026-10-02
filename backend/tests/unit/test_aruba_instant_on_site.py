@@ -621,20 +621,35 @@ class TestHttp:
         assert repo.routers == {}
 
     async def test_org_scoped_create_refuses_the_nas_only_vendor(self) -> None:
+        """Called directly rather than over HTTP: the org-scoped route's
+        `RequirePermission` resolves the path location's owner from the
+        database before any override applies, and CI has no database."""
+        from app.domains.router.router import create_router as org_scoped_create
+        from app.domains.router.schemas import RouterCreateRequest
+
         service, repo, _locations, _orgs, _audit, _org, location = _setup()
-        status, body = await _post(
-            _app(service),
-            f"/api/v1/locations/{location.id}/routers",
-            {
-                "name": "Sneaky",
-                "serial_number": _AP21_SERIAL,
-                "mac_address": _AP21_MAC,
-                "model": "AP21",
-                "vendor": ARUBA_INSTANT_ON_VENDOR,
-            },
-        )
-        assert status == 422
-        assert body["data"]["reason"] == "master_console_only"
+
+        class _Req:
+            class state:  # noqa: N801 -- mirrors Starlette's request.state
+                request_id = "t"
+
+        with pytest.raises(NasOnlySiteRefusedError) as exc:
+            await org_scoped_create(
+                _Req(),
+                location.id,
+                RouterCreateRequest(
+                    name="Sneaky",
+                    serial_number=_AP21_SERIAL,
+                    mac_address=_AP21_MAC,
+                    model="AP21",
+                    vendor=ARUBA_INSTANT_ON_VENDOR,
+                ),
+                user=_ACTOR,
+                requesting_organization_id=location.organization_id,
+                router_service=service,
+            )
+        assert exc.value.status_code == 422
+        assert exc.value.data["reason"] == "master_console_only"
         assert repo.routers == {}
 
 
