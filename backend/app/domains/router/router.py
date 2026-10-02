@@ -156,6 +156,7 @@ from .device_adapters import (
 )
 from .enums import RouterStatus
 from .exceptions import NasOnlySiteRefusedError
+from .instant_on_onboarding import onboard_instant_on_site
 from .models import Router
 from .schemas import (
     BootstrapScriptPreviewResponse,
@@ -591,35 +592,24 @@ async def create_instant_on_site(
     (``PUT /platform/instant-on/routers/{router_id}/site``). Both writes share
     the request's session, so a failure in the second rolls back the first.
     """
-    if payload.instant_on_site_id:
-        in_use = await instant_on_service.site_in_use(payload.instant_on_site_id)
-        if in_use is not None:
-            raise NasOnlySiteRefusedError(
-                f"Instant On site {payload.instant_on_site_id} is already "
-                "mapped to another fleet device. One Instant On site is one "
-                "fleet row.",
-                reason="site_already_onboarded",
-                existing_router_id=in_use.router_id,
-            )
-    result = await router_service.create_nas_only_site(
+    # The site-id check, the row and the site mapping are one shared
+    # sequence (`instant_on_onboarding`), so this route and the Add Customer
+    # wizard's Aruba option (`POST /locations/provision`) cannot drift.
+    onboarded = await onboard_instant_on_site(
+        router_service=router_service,
+        instant_on_service=instant_on_service,
         actor_user_id=uuid.UUID(user.id),
         organization_id=payload.organization_id,
         location_id=payload.location_id,
         name=payload.name,
         serial_number=payload.serial_number,
         mac_address=payload.mac_address,
+        instant_on_site_id=payload.instant_on_site_id,
+        instant_on_site_name=payload.instant_on_site_name,
     )
-    created, synthetic_serial, synthetic_mac = result
-    if payload.instant_on_site_id:
-        await instant_on_service.configure_site(
-            router_id=created.id,
-            site_id=payload.instant_on_site_id,
-            site_name=payload.instant_on_site_name,
-            poll_enabled=False,
-            customer_visible=False,
-            router_lookup=router_service,
-            actor_user_id=uuid.UUID(user.id),
-        )
+    created = onboarded.router
+    synthetic_serial = onboarded.synthetic_serial_number
+    synthetic_mac = onboarded.synthetic_mac_address
     return build_response(
         success=True,
         message="Instant On site added",

@@ -154,6 +154,40 @@ class RouterConfigTemplateWithoutRouterError(LocationError):
         super().__init__(message, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
 
+class ProvisioningDeviceConflictError(LocationError):
+    """Smart Location Provisioning: both a MikroTik ``router`` and an Aruba
+    ``instant_on_site`` were supplied.
+
+    A venue's first device is one or the other. ``ProvisionLocationRequest``
+    refuses this shape as a 422 at the request boundary; this is the same
+    rule for a caller that builds ``ProvisionLocationInput`` itself."""
+
+    def __init__(
+        self,
+        message: str = (
+            "router and instant_on_site were both supplied -- a venue's first "
+            "device is either a MikroTik router or an Aruba Instant On site, "
+            "not both. Send one of them."
+        ),
+    ) -> None:
+        super().__init__(message, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
+class InstantOnProvisioningUnavailableError(LocationError):
+    """Smart Location Provisioning was asked for an Aruba Instant On site but
+    was built without the Instant On site service. A wiring bug, refused
+    before anything is written rather than creating a row with no way to
+    record its site mapping."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This deployment cannot add an Aruba Instant On site during "
+            "provisioning (the Instant On site service is not wired). Nothing "
+            "was saved.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 class LocationOrganizationMismatchError(LocationError):
     """The ``X-Location-Id`` header named a location that does not belong to
     the resolved ``X-Organization-Id`` organization context (RBAC's
