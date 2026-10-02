@@ -199,13 +199,13 @@ jobs:
       - name: Verify through the staging endpoint
         run: |
           set -euo pipefail
-          echo "Verifying staging API responds on Elastic IP..."
+          echo "Verifying staging API responds at https://staging.wyfyguest.com (nginx 404s a bare-IP request)..."
           for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-              "http://13.207.123.212/api/v1/health/live?cb=$(date +%s)" || echo 000)
+              "https://staging.wyfyguest.com/api/v1/health/live?cb=$(date +%s)" || echo 000)
             echo "attempt $i: HTTP $CODE"
             [ "$CODE" = "200" ] && { echo "Staging API verified 200 OK"; exit 0; }
             sleep 10
           done
-          echo "::error::13.207.123.212/api/v1/health/live did not return 200 after the deploy."
+          echo "::error::https://staging.wyfyguest.com/api/v1/health/live did not return 200 after the deploy."
           exit 1
