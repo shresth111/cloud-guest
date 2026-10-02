@@ -18,13 +18,17 @@ chmod 0640 /var/lib/wyfy-radius/clients.conf
 
 python3 -u /opt/wyfy/radius_agent.py &
 AGENT=$!
+echo $AGENT > /run/wyfy-agent.pid
 trap 'kill $AGENT $(cat /run/wyfy-radiusd.pid 2>/dev/null) 2>/dev/null; exit 0' TERM INT
 
 while true; do
   kill -0 "$AGENT" 2>/dev/null || { echo "radius-agent exited" >&2; exit 1; }
   freeradius -f -l stdout &
   echo $! > /run/wyfy-radiusd.pid
-  wait $!
-  echo "freeradius exited rc=$? -- restarting in 1s" >&2
+  # Returns when EITHER child exits. A dead agent ends the container (compose
+  # restarts it); a dead radiusd (the shim's restart) loops.
+  wait -n
+  kill -0 "$AGENT" 2>/dev/null || { echo "radius-agent exited -- stopping container" >&2; kill "$(cat /run/wyfy-radiusd.pid)" 2>/dev/null; exit 1; }
+  echo "freeradius exited -- restarting in 1s" >&2
   sleep 1
 done

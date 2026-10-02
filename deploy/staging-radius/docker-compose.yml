@@ -26,7 +26,7 @@ services:
       - radius_state:/var/lib/wyfy-radius
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "kill -0 $$(cat /run/wyfy-radiusd.pid) && pgrep -f radius_agent.py >/dev/null"]
+      test: ["CMD-SHELL", "kill -0 $$(cat /run/wyfy-radiusd.pid) && kill -0 $$(cat /run/wyfy-agent.pid)"]
       interval: 30s
       timeout: 5s
       retries: 3

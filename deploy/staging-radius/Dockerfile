@@ -19,7 +19,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=gen /gen/out/default /etc/freeradius/sites-available/default
 COPY --from=gen /gen/out/rest    /etc/freeradius/mods-available/rest
+# The image is Ubuntu 20.04 (python 3.8); the agent uses PEP 604 `X | None`
+# in signatures. Postponed annotations make that a no-op on 3.8 without
+# touching the agent's logic; the import check below proves it loads.
 COPY backend/ops/hub-agents/radius_agent.py /opt/wyfy/radius_agent.py
+RUN sed -i '0,/^import /s//from __future__ import annotations\nimport /' /opt/wyfy/radius_agent.py \
+ && cd /opt/wyfy && python3 -c 'import radius_agent; assert radius_agent.CLIENTS_CONF == "/etc/freeradius/3.0/clients.conf"'
 COPY deploy/staging-radius/entrypoint.sh     /opt/wyfy/entrypoint.sh
 COPY deploy/staging-radius/systemctl-shim.sh /usr/local/bin/systemctl
 # clients.conf lives on a volume (stanzas are written at runtime by the agent).
