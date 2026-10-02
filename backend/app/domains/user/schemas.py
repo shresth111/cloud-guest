@@ -22,11 +22,11 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.domains.auth.schemas import MessageResponse
 from app.domains.auth.schemas import (
-    MessageResponse,
-    OrganizationMembershipSummary,
-    RoleAssignmentSummary,
+    OrganizationMembershipSummary as LoginOrganizationMembershipSummary,
 )
+from app.domains.auth.schemas import RoleAssignmentSummary
 from app.domains.rbac.enums import ScopeType
 
 __all__ = [
@@ -338,7 +338,11 @@ class ImpersonateUserResponse(BaseModel):
     # placeholder. Read-only facts about the target -- they grant nothing;
     # every request is still authorized server-side against the token.
     roles: list[RoleAssignmentSummary] = Field(default_factory=list)
-    organizations: list[OrganizationMembershipSummary] = Field(default_factory=list)
+    # The LOGIN response's membership shape (auth.schemas), not this module's
+    # own same-named ``OrganizationMembershipSummary`` further up.
+    organizations: list[LoginOrganizationMembershipSummary] = Field(
+        default_factory=list
+    )
 
 
 class UserUpdateRequest(BaseModel):
