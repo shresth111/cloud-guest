@@ -101,6 +101,31 @@ Two consequences worth stating:
   (``RouterConfigTemplateWithoutRouterError``, 422) -- an explicit choice
   the operator made should never be silently discarded behind a 201.
 
+## Provisioning an Aruba Instant On venue
+
+``ProvisionLocationInput.instant_on_site`` is the Add Customer wizard's third
+device option (PM_SPEC §5 Wave 2): a venue whose access points are managed
+in the Aruba Instant On app. Instant On has no gateway this platform can
+reach, so the venue's fleet row is NAS-only (vendor ``aruba_instant_on``):
+it exists so RADIUS can be registered against the venue's static public
+address later, from the Instant On setup panel.
+
+It is created by ``app.domains.router.instant_on_onboarding
+.onboard_instant_on_site`` -- the SAME sequence Router Fleet's "Add Instant
+On site" (``POST /platform/routers/instant-on-sites``) runs, not a copy of
+it: the site-id-already-mapped check, ``RouterService.create_nas_only_site``
+(which refuses a location of another customer, a second Instant On row and a
+mixed venue) and the ``instant_on_sites`` mapping, with polling and the
+customer view OFF. All of it is flushes on this request's session, so it
+commits or rolls back with the rest of the customer.
+
+The row is NOT a router to this flow. Steps (f) config template and (e')
+WireGuard peer stay MikroTik-only: an Instant On venue gets no template, no
+hub call, no agent credential and no RADIUS NAS. The site-id check also runs
+once before the first write, so an already-mapped site is refused with
+nothing saved. ``router`` and ``instant_on_site`` together are refused
+(``ProvisioningDeviceConflictError``, 422).
+
 ## Billing feature-flag/plan-limit override design decision
 
 BE-013 Part 1's ``PlanFeature`` is inherently *plan-level*: every
@@ -259,6 +284,11 @@ from app.domains.organization.exceptions import (
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.models import Role
+from app.domains.router.instant_on_onboarding import (
+    InstantOnSiteMapper,
+    ensure_instant_on_site_id_free,
+    onboard_instant_on_site,
+)
 from app.domains.router.models import Router
 from app.domains.router_provisioning.models import ConfigTemplate
 from app.domains.wireguard.dependencies import HubBridgeUnavailableError
@@ -268,7 +298,9 @@ from app.domains.wireguard.service import HubTunnelAllocation
 from .enums import PropertyType
 from .exceptions import (
     DefaultConfigTemplateNotFoundError,
+    InstantOnProvisioningUnavailableError,
     NewOrganizationRequiredError,
+    ProvisioningDeviceConflictError,
     RouterConfigTemplateWithoutRouterError,
 )
 from .models import Location
@@ -738,6 +770,19 @@ class RouterInput:
 
 
 @dataclass(frozen=True, slots=True)
+class InstantOnSiteInput:
+    """An Aruba Instant On site -- see module docstring's "Provisioning an
+    Aruba Instant On venue". Serial/MAC are optional (minted when absent, as
+    Router Fleet's "Add Instant On site" does); the site name needs the id."""
+
+    name: str
+    serial_number: str | None = None
+    mac_address: str | None = None
+    instant_on_site_id: str | None = None
+    instant_on_site_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureOverride:
     feature_key: PlanFeatureKey
     limit_value: Decimal | None = None
@@ -760,6 +805,8 @@ class ProvisionLocationInput:
     feature_overrides: tuple[FeatureOverride, ...] = ()
     router_config_template_id: uuid.UUID | None = None
     coupon_code: str | None = None
+    # The Aruba Instant On option; mutually exclusive with `router`.
+    instant_on_site: InstantOnSiteInput | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -784,6 +831,10 @@ class ProvisionLocationResult:
     owner_temporary_password: str
     login_url: str
     provisioned_at: datetime
+    # The fleet row's vendor ("mikrotik" / "aruba_instant_on"); None with no
+    # device. `router_id`/`router_name` name an Instant On row too.
+    router_vendor: str | None = None
+    instant_on_site_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -853,7 +904,12 @@ def _reject_template_without_router(data: ProvisionLocationInput) -> None:
     boundary; this is the same rule for a caller that builds the input
     dataclass directly, so the service cannot be talked into silently
     dropping a template either. See
-    ``RouterConfigTemplateWithoutRouterError``."""
+    ``RouterConfigTemplateWithoutRouterError``.
+
+    Also refuses a MikroTik router and an Instant On site together
+    (``ProvisioningDeviceConflictError``) -- same boundary, same reason."""
+    if data.router is not None and data.instant_on_site is not None:
+        raise ProvisioningDeviceConflictError()
     if data.router is None and data.router_config_template_id is not None:
         raise RouterConfigTemplateWithoutRouterError()
 
@@ -991,6 +1047,7 @@ class LocationProvisioningService:
         login_url_base: str = _DEFAULT_LOGIN_URL_BASE,
         notification_service: NotificationSenderProtocol | None = None,
         default_alerting: DefaultAlertingProtocol | None = None,
+        instant_on_service: InstantOnSiteMapper | None = None,
     ) -> None:
         self.location_service = location_service
         self.organization_service = organization_service
@@ -1012,6 +1069,21 @@ class LocationProvisioningService:
         self.default_alerting: DefaultAlertingProtocol = (
             default_alerting or _NoopDefaultAlerting()
         )
+        # Only the Aruba Instant On option needs it; None refuses that option
+        # (before any write) rather than creating a row with no site mapping.
+        self.instant_on_service = instant_on_service
+
+    async def _precheck_instant_on_site(self, data: ProvisionLocationInput) -> None:
+        """Read-only refusals for the Instant On option, run before the first
+        write: the service must be wired, and the site id must not already
+        be mapped to a live fleet row (``site_already_onboarded``)."""
+        if data.instant_on_site is None:
+            return
+        if self.instant_on_service is None:
+            raise InstantOnProvisioningUnavailableError()
+        await ensure_instant_on_site_id_free(
+            self.instant_on_service, data.instant_on_site.instant_on_site_id
+        )
 
     # -- preview (read-only dry run) ----------------------------------------
 
@@ -1024,6 +1096,7 @@ class LocationProvisioningService:
         guarantee. Never calls a single ``create_*``/``update_*`` method
         on any composed service."""
         _reject_template_without_router(data)
+        await self._precheck_instant_on_site(data)
         organization_id: uuid.UUID | None
         if data.existing_organization_id is not None:
             organization = await self.organization_service.get_organization(
@@ -1074,7 +1147,13 @@ class LocationProvisioningService:
             site_id=site_id,
             nas_id=nas_id,
             controller_id=(
-                data.router.serial_number if data.router is not None else None
+                data.router.serial_number
+                if data.router is not None
+                # An Instant On site's own serial when typed; a minted one
+                # does not exist until the write path runs.
+                else data.instant_on_site.serial_number
+                if data.instant_on_site is not None
+                else None
             ),
             plan_id=base_plan.id,
             plan_name=base_plan.name,
@@ -1082,7 +1161,13 @@ class LocationProvisioningService:
             owner_name=f"{data.owner.first_name} {data.owner.last_name}".strip(),
             owner_email=data.owner.email,
             owner_username_preview=owner_username_preview,
-            router_name=data.router.name if data.router is not None else None,
+            router_name=(
+                data.router.name
+                if data.router is not None
+                else data.instant_on_site.name
+                if data.instant_on_site is not None
+                else None
+            ),
         )
 
     # -- main orchestration ------------------------------------------------
@@ -1100,6 +1185,7 @@ class LocationProvisioningService:
         now = datetime.now(UTC)
         # Before the first write, so a rejected request writes nothing.
         _reject_template_without_router(data)
+        await self._precheck_instant_on_site(data)
 
         # -- a. Create Organization (if new) / reuse existing ----------------
         organization = await self._resolve_organization(actor_user_id, data)
@@ -1176,6 +1262,30 @@ class LocationProvisioningService:
                 api_secret=data.router.api_secret,
                 settings=dict(data.router.settings),
             )
+
+        # -- d2. Aruba Instant On site (instead of a router) ----------------------
+        #
+        # One NAS-only row through the same sequence as Router Fleet's "Add
+        # Instant On site" -- see module docstring. Kept OUT of `router`, on
+        # purpose: (f) and (e') below key on `router`, and an Instant On row
+        # must get neither a config template nor a WireGuard peer.
+        instant_on_router: Router | None = None
+        if data.instant_on_site is not None:
+            assert self.instant_on_service is not None  # noqa: S101 -- prechecked
+            onboarded = await onboard_instant_on_site(
+                router_service=self.router_service,  # type: ignore[arg-type]
+                instant_on_service=self.instant_on_service,
+                actor_user_id=actor_user_id,
+                organization_id=organization.id,
+                location_id=location.id,
+                name=data.instant_on_site.name,
+                serial_number=data.instant_on_site.serial_number,
+                mac_address=data.instant_on_site.mac_address,
+                instant_on_site_id=data.instant_on_site.instant_on_site_id,
+                instant_on_site_name=data.instant_on_site.instant_on_site_name,
+            )
+            instant_on_router = onboarded.router
+        device = router if router is not None else instant_on_router
 
         # -- e. Generate WireGuard Peer -- DEFERRED, see step (e') below --------
         #
@@ -1373,7 +1483,7 @@ class LocationProvisioningService:
                 # A real null, not the string "None", when there is no
                 # router -- anything reading the audit trail back must be
                 # able to tell "no router" from a router id.
-                "router_id": str(router.id) if router is not None else None,
+                "router_id": str(device.id) if device is not None else None,
                 "plan_id": str(effective_plan_id),
                 "owner_user_id": str(owner.id),
             },
@@ -1419,8 +1529,8 @@ class LocationProvisioningService:
             plan_id=effective_plan_id,
             plan_name=resolved_plan.name,
             feature_summary=feature_summary,
-            router_id=router.id if router is not None else None,
-            router_name=router.name if router is not None else None,
+            router_id=device.id if device is not None else None,
+            router_name=device.name if device is not None else None,
             tunnel_ip_address=tunnel_ip_address,
             owner_user_id=owner.id,
             owner_name=f"{owner.first_name} {owner.last_name}".strip(),
@@ -1429,6 +1539,14 @@ class LocationProvisioningService:
             owner_temporary_password=temporary_password,
             login_url=login_url,
             provisioned_at=now,
+            router_vendor=(
+                getattr(device, "vendor", None) if device is not None else None
+            ),
+            instant_on_site_id=(
+                data.instant_on_site.instant_on_site_id
+                if data.instant_on_site is not None
+                else None
+            ),
         )
 
     # -- resend welcome email ------------------------------------------------
@@ -1670,6 +1788,7 @@ __all__ = [
     "LocationInput",
     "OwnerInput",
     "RouterInput",
+    "InstantOnSiteInput",
     "FeatureOverride",
     "OwnerRoleNotSeededError",
     "OwnerNotProvisionedError",
