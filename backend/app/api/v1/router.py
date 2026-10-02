@@ -74,6 +74,12 @@ from app.domains.network_diagnostics.router import router as network_diagnostics
 from app.domains.network_integration.customer_router import (
     customer_router as network_integration_customer_router,
 )
+from app.domains.network_integration.instant_on_router import (
+    instant_on_customer_router as network_integration_instant_on_customer_router,
+)
+from app.domains.network_integration.instant_on_router import (
+    instant_on_platform_router as network_integration_instant_on_platform_router,
+)
 from app.domains.network_integration.router import (
     portal_router as network_integration_portal_router,
 )
@@ -214,6 +220,12 @@ api_v1_router.include_router(network_integration_portal_router)
 # inventory -- deliberately NOT on the GLOBAL network_integration_router,
 # and not license-gated for writes because it has none (see its module).
 api_v1_router.include_router(network_integration_customer_router)
+# Aruba Instant On, read-only: customer reads (organization scope, keyed on
+# location) and the Master console's GLOBAL reads plus the one write that
+# maps a NAS-only device to its Instant On site (platform DB only). Not
+# license-gated: nothing here changes a venue's network.
+api_v1_router.include_router(network_integration_instant_on_customer_router)
+api_v1_router.include_router(network_integration_instant_on_platform_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 # Cloudflare Gateway category filtering: the provider-backed half of the same

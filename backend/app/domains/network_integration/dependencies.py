@@ -57,6 +57,7 @@ from app.domains.guest.repository import GuestRepository
 from app.domains.guest.service import GuestService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.location_scope import (
+    CallerLocationScope,
     LocationScope,
     OptionalCallerLocationScope,
 )
@@ -64,6 +65,8 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
+from .instant_on_repository import InstantOnRepository
+from .instant_on_service import GuestRepositoryMacLookup, InstantOnReadService
 from .repository import (
     NetworkIntegrationRepository,
     NetworkIntegrationRepositoryProtocol,
@@ -79,6 +82,7 @@ __all__ = [
     "get_fleet_device_provisioner",
     "get_guest_session_lookup",
     "get_guest_session_terminator",
+    "get_instant_on_read_service",
     "get_network_integration_repository",
     "get_network_integration_service",
 ]
@@ -184,4 +188,22 @@ def get_network_integration_service(
         fleet_device_provisioner=fleet_device_provisioner,
         redis=redis,
         caller_location_scope=caller_location_scope,
+    )
+
+
+def get_instant_on_read_service(
+    db: AsyncSession = Depends(get_db_session),
+    # Strict, not Optional: every Instant On route is authenticated (RBAC
+    # gated), and none of this is composed into a guest-facing service.
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> InstantOnReadService:
+    """The Instant On read service. Location confinement comes from the
+    caller's grants; the organization is applied in the query by the
+    service."""
+    return InstantOnReadService(
+        InstantOnRepository(db),
+        caller_location_scope=caller_location_scope,
+        guest_mac_lookup=GuestRepositoryMacLookup(GuestRepository(db)),
+        audit_writer=audit_repository,
     )

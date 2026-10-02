@@ -103,6 +103,9 @@ from .constants import (
 )
 
 __all__ = [
+    "InstantOnAccountToken",
+    "InstantOnSite",
+    "InstantOnSnapshot",
     "NetworkIntegration",
     "NetworkIntegrationAuthorization",
     "NetworkIntegrationEvent",
@@ -482,3 +485,191 @@ class NetworkIntegrationAuthorization(BaseModel):
             f"<NetworkIntegrationAuthorization(id={self.id}, "
             f"status={self.status})>"
         )
+
+
+# ============================================================================
+# Aruba Instant On read-only poller
+# ============================================================================
+#
+# Three tables, deliberately NOT ``network_integrations`` rows: an Instant On
+# venue is a NAS-only fleet ``Router`` (``vendor = aruba_instant_on``, PR
+# #326) that guests reach through RADIUS, and ``NetworkIntegrationService``
+# treats every integration row as something it may authorize guests on and
+# configure. Nothing here can be authorized against or configured; it is a
+# read cache of what Instant On says about the venue's APs.
+
+
+class InstantOnSite(BaseModel):
+    """Which Instant On site a NAS-only fleet ``Router`` is, and whether to
+    poll it. One live row per router.
+
+    ``organization_id``/``location_id`` are copied from the router when the
+    row is written (never from a request body) so every customer read can
+    put the tenant and the venue in its WHERE clause.
+
+    ``poll_enabled`` is the per-venue enable flag the poller honours (behind
+    the global ``Settings.instant_on_poller_enabled``). ``customer_visible``
+    is the separate per-venue flag that lets the customer dashboard read it:
+    SPIKE section 7 rolls out Master-only first.
+
+    ``api_state``/``last_*`` describe the most recent poll of this site as a
+    whole; per-resource freshness lives on ``InstantOnSnapshot``.
+    """
+
+    __tablename__ = "instant_on_sites"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    site_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    site_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    poll_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    customer_visible: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    # never_polled | ok | auth_failed | incompatible | rate_limited |
+    # not_invited | upstream_error | not_configured
+    api_state: Mapped[str] = mapped_column(
+        String(30), default="never_polled", server_default="never_polled",
+        nullable=False,
+    )
+    last_poll_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    # Set from a 429's Retry-After; the poller skips the site until then.
+    backoff_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_instant_on_sites_organization_id", "organization_id"),
+        Index("ix_instant_on_sites_location_id", "location_id"),
+        Index(
+            "uq_instant_on_sites_router_id",
+            "router_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<InstantOnSite(id={self.id}, api_state={self.api_state})>"
+
+
+class InstantOnSnapshot(BaseModel):
+    """The latest read of one resource kind for one site. **Upserted, one
+    row per (site, kind)** -- never appended per poll (the
+    ``analytics_snapshots`` duplication lesson).
+
+    ``payload`` is the *normalized* records (``providers.aruba_instant_on``
+    dataclasses), never the raw API body, so an unmapped vendor field can
+    never reach an API response. ``fetched_at`` is when ``payload`` was read;
+    ``last_attempt_*`` is the most recent try, which may have failed -- in
+    which case ``payload`` is the last good read and every API answers
+    ``unavailable`` rather than serving it as current.
+    """
+
+    __tablename__ = "instant_on_snapshots"
+
+    instant_on_site_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("instant_on_sites.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # access_points | clients | ssids | alerts | health | client_usage
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    payload: Mapped[Any] = mapped_column(JSONB, nullable=True)
+    payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_attempt_ok: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_instant_on_snapshots_site_kind",
+            "instant_on_site_id",
+            "kind",
+            unique=True,
+        ),
+        Index("ix_instant_on_snapshots_organization_id", "organization_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<InstantOnSnapshot(kind={self.kind}, ok={self.last_attempt_ok})>"
+
+
+class InstantOnAccountToken(BaseModel):
+    """The Wyfy service account's OAuth tokens, shared by every worker.
+
+    Shared state is the point: the refresh token rotates, so two processes
+    each holding their own copy would invalidate each other. Both tokens
+    live in ``tokens_encrypted`` (Fernet, ``network_integration_encryption_key``
+    via ``crypto.encrypt_credentials``); nothing else here is secret.
+    ``account_key`` is a hash of the configured secret ARN, so pointing the
+    platform at a different account starts from a clean row.
+    """
+
+    __tablename__ = "instant_on_account_tokens"
+
+    account_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    tokens_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    access_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    refresh_obtained_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    auth_state: Mapped[str] = mapped_column(
+        String(30), default="never", server_default="never", nullable=False
+    )
+    auth_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    login_blocked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_instant_on_account_tokens_account_key", "account_key", unique=True
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<InstantOnAccountToken(auth_state={self.auth_state})>"

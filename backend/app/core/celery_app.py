@@ -197,8 +197,10 @@ from app.domains.network_diagnostics.constants import (
     TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
 )
 from app.domains.network_integration.constants import (
+    INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS,
     NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
     OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_INSTANT_ON_POLL_SWEEP,
     TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
     TASK_RUN_OMADA_USAGE_SYNC_SWEEP,
 )
@@ -277,6 +279,7 @@ celery_app = Celery(
         "app.domains.network_diagnostics.tasks",
         "app.domains.network_integration.tasks",
         "app.domains.network_integration.usage_tasks",
+        "app.domains.network_integration.instant_on_tasks",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
@@ -378,6 +381,8 @@ celery_app.conf.update(
         # unreachable controller must not starve the pure-DB sweeps sharing
         # the default queue.
         TASK_RUN_OMADA_USAGE_SYNC_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Outbound HTTPS to the Instant On cloud on every tick.
+        TASK_RUN_INSTANT_ON_POLL_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
         # Releasing a controller-side device block is one real outbound
         # HTTPS write per stranded device to a customer-owned controller --
         # the same class of I/O as the two sweeps above and on this queue
@@ -892,6 +897,15 @@ celery_app.conf.update(
         "omada-usage-sync-sweep": {
             "task": TASK_RUN_OMADA_USAGE_SYNC_SWEEP,
             "schedule": OMADA_USAGE_SYNC_SWEEP_INTERVAL_SECONDS,
+        },
+        # Aruba Instant On read-only poller. The tick is the floor of the
+        # per-kind cadences (Settings.instant_on_*_poll_seconds); each tick
+        # reads only the kinds whose own period elapsed. Does nothing at all
+        # unless CLOUDGUEST_INSTANT_ON_POLLER_ENABLED is true. Routed onto
+        # DEVICE_IO_QUEUE_NAME above.
+        "instant-on-poll-sweep": {
+            "task": TASK_RUN_INSTANT_ON_POLL_SWEEP,
+            "schedule": INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS,
         },
         # Controller-side block release. The only scheduled thing standing
         # between a time-bound block and a permanently blocked customer
