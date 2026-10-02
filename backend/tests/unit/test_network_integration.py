@@ -305,6 +305,16 @@ class FakeRepository:
     authorizations: list[NetworkIntegrationAuthorization] = field(
         default_factory=list
     )
+    # (location_id, organization_id) -> vendor, for NAS-only fleet rows
+    # (Aruba Instant On). Empty by default: every existing test sees "none".
+    nas_only_rows: dict[tuple[uuid.UUID, uuid.UUID], str] = field(
+        default_factory=dict
+    )
+
+    async def nas_only_vendor_for_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> str | None:
+        return self.nas_only_rows.get((location_id, organization_id))
 
     def add(self, integration: NetworkIntegration) -> NetworkIntegration:
         self.integrations[integration.id] = integration
