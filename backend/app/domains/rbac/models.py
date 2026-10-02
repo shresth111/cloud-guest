@@ -77,9 +77,11 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import event
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import BaseModel
+from app.middleware.request_context import current_impersonator
 
 
 class PermissionGroup(BaseModel):
@@ -555,3 +557,26 @@ class AuditLogEntry(BaseModel):
             f"<AuditLogEntry(id={self.id}, action={self.action}, "
             f"entity_type={self.entity_type})>"
         )
+
+
+@event.listens_for(AuditLogEntry, "before_insert")
+def _stamp_impersonating_operator(_mapper, _connection, target: AuditLogEntry) -> None:
+    """Every audit row written by a request that runs on an impersonation
+    token records the real operator, in ``metadata.impersonated_by``.
+
+    During "View as this customer" the request's identity is the customer --
+    deliberately, so authorization is exactly theirs -- which means every
+    domain's ``create_audit_log_entry(actor_user_id=user.id, ...)`` names the
+    customer as the actor. Without this, a change an operator made while
+    viewing as a venue owner was indistinguishable from one the owner made.
+    Done once, here, at the one insert point every domain's audit writer
+    reaches (``GenericRepository.create`` -> ``session.add``), rather than at
+    ~50 call sites that would each have to remember it. ``actor_user_id``
+    itself is left as the customer: it is what the request was authorized
+    as, and rewriting it would make the row lie the other way."""
+    impersonator = current_impersonator()
+    if not impersonator:
+        return
+    metadata = dict(target.event_metadata or {})
+    metadata.setdefault("impersonated_by", dict(impersonator))
+    target.event_metadata = metadata
