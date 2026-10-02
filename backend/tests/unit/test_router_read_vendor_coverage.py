@@ -444,6 +444,16 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "if a legacy integration is invisible to the query and the venue "
         "reads as having no controller at all."
     ),
+    "app/domains/network_integration/repository.py::"
+    "NetworkIntegrationRepository.nas_only_vendor_for_location": (
+        "Narrowed to `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant On) "
+        "in the WHERE, so it is vendor-scoped by construction: it can only "
+        "ever return a controller-managed, NAS-only row, which is exactly "
+        "what it exists to find. It feeds no device work -- it lets the "
+        "client-capabilities read answer 'every action unsupported, here is "
+        "why' instead of 404 at such a venue. Wrapping it in "
+        "`agent_managed_only` would make it find nothing, by definition."
+    ),
     # -- the router domain's own accessors (names) -------------------------
     "app/domains/router/repository.py::RouterRepository.names_for_routers": (
         "Resolves a page of router ids the caller already holds to their "
