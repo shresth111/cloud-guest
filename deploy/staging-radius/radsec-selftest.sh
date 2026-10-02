@@ -14,7 +14,13 @@
 #      New-TLS-Connection, nothing reaches the api;
 #  R4  cert from an untrusted CA -> TLS handshake refused;
 #  R5  no client cert -> TLS handshake refused;
-#  R6  the UDP 1812/1813 listeners are still up (run selftest.sh for the full UDP test).
+#  R6  the UDP 1812/1813 listeners are still up (run selftest.sh for the full UDP test);
+#  R7  (only with E2E_ROUTER_ID=<staging router uuid that has NO NAS row yet>)
+#      a TRANSIENT radius_nas_clients row is inserted for that router with the
+#      selftest NAS identifier + secret, the same RadSec requests are repeated,
+#      and the staging api must NOT answer 401 -- i.e. CurrentNas accepted the
+#      X-RADIUS-NAS-* headers the certificate mapping produced. The row is
+#      hard-deleted on exit. Staging DB only.
 # The selftest NAS has no row in the staging DB, so the backend answers 401: the
 # Access-Request ends in Access-Reject and the accounting snippet still acks.
 # That proves listener -> certificate mapping -> rest -> staging api; the header
@@ -36,7 +42,11 @@ T=$(mktemp -d /tmp/radsec-selftest.XXXXXX); chmod 0755 "$T"
 START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PASS=0; FAIL=0
 res() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); echo "PASS $2"; else FAIL=$((FAIL+1)); echo "FAIL $2"; fi; }
+PGU=$(docker exec deploy-postgres-1 printenv POSTGRES_USER 2>/dev/null); PGD=$(docker exec deploy-postgres-1 printenv POSTGRES_DB 2>/dev/null)
+psqlq() { docker exec -i deploy-postgres-1 psql -v ON_ERROR_STOP=1 -U "$PGU" -d "$PGD" -Atq "$@"; }
+E2E_ROW=""
 cleanup() {
+  [ -n "$E2E_ROW" ] && psqlq -c "delete from radius_nas_clients where id='$E2E_ROW' and nas_identifier like 'cg-radsec-selftest%'" >/dev/null 2>&1
   docker rm -f radsec-st-a radsec-st-b radsec-st-c radsec-st-d >/dev/null 2>&1
   docker network rm radsec-st-net-a radsec-st-net-b >/dev/null 2>&1
   "$MAPSH" del "$CN" >/dev/null 2>&1
@@ -111,6 +121,18 @@ ask() {  # ask <container> <auth|acct> <attrs> -> radclient output (proxy on 127
   printf '%s\n' "$3" | docker exec -i "$1" radclient -x -r 1 -t 12 127.0.0.1 "$2" testing123 2>&1
 }
 UN="+9199999$(shuf -i 10000-99999 -n1)"
+api_status() {  # api_status <since> -> "<path> <http status>" per RADIUS-facing api request
+  # The api's completion log has no status; an error status is logged
+  # separately as application_error with the same request_id. No error = 2xx.
+  docker logs --since "$1" $A 2>&1 | grep -E '/api/v1/radius/(authorize|accounting)' | python3 -c 'import sys,json
+done, err = [], {}
+for l in sys.stdin:
+    try: j = json.loads(l)
+    except Exception: continue
+    if j.get("message") == "application_error": err[j.get("request_id")] = j.get("status_code")
+    elif j.get("message") == "http_request_completed": done.append((j.get("request_id"), j.get("path")))
+for rid, path in done: print(path, err.get(rid, "2xx"))'
+}
 AUTH="User-Name = \"$UN\"
 User-Password = \"portal-issued-token\"
 Calling-Station-Id = \"a4c3f0112233\"
@@ -144,7 +166,8 @@ echo "$LOG" | sed 's/^/   /'
 SRCS=$(echo "$LOG" | grep "verdict=accept nas=$NAS cn=\"$CN\"" | sed -n 's/.* src=\([0-9.]*\):.*/\1/p' | sort -u)
 [ "$(echo "$SRCS" | grep -c .)" -ge 2 ]; res $? "R2 two different source IPs ($(echo $SRCS)) both mapped to nas=$NAS"
 L=$(docker logs --since "$START" $A 2>&1 | grep -E '"path":"/api/v1/radius/(authorize|accounting)"')
-echo "$L" | cut -c1-220 | sed 's/^/   /' | tail -6
+api_status "$START" | sed 's/^/   api: /'
+
 [ "$(echo "$L" | grep -c '/radius/authorize')" -ge 2 ]; res $? "R2 staging api received >=2 POST /radius/authorize"
 [ "$(echo "$L" | grep -c '/radius/accounting')" -ge 2 ]; res $? "R2 staging api received >=2 POST /radius/accounting"
 
@@ -160,11 +183,33 @@ docker logs --since "$since" $RS 2>&1 | grep -E 'OpenSSL says|Alert' | head -2 |
 docker logs --since "$since" $RS 2>&1 | grep -qE 'unable to get local issuer certificate|unknown CA'; res $? "R4 TLS handshake refused (unknown CA)"
 
 echo "== R5 no client certificate"
-since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sleep 2; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo | timeout 10 openssl s_client -connect 127.0.0.1:2083 -servername "$HOST" -tls1_2 >/dev/null 2>&1
 sleep 1
 docker logs --since "$since" $RS 2>&1 | grep -E 'Alert|certificate' | head -2 | sed 's/^/   /'
-docker logs --since "$since" $RS 2>&1 | grep -qE 'handshake failure|peer did not return a certificate|certificate required'; res $? "R5 handshake refused without a client certificate"
+docker logs --since "$since" $RS 2>&1 | grep -qE 'Alert write:fatal:handshake failure|peer did not return a certificate|certificate required'; res $? "R5 handshake refused without a client certificate"
+
+if [ -n "${E2E_ROUTER_ID:-}" ]; then
+  echo "== R7 real NAS row (transient) for router $E2E_ROUTER_ID"
+  [[ "$E2E_ROUTER_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "bad E2E_ROUTER_ID"; exit 1; }
+  if [ "$(psqlq -c "select count(*) from radius_nas_clients where router_id='$E2E_ROUTER_ID' and not is_deleted")" != 0 ]; then
+    res 1 "R7 router already has a NAS row -- refusing to touch it"
+  else
+    ENC=$(docker exec -e S="$BSEC" $A python -c 'import os; from app.domains.router.crypto import encrypt_secret; print(encrypt_secret(os.environ["S"]))')
+    E2E_ROW=$(psqlq -c "insert into radius_nas_clients (router_id, organization_id, location_id, nas_identifier, shared_secret_encrypted, status, is_active, vendor, name, description)
+      select id, organization_id, location_id, '$NAS', '$ENC', 'active', true, vendor, 'RadSec selftest (transient)', 'deleted by radsec-selftest.sh on exit'
+      from routers where id='$E2E_ROUTER_ID' returning id" | head -1)
+    echo "   inserted transient row $E2E_ROW (nas_identifier=$NAS)"
+    since=$(date -u +%Y-%m-%dT%H:%M:%SZ); sleep 1
+    for c in a b; do
+      ask radsec-st-$c auth "$AUTH" | grep -E 'Received|No reply' | sed "s/^/   [$c] /"
+      ask radsec-st-$c acct "$ACCT" | grep -E 'Received|No reply' | sed "s/^/   [$c] /"
+    done
+    sleep 1; S7=$(api_status "$since"); echo "$S7" | sed 's/^/   api: /'
+    [ "$(echo "$S7" | grep -c .)" -ge 4 ] && ! echo "$S7" | grep -q ' 401$'
+    res $? "R7 api accepted the RadSec-mapped NAS headers from both sources (no 401)"
+  fi
+fi
 
 echo "== R6 UDP listeners untouched"
 ss -Hlun '( sport = :1812 or sport = :1813 )' | grep -q 1812; res $? "R6 udp/1812 + 1813 still listening (radius container)"
