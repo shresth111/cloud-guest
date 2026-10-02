@@ -22,7 +22,10 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.domains.auth.schemas import MessageResponse
+from app.domains.auth.schemas import MessageResponse, RoleAssignmentSummary
+from app.domains.auth.schemas import (
+    OrganizationMembershipSummary as LoginOrganizationMembershipSummary,
+)
 from app.domains.rbac.enums import ScopeType
 
 __all__ = [
@@ -323,6 +326,22 @@ class ImpersonateUserResponse(BaseModel):
     access_token: str
     expires_at: datetime
     target_user: ImpersonationTargetUser
+    # The target's REAL grants, in exactly the shape ``POST /auth/login``
+    # returns them (same helpers build both). Without these the frontend
+    # had to invent a session: one placeholder organization-scoped role and
+    # the organization picked in the Master drawer. Any customer whose real
+    # grant differed (a location-scoped role, or a membership on a different
+    # organization than the drawer's) then got a session whose every
+    # org-scoped read 403'd, and whose location-scoped fallback could never
+    # run because the real location roles had been replaced by the
+    # placeholder. Read-only facts about the target -- they grant nothing;
+    # every request is still authorized server-side against the token.
+    roles: list[RoleAssignmentSummary] = Field(default_factory=list)
+    # The LOGIN response's membership shape (auth.schemas), not this module's
+    # own same-named ``OrganizationMembershipSummary`` further up.
+    organizations: list[LoginOrganizationMembershipSummary] = Field(
+        default_factory=list
+    )
 
 
 class UserUpdateRequest(BaseModel):
