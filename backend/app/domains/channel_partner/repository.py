@@ -41,6 +41,8 @@ class ChannelPartnerRepositoryProtocol(Protocol):
         self, partner: ChannelPartner, data: dict[str, object]
     ) -> ChannelPartner: ...
 
+    async def soft_delete_partner(self, partner: ChannelPartner) -> ChannelPartner: ...
+
     async def list_partners(
         self,
         *,
@@ -69,6 +71,15 @@ class ChannelPartnerRepository:
         self, partner: ChannelPartner, data: dict[str, object]
     ) -> ChannelPartner:
         return await self.partners.update(partner, data)
+
+    async def soft_delete_partner(self, partner: ChannelPartner) -> ChannelPartner:
+        """Flags the row ``is_deleted``/``deleted_at`` -- never a row
+        removal. Same ``GenericRepository.soft_delete`` call
+        ``app.domains.quotation.repository.soft_delete_quotation`` makes;
+        ``_list_filters`` below and ``service.ChannelPartnerService
+        .get_partner`` already exclude ``is_deleted`` rows, so every read
+        path honours the flag the moment it is set."""
+        return await self.partners.soft_delete(partner)
 
     def _list_filters(self, *, status: str | None, search: str | None) -> list:
         filters = [ChannelPartner.is_deleted.is_(False)]
