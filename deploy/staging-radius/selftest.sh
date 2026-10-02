@@ -52,7 +52,7 @@ NAS-Port-Type = Wireless-802.11
 Acct-Input-Octets = 1000
 Acct-Output-Octets = 2000
 Message-Authenticator = 0x00'
-rc() { docker exec -i $R radclient -x -r 1 -t 3 127.0.0.1:$1 $2 "$3" 2>&1; }
+rc() { docker exec -i $R radclient -x -r 1 -t 6 127.0.0.1:$1 $2 "$3" 2>&1; }
 
 echo "== 1. register $NAS @127.0.0.1 via agent, from inside $A"
 out=$(agent POST); echo "$out"; [[ "$out" == 200* ]]; res $? "agent POST from api container"
@@ -60,7 +60,9 @@ docker exec $R grep -A7 "shortname = $NAS" /etc/freeradius/3.0/clients.conf | se
 sleep 1
 
 echo "== 2. radclient from 127.0.0.1"
+t0=$(date +%s%N)
 o=$(printf '%s\nMessage-Authenticator = 0x00\n' "$AUTH" | rc 1812 auth "$S"); echo "$o" | grep -E 'Received|No reply'
+echo "   round trip $(( ($(date +%s%N) - t0) / 1000000 )) ms (includes FreeRADIUS reject_delay)"
 echo "$o" | grep -q 'Received Access-Reject'; res $? "T1 Access-Request + Message-Authenticator -> Access-Reject (backend 401: NAS not in staging DB)"
 o=$(printf '%s\nMessage-Authenticator = 0x00\n' "$AUTH" | rc 1812 auth "${S%?}X"); echo "$o" | grep -E 'Received|No reply'
 echo "$o" | grep -q 'No reply'; res $? "T2 wrong secret -> silently dropped"
