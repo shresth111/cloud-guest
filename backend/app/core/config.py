@@ -298,6 +298,12 @@ class Settings(BaseSettings):
     #      because it was connecting to a machine that no longer exists.
     #      Nothing about the failure named the address, so it read as "the
     #      hub is down" rather than "one setting was missed".
+    #   3. 172.31.40.230 (the live AWS hub's PRIVATE IP) was the default
+    #      here, so any environment that did not set these -- staging, a
+    #      laptop -- was wired to the PRODUCTION hub, whose wg agent has no
+    #      delete verb and whose radius agent restarts FreeRADIUS for every
+    #      venue on each write (found 2026-10-02). The defaults are now
+    #      empty: an unset URL fails closed as HubBridgeUnavailableError.
     #
     # A plausible-looking stale default is worse than no default: it fails
     # slowly, at a distance, and blames the wrong component. If you move
@@ -306,7 +312,7 @@ class Settings(BaseSettings):
     # do not rely on these defaults being current.
     # ------------------------------------------------------------------
     hub_wg_agent_url: str = Field(
-        default="http://172.31.40.230:9091/wg/peer",
+        default="",
         description=(
             "Absolute URL of the hub's WireGuard peer-provisioning agent "
             "(ops/hub-agents/wg_agent.py, port 9091), called by "
@@ -314,9 +320,10 @@ class Settings(BaseSettings):
             "Was a module-level constant hardcoded to the OLD hub's public "
             "IP (20.219.72.235); that host was deleted with its subscription "
             "and every venue provisioning hung to timeout until this moved "
-            "here. Defaults to the hub's VNET-PRIVATE address so the call "
-            "and its shared secret never leave the VNet -- the transport is "
-            "plain HTTP. Do not point this at a public IP or hostname."
+            "here. No default: set it to the hub's VPC-PRIVATE address so the "
+            "call and its shared secret never leave the VPC -- the transport "
+            "is plain HTTP. Do not point this at a public IP or hostname. "
+            "Empty = unconfigured, fails closed."
         ),
     )
     hub_wg_agent_secret: str = Field(
@@ -339,7 +346,7 @@ class Settings(BaseSettings):
         # the new AWS hub and never set this one, so it silently kept the
         # dead Azure default and every GET /wireguard/fleet-status hung for
         # the full 15s httpx timeout and then 500'd.
-        default="http://172.31.40.230:9091/wg/peers",
+        default="",
         description=(
             "Absolute URL of the hub's GET /wg/peers endpoint (same "
             "ops/hub-agents/wg_agent.py process as hub_wg_agent_url, same "
@@ -358,13 +365,13 @@ class Settings(BaseSettings):
         ),
     )
     hub_radius_agent_url: str = Field(
-        default="http://172.31.40.230:9092/radius/client",
+        default="",
         description=(
             "Absolute URL of the hub's FreeRADIUS client-provisioning agent "
             "(ops/hub-agents/radius_agent.py, port 9092), called by "
             "app.domains.guest.router.register_external_radius_nas. See "
-            "hub_wg_agent_url for why this is private-address-by-default and "
-            "why it stopped being a constant."
+            "hub_wg_agent_url for why this must be a private address, why it "
+            "stopped being a constant, and why it has no default."
         ),
     )
     hub_radius_public_address: str = Field(
