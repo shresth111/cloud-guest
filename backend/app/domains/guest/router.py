@@ -85,13 +85,25 @@ from .dependencies import (
     get_radius_service,
 )
 from .exceptions import (
+    PublicNasRegistrationRefusedError,
     RadiusAccountingUnsupportedStatusTypeError,
     RadiusNasBridgeDeregistrationError,
     RadiusNasNotFoundError,
 )
 from .models import Guest, GuestDevice, GuestLoginHistory, GuestSession, RadiusNasClient
-from .radius_bridge import RadiusBridgePushError, push_nas_client
+from .nas_number_generator import (
+    generate_alphanumeric_shared_secret,
+    secret_fingerprint,
+)
+from .radius_bridge import (
+    RadiusBridgePushError,
+    RadiusClientAddressRejected,
+    push_controller_nas_client,
+    push_nas_client,
+    validate_controller_nas_address,
+)
 from .schemas import (
+    NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY,
     DashboardOsCountResponse,
     DashboardSeriesPointResponse,
     GuestAnalyticsSummaryResponse,
@@ -124,6 +136,10 @@ from .schemas import (
     GuestUpdateProfileResponse,
     GuestVoucherLoginRequest,
     OtpSuccessRateResponse,
+    PublicNasRegistrationRequest,
+    PublicNasRegistrationResponse,
+    PublicNasStatusResponse,
+    PublicPortalUrlView,
     RadiusAccountingRequest,
     RadiusAccountingResponse,
     RadiusAuthorizeRequest,
@@ -134,6 +150,7 @@ from .schemas import (
     RadiusNasResponse,
     RadiusNasSecretRotatedResponse,
     RadiusNasUpdateRequest,
+    RadiusServerView,
     SessionDisconnectRequest,
     SessionExtendRequest,
     SessionPauseRequest,
@@ -2288,6 +2305,305 @@ async def delete_radius_nas(
 # construction instead of quietly reopening this.
 
 
+# ----------------------------------------------------------------------------
+# NAS-only devices (Aruba Instant On): a NAS keyed on the venue's public IP
+# ----------------------------------------------------------------------------
+
+#: Display names for NAS-only vendors, in the console's own vocabulary.
+_NAS_ONLY_VENDOR_LABELS: dict[str, str] = {"aruba_instant_on": "Aruba Instant On"}
+
+
+def _nas_only_portal_url(router) -> PublicPortalUrlView | None:  # noqa: ANN001
+    """The portal URL for a NAS-only fleet row, whole and split into the
+    boxes Instant On's Guest portal form has."""
+    from app.domains.network_integration.validators import build_nas_only_portal_url
+
+    portal = build_nas_only_portal_url(
+        organization_id=router.organization_id,
+        location_id=router.location_id,
+        router_id=router.id,
+        vendor=str(router.vendor),
+    )
+    if portal is None:
+        return None
+    host, _, path_and_query = portal.host_and_query.partition("/")
+    return PublicPortalUrlView(
+        url=f"{portal.scheme}://{portal.host_and_query}",
+        server_host=host,
+        server_url_path=f"/{path_and_query}",
+        server_port=443,
+        use_https=portal.scheme == "https",
+    )
+
+
+def _nas_only_allowed_domains() -> list[str]:
+    """Every host a guest's browser must reach before signing in: the portal
+    host the URL above names, and this backend's public API host (the portal
+    calls it for OTP). Derived from the same constants the MikroTik walled
+    garden uses, never typed from memory."""
+    from urllib.parse import urlsplit
+
+    from app.domains.network_config.renderers import GUEST_PORTAL_HOST
+
+    hosts = [GUEST_PORTAL_HOST]
+    api_host = urlsplit(get_settings().api_public_base_url).hostname
+    if api_host and api_host not in hosts:
+        hosts.append(api_host)
+    return hosts
+
+
+def _radius_server_view() -> RadiusServerView | None:
+    address = get_settings().hub_radius_public_address.strip()
+    return RadiusServerView(host=address) if address else None
+
+
+async def _nas_only_router(service: RadiusService, router_id: uuid.UUID):  # noqa: ANN202
+    """The fleet row, refused unless its vendor is NAS-only."""
+    from app.domains.router.vendor_capabilities import is_nas_only
+
+    router = await service.router_lookup.get_router(router_id)
+    if not is_nas_only(router):
+        raise PublicNasRegistrationRefusedError(
+            f"This device is recorded as '{router.vendor}'. Public-address "
+            "registration is only for devices whose vendor cloud this "
+            "platform has no API to (Aruba Instant On). A MikroTik registers "
+            "over its WireGuard tunnel; an Omada controller registers from "
+            "its network integration."
+        )
+    return router
+
+
+@nas_platform_router.get(
+    "/public/{router_id}",
+    response_model=ApiResponse[PublicNasStatusResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("radius.read", scope=ScopeType.GLOBAL))
+    ],
+)
+async def get_public_radius_nas_status(
+    request: Request,
+    router_id: uuid.UUID,
+    service: RadiusService = Depends(get_radius_service),
+):
+    """The Master setup panel's single read for a NAS-only device.
+
+    Never returns the shared secret -- only its fingerprint and length,
+    which match what ``radius-secret-fingerprints.sh`` prints on the hub.
+    ``portal_url`` is null whenever ``gaps`` is non-empty.
+    """
+    from app.domains.router.vendor_capabilities import is_nas_only
+
+    router = await service.router_lookup.get_router(router_id)
+    vendor = str(router.vendor)
+    gaps: list[str] = []
+    if not is_nas_only(router):
+        gaps.append("not_nas_only_vendor")
+    if router.location_id is None:
+        gaps.append("no_location")
+
+    existing, _meta = await service.list_nas_clients(
+        requesting_organization_id=None, router_id=router_id, page=1, page_size=1
+    )
+    nas_client = existing[0] if existing else None
+    fingerprint: str | None = None
+    secret_length: int | None = None
+    hub_confirmed = False
+    nas_ip: str | None = None
+    if nas_client is None:
+        gaps.append("nas_not_registered")
+    else:
+        fingerprint, secret_length = service.shared_secret_fingerprint(nas_client)
+        nas_ip = nas_client.ip_address
+        hub_confirmed = (
+            nas_client.hub_client_synced_ip is not None
+            and nas_client.hub_client_synced_ip == nas_client.ip_address
+        )
+        if not hub_confirmed:
+            gaps.append("hub_not_confirmed")
+    radius_server = _radius_server_view()
+    if radius_server is None:
+        gaps.append("radius_server_address_not_configured")
+
+    payload = PublicNasStatusResponse(
+        router_id=str(router.id),
+        vendor=vendor,
+        vendor_label=_NAS_ONLY_VENDOR_LABELS.get(vendor, vendor),
+        serial_number=getattr(router, "serial_number", None),
+        mac_address=getattr(router, "mac_address", None),
+        registered=nas_client is not None,
+        nas_id=str(nas_client.id) if nas_client else None,
+        nas_identifier=nas_client.nas_identifier if nas_client else None,
+        nas_ip=nas_ip,
+        nas_status=nas_client.status if nas_client else None,
+        secret_fingerprint=fingerprint,
+        secret_length=secret_length,
+        hub_confirmed=hub_confirmed,
+        radius_server=radius_server,
+        allowed_domains=_nas_only_allowed_domains(),
+        portal_url=None if gaps else _nas_only_portal_url(router),
+        gaps=gaps,
+    )
+    return build_response(
+        success=True,
+        message="NAS-only device RADIUS status",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.post(
+    "/register-public/{router_id}",
+    response_model=ApiResponse[PublicNasRegistrationResponse],
+    status_code=status.HTTP_201_CREATED,
+    # GLOBAL, pinned: this writes a live client{} stanza to the hub keyed on
+    # an internet address and hands out a shared secret. `radius.create` is
+    # held at organization scope by every venue owner, so without the pin the
+    # caller would choose their own check level.
+    dependencies=[
+        Depends(RequirePermission("radius.create", scope=ScopeType.GLOBAL))
+    ],
+)
+async def register_public_radius_nas(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: PublicNasRegistrationRequest,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+):
+    """Register a **NAS-only** device -- one whose vendor cloud this platform
+    has no API to, today Aruba Instant On -- as a RADIUS client keyed on the
+    venue's public egress address. Calling it again for the same device
+    rotates the secret (and moves the stanza if the IP changed).
+
+    The third NAS registration path, and deliberately a separate route:
+
+    * ``POST /radius/nas/register-external/{router_id}`` keys the stanza on
+      a WireGuard tunnel address. An Instant On AP runs no agent and gets no
+      peer (``wireguard.validators`` refuses every controller-managed row).
+    * ``POST /network-integrations/platform/integrations/{id}/radius-nas``
+      keys it on a controller's public address, but hangs off a
+      ``network_integrations`` row. An Instant On venue has none and never
+      will.
+
+    Shared with the controller path: the address validation (literal,
+    public, global unicast, outside the tunnel range -- so private, CGNAT
+    100.64/10 and loopback are refused), the hub write with
+    ``require_message_authenticator``, push-first rotation, and "record what
+    the hub confirmed". The secret is 32 alphanumeric characters (the Omada
+    truncation lesson) and is returned on this response only.
+
+    Like the controller route, this does **not** make a guest able to log
+    in by itself: the hub's security group must admit UDP 1812/1813 from
+    this /32 (``ops/runbooks/omada-radius-mode.md`` section 2 applies).
+    """
+    router = await _nas_only_router(service, router_id)
+    try:
+        nas_ip = validate_controller_nas_address(payload.nas_ip)
+    except RadiusClientAddressRejected as exc:
+        raise PublicNasRegistrationRefusedError(str(exc)) from exc
+
+    # Two venues behind one public IP cannot share a client{} stanza: the
+    # hub matches by source address, so the second registration would
+    # silently take over the first venue's RADIUS traffic.
+    others = [
+        nas
+        for nas in await service.nas_clients_at_address(nas_ip)
+        if nas.router_id != router.id
+    ]
+    if others:
+        raise PublicNasRegistrationRefusedError(
+            f"Another device already uses {nas_ip} as its RADIUS address. Two "
+            "venues behind one public IP can't share RADIUS safely."
+        )
+
+    new_secret = generate_alphanumeric_shared_secret()
+    existing, _meta = await service.list_nas_clients(
+        requesting_organization_id=None, router_id=router_id, page=1, page_size=1
+    )
+    rotated = bool(existing)
+    if existing:
+        nas_identifier = existing[0].nas_identifier
+
+        async def _push_rotated(secret: str) -> None:
+            await push_controller_nas_client(
+                controller_ip=nas_ip, nas_identifier=nas_identifier, secret=secret
+            )
+
+        try:
+            # PUSH FIRST, THEN WRITE -- `regenerate_secret` runs the hook
+            # before its own database write, so a refusing hub cannot leave
+            # the row holding a secret the RADIUS server never saw.
+            result = await service.regenerate_secret(
+                nas_id=existing[0].id,
+                requesting_organization_id=None,
+                actor_user_id=uuid.UUID(user.id),
+                push_secret=_push_rotated,
+                new_secret=new_secret,
+            )
+        except RadiusBridgePushError as exc:
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        # A changed venue IP moves the stanza: the push above wrote it at the
+        # new address, and `record_hub_client_sync` below rewrites both
+        # `ip_address` and `hub_client_synced_ip` to match.
+        nas_client = result.nas_client
+        shared_secret = result.shared_secret
+    else:
+        registration = await service.register_nas(
+            actor_user_id=uuid.UUID(user.id),
+            router_id=router_id,
+            # `cg-<kind>-<8 hex>`, the controller path's shape, so one
+            # `%{client:shortname}` vocabulary covers every NAS and the
+            # prefix says which kind it is.
+            nas_identifier=f"cg-aruba-{str(router_id)[:8]}",
+            shared_secret=new_secret,
+            name=f"{router.name} (Aruba Instant On)",
+            ip_address=nas_ip,
+            requesting_organization_id=None,
+        )
+        try:
+            await push_controller_nas_client(
+                controller_ip=nas_ip,
+                nas_identifier=registration.nas_client.nas_identifier,
+                secret=registration.shared_secret,
+            )
+        except RadiusBridgePushError as exc:
+            # The row exists, the stanza does not; visible
+            # (`hub_client_synced_ip` NULL, `hub_not_confirmed` on the status
+            # read) and converges on the next call, which rotates.
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        nas_client = registration.nas_client
+        shared_secret = registration.shared_secret
+
+    nas_client = await service.record_hub_client_sync(
+        nas_id=nas_client.id,
+        tunnel_ip_address=nas_ip,
+        requesting_organization_id=None,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "RADIUS NAS client re-registered"
+            if rotated
+            else "RADIUS NAS client registered"
+        ),
+        data=PublicNasRegistrationResponse(
+            router_id=str(router.id),
+            nas_id=str(nas_client.id),
+            vendor=str(router.vendor),
+            nas_identifier=nas_client.nas_identifier,
+            nas_ip=nas_ip,
+            shared_secret=shared_secret,
+            secret_fingerprint=secret_fingerprint(shared_secret),
+            secret_length=len(shared_secret),
+            hub_confirmed=nas_client.hub_client_synced_ip == nas_ip,
+            rotated=rotated,
+            portal_url=_nas_only_portal_url(router),
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @nas_platform_router.post(
     "/{nas_id}/regenerate-secret",
     response_model=ApiResponse[RadiusNasSecretRotatedResponse],
@@ -2339,6 +2655,63 @@ async def regenerate_radius_nas_secret(
     ``get_router_platform_view``/``decommission_router`` use.
     """
     nas_client = await service.get_nas_client(nas_id, requesting_organization_id=None)
+
+    # A NAS-only device (Aruba Instant On) has no WireGuard peer and never
+    # will: its stanza is keyed on the venue's public address, which is the
+    # row's own `ip_address`. Same push-first rotation, same "record what the
+    # hub confirmed", and a 32-char alphanumeric secret because an operator
+    # types it into the vendor's UI. Every other NAS takes the unchanged path
+    # below.
+    from app.domains.router.vendor_capabilities import is_nas_only
+
+    nas_router = await service.router_lookup.get_router(
+        nas_client.router_id, include_deleted=True
+    )
+    if is_nas_only(nas_router):
+        public_ip = nas_client.hub_client_synced_ip or nas_client.ip_address
+        if not public_ip:
+            raise PublicNasRegistrationRefusedError(
+                "This device's RADIUS client has no public address on record. "
+                "Register it again with the venue's public IP."
+            )
+
+        async def _push_public(secret: str) -> None:
+            await push_controller_nas_client(
+                controller_ip=public_ip,
+                nas_identifier=nas_client.nas_identifier,
+                secret=secret,
+            )
+
+        try:
+            rotated = await service.regenerate_secret(
+                nas_id=nas_id,
+                requesting_organization_id=None,
+                actor_user_id=uuid.UUID(user.id),
+                push_secret=_push_public,
+                new_secret=generate_alphanumeric_shared_secret(),
+            )
+        except RadiusBridgePushError as exc:
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        synced_public = await service.record_hub_client_sync(
+            nas_id=rotated.nas_client.id,
+            tunnel_ip_address=public_ip,
+            requesting_organization_id=None,
+        )
+        return build_response(
+            success=True,
+            message=(
+                "RADIUS NAS client shared secret rotated and pushed to the "
+                "FreeRADIUS server -- the access point still holds the old "
+                "secret until it is re-entered in the vendor's app"
+            ),
+            data=RadiusNasSecretRotatedResponse(
+                **_nas_response(synced_public).model_dump(),
+                shared_secret=rotated.shared_secret,
+                device_action=NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY,
+            ).model_dump(),
+            request_id=_request_id(request),
+        )
+
     peer = await wireguard_service.get_peer(
         router_id=nas_client.router_id, requesting_organization_id=None
     )

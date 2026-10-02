@@ -56,7 +56,9 @@ retry loop.
 
 from __future__ import annotations
 
+import hashlib
 import secrets
+import string
 import uuid
 from typing import Protocol
 
@@ -107,6 +109,34 @@ def generate_shared_secret(length: int) -> str:
     ``length`` bytes of entropy before base64url-encoding -- see module
     docstring."""
     return secrets.token_urlsafe(length)
+
+
+#: Length of a secret minted for a public-address (NAS-only) NAS client.
+PUBLIC_NAS_SHARED_SECRET_LENGTH = 32
+
+_ALPHANUMERIC = string.ascii_letters + string.digits
+
+
+def generate_alphanumeric_shared_secret(
+    length: int = PUBLIC_NAS_SHARED_SECRET_LENGTH,
+) -> str:
+    """A cryptographically-random secret of ``[A-Za-z0-9]`` only.
+
+    For secrets an operator types into a vendor's own UI. The Omada
+    controller silently dropped one character of a 43-character
+    ``token_urlsafe`` value on 2026-09-17 and every login then timed out;
+    the fix that held was a 32-character alphanumeric secret, which leaves
+    nothing for a UI to mangle (``-``, ``_``, ``=``). 32 characters of a
+    62-symbol alphabet is ~190 bits.
+    """
+    return "".join(secrets.choice(_ALPHANUMERIC) for _ in range(length))
+
+
+def secret_fingerprint(secret: str) -> str:
+    """``sha256(secret)[:12]`` -- the same fingerprint
+    ``radius-secret-fingerprints.sh`` prints on the hub, so the two can be
+    compared without either side ever showing the secret."""
+    return hashlib.sha256(secret.encode()).hexdigest()[:12]
 
 
 def preview_first_nas_code(location_code: str) -> str:

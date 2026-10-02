@@ -40,6 +40,7 @@ __all__ = [
     "RadiusNasClientNotFoundError",
     "RadiusNasAuthenticationError",
     "RadiusNasAlreadyRegisteredError",
+    "PublicNasRegistrationRefusedError",
     "RadiusNasNotFoundError",
     "RadiusNasBridgeDeregistrationError",
     "CrossOrganizationNasAccessError",
@@ -358,6 +359,24 @@ class RadiusNasAlreadyRegisteredError(GuestError):
         super().__init__(
             f"Router {router_id} already has a registered RADIUS NAS client",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class PublicNasRegistrationRefusedError(GuestError):
+    """A public-address NAS registration this platform will not make, with
+    the one concrete reason.
+
+    Raised before anything is written or pushed. ``data.code`` is stable so
+    the Master console can tell this refusal from a hub failure (502).
+    """
+
+    CODE = "PUBLIC_NAS_REGISTRATION_REFUSED"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            detail,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            data={"code": self.CODE},
         )
 
 

@@ -18,7 +18,14 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.common.masking import MaskedIdentifier, MaskedMac, MaskedName
 
@@ -32,6 +39,7 @@ from .constants import (
     GuestSessionEndedReason,
     GuestSessionStatus,
 )
+from .validators import canonicalize_calling_station_id
 
 __all__ = [
     "GuestOtpLoginRequest",
@@ -863,6 +871,109 @@ class RadiusNasCreatedResponse(RadiusNasResponse):
     shared_secret: str
 
 
+class PublicNasRegistrationRequest(BaseModel):
+    """Register a NAS-only device (Aruba Instant On) as a RADIUS client keyed
+    on the public address its Access-Requests arrive from.
+
+    There is no ``shared_secret`` field, for the reason
+    ``ControllerRadiusNasRequest`` gives: the platform mints it and returns
+    it once; a secret never travels in a body somebody typed.
+    """
+
+    nas_ip: str = Field(
+        ...,
+        min_length=1,
+        max_length=45,
+        description=(
+            "The venue's PUBLIC egress IP -- the source address the access "
+            "point's RADIUS packets reach the hub from after the venue's NAT. "
+            "Literal, global unicast; a hostname is refused because "
+            "clients.conf resolves one only at FreeRADIUS start-up."
+        ),
+    )
+
+
+class PublicPortalUrlView(BaseModel):
+    """The portal URL, whole and split the way Instant On's Guest portal form
+    asks for it (Server host / Server URL path / Server port / Use HTTPS)."""
+
+    url: str
+    server_host: str
+    server_url_path: str = Field(
+        description="Path AND query, e.g. '/portal?organizationId=...'."
+    )
+    server_port: int = 443
+    use_https: bool = True
+
+
+class RadiusServerView(BaseModel):
+    """What the access point's RADIUS profile must point at."""
+
+    host: str
+    auth_port: int = 1812
+    accounting_port: int = 1813
+
+
+class PublicNasRegistrationResponse(BaseModel):
+    """What was registered, and the one-time secret.
+
+    ``shared_secret`` appears here and on the rotate response ONLY. Every
+    later read carries ``secret_fingerprint``/``secret_length`` instead.
+    ``hub_confirmed`` is what the hub agent answered, not what was intended.
+    """
+
+    router_id: str
+    nas_id: str
+    vendor: str
+    nas_identifier: str
+    nas_ip: str
+    shared_secret: str
+    secret_fingerprint: str
+    secret_length: int
+    hub_confirmed: bool
+    rotated: bool = Field(
+        description="True when an existing registration was rotated (and, if "
+        "the IP changed, moved) rather than created."
+    )
+    portal_url: PublicPortalUrlView | None = None
+
+
+class PublicNasStatusResponse(BaseModel):
+    """Everything the Master setup panel for a NAS-only device renders.
+
+    ``gaps`` is the closed list of reasons the panel must show INSTEAD of a
+    copyable portal URL; ``portal_url`` is null whenever ``gaps`` is not
+    empty, so a console cannot render a URL beside a warning.
+
+    Gap codes: ``not_nas_only_vendor``, ``no_location``,
+    ``nas_not_registered``, ``hub_not_confirmed``,
+    ``radius_server_address_not_configured``.
+    """
+
+    router_id: str
+    vendor: str
+    vendor_label: str
+    serial_number: str | None
+    mac_address: str | None
+    registered: bool
+    nas_id: str | None = None
+    nas_identifier: str | None = None
+    nas_ip: str | None = None
+    nas_status: str | None = None
+    secret_fingerprint: str | None = None
+    secret_length: int | None = None
+    hub_confirmed: bool = False
+    radius_server: RadiusServerView | None = None
+    allowed_domains: list[str] = Field(
+        default_factory=list,
+        description="Every host a not-yet-signed-in guest's browser must "
+        "reach, derived from the same constants the portal is served from. "
+        "Goes into Instant On's Guest portal > Allowed domains.",
+    )
+    portal_url: PublicPortalUrlView | None = None
+    gaps: list[str] = Field(default_factory=list)
+
+
 # The device half of a rotation, stated rather than implied.
 #
 # A rotate touches two of the three places that must agree -- the database
@@ -881,6 +992,15 @@ NAS_SECRET_ROTATION_DEVICE_ACTION = (
     "router. The platform cannot do that -- open the router in WinBox and "
     "re-paste the RADIUS client configuration with the secret above. Until "
     "then every guest login will be rejected."
+)
+
+
+# The NAS-only (Aruba Instant On) wording of the same instruction: there is
+# no WinBox and no router, the secret lives in the vendor's own app.
+NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY = (
+    "Guest WiFi at this venue is DOWN until this secret is entered in the "
+    "Instant On app (Site > RADIUS > the Wyfy profile > Shared secret). The "
+    "platform cannot do that. Until then every guest sign-in will time out."
 )
 
 
@@ -947,6 +1067,12 @@ class RadiusAuthorizeRequest(BaseModel):
             "``username`` -- see ``RadiusService.authorize``'s docstring."
         ),
     )
+
+    @field_validator("calling_station_id")
+    @classmethod
+    def _canonicalize_calling_station_id(cls, value: str | None) -> str | None:
+        # Aruba sends bare hex; see `canonicalize_calling_station_id`.
+        return canonicalize_calling_station_id(value)
 
 
 class RadiusAuthorizeResponse(BaseModel):
@@ -1040,6 +1166,12 @@ class RadiusAccountingRequest(BaseModel):
     bytes_uploaded_total: int | None = Field(default=None, ge=0)
     bytes_downloaded_total: int | None = Field(default=None, ge=0)
     disconnect_reason: str | None = Field(default=None, max_length=255)
+
+    @field_validator("calling_station_id")
+    @classmethod
+    def _canonicalize_calling_station_id(cls, value: str | None) -> str | None:
+        # Aruba sends bare hex; see `canonicalize_calling_station_id`.
+        return canonicalize_calling_station_id(value)
 
     @model_validator(mode="after")
     def _require_username_for_session_scoped_status_types(

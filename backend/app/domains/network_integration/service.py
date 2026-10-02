@@ -783,6 +783,48 @@ class ClientCapabilitiesReport:
     controller: ControllerLiveness
 
 
+# What a NAS-only venue (Aruba Instant On) can do to one guest device from
+# here: nothing. Customer-facing copy (PM_SPEC.md section 4, U1/U2/U5): it
+# names the app and never says RADIUS, NAS or controller.
+NAS_ONLY_SPEED_REASON = (
+    "Speed limits for Aruba Instant On are set in the Instant On app, on the "
+    "guest network. Wyfy can't change them."
+)
+NAS_ONLY_DISCONNECT_REASON = (
+    "Wyfy can't disconnect a device from Aruba Instant On access points. The "
+    "guest stays online until their session time runs out."
+)
+NAS_ONLY_STATS_REASON = "Data usage isn't reported for this venue yet."
+NAS_ONLY_LIVENESS_REASON = (
+    "This venue's access points are managed in Aruba's Instant On app. Wyfy "
+    "doesn't see their status directly. It sees guests signing in."
+)
+
+
+def nas_only_client_capabilities() -> ClientCapabilitiesReport:
+    """Every client action unsupported, each with the sentence the venue
+    owner reads, and a liveness of ``None`` -- nothing here ever measures a
+    NAS-only vendor's access points, which is "not measured", not "down"."""
+    reasons = {
+        "set_rate_limit": NAS_ONLY_SPEED_REASON,
+        "clear_rate_limit": NAS_ONLY_SPEED_REASON,
+        "block": NAS_ONLY_DISCONNECT_REASON,
+        "unblock": NAS_ONLY_DISCONNECT_REASON,
+        "list_blocked": NAS_ONLY_DISCONNECT_REASON,
+        "disconnect": NAS_ONLY_DISCONNECT_REASON,
+        "client_stats": NAS_ONLY_STATS_REASON,
+    }
+    return ClientCapabilitiesReport(
+        capabilities={
+            name: {"supported": False, "reason": reason}
+            for name, reason in reasons.items()
+        },
+        controller=ControllerLiveness(
+            reachable=None, checked_at=None, reason=NAS_ONLY_LIVENESS_REASON
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ControllerInventoryResult:
     """What the customer-facing controller-device read found.
@@ -4846,9 +4888,37 @@ class NetworkIntegrationService:
         run or has stopped running) degrades the control rather than
         asserting it.
         """
-        integration, provider_impl, config = await self._resolve_location_controller(
-            location_id=location_id, organization_id=organization_id
-        )
+        try:
+            integration, provider_impl, config = (
+                await self._resolve_location_controller(
+                    location_id=location_id, organization_id=organization_id
+                )
+            )
+        except LocationHasNoControllerError:
+            # A venue on a NAS-only vendor (Aruba Instant On) HAS told us what
+            # it can do: nothing, from here. Answering 404 would make the
+            # console read "nothing has told us" and leave the controls in an
+            # undecided state. Only consulted when there is no Omada row, so an
+            # Omada venue's answer is untouched; and tenant-scoped by the same
+            # organization + location WHERE clause.
+            vendor = (
+                await self.repository.nas_only_vendor_for_location(
+                    location_id=location_id, organization_id=organization_id
+                )
+                if organization_id is not None
+                else None
+            )
+            if vendor is None:
+                raise
+            # The location confinement `_enforce_tenant_scope` applies to a
+            # loaded integration, applied to the location itself: a
+            # location-scoped staff user learns nothing about a sibling site.
+            enforce_entity_location(
+                entity_location_id=location_id,
+                caller_location_scope=self.caller_location_scope,
+                error=CrossLocationNetworkIntegrationAccessError(),
+            )
+            return nas_only_client_capabilities()
         capabilities = provider_impl.client_capabilities(config)
         return ClientCapabilitiesReport(
             capabilities={

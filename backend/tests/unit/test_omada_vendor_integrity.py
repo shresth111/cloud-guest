@@ -210,7 +210,11 @@ class TestVendorIsAGuardedWrite:
         assert router.vendor == "mikrotik"
 
     def test_the_supported_vocabulary_is_only_what_is_implemented(self) -> None:
-        assert SUPPORTED_ROUTER_VENDORS == ("mikrotik", "tplink_omada")
+        assert SUPPORTED_ROUTER_VENDORS == (
+            "mikrotik",
+            "tplink_omada",
+            "aruba_instant_on",
+        )
 
     async def test_agent_evidence_refuses_a_controller_claim(self) -> None:
         service, repo, locations, orgs, audit = make_service()

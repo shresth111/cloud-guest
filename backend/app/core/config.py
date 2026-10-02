@@ -367,6 +367,18 @@ class Settings(BaseSettings):
             "why it stopped being a constant."
         ),
     )
+    hub_radius_public_address: str = Field(
+        default="",
+        description=(
+            "The RADIUS hub's PUBLIC address (IP or DNS name), as a venue's "
+            "own access point must be told it: the value an operator types "
+            "into Aruba Instant On's RADIUS profile. Only NAS-only vendors "
+            "need it -- every other NAS reaches the hub over WireGuard or "
+            "the VPC. Empty means 'not configured', and the Master setup "
+            "panel lists that as a gap instead of inventing an address. "
+            "Override via CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS."
+        ),
+    )
     hub_radius_agent_secret: str = Field(
         default="",
         description=(
