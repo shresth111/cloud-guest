@@ -64,6 +64,19 @@ from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 from app.domains.wireguard.validators import hub_reserved_ip
 
+from .aruba_shared import (
+    CALLED_STATION_ID_HEADER,
+    PACKET_NAS_IDENTIFIER_HEADER,
+    SHARED_SECRET_HEADER,
+    ArubaSharedNotConfiguredError,
+    ArubaSharedRequestRejected,
+    ArubaSharedSecretStore,
+    canonical_mac,
+    log_rejection,
+    resolve_shared_nas,
+    rotate_shared_secret,
+    would_be_nas_identifier,
+)
 from .constants import (
     MAX_BULK_DEVICE_LOOKUP_IDS,
     MAX_BULK_VOUCHER_LOOKUP_IDS,
@@ -87,6 +100,7 @@ from .dependencies import (
 from .exceptions import (
     PublicNasRegistrationRefusedError,
     RadiusAccountingUnsupportedStatusTypeError,
+    RadiusNasAuthenticationError,
     RadiusNasBridgeDeregistrationError,
     RadiusNasNotFoundError,
 )
@@ -104,6 +118,9 @@ from .radius_bridge import (
 )
 from .schemas import (
     NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY,
+    ArubaSharedListenerView,
+    ArubaSharedSecretRotatedResponse,
+    ArubaSharedSecretStatusResponse,
     DashboardOsCountResponse,
     DashboardSeriesPointResponse,
     GuestAnalyticsSummaryResponse,
@@ -182,6 +199,10 @@ nas_cross_reference_router = APIRouter(tags=["RADIUS NAS Admin"])
 # namespace `app.domains.router.router` already established for exactly
 # this separation; see the section header above
 # `regenerate_radius_nas_secret` for why the split exists.
+#: The shared Aruba Instant On listener's platform-wide secret (Master only).
+aruba_shared_platform_router = APIRouter(
+    prefix="/platform/radius/aruba-shared", tags=["RADIUS NAS Platform"]
+)
 nas_platform_router = APIRouter(
     prefix="/platform/radius/nas", tags=["RADIUS NAS Platform"]
 )
@@ -2425,7 +2446,13 @@ async def get_public_radius_nas_status(
     if radius_server is None:
         gaps.append("radius_server_address_not_configured")
 
+    shared_listener = (
+        await _shared_listener_view(service, router, nas_client)
+        if is_nas_only(router)
+        else None
+    )
     payload = PublicNasStatusResponse(
+        shared_listener=shared_listener,
         router_id=str(router.id),
         vendor=vendor,
         vendor_label=_NAS_ONLY_VENDOR_LABELS.get(vendor, vendor),
@@ -2448,6 +2475,219 @@ async def get_public_radius_nas_status(
         success=True,
         message="NAS-only device RADIUS status",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ----------------------------------------------------------------------------
+# The shared Aruba listener, platform side (Master only, GLOBAL)
+# ----------------------------------------------------------------------------
+
+#: The device half of a shared-secret rotation, stated rather than implied.
+ARUBA_SHARED_ROTATION_DEVICE_ACTION = (
+    "Every Instant On site that uses the shared Aruba listener (ports "
+    "1912/1913) rejects guests from now until this secret is typed into its "
+    "RADIUS profile. Venues registered by public IP (port 1812) are not "
+    "affected."
+)
+
+
+def _shared_ports() -> tuple[int, int]:
+    settings = get_settings()
+    return (
+        int(getattr(settings, "aruba_shared_radius_auth_port", 1912)),
+        int(getattr(settings, "aruba_shared_radius_acct_port", 1913)),
+    )
+
+
+def _shared_radius_server_view() -> RadiusServerView | None:
+    address = get_settings().hub_radius_public_address.strip()
+    if not address:
+        return None
+    auth, acct = _shared_ports()
+    return RadiusServerView(host=address, auth_port=auth, accounting_port=acct)
+
+
+async def _shared_listener_view(
+    service: RadiusService,
+    router,  # noqa: ANN001
+    nas_client,  # noqa: ANN001
+) -> ArubaSharedListenerView:
+    settings = get_settings()
+    auth, acct = _shared_ports()
+    gaps: list[str] = []
+    installed = bool(getattr(settings, "hub_radius_aruba_shared_agent_url", ""))
+    if not installed:
+        gaps.append("listener_not_installed")
+    state = await _aruba_shared_store(service).state()
+    if not state.configured:
+        gaps.append("shared_secret_not_set")
+    elif not state.hub_confirmed:
+        gaps.append("hub_not_confirmed")
+    if nas_client is None:
+        gaps.append("nas_not_registered")
+    ap_mac = canonical_mac(getattr(router, "mac_address", None))
+    if ap_mac is None:
+        gaps.append("no_ap_mac")
+    server = _shared_radius_server_view()
+    if server is None:
+        gaps.append("radius_server_address_not_configured")
+    return ArubaSharedListenerView(
+        available=not gaps,
+        radius_server=server,
+        auth_port=auth,
+        accounting_port=acct,
+        nas_identifier=(
+            nas_client.nas_identifier
+            if nas_client is not None
+            else would_be_nas_identifier(router.id)
+        ),
+        ap_mac=ap_mac,
+        secret_configured=state.configured,
+        secret_fingerprint=state.fingerprint,
+        secret_length=state.length,
+        secret_rotated_at=state.rotated_at,
+        hub_confirmed=state.hub_confirmed,
+        gaps=gaps,
+    )
+
+
+async def _shared_status(service: RadiusService) -> ArubaSharedSecretStatusResponse:
+    state = await _aruba_shared_store(service).state()
+    auth, acct = _shared_ports()
+    return ArubaSharedSecretStatusResponse(
+        listener_installed=bool(get_settings().hub_radius_aruba_shared_agent_url),
+        secret_configured=state.configured,
+        secret_fingerprint=state.fingerprint,
+        secret_length=state.length,
+        secret_rotated_at=state.rotated_at,
+        hub_confirmed=state.hub_confirmed,
+        auth_port=auth,
+        accounting_port=acct,
+        radius_server=_shared_radius_server_view(),
+    )
+
+
+@aruba_shared_platform_router.get(
+    "",
+    response_model=ApiResponse[ArubaSharedSecretStatusResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("radius.read", scope=ScopeType.GLOBAL))
+    ],
+)
+async def get_aruba_shared_secret_status(
+    request: Request,
+    service: RadiusService = Depends(get_radius_service),
+):
+    """The shared Aruba listener's secret: fingerprint, length, when it was
+    rotated and whether the hub confirmed it. Never the secret."""
+    return build_response(
+        success=True,
+        message="Shared Aruba RADIUS listener status",
+        data=(await _shared_status(service)).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@aruba_shared_platform_router.post(
+    "/rotate",
+    response_model=ApiResponse[ArubaSharedSecretRotatedResponse],
+    status_code=status.HTTP_200_OK,
+    # GLOBAL, pinned, `radius.execute`: one call changes the credential of
+    # every venue on the shared listener.
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
+)
+async def rotate_aruba_shared_secret(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+):
+    """Set (first time) or rotate the shared Aruba listener's secret. The
+    platform mints 32 alphanumeric characters, the hub agent writes them
+    FIRST (and reports their fingerprint back), and only then is the secret
+    stored, encrypted. Returned once, here; only its fingerprint afterwards.
+    """
+    store = _aruba_shared_store(service)
+    try:
+        secret, _fp = await rotate_shared_secret(store, actor_user_id=user.id)
+    except ArubaSharedNotConfiguredError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="This platform has no shared Aruba RADIUS listener "
+            "(CLOUDGUEST_HUB_RADIUS_ARUBA_SHARED_AGENT_URL is not set).",
+        ) from exc
+    except RadiusBridgePushError as exc:
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+    current = await _shared_status(service)
+    return build_response(
+        success=True,
+        message="Shared Aruba RADIUS secret set; shown once",
+        data=ArubaSharedSecretRotatedResponse(
+            **current.model_dump(),
+            shared_secret=secret,
+            device_action=ARUBA_SHARED_ROTATION_DEVICE_ACTION,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.post(
+    "/register-shared/{router_id}",
+    response_model=ApiResponse[ArubaSharedListenerView],
+    status_code=status.HTTP_200_OK,
+    # GLOBAL, pinned -- same as register-public: it creates a NAS identity.
+    dependencies=[
+        Depends(RequirePermission("radius.create", scope=ScopeType.GLOBAL))
+    ],
+)
+async def register_shared_radius_nas(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+):
+    """Give a NAS-only (Aruba Instant On) device a NAS identity for the
+    shared listener: a ``cg-aruba-<8hex>`` NAS-Identifier with NO address
+    and NO hub stanza of its own -- the shared listener's catch-all client
+    covers it, and the backend binds it to the device's AP MAC.
+
+    Idempotent: a device that already has a NAS row (registered by public
+    IP, say) keeps it -- its identifier works on both listeners at once.
+    Refused unless the device has a recorded AP MAC: without one there is
+    nothing to bind the packets to.
+    """
+    router = await _nas_only_router(service, router_id)
+    if canonical_mac(getattr(router, "mac_address", None)) is None:
+        raise PublicNasRegistrationRefusedError(
+            "This device has no AP MAC address on record. The shared Aruba "
+            "listener identifies a venue by NAS-Identifier AND the access "
+            "point's MAC, so record the AP's MAC on the device first."
+        )
+    existing, _meta = await service.list_nas_clients(
+        requesting_organization_id=None, router_id=router_id, page=1, page_size=1
+    )
+    nas_client = existing[0] if existing else None
+    if nas_client is None:
+        registration = await service.register_nas(
+            actor_user_id=uuid.UUID(user.id),
+            router_id=router_id,
+            nas_identifier=would_be_nas_identifier(router_id),
+            # A per-NAS secret is still minted (the column is required) but
+            # never shown and never pushed: on the shared listener the
+            # platform-wide Aruba secret is what the AP holds.
+            shared_secret=generate_alphanumeric_shared_secret(),
+            name=f"{router.name} (Aruba Instant On, shared listener)",
+            ip_address=None,
+            requesting_organization_id=None,
+        )
+        nas_client = registration.nas_client
+    return build_response(
+        success=True,
+        message="Device ready for the shared Aruba RADIUS listener",
+        data=(await _shared_listener_view(service, router, nas_client)).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -2996,6 +3236,17 @@ async def radius_authorize(
     of this endpoint's own (correct) accept/reject decision, invisible
     behind an HTTP 200. The wire response below uses rlm_rest's real
     attribute-name convention instead."""
+    return await _radius_authorize_reply(payload, nas_client, service)
+
+
+async def _radius_authorize_reply(
+    payload: RadiusAuthorizeRequest,
+    nas_client,  # noqa: ANN001 -- RadiusNasClient
+    service: RadiusService,
+) -> dict:
+    """``radius_authorize``'s whole decision and wire reply, shared verbatim
+    with the shared Aruba listener's ``radius_aruba_shared_authorize`` --
+    the two differ only in how the NAS was identified."""
     result = await service.authorize(
         nas_client=nas_client,
         username=payload.username,
@@ -3054,6 +3305,16 @@ async def radius_accounting(
     nas_client=Depends(CurrentNas),
     service: RadiusService = Depends(get_radius_service),
 ) -> RadiusAccountingResponse:
+    return await _radius_accounting(payload, nas_client, service)
+
+
+async def _radius_accounting(
+    payload: RadiusAccountingRequest,
+    nas_client,  # noqa: ANN001 -- RadiusNasClient
+    service: RadiusService,
+) -> RadiusAccountingResponse:
+    """``radius_accounting``'s whole body, shared verbatim with the shared
+    Aruba listener's ``radius_aruba_shared_accounting``."""
     # Accounting-On/Accounting-Off (RFC 2866 §5.13) are NAS-level events --
     # no single session to report on, handled entirely separately from the
     # three session-scoped status types below. See
@@ -3116,6 +3377,89 @@ async def radius_accounting(
         # real Accounting-Stop.
         raise RadiusAccountingUnsupportedStatusTypeError(payload.status_type)
     return RadiusAccountingResponse(session_id=str(session.id), status=session.status)
+
+
+# ----------------------------------------------------------------------------
+# The shared Aruba Instant On listener (UDP 1912/1913): identity from inside
+# the packet. See app.domains.guest.aruba_shared.
+# ----------------------------------------------------------------------------
+
+
+def _aruba_shared_store(radius_service: RadiusService) -> ArubaSharedSecretStore:
+    from app.domains.system_settings.repository import SystemSettingsRepository
+
+    session = getattr(getattr(radius_service, "repository", None), "session", None)
+    if session is None:
+        # No database behind this service (a unit-test fake): an unset
+        # secret, which every caller already handles.
+        return ArubaSharedSecretStore(_NoSettings())
+    return ArubaSharedSecretStore(SystemSettingsRepository(session))
+
+
+class _NoSettings:
+    async def get_value(self, key: str) -> None:
+        return None
+
+    async def upsert(self, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("no settings store behind this RadiusService")
+
+
+async def _resolve_shared(request: Request, service: RadiusService):  # noqa: ANN202
+    return await resolve_shared_nas(
+        presented_secret=request.headers.get(SHARED_SECRET_HEADER),
+        nas_identifier=request.headers.get(PACKET_NAS_IDENTIFIER_HEADER),
+        called_station_id=request.headers.get(CALLED_STATION_ID_HEADER),
+        store=_aruba_shared_store(service),
+        radius_service=service,
+    )
+
+
+@radius_router.post(
+    "/aruba-shared/authorize",
+    status_code=status.HTTP_200_OK,
+)
+async def radius_aruba_shared_authorize(
+    request: Request,
+    payload: RadiusAuthorizeRequest,
+    service: RadiusService = Depends(get_radius_service),
+) -> dict:
+    """``/radius/authorize`` for the shared Aruba listener. Not gated by
+    ``CurrentNas`` -- that dependency (and every per-venue stanza) is
+    untouched. The NAS comes from ``resolve_shared_nas``: shared secret,
+    then NAS-Identifier -> ACTIVE ``aruba_instant_on`` NAS, then the AP MAC
+    in Called-Station-Id. Any mismatch is an Access-Reject with the reason
+    logged (``radius_aruba_shared_rejected``), never sent to the NAS. A
+    match goes through exactly the per-venue decision, so a guest still
+    needs an OTP-verified session at THIS venue."""
+    try:
+        nas_client = await _resolve_shared(request, service)
+    except ArubaSharedRequestRejected as exc:
+        log_rejection(exc, kind="authorize")
+        return {"control:Auth-Type": "Reject"}
+    return await _radius_authorize_reply(payload, nas_client, service)
+
+
+@radius_router.post(
+    "/aruba-shared/accounting",
+    response_model=RadiusAccountingResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def radius_aruba_shared_accounting(
+    request: Request,
+    payload: RadiusAccountingRequest,
+    service: RadiusService = Depends(get_radius_service),
+) -> RadiusAccountingResponse:
+    """``/radius/accounting`` for the shared Aruba listener, resolved the
+    same way as its authorize. A refusal is a 401 with the reason logged;
+    FreeRADIUS acknowledges the packet either way (the snippet's
+    ``invalid``/``reject`` -> ``ok``), so an AP never retries forever, but
+    nothing is recorded against any session."""
+    try:
+        nas_client = await _resolve_shared(request, service)
+    except ArubaSharedRequestRejected as exc:
+        log_rejection(exc, kind="accounting")
+        raise RadiusNasAuthenticationError() from None
+    return await _radius_accounting(payload, nas_client, service)
 
 
 # ============================================================================

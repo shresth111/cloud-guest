@@ -677,6 +677,22 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "location confinement, and it must never 401: this is the path every guest's "
         "traffic authorises through."
     ),
+    ("POST", "/api/v1/radius/aruba-shared/authorize"): (
+        "The shared Aruba Instant On listener (UDP 1912/1913). Authenticated by the "
+        "platform-wide Aruba shared secret (constant-time, `resolve_shared_nas`), "
+        "then bound to one ACTIVE aruba_instant_on NAS by the packet's "
+        "NAS-Identifier AND its AP MAC. Same reasoning as `/radius/authorize`: the "
+        "AP is the caller, it has no RBAC grants, and a refusal is an Access-Reject "
+        "(or a logged 401 for accounting), never a user-session 401."
+    ),
+    ("POST", "/api/v1/radius/aruba-shared/accounting"): (
+        "The shared Aruba Instant On listener (UDP 1912/1913). Authenticated by the "
+        "platform-wide Aruba shared secret (constant-time, `resolve_shared_nas`), "
+        "then bound to one ACTIVE aruba_instant_on NAS by the packet's "
+        "NAS-Identifier AND its AP MAC. Same reasoning as `/radius/authorize`: the "
+        "AP is the caller, it has no RBAC grants, and a refusal is an Access-Reject "
+        "(or a logged 401 for accounting), never a user-session 401."
+    ),
     ("GET", "/api/v1/agent/authorized-macs"): (
         "Authenticated by the router agent's own credential (`CurrentAgent`), not by a "
         "user session. Same reasoning as the RADIUS routes: a device is the caller, "

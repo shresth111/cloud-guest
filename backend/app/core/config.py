@@ -379,6 +379,26 @@ class Settings(BaseSettings):
             "Override via CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS."
         ),
     )
+    hub_radius_aruba_shared_agent_url: str = Field(
+        default="",
+        description=(
+            "Absolute URL of the hub agent's shared-Aruba-listener endpoint "
+            "(radius_agent.py `POST /radius/shared-client`). Empty means this "
+            "deployment has no shared Aruba listener: the Master panel shows "
+            "that as a gap and rotation is refused. Same agent secret as "
+            "hub_radius_agent_url. Override via "
+            "CLOUDGUEST_HUB_RADIUS_ARUBA_SHARED_AGENT_URL."
+        ),
+    )
+    aruba_shared_radius_auth_port: int = Field(
+        default=1912,
+        description="UDP port of the shared Aruba listener's auth side, as "
+        "typed into Instant On's RADIUS profile.",
+    )
+    aruba_shared_radius_acct_port: int = Field(
+        default=1913,
+        description="UDP port of the shared Aruba listener's accounting side.",
+    )
     hub_radius_agent_secret: str = Field(
         default="",
         description=(
