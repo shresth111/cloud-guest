@@ -279,6 +279,12 @@ class LearnedAddressStore(Protocol):
     async def flush(self) -> None: ...
 
 
+def _live_nas_ids():  # noqa: ANN202
+    """Learned rows of a deregistered (soft-deleted) NAS are dead weight until
+    the daily prune removes them; they must not block another venue."""
+    return select(RadiusNasClient.id).where(RadiusNasClient.is_deleted.is_(False))
+
+
 class SqlLearnedAddressStore:
     """Postgres-backed store. ``lock_nas`` takes a transaction-scoped
     advisory lock, so two hints for one NAS compute and push its address set
@@ -353,6 +359,7 @@ class SqlLearnedAddressStore:
             .where(
                 RadiusNasLearnedAddress.nas_client_id != nas_client_id,
                 RadiusNasLearnedAddress.ip_address == address,
+                RadiusNasLearnedAddress.nas_client_id.in_(_live_nas_ids()),
             )
         )
         return bool(learned.scalar_one())
@@ -401,6 +408,7 @@ class SqlLearnedAddressStore:
             .where(
                 RadiusNasLearnedAddress.router_id != router_id,
                 RadiusNasLearnedAddress.ip_address == address,
+                RadiusNasLearnedAddress.nas_client_id.in_(_live_nas_ids()),
             )
         )
         return bool(result.scalar_one())
