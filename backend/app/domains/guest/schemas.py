@@ -1226,12 +1226,32 @@ class RadiusAccountingRequest(BaseModel):
     bytes_uploaded_total: int | None = Field(default=None, ge=0)
     bytes_downloaded_total: int | None = Field(default=None, ge=0)
     disconnect_reason: str | None = Field(default=None, max_length=255)
+    framed_ip_address: str | None = Field(
+        default=None,
+        description="RADIUS Framed-IP-Address (RFC 2865 s5.8): the guest's IP "
+        "as the NAS saw it. Read only by the Aruba AP + MikroTik gateway "
+        "hybrid, to key the guest's queue on the gateway. An empty or "
+        "malformed value is dropped to None, never a validation error: an "
+        "accounting packet must not be refused over an optional attribute.",
+    )
 
     @field_validator("calling_station_id")
     @classmethod
     def _canonicalize_calling_station_id(cls, value: str | None) -> str | None:
         # Aruba sends bare hex; see `canonicalize_calling_station_id`.
         return canonicalize_calling_station_id(value)
+
+    @field_validator("framed_ip_address", mode="before")
+    @classmethod
+    def _lenient_framed_ip_address(cls, value: object) -> str | None:
+        import ipaddress
+
+        if value is None:
+            return None
+        try:
+            return str(ipaddress.ip_address(str(value).strip()))
+        except ValueError:
+            return None
 
     @model_validator(mode="after")
     def _require_username_for_session_scoped_status_types(
