@@ -900,6 +900,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # permanent block nobody can find, from a temporary one.
         "guest-access-controller-block-release-sweep",
         "guest-access-device-block-release-sweep",
+        # Aruba AP + MikroTik gateway hybrid: removes a gateway's per-guest
+        # queue once the AP has certainly dropped the guest, and retries a
+        # Stop-time removal that could not reach the gateway.
+        "aruba-hybrid-queue-reconcile-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         # Monitored hardware liveness: the fast ping-driven UP/DOWN path
