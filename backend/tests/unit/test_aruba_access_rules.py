@@ -463,3 +463,84 @@ class TestAPolicyOutageDoesNotLockTheVenueOut:
         lookup.raises = RuntimeError("policy tables unreachable")
         authz = await _authorize(fx, nas)
         assert authz.authorized is True
+
+
+# ============================================================================
+# Blocking a guest who is online right now
+# ============================================================================
+
+
+class TestBlockingAnOnlineGuestAtANasOnlyVenue:
+    """The live half of a block cannot happen on an Instant On AP. It must say
+    so in the owner's words -- not "could not reach the controller", which
+    reads as a fault to repair -- and it must not touch the controller path."""
+
+    async def test_it_raises_the_plain_sentence_without_contacting_anything(
+        self,
+    ) -> None:
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+        from app.domains.guest_access.exceptions import (
+            NasOnlyLiveSessionUnreachableError,
+        )
+        from tests.unit.test_omada_client_management import (
+            CLIENT_MAC,
+            GUEST_IDENTIFIER,
+            _DeviceLookup,
+            _mac_only_controller_terminator,
+            _Router,
+            _RouterLookup,
+            _Session,
+        )
+
+        reached: list[dict] = []
+        terminator = LiveSessionTerminator(
+            router_lookup=_RouterLookup(
+                _Router(vendor=_ARUBA, api_username=None, management_ip_address=None)
+            ),
+            device_lookup=_DeviceLookup(mac=CLIENT_MAC),
+            controller_terminator=_mac_only_controller_terminator(reached),
+        )
+        with pytest.raises(NasOnlyLiveSessionUnreachableError) as exc_info:
+            await terminator.end_on_router(
+                session=_Session(device_id=uuid.uuid4()),
+                identifier=GUEST_IDENTIFIER,
+                organization_id=uuid.uuid4(),
+            )
+        assert reached == []
+        message = str(exc_info.value.message)
+        assert "stops this person signing in again" in message
+        assert "controller" not in message.lower()
+        assert "RADIUS" not in message
+        assert exc_info.value.status_code == 409
+
+    async def test_an_omada_venue_still_goes_to_its_controller(self) -> None:
+        from app.domains.guest_access.enforcement import LiveSessionTerminator
+        from tests.unit.test_omada_client_management import (
+            CLIENT_MAC,
+            GUEST_IDENTIFIER,
+            _DeviceLookup,
+            _mac_only_controller_terminator,
+            _Router,
+            _RouterLookup,
+            _Session,
+        )
+
+        reached: list[dict] = []
+        terminator = LiveSessionTerminator(
+            router_lookup=_RouterLookup(
+                _Router(
+                    vendor="tplink_omada",
+                    api_username=None,
+                    management_ip_address=None,
+                )
+            ),
+            device_lookup=_DeviceLookup(mac=CLIENT_MAC),
+            controller_terminator=_mac_only_controller_terminator(reached),
+        )
+        outcome = await terminator.end_on_router(
+            session=_Session(device_id=uuid.uuid4()),
+            identifier=GUEST_IDENTIFIER,
+            organization_id=uuid.uuid4(),
+        )
+        assert outcome.ended_cleanly is True
+        assert len(reached) == 1
