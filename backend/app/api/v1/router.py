@@ -109,6 +109,12 @@ from app.domains.port_forwarding.router import router as port_forwarding_router
 from app.domains.provisioning_engine.router import router as provisioning_engine_router
 from app.domains.qos.router import router as qos_router
 from app.domains.queue_management.router import router as queue_management_router
+from app.domains.queue_management.speed_gateway_router import (
+    speed_gateway_customer_router as queue_speed_gateway_customer_router,
+)
+from app.domains.queue_management.speed_gateway_router import (
+    speed_gateway_platform_router as queue_speed_gateway_platform_router,
+)
 from app.domains.quotation.router import router as quotation_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.readiness.router import router as readiness_router
@@ -286,6 +292,12 @@ api_v1_router.include_router(traffic_flow_geo_customer_router)
 # Findings for the same venue page: same three guards, read-only, computed
 # on read (no table, no notification).
 api_v1_router.include_router(traffic_flow_findings_customer_router)
+# Aruba AP + MikroTik gateway hybrid: Master links a venue MikroTik as an
+# Instant On access point's speed gateway (GLOBAL, platform DB only); the
+# customer reads one boolean. Queue writes happen in the worker, behind
+# CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED.
+api_v1_router.include_router(queue_speed_gateway_customer_router)
+api_v1_router.include_router(queue_speed_gateway_platform_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 # Cloudflare Gateway category filtering: the provider-backed half of the same

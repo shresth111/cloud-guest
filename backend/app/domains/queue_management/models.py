@@ -37,7 +37,16 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -321,4 +330,70 @@ class QueueAssignment(BaseModel):
         )
 
 
-__all__ = ["QueueProfile", "QueueSchedule", "QueueTemplate", "QueueAssignment"]
+class LocationSpeedGateway(BaseModel):
+    """The Aruba AP + MikroTik gateway hybrid: which Wyfy-managed MikroTik
+    enforces per-guest speed for the guests a NAS-only access point (Aruba
+    Instant On) authorizes at one location.
+
+    One live row per NAS-only router. ``organization_id``/``location_id``
+    are copied from the NAS-only router when the row is written -- never from
+    a request body -- and the gateway is refused unless it is a MikroTik of
+    the **same** organization **and** location (``speed_gateway
+    .SpeedGatewayService.link``). They are re-checked at use time as well,
+    so a router later moved to another venue stops being used rather than
+    rate-limiting someone else's guests.
+
+    Written only from the Master console (``ScopeType.GLOBAL``). Deliberately
+    a table and not a ``routers.settings``/``locations.settings`` key: both of
+    those JSON columns are writable by a venue owner.
+    """
+
+    __tablename__ = "location_speed_gateways"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    nas_router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    gateway_router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_location_speed_gateways_organization_id", "organization_id"),
+        Index("ix_location_speed_gateways_location_id", "location_id"),
+        Index("ix_location_speed_gateways_gateway_router_id", "gateway_router_id"),
+        Index(
+            "uq_location_speed_gateways_nas_router_id",
+            "nas_router_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<LocationSpeedGateway(nas_router_id={self.nas_router_id}, "
+            f"gateway_router_id={self.gateway_router_id})>"
+        )
+
+
+__all__ = [
+    "QueueProfile",
+    "QueueSchedule",
+    "QueueTemplate",
+    "QueueAssignment",
+    "LocationSpeedGateway",
+]
