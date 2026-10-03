@@ -823,6 +823,20 @@ class RadiusNasClient(BaseModel):
         DateTime(timezone=True), nullable=True
     )
 
+    # -- RadSec (RADIUS over TLS, TCP 2083) identity. ``transport`` is
+    # ``udp`` for every NAS keyed on a source address (``ip_address``,
+    # above) and ``radsec`` for a NAS-only venue that cannot have a stable
+    # one (CGNAT, dynamic IP). A RadSec NAS is identified by its TLS client
+    # certificate: the hub maps (leaf CN, issuer DN) to this row's
+    # ``nas_identifier`` + secret, so ``CurrentNas`` sees the same two
+    # headers either way. Issuer is OpenSSL's one-line compat form, as
+    # FreeRADIUS renders ``TLS-Client-Cert-Issuer``. Migration 0143.
+    transport: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="udp", server_default="udp"
+    )
+    radsec_cert_cn: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    radsec_cert_issuer: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # -- Router-side push state, the other half of the two above. The pair
     # above records that the HUB's FreeRADIUS confirmed a client{} stanza;
     # these record that the ROUTER's own /radius row and CoA listener were

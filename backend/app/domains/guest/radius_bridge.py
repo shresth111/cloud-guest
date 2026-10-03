@@ -373,3 +373,134 @@ __all__ = [
     "RadiusClientAddressRejected",
     "RETRY_DELAYS",
 ]
+
+
+# ---------------------------------------------------------------------------
+# RadSec (RADIUS over TLS) enrolment -- the third shape of NAS.
+#
+# A NAS-only venue behind CGNAT or a dynamic IP has no address a client{}
+# stanza could be keyed on. Over RadSec the hub identifies it by its TLS
+# client certificate instead: the agent writes one map line
+# (CN, issuer) -> (nas_identifier, secret), and the RadSec virtual server
+# turns a verified certificate into the same X-RADIUS-NAS-Identifier /
+# X-RADIUS-Shared-Secret headers a UDP stanza produces. The secret never
+# leaves the platform: over RadSec the device's RADIUS secret is the fixed
+# string "radsec" (RFC 6614), so this one is a backend credential only.
+# ---------------------------------------------------------------------------
+
+RADSEC_PORT = 2083
+
+# Characters the hub's map format cannot carry: '|' is its field separator,
+# and a line break would split one enrolment into two.
+_RADSEC_FORBIDDEN = ("|", "\n", "\r", "\x00")
+
+
+class RadsecNotConfiguredError(Exception):
+    """This platform has no RadSec listener (``hub_radius_radsec_agent_url``
+    is empty). Raised before any row is written."""
+
+
+class RadsecIdentityRejected(ValueError):
+    """The certificate identity offered for a RadSec NAS cannot be enrolled."""
+
+
+def validate_radsec_identity(common_name: str, issuer: str) -> tuple[str, str]:
+    """The (CN, issuer DN) a RadSec NAS may be enrolled under, or a refusal.
+
+    * Both are required. CN alone is not an identity: it is only unique
+      within the CA that issued it, and the hub may trust more than one CA
+      (the device vendor's factory CA plus a test CA), so the hub binds the
+      two together and so must the record.
+    * The issuer must be in OpenSSL's one-line compat form (``/C=../CN=..``)
+      because that is the exact string FreeRADIUS compares against. The
+      ``C = US, O = ...`` form ``openssl x509 -issuer`` prints by default
+      would never match, silently -- the connection would just be refused.
+    """
+    cn = (common_name or "").strip()
+    iss = (issuer or "").strip()
+    if not cn or not iss:
+        raise RadsecIdentityRejected(
+            "both the certificate CN and its issuer are required"
+        )
+    if len(cn) > 255 or len(iss) > 1024:
+        raise RadsecIdentityRejected("certificate CN or issuer is too long")
+    if any(c in cn + iss for c in _RADSEC_FORBIDDEN):
+        raise RadsecIdentityRejected(
+            "certificate CN/issuer may not contain '|' or line breaks"
+        )
+    if not iss.startswith("/") or "=" not in iss:
+        raise RadsecIdentityRejected(
+            "issuer must be the OpenSSL one-line form, e.g. "
+            "'/C=US/O=Example/CN=Example Device CA' "
+            "(openssl x509 -noout -issuer -nameopt compat)"
+        )
+    return cn, iss
+
+
+async def push_radsec_nas_client(
+    *, nas_identifier: str, secret: str, cert_common_name: str, cert_issuer: str
+) -> None:
+    """Enrols (or re-enrols) ``nas_identifier`` on the hub's RadSec listener
+    under the given certificate identity. One line per NAS and per CN on the
+    hub: a re-push replaces both. A 2xx or ``RadiusBridgePushError``."""
+    url = get_settings().hub_radius_radsec_agent_url
+    if not url:
+        raise RadsecNotConfiguredError()
+    cn, issuer = validate_radsec_identity(cert_common_name, cert_issuer)
+    await _agent_call(
+        "POST",
+        url,
+        {
+            "nas_identifier": nas_identifier,
+            "secret": secret,
+            "cert_common_name": cn,
+            "cert_issuer": issuer,
+        },
+    )
+
+
+async def remove_radsec_nas_client(*, nas_identifier: str) -> None:
+    """Revokes ``nas_identifier``'s RadSec enrolment on the hub."""
+    url = get_settings().hub_radius_radsec_agent_url
+    if not url:
+        raise RadsecNotConfiguredError()
+    await _agent_call("DELETE", url, {"nas_identifier": nas_identifier})
+
+
+async def _agent_call(method: str, url: str, body: dict) -> None:
+    """Same retry/error contract as ``_push_client_stanza``: 5xx and transport
+    errors retried on ``RETRY_DELAYS``, a 4xx reported at once, the agent's
+    own explanation carried in ``RadiusBridgePushError.detail``."""
+    settings = get_settings()
+    resp: httpx.Response | None = None
+    last_transport_error: httpx.HTTPError | None = None
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.request(
+                    method,
+                    url,
+                    headers={
+                        "X-Agent-Secret": settings.hub_radius_agent_secret,
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+            last_transport_error = None
+        except httpx.HTTPError as exc:
+            last_transport_error = exc
+            resp = None
+        if resp is not None and resp.status_code < 500:
+            break
+        if attempt < len(RETRY_DELAYS):
+            await asyncio.sleep(RETRY_DELAYS[attempt])
+    if resp is None:
+        raise RadiusBridgePushError(
+            f"RadSec agent unreachable: {last_transport_error!r}",
+            transport=True,
+            status_code=None,
+        )
+    if resp.status_code >= 400:
+        raise RadiusBridgePushError(
+            bridge_error_detail(resp), transport=False, status_code=resp.status_code
+        )

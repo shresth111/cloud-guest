@@ -56,6 +56,16 @@ SHARED_SECRET = os.environ.get("RADIUS_AGENT_SECRET", "")
 # the wg0 tunnel (10.20.0.1), which the NSG cannot see at all.
 BIND_ADDR = os.environ.get("AGENT_BIND_ADDR", "0.0.0.0")
 CLIENTS_CONF = "/etc/freeradius/3.0/clients.conf"
+
+# RadSec (RADIUS over TLS) enrolment map, read by the RadSec virtual server's
+# `passwd` module: one line per enrolled certificate,
+#   <leaf CN>|<nas_identifier>|<backend secret>|<issuer DN, OpenSSL compat>
+# Unset = this hub has no RadSec listener, and /radius/radsec-client answers
+# 501 rather than writing a file nothing reads. RADSEC_RELOAD_CMD (optional)
+# is run after every write; without it the RadSec server is expected to
+# watch the file (the staging container does).
+RADSEC_MAP = os.environ.get("RADSEC_MAP", "")
+RADSEC_RELOAD_CMD = os.environ.get("RADSEC_RELOAD_CMD", "")
 BACKUP_DIR = "/root/freeradius-backups"
 
 # ONE WRITER AT A TIME.
@@ -393,6 +403,83 @@ def _remove_client_locked(nas_identifier: str) -> dict:
     return {"status": "ok", "removed": len(removed)}
 
 
+_RADSEC_FORBIDDEN_RE = re.compile(r"[|\r\n\x00]")
+_RADSEC_SECRET_RE = re.compile(r"^[A-Za-z0-9]{16,128}$")
+
+
+def _read_radsec_map() -> list[list[str]]:
+    if not os.path.exists(RADSEC_MAP):
+        return []
+    with open(RADSEC_MAP) as f:
+        return [ln.split("|", 3) for ln in f.read().splitlines() if ln.count("|") >= 3]
+
+
+def _write_radsec_map(rows: list[list[str]]) -> None:
+    """Atomic replace that keeps the existing file's owner/group/mode (the
+    RadSec radiusd reads it as its own unprivileged user), then reload."""
+    directory = os.path.dirname(RADSEC_MAP) or "."
+    st = os.stat(RADSEC_MAP) if os.path.exists(RADSEC_MAP) else None
+    tmp = os.path.join(directory, f".radsec-map.{os.getpid()}.{threading.get_ident()}")
+    with open(tmp, "w") as f:
+        f.write("".join("|".join(r) + "\n" for r in rows))
+    os.chmod(tmp, st.st_mode & 0o777 if st else 0o640)
+    if st is not None and hasattr(os, "chown"):
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except PermissionError:
+            pass
+    os.replace(tmp, RADSEC_MAP)
+    if RADSEC_RELOAD_CMD:
+        r = subprocess.run(
+            RADSEC_RELOAD_CMD.split(), capture_output=True, text=True, timeout=60
+        )
+        if r.returncode != 0:
+            raise RuntimeError("RadSec reload failed: " + (r.stderr or r.stdout)[-2000:])
+
+
+def add_radsec_client(
+    nas_identifier: str, secret: str, cert_common_name: str, cert_issuer: str
+) -> dict:
+    """Enrol (CN, issuer) -> (nas_identifier, secret). One line per NAS AND
+    one per CN: a re-enrolment replaces any line holding either, so a NAS
+    that moves to a new certificate does not leave its old certificate
+    still mapped to it, and a certificate cannot belong to two NAS."""
+    if not RADSEC_MAP:
+        raise NotImplementedError("radsec is not configured on this hub")
+    if not _IDENTIFIER_RE.match(nas_identifier):
+        raise ValueError("invalid nas_identifier")
+    if not _RADSEC_SECRET_RE.match(secret or ""):
+        raise ValueError("secret must be 16-128 alphanumerics")
+    cn, issuer = (cert_common_name or "").strip(), (cert_issuer or "").strip()
+    if not cn or not issuer.startswith("/") or "=" not in issuer:
+        raise ValueError("cert_common_name and an OpenSSL compat cert_issuer are required")
+    if _RADSEC_FORBIDDEN_RE.search(cn + issuer):
+        raise ValueError("cert_common_name/cert_issuer may not contain | or line breaks")
+    with _WRITE_LOCK:
+        rows = _read_radsec_map()
+        kept = [r for r in rows if r[0] != cn and r[1] != nas_identifier]
+        _write_radsec_map(kept + [[cn, nas_identifier, secret, issuer]])
+        return {"status": "ok", "superseded": len(rows) - len(kept)}
+
+
+def remove_radsec_client(nas_identifier: str) -> dict:
+    if not RADSEC_MAP:
+        raise NotImplementedError("radsec is not configured on this hub")
+    if not _IDENTIFIER_RE.match(nas_identifier):
+        raise ValueError("invalid nas_identifier")
+    with _WRITE_LOCK:
+        rows = _read_radsec_map()
+        kept = [r for r in rows if r[1] != nas_identifier]
+        if len(kept) != len(rows):
+            _write_radsec_map(kept)
+        if any(r[1] == nas_identifier for r in _read_radsec_map()):
+            raise RuntimeError(f"radsec enrolment for {nas_identifier} still present")
+        return {"status": "ok", "removed": len(rows) - len(kept)}
+
+
+_PATHS = ("/radius/client", "/radius/radsec-client")
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, status: int, obj: dict) -> None:
         body = json.dumps(obj).encode()
@@ -405,7 +492,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _authed_payload(self) -> dict | None:
         """Shared auth + body parse. Returns ``None`` (having already
         written the error response) if the request must not proceed."""
-        if self.path != "/radius/client":
+        if self.path not in _PATHS:
             self.send_response(404)
             self.end_headers()
             return None
@@ -419,6 +506,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             payload = self._authed_payload()
             if payload is None:
+                return
+            if self.path == "/radius/radsec-client":
+                self._radsec(
+                    lambda: add_radsec_client(
+                        payload["nas_identifier"],
+                        payload["secret"],
+                        payload["cert_common_name"],
+                        payload["cert_issuer"],
+                    )
+                )
                 return
             # `address` is the current spelling, `tunnel_ip` the one every
             # deployed backend before 2026-09-12 sends. Accepting both is
@@ -454,9 +551,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not nas_identifier:
                 self._json(400, {"error": "nas_identifier is required"})
                 return
+            if self.path == "/radius/radsec-client":
+                self._radsec(lambda: remove_radsec_client(nas_identifier))
+                return
             self._json(200, remove_client(nas_identifier))
         except Exception as e:  # noqa: BLE001 -- single-purpose agent
             _LOG.warning("remove_client failed: %s", e, exc_info=True)
+            self._json(500, {"error": str(e)})
+
+    def _radsec(self, call) -> None:  # noqa: ANN001
+        """RadSec handlers: 501 when this hub has no RadSec, 400 on a bad
+        payload (deterministic -- the backend must not retry it), 500 on a
+        write/reload failure."""
+        try:
+            self._json(200, call())
+        except NotImplementedError as e:
+            self._json(501, {"error": str(e)})
+        except (ValueError, KeyError) as e:
+            self._json(400, {"error": f"bad radsec request: {e}"})
+        except Exception as e:  # noqa: BLE001 -- single-purpose agent
+            _LOG.warning("radsec enrolment failed: %s", e, exc_info=True)
             self._json(500, {"error": str(e)})
 
     def log_message(self, fmt, *args):

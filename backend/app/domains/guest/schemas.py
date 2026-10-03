@@ -938,6 +938,56 @@ class PublicNasRegistrationResponse(BaseModel):
     portal_url: PublicPortalUrlView | None = None
 
 
+class RadsecNasRegistrationRequest(BaseModel):
+    """Register a NAS-only device over RadSec (RADIUS over TLS, TCP 2083),
+    identified by its TLS client certificate instead of a source address --
+    the path for a venue behind CGNAT or on a dynamic IP.
+
+    The two fields are what ``deploy/staging-radius/radsec-capture.sh`` (or
+    ``openssl x509 -noout -subject -issuer -nameopt compat`` on the device's
+    certificate) prints. No secret field: over RadSec the device's RADIUS
+    secret is the fixed string ``radsec``; the platform mints the backend
+    secret itself and never returns it.
+    """
+
+    cert_common_name: str = Field(..., min_length=1, max_length=255)
+    cert_issuer: str = Field(
+        ...,
+        min_length=3,
+        max_length=1024,
+        description="Issuer DN in OpenSSL's one-line compat form, e.g. "
+        "'/C=US/O=Example/CN=Example Device CA'.",
+    )
+
+
+class RadsecServerView(BaseModel):
+    """What the access point's RADIUS profile must point at for RadSec."""
+
+    host: str
+    port: int = 2083
+    shared_secret: str = Field(
+        default="radsec",
+        description="RFC 6614's fixed RADIUS secret inside TLS. Not a secret.",
+    )
+
+
+class RadsecNasRegistrationResponse(BaseModel):
+    """What was enrolled. Deliberately no secret: nothing on the device side
+    needs one beyond the fixed ``radsec``."""
+
+    router_id: str
+    nas_id: str
+    vendor: str
+    nas_identifier: str
+    transport: str = "radsec"
+    cert_common_name: str
+    cert_issuer: str
+    hub_confirmed: bool
+    rotated: bool
+    radsec_server: RadsecServerView | None = None
+    portal_url: PublicPortalUrlView | None = None
+
+
 class PublicNasStatusResponse(BaseModel):
     """Everything the Master setup panel for a NAS-only device renders.
 
@@ -947,7 +997,8 @@ class PublicNasStatusResponse(BaseModel):
 
     Gap codes: ``not_nas_only_vendor``, ``no_location``,
     ``nas_not_registered``, ``hub_not_confirmed``,
-    ``radius_server_address_not_configured``.
+    ``radius_server_address_not_configured`` (UDP rows),
+    ``radsec_server_address_not_configured`` (RadSec rows).
     """
 
     router_id: str
@@ -964,6 +1015,14 @@ class PublicNasStatusResponse(BaseModel):
     secret_length: int | None = None
     hub_confirmed: bool = False
     radius_server: RadiusServerView | None = None
+    transport: str = Field(
+        default="udp",
+        description="'udp' (keyed on nas_ip) or 'radsec' (keyed on the "
+        "certificate below; nas_ip is null).",
+    )
+    radsec_cert_cn: str | None = None
+    radsec_cert_issuer: str | None = None
+    radsec_server: RadsecServerView | None = None
     allowed_domains: list[str] = Field(
         default_factory=list,
         description="Every host a not-yet-signed-in guest's browser must "
@@ -1001,6 +1060,14 @@ NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY = (
     "Guest WiFi at this venue is DOWN until this secret is entered in the "
     "Instant On app (Site > RADIUS > the Wyfy profile > Shared secret). The "
     "platform cannot do that. Until then every guest sign-in will time out."
+)
+
+# RadSec: the device's RADIUS secret is the fixed "radsec"; the rotated one
+# is a backend credential the hub already holds. Nothing to do on site.
+NAS_SECRET_ROTATION_DEVICE_ACTION_RADSEC = (
+    "None. This venue uses RadSec: the access point's RADIUS secret stays "
+    "'radsec' and the rotated secret is only used between the RadSec "
+    "listener and the platform."
 )
 
 
