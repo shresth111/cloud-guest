@@ -280,7 +280,7 @@ async def end_nas_only_session(
         "instant_on_disconnect_enforced",
         extra={
             "router_id": str(router_id),
-            "created": result.created,
+            "block_created": result.created,
             "enforcement_delivered": True,
         },
     )
