@@ -245,6 +245,13 @@ class InstantOnControlClient:
                     continue
         return None
 
+    async def list_networks(self, site_id: str) -> list[dict[str, Any]]:
+        """Every network on the site, raw (``GET networksSummary``). Raw rows
+        carry the PSK and RADIUS secret: never log or return them as-is."""
+        return _elements(
+            await self._call("GET", site_id, "networksSummary"), "networksSummary"
+        )
+
     async def get_network(self, site_id: str, network_id: str) -> dict[str, Any]:
         payload = await self._call("GET", site_id, "networksSummary")
         for row in _elements(payload, "networksSummary"):
