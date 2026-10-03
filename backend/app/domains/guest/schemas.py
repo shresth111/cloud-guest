@@ -259,6 +259,30 @@ class GuestUpdateProfileRequest(BaseModel):
     )
 
 
+class GuestSignInNameRequest(BaseModel):
+    """The portal's "Your name" screen, between OTP verify and the hotspot
+    login. Proof of session is the ``guest_id``/``session_id`` pair the
+    login response just issued -- see
+    ``service.GuestService.submit_sign_in_name``.
+
+    ``display_name`` is deliberately loose here (any string up to a
+    generous ceiling) and is cleaned and checked by
+    ``validators.normalize_guest_display_name``, so an empty or
+    whitespace-only name comes back as the stable
+    ``data.code == "guest_name_invalid"`` the portal can show, not as a
+    generic 422 schema error."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+    display_name: str = Field(max_length=1000)
+
+
+class GuestSignInNameResponse(BaseModel):
+    guest_id: str
+    display_name: str
+    has_profile: bool
+
+
 class GuestUpdateProfileResponse(BaseModel):
     guest_id: str
     display_name: str | None
@@ -627,6 +651,13 @@ class GuestLoginResponse(BaseModel):
     # add-on, and this guest has no consent row yet. The portal renders an
     # UNTICKED checkbox from it and never blocks access on it.
     marketing_consent_offer: dict[str, str] | None = None
+    # Name required at sign-in: true when this venue requires a name, this
+    # is an OTP login, and the guest has none on file. The session exists,
+    # but every step that opens the network refuses it (code
+    # ``guest_name_required``) until ``POST /guest/sign-in-name`` stores a
+    # name. The portal shows its one "Your name" screen on this bit and
+    # starts the hotspot login only after that call returns.
+    name_required: bool = False
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
 

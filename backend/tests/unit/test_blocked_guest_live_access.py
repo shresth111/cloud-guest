@@ -87,6 +87,7 @@ async def _authorized_macs(fx: Fixture, hook: object) -> list[str]:
         guest_repository=fx.repository,
         mac_authorization_service=_NoTrustedDevices(),  # type: ignore[arg-type]
         access_decision_service=hook,  # type: ignore[arg-type]
+        captive_portal_service=fx.captive_portal_service,  # type: ignore[arg-type]
     )
     return response.mac_addresses
 

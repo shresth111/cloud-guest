@@ -615,6 +615,12 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "dependency resolves them to unconfined rather than 401ing them out of the "
         "portal."
     ),
+    ("POST", "/api/v1/guest/sign-in-name"): (
+        "A guest acting on their own just-verified OTP session, during login -- "
+        "the same shape as `/guest/profile` above. They hold no roles, so there "
+        "is no confinement to derive; the anonymous-tolerant dependency resolves "
+        "them to unconfined rather than 401ing them out of the portal."
+    ),
     ("POST", "/api/v1/guest/review-link-opened"): (
         "A guest tapping the review card on their own connected session -- the same "
         "shape as `/guest/profile` above, and unauthenticated for the same reason: "
