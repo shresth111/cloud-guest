@@ -277,6 +277,79 @@ class TestDevicesPerGuest:
         assert (await _authorize(fx, nas)).authorized is True
 
 
+class TestTheAcceptIsBoundToTheSignedInDevice:
+    """Instant On ignores the login POST's password, so the AP will send an
+    Access-Request for ANY client that POSTs a signed-in guest's identifier.
+    The Accept must go only to a device the portal admitted."""
+
+    async def test_a_device_that_never_signed_in_is_refused(self) -> None:
+        fx = _fixture()
+        nas = await _register_nas(fx)
+        await _sign_in(fx)  # _MAC
+        authz = await fx.radius_service.authorize(
+            nas_client=nas,
+            username=_PHONE,
+            calling_station_id=canonicalize_calling_station_id("0a1b2c3d4e5f"),
+        )
+        assert authz.authorized is False
+
+    async def test_a_device_refused_by_the_device_limit_cannot_ride_the_first(
+        self,
+    ) -> None:
+        fx = _fixture(
+            policy_lookup=_PolicyLookup(
+                {PolicyType.DEVICE: {"max_devices_per_guest": 1}}
+            )
+        )
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+        with pytest.raises(GuestDeviceLimitExceededError):
+            await _sign_in(fx, mac="aa:bb:cc:dd:ee:02")
+        authz = await fx.radius_service.authorize(
+            nas_client=nas,
+            username=_PHONE,
+            calling_station_id=canonicalize_calling_station_id("aabbccddee02"),
+        )
+        assert authz.authorized is False
+        # The admitted device is unaffected.
+        assert (await _authorize(fx, nas)).authorized is True
+
+    async def test_each_admitted_device_gets_its_own_session(self) -> None:
+        fx = _fixture(
+            policy_lookup=_PolicyLookup(
+                {PolicyType.DEVICE: {"max_devices_per_guest": 2}}
+            )
+        )
+        nas = await _register_nas(fx)
+        first = await _sign_in(fx)
+        second = await _sign_in(fx, mac="aa:bb:cc:dd:ee:02")
+        assert first.session.id != second.session.id
+        a = await _authorize(fx, nas)
+        b = await fx.radius_service.authorize(
+            nas_client=nas,
+            username=_PHONE,
+            calling_station_id=canonicalize_calling_station_id("aabbccddee02"),
+        )
+        assert a.authorized is True and b.authorized is True
+
+    async def test_a_session_without_a_device_is_still_adopted(self) -> None:
+        fx = _fixture()
+        nas = await _register_nas(fx)
+        await _sign_in(fx, mac=None)
+        assert (await _authorize(fx, nas)).authorized is True
+
+    async def test_mikrotik_is_unchanged(self) -> None:
+        fx = _fixture(vendor="mikrotik")
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+        authz = await fx.radius_service.authorize(
+            nas_client=nas,
+            username=_PHONE,
+            calling_station_id="0A:1B:2C:3D:4E:5F",
+        )
+        assert authz.authorized is True
+
+
 # ============================================================================
 # Session length and idle timeout -- the RADIUS reply attributes
 # ============================================================================
