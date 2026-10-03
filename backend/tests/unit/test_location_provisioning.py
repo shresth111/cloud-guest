@@ -379,10 +379,12 @@ class ProvisioningFakes:
         self._maybe_fail("organization.get")
         return self.organizations[organization_id]
 
-    async def get_by_slug(self, slug: str):
+    async def get_by_slug(self, slug: str, *, include_deleted: bool = False):
         self._maybe_fail("organization.get_by_slug")
         for organization in self.organizations.values():
-            if organization.slug == slug:
+            if organization.slug == slug and (
+                include_deleted or not organization.is_deleted
+            ):
                 return organization
         raise OrganizationNotFoundError(slug)
 
@@ -941,7 +943,11 @@ class TestPreviewProvisionLocation:
                 )
             )
 
-    async def test_preview_rejects_duplicate_new_organization_slug(self) -> None:
+    # A soft-deleted org still holds its slug under uq_organizations_slug.
+    @pytest.mark.parametrize("soft_deleted", [False, True])
+    async def test_preview_rejects_duplicate_new_organization_slug(
+        self, soft_deleted: bool
+    ) -> None:
         service, fakes, base_plan_id = make_service()
         taken_slug = "taken-slug"
         organization = Organization(
@@ -960,6 +966,8 @@ class TestPreviewProvisionLocation:
                 subscription_tier=None,
             )
         )
+        if soft_deleted:
+            organization.mark_deleted()
         fakes.organizations[organization.id] = organization
 
         with pytest.raises(DuplicateSlugError):

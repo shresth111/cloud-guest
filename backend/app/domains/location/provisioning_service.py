@@ -421,7 +421,9 @@ class OrganizationProvisioningProtocol(Protocol):
         self, organization_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Organization: ...
 
-    async def get_by_slug(self, slug: str) -> Organization: ...
+    async def get_by_slug(
+        self, slug: str, *, include_deleted: bool = False
+    ) -> Organization: ...
 
     async def create_organization(
         self,
@@ -1111,7 +1113,9 @@ class LocationProvisioningService:
             if data.new_organization is None:
                 raise NewOrganizationRequiredError()
             try:
-                await self.organization_service.get_by_slug(data.new_organization.slug)
+                await self.organization_service.get_by_slug(
+                    data.new_organization.slug, include_deleted=True
+                )
             except OrganizationNotFoundError:
                 pass
             else:
