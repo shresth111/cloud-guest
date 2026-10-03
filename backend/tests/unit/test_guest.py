@@ -9186,6 +9186,10 @@ class TestNasSecretRotationIsPlatformOnly:
         endpoint is for."""
         paths = sorted(r.path for r in self._routes_requiring("radius.execute"))
         assert paths == [
+            # Rotating the shared Aruba listener's secret changes the
+            # credential of every venue on that listener: the same key, the
+            # same platform namespace, pinned GLOBAL.
+            "/api/v1/platform/radius/aruba-shared/rotate",
             "/api/v1/platform/radius/nas/{nas_id}/activate",
             "/api/v1/platform/radius/nas/{nas_id}/disable",
             "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret",

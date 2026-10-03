@@ -938,6 +938,53 @@ class PublicNasRegistrationResponse(BaseModel):
     portal_url: PublicPortalUrlView | None = None
 
 
+class ArubaSharedListenerView(BaseModel):
+    """The shared Aruba RADIUS listener, as one venue's setup panel needs it:
+    the alternative to registering the venue's public IP. Identity comes
+    from inside each packet (NAS-Identifier + AP MAC), so the venue's public
+    address may change freely.
+
+    Gap codes: ``listener_not_installed`` (no agent URL on this deployment),
+    ``shared_secret_not_set``, ``hub_not_confirmed``, ``nas_not_registered``,
+    ``no_ap_mac``, ``radius_server_address_not_configured``.
+    """
+
+    available: bool
+    radius_server: RadiusServerView | None = None
+    auth_port: int
+    accounting_port: int
+    nas_identifier: str
+    ap_mac: str | None = None
+    secret_configured: bool = False
+    secret_fingerprint: str | None = None
+    secret_length: int | None = None
+    secret_rotated_at: str | None = None
+    hub_confirmed: bool = False
+    gaps: list[str] = Field(default_factory=list)
+
+
+class ArubaSharedSecretStatusResponse(BaseModel):
+    """Platform-wide shared Aruba secret: never the secret itself."""
+
+    listener_installed: bool
+    secret_configured: bool
+    secret_fingerprint: str | None = None
+    secret_length: int | None = None
+    secret_rotated_at: str | None = None
+    hub_confirmed: bool = False
+    auth_port: int
+    accounting_port: int
+    radius_server: RadiusServerView | None = None
+
+
+class ArubaSharedSecretRotatedResponse(ArubaSharedSecretStatusResponse):
+    """The one response that carries the shared secret. It breaks every
+    venue on the shared listener until retyped in each Instant On site."""
+
+    shared_secret: str
+    device_action: str
+
+
 class PublicNasStatusResponse(BaseModel):
     """Everything the Master setup panel for a NAS-only device renders.
 
@@ -972,6 +1019,12 @@ class PublicNasStatusResponse(BaseModel):
     )
     portal_url: PublicPortalUrlView | None = None
     gaps: list[str] = Field(default_factory=list)
+    shared_listener: ArubaSharedListenerView | None = Field(
+        default=None,
+        description="The IP-independent alternative: the shared Aruba "
+        "listener (ports 1912/1913, one platform secret, NAS-Identifier + AP "
+        "MAC identify the venue). Null for a non-NAS-only device.",
+    )
 
 
 # The device half of a rotation, stated rather than implied.
