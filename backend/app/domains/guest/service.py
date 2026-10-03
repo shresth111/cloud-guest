@@ -292,6 +292,7 @@ from app.domains.router.vendor_capabilities import (
     is_controller_managed,
     is_nas_only,
 )
+from app.domains.voucher.constants import VoucherStatus
 from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
@@ -1459,6 +1460,8 @@ class VoucherRedeemProtocol(Protocol):
         self, plan_id: uuid.UUID
     ) -> uuid.UUID | None: ...
 
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None: ...
+
 
 class CaptivePortalLookupProtocol(Protocol):
     async def resolve_portal_config(
@@ -2542,8 +2545,9 @@ class NasOnlyAuthorizeStanding:
     ``refusal`` is a short machine reason (logged, never sent to the NAS)
     when the session must be refused, else ``None``.
     ``session_timeout_cap_seconds`` is the tightest of the guest's remaining
-    FUP time allowance and the time until the venue's Open Hours close, for
-    capping ``Session-Timeout``; ``None`` when neither applies."""
+    FUP time allowance, the time until the venue's Open Hours close and the
+    time until a redeemed voucher's own ``expires_at``, for capping
+    ``Session-Timeout``; ``None`` when none applies."""
 
     refusal: str | None
     session_timeout_cap_seconds: int | None
@@ -5862,12 +5866,14 @@ class GuestService:
           portal sign-in passes -- so the two can never disagree.
         * **Time limits can only cut a guest off through
           ``Session-Timeout``.** ``session_timeout_cap_seconds`` is the
-          smaller of the time left in the guest's FUP time allowance (the
-          daily limit) and the time until the venue's Open Hours close, for
-          the caller to cap ``Session-Timeout`` with. A venue that is closed
-          right now refuses, as the portal sign-in already does. Whether the
-          AP honours ``Session-Timeout`` is hardware check V1 in the Aruba
-          spec; sending the right number is the half this platform owns.
+          smallest of the time left in the guest's FUP time allowance (the
+          daily limit), the time until the venue's Open Hours close and the
+          time until a redeemed voucher expires, for the caller to cap
+          ``Session-Timeout`` with. A venue that is closed right now, or a
+          voucher that was revoked or has expired, refuses, as the portal
+          sign-in already does. The AP honours ``Session-Timeout`` (hardware
+          check V1, MEASURED 2026-10-03 on an AP21: Accounting-Stop with
+          Acct-Terminate-Cause=Session-Timeout at the time sent).
 
         ``minutes_used`` is accrued by a five-minutely sweep, so the
         remaining figure can be up to one sweep interval generous for a
@@ -5908,6 +5914,11 @@ class GuestService:
             return NasOnlyAuthorizeStanding(
                 refusal=None, session_timeout_cap_seconds=None
             )
+        voucher = await self._voucher_standing(session)
+        if isinstance(voucher, str):
+            return NasOnlyAuthorizeStanding(
+                refusal=voucher, session_timeout_cap_seconds=None
+            )
         open_hours = await self._open_hours_standing(session)
         if open_hours == "closed":
             return NasOnlyAuthorizeStanding(
@@ -5918,8 +5929,46 @@ class GuestService:
             session_timeout_cap_seconds=_min_present(
                 await self._fup_time_remaining_seconds(session),
                 open_hours,
+                voucher,
             ),
         )
+
+    async def _voucher_standing(self, session: GuestSession) -> int | str | None:
+        """For a voucher sign-in: a refusal reason when the voucher behind
+        ``session`` was revoked or its own ``expires_at`` has passed, else the
+        seconds until that ``expires_at``, else ``None`` (not a voucher
+        session, a voucher with no expiry, or a lookup that failed -- the
+        forgiving direction every other check here takes).
+
+        Needed because a session copies ``batch.validity_minutes`` from its
+        OWN start, while ``Voucher.expires_at`` is fixed at the voucher's
+        FIRST redemption. A multi-use voucher redeemed again an hour later
+        therefore got a session that outlived the voucher by an hour. At a
+        MikroTik or Omada venue nothing could see the difference either; at a
+        NAS-only venue ``Session-Timeout`` is the cut-off the AP obeys
+        (measured on the AP21, 2026-10-03), so it is capped here."""
+        if session.voucher_id is None or self.voucher_service is None:
+            return None
+        try:
+            voucher = await self.voucher_service.get_voucher_by_id(
+                session.voucher_id
+            )
+        except Exception as exc:  # noqa: BLE001 -- never raises, see caller
+            logger.warning(
+                "nas_only_authorize_voucher_lookup_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
+        if voucher is None:
+            return None
+        if voucher.status == VoucherStatus.REVOKED.value:
+            return "voucher_revoked"
+        if voucher.expires_at is None:
+            return None
+        remaining = (voucher.expires_at - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            return "voucher_expired"
+        return max(math.ceil(remaining), 1)
 
     async def _open_hours_standing(self, session: GuestSession) -> int | str | None:
         """``"closed"`` when this session's venue is outside its Open Hours
@@ -8485,6 +8534,23 @@ class RadiusService:
                 session = None
             else:
                 session_timeout_cap_seconds = standing.session_timeout_cap_seconds
+        # The one number the AP is told. Computed before the verdict so that
+        # "no time left" is a Reject and never an Accept carrying 0 or less:
+        # RFC 2865 gives Session-Timeout 0 no "end now" meaning, and a NAS
+        # that reads it as "no limit" would fail open on exactly the guest we
+        # mean to end. Every input is already floored at 1 s, so this guards
+        # a future input that is not, not a path that exists today.
+        session_timeout_seconds: int | None = None
+        if session is not None:
+            session_timeout_seconds = _min_present(
+                self._remaining_session_seconds(session), session_timeout_cap_seconds
+            )
+            if session_timeout_seconds is not None and session_timeout_seconds <= 0:
+                logger.info(
+                    "radius_authorize_no_time_left",
+                    extra={**decision_extra, "event_session_id": str(session.id)},
+                )
+                session = None
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -8530,12 +8596,14 @@ class RadiusService:
             # failing open on exactly the session we mean to end.
             #
             # At a NAS-only venue it is also capped by the guest's remaining
-            # FUP time allowance (the daily limit) and by the time until the
-            # venue's Open Hours close, because Session-Timeout is the one way
-            # either can reach a device there.
-            session_timeout_seconds=_min_present(
-                self._remaining_session_seconds(session), session_timeout_cap_seconds
-            ),
+            # FUP time allowance (the daily limit), by the time until the
+            # venue's Open Hours close and by the redeemed voucher's own
+            # expiry, because Session-Timeout is the one way any of them can
+            # reach a device there. MEASURED 2026-10-03 on an Aruba Instant On
+            # AP21: the AP ends the session at Session-Timeout
+            # (Acct-Terminate-Cause=Session-Timeout), so this is a guaranteed
+            # mid-session cut-off there, not a hint.
+            session_timeout_seconds=session_timeout_seconds,
             # The FULL configured idle allowance, every time -- see the
             # field's own comment for why this is deliberately not the
             # "remaining" treatment its neighbour above gets.
