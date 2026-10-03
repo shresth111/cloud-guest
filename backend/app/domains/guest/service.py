@@ -5784,6 +5784,32 @@ class GuestService:
             # sign-in (``_enforce_fup_quota``) and the next Access-Request
             # (``RadiusService.authorize`` -> ``nas_only_authorize_standing``)
             # are both refused. PM_SPEC (Aruba) §3.1 "BE requirement".
+            #
+            # Exception: Instant On cloud control (OFF by default, per-router
+            # allowlist) CAN take the device off through Instant On's cloud.
+            # It is tried FIRST and the row is expired only once Instant On
+            # confirmed the write -- never the other way round, which would
+            # be the fake-ended-session class again.
+            reason = (
+                "data_limit_exceeded"
+                if session_cap_reached
+                else f"fup_data_quota_exceeded_{violated_fup_period}"
+            )
+            if await self._end_nas_only_session_via_cloud(updated):
+                updated = await self.repository.update_session(
+                    updated,
+                    {
+                        "status": GuestSessionStatus.EXPIRED.value,
+                        "ended_at": now,
+                        "disconnect_reason": reason,
+                        "disconnect_enforced": True,
+                    },
+                )
+                logger.info(
+                    "guest_usage_cap_reached_nas_only_session_ended_via_cloud",
+                    extra={"session_id": str(updated.id), "reason": reason},
+                )
+                return updated
             logger.info(
                 "guest_usage_cap_reached_nas_only_session_left_active",
                 extra={
@@ -5827,6 +5853,29 @@ class GuestService:
 
     def check_quota_exceeded(self, session: GuestSession) -> bool:
         return is_quota_exceeded(session)
+
+    async def _end_nas_only_session_via_cloud(self, session: GuestSession) -> bool:
+        """Ask the session-end hook to take this NAS-only session off the
+        venue (Aruba Instant On cloud control). ``True`` only for a confirmed
+        removal; every other answer -- no hook, gate closed (the hook raises
+        ``NasOnlyLiveSessionUnreachableError``), Instant On failed -- is
+        ``False`` and the caller keeps the session ACTIVE as before."""
+        hook = self.session_end_hook
+        if hook is None:
+            return False
+        guest = await self.repository.get_guest_by_id(session.guest_id)
+        if guest is None:
+            return False
+        try:
+            outcome = await hook.end_on_router(
+                session=session,
+                identifier=guest.identifier,
+                organization_id=session.organization_id,
+            )
+        except Exception:  # noqa: BLE001 -- "could not" is the old behaviour
+            return False
+        removed = _removals_reported(outcome)
+        return removed is not None and removed >= 1
 
     async def _session_is_on_nas_only_router(self, session: GuestSession) -> bool:
         """Whether ``session`` runs on a NAS-only access point. Asked only
