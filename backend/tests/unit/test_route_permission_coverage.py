@@ -239,6 +239,14 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ),
     ("POST", "/api/v1/radius/authorize"): "FreeRADIUS -- CurrentNas shared secret.",
     ("POST", "/api/v1/radius/accounting"): "FreeRADIUS -- CurrentNas shared secret.",
+    ("POST", "/api/v1/radius/aruba-shared/authorize"): (
+        "FreeRADIUS shared Aruba listener -- platform Aruba shared secret, then "
+        "NAS-Identifier + AP MAC bound to one aruba_instant_on NAS "
+        "(resolve_shared_nas)."
+    ),
+    ("POST", "/api/v1/radius/aruba-shared/accounting"): (
+        "FreeRADIUS shared Aruba listener -- same resolver as its authorize."
+    ),
     ("POST", "/api/v1/router-enrollment"): (
         "First-contact device enrollment -- no credential exists yet; "
         "nothing happens to real state until an RBAC-gated admin "
