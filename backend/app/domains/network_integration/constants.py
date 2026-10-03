@@ -108,6 +108,7 @@ __all__ = [
     "TASK_RUN_OMADA_USAGE_SYNC_SWEEP",
     "INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_INSTANT_ON_POLL_SWEEP",
+    "TASK_INSTANT_ON_RELEASE_TRANSIENT_BLOCK",
 ]
 
 
@@ -972,6 +973,12 @@ TASK_RUN_INSTANT_ON_POLL_SWEEP = (
     "app.domains.network_integration.instant_on_tasks.run_instant_on_poll_sweep"
 )
 INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS = 60.0
+
+# Timed unblock after an Instant On "disconnect" (block + hold + unblock).
+# See ``app.domains.network_integration.instant_on_control``.
+TASK_INSTANT_ON_RELEASE_TRANSIENT_BLOCK = (
+    "app.domains.network_integration.instant_on_control.release_transient_block_task"
+)
 
 # ============================================================================
 # Portal authorize rate limiting

@@ -280,6 +280,7 @@ celery_app = Celery(
         "app.domains.network_integration.tasks",
         "app.domains.network_integration.usage_tasks",
         "app.domains.network_integration.instant_on_tasks",
+        "app.domains.network_integration.instant_on_control",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",

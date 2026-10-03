@@ -476,13 +476,22 @@ def build_controller_device_blocker(session: AsyncSession):
             resolves nothing, decrypts nothing, calls nothing, and the
             caller stops here.
             """
-            return (
+            if (
                 await _resolve(
                     session,
                     location_id=location_id,
                     organization_id=organization_id,
                 )
                 is not None
+            ):
+                return True
+            # Aruba Instant On: no controller integration row, but Instant
+            # On's cloud can block a device -- only when cloud control is
+            # switched on for this venue (``instant_on_control``'s gates).
+            from .instant_on_control import instant_on_control_present
+
+            return await instant_on_control_present(
+                session, location_id=location_id, organization_id=organization_id
             )
 
         @staticmethod
@@ -492,6 +501,15 @@ def build_controller_device_blocker(session: AsyncSession):
             organization_id: uuid.UUID | None,
             client_mac: str,
         ) -> ControllerBlockOutcome:
+            instant_on = await _instant_on_device_action(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="block",
+            )
+            if instant_on is not None:
+                return instant_on
             return await _client_block_action(
                 session,
                 location_id=location_id,
@@ -507,7 +525,13 @@ def build_controller_device_blocker(session: AsyncSession):
             organization_id: uuid.UUID | None,
             client_mac: str,
         ) -> ControllerReleaseOutcome:
-            outcome = await _client_block_action(
+            outcome = await _instant_on_device_action(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="unblock",
+            ) or await _client_block_action(
                 session,
                 location_id=location_id,
                 organization_id=organization_id,
@@ -531,6 +555,51 @@ def build_controller_device_blocker(session: AsyncSession):
             )
 
     return _DeviceBlocker()
+
+
+async def _instant_on_device_action(
+    session: AsyncSession,
+    *,
+    location_id: uuid.UUID,
+    organization_id: uuid.UUID | None,
+    client_mac: str,
+    action: str,
+) -> ControllerBlockOutcome | None:
+    """Instant On's half of a device block/unblock, or ``None`` when this
+    venue has no Instant On cloud control (the caller then takes the Omada
+    path exactly as before). Only consulted when no Omada controller
+    resolves for the location, so an Omada venue never reaches Instant On."""
+    if (
+        await _resolve(
+            session, location_id=location_id, organization_id=organization_id
+        )
+        is not None
+    ):
+        return None
+    from .instant_on_control import (
+        instant_on_block_device,
+        instant_on_release_device,
+    )
+
+    call = instant_on_block_device if action == "block" else instant_on_release_device
+    outcome = await call(
+        session,
+        location_id=location_id,
+        organization_id=organization_id,
+        client_mac=client_mac,
+    )
+    if outcome.status == "unavailable":
+        return None
+    return ControllerBlockOutcome(
+        location_id=location_id,
+        mac_address=client_mac,
+        status=(
+            BlockEnforcementStatus.ENFORCED.value
+            if outcome.status == "enforced"
+            else BlockEnforcementStatus.FAILED.value
+        ),
+        error_message=outcome.error_message,
+    )
 
 
 async def _client_block_action(
@@ -758,7 +827,29 @@ def build_controller_session_terminator(session: AsyncSession):
             return
         await _release_rate_limit(session, resolved, client_mac=normalized)
 
+    async def end_nas_only(
+        *,
+        router_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+    ) -> bool:
+        """End a session on a NAS-only access point (Aruba Instant On)
+        through Instant On's cloud, when cloud control is switched on for
+        that router. ``False`` (never raises) means "could not" -- and is
+        what every gate closed answers, so the default is the old NAS-only
+        behaviour. Hung on the function for the reason
+        ``release_rate_limit`` is."""
+        from .instant_on_control import end_nas_only_session
+
+        return await end_nas_only_session(
+            session,
+            router_id=router_id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+        )
+
     terminate.release_rate_limit = release_rate_limit  # type: ignore[attr-defined]
+    terminate.end_nas_only = end_nas_only  # type: ignore[attr-defined]
     return terminate
 
 

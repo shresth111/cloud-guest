@@ -193,3 +193,36 @@ class InstantOnAccountSitesResponse(BaseModel):
     unavailable_reason: str | None = None
     message: str | None = None
     sites: list[InstantOnAccountSite] | None = None
+
+
+class InstantOnGuestRateLimitRequest(BaseModel):
+    """Master: the guest SSID's per-client cap on Instant On. Integer Mbps
+    (Instant On's own unit, 1..1000); both ``None`` clears the cap.
+    ``dry_run`` defaults to True: nothing is written unless asked.
+    ``extra="forbid"`` so a misspelt field is a 422, never a silently
+    ignored no-op (the credential-shape lesson)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    network_id: str = Field(min_length=1, max_length=128)
+    download_mbps: int | None = Field(default=None, ge=1, le=1000)
+    upload_mbps: int | None = Field(default=None, ge=1, le=1000)
+    dry_run: bool = True
+
+
+class InstantOnGuestRateLimitState(BaseModel):
+    network_id: str
+    network_name: str | None = None
+    enabled: bool
+    download_mbps: int | None = None
+    upload_mbps: int | None = None
+
+
+class InstantOnGuestRateLimitResponse(BaseModel):
+    source: Literal["instant_on"] = "instant_on"
+    status: Literal["preview", "applied", "unavailable", "failed"]
+    reason: str | None = None
+    message: str | None = None
+    before: InstantOnGuestRateLimitState | None = None
+    requested: InstantOnGuestRateLimitState | None = None
+    after: InstantOnGuestRateLimitState | None = None
