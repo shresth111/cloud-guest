@@ -56,6 +56,26 @@ SHARED_SECRET = os.environ.get("RADIUS_AGENT_SECRET", "")
 # the wg0 tunnel (10.20.0.1), which the NSG cannot see at all.
 BIND_ADDR = os.environ.get("AGENT_BIND_ADDR", "0.0.0.0")
 CLIENTS_CONF = "/etc/freeradius/3.0/clients.conf"
+
+# The ONE platform-wide client list of the shared Aruba Instant On listener
+# (UDP 1912/1913, `server wyfy_aruba_shared`, see
+# backend/ops/freeradius/sites-aruba-shared.conf). That listener matches every
+# source address; the venue is identified from inside the packet
+# (NAS-Identifier + the AP MAC in Called-Station-Id) by the backend, never by
+# address. This file holds only its catch-all client{} entries and their one
+# shared secret, and it is included ONLY by that server's per-listener
+# `clients` section -- never by clients.conf, so the default 1812/1813
+# listeners are unaffected by anything written here.
+#
+# The file must already exist: it is created (with an unguessable placeholder
+# secret nobody knows) by whoever installed the listener. Its absence means
+# this hub has no shared listener, and a write is refused rather than
+# reported as a success that changed nothing FreeRADIUS reads.
+SHARED_CLIENTS_CONF = os.environ.get(
+    "ARUBA_SHARED_CLIENTS_CONF", "/etc/freeradius/3.0/wyfy-aruba-shared-clients.conf"
+)
+SHARED_SHORTNAME = "wyfy-aruba-shared"
+_SHARED_SECRET_RE = re.compile(r"^[A-Za-z0-9]{24,64}$")
 BACKUP_DIR = "/root/freeradius-backups"
 
 # ONE WRITER AT A TIME.
@@ -202,7 +222,7 @@ def _strip_clients_with_shortname(
     return "\n".join(kept), removed_text
 
 
-def _validate_and_restart(backup_path: str) -> None:
+def _validate_and_restart(backup_path: str, target: str | None = None) -> None:
     """Parse-check, then restart. Any failure restores ``backup_path`` and
     raises -- never returns a "succeeded" that didn't.
 
@@ -211,11 +231,12 @@ def _validate_and_restart(backup_path: str) -> None:
     problems, and a config that fails to parse takes authentication down
     for the entire fleet, not just the router being changed.
     """
+    target = target or CLIENTS_CONF
     check = subprocess.run(
         ["freeradius", "-CX"], capture_output=True, text=True, timeout=30
     )
     if check.returncode != 0 or "Configuration appears to be OK" not in check.stdout:
-        shutil.copy2(backup_path, CLIENTS_CONF)
+        shutil.copy2(backup_path, target)
         raise RuntimeError(
             "config validation failed, reverted: " + check.stdout[-2000:]
         )
@@ -227,17 +248,20 @@ def _validate_and_restart(backup_path: str) -> None:
         timeout=30,
     )
     if restart.returncode != 0:
-        shutil.copy2(backup_path, CLIENTS_CONF)
+        shutil.copy2(backup_path, target)
         subprocess.run(["systemctl", "restart", "freeradius"], timeout=30)
         raise RuntimeError(
             "service restart failed, reverted: " + restart.stderr[-2000:]
         )
 
 
-def _backup() -> str:
+def _backup(target: str | None = None) -> str:
+    target = target or CLIENTS_CONF
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    backup_path = os.path.join(BACKUP_DIR, f"clients.conf.bak-{int(time.time())}")
-    shutil.copy2(CLIENTS_CONF, backup_path)
+    backup_path = os.path.join(
+        BACKUP_DIR, f"{os.path.basename(target)}.bak-{int(time.time())}"
+    )
+    shutil.copy2(target, backup_path)
     return backup_path
 
 
@@ -393,6 +417,64 @@ def _remove_client_locked(nas_identifier: str) -> dict:
     return {"status": "ok", "removed": len(removed)}
 
 
+class SharedListenerNotInstalled(Exception):
+    """This hub has no shared Aruba listener (``SHARED_CLIENTS_CONF`` is
+    absent). Answered 409, never 200."""
+
+
+def shared_fingerprint(secret: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(secret.encode()).hexdigest()[:12]
+
+
+def set_shared_secret(secret: str) -> dict:
+    """Replace the shared Aruba listener's secret: rewrite its catch-all
+    client list (IPv4 + IPv6), parse-check, restart. Returns the new secret's
+    ``sha256[:12]`` so the caller can confirm what landed without the secret
+    ever being echoed. Same revert-on-any-failure contract as ``add_client``.
+    """
+    if not isinstance(secret, str) or not _SHARED_SECRET_RE.match(secret):
+        raise ValueError("secret must be 24-64 ASCII letters/digits")
+    with _WRITE_LOCK:
+        if not os.path.isfile(SHARED_CLIENTS_CONF):
+            raise SharedListenerNotInstalled(
+                f"{SHARED_CLIENTS_CONF} does not exist: this RADIUS server has "
+                "no shared Aruba listener installed"
+            )
+        body = (
+            "# Written by radius_agent.py (set_shared_secret). The shared Aruba\n"
+            "# Instant On listener's ONLY clients: any source address, one secret.\n"
+            "# Venue identity is checked by the backend from inside each packet.\n"
+        )
+        for label, key, network in (
+            ("wyfy-aruba-shared-v4", "ipaddr", "0.0.0.0/0"),
+            ("wyfy-aruba-shared-v6", "ipv6addr", "::/0"),
+        ):
+            body += (
+                f"client {label} {{\n"
+                f"\t{key} = {network}\n"
+                f"\tsecret = {secret}\n"
+                f"\tshortname = {SHARED_SHORTNAME}\n"
+                f"\tbackend_secret = {secret}\n"
+                f"\trequire_message_authenticator = yes\n"
+                f"\tnas_type = other\n"
+                f"}}\n"
+            )
+        with open(SHARED_CLIENTS_CONF) as f:
+            if f.read() == body:
+                return {
+                    "status": "ok",
+                    "fingerprint": shared_fingerprint(secret),
+                    "unchanged": True,
+                }
+        backup_path = _backup(SHARED_CLIENTS_CONF)
+        with open(SHARED_CLIENTS_CONF, "w") as f:
+            f.write(body)
+        _validate_and_restart(backup_path, SHARED_CLIENTS_CONF)
+        return {"status": "ok", "fingerprint": shared_fingerprint(secret)}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, status: int, obj: dict) -> None:
         body = json.dumps(obj).encode()
@@ -405,7 +487,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _authed_payload(self) -> dict | None:
         """Shared auth + body parse. Returns ``None`` (having already
         written the error response) if the request must not proceed."""
-        if self.path != "/radius/client":
+        if self.path not in ("/radius/client", "/radius/shared-client"):
             self.send_response(404)
             self.end_headers()
             return None
@@ -419,6 +501,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             payload = self._authed_payload()
             if payload is None:
+                return
+            if self.path == "/radius/shared-client":
+                try:
+                    self._json(200, set_shared_secret(payload.get("secret")))
+                except SharedListenerNotInstalled as exc:
+                    self._json(409, {"error": str(exc)})
                 return
             # `address` is the current spelling, `tunnel_ip` the one every
             # deployed backend before 2026-09-12 sends. Accepting both is
@@ -449,6 +537,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             payload = self._authed_payload()
             if payload is None:
+                return
+            if self.path != "/radius/client":
+                # The shared listener's secret is rotated, never deleted:
+                # deleting it would leave the listener with no client list.
+                self._json(405, {"error": "use POST to rotate"})
                 return
             nas_identifier = payload.get("nas_identifier")
             if not nas_identifier:
