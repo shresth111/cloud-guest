@@ -216,6 +216,15 @@ class InstantOnGuestRateLimitState(BaseModel):
     enabled: bool
     download_mbps: int | None = None
     upload_mbps: int | None = None
+    is_guest: bool | None = None
+
+
+class InstantOnGuestNetworksResponse(BaseModel):
+    source: Literal["instant_on"] = "instant_on"
+    status: Literal["ok", "unavailable", "failed"]
+    reason: str | None = None
+    message: str | None = None
+    networks: list[InstantOnGuestRateLimitState] | None = None
 
 
 class InstantOnGuestRateLimitResponse(BaseModel):

@@ -657,3 +657,41 @@ class TestDataCapWithCloudControl:
         assert hook.calls == 1
         assert session.status == GuestSessionStatus.ACTIVE.value
         assert session.ended_at is None
+
+
+class TestListGuestNetworks:
+    async def test_lists_each_guest_ssid_with_its_cap_and_writes_nothing(self) -> None:
+        site = FakeSite()
+        staff = {
+            "id": "net-2",
+            "networkName": "STAFF",
+            "type": "employee",
+            "isGuestPortalEnabled": False,
+            "qos": {"isBandwidthLimitEnabled": False},
+        }
+        fast = json.loads(json.dumps(site.network))
+        fast.update({"id": "net-3", "networkName": "GUEST_FAST", "type": "guest"})
+        fast["qos"].update(
+            {
+                "isBandwidthLimitEnabled": True,
+                "isDownloadBandwidthLimitEnabled": True,
+                "perClientDownloadBandwidthLimitInMbps": 50,
+            }
+        )
+        original = site.handler
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/networksSummary"):
+                site.requests.append(request)
+                return httpx.Response(
+                    200, json={"elements": [site.network, staff, fast]}
+                )
+            return original(request)
+
+        site.handler = handler  # type: ignore[method-assign]
+        limits = await _client(site).list_guest_network_rate_limits(SITE)
+        assert [(n.network_id, n.enabled, n.download_mbps) for n in limits] == [
+            (NET, False, None),
+            ("net-3", True, 50),
+        ]
+        assert site.writes() == []

@@ -148,6 +148,8 @@ class GuestNetworkRateLimit:
     enabled: bool
     download_mbps: int | None
     upload_mbps: int | None
+    #: ``type == "guest"`` or the guest portal is on for it (measured fields).
+    is_guest: bool = False
 
     @classmethod
     def from_network(cls, network: dict[str, Any]) -> GuestNetworkRateLimit:
@@ -170,6 +172,9 @@ class GuestNetworkRateLimit:
             enabled=enabled and per_client and (down is not None or up is not None),
             download_mbps=down if isinstance(down, int) else None,
             upload_mbps=up if isinstance(up, int) else None,
+            is_guest=bool(
+                network.get("type") == "guest" or network.get("isGuestPortalEnabled")
+            ),
         )
 
 
@@ -248,6 +253,20 @@ class InstantOnControlClient:
         raise InstantOnNetworkNotFoundError(
             "That network is not on this Instant On site", reason="network_not_found"
         )
+
+    async def list_guest_network_rate_limits(
+        self, site_id: str, *, guest_only: bool = True
+    ) -> list[GuestNetworkRateLimit]:
+        """Every wireless network on the site with its current per-client
+        cap -- the read half for speed tiers by SSID (one cap per network;
+        a venue can run several guest SSIDs at different caps). Read-only."""
+        payload = await self._call("GET", site_id, "networksSummary")
+        limits = [
+            GuestNetworkRateLimit.from_network(row)
+            for row in _elements(payload, "networksSummary")
+            if row.get("isWireless", True) is not False
+        ]
+        return [n for n in limits if n.is_guest] if guest_only else limits
 
     async def get_guest_network_rate_limit(
         self, site_id: str, network_id: str

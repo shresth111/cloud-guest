@@ -58,6 +58,7 @@ from .instant_on_schemas import (
     InstantOnClientItem,
     InstantOnClientUsageItem,
     InstantOnCustomerView,
+    InstantOnGuestNetworksResponse,
     InstantOnGuestRateLimitRequest,
     InstantOnGuestRateLimitResponse,
     InstantOnGuestRateLimitState,
@@ -433,6 +434,77 @@ async def set_instant_on_guest_rate_limit(
     return build_response(
         success=True,
         message="Instant On guest speed limit",
+        data=body.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@instant_on_platform_router.get(
+    "/routers/{router_id}/guest-networks",
+    response_model=ApiResponse[InstantOnGuestNetworksResponse],
+    dependencies=[Depends(_PLATFORM_READ)],
+)
+async def list_instant_on_guest_networks(
+    router_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Master: the venue's guest SSIDs with their current per-client caps,
+    read live through the write account (cloud control must be enabled for
+    this router). Read-only; feeds the speed-tiers-by-SSID screen."""
+    import httpx
+
+    from .instant_on_control import build_live_control_client, resolve_control_target
+    from .instant_on_repository import InstantOnRepository
+    from .providers.aruba_instant_on_client import InstantOnError
+
+    settings = get_settings()
+    site = await InstantOnRepository(db).get_site_for_router(router_id)
+    target = (
+        await resolve_control_target(
+            db,
+            organization_id=site.organization_id,
+            router_id=router_id,
+            settings=settings,
+        )
+        if site is not None
+        else None
+    )
+    if target is None:
+        body = InstantOnGuestNetworksResponse(
+            status="unavailable", reason="cloud_control_not_enabled"
+        )
+    else:
+        async with httpx.AsyncClient(
+            timeout=settings.instant_on_http_timeout_seconds
+        ) as http:
+            client = build_live_control_client(
+                http, settings, secret_arn=target.secret_arn
+            )
+            try:
+                limits = await client.list_guest_network_rate_limits(target.site_id)
+            except InstantOnError as error:
+                body = InstantOnGuestNetworksResponse(
+                    status="failed", reason=error.code, message=str(error)
+                )
+            else:
+                body = InstantOnGuestNetworksResponse(
+                    status="ok",
+                    networks=[
+                        InstantOnGuestRateLimitState(
+                            network_id=n.network_id,
+                            network_name=n.network_name,
+                            enabled=n.enabled,
+                            download_mbps=n.download_mbps,
+                            upload_mbps=n.upload_mbps,
+                            is_guest=n.is_guest,
+                        )
+                        for n in limits
+                    ],
+                )
+    return build_response(
+        success=True,
+        message="Instant On guest networks",
         data=body.model_dump(mode="json"),
         request_id=_request_id(request),
     )
