@@ -8321,6 +8321,44 @@ class RadiusService:
             "event_router_id": str(router.id),
             "event_calling_station_id": calling_station_id,
         }
+        # NAS-only access point (Aruba Instant On): bind the Accept to the
+        # DEVICE, not only to the person. Instant On's login POST
+        # (swarm.cgi / cgi-bin/login) carries user + password, the password
+        # is ignored (session lookup by User-Name), and the AP accepts that
+        # POST from any client on the guest SSID. Without this check a
+        # second device -- one the portal refused under "Devices per user",
+        # or simply anyone who knows an online guest's phone number -- could
+        # POST the identifier itself and be admitted on the first device's
+        # session, with no OTP. The portal is the only place a device is
+        # admitted (``_enforce_device_limit``); this makes the RADIUS reply
+        # agree with it: the calling MAC must own an ACTIVE session of this
+        # guest on this router (that session, not merely the latest one, is
+        # then the one whose remaining time goes into Session-Timeout).
+        #
+        # Only when the session already knows its device: a login that
+        # carried no MAC is adopted above, exactly as before. A packet with
+        # no parseable Calling-Station-Id is not second-guessed (nothing to
+        # compare). MikroTik and Omada never enter this block.
+        if (
+            session is not None
+            and session.device_id is not None
+            and canonical_mac_key(calling_station_id) is not None
+            and is_nas_only(router)
+        ):
+            by_device = await self._session_for_calling_station(
+                guest_id=session.guest_id,
+                organization_id=router.organization_id,
+                router_id=router.id,
+                calling_station_id=calling_station_id,
+            )
+            if by_device is None or not by_device.is_active():
+                logger.info(
+                    "radius_authorize_device_not_signed_in",
+                    extra={**decision_extra, "event_session_id": str(session.id)},
+                )
+                session = None
+            else:
+                session = by_device
         # A session that has already spent its wall-clock allowance is not
         # an authorization, however ACTIVE its row still says it is. This
         # is the hop that makes a venue's "30 min" actually mean the guest
