@@ -394,9 +394,7 @@ class SqlLearnedAddressStore:
         )
         return list(result.scalars().all())
 
-    async def learned_by_other_router(
-        self, address: str, router_id: uuid.UUID
-    ) -> bool:
+    async def learned_by_other_router(self, address: str, router_id: uuid.UUID) -> bool:
         result = await self.session.execute(
             select(func.count())
             .select_from(RadiusNasLearnedAddress)

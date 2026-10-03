@@ -271,6 +271,7 @@ celery_app = Celery(
         "app.domains.dhcp.tasks",
         "app.domains.dns_filtering.tasks",
         "app.domains.guest.tasks",
+        "app.domains.guest.nas_egress_tasks",
         "app.domains.guest_access.tasks",
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
@@ -453,6 +454,13 @@ celery_app.conf.update(
         "monitoring-health-check-sweep": {
             "task": TASK_RUN_HEALTH_CHECK_SWEEP,
             "schedule": HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+        },
+        # Auto-learned NAS egress addresses (Aruba Instant On): drop the ones
+        # unseen for nas_egress_ttl_days and re-push only the NAS whose set
+        # changed. No-op unless CLOUDGUEST_NAS_EGRESS_LEARNING_ENABLED.
+        "guest-nas-egress-prune": {
+            "task": "guest.nas_egress.prune_learned_addresses",
+            "schedule": crontab(hour=2, minute=20),
         },
         "hub-reconciliation-sweep": {
             "task": TASK_RUN_HUB_RECONCILIATION_SWEEP,
