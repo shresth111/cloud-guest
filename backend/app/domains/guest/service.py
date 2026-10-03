@@ -273,6 +273,7 @@ from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
 from app.domains.policy.constants import PolicyType
+from app.domains.policy.schemas import BandwidthPolicyRules
 from app.domains.queue_management.constants import QueueTargetType
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
@@ -2514,6 +2515,24 @@ class RadiusAuthorizeResult:
     # or None when no queue_lookup hook is wired or the session has no
     # queue assignment -- see RadiusService.__init__'s own docstring.
     rate_limit: str | None = None
+    # WISPr-Bandwidth-Max-Down / -Up (WISPr vendor 14122, attributes 8 and
+    # 7, bits per second). Only ever set for a NAS-only router (Aruba Instant
+    # On) named in ``Settings.radius_bandwidth_attribute_router_ids`` -- an
+    # experiment gate while a hardware measurement decides whether Instant On
+    # honours them at all (no Aruba document says it does). ``None`` means
+    # "send no attribute", which is every other router's reply, unchanged.
+    bandwidth_max_down_bps: int | None = None
+    bandwidth_max_up_bps: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NasOnlyBandwidthRates:
+    """``GuestService.nas_only_bandwidth_rates``'s answer, in kbps (the
+    ``BandwidthPolicyRules`` unit). ``None`` on a direction means "no limit
+    configured for it", never zero."""
+
+    download_kbps: int | None
+    upload_kbps: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5930,6 +5949,49 @@ class GuestService:
             enabled=enabled, timezone=timezone, schedule=schedule
         )
 
+    async def nas_only_bandwidth_rates(
+        self, session: GuestSession
+    ) -> NasOnlyBandwidthRates | None:
+        """The guest's entitled speed at a NAS-only venue, resolved exactly
+        the way ``QueueManagementService.resolve_and_assign_queue`` resolves
+        it for a MikroTik/Omada session: the effective ``PolicyType.BANDWIDTH``
+        policy for the session's organization and location, with a Group
+        Policies "Map users" assignment for this guest taking precedence
+        (``guest_id``). A NAS-only venue never gets a ``QueueAssignment``
+        (``_queue_device_target`` returns ``None`` there -- there is no
+        device-side write), so the queue tables cannot be read for it; the
+        policy is the same source those tables are built from.
+
+        ``None`` when no policy applies, when both rates are 0 (this
+        codebase's "unlimited" convention -- see
+        ``get_rate_limit_reply_for_session``), when no ``policy_lookup`` is
+        wired, or when the lookup fails. Never raises: a policy-table outage
+        must not turn a valid Accept into a Reject, the same rule
+        ``_resolve_rate_limit_reply`` follows."""
+        if self.policy_lookup is None:
+            return None
+        try:
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.BANDWIDTH,
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+                guest_id=session.guest_id,
+            )
+            if not resolved.rules:
+                return None
+            rules = BandwidthPolicyRules.model_validate(resolved.rules)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "nas_only_bandwidth_policy_lookup_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
+        download = rules.download_rate_kbps or None
+        upload = rules.upload_rate_kbps or None
+        if download is None and upload is None:
+            return None
+        return NasOnlyBandwidthRates(download_kbps=download, upload_kbps=upload)
+
     async def _fup_time_remaining_seconds(self, session: GuestSession) -> int | None:
         """Seconds left of the guest's tightest FUP *time* allowance at this
         session's location, or ``None`` when no time limit is configured (or
@@ -7557,6 +7619,7 @@ class RadiusService:
         audit_writer: AuditLogWriter | None = None,
         queue_lookup: QueueRateLimitLookupProtocol | None = None,
         caller_location_scope: LocationScope = None,
+        bandwidth_attribute_router_ids: frozenset[uuid.UUID] = frozenset(),
     ) -> None:
         self.repository = repository
         self.guest_service = guest_service
@@ -7565,6 +7628,10 @@ class RadiusService:
         self.nas_code_counter_repository = nas_code_counter_repository
         self.audit_writer = audit_writer
         self.queue_lookup = queue_lookup
+        # Experiment gate -- see ``Settings.radius_bandwidth_attribute_router_ids``.
+        # Empty by default, so a RadiusService built anywhere without it
+        # (every existing test, every other caller) sends no WISPr attribute.
+        self.bandwidth_attribute_router_ids = bandwidth_attribute_router_ids
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
 
@@ -8395,6 +8462,7 @@ class RadiusService:
                 idle_timeout_seconds=None,
                 data_limit_mb=None,
             )
+        bandwidth = await self._nas_only_bandwidth_attributes(router, session)
         logger.info(
             "radius_authorize_decision",
             extra={
@@ -8449,7 +8517,52 @@ class RadiusService:
                 if is_nas_only(router)
                 else await self._resolve_rate_limit_reply(session.id)
             ),
+            bandwidth_max_down_bps=bandwidth[0],
+            bandwidth_max_up_bps=bandwidth[1],
         )
+
+    async def _nas_only_bandwidth_attributes(
+        self, router: Router, session: GuestSession
+    ) -> tuple[int | None, int | None]:
+        """``(WISPr-Bandwidth-Max-Down, WISPr-Bandwidth-Max-Up)`` in bits per
+        second for this Accept, or ``(None, None)`` to send neither.
+
+        Both are ``None`` unless ``router`` is NAS-only **and** named in the
+        experiment gate (``bandwidth_attribute_router_ids``). That keeps
+        every MikroTik and Omada reply byte-identical whatever the gate
+        holds, and keeps an un-gated Aruba venue exactly as PR #339 left it.
+
+        Why WISPr and not ``Aruba-User-Role``: a role names a bandwidth
+        contract the AP must already hold, and Instant On exposes no way for
+        this platform to create one. WISPr attributes carry the rate itself.
+        Whether Instant On honours them is UNMEASURED (Aruba's documented
+        Instant attribute list does not include them); this method only
+        makes the measurement possible. The customer control stays greyed
+        until it passes.
+
+        Units: ``BandwidthPolicyRules`` is in kbps (1 kbps = 1000 bit/s, the
+        convention ``format_mikrotik_rate_limit``'s ``k`` suffix uses too).
+        WISPr is bits per second. Never raises (see
+        ``GuestService.nas_only_bandwidth_rates``)."""
+        if router.id not in self.bandwidth_attribute_router_ids or not is_nas_only(
+            router
+        ):
+            return None, None
+        rates = await self.guest_service.nas_only_bandwidth_rates(session)
+        if rates is None:
+            return None, None
+        down = rates.download_kbps * 1000 if rates.download_kbps else None
+        up = rates.upload_kbps * 1000 if rates.upload_kbps else None
+        logger.info(
+            "radius_authorize_bandwidth_attributes",
+            extra={
+                "event_router_id": str(router.id),
+                "event_session_id": str(session.id),
+                "event_wispr_bandwidth_max_down_bps": down,
+                "event_wispr_bandwidth_max_up_bps": up,
+            },
+        )
+        return down, up
 
     @staticmethod
     def _remaining_session_seconds(session: GuestSession) -> int | None:
