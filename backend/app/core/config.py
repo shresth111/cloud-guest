@@ -408,6 +408,17 @@ class Settings(BaseSettings):
             "and fail-closed rules."
         ),
     )
+    instant_on_ssid_tier_push_enabled: bool = Field(
+        default=False,
+        description=(
+            "Speed tiers by WiFi network: allow POST /locations/{id}/ssid-tiers"
+            "/instant-on-sync (Master only) to write each mapped SSID's "
+            "per-client speed cap to Aruba Instant On through the cloud-control "
+            "client. OFF by default; the cloud-control gates "
+            "(CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_*) must ALSO be on for the "
+            "venue. While off, the endpoint returns the manual Instant On steps."
+        ),
+    )
     radius_bandwidth_attribute_router_ids: str = Field(
         default="",
         description=(

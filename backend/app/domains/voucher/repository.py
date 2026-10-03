@@ -127,6 +127,8 @@ class VoucherRepositoryProtocol(Protocol):
 
     async def get_voucher_by_code(self, code: str) -> Voucher | None: ...
 
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None: ...
+
     async def find_existing_codes(self, codes: Sequence[str]) -> list[str]: ...
 
     async def redeem_voucher_conditionally(
@@ -309,6 +311,9 @@ class VoucherRepository:
     async def get_voucher_by_code(self, code: str) -> Voucher | None:
         results = await self.vouchers.get_all(filters={"code": code}, limit=1)
         return results[0] if results else None
+
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None:
+        return await self.vouchers.get_by_id(voucher_id)
 
     async def find_existing_codes(self, codes: Sequence[str]) -> list[str]:
         if not codes:

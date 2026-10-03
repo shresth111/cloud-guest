@@ -297,6 +297,12 @@ class FakeVoucherService:
     async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
         return self.plan_queue_profiles.get(plan_id)
 
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None:
+        for voucher, _batch in self.vouchers.values():
+            if voucher.id == voucher_id:
+                return voucher
+        return None
+
 
 @dataclass
 class FakeCaptivePortalService:
