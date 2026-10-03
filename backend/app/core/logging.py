@@ -92,7 +92,13 @@ def configure_logging(settings: Settings) -> None:
     logging.getLogger("uvicorn.access").handlers.clear()
     logging.getLogger("uvicorn.error").propagate = True
 
+    # httpx logs every outbound request's full URL at INFO. Providers that
+    # take credentials in the query string (Ping4SMS: ``key=``) and the OTP
+    # text itself (``sms=``) therefore landed in plain text in the container
+    # and file logs on every guest OTP. Warnings and errors still come through.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(max(log_level, logging.WARNING))
+
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
-
