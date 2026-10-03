@@ -69,6 +69,7 @@ from .repository import (
     RadiusNasCodeCounterRepository,
 )
 from .service import GuestAnalyticsService, GuestService, RadiusService
+from .ssid_tier_service import SsidTierRepository, SsidTierService
 
 
 def get_guest_repository(
@@ -243,6 +244,18 @@ def get_nas_code_counter_repository(
     return RadiusNasCodeCounterRepository(db)
 
 
+def get_ssid_tier_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> SsidTierRepository:
+    return SsidTierRepository(session)
+
+
+def get_ssid_tier_service(
+    repository: SsidTierRepository = Depends(get_ssid_tier_repository),
+) -> SsidTierService:
+    return SsidTierService(repository)
+
+
 def get_radius_service(
     repository: GuestRepositoryProtocol = Depends(get_guest_repository),
     guest_service: GuestService = Depends(get_guest_service),
@@ -257,6 +270,7 @@ def get_radius_service(
     ),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
     db: AsyncSession = Depends(get_db_session),
+    ssid_tier_repository: SsidTierRepository = Depends(get_ssid_tier_repository),
 ) -> RadiusService:
     """Queue Management Engine addition: wires ``QueueManagementService`` in
     as ``RadiusService``'s optional ``queue_lookup`` hook -- the one
@@ -279,6 +293,7 @@ def get_radius_service(
         bandwidth_attribute_router_ids=(
             get_settings().radius_bandwidth_attribute_router_id_set
         ),
+        ssid_tier_lookup=ssid_tier_repository,
     )
 
 
