@@ -44,7 +44,10 @@ from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
 
 from .constants import (
+    TASK_APPLY_ARUBA_HYBRID_QUEUE,
     TASK_REAPPLY_POLICY_ASSIGNMENTS,
+    TASK_RECONCILE_ARUBA_HYBRID_QUEUES,
+    TASK_RELEASE_ARUBA_HYBRID_QUEUE,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from .repository import QueueManagementRepository
@@ -248,4 +251,185 @@ def sweep_schedule_transitions() -> dict[str, int]:
     return result
 
 
-__all__ = ["sweep_schedule_transitions", "reapply_policy_assignments"]
+# ============================================================================
+# Aruba AP + MikroTik gateway hybrid (see speed_gateway.py)
+# ============================================================================
+
+
+def _build_speed_gateway_service(session):  # noqa: ANN001, ANN202
+    """``SpeedGatewayService`` over the same hand-built ``QueueManagementService``
+    graph the two tasks above compose (controller hook included, so the
+    composition does not drift from the FastAPI dependency's)."""
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
+    from .speed_gateway import SpeedGatewayRepository, SpeedGatewayService
+
+    settings = get_settings()
+    audit_repository = RBACRepository(session)
+    organization_service = OrganizationService(
+        OrganizationRepository(session), audit_writer=audit_repository
+    )
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+        audit_writer=audit_repository,
+    )
+    router_service = RouterService(
+        RouterRepository(session),
+        location_service,
+        organization_service,
+        audit_writer=audit_repository,
+        provisioning_token_ttl_hours=settings.router_provisioning_token_expire_hours,
+    )
+    policy_service = PolicyService(
+        PolicyRepository(session),
+        organization_service,
+        location_service,
+        audit_writer=audit_repository,
+    )
+    queue_service = QueueManagementService(
+        QueueManagementRepository(session),
+        router_service,
+        policy_service,
+        audit_writer=audit_repository,
+        controller_speed_hook=build_controller_speed_hook(session),
+    )
+    return SpeedGatewayService(
+        SpeedGatewayRepository(session),
+        router_service,
+        queue_service=queue_service,
+        enabled=settings.aruba_hybrid_speed_gateway_enabled,
+    )
+
+
+async def _run_hybrid(work) -> dict[str, object]:  # noqa: ANN001
+    async with SessionLocal() as session:
+        try:
+            service = _build_speed_gateway_service(session)
+            result = await work(service)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+    return result.as_dict() if hasattr(result, "as_dict") else result
+
+
+@celery_app.task(name=TASK_APPLY_ARUBA_HYBRID_QUEUE)
+def apply_aruba_hybrid_queue(
+    *,
+    session_id: str,
+    nas_router_id: str,
+    framed_ip: str | None = None,
+    verify: bool = False,
+) -> dict[str, object]:
+    """Put this guest's per-device queue on the venue's gateway MikroTik.
+    Never retried here: the next Interim-Update (~5 min) re-runs it, and a
+    failure must not pile retries onto an unreachable router."""
+    try:
+        result = run_celery_task(
+            _run_hybrid(
+                lambda service: service.apply_for_session(
+                    session_id=uuid.UUID(session_id),
+                    nas_router_id=uuid.UUID(nas_router_id),
+                    framed_ip=framed_ip,
+                    verify=verify,
+                )
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- logged; next interim retries
+        logger.warning(
+            "aruba_hybrid_apply_failed",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return {"action": "failed", "reason": str(exc)}
+    return result
+
+
+@celery_app.task(name=TASK_RELEASE_ARUBA_HYBRID_QUEUE)
+def release_aruba_hybrid_queue(*, session_id: str) -> dict[str, object]:
+    """Take an ended guest's queue off the gateway (Accounting-Stop). A
+    failure leaves the assignment ACTIVE for the reconcile sweep."""
+    try:
+        return run_celery_task(
+            _run_hybrid(
+                lambda service: service.release_for_session(
+                    session_id=uuid.UUID(session_id)
+                )
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- the sweep retries
+        logger.warning(
+            "aruba_hybrid_release_failed",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return {"action": "failed", "reason": str(exc)}
+
+
+@celery_app.task(name=TASK_RECONCILE_ARUBA_HYBRID_QUEUES)
+def reconcile_aruba_hybrid_queues() -> dict[str, object]:
+    """Beat: release gateway queues whose session has ended and whose AP-side
+    cut-off has passed. Does nothing unless
+    CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED is true."""
+    if not get_settings().aruba_hybrid_speed_gateway_enabled:
+        return {"checked": 0, "released": 0, "failed": 0, "kept": 0}
+    result = run_celery_task(_run_hybrid(lambda service: service.reconcile()))
+    logger.info("aruba_hybrid_reconcile_completed", extra=result)
+    return result
+
+
+async def enqueue_aruba_hybrid_apply(
+    *,
+    session_id: uuid.UUID,
+    nas_router_id: uuid.UUID,
+    framed_ip: str | None,
+    verify: bool,
+) -> None:
+    """Publish from the RADIUS request path without blocking the event loop.
+    Never raises (an accounting packet must never fail on a broker hiccup)."""
+    from asyncio import to_thread  # noqa: PLC0415
+
+    def _publish() -> None:
+        apply_aruba_hybrid_queue.delay(
+            session_id=str(session_id),
+            nas_router_id=str(nas_router_id),
+            framed_ip=framed_ip,
+            verify=verify,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "aruba_hybrid_apply_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+async def enqueue_aruba_hybrid_release(*, session_id: uuid.UUID) -> None:
+    """See ``enqueue_aruba_hybrid_apply``."""
+    from asyncio import to_thread  # noqa: PLC0415
+
+    def _publish() -> None:
+        release_aruba_hybrid_queue.delay(session_id=str(session_id))
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "aruba_hybrid_release_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+__all__ = [
+    "sweep_schedule_transitions",
+    "reapply_policy_assignments",
+    "apply_aruba_hybrid_queue",
+    "release_aruba_hybrid_queue",
+    "reconcile_aruba_hybrid_queues",
+    "enqueue_aruba_hybrid_apply",
+    "enqueue_aruba_hybrid_release",
+]

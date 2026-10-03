@@ -215,7 +215,9 @@ from app.domains.provisioning_engine.constants import (
     TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
 )
 from app.domains.queue_management.constants import (
+    ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS,
     SCHEDULE_SWEEP_INTERVAL_SECONDS,
+    TASK_RECONCILE_ARUBA_HYBRID_QUEUES,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from app.domains.router.constants import (
@@ -926,6 +928,15 @@ celery_app.conf.update(
         "guest-access-device-block-release-sweep": {
             "task": TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP,
             "schedule": DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+        },
+        # Aruba AP + MikroTik gateway hybrid: removes a per-guest gateway
+        # queue once its session has ended and the AP's own Session-Timeout
+        # has certainly fired, and retries a Stop-time removal that could not
+        # reach the gateway. Returns immediately unless
+        # CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED is true.
+        "aruba-hybrid-queue-reconcile-sweep": {
+            "task": TASK_RECONCILE_ARUBA_HYBRID_QUEUES,
+            "schedule": ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS,
         },
     },
 )

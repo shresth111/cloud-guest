@@ -441,6 +441,22 @@ class Settings(BaseSettings):
         ),
     )
 
+    aruba_hybrid_speed_gateway_enabled: bool = Field(
+        default=False,
+        description=(
+            "Aruba AP + MikroTik gateway hybrid: when true, a guest "
+            "authorized by a NAS-only access point (Aruba Instant On) at a "
+            "location whose Master-linked speed gateway is a Wyfy-managed "
+            "MikroTik gets a per-guest /queue simple on that MikroTik, keyed "
+            "on the guest's IP (RADIUS Framed-IP-Address, else the portal's "
+            "recorded IP), and loses it again when the session ends. False "
+            "(the default) means no queue is written or removed anywhere, "
+            "whatever links exist. MikroTik-only and Omada venues are never "
+            "touched by it. See app.domains.queue_management.speed_gateway. "
+            "Override via CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED."
+        ),
+    )
+
     @field_validator("radius_bandwidth_attribute_router_ids")
     @classmethod
     def _normalize_radius_bandwidth_attribute_router_ids(cls, value: str) -> str:

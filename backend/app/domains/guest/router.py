@@ -3518,7 +3518,70 @@ async def radius_aruba_shared_accounting(
         return RadiusAccountingResponse(
             session_id=None, status=payload.status_type, closed_session_count=0
         )
-    return await _radius_accounting(payload, nas_client, service)
+    response = await _radius_accounting(payload, nas_client, service)
+    await _dispatch_aruba_hybrid_speed(payload, nas_client, response, service)
+    return response
+
+
+async def _dispatch_aruba_hybrid_speed(
+    payload: RadiusAccountingRequest,
+    nas_client,  # noqa: ANN001 -- RadiusNasClient
+    response: RadiusAccountingResponse,
+    service: RadiusService,
+) -> None:
+    """The Aruba AP + MikroTik gateway hybrid's two triggers. See
+    ``app.domains.queue_management.speed_gateway``.
+
+    Start / Interim-Update -> put (or keep) the guest's queue on the venue's
+    gateway MikroTik, keyed on ``Framed-IP-Address``. Stop -> take it off.
+    Both are handed to the worker: a router connect never sits on the RADIUS
+    path. Only reachable from this shared Aruba listener, so MikroTik and
+    Omada accounting never get here; does nothing at all unless
+    ``CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED`` is true and this access
+    point has a linked gateway. Never raises: accounting has already been
+    recorded, and the AP must get its Accounting-Response."""
+    if not get_settings().aruba_hybrid_speed_gateway_enabled:
+        return
+    if not response.session_id:
+        return
+    try:
+        from app.domains.queue_management.speed_gateway import (
+            SpeedGatewayRepository,
+        )
+        from app.domains.queue_management.tasks import (
+            enqueue_aruba_hybrid_apply,
+            enqueue_aruba_hybrid_release,
+        )
+
+        if payload.status_type not in (
+            RADIUS_ACCT_STATUS_START,
+            RADIUS_ACCT_STATUS_INTERIM_UPDATE,
+            RADIUS_ACCT_STATUS_STOP,
+        ):
+            return
+        db = getattr(getattr(service, "repository", None), "session", None)
+        if db is None:
+            return
+        link = await SpeedGatewayRepository(db).get_for_nas_router(
+            nas_client.router_id
+        )
+        if link is None:
+            return
+        session_id = uuid.UUID(str(response.session_id))
+        if payload.status_type == RADIUS_ACCT_STATUS_STOP:
+            await enqueue_aruba_hybrid_release(session_id=session_id)
+            return
+        await enqueue_aruba_hybrid_apply(
+            session_id=session_id,
+            nas_router_id=nas_client.router_id,
+            framed_ip=payload.framed_ip_address,
+            verify=payload.status_type == RADIUS_ACCT_STATUS_START,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "aruba_hybrid_dispatch_failed",
+            extra={"session_id": str(response.session_id), "error": str(exc)},
+        )
 
 
 # ============================================================================

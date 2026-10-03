@@ -229,6 +229,20 @@ TASK_REAPPLY_POLICY_ASSIGNMENTS = (
 # schedule.
 SCHEDULE_SWEEP_INTERVAL_SECONDS = 300.0
 
+# Aruba AP + MikroTik gateway hybrid (see ``speed_gateway.py``). Apply and
+# release are enqueued from the shared Aruba RADIUS accounting endpoint; the
+# reconcile sweep is the retry and the cleanup for every other session end.
+TASK_APPLY_ARUBA_HYBRID_QUEUE = (
+    "app.domains.queue_management.tasks.apply_aruba_hybrid_queue"
+)
+TASK_RELEASE_ARUBA_HYBRID_QUEUE = (
+    "app.domains.queue_management.tasks.release_aruba_hybrid_queue"
+)
+TASK_RECONCILE_ARUBA_HYBRID_QUEUES = (
+    "app.domains.queue_management.tasks.reconcile_aruba_hybrid_queues"
+)
+ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS = 120.0
+
 
 __all__ = [
     "QueueType",
@@ -247,4 +261,8 @@ __all__ = [
     "TASK_SWEEP_SCHEDULE_TRANSITIONS",
     "TASK_REAPPLY_POLICY_ASSIGNMENTS",
     "SCHEDULE_SWEEP_INTERVAL_SECONDS",
+    "TASK_APPLY_ARUBA_HYBRID_QUEUE",
+    "TASK_RELEASE_ARUBA_HYBRID_QUEUE",
+    "TASK_RECONCILE_ARUBA_HYBRID_QUEUES",
+    "ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS",
 ]
