@@ -507,6 +507,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json(200, set_shared_secret(payload.get("secret")))
                 except SharedListenerNotInstalled as exc:
                     self._json(409, {"error": str(exc)})
+                except ValueError as exc:
+                    # A malformed secret is the caller's mistake: 400, so the
+                    # backend reports it at once instead of retrying a 500.
+                    self._json(400, {"error": str(exc)})
                 return
             # `address` is the current spelling, `tunnel_ip` the one every
             # deployed backend before 2026-09-12 sends. Accepting both is
