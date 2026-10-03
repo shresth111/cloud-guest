@@ -387,6 +387,29 @@ class Settings(BaseSettings):
             "and fail-closed rules."
         ),
     )
+    hub_radius_radsec_agent_url: str = Field(
+        default="",
+        description=(
+            "Absolute URL of the RadSec enrolment endpoint of the hub's "
+            "radius agent (ops/hub-agents/radius_agent.py "
+            "`/radius/radsec-client`, same process and X-Agent-Secret as "
+            "hub_radius_agent_url). Empty = this platform has no RadSec "
+            "listener, and register-radsec refuses with 503 instead of "
+            "writing a row nothing serves. Separate explicit field, not "
+            "derived from hub_radius_agent_url (see hub_wg_peers_url). "
+            "Override via CLOUDGUEST_HUB_RADIUS_RADSEC_AGENT_URL."
+        ),
+    )
+    hub_radius_radsec_address: str = Field(
+        default="",
+        description=(
+            "The DNS name a venue's access point must use as its RadSec "
+            "(RADIUS over TLS, TCP 2083) server: the name on the listener's "
+            "publicly-trusted certificate, because an Instant On AP cannot be "
+            "given a private CA. Empty = not configured (a gap on the Master "
+            "setup panel). Override via CLOUDGUEST_HUB_RADIUS_RADSEC_ADDRESS."
+        ),
+    )
     # ------------------------------------------------------------------
     # WHAT THE DEPLOYED HUB AGENT CAN ACTUALLY DO.
     #

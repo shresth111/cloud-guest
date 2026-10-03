@@ -7709,6 +7709,63 @@ class RadiusService:
         )
         return updated
 
+    async def record_radsec_sync(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        cert_common_name: str,
+        cert_issuer: str,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> RadiusNasClient:
+        """Records that the hub CONFIRMED a RadSec enrolment for this NAS
+        under (``cert_common_name``, ``cert_issuer``) -- the RadSec twin of
+        ``record_hub_client_sync``, called only after the agent's 2xx.
+
+        The row stops being address-keyed: ``ip_address`` and
+        ``hub_client_synced_ip`` are cleared, because a RadSec venue's source
+        address is exactly the thing that is not stable (that is why it is on
+        RadSec), and a stale address left here would read as a binding the
+        hub no longer has. ``hub_client_synced_at`` still timestamps the
+        confirmation."""
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        updated = await self.repository.update_nas_client(
+            nas_client,
+            {
+                "transport": "radsec",
+                "radsec_cert_cn": cert_common_name,
+                "radsec_cert_issuer": cert_issuer,
+                "ip_address": None,
+                "hub_client_synced_ip": None,
+                "hub_client_synced_at": datetime.now(UTC),
+            },
+        )
+        logger.info(
+            "radius_nas_radsec_synced",
+            extra={
+                "nas_identifier": updated.nas_identifier,
+                "radsec_cert_cn": cert_common_name,
+            },
+        )
+        return updated
+
+    async def clear_radsec_identity(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> RadiusNasClient:
+        """Back to an address-keyed (UDP) NAS: forget the certificate. The
+        caller has already revoked the hub enrolment and pushed the stanza."""
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        return await self.repository.update_nas_client(
+            nas_client,
+            {"transport": "udp", "radsec_cert_cn": None, "radsec_cert_issuer": None},
+        )
+
     async def activate_nas(
         self,
         *,

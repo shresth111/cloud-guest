@@ -98,12 +98,18 @@ from .nas_number_generator import (
 from .radius_bridge import (
     RadiusBridgePushError,
     RadiusClientAddressRejected,
+    RadsecIdentityRejected,
+    RadsecNotConfiguredError,
     push_controller_nas_client,
     push_nas_client,
+    push_radsec_nas_client,
+    remove_radsec_nas_client,
     validate_controller_nas_address,
+    validate_radsec_identity,
 )
 from .schemas import (
     NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY,
+    NAS_SECRET_ROTATION_DEVICE_ACTION_RADSEC,
     DashboardOsCountResponse,
     DashboardSeriesPointResponse,
     GuestAnalyticsSummaryResponse,
@@ -139,6 +145,9 @@ from .schemas import (
     PublicNasRegistrationRequest,
     PublicNasRegistrationResponse,
     PublicNasStatusResponse,
+    RadsecNasRegistrationRequest,
+    RadsecNasRegistrationResponse,
+    RadsecServerView,
     PublicPortalUrlView,
     RadiusAccountingRequest,
     RadiusAccountingResponse,
@@ -2357,6 +2366,15 @@ def _radius_server_view() -> RadiusServerView | None:
     return RadiusServerView(host=address) if address else None
 
 
+def _radsec_server_view() -> RadsecServerView | None:
+    address = get_settings().hub_radius_radsec_address.strip()
+    return RadsecServerView(host=address) if address else None
+
+
+def _is_radsec(nas_client) -> bool:  # noqa: ANN001
+    return getattr(nas_client, "transport", "udp") == "radsec"
+
+
 async def _nas_only_router(service: RadiusService, router_id: uuid.UUID):  # noqa: ANN202
     """The fleet row, refused unless its vendor is NAS-only."""
     from app.domains.router.vendor_capabilities import is_nas_only
@@ -2410,19 +2428,31 @@ async def get_public_radius_nas_status(
     secret_length: int | None = None
     hub_confirmed = False
     nas_ip: str | None = None
+    radsec = nas_client is not None and _is_radsec(nas_client)
     if nas_client is None:
         gaps.append("nas_not_registered")
     else:
         fingerprint, secret_length = service.shared_secret_fingerprint(nas_client)
         nas_ip = nas_client.ip_address
-        hub_confirmed = (
-            nas_client.hub_client_synced_ip is not None
-            and nas_client.hub_client_synced_ip == nas_client.ip_address
-        )
+        if radsec:
+            # Certificate-keyed: confirmed = the agent acknowledged the
+            # enrolment (record_radsec_sync), there is no address to compare.
+            hub_confirmed = bool(
+                nas_client.hub_client_synced_at and nas_client.radsec_cert_cn
+            )
+        else:
+            hub_confirmed = (
+                nas_client.hub_client_synced_ip is not None
+                and nas_client.hub_client_synced_ip == nas_client.ip_address
+            )
         if not hub_confirmed:
             gaps.append("hub_not_confirmed")
     radius_server = _radius_server_view()
-    if radius_server is None:
+    radsec_server = _radsec_server_view() if radsec else None
+    if radsec:
+        if radsec_server is None:
+            gaps.append("radsec_server_address_not_configured")
+    elif radius_server is None:
         gaps.append("radius_server_address_not_configured")
 
     payload = PublicNasStatusResponse(
@@ -2439,7 +2469,11 @@ async def get_public_radius_nas_status(
         secret_fingerprint=fingerprint,
         secret_length=secret_length,
         hub_confirmed=hub_confirmed,
-        radius_server=radius_server,
+        radius_server=None if radsec else radius_server,
+        transport="radsec" if radsec else "udp",
+        radsec_cert_cn=nas_client.radsec_cert_cn if radsec else None,
+        radsec_cert_issuer=nas_client.radsec_cert_issuer if radsec else None,
+        radsec_server=radsec_server if radsec else None,
         allowed_domains=_nas_only_allowed_domains(),
         portal_url=None if gaps else _nas_only_portal_url(router),
         gaps=gaps,
@@ -2580,6 +2614,20 @@ async def register_public_radius_nas(
         tunnel_ip_address=nas_ip,
         requesting_organization_id=None,
     )
+    if _is_radsec(nas_client):
+        # Moving a RadSec venue back to UDP (it got a static IP): the
+        # certificate enrolment carries the OLD backend secret, which the
+        # rotation above just replaced -- revoke it rather than leave a
+        # second, stale credential on the hub.
+        try:
+            await remove_radsec_nas_client(nas_identifier=nas_client.nas_identifier)
+        except RadsecNotConfiguredError:
+            pass
+        except RadiusBridgePushError as exc:
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        nas_client = await service.clear_radsec_identity(
+            nas_id=nas_client.id, requesting_organization_id=None
+        )
     return build_response(
         success=True,
         message=(
@@ -2598,6 +2646,140 @@ async def register_public_radius_nas(
             secret_length=len(shared_secret),
             hub_confirmed=nas_client.hub_client_synced_ip == nas_ip,
             rotated=rotated,
+            portal_url=_nas_only_portal_url(router),
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.post(
+    "/register-radsec/{router_id}",
+    response_model=ApiResponse[RadsecNasRegistrationResponse],
+    status_code=status.HTTP_201_CREATED,
+    # GLOBAL, pinned, for the same reason as register-public: it puts a live
+    # credential on the hub that admits a venue's RADIUS traffic.
+    dependencies=[
+        Depends(RequirePermission("radius.create", scope=ScopeType.GLOBAL))
+    ],
+)
+async def register_radsec_radius_nas(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: RadsecNasRegistrationRequest,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+):
+    """Register a **NAS-only** device over **RadSec** (RADIUS over TLS, TCP
+    2083), identified by its TLS client certificate -- the path for a venue
+    with no static public IP (CGNAT, dynamic address), where
+    ``register-public`` cannot work because the hub picks a UDP client by
+    source address.
+
+    What it does: mints a fresh 32-char backend secret, creates the NAS row
+    (or rotates an existing one, UDP or RadSec), asks the hub agent to enrol
+    (``cert_common_name``, ``cert_issuer``) -> (``nas_identifier``, secret),
+    and records what the hub confirmed. If the row was address-keyed, its UDP
+    stanza is removed (the device must be switched to RadSec anyway; leaving
+    the stanza would leave a live secret at an address the venue may no
+    longer hold).
+
+    What it does NOT do: it returns no secret. Over RadSec the device's
+    RADIUS secret is the fixed string ``radsec`` (RFC 6614); the minted one is
+    only ever compared by ``CurrentNas``. And it does not make the device's
+    certificate trusted: the hub's RadSec listener must already trust the CA
+    that issued it (``trust.pem``), which is an infrastructure change, not an
+    API call.
+    """
+    router = await _nas_only_router(service, router_id)
+    try:
+        cn, issuer = validate_radsec_identity(
+            payload.cert_common_name, payload.cert_issuer
+        )
+    except RadsecIdentityRejected as exc:
+        raise PublicNasRegistrationRefusedError(str(exc)) from exc
+    if not get_settings().hub_radius_radsec_agent_url:
+        raise HTTPException(
+            status_code=503,
+            detail="RadSec is not configured on this platform "
+            "(hub_radius_radsec_agent_url is empty).",
+        )
+
+    new_secret = generate_alphanumeric_shared_secret()
+    existing, _meta = await service.list_nas_clients(
+        requesting_organization_id=None, router_id=router_id, page=1, page_size=1
+    )
+    rotated = bool(existing)
+
+    async def _push(nas_identifier: str, secret: str) -> None:
+        await push_radsec_nas_client(
+            nas_identifier=nas_identifier,
+            secret=secret,
+            cert_common_name=cn,
+            cert_issuer=issuer,
+        )
+
+    try:
+        if existing:
+            old = existing[0]
+            nas_identifier = old.nas_identifier
+
+            async def _push_rotated(secret: str) -> None:
+                await _push(nas_identifier, secret)
+
+            # PUSH FIRST, THEN WRITE -- as register-public.
+            result = await service.regenerate_secret(
+                nas_id=old.id,
+                requesting_organization_id=None,
+                actor_user_id=uuid.UUID(user.id),
+                push_secret=_push_rotated,
+                new_secret=new_secret,
+            )
+            nas_client = result.nas_client
+            if not _is_radsec(old) and old.ip_address:
+                # UDP -> RadSec: revoke the address-keyed stanza.
+                await _deregister_nas_from_radius_bridge(nas_identifier)
+        else:
+            registration = await service.register_nas(
+                actor_user_id=uuid.UUID(user.id),
+                router_id=router_id,
+                nas_identifier=f"cg-aruba-{str(router_id)[:8]}",
+                shared_secret=new_secret,
+                name=f"{router.name} (Aruba Instant On, RadSec)",
+                ip_address=None,
+                requesting_organization_id=None,
+            )
+            nas_client = registration.nas_client
+            await _push(nas_client.nas_identifier, registration.shared_secret)
+    except RadsecNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail="RadSec is not configured") from exc
+    except RadiusBridgePushError as exc:
+        # As register-public: the row may exist without a confirmed hub
+        # enrolment -- visible as `hub_not_confirmed`, converges on retry.
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+
+    nas_client = await service.record_radsec_sync(
+        nas_id=nas_client.id,
+        cert_common_name=cn,
+        cert_issuer=issuer,
+        requesting_organization_id=None,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "RADIUS NAS client re-registered over RadSec"
+            if rotated
+            else "RADIUS NAS client registered over RadSec"
+        ),
+        data=RadsecNasRegistrationResponse(
+            router_id=str(router.id),
+            nas_id=str(nas_client.id),
+            vendor=str(router.vendor),
+            nas_identifier=nas_client.nas_identifier,
+            cert_common_name=cn,
+            cert_issuer=issuer,
+            hub_confirmed=True,
+            rotated=rotated,
+            radsec_server=_radsec_server_view(),
             portal_url=_nas_only_portal_url(router),
         ).model_dump(),
         request_id=_request_id(request),
@@ -2667,6 +2849,51 @@ async def regenerate_radius_nas_secret(
     nas_router = await service.router_lookup.get_router(
         nas_client.router_id, include_deleted=True
     )
+    if is_nas_only(nas_router) and _is_radsec(nas_client):
+        # RadSec: the secret is backend-only (the device uses "radsec"), so
+        # this rotation needs no device action at all. Same push-first rule.
+        async def _push_radsec(secret: str) -> None:
+            await push_radsec_nas_client(
+                nas_identifier=nas_client.nas_identifier,
+                secret=secret,
+                cert_common_name=nas_client.radsec_cert_cn or "",
+                cert_issuer=nas_client.radsec_cert_issuer or "",
+            )
+
+        try:
+            rotated = await service.regenerate_secret(
+                nas_id=nas_id,
+                requesting_organization_id=None,
+                actor_user_id=uuid.UUID(user.id),
+                push_secret=_push_radsec,
+                new_secret=generate_alphanumeric_shared_secret(),
+            )
+        except RadsecIdentityRejected as exc:
+            raise PublicNasRegistrationRefusedError(str(exc)) from exc
+        except RadsecNotConfiguredError as exc:
+            raise HTTPException(status_code=503, detail="RadSec is not configured") from exc
+        except RadiusBridgePushError as exc:
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        synced_radsec = await service.record_radsec_sync(
+            nas_id=rotated.nas_client.id,
+            cert_common_name=nas_client.radsec_cert_cn or "",
+            cert_issuer=nas_client.radsec_cert_issuer or "",
+            requesting_organization_id=None,
+        )
+        return build_response(
+            success=True,
+            message=(
+                "RadSec NAS backend secret rotated and pushed to the RadSec "
+                "listener -- nothing to change on the access point"
+            ),
+            data=RadiusNasSecretRotatedResponse(
+                **_nas_response(synced_radsec).model_dump(),
+                shared_secret=rotated.shared_secret,
+                device_action_required=False,
+                device_action=NAS_SECRET_ROTATION_DEVICE_ACTION_RADSEC,
+            ).model_dump(),
+            request_id=_request_id(request),
+        )
     if is_nas_only(nas_router):
         public_ip = nas_client.hub_client_synced_ip or nas_client.ip_address
         if not public_ip:
