@@ -30,7 +30,9 @@ class OrganizationRepositoryProtocol(Protocol):
         self, organization_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Organization | None: ...
 
-    async def get_by_slug(self, slug: str) -> Organization | None: ...
+    async def get_by_slug(
+        self, slug: str, *, include_deleted: bool = False
+    ) -> Organization | None: ...
 
     async def create_organization(self, **fields: object) -> Organization: ...
 
@@ -105,8 +107,12 @@ class OrganizationRepository:
             organization_id, include_deleted=include_deleted
         )
 
-    async def get_by_slug(self, slug: str) -> Organization | None:
-        results = await self.organizations.get_all(filters={"slug": slug}, limit=1)
+    async def get_by_slug(
+        self, slug: str, *, include_deleted: bool = False
+    ) -> Organization | None:
+        results = await self.organizations.get_all(
+            filters={"slug": slug}, limit=1, include_deleted=include_deleted
+        )
         return results[0] if results else None
 
     async def create_organization(self, **fields: object) -> Organization:
