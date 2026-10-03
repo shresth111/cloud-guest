@@ -938,6 +938,17 @@ class PublicNasRegistrationResponse(BaseModel):
     portal_url: PublicPortalUrlView | None = None
 
 
+class LearnedNasAddressView(BaseModel):
+    """One auto-learned egress address, as the Master setup panel shows it."""
+
+    ip_address: str
+    source: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    hit_count: int
+    hub_confirmed: bool
+
+
 class PublicNasStatusResponse(BaseModel):
     """Everything the Master setup panel for a NAS-only device renders.
 
@@ -972,6 +983,36 @@ class PublicNasStatusResponse(BaseModel):
     )
     portal_url: PublicPortalUrlView | None = None
     gaps: list[str] = Field(default_factory=list)
+    egress_learning_enabled: bool = Field(
+        default=False,
+        description="Whether this deployment auto-learns the venue's public "
+        "egress addresses from guest portal traffic "
+        "(CLOUDGUEST_NAS_EGRESS_LEARNING_ENABLED).",
+    )
+    learned_addresses: list[LearnedNasAddressView] = Field(
+        default_factory=list,
+        description="Addresses auto-learned for this NAS, each an additional "
+        "client{} stanza on the hub beside nas_ip. Most recently seen first.",
+    )
+
+
+class NasEgressHintRequest(BaseModel):
+    """What the guest portal sends once per page load at an Aruba Instant On
+    venue. ``router_id`` comes from the portal URL we configured on the AP;
+    ``ap_mac`` and ``nas_id`` are the AP-appended ``apmac`` / ``nas-id``.
+    Nothing here identifies the guest."""
+
+    router_id: uuid.UUID
+    nas_id: str | None = Field(default=None, max_length=255)
+    ap_mac: str | None = Field(default=None, max_length=64)
+    net_provider: str | None = Field(default=None, max_length=64)
+
+
+class NasEgressHintResponse(BaseModel):
+    """Always ``accepted: true``: an unauthenticated caller learns nothing
+    about whether a router, a NAS or an address exists."""
+
+    accepted: bool = True
 
 
 # The device half of a rotation, stated rather than implied.

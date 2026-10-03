@@ -379,6 +379,59 @@ class Settings(BaseSettings):
             "Override via CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS."
         ),
     )
+    # ------------------------------------------------------------------
+    # NAS-only egress auto-learn (Aruba Instant On on a dynamic public IP).
+    # See app.domains.guest.nas_egress for the design and the security
+    # argument. Off by default: it writes client{} stanzas to the hub, so a
+    # deployment opts in explicitly (staging first).
+    # ------------------------------------------------------------------
+    nas_egress_learning_enabled: bool = Field(
+        default=False,
+        description=(
+            "Learn a NAS-only venue's current public egress IP from its "
+            "guests' portal traffic and add it to the hub as an ADDITIONAL "
+            "client{} stanza (same secret, same shortname). Override via "
+            "CLOUDGUEST_NAS_EGRESS_LEARNING_ENABLED."
+        ),
+    )
+    nas_egress_ttl_days: int = Field(
+        default=14,
+        ge=1,
+        description=(
+            "A learned address unseen for this many days is removed from "
+            "the hub. The most recently seen learned address is never "
+            "removed by age, and the operator-registered address never is."
+        ),
+    )
+    nas_egress_max_addresses: int = Field(
+        default=6,
+        ge=1,
+        le=16,
+        description=(
+            "Most learned addresses one NAS may hold at once (the hub agent "
+            "refuses more than 16). At the cap, the least recently seen one "
+            "is evicted to make room."
+        ),
+    )
+    nas_egress_max_new_per_hour: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Most NEW learned addresses one NAS may gain per rolling hour. "
+            "Each one restarts FreeRADIUS on the hub, so this is also a "
+            "bound on how often a spoofed portal request can do that."
+        ),
+    )
+    trusted_proxy_cidrs: str = Field(
+        default="127.0.0.1/32,::1/128,172.16.0.0/12",
+        description=(
+            "Comma-separated peers whose X-Real-IP header is believed when "
+            "learning a venue's egress address: the host nginx, which "
+            "reaches the api container through the Docker bridge gateway "
+            "(172.18.0.1 on staging, measured 2026-10-03). nginx sets "
+            "X-Real-IP to $remote_addr, overwriting anything a client sent."
+        ),
+    )
     hub_radius_agent_secret: str = Field(
         default="",
         description=(
