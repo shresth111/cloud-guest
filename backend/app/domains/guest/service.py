@@ -7669,9 +7669,13 @@ class RadiusService:
         queue_lookup: QueueRateLimitLookupProtocol | None = None,
         caller_location_scope: LocationScope = None,
         bandwidth_attribute_router_ids: frozenset[uuid.UUID] = frozenset(),
+        ssid_tier_lookup: Any = None,
     ) -> None:
         self.repository = repository
         self.guest_service = guest_service
+        # Speed tiers by WiFi network (``app.domains.guest.ssid_tiers``).
+        # ``None`` -- every existing construction -- means no SSID gate at all.
+        self.ssid_tier_lookup = ssid_tier_lookup
         self.router_lookup = router_lookup
         self.location_lookup = location_lookup
         self.nas_code_counter_repository = nas_code_counter_repository
@@ -8302,12 +8306,76 @@ class RadiusService:
             location_id=nas_client.location_id,
         )
 
+    async def _ssid_tier_allows(
+        self,
+        router: Any,
+        session: GuestSession,
+        called_station_id: str,
+        decision_extra: dict[str, object],
+    ) -> bool:
+        """The SSID gate of ``authorize``. True = no objection. Any lookup
+        failure is logged and treated as no objection: a broken tier table
+        must not lock every guest of a venue out (the same posture
+        ``_resolve_rate_limit_reply`` takes)."""
+        from .ssid_tiers import (
+            NO_ENTITLEMENT,
+            SsidDecisionReason,
+            decide_ssid_access,
+            find_rule,
+            ssid_from_called_station_id,
+        )
+
+        ssid = ssid_from_called_station_id(called_station_id)
+        try:
+            rules = await self.ssid_tier_lookup.rules_for_location(
+                organization_id=router.organization_id,
+                location_id=router.location_id,
+            )
+            if not rules:
+                return True
+            rule = find_rule(rules, ssid)
+            entitlement = NO_ENTITLEMENT
+            if rule is not None and rule.requires_entitlement:
+                entitlement = await self.ssid_tier_lookup.entitlement_for(
+                    guest_id=session.guest_id,
+                    organization_id=router.organization_id,
+                    location_id=router.location_id,
+                )
+        except Exception as exc:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                "radius_authorize_ssid_tier_lookup_failed",
+                extra={**decision_extra, "error": str(exc)},
+            )
+            return True
+        decision = decide_ssid_access(rules, ssid, entitlement)
+        if decision.reason == SsidDecisionReason.NO_SSID:
+            logger.warning(
+                "radius_authorize_ssid_unknown",
+                extra={
+                    **decision_extra,
+                    "event_called_station_id": called_station_id[:80],
+                },
+            )
+        if not decision.allowed:
+            logger.info(
+                "radius_authorize_ssid_not_entitled",
+                extra={
+                    **decision_extra,
+                    "event_session_id": str(session.id),
+                    "event_ssid": ssid,
+                    "event_tier": decision.rule.tier_name if decision.rule else None,
+                    "event_refusal": "ssid_requires_voucher_or_tier",
+                },
+            )
+        return decision.allowed
+
     async def authorize(
         self,
         *,
         nas_client: RadiusNasClient,
         username: str,
         calling_station_id: str | None = None,
+        called_station_id: str | None = None,
     ) -> RadiusAuthorizeResult:
         """Authorize phase: is ``username`` (the guest's identifier) a
         currently-``ACTIVE`` guest session on a router bound to this NAS?
@@ -8534,6 +8602,22 @@ class RadiusService:
                 session = None
             else:
                 session_timeout_cap_seconds = standing.session_timeout_cap_seconds
+        # Speed tiers by WiFi network (NAS-only venues, shared Aruba listener
+        # only: ``called_station_id`` is passed by that route alone). A guest
+        # on an entitlement-only SSID (``WYFY_PREMIUM``) without a valid
+        # voucher pass or Access Tier mapping is refused here; see
+        # ``app.domains.guest.ssid_tiers`` for the fail-open rules. MikroTik
+        # and Omada never enter this block.
+        if (
+            session is not None
+            and called_station_id is not None
+            and self.ssid_tier_lookup is not None
+            and is_nas_only(router)
+            and not await self._ssid_tier_allows(
+                router, session, called_station_id, decision_extra
+            )
+        ):
+            session = None
         # The one number the AP is told. Computed before the verdict so that
         # "no time left" is a Reject and never an Accept carrying 0 or less:
         # RFC 2865 gives Session-Timeout 0 no "end now" meaning, and a NAS

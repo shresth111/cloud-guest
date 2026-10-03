@@ -379,9 +379,11 @@ def wired(monkeypatch):  # noqa: ANN001, ANN201
     from app.domains.guest import router as guest_router
 
     calls: list[tuple[str, Any]] = []
+    calls_kw: list[dict] = []
 
-    async def _authorize_reply(payload, nas_client, service):  # noqa: ANN001, ANN202
+    async def _authorize_reply(payload, nas_client, service, **kw):  # noqa: ANN001, ANN003, ANN202
         calls.append(("authorize", nas_client))
+        calls_kw.append(kw)
         return {"control:Auth-Type": "Accept"}
 
     async def _accounting(payload, nas_client, service):  # noqa: ANN001, ANN202
@@ -393,6 +395,7 @@ def wired(monkeypatch):  # noqa: ANN001, ANN201
     monkeypatch.setattr(
         guest_router, "_aruba_shared_store", lambda service: _store_with(SECRET)
     )
+    monkeypatch.setattr(guest_router, "_test_calls_kw", calls_kw, raising=False)
     return guest_router, calls
 
 
@@ -409,6 +412,11 @@ class TestRadiusRoutes:
         )
         assert reply == {"control:Auth-Type": "Accept"}
         assert calls == [("authorize", service.nas)]
+        # The shared route alone hands the SSID-bearing Called-Station-Id on
+        # (speed tiers by WiFi network).
+        assert guest_router._test_calls_kw == [
+            {"called_station_id": _shared_headers()["X-RADIUS-Called-Station-Id"]}
+        ]
 
     @pytest.mark.parametrize(
         "over",
