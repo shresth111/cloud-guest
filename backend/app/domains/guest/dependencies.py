@@ -22,6 +22,7 @@ from fastapi import Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.captive_portal.dependencies import get_captive_portal_service
@@ -261,6 +262,9 @@ def get_radius_service(
         audit_writer=audit_repository,
         queue_lookup=queue_management_service,
         caller_location_scope=caller_location_scope,
+        bandwidth_attribute_router_ids=(
+            get_settings().radius_bandwidth_attribute_router_id_set
+        ),
     )
 
 
