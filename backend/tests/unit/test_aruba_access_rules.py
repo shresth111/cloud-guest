@@ -719,3 +719,270 @@ class TestSecondsUntilClosing:
         schedule = {"monday": {"open": True, "start": "09:00", "end": "18:00"}}
         assert self._call(self._at("19:00"), schedule) is None
         assert self._call(self._at("17:00"), {"monday": {"open": False}}) is None
+
+
+# ============================================================================
+# Session-Timeout is THE mid-session cut-off at an Aruba venue.
+#
+# MEASURED 2026-10-03 on the AP21 (staging, qa/v1-verdict.sh): 299 s sent ->
+# Accounting-Stop with Acct-Terminate-Cause=Session-Timeout at ~5:15. So the
+# value below is the one rule that ends a guest who is already online, and it
+# must be min(policy session timeout, remaining daily allowance, time until
+# Open Hours close, voucher expiry), never 0 or less, never above the policy.
+# ============================================================================
+
+
+def _minutes(seconds: int | None) -> float:
+    assert seconds is not None
+    return seconds / 60
+
+
+async def _sign_in_voucher(fx, code: str = "AP21VOUCHER"):  # noqa: ANN001, ANN202
+    return await fx.guest_service.login_via_voucher(
+        code=code,
+        identifier=_PHONE,
+        organization_id=None,
+        location_id=fx.location_id,
+        router_id=fx.router.id,
+        device_mac=_MAC,
+        ip_address="192.168.1.50",
+    )
+
+
+class TestSessionTimeoutIsTheCutOff:
+    async def test_never_above_the_policy_timeout_when_every_other_cap_is_later(
+        self,
+    ) -> None:
+        fx = _fixture(
+            policy_lookup=_PolicyLookup(
+                {
+                    PolicyType.SESSION: {"session_timeout_minutes": 30},
+                    PolicyType.FUP: {"daily_time_limit_minutes": 600},
+                }
+            )
+        )
+        _open_until(fx, 120)
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.authorized is True
+        assert 0 < authz.session_timeout_seconds <= 30 * 60
+
+    async def test_the_policy_timeout_alone_when_nothing_else_applies(self) -> None:
+        fx = _fixture(
+            policy_lookup=_PolicyLookup(
+                {PolicyType.SESSION: {"session_timeout_minutes": 45}}
+            )
+        )
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+        authz = await _authorize(fx, nas)
+        assert 44 * 60 < authz.session_timeout_seconds <= 45 * 60
+
+    async def test_daily_allowance_wins_when_it_is_the_smallest(self) -> None:
+        fx = _fixture(
+            policy_lookup=_PolicyLookup(
+                {
+                    PolicyType.SESSION: {"session_timeout_minutes": 240},
+                    PolicyType.FUP: {"daily_time_limit_minutes": 60},
+                }
+            )
+        )
+        _open_until(fx, 120)
+        nas = await _register_nas(fx)
+        result = await _sign_in(fx)
+        await _set_minutes_used(fx, result.guest.id, 45)
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.session_timeout_seconds == 15 * 60
+
+    async def test_closing_time_wins_when_it_is_the_smallest(self) -> None:
+        fx = _fixture(
+            policy_lookup=_PolicyLookup(
+                {
+                    PolicyType.SESSION: {"session_timeout_minutes": 240},
+                    PolicyType.FUP: {"daily_time_limit_minutes": 120},
+                }
+            )
+        )
+        _open_until(fx, 20)
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+
+        authz = await _authorize(fx, nas)
+
+        assert 19 <= _minutes(authz.session_timeout_seconds) <= 21
+
+    async def test_voucher_expiry_wins_when_it_is_the_smallest(self) -> None:
+        """A multi-use voucher redeemed again later: the session copies the
+        batch's full validity from ITS start, but the voucher itself expires
+        at first redemption + validity. The AP must be told the earlier."""
+        from datetime import timedelta
+
+        fx = _fixture()
+        voucher, _batch = fx.voucher_service.register(
+            "AP21VOUCHER", data_limit_mb=None, validity_minutes=120
+        )
+        nas = await _register_nas(fx)
+        result = await _sign_in_voucher(fx)
+        assert result.session.session_timeout_minutes == 120
+        voucher.expires_at = datetime.now(UTC) + timedelta(minutes=20)
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.authorized is True
+        assert 19 <= _minutes(authz.session_timeout_seconds) <= 20
+
+    async def test_an_expired_voucher_is_rejected_not_sent_zero(self) -> None:
+        from datetime import timedelta
+
+        fx = _fixture()
+        voucher, _batch = fx.voucher_service.register(
+            "AP21VOUCHER", data_limit_mb=None, validity_minutes=120
+        )
+        nas = await _register_nas(fx)
+        result = await _sign_in_voucher(fx)
+        voucher.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.authorized is False
+        assert authz.session_timeout_seconds is None
+        # Refused, never faked as ended: the AP still decides when it stops.
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_a_revoked_voucher_is_rejected(self) -> None:
+        fx = _fixture()
+        voucher, _batch = fx.voucher_service.register(
+            "AP21VOUCHER", data_limit_mb=None, validity_minutes=120
+        )
+        nas = await _register_nas(fx)
+        await _sign_in_voucher(fx)
+        voucher.status = "revoked"
+
+        assert (await _authorize(fx, nas)).authorized is False
+
+    async def test_a_voucher_lookup_failure_still_admits_with_the_policy_timeout(
+        self,
+    ) -> None:
+        fx = _fixture()
+        fx.voucher_service.register(
+            "AP21VOUCHER", data_limit_mb=None, validity_minutes=90
+        )
+        nas = await _register_nas(fx)
+        await _sign_in_voucher(fx)
+
+        async def _boom(voucher_id):  # noqa: ANN001, ANN202
+            raise RuntimeError("voucher table unreachable")
+
+        fx.voucher_service.get_voucher_by_id = _boom  # type: ignore[method-assign]
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.authorized is True
+        assert 89 * 60 < authz.session_timeout_seconds <= 90 * 60
+
+    async def test_a_mikrotik_voucher_session_is_unchanged(self) -> None:
+        from datetime import timedelta
+
+        fx = _fixture(vendor="mikrotik")
+        voucher, _batch = fx.voucher_service.register(
+            "AP21VOUCHER", data_limit_mb=None, validity_minutes=120
+        )
+        nas = await _register_nas(fx)
+        await _sign_in_voucher(fx)
+        voucher.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas, username=_PHONE, calling_station_id=_ARUBA_CSID
+        )
+
+        assert authz.authorized is True
+        assert authz.session_timeout_seconds > 119 * 60
+
+    async def test_no_time_left_is_a_reject_never_a_zero(self) -> None:
+        fx = _fixture()
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+        fx.radius_service._remaining_session_seconds = lambda session: 0  # type: ignore[method-assign]
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.authorized is False
+        assert authz.session_timeout_seconds is None
+
+    async def test_a_guest_blocked_on_their_profile_after_sign_in_is_rejected(
+        self,
+    ) -> None:
+        fx = _fixture()
+        nas = await _register_nas(fx)
+        result = await _sign_in(fx)
+        assert (await _authorize(fx, nas)).authorized is True
+
+        result.guest.is_blocked = True
+
+        assert (await _authorize(fx, nas)).authorized is False
+
+    async def test_a_session_an_admin_ended_is_rejected(self) -> None:
+        fx = _fixture()
+        nas = await _register_nas(fx)
+        result = await _sign_in(fx)
+        await fx.guest_service.disconnect_session(
+            session_id=result.session.id,
+            actor_user_id=uuid.uuid4(),
+            reason="admin",
+            already_ended_on_device=True,
+        )
+
+        assert (await _authorize(fx, nas)).authorized is False
+
+
+class TestTheWireReplyOnTheSharedArubaPath:
+    """``_radius_authorize_reply`` is what the shared 1912/1913 listener's
+    ``/radius/aruba-shared/authorize`` returns to FreeRADIUS verbatim."""
+
+    async def test_accept_carries_the_capped_session_timeout(self) -> None:
+        from app.domains.guest.router import _radius_authorize_reply
+        from app.domains.guest.schemas import RadiusAuthorizeRequest
+
+        fx = _fixture(
+            policy_lookup=_PolicyLookup(
+                {
+                    PolicyType.SESSION: {"session_timeout_minutes": 240},
+                    PolicyType.FUP: {"daily_time_limit_minutes": 60},
+                }
+            )
+        )
+        nas = await _register_nas(fx)
+        result = await _sign_in(fx)
+        await _set_minutes_used(fx, result.guest.id, 50)
+
+        reply = await _radius_authorize_reply(
+            RadiusAuthorizeRequest(username=_PHONE, calling_station_id=_ARUBA_CSID),
+            nas,
+            fx.radius_service,
+        )
+
+        assert reply["control:Auth-Type"] == "Accept"
+        assert reply["Session-Timeout"] == 10 * 60
+        assert "Mikrotik-Rate-Limit" not in reply
+
+    async def test_reject_carries_no_session_timeout(self) -> None:
+        from app.domains.guest.router import _radius_authorize_reply
+        from app.domains.guest.schemas import RadiusAuthorizeRequest
+
+        fx = _fixture()
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+        _shut_the_venue(fx)
+
+        reply = await _radius_authorize_reply(
+            RadiusAuthorizeRequest(username=_PHONE, calling_station_id=_ARUBA_CSID),
+            nas,
+            fx.radius_service,
+        )
+
+        assert reply == {"control:Auth-Type": "Reject"}
