@@ -166,9 +166,7 @@ class TestBlockParsing:
         text = _STOCK_PREAMBLE + _stanza("cg-5d3a509e", "10.20.0.28")
         blocks = radius_agent._split_client_blocks(text)
         assert blocks[-1][2] == "cg-5d3a509e"
-        _, removed = radius_agent._strip_clients_with_shortname(
-            text, "cg-cg-5d3a509e"
-        )
+        _, removed = radius_agent._strip_clients_with_shortname(text, "cg-cg-5d3a509e")
         assert removed == []
 
 
@@ -511,3 +509,161 @@ class TestFailuresAreRecorded:
                 f"{handler.__name__} returns a 500 without recording why -- "
                 "the response body is the caller's only clue and the journal has none"
             )
+
+
+# ---------------------------------------------------------------------------
+# The shared Aruba listener's client list (POST /radius/shared-client)
+# ---------------------------------------------------------------------------
+
+
+def _restarts(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Re-stub subprocess.run so a test can count restarts."""
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        calls.append(cmd)
+        if cmd[:2] == ["freeradius", "-CX"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Configuration appears to be OK\n", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(radius_agent.subprocess, "run", _fake_run)
+    return calls
+
+
+@pytest.fixture()
+def shared_conf(conf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "wyfy-aruba-shared-clients.conf"
+    path.write_text(
+        "# PLACEHOLDER\nclient x {\n\tipaddr = 0.0.0.0/0\n\tsecret = zzz\n}\n"
+    )
+    monkeypatch.setattr(radius_agent, "SHARED_CLIENTS_CONF", str(path))
+    return path
+
+
+class TestSharedClient:
+    SECRET = "A" * 16 + "b" * 16
+
+    def test_writes_both_families_one_secret_message_authenticator_required(
+        self, shared_conf: Path, conf: Path
+    ) -> None:
+        before = conf.read_text()
+        result = radius_agent.set_shared_secret(self.SECRET)
+        assert result == {
+            "status": "ok",
+            "fingerprint": radius_agent.shared_fingerprint(self.SECRET),
+        }
+        text = shared_conf.read_text()
+        assert "ipaddr = 0.0.0.0/0" in text and "ipv6addr = ::/0" in text
+        assert text.count(f"secret = {self.SECRET}") == 4  # secret + backend x2
+        assert text.count("require_message_authenticator = yes") == 2
+        assert text.count("shortname = wyfy-aruba-shared") == 2
+        assert "PLACEHOLDER" not in text
+        # clients.conf (every per-venue stanza, the 1812 listener) untouched.
+        assert conf.read_text() == before
+
+    def test_the_same_secret_again_does_not_restart(
+        self, shared_conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        radius_agent.set_shared_secret(self.SECRET)
+        calls = _restarts(monkeypatch)
+        assert radius_agent.set_shared_secret(self.SECRET)["unchanged"] is True
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "bad", ["short", "A" * 65, "has space " + "a" * 20, "a|b" * 10, None, 42]
+    )
+    def test_malformed_secret_refused_file_untouched(
+        self, shared_conf: Path, bad: object
+    ) -> None:
+        before = shared_conf.read_text()
+        with pytest.raises(ValueError):
+            radius_agent.set_shared_secret(bad)  # type: ignore[arg-type]
+        assert shared_conf.read_text() == before
+
+    def test_no_listener_installed_is_refused(
+        self, conf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            radius_agent, "SHARED_CLIENTS_CONF", str(tmp_path / "absent.conf")
+        )
+        with pytest.raises(radius_agent.SharedListenerNotInstalled):
+            radius_agent.set_shared_secret(self.SECRET)
+        assert not (tmp_path / "absent.conf").exists()
+
+    def test_a_failed_parse_check_restores_the_previous_file(
+        self, shared_conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = shared_conf.read_text()
+
+        def _bad(cmd: list[str], **kwargs: Any) -> Any:
+            return subprocess.CompletedProcess(cmd, 1, stdout="error", stderr="")
+
+        monkeypatch.setattr(radius_agent.subprocess, "run", _bad)
+        with pytest.raises(RuntimeError, match="reverted"):
+            radius_agent.set_shared_secret(self.SECRET)
+        assert shared_conf.read_text() == before
+
+
+class TestSharedClientOverHttp:
+    """The HTTP surface: status codes the backend relies on."""
+
+    def _call(self, method: str, path: str, body: dict, secret: str = "agent-s3cret"):  # noqa: ANN202
+        import http.client
+        import http.server
+        import json as _json
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), radius_agent.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+            conn.request(
+                method,
+                path,
+                body=_json.dumps(body),
+                headers={"X-Agent-Secret": secret, "Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            return resp.status, _json.loads(resp.read() or b"{}")
+        finally:
+            server.shutdown()
+
+    @pytest.fixture(autouse=True)
+    def _secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(radius_agent, "SHARED_SECRET", "agent-s3cret")
+
+    def test_ok(self, shared_conf: Path) -> None:
+        status, body = self._call(
+            "POST", "/radius/shared-client", {"secret": TestSharedClient.SECRET}
+        )
+        assert status == 200
+        assert body["fingerprint"] == radius_agent.shared_fingerprint(
+            TestSharedClient.SECRET
+        )
+        assert TestSharedClient.SECRET not in str(body)
+
+    def test_malformed_is_400_not_a_retryable_500(self, shared_conf: Path) -> None:
+        assert self._call("POST", "/radius/shared-client", {"secret": "x"})[0] == 400
+
+    def test_not_installed_is_409(
+        self, conf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(radius_agent, "SHARED_CLIENTS_CONF", str(tmp_path / "no"))
+        status, _ = self._call(
+            "POST", "/radius/shared-client", {"secret": TestSharedClient.SECRET}
+        )
+        assert status == 409
+
+    def test_wrong_agent_secret_is_401(self, shared_conf: Path) -> None:
+        status, _ = self._call(
+            "POST",
+            "/radius/shared-client",
+            {"secret": TestSharedClient.SECRET},
+            secret="wrong",
+        )
+        assert status == 401
+
+    def test_delete_is_refused(self, shared_conf: Path) -> None:
+        assert self._call("DELETE", "/radius/shared-client", {})[0] == 405
