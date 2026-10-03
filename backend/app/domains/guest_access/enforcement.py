@@ -71,7 +71,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from app.domains.router.vendor_capabilities import is_controller_managed
+from app.domains.router.vendor_capabilities import is_controller_managed, is_nas_only
 
 from .constants import BlockEnforcementStatus
 from .device_adapters import (
@@ -84,6 +84,7 @@ from .device_adapters import (
 from .exceptions import (
     BlockEnforcementMissingCredentialsError,
     ControllerSessionTerminationUnavailableError,
+    NasOnlyLiveSessionUnreachableError,
     RouterHasNoHotspotError,
     SessionStillActiveOnDeviceError,
 )
@@ -540,6 +541,14 @@ class LiveSessionTerminator:
         # this is the eighth. Asking the vendor first costs nothing on the
         # MikroTik path, which reaches the same two lines in the same order
         # one branch later, with the same adapter and the same credentials.
+        # A NAS-only access point (Aruba Instant On) is reachable by nothing
+        # this platform has, so there is nothing to attempt -- and asking the
+        # controller path would only answer "could not reach the controller",
+        # a sentence about a fault that does not exist. Said plainly instead,
+        # before any lookup. The block itself is unaffected: the sign-in gate
+        # and the RADIUS authorize re-check both refuse this guest.
+        if is_nas_only(router):
+            raise NasOnlyLiveSessionUnreachableError(router.id)
         if is_controller_managed(router):
             return await self._end_on_controller(
                 router, session=session, organization_id=organization_id
