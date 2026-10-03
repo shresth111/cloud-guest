@@ -3262,14 +3262,19 @@ async def _radius_authorize_reply(
     payload: RadiusAuthorizeRequest,
     nas_client,  # noqa: ANN001 -- RadiusNasClient
     service: RadiusService,
+    *,
+    called_station_id: str | None = None,
 ) -> dict:
     """``radius_authorize``'s whole decision and wire reply, shared verbatim
     with the shared Aruba listener's ``radius_aruba_shared_authorize`` --
-    the two differ only in how the NAS was identified."""
+    the two differ only in how the NAS was identified, and in that only the
+    shared listener passes ``called_station_id`` (``<AP MAC>:<SSID>``), which
+    turns on the speed-tiers-by-SSID gate."""
     result = await service.authorize(
         nas_client=nas_client,
         username=payload.username,
         calling_station_id=payload.calling_station_id,
+        called_station_id=called_station_id,
     )
     reply: dict = {
         "control:Auth-Type": "Accept" if result.authorized else "Reject",
@@ -3464,7 +3469,12 @@ async def radius_aruba_shared_authorize(
     except ArubaSharedRequestRejected as exc:
         log_rejection(exc, kind="authorize")
         return {"control:Auth-Type": "Reject"}
-    return await _radius_authorize_reply(payload, nas_client, service)
+    return await _radius_authorize_reply(
+        payload,
+        nas_client,
+        service,
+        called_station_id=request.headers.get(CALLED_STATION_ID_HEADER),
+    )
 
 
 @radius_router.post(

@@ -49,6 +49,12 @@ from app.domains.guest.router import nas_cross_reference_router as guest_nas_xre
 from app.domains.guest.router import nas_platform_router as guest_nas_platform_router
 from app.domains.guest.router import nas_router as guest_nas_router
 from app.domains.guest.router import radius_router as guest_radius_router
+from app.domains.guest.ssid_tier_router import (
+    ssid_tier_guest_router as guest_ssid_tier_guest_router,
+)
+from app.domains.guest.ssid_tier_router import (
+    ssid_tier_router as guest_ssid_tier_router,
+)
 from app.domains.guest_access.router import router as guest_access_router
 from app.domains.guest_teams.router import admin_router as guest_teams_admin_router
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
@@ -188,6 +194,8 @@ api_v1_router.include_router(guest_nas_router)
 api_v1_router.include_router(guest_nas_xref_router)
 api_v1_router.include_router(guest_nas_platform_router)
 api_v1_router.include_router(guest_aruba_shared_platform_router)
+api_v1_router.include_router(guest_ssid_tier_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(guest_ssid_tier_guest_router)
 api_v1_router.include_router(guest_analytics_router)
 api_v1_router.include_router(guest_access_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_teams_guest_router)

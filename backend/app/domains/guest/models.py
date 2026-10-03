@@ -127,7 +127,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
@@ -913,6 +913,63 @@ class RadiusNasCodeCounter(BaseModel):
         )
 
 
+class LocationSsidTier(BaseModel):
+    """Speed tiers by WiFi network: one guest SSID of a location, the tier it
+    stands for, and whether joining it needs an entitlement. See
+    ``app.domains.guest.ssid_tiers`` for the decision.
+
+    ``organization_id`` is copied from the location on write (never from a
+    request body) so every read carries the tenant in its WHERE clause.
+    ``policy_id`` optionally links an Access Tier (a BANDWIDTH policy of the
+    same organization): a guest mapped into that tier may join.
+    ``voucher_plan_ids`` (JSON list of voucher plan ids, empty = any voucher)
+    narrows which voucher passes entitle. ``download_mbps``/``upload_mbps``
+    are the per-guest cap Instant On applies to EVERY guest on the SSID
+    (integer Mbps, ``None`` = no cap)."""
+
+    __tablename__ = "location_ssid_tiers"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ssid: Mapped[str] = mapped_column(String(32), nullable=False)
+    tier_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    requires_entitlement: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("policies.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    voucher_plan_ids: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    download_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sort_order: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_location_ssid_tiers_organization_id", "organization_id"),
+        Index("ix_location_ssid_tiers_location_id", "location_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<LocationSsidTier(id={self.id}, location_id={self.location_id}, "
+            f"ssid={self.ssid!r})>"
+        )
+
+
 __all__ = [
     "Guest",
     "GuestDevice",
@@ -921,4 +978,5 @@ __all__ = [
     "GuestConsent",
     "RadiusNasClient",
     "RadiusNasCodeCounter",
+    "LocationSsidTier",
 ]
