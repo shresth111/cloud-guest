@@ -254,7 +254,11 @@ from app.domains.auth.password import (
     PasswordVerificationError,
 )
 from app.domains.captive_portal.service import ResolvedPortalConfig
-from app.domains.captive_portal.validators import compute_terms_version, is_open_now
+from app.domains.captive_portal.validators import (
+    compute_terms_version,
+    is_open_now,
+    seconds_until_closing,
+)
 from app.domains.guest_access.exceptions import (
     GuestAccessDeniedError,
     WhitelistOnlyAccessDeniedError,
@@ -269,6 +273,7 @@ from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
 from app.domains.policy.constants import PolicyType
+from app.domains.policy.schemas import BandwidthPolicyRules
 from app.domains.queue_management.constants import QueueTargetType
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
@@ -2381,6 +2386,14 @@ FUP_TIME_LIMIT_RULE_KEYS: dict[QuotaPeriodType, str] = {
 }
 
 
+def _min_present(*values: int | None) -> int | None:
+    """The smallest of ``values`` that is not ``None``, or ``None`` when all
+    are. For combining RADIUS time allowances, where absent means "no limit"
+    and must never be read as zero."""
+    present = [v for v in values if v is not None]
+    return min(present) if present else None
+
+
 def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | None:
     """Map an already-ended ``GuestSession`` to the coarse, guest-safe
     vocabulary the captive portal is allowed to see, or ``None`` when a
@@ -2502,6 +2515,38 @@ class RadiusAuthorizeResult:
     # or None when no queue_lookup hook is wired or the session has no
     # queue assignment -- see RadiusService.__init__'s own docstring.
     rate_limit: str | None = None
+    # WISPr-Bandwidth-Max-Down / -Up (WISPr vendor 14122, attributes 8 and
+    # 7, bits per second). Only ever set for a NAS-only router (Aruba Instant
+    # On) named in ``Settings.radius_bandwidth_attribute_router_ids`` -- an
+    # experiment gate while a hardware measurement decides whether Instant On
+    # honours them at all (no Aruba document says it does). ``None`` means
+    # "send no attribute", which is every other router's reply, unchanged.
+    bandwidth_max_down_bps: int | None = None
+    bandwidth_max_up_bps: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NasOnlyBandwidthRates:
+    """``GuestService.nas_only_bandwidth_rates``'s answer, in kbps (the
+    ``BandwidthPolicyRules`` unit). ``None`` on a direction means "no limit
+    configured for it", never zero."""
+
+    download_kbps: int | None
+    upload_kbps: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class NasOnlyAuthorizeStanding:
+    """``GuestService.nas_only_authorize_standing``'s answer.
+
+    ``refusal`` is a short machine reason (logged, never sent to the NAS)
+    when the session must be refused, else ``None``.
+    ``session_timeout_cap_seconds`` is the tightest of the guest's remaining
+    FUP time allowance and the time until the venue's Open Hours close, for
+    capping ``Session-Timeout``; ``None`` when neither applies."""
+
+    refusal: str | None
+    session_timeout_cap_seconds: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5720,7 +5765,31 @@ class GuestService:
             delta_bytes=total_delta_bytes,
             now=now,
         )
-        if is_quota_exceeded(updated):
+        session_cap_reached = is_quota_exceeded(updated)
+        if (
+            session_cap_reached or violated_fup_period is not None
+        ) and await self._session_is_on_nas_only_router(updated):
+            # NAS-only access point (Aruba Instant On): nothing can take this
+            # guest off the network mid-session -- no router API, no
+            # controller API, no CoA into the venue's NAT. Marking the row
+            # EXPIRED would show a guest who is still online as gone, and
+            # every later Interim-Update would land on a closed record. So
+            # the session stays ACTIVE until the AP itself ends it
+            # (Accounting-Stop, or Session-Timeout), and the breach is
+            # enforced where this platform CAN enforce it: the next portal
+            # sign-in (``_enforce_fup_quota``) and the next Access-Request
+            # (``RadiusService.authorize`` -> ``nas_only_authorize_standing``)
+            # are both refused. PM_SPEC (Aruba) §3.1 "BE requirement".
+            logger.info(
+                "guest_usage_cap_reached_nas_only_session_left_active",
+                extra={
+                    "session_id": str(updated.id),
+                    "session_data_limit_reached": session_cap_reached,
+                    "fup_period": violated_fup_period,
+                },
+            )
+            return updated
+        if session_cap_reached:
             updated = await self.repository.update_session(
                 updated,
                 {
@@ -5754,6 +5823,219 @@ class GuestService:
 
     def check_quota_exceeded(self, session: GuestSession) -> bool:
         return is_quota_exceeded(session)
+
+    async def _session_is_on_nas_only_router(self, session: GuestSession) -> bool:
+        """Whether ``session`` runs on a NAS-only access point. Asked only
+        after a cap was crossed, so the normal accounting path pays nothing.
+        A router that cannot be read answers ``False``: the vendor-agnostic
+        behaviour that applied before this question existed."""
+        try:
+            router = await self.router_lookup.get_router(
+                session.router_id, include_deleted=True
+            )
+        except Exception as exc:  # noqa: BLE001 -- fall back to prior behaviour
+            logger.warning(
+                "guest_usage_router_lookup_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return False
+        return is_nas_only(router)
+
+    async def nas_only_authorize_standing(
+        self, session: GuestSession
+    ) -> NasOnlyAuthorizeStanding:
+        """What ``RadiusService.authorize`` must know about ``session``
+        before it answers a NAS-only access point (Aruba Instant On).
+
+        At such a venue the RADIUS reply is the **only** enforcement point
+        this platform has: there is no router API, no controller API and no
+        CoA (the AP is behind NAT), so nothing can end a session once the
+        AP has admitted it. Two consequences, and this answers both:
+
+        * **A used-up allowance must refuse the next Access-Request.**
+          ``record_usage`` deliberately leaves a NAS-only session ``ACTIVE``
+          when a data cap is crossed (marking it ended would show a guest
+          who is still online as gone). So "this session is ACTIVE" is not
+          enough on its own: the session's own ``data_limit_mb``, the
+          guest's FUP data/time quotas and a team's shared quota are
+          checked here, through ``_enforce_fup_quota`` -- the same gate a
+          portal sign-in passes -- so the two can never disagree.
+        * **Time limits can only cut a guest off through
+          ``Session-Timeout``.** ``session_timeout_cap_seconds`` is the
+          smaller of the time left in the guest's FUP time allowance (the
+          daily limit) and the time until the venue's Open Hours close, for
+          the caller to cap ``Session-Timeout`` with. A venue that is closed
+          right now refuses, as the portal sign-in already does. Whether the
+          AP honours ``Session-Timeout`` is hardware check V1 in the Aruba
+          spec; sending the right number is the half this platform owns.
+
+        ``minutes_used`` is accrued by a five-minutely sweep, so the
+        remaining figure can be up to one sweep interval generous for a
+        guest who was already online. That is the conservative direction for
+        a number that ends someone's internet.
+
+        Never raises: a policy lookup that fails here admits the guest
+        (``refusal is None``) and sends no extra cap, because the portal
+        sign-in seconds earlier already ran the same gate, and an outage of
+        the policy tables must not become "nobody at the venue gets online".
+        """
+        if is_quota_exceeded(session):
+            return NasOnlyAuthorizeStanding(
+                refusal="session_data_limit_reached",
+                session_timeout_cap_seconds=None,
+            )
+        try:
+            await self._enforce_fup_quota(
+                guest_id=session.guest_id,
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+        except FairUsagePolicyExceededError as exc:
+            return NasOnlyAuthorizeStanding(
+                refusal=f"fup_{exc.metric}_quota_exhausted_{exc.period_type}",
+                session_timeout_cap_seconds=None,
+            )
+        except GuestTeamSharedQuotaExceededError:
+            return NasOnlyAuthorizeStanding(
+                refusal="team_shared_quota_exhausted",
+                session_timeout_cap_seconds=None,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "nas_only_authorize_fup_check_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return NasOnlyAuthorizeStanding(
+                refusal=None, session_timeout_cap_seconds=None
+            )
+        open_hours = await self._open_hours_standing(session)
+        if open_hours == "closed":
+            return NasOnlyAuthorizeStanding(
+                refusal="venue_closed", session_timeout_cap_seconds=None
+            )
+        return NasOnlyAuthorizeStanding(
+            refusal=None,
+            session_timeout_cap_seconds=_min_present(
+                await self._fup_time_remaining_seconds(session),
+                open_hours,
+            ),
+        )
+
+    async def _open_hours_standing(self, session: GuestSession) -> int | str | None:
+        """``"closed"`` when this session's venue is outside its Open Hours
+        right now, else the seconds until it closes, else ``None`` (no Open
+        Hours, or the config cannot be read -- the forgiving direction
+        ``_require_venue_open`` documents)."""
+        try:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+            config = resolved.config
+            enabled = bool(config.business_hours_enabled)
+            timezone = config.business_hours_timezone
+            schedule = config.business_hours_schedule or {}
+        except Exception as exc:  # noqa: BLE001 -- never raises, see caller
+            logger.warning(
+                "nas_only_authorize_open_hours_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
+        if not enabled:
+            return None
+        if not is_open_now(enabled=enabled, timezone=timezone, schedule=schedule):
+            return "closed"
+        return seconds_until_closing(
+            enabled=enabled, timezone=timezone, schedule=schedule
+        )
+
+    async def nas_only_bandwidth_rates(
+        self, session: GuestSession
+    ) -> NasOnlyBandwidthRates | None:
+        """The guest's entitled speed at a NAS-only venue, resolved exactly
+        the way ``QueueManagementService.resolve_and_assign_queue`` resolves
+        it for a MikroTik/Omada session: the effective ``PolicyType.BANDWIDTH``
+        policy for the session's organization and location, with a Group
+        Policies "Map users" assignment for this guest taking precedence
+        (``guest_id``). A NAS-only venue never gets a ``QueueAssignment``
+        (``_queue_device_target`` returns ``None`` there -- there is no
+        device-side write), so the queue tables cannot be read for it; the
+        policy is the same source those tables are built from.
+
+        ``None`` when no policy applies, when both rates are 0 (this
+        codebase's "unlimited" convention -- see
+        ``get_rate_limit_reply_for_session``), when no ``policy_lookup`` is
+        wired, or when the lookup fails. Never raises: a policy-table outage
+        must not turn a valid Accept into a Reject, the same rule
+        ``_resolve_rate_limit_reply`` follows."""
+        if self.policy_lookup is None:
+            return None
+        try:
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.BANDWIDTH,
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+                guest_id=session.guest_id,
+            )
+            if not resolved.rules:
+                return None
+            rules = BandwidthPolicyRules.model_validate(resolved.rules)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "nas_only_bandwidth_policy_lookup_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
+        download = rules.download_rate_kbps or None
+        upload = rules.upload_rate_kbps or None
+        if download is None and upload is None:
+            return None
+        return NasOnlyBandwidthRates(download_kbps=download, upload_kbps=upload)
+
+    async def _fup_time_remaining_seconds(self, session: GuestSession) -> int | None:
+        """Seconds left of the guest's tightest FUP *time* allowance at this
+        session's location, or ``None`` when no time limit is configured (or
+        the answer cannot be read -- see ``nas_only_authorize_standing``).
+        Only ever called after ``_enforce_fup_quota`` passed, so every
+        configured period still has time left; ``max(..., 1)`` guards the
+        same sub-second edge ``_remaining_session_seconds`` does."""
+        if self.policy_lookup is None:
+            return None
+        try:
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.FUP,
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+                guest_id=session.guest_id,
+            )
+            time_limits = {
+                period_type: resolved.rules.get(rule_key)
+                for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items()
+            }
+            capped = [p for p, limit in time_limits.items() if limit]
+            if not capped:
+                return None
+            tz_name = await self.repository.get_organization_timezone(
+                session.organization_id
+            )
+            usages = await get_or_reset_quota_usages(
+                self.repository,
+                guest_id=session.guest_id,
+                organization_id=session.organization_id,
+                period_types=capped,
+                tz_name=tz_name,
+                now=datetime.now(UTC),
+            )
+            remaining_minutes = min(
+                time_limits[p] - usages[p].minutes_used for p in capped
+            )
+        except Exception as exc:  # noqa: BLE001 -- never raises, see caller
+            logger.warning(
+                "nas_only_authorize_fup_time_remaining_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
+        return max(int(remaining_minutes) * 60, 1)
 
     async def enforce_timeouts(self) -> list[GuestSession]:
         """See module docstring's "a reporting mechanism, not live
@@ -7337,6 +7619,7 @@ class RadiusService:
         audit_writer: AuditLogWriter | None = None,
         queue_lookup: QueueRateLimitLookupProtocol | None = None,
         caller_location_scope: LocationScope = None,
+        bandwidth_attribute_router_ids: frozenset[uuid.UUID] = frozenset(),
     ) -> None:
         self.repository = repository
         self.guest_service = guest_service
@@ -7345,6 +7628,10 @@ class RadiusService:
         self.nas_code_counter_repository = nas_code_counter_repository
         self.audit_writer = audit_writer
         self.queue_lookup = queue_lookup
+        # Experiment gate -- see ``Settings.radius_bandwidth_attribute_router_ids``.
+        # Empty by default, so a RadiusService built anywhere without it
+        # (every existing test, every other caller) sends no WISPr attribute.
+        self.bandwidth_attribute_router_ids = bandwidth_attribute_router_ids
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
 
@@ -8101,6 +8388,44 @@ class RadiusService:
             "event_router_id": str(router.id),
             "event_calling_station_id": calling_station_id,
         }
+        # NAS-only access point (Aruba Instant On): bind the Accept to the
+        # DEVICE, not only to the person. Instant On's login POST
+        # (swarm.cgi / cgi-bin/login) carries user + password, the password
+        # is ignored (session lookup by User-Name), and the AP accepts that
+        # POST from any client on the guest SSID. Without this check a
+        # second device -- one the portal refused under "Devices per user",
+        # or simply anyone who knows an online guest's phone number -- could
+        # POST the identifier itself and be admitted on the first device's
+        # session, with no OTP. The portal is the only place a device is
+        # admitted (``_enforce_device_limit``); this makes the RADIUS reply
+        # agree with it: the calling MAC must own an ACTIVE session of this
+        # guest on this router (that session, not merely the latest one, is
+        # then the one whose remaining time goes into Session-Timeout).
+        #
+        # Only when the session already knows its device: a login that
+        # carried no MAC is adopted above, exactly as before. A packet with
+        # no parseable Calling-Station-Id is not second-guessed (nothing to
+        # compare). MikroTik and Omada never enter this block.
+        if (
+            session is not None
+            and session.device_id is not None
+            and canonical_mac_key(calling_station_id) is not None
+            and is_nas_only(router)
+        ):
+            by_device = await self._session_for_calling_station(
+                guest_id=session.guest_id,
+                organization_id=router.organization_id,
+                router_id=router.id,
+                calling_station_id=calling_station_id,
+            )
+            if by_device is None or not by_device.is_active():
+                logger.info(
+                    "radius_authorize_device_not_signed_in",
+                    extra={**decision_extra, "event_session_id": str(session.id)},
+                )
+                session = None
+            else:
+                session = by_device
         # A session that has already spent its wall-clock allowance is not
         # an authorization, however ACTIVE its row still says it is. This
         # is the hop that makes a venue's "30 min" actually mean the guest
@@ -8137,6 +8462,29 @@ class RadiusService:
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
             session = None
+        # NAS-only access point (Aruba Instant On): this reply is the only
+        # enforcement point there is -- see ``nas_only_authorize_standing``.
+        # A used-up data or time allowance, or a closed venue, refuses here;
+        # the remaining time allowance and the time until closing cap
+        # Session-Timeout below. Every other
+        # vendor skips this block entirely and is byte-identical: a MikroTik
+        # or Omada session over its cap was already ended by
+        # ``record_usage``/the accrual sweep and never reaches this line.
+        session_timeout_cap_seconds: int | None = None
+        if session is not None and is_nas_only(router):
+            standing = await self.guest_service.nas_only_authorize_standing(session)
+            if standing.refusal is not None:
+                logger.info(
+                    "radius_authorize_quota_exhausted",
+                    extra={
+                        **decision_extra,
+                        "event_session_id": str(session.id),
+                        "event_refusal": standing.refusal,
+                    },
+                )
+                session = None
+            else:
+                session_timeout_cap_seconds = standing.session_timeout_cap_seconds
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -8152,6 +8500,7 @@ class RadiusService:
                 idle_timeout_seconds=None,
                 data_limit_mb=None,
             )
+        bandwidth = await self._nas_only_bandwidth_attributes(router, session)
         logger.info(
             "radius_authorize_decision",
             extra={
@@ -8179,7 +8528,14 @@ class RadiusService:
             # sub-second race between that check and this line, since a
             # NAS given `Session-Timeout: 0` may treat it as unlimited --
             # failing open on exactly the session we mean to end.
-            session_timeout_seconds=self._remaining_session_seconds(session),
+            #
+            # At a NAS-only venue it is also capped by the guest's remaining
+            # FUP time allowance (the daily limit) and by the time until the
+            # venue's Open Hours close, because Session-Timeout is the one way
+            # either can reach a device there.
+            session_timeout_seconds=_min_present(
+                self._remaining_session_seconds(session), session_timeout_cap_seconds
+            ),
             # The FULL configured idle allowance, every time -- see the
             # field's own comment for why this is deliberately not the
             # "remaining" treatment its neighbour above gets.
@@ -8199,7 +8555,52 @@ class RadiusService:
                 if is_nas_only(router)
                 else await self._resolve_rate_limit_reply(session.id)
             ),
+            bandwidth_max_down_bps=bandwidth[0],
+            bandwidth_max_up_bps=bandwidth[1],
         )
+
+    async def _nas_only_bandwidth_attributes(
+        self, router: Router, session: GuestSession
+    ) -> tuple[int | None, int | None]:
+        """``(WISPr-Bandwidth-Max-Down, WISPr-Bandwidth-Max-Up)`` in bits per
+        second for this Accept, or ``(None, None)`` to send neither.
+
+        Both are ``None`` unless ``router`` is NAS-only **and** named in the
+        experiment gate (``bandwidth_attribute_router_ids``). That keeps
+        every MikroTik and Omada reply byte-identical whatever the gate
+        holds, and keeps an un-gated Aruba venue exactly as PR #339 left it.
+
+        Why WISPr and not ``Aruba-User-Role``: a role names a bandwidth
+        contract the AP must already hold, and Instant On exposes no way for
+        this platform to create one. WISPr attributes carry the rate itself.
+        Whether Instant On honours them is UNMEASURED (Aruba's documented
+        Instant attribute list does not include them); this method only
+        makes the measurement possible. The customer control stays greyed
+        until it passes.
+
+        Units: ``BandwidthPolicyRules`` is in kbps (1 kbps = 1000 bit/s, the
+        convention ``format_mikrotik_rate_limit``'s ``k`` suffix uses too).
+        WISPr is bits per second. Never raises (see
+        ``GuestService.nas_only_bandwidth_rates``)."""
+        if router.id not in self.bandwidth_attribute_router_ids or not is_nas_only(
+            router
+        ):
+            return None, None
+        rates = await self.guest_service.nas_only_bandwidth_rates(session)
+        if rates is None:
+            return None, None
+        down = rates.download_kbps * 1000 if rates.download_kbps else None
+        up = rates.upload_kbps * 1000 if rates.upload_kbps else None
+        logger.info(
+            "radius_authorize_bandwidth_attributes",
+            extra={
+                "event_router_id": str(router.id),
+                "event_session_id": str(session.id),
+                "event_wispr_bandwidth_max_down_bps": down,
+                "event_wispr_bandwidth_max_up_bps": up,
+            },
+        )
+        return down, up
 
     @staticmethod
     def _remaining_session_seconds(session: GuestSession) -> int | None:

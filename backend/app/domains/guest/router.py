@@ -3298,6 +3298,15 @@ async def _radius_authorize_reply(
             reply["Idle-Timeout"] = result.idle_timeout_seconds
         if result.rate_limit is not None:
             reply["Mikrotik-Rate-Limit"] = result.rate_limit
+        # WISPr vendor 14122 (dictionary.wispr, $INCLUDEd by FreeRADIUS's
+        # stock dictionary, so rlm_rest resolves these names). Only ever set
+        # for a gated NAS-only router -- see
+        # ``RadiusService._nas_only_bandwidth_attributes``. Absent for every
+        # other router, so their replies are unchanged key for key.
+        if result.bandwidth_max_down_bps is not None:
+            reply["WISPr-Bandwidth-Max-Down"] = result.bandwidth_max_down_bps
+        if result.bandwidth_max_up_bps is not None:
+            reply["WISPr-Bandwidth-Max-Up"] = result.bandwidth_max_up_bps
         # Without this, RouterOS's hotspot profile (radius-interim-update
         # ="received" -- confirmed live, this platform's own setup script
         # never sets a fixed interval) never sends a single
