@@ -11,8 +11,8 @@ changes no venue's behaviour.
 
 Downgrade drops the table.
 
-Revision ID: 0143_create_location_speed_gateways
-Revises: 0142_create_instant_on_poller_tables
+Revision ID: 0144_create_location_speed_gateways
+Revises: 0143_create_location_ssid_tiers
 Create Date: 2026-10-03
 """
 
@@ -21,8 +21,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0143_create_location_speed_gateways"
-down_revision = "0142_create_instant_on_poller_tables"
+revision = "0144_create_location_speed_gateways"
+down_revision = "0143_create_location_ssid_tiers"
 branch_labels = None
 depends_on = None
 
