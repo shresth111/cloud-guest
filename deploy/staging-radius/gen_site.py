@@ -61,6 +61,13 @@ def insert_after(text, section, anchor_re, insertion):
     raise SystemExit(f"anchor {anchor_re!r} not found in {section}")
 
 
+def must_sub_top(pattern, repl, text, count):
+    new, n = re.subn(pattern, repl, text)
+    if n != count:
+        raise SystemExit(f"rest_aruba: expected {count} x {pattern!r}, found {n}")
+    return new
+
+
 snip = read("snippets.conf")
 site = read("stock-default")
 site = insert_after(site, "authorize", r"^\s*preprocess\s*$",
@@ -76,6 +83,18 @@ if n != 1:
 with open(os.path.join(out, "rest"), "w") as f:
     f.write(rest)
 print("gen_site: default + rest written")
+
+# rest_aruba: the shared Aruba listener's instance (backend/ops/freeradius/
+# sites-aruba-shared.conf). Same file, so it can never drift from rest.conf;
+# only the instance name and the two endpoint paths differ.
+ra = must_sub_top(r"(?m)^rest \{", "rest rest_aruba {", rest, 1)
+ra = must_sub_top(r'"\$\{\.\.connect_uri\}/radius/authorize"',
+                  '"${..connect_uri}/radius/aruba-shared/authorize"', ra, 1)
+ra = must_sub_top(r'"\$\{\.\.connect_uri\}/radius/accounting"',
+                  '"${..connect_uri}/radius/aruba-shared/accounting"', ra, 1)
+with open(os.path.join(out, "rest_aruba"), "w") as f:
+    f.write(ra)
+print("gen_site: rest_aruba written")
 
 
 def drop_listen_blocks(text):

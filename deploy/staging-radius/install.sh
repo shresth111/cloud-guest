@@ -89,16 +89,22 @@ for c in radius radsec; do
   for _ in $(seq 1 40); do docker logs wyfy-staging-radius-$c-1 2>&1 | grep -q 'Ready to process requests' && break; sleep 1; done
   docker logs wyfy-staging-radius-$c-1 2>&1 | grep -q 'Ready to process requests' || { docker logs --tail 50 wyfy-staging-radius-$c-1; exit 1; }
 done
-log "freeradius ready (udp 1812/1813 + radsec tcp 2083); agent on $GW:9092"
-log "listeners: $(ss -Hltnu '( sport = :1812 or sport = :1813 or sport = :2083 )' | awk '{print $1"/"$5}' | sort -u | tr '\n' ' ')"
+log "freeradius ready (udp 1812/1813 + shared aruba udp 1912/1913 + radsec tcp 2083); agent on $GW:9092"
+log "listeners: $(ss -Hltnu '( sport = :1812 or sport = :1813 or sport = :1912 or sport = :1913 or sport = :2083 )' | awk '{print $1"/"$5}' | sort -u | tr '\n' ' ')"
+SHARED_FILE=$(docker exec wyfy-staging-radius-radius-1 cat /var/lib/wyfy-radius/wyfy-aruba-shared-clients.conf)
+if printf '%s' "$SHARED_FILE" | grep -q '^# PLACEHOLDER'; then
+  log "shared aruba listener: placeholder secret (rejects everything) -- set it from Master > Aruba shared secret"
+else
+  log "shared aruba listener secret fp: $(fp "$(printf '%s' "$SHARED_FILE" | awk '/^[[:space:]]*secret = /{print $3; exit}')")"
+fi
 
 # 4. staging backend env
 if [ "${SKIP_BACKEND:-0}" != 1 ]; then
   cp -p "$DEPLOY/backend.env" "$DEPLOY/backend.env.bak.$(date -u +%Y%m%dT%H%M%SZ)"
   tmp=$(mktemp "$DEPLOY/backend.env.XXXXXX")
-  grep -vE '^CLOUDGUEST_HUB_RADIUS_(AGENT_URL|AGENT_SECRET|PUBLIC_ADDRESS)=' "$DEPLOY/backend.env" > "$tmp" || true
-  printf 'CLOUDGUEST_HUB_RADIUS_AGENT_URL=http://%s:9092/radius/client\nCLOUDGUEST_HUB_RADIUS_AGENT_SECRET=%s\nCLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS=%s\n' \
-    "$GW" "$AGENT_SECRET" "$PUBLIC_ADDRESS" >> "$tmp"
+  grep -vE '^CLOUDGUEST_HUB_RADIUS_(AGENT_URL|AGENT_SECRET|PUBLIC_ADDRESS|ARUBA_SHARED_AGENT_URL)=' "$DEPLOY/backend.env" > "$tmp" || true
+  printf 'CLOUDGUEST_HUB_RADIUS_AGENT_URL=http://%s:9092/radius/client\nCLOUDGUEST_HUB_RADIUS_AGENT_SECRET=%s\nCLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS=%s\nCLOUDGUEST_HUB_RADIUS_ARUBA_SHARED_AGENT_URL=http://%s:9092/radius/shared-client\n' \
+    "$GW" "$AGENT_SECRET" "$PUBLIC_ADDRESS" "$GW" >> "$tmp"
   chown ubuntu:ubuntu "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$DEPLOY/backend.env"
   cd "$DEPLOY"
   sudo -u ubuntu -H docker compose --env-file .deploy.env up -d --no-deps api celery-worker celery-beat
@@ -112,4 +118,4 @@ fi
 IN_API=$(docker exec deploy-api-1 printenv CLOUDGUEST_HUB_RADIUS_AGENT_SECRET 2>/dev/null || true)
 IN_AGENT=$(docker exec wyfy-staging-radius-radius-1 printenv RADIUS_AGENT_SECRET)
 log "agent secret fp: radius.env=$(fp "$AGENT_SECRET") agent=$(fp "$IN_AGENT") api=$(fp "$IN_API") len=${#AGENT_SECRET}"
-log "api sees: $(docker exec deploy-api-1 printenv CLOUDGUEST_HUB_RADIUS_AGENT_URL) public=$(docker exec deploy-api-1 printenv CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS)"
+log "api sees: $(docker exec deploy-api-1 printenv CLOUDGUEST_HUB_RADIUS_AGENT_URL) public=$(docker exec deploy-api-1 printenv CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS) shared=$(docker exec deploy-api-1 printenv CLOUDGUEST_HUB_RADIUS_ARUBA_SHARED_AGENT_URL)"
