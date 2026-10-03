@@ -25,3 +25,9 @@ class SystemSettingKey(StrEnum):
 
     NEW_CUSTOMER_DEFAULT_PLAN_ID = "new_customer_default_plan_id"
     NEW_CUSTOMER_DEFAULT_FEATURE_OVERRIDES = "new_customer_default_feature_overrides"
+    # The shared Aruba Instant On RADIUS listener's secret, Fernet-encrypted,
+    # plus when it was rotated and the fingerprint the hub confirmed. Read
+    # and written only by app.domains.guest.aruba_shared; deliberately NOT a
+    # field of PlatformSettingsResponse, so the platform-settings read never
+    # carries it, encrypted or not.
+    ARUBA_SHARED_RADIUS = "aruba_shared_radius"

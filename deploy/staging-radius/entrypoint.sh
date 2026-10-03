@@ -13,8 +13,15 @@ set -u
 if [ ! -s /var/lib/wyfy-radius/clients.conf ]; then
   printf '# wyfy staging: stanzas below are written by radius_agent.py only\n' > /var/lib/wyfy-radius/clients.conf
 fi
-chown freerad:freerad /var/lib/wyfy-radius /var/lib/wyfy-radius/clients.conf
-chmod 0640 /var/lib/wyfy-radius/clients.conf
+# Same for the shared Aruba listener's client file: a placeholder with an
+# unguessable secret nobody knows (so the listener rejects everything) until
+# the platform sets the real one through the agent.
+if [ ! -s /var/lib/wyfy-radius/wyfy-aruba-shared-clients.conf ]; then
+  /opt/wyfy/aruba-shared-placeholder.sh /var/lib/wyfy-radius/wyfy-aruba-shared-clients.conf
+fi
+chown freerad:freerad /var/lib/wyfy-radius /var/lib/wyfy-radius/clients.conf \
+  /var/lib/wyfy-radius/wyfy-aruba-shared-clients.conf
+chmod 0640 /var/lib/wyfy-radius/clients.conf /var/lib/wyfy-radius/wyfy-aruba-shared-clients.conf
 
 python3 -u /opt/wyfy/radius_agent.py &
 AGENT=$!
