@@ -22,7 +22,8 @@ MAP=$RD/state/radsec-map
 CT=${RADSEC_CONTAINER:-wyfy-staging-radius-radsec-1}
 fp() { printf '%s' "$1" | sha256sum | cut -c1-12; }
 die() { echo "radsec-map: $*" >&2; exit 1; }
-restart() {
+restart() {  # the container also restarts radiusd on its own when the map changes;
+             # an explicit restart makes this script's success mean "serving it now"
   local since; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   docker restart "$CT" >/dev/null
   for _ in $(seq 1 40); do docker logs --since "$since" "$CT" 2>&1 | grep -q 'Ready to process requests' && { echo "radsec-map: $CT restarted"; return 0; }; sleep 1; done
