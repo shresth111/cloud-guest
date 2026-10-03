@@ -145,9 +145,6 @@ from .schemas import (
     PublicNasRegistrationRequest,
     PublicNasRegistrationResponse,
     PublicNasStatusResponse,
-    RadsecNasRegistrationRequest,
-    RadsecNasRegistrationResponse,
-    RadsecServerView,
     PublicPortalUrlView,
     RadiusAccountingRequest,
     RadiusAccountingResponse,
@@ -160,6 +157,9 @@ from .schemas import (
     RadiusNasSecretRotatedResponse,
     RadiusNasUpdateRequest,
     RadiusServerView,
+    RadsecNasRegistrationRequest,
+    RadsecNasRegistrationResponse,
+    RadsecServerView,
     SessionDisconnectRequest,
     SessionExtendRequest,
     SessionPauseRequest,
@@ -2751,7 +2751,9 @@ async def register_radsec_radius_nas(
             nas_client = registration.nas_client
             await _push(nas_client.nas_identifier, registration.shared_secret)
     except RadsecNotConfiguredError as exc:
-        raise HTTPException(status_code=503, detail="RadSec is not configured") from exc
+        raise HTTPException(
+            status_code=503, detail="RadSec is not configured"
+        ) from exc
     except RadiusBridgePushError as exc:
         # As register-public: the row may exist without a confirmed hub
         # enrolment -- visible as `hub_not_confirmed`, converges on retry.
@@ -2871,7 +2873,9 @@ async def regenerate_radius_nas_secret(
         except RadsecIdentityRejected as exc:
             raise PublicNasRegistrationRefusedError(str(exc)) from exc
         except RadsecNotConfiguredError as exc:
-            raise HTTPException(status_code=503, detail="RadSec is not configured") from exc
+            raise HTTPException(
+                status_code=503, detail="RadSec is not configured"
+            ) from exc
         except RadiusBridgePushError as exc:
             raise HTTPException(status_code=502, detail=exc.detail) from exc
         synced_radsec = await service.record_radsec_sync(

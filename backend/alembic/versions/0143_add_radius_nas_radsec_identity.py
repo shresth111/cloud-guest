@@ -34,7 +34,9 @@ depends_on = None
 def upgrade() -> None:
     op.add_column(
         "radius_nas_clients",
-        sa.Column("transport", sa.String(length=10), nullable=False, server_default="udp"),
+        sa.Column(
+            "transport", sa.String(length=10), nullable=False, server_default="udp"
+        ),
     )
     op.add_column(
         "radius_nas_clients",
