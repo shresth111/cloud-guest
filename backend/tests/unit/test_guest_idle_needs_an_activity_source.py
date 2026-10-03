@@ -252,7 +252,22 @@ class _Integration:
         self.credentials_encrypted = credentials
 
 
-def _install_integration(monkeypatch: pytest.MonkeyPatch, integration) -> None:
+def _install_integration(
+    monkeypatch: pytest.MonkeyPatch, integration, *, nas_only: bool = False
+) -> list[dict]:
+    """``nas_only`` answers "does this location have a NAS-only access point"
+    (Aruba Instant On), asked only when there is no integration row. Its
+    default, ``False``, is the MikroTik/RADIUS fleet. Returns the calls."""
+    nas_only_asked: list[dict] = []
+
+    async def _nas_only(_session, *, organization_id, location_id) -> bool:
+        nas_only_asked.append(
+            {"organization_id": organization_id, "location_id": location_id}
+        )
+        return nas_only
+
+    monkeypatch.setattr(client_hooks, "location_has_nas_only_access_points", _nas_only)
+
     class _Repository:
         def __init__(self, _session) -> None:
             pass
@@ -269,6 +284,7 @@ def _install_integration(monkeypatch: pytest.MonkeyPatch, integration) -> None:
     monkeypatch.setattr(
         client_hooks, "get_settings", lambda: MagicMock(omada_api_timeout_seconds=15.0)
     )
+    return nas_only_asked
 
 
 def _install_observed_activity(
@@ -568,3 +584,118 @@ class TestMikrotikIsUntouched:
             )
             is True
         )
+
+
+class TestANasOnlyVenueIsObservedNotAssumed:
+    """Aruba Instant On: no integration row, like the MikroTik fleet -- but
+    not the MikroTik premise. Whether its access points send Interim-Updates
+    is unmeasured (Aruba spec V3), so the idle rule only applies once
+    something has actually reported there. Otherwise every guest would be
+    expired at the idle timeout while still online, with nothing able to
+    reconnect or disconnect them."""
+
+    async def _ask(self) -> bool:
+        lookup = client_hooks.build_controller_activity_reporting_lookup(MagicMock())
+        return await lookup.venue_reports_guest_activity(
+            organization_id=uuid.uuid4(), location_id=uuid.uuid4()
+        )
+
+    async def test_an_aruba_venue_with_no_interims_cannot_report(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_integration(monkeypatch, None, nas_only=True)
+        asked = _install_observed_activity(monkeypatch, reported=False)
+        assert await self._ask() is False
+        assert len(asked) == 1
+
+    async def test_an_aruba_venue_whose_aps_send_interims_keeps_the_idle_rule(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_integration(monkeypatch, None, nas_only=True)
+        _install_observed_activity(monkeypatch, reported=True)
+        assert await self._ask() is True
+
+    async def test_a_mikrotik_venue_is_not_observed_at_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The NAS-only question is asked, answers no, and the observation
+        query is never run: the MikroTik answer is still the constant
+        ``True`` it always was."""
+        nas_asked = _install_integration(monkeypatch, None, nas_only=False)
+        asked = _install_observed_activity(monkeypatch, reported=False)
+        assert await self._ask() is True
+        assert len(nas_asked) == 1
+        assert asked == []
+
+    async def test_an_omada_venue_never_asks_the_nas_only_question(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        nas_asked = _install_integration(
+            monkeypatch, _Integration(ControllerAuthMode.OPENAPI.value)
+        )
+        _install_observed_activity(monkeypatch, reported=True)
+        assert await self._ask() is True
+        assert nas_asked == []
+
+    async def test_the_sweep_drops_the_idle_half_at_a_silent_aruba_venue(
+        self,
+    ) -> None:
+        """End to end through the sweep: the guest past the idle timeout but
+        inside the session ceiling stays ACTIVE (they are still online on the
+        AP), exactly as at a legacy Omada venue."""
+        fx = make_fixture()
+        idle = await _session(fx, "+15553330199", idle_for=45)
+
+        expired = await enforce_session_timeouts(
+            fx.repository, activity_reporting=_ActivityReporting(reports=False)
+        )
+
+        assert expired == []
+        assert idle.status == GuestSessionStatus.ACTIVE.value
+
+
+class TestTheNasOnlyRouterQuery:
+    """The real query, against a stand-in session: it asks for a live,
+    NAS-only fleet row at exactly this tenant's location."""
+
+    async def test_the_statement_and_the_answer(self) -> None:
+        from app.domains.router.vendor_capabilities import NAS_ONLY_VENDORS
+
+        seen: list = []
+
+        class _Result:
+            def __init__(self, row) -> None:
+                self._row = row
+
+            def first(self):
+                return self._row
+
+        class _Session:
+            def __init__(self, row) -> None:
+                self._row = row
+
+            async def execute(self, statement):
+                seen.append(statement)
+                return _Result(self._row)
+
+        org, loc = uuid.uuid4(), uuid.uuid4()
+        assert (
+            await client_hooks.location_has_nas_only_access_points(
+                _Session(None), organization_id=org, location_id=loc
+            )
+            is False
+        )
+        assert (
+            await client_hooks.location_has_nas_only_access_points(
+                _Session((uuid.uuid4(),)), organization_id=org, location_id=loc
+            )
+            is True
+        )
+        compiled = seen[0].compile(compile_kwargs={"literal_binds": True})
+        sql = str(compiled)
+        for vendor in NAS_ONLY_VENDORS:
+            assert f"'{vendor}'" in sql
+        assert "mikrotik" not in sql
+        assert "omada" not in sql
+        assert "is_deleted" in sql
+        assert str(loc).replace("-", "") in sql.replace("-", "")

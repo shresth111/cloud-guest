@@ -2381,6 +2381,14 @@ FUP_TIME_LIMIT_RULE_KEYS: dict[QuotaPeriodType, str] = {
 }
 
 
+def _min_present(*values: int | None) -> int | None:
+    """The smallest of ``values`` that is not ``None``, or ``None`` when all
+    are. For combining RADIUS time allowances, where absent means "no limit"
+    and must never be read as zero."""
+    present = [v for v in values if v is not None]
+    return min(present) if present else None
+
+
 def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | None:
     """Map an already-ended ``GuestSession`` to the coarse, guest-safe
     vocabulary the captive portal is allowed to see, or ``None`` when a
@@ -2502,6 +2510,19 @@ class RadiusAuthorizeResult:
     # or None when no queue_lookup hook is wired or the session has no
     # queue assignment -- see RadiusService.__init__'s own docstring.
     rate_limit: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NasOnlyAuthorizeStanding:
+    """``GuestService.nas_only_authorize_standing``'s answer.
+
+    ``refusal`` is a short machine reason (logged, never sent to the NAS)
+    when the session must be refused, else ``None``.
+    ``fup_time_remaining_seconds`` is the tightest FUP time allowance left,
+    for capping ``Session-Timeout``; ``None`` when no time limit applies."""
+
+    refusal: str | None
+    fup_time_remaining_seconds: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5720,7 +5741,31 @@ class GuestService:
             delta_bytes=total_delta_bytes,
             now=now,
         )
-        if is_quota_exceeded(updated):
+        session_cap_reached = is_quota_exceeded(updated)
+        if (
+            session_cap_reached or violated_fup_period is not None
+        ) and await self._session_is_on_nas_only_router(updated):
+            # NAS-only access point (Aruba Instant On): nothing can take this
+            # guest off the network mid-session -- no router API, no
+            # controller API, no CoA into the venue's NAT. Marking the row
+            # EXPIRED would show a guest who is still online as gone, and
+            # every later Interim-Update would land on a closed record. So
+            # the session stays ACTIVE until the AP itself ends it
+            # (Accounting-Stop, or Session-Timeout), and the breach is
+            # enforced where this platform CAN enforce it: the next portal
+            # sign-in (``_enforce_fup_quota``) and the next Access-Request
+            # (``RadiusService.authorize`` -> ``nas_only_authorize_standing``)
+            # are both refused. PM_SPEC (Aruba) §3.1 "BE requirement".
+            logger.info(
+                "guest_usage_cap_reached_nas_only_session_left_active",
+                extra={
+                    "session_id": str(updated.id),
+                    "session_data_limit_reached": session_cap_reached,
+                    "fup_period": violated_fup_period,
+                },
+            )
+            return updated
+        if session_cap_reached:
             updated = await self.repository.update_session(
                 updated,
                 {
@@ -5754,6 +5799,141 @@ class GuestService:
 
     def check_quota_exceeded(self, session: GuestSession) -> bool:
         return is_quota_exceeded(session)
+
+    async def _session_is_on_nas_only_router(self, session: GuestSession) -> bool:
+        """Whether ``session`` runs on a NAS-only access point. Asked only
+        after a cap was crossed, so the normal accounting path pays nothing.
+        A router that cannot be read answers ``False``: the vendor-agnostic
+        behaviour that applied before this question existed."""
+        try:
+            router = await self.router_lookup.get_router(
+                session.router_id, include_deleted=True
+            )
+        except Exception as exc:  # noqa: BLE001 -- fall back to prior behaviour
+            logger.warning(
+                "guest_usage_router_lookup_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return False
+        return is_nas_only(router)
+
+    async def nas_only_authorize_standing(
+        self, session: GuestSession
+    ) -> NasOnlyAuthorizeStanding:
+        """What ``RadiusService.authorize`` must know about ``session``
+        before it answers a NAS-only access point (Aruba Instant On).
+
+        At such a venue the RADIUS reply is the **only** enforcement point
+        this platform has: there is no router API, no controller API and no
+        CoA (the AP is behind NAT), so nothing can end a session once the
+        AP has admitted it. Two consequences, and this answers both:
+
+        * **A used-up allowance must refuse the next Access-Request.**
+          ``record_usage`` deliberately leaves a NAS-only session ``ACTIVE``
+          when a data cap is crossed (marking it ended would show a guest
+          who is still online as gone). So "this session is ACTIVE" is not
+          enough on its own: the session's own ``data_limit_mb``, the
+          guest's FUP data/time quotas and a team's shared quota are
+          checked here, through ``_enforce_fup_quota`` -- the same gate a
+          portal sign-in passes -- so the two can never disagree.
+        * **The daily time limit can only cut a guest off through
+          ``Session-Timeout``.** ``fup_time_remaining_seconds`` is the
+          smallest time allowance left across the guest's configured
+          periods, for the caller to cap ``Session-Timeout`` with. Whether
+          the AP honours ``Session-Timeout`` is hardware check V1 in the
+          Aruba spec; sending the right number is the half this platform
+          owns.
+
+        ``minutes_used`` is accrued by a five-minutely sweep, so the
+        remaining figure can be up to one sweep interval generous for a
+        guest who was already online. That is the conservative direction for
+        a number that ends someone's internet.
+
+        Never raises: a policy lookup that fails here admits the guest
+        (``refusal is None``) and sends no extra cap, because the portal
+        sign-in seconds earlier already ran the same gate, and an outage of
+        the policy tables must not become "nobody at the venue gets online".
+        """
+        if is_quota_exceeded(session):
+            return NasOnlyAuthorizeStanding(
+                refusal="session_data_limit_reached",
+                fup_time_remaining_seconds=None,
+            )
+        try:
+            await self._enforce_fup_quota(
+                guest_id=session.guest_id,
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+        except FairUsagePolicyExceededError as exc:
+            return NasOnlyAuthorizeStanding(
+                refusal=f"fup_{exc.metric}_quota_exhausted_{exc.period_type}",
+                fup_time_remaining_seconds=None,
+            )
+        except GuestTeamSharedQuotaExceededError:
+            return NasOnlyAuthorizeStanding(
+                refusal="team_shared_quota_exhausted",
+                fup_time_remaining_seconds=None,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "nas_only_authorize_fup_check_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return NasOnlyAuthorizeStanding(
+                refusal=None, fup_time_remaining_seconds=None
+            )
+        return NasOnlyAuthorizeStanding(
+            refusal=None,
+            fup_time_remaining_seconds=await self._fup_time_remaining_seconds(
+                session
+            ),
+        )
+
+    async def _fup_time_remaining_seconds(self, session: GuestSession) -> int | None:
+        """Seconds left of the guest's tightest FUP *time* allowance at this
+        session's location, or ``None`` when no time limit is configured (or
+        the answer cannot be read -- see ``nas_only_authorize_standing``).
+        Only ever called after ``_enforce_fup_quota`` passed, so every
+        configured period still has time left; ``max(..., 1)`` guards the
+        same sub-second edge ``_remaining_session_seconds`` does."""
+        if self.policy_lookup is None:
+            return None
+        try:
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.FUP,
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+                guest_id=session.guest_id,
+            )
+            time_limits = {
+                period_type: resolved.rules.get(rule_key)
+                for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items()
+            }
+            capped = [p for p, limit in time_limits.items() if limit]
+            if not capped:
+                return None
+            tz_name = await self.repository.get_organization_timezone(
+                session.organization_id
+            )
+            usages = await get_or_reset_quota_usages(
+                self.repository,
+                guest_id=session.guest_id,
+                organization_id=session.organization_id,
+                period_types=capped,
+                tz_name=tz_name,
+                now=datetime.now(UTC),
+            )
+            remaining_minutes = min(
+                time_limits[p] - usages[p].minutes_used for p in capped
+            )
+        except Exception as exc:  # noqa: BLE001 -- never raises, see caller
+            logger.warning(
+                "nas_only_authorize_fup_time_remaining_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
+        return max(int(remaining_minutes) * 60, 1)
 
     async def enforce_timeouts(self) -> list[GuestSession]:
         """See module docstring's "a reporting mechanism, not live
@@ -8137,6 +8317,28 @@ class RadiusService:
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
             session = None
+        # NAS-only access point (Aruba Instant On): this reply is the only
+        # enforcement point there is -- see ``nas_only_authorize_standing``.
+        # A used-up data or time allowance refuses here, and the tightest
+        # remaining time allowance caps Session-Timeout below. Every other
+        # vendor skips this block entirely and is byte-identical: a MikroTik
+        # or Omada session over its cap was already ended by
+        # ``record_usage``/the accrual sweep and never reaches this line.
+        fup_time_remaining_seconds: int | None = None
+        if session is not None and is_nas_only(router):
+            standing = await self.guest_service.nas_only_authorize_standing(session)
+            if standing.refusal is not None:
+                logger.info(
+                    "radius_authorize_quota_exhausted",
+                    extra={
+                        **decision_extra,
+                        "event_session_id": str(session.id),
+                        "event_refusal": standing.refusal,
+                    },
+                )
+                session = None
+            else:
+                fup_time_remaining_seconds = standing.fup_time_remaining_seconds
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -8179,7 +8381,13 @@ class RadiusService:
             # sub-second race between that check and this line, since a
             # NAS given `Session-Timeout: 0` may treat it as unlimited --
             # failing open on exactly the session we mean to end.
-            session_timeout_seconds=self._remaining_session_seconds(session),
+            #
+            # At a NAS-only venue it is also capped by the guest's remaining
+            # FUP time allowance (the daily limit), because Session-Timeout is
+            # the one way that limit can reach a device there.
+            session_timeout_seconds=_min_present(
+                self._remaining_session_seconds(session), fup_time_remaining_seconds
+            ),
             # The FULL configured idle allowance, every time -- see the
             # field's own comment for why this is deliberately not the
             # "remaining" treatment its neighbour above gets.
