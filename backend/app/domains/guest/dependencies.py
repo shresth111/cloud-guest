@@ -276,6 +276,9 @@ def get_radius_service(
         # NetLogs: one row per Authorize verdict, in this request's own
         # transaction (SAVEPOINT; never fails the verdict).
         radius_event_recorder=RadiusEventRecorder(db, get_settings()),
+        bandwidth_attribute_router_ids=(
+            get_settings().radius_bandwidth_attribute_router_id_set
+        ),
     )
 
 

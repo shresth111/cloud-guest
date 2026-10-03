@@ -311,6 +311,14 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "The public address of routers that already exported flow records, "
         "for the IPDR's derived Translated IP. Rows are decided by "
         "traffic_flow_records; nothing is polled, pushed or judged."
+    # -- network integration ------------------------------------------------
+    "app/domains/network_integration/client_hooks.py::location_has_nas_only_access_points": (  # noqa: E501
+        "A vendor question, not a fleet count: it asks whether this location "
+        "has a live NAS-only row (Aruba Instant On), filtering on "
+        "`vendor IN NAS_ONLY_VENDORS` itself. Narrowing it to agent-managed "
+        "rows would remove exactly the rows it exists to find. Its answer "
+        "only decides whether the idle sweep observes `last_activity_at` "
+        "instead of assuming it moves; it feeds no device work."
     ),
     # -- security -----------------------------------------------------------
     "app/domains/security/repository.py::SecurityRepository.fleet_counts": (

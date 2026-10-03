@@ -895,6 +895,68 @@ def _connection_config(
     )
 
 
+def _activity_window_minutes() -> int:
+    """``VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES``, imported at call time for
+    the reason this module's own docstring gives about the direction of the
+    guest edge."""
+    from app.domains.guest.constants import (  # noqa: PLC0415
+        VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
+    )
+
+    return VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES
+
+
+async def _activity_was_reported(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID,
+) -> bool:
+    """Has anything moved ``last_activity_at`` at this venue inside the
+    reporting window? The observation half of
+    ``build_controller_activity_reporting_lookup`` -- see its docstring."""
+    from app.domains.guest.repository import GuestRepository  # noqa: PLC0415
+
+    since = datetime.now(UTC) - timedelta(minutes=_activity_window_minutes())
+    return await GuestRepository(session).venue_activity_was_reported_since(
+        organization_id=organization_id,
+        location_id=location_id,
+        since=since,
+    )
+
+
+async def location_has_nas_only_access_points(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID,
+) -> bool:
+    """Whether a live fleet row at this location is a NAS-only vendor
+    (``vendor_capabilities.NAS_ONLY_VENDORS`` -- Aruba Instant On).
+
+    One indexed read, asked only for a venue with no controller integration
+    and memoized per venue per sweep run by the caller. Module-level so a
+    test can stand it in without a database."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.domains.router.models import Router  # noqa: PLC0415
+    from app.domains.router.vendor_capabilities import (  # noqa: PLC0415
+        NAS_ONLY_VENDORS,
+    )
+
+    statement = (
+        select(Router.id)
+        .where(
+            Router.organization_id == organization_id,
+            Router.location_id == location_id,
+            Router.vendor.in_(sorted(NAS_ONLY_VENDORS)),
+            Router.is_deleted.is_(False),
+        )
+        .limit(1)
+    )
+    return (await session.execute(statement)).first() is not None
+
+
 def build_controller_activity_reporting_lookup(session: AsyncSession):
     """Whether a venue can report that its guests are still using the
     network, bound to ``session``.
@@ -1007,7 +1069,27 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
                 location_id=location_id, organization_id=organization_id
             )
             if integration is None:
-                return True
+                if not await location_has_nas_only_access_points(
+                    session,
+                    organization_id=organization_id,
+                    location_id=location_id,
+                ):
+                    return True
+                # A NAS-only venue (Aruba Instant On) has no integration row
+                # either, but it is NOT the MikroTik premise: whether its
+                # access points send Interim-Updates at all is unmeasured
+                # (Instant On exposes no interim setting; Aruba spec check
+                # V3). Without them ``last_activity_at`` never moves, so the
+                # idle rule would expire every guest at the idle timeout
+                # while they are still online -- and nothing can reconnect
+                # or disconnect them there, so the Guests screen would lie.
+                # Observe the column instead of assuming it, exactly as an
+                # Open API controller venue is observed below.
+                return await _activity_was_reported(
+                    session,
+                    organization_id=organization_id,
+                    location_id=location_id,
+                )
             credentials: dict[str, str] = {}
             if integration.credentials_encrypted:
                 try:
@@ -1033,21 +1115,9 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
                 # Question 1: this venue can never report. No observation
                 # needed, and none would be meaningful.
                 return False
-            # Question 2: it can -- but is it? Imported here rather than at
-            # module scope for the reason this module's own docstring gives
-            # about the direction of the guest edge.
-            from app.domains.guest.constants import (  # noqa: PLC0415
-                VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
-            )
-            from app.domains.guest.repository import GuestRepository  # noqa: PLC0415
-
-            since = datetime.now(UTC) - timedelta(
-                minutes=VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES
-            )
-            reported = await GuestRepository(session).venue_activity_was_reported_since(
-                organization_id=organization_id,
-                location_id=location_id,
-                since=since,
+            # Question 2: it can -- but is it?
+            reported = await _activity_was_reported(
+                session, organization_id=organization_id, location_id=location_id
             )
             if not reported:
                 # Worth a line: the capability says this controller can be
@@ -1060,7 +1130,7 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
                     extra={
                         "integration_id": str(integration.id),
                         "location_id": str(location_id),
-                        "window_minutes": VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
+                        "window_minutes": _activity_window_minutes(),
                     },
                 )
             return reported
