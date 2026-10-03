@@ -947,6 +947,12 @@ class ArubaSharedListenerView(BaseModel):
     Gap codes: ``listener_not_installed`` (no agent URL on this deployment),
     ``shared_secret_not_set``, ``hub_not_confirmed``, ``nas_not_registered``,
     ``no_ap_mac``, ``radius_server_address_not_configured``.
+
+    ``no_ap_mac`` also covers a placeholder: a site added without its AP's
+    MAC carries a minted, locally administered one (``routers.mac_address``
+    is NOT NULL). Then ``ap_mac`` is None and ``ap_mac_placeholder`` is true,
+    so the panel can say "record the AP's real MAC" instead of showing a MAC
+    no access point will ever present.
     """
 
     available: bool
@@ -955,6 +961,7 @@ class ArubaSharedListenerView(BaseModel):
     accounting_port: int
     nas_identifier: str
     ap_mac: str | None = None
+    ap_mac_placeholder: bool = False
     secret_configured: bool = False
     secret_fingerprint: str | None = None
     secret_length: int | None = None
