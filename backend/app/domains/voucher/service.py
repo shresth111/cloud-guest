@@ -690,6 +690,14 @@ class VoucherService:
             raise CrossOrganizationVoucherPlanAccessError()
         return plan
 
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None:
+        """The redeemed voucher behind a guest session, by the id the session
+        copied at login (``GuestSession.voucher_id``). Read by
+        ``GuestService.nas_only_authorize_standing``: at a NAS-only venue the
+        RADIUS reply is the only way a voucher's own ``expires_at`` (or a
+        batch revocation) can reach a guest who is already online."""
+        return await self.repository.get_voucher_by_id(voucher_id)
+
     async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
         """The single, narrow read ``app.domains.guest.service.GuestService
         ._assign_voucher_queue`` needs -- see that method's own docstring
