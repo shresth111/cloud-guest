@@ -1,3 +1,4 @@
+import uuid
 from functools import lru_cache
 from pathlib import Path
 
@@ -407,6 +408,58 @@ class Settings(BaseSettings):
             "and fail-closed rules."
         ),
     )
+    radius_bandwidth_attribute_router_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated router UUIDs of NAS-only access points (Aruba "
+            "Instant On) whose RADIUS Access-Accept should carry "
+            "WISPr-Bandwidth-Max-Down/-Up (vendor 14122, bits/s) from the "
+            "guest's resolved BANDWIDTH policy. An EXPERIMENT GATE, not a "
+            "feature flag: no Aruba documentation says Instant On honours "
+            "these attributes, so they are only sent to the routers named "
+            "here while a hardware measurement decides. Empty (the default) "
+            "sends nothing to anyone. Ignored for every non-NAS-only router, "
+            "so MikroTik and Omada replies are unaffected whatever it holds. "
+            "Deliberately an environment setting and not a routers.settings "
+            "key: routers.settings is writable by a venue owner through "
+            "PUT /routers/{id}. A plain comma-separated string rather than "
+            "list[str] for the reason platform_alert_emails gives; validated "
+            "at startup so a typo stops the process instead of silently "
+            "matching nothing. Override via "
+            "CLOUDGUEST_RADIUS_BANDWIDTH_ATTRIBUTE_ROUTER_IDS."
+        ),
+    )
+
+    @field_validator("radius_bandwidth_attribute_router_ids")
+    @classmethod
+    def _normalize_radius_bandwidth_attribute_router_ids(cls, value: str) -> str:
+        """Lower-cased canonical UUIDs, de-duplicated, order-preserving --
+        naming the offending token on a typo."""
+        ids: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            try:
+                normalized = str(uuid.UUID(candidate))
+            except ValueError as exc:
+                raise ValueError(
+                    "radius_bandwidth_attribute_router_ids: "
+                    f"{candidate!r} is not a UUID"
+                ) from exc
+            if normalized not in ids:
+                ids.append(normalized)
+        return ",".join(ids)
+
+    @property
+    def radius_bandwidth_attribute_router_id_set(self) -> frozenset[uuid.UUID]:
+        """``radius_bandwidth_attribute_router_ids`` parsed, for
+        ``RadiusService``'s constructor."""
+        return frozenset(
+            uuid.UUID(token)
+            for token in self.radius_bandwidth_attribute_router_ids.split(",")
+            if token
+        )
     # ------------------------------------------------------------------
     # WHAT THE DEPLOYED HUB AGENT CAN ACTUALLY DO.
     #
