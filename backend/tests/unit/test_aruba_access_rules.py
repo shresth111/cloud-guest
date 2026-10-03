@@ -544,3 +544,105 @@ class TestBlockingAnOnlineGuestAtANasOnlyVenue:
         )
         assert outcome.ended_cleanly is True
         assert len(reached) == 1
+
+
+# ============================================================================
+# Open Hours -- sign-in AND Session-Timeout
+# ============================================================================
+
+_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+def _noon_somewhere() -> tuple[str, datetime]:
+    """A fixed-offset zone where it is roughly midday right now, so a window
+    that closes 30 minutes from now never wraps past midnight whatever time
+    the suite runs. ``Etc/GMT-N`` is UTC+N (POSIX sign convention)."""
+    from zoneinfo import ZoneInfo
+
+    utc_hour = datetime.now(UTC).hour
+    offset = (12 - utc_hour) % 24
+    if offset > 14:
+        offset -= 24
+    name = "Etc/GMT" + (f"-{offset}" if offset > 0 else f"+{-offset}" if offset else "")
+    return name, datetime.now(ZoneInfo(name))
+
+
+def _open_until(fx, minutes_from_now: int) -> None:  # noqa: ANN001
+    from datetime import timedelta
+
+    zone, local = _noon_somewhere()
+    end = (local + timedelta(minutes=minutes_from_now)).strftime("%H:%M")
+    config = fx.captive_portal_service.configs_by_org[fx.organization_id]
+    config.business_hours_enabled = True
+    config.business_hours_timezone = zone
+    config.business_hours_schedule = {
+        _WEEKDAYS[local.weekday()]: {"open": True, "start": "00:00", "end": end}
+    }
+
+
+class TestOpenHours:
+    async def test_session_timeout_is_capped_at_closing_time(self) -> None:
+        fx = _fixture()
+        _open_until(fx, 30)
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.authorized is True
+        # closes at the END of the minute 30 minutes from now
+        assert 29 * 60 <= authz.session_timeout_seconds <= 31 * 60
+
+    async def test_a_venue_that_has_closed_refuses_the_access_request(self) -> None:
+        fx = _fixture()
+        nas = await _register_nas(fx)
+        result = await _sign_in(fx)
+        _shut_the_venue(fx)
+
+        assert (await _authorize(fx, nas)).authorized is False
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_a_mikrotik_nas_is_unchanged_by_open_hours(self) -> None:
+        fx = _fixture(vendor="mikrotik")
+        _open_until(fx, 30)
+        nas = await _register_nas(fx)
+        await _sign_in(fx)
+        authz = await _authorize(fx, nas)
+        assert authz.session_timeout_seconds > 31 * 60
+
+        _shut_the_venue(fx)
+        assert (await _authorize(fx, nas)).authorized is True
+
+
+class TestSecondsUntilClosing:
+    def _at(self, hhmm: str) -> datetime:
+        h, m = (int(x) for x in hhmm.split(":"))
+        # 2026-10-05 is a Monday
+        return datetime(2026, 10, 5, h, m, 0, tzinfo=UTC)
+
+    def _call(self, now: datetime, schedule: dict, enabled: bool = True):  # noqa: ANN202
+        from app.domains.captive_portal.validators import seconds_until_closing
+
+        return seconds_until_closing(
+            enabled=enabled, timezone="UTC", schedule=schedule, now=now
+        )
+
+    def test_counts_to_the_end_of_the_closing_minute(self) -> None:
+        schedule = {"monday": {"open": True, "start": "09:00", "end": "18:00"}}
+        assert self._call(self._at("17:00"), schedule) == 3660
+
+    def test_none_when_hours_are_off(self) -> None:
+        assert self._call(self._at("17:00"), {}, enabled=False) is None
+
+    def test_none_when_already_closed(self) -> None:
+        schedule = {"monday": {"open": True, "start": "09:00", "end": "18:00"}}
+        assert self._call(self._at("19:00"), schedule) is None
+        assert self._call(self._at("17:00"), {"monday": {"open": False}}) is None

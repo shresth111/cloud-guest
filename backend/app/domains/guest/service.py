@@ -254,7 +254,11 @@ from app.domains.auth.password import (
     PasswordVerificationError,
 )
 from app.domains.captive_portal.service import ResolvedPortalConfig
-from app.domains.captive_portal.validators import compute_terms_version, is_open_now
+from app.domains.captive_portal.validators import (
+    compute_terms_version,
+    is_open_now,
+    seconds_until_closing,
+)
 from app.domains.guest_access.exceptions import (
     GuestAccessDeniedError,
     WhitelistOnlyAccessDeniedError,
@@ -2518,11 +2522,12 @@ class NasOnlyAuthorizeStanding:
 
     ``refusal`` is a short machine reason (logged, never sent to the NAS)
     when the session must be refused, else ``None``.
-    ``fup_time_remaining_seconds`` is the tightest FUP time allowance left,
-    for capping ``Session-Timeout``; ``None`` when no time limit applies."""
+    ``session_timeout_cap_seconds`` is the tightest of the guest's remaining
+    FUP time allowance and the time until the venue's Open Hours close, for
+    capping ``Session-Timeout``; ``None`` when neither applies."""
 
     refusal: str | None
-    fup_time_remaining_seconds: int | None
+    session_timeout_cap_seconds: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5836,13 +5841,14 @@ class GuestService:
           guest's FUP data/time quotas and a team's shared quota are
           checked here, through ``_enforce_fup_quota`` -- the same gate a
           portal sign-in passes -- so the two can never disagree.
-        * **The daily time limit can only cut a guest off through
-          ``Session-Timeout``.** ``fup_time_remaining_seconds`` is the
-          smallest time allowance left across the guest's configured
-          periods, for the caller to cap ``Session-Timeout`` with. Whether
-          the AP honours ``Session-Timeout`` is hardware check V1 in the
-          Aruba spec; sending the right number is the half this platform
-          owns.
+        * **Time limits can only cut a guest off through
+          ``Session-Timeout``.** ``session_timeout_cap_seconds`` is the
+          smaller of the time left in the guest's FUP time allowance (the
+          daily limit) and the time until the venue's Open Hours close, for
+          the caller to cap ``Session-Timeout`` with. A venue that is closed
+          right now refuses, as the portal sign-in already does. Whether the
+          AP honours ``Session-Timeout`` is hardware check V1 in the Aruba
+          spec; sending the right number is the half this platform owns.
 
         ``minutes_used`` is accrued by a five-minutely sweep, so the
         remaining figure can be up to one sweep interval generous for a
@@ -5857,7 +5863,7 @@ class GuestService:
         if is_quota_exceeded(session):
             return NasOnlyAuthorizeStanding(
                 refusal="session_data_limit_reached",
-                fup_time_remaining_seconds=None,
+                session_timeout_cap_seconds=None,
             )
         try:
             await self._enforce_fup_quota(
@@ -5868,12 +5874,12 @@ class GuestService:
         except FairUsagePolicyExceededError as exc:
             return NasOnlyAuthorizeStanding(
                 refusal=f"fup_{exc.metric}_quota_exhausted_{exc.period_type}",
-                fup_time_remaining_seconds=None,
+                session_timeout_cap_seconds=None,
             )
         except GuestTeamSharedQuotaExceededError:
             return NasOnlyAuthorizeStanding(
                 refusal="team_shared_quota_exhausted",
-                fup_time_remaining_seconds=None,
+                session_timeout_cap_seconds=None,
             )
         except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
             logger.warning(
@@ -5881,13 +5887,47 @@ class GuestService:
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
             return NasOnlyAuthorizeStanding(
-                refusal=None, fup_time_remaining_seconds=None
+                refusal=None, session_timeout_cap_seconds=None
+            )
+        open_hours = await self._open_hours_standing(session)
+        if open_hours == "closed":
+            return NasOnlyAuthorizeStanding(
+                refusal="venue_closed", session_timeout_cap_seconds=None
             )
         return NasOnlyAuthorizeStanding(
             refusal=None,
-            fup_time_remaining_seconds=await self._fup_time_remaining_seconds(
-                session
+            session_timeout_cap_seconds=_min_present(
+                await self._fup_time_remaining_seconds(session),
+                open_hours,
             ),
+        )
+
+    async def _open_hours_standing(self, session: GuestSession) -> int | str | None:
+        """``"closed"`` when this session's venue is outside its Open Hours
+        right now, else the seconds until it closes, else ``None`` (no Open
+        Hours, or the config cannot be read -- the forgiving direction
+        ``_require_venue_open`` documents)."""
+        try:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+            config = resolved.config
+            enabled = bool(config.business_hours_enabled)
+            timezone = config.business_hours_timezone
+            schedule = config.business_hours_schedule or {}
+        except Exception as exc:  # noqa: BLE001 -- never raises, see caller
+            logger.warning(
+                "nas_only_authorize_open_hours_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
+        if not enabled:
+            return None
+        if not is_open_now(enabled=enabled, timezone=timezone, schedule=schedule):
+            return "closed"
+        return seconds_until_closing(
+            enabled=enabled, timezone=timezone, schedule=schedule
         )
 
     async def _fup_time_remaining_seconds(self, session: GuestSession) -> int | None:
@@ -8319,12 +8359,13 @@ class RadiusService:
             session = None
         # NAS-only access point (Aruba Instant On): this reply is the only
         # enforcement point there is -- see ``nas_only_authorize_standing``.
-        # A used-up data or time allowance refuses here, and the tightest
-        # remaining time allowance caps Session-Timeout below. Every other
+        # A used-up data or time allowance, or a closed venue, refuses here;
+        # the remaining time allowance and the time until closing cap
+        # Session-Timeout below. Every other
         # vendor skips this block entirely and is byte-identical: a MikroTik
         # or Omada session over its cap was already ended by
         # ``record_usage``/the accrual sweep and never reaches this line.
-        fup_time_remaining_seconds: int | None = None
+        session_timeout_cap_seconds: int | None = None
         if session is not None and is_nas_only(router):
             standing = await self.guest_service.nas_only_authorize_standing(session)
             if standing.refusal is not None:
@@ -8338,7 +8379,7 @@ class RadiusService:
                 )
                 session = None
             else:
-                fup_time_remaining_seconds = standing.fup_time_remaining_seconds
+                session_timeout_cap_seconds = standing.session_timeout_cap_seconds
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -8383,10 +8424,11 @@ class RadiusService:
             # failing open on exactly the session we mean to end.
             #
             # At a NAS-only venue it is also capped by the guest's remaining
-            # FUP time allowance (the daily limit), because Session-Timeout is
-            # the one way that limit can reach a device there.
+            # FUP time allowance (the daily limit) and by the time until the
+            # venue's Open Hours close, because Session-Timeout is the one way
+            # either can reach a device there.
             session_timeout_seconds=_min_present(
-                self._remaining_session_seconds(session), fup_time_remaining_seconds
+                self._remaining_session_seconds(session), session_timeout_cap_seconds
             ),
             # The FULL configured idle allowance, every time -- see the
             # field's own comment for why this is deliberately not the

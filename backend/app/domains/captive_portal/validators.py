@@ -8,6 +8,7 @@ service layer calls before touching the database.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import uuid
 from datetime import datetime, time
@@ -595,7 +596,42 @@ def is_open_now(
     return start_t <= moment.time() <= end_t
 
 
+def seconds_until_closing(
+    *, enabled: bool, timezone: str, schedule: dict, now: datetime | None = None
+) -> int | None:
+    """Seconds from ``now`` until today's Open Hours window ends, or ``None``
+    when there is no closing time to count down to: business hours off, or
+    the venue is not open right now (the caller refuses a closed venue on
+    its own, through ``is_open_now``). Same parsing and the same forgiving
+    failure direction as ``is_open_now`` -- a row it cannot read yields
+    ``None``, "no cap", never an exception.
+
+    A schedule has no overnight windows (``validate_business_hours_schedule``
+    refuses them), so "today's end" is always later today. ``end`` is read
+    as the end of that minute, matching ``is_open_now``'s inclusive
+    ``<= end``."""
+    if not enabled:
+        return None
+    if not is_open_now(enabled=enabled, timezone=timezone, schedule=schedule, now=now):
+        return None
+    try:
+        zone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo("UTC")
+    moment = (now or datetime.now(zone)).astimezone(zone)
+    entry = schedule.get(_WEEKDAYS[moment.weekday()]) or {}
+    try:
+        end_t = time.fromisoformat(entry.get("end"))
+    except (TypeError, ValueError):
+        return None
+    closes_at = moment.replace(
+        hour=end_t.hour, minute=end_t.minute, second=59, microsecond=999999
+    )
+    return max(math.ceil((closes_at - moment).total_seconds()), 1)
+
+
 __all__ = [
+    "seconds_until_closing",
     "validate_hex_color",
     "validate_single_content_source",
     "validate_review_url",
