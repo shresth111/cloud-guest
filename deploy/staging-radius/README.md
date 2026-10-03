@@ -47,3 +47,20 @@ The staging instance shares `wyfy-app-sg` (`sg-04cb10156254e1690`) with the **pr
 app server, so UDP 1812/1813 must NOT be opened on that group. Use a separate
 staging-only group with the venue /32 and attach it to the staging instance as
 an extra group (commands in `~/wyfy-ops/aruba-ap21/STAGING_RADIUS.md`).
+
+## RadSec (RADIUS over TLS, TCP 2083)
+Service `radsec` (`Dockerfile.radsec`, FreeRADIUS 3.2.8: `check_client_connections`
+never answers the first request on 3.2.1-3.2.5). A venue is identified by its TLS
+client certificate, not its source address, so CGNAT / dynamic-IP venues work:
+`Autz-Type New-TLS-Connection` maps (leaf CN, issuer) through
+`radsec/state/radsec-map` to a NAS shortname + backend secret and pins it to the
+TCP connection; requests on it get the same `X-RADIUS-NAS-*` headers as UDP.
+Server cert = certbot's `staging.wyfyguest.com` (renewal hook installed). Trust =
+the on-box test CA + `radsec/trust.d/*.pem`.
+
+```bash
+~/wyfy-ops/ssm-run-on.sh i-0a6a08bb87c6f0f84 deploy/staging-radius/radsec-selftest.sh   # R1-R6 (+R7 with E2E_ROUTER_ID)
+sudo deploy/staging-radius/radsec-map.sh list                                           # on the box
+sudo DURATION=600 deploy/staging-radius/radsec-capture.sh                               # discover an unknown device's chain
+```
+TCP 2083 is NOT open in any security group; see `~/wyfy-ops/aruba-ap21/STAGING_RADSEC.md`.
