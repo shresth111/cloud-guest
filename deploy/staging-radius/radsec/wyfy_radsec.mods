@@ -1,0 +1,48 @@
+# STAGING ONLY. mods-enabled/wyfy_radsec for the RadSec (RADIUS/TLS) listener.
+#
+# Identity model: a RadSec client is NOT identified by its source address
+# (the whole point: venues behind CGNAT / dynamic IPs). The TLS listener
+# verifies the client certificate against trust.pem, then
+# `Autz-Type New-TLS-Connection` (policy wyfy_radsec_new_connection) looks
+# the certificate up in the map below and pins the result to the TCP
+# connection in wyfy_radsec_conn. Every RADIUS request on that connection
+# reads it back (policy wyfy_radsec_identify).
+
+# The map: one line per enrolled certificate, '|'-separated
+#   <leaf CN>|<nas shortname>|<backend secret>|<issuer DN, OpenSSL compat form>
+# Written by radsec-map.sh (or, later, the hub agent). 0640, never printed.
+# rlm_passwd reads it at start-up only: a change needs a radiusd restart.
+passwd wyfy_radsec_map {
+	filename = /var/lib/wyfy-radsec/radsec-map
+	format = "*Tmp-String-7:Tmp-String-8:Tmp-String-9:Tmp-String-6"
+	delimiter = "|"
+	hash_size = 256
+	ignore_nislike = yes
+	ignore_empty = yes
+	allow_multiple_keys = no
+}
+
+# Per-connection identity. Keyed by the TCP peer (ip:port), which is
+# constant for the life of one TLS connection. A later connection that
+# reuses the same ip:port always runs New-TLS-Connection first, which
+# overwrites the entry (Cache-TTL := 0) or kills the connection, so a
+# stale entry can never be read by a different certificate.
+cache wyfy_radsec_conn {
+	driver = "rlm_cache_rbtree"
+	key = "%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}}:%{Packet-Src-Port}"
+	ttl = 604800
+	max_entries = 4096
+	update control {
+		&Tmp-String-8 := &control:Tmp-String-8
+		&Tmp-String-9 := &control:Tmp-String-9
+	}
+}
+
+# One line per TLS connection attempt that got past certificate
+# verification: who it was and what we decided. No secrets.
+linelog wyfy_radsec_log {
+	destination = file
+	filename = /var/lib/wyfy-radsec/connections.log
+	permissions = 0644
+	format = "%S radsec-connection src=%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}}:%{Packet-Src-Port} verdict=%{%{control:Tmp-String-4}:-?} nas=%{%{control:Tmp-String-8}:-none} cn=\"%{Tmp-String-7}\" issuer=\"%{Tmp-String-5}\" subject=\"%{Tmp-String-3}\" serial=%{Tmp-String-2}"
+}

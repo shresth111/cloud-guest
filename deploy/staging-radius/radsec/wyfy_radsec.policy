@@ -1,0 +1,76 @@
+# STAGING ONLY. policy.d/wyfy_radsec -- see mods-enabled/wyfy_radsec.
+
+#  Autz-Type New-TLS-Connection: runs once per TLS connection, after the
+#  certificate chain verified against trust.pem. The request holds only
+#  TLS-Client-Cert-* attributes, one set per chain element, root first,
+#  so the LAST value of each is the leaf's. Return ok = keep the
+#  connection; anything else = FreeRADIUS closes it.
+wyfy_radsec_new_connection {
+	foreach &TLS-Client-Cert-Common-Name {
+		update request {
+			Tmp-String-7 := "%{Foreach-Variable-0}"
+		}
+	}
+	foreach &TLS-Client-Cert-Issuer {
+		update request {
+			Tmp-String-5 := "%{Foreach-Variable-0}"
+		}
+	}
+	foreach &TLS-Client-Cert-Subject {
+		update request {
+			Tmp-String-3 := "%{Foreach-Variable-0}"
+		}
+	}
+	foreach &TLS-Client-Cert-Serial {
+		update request {
+			Tmp-String-2 := "%{Foreach-Variable-0}"
+		}
+	}
+	if (!&Tmp-String-7) {
+		update control {
+			Tmp-String-4 := "reject-no-cn"
+		}
+		wyfy_radsec_log
+		reject
+	}
+	wyfy_radsec_map
+	if (!&control:Tmp-String-8 || !&control:Tmp-String-9) {
+		update control {
+			Tmp-String-4 := "reject-not-enrolled"
+		}
+		wyfy_radsec_log
+		reject
+	}
+	#  The CN is only unique within one issuer. Bind it to the issuer it
+	#  was enrolled with, so a certificate from another trusted CA that
+	#  happens to carry the same CN cannot take this venue's identity.
+	if (&control:Tmp-String-6 != &Tmp-String-5) {
+		update control {
+			Tmp-String-4 := "reject-issuer-mismatch"
+			Tmp-String-8 !* ANY
+			Tmp-String-9 !* ANY
+		}
+		wyfy_radsec_log
+		reject
+	}
+	update control {
+		Cache-TTL := 0
+		Tmp-String-4 := "accept"
+	}
+	wyfy_radsec_conn
+	wyfy_radsec_log
+	ok
+}
+
+#  Every Access-Request / Accounting-Request on a RadSec connection.
+wyfy_radsec_identify {
+	update control {
+		Cache-Read-Only := yes
+		Tmp-String-8 !* ANY
+		Tmp-String-9 !* ANY
+	}
+	wyfy_radsec_conn
+	if (!&control:Tmp-String-8 || !&control:Tmp-String-9) {
+		reject
+	}
+}
