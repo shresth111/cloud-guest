@@ -73,6 +73,7 @@ from .aruba_shared import (
     ArubaSharedSecretStore,
     canonical_mac,
     log_rejection,
+    recorded_ap_mac,
     resolve_shared_nas,
     rotate_shared_secret,
     would_be_nas_identifier,
@@ -2526,7 +2527,14 @@ async def _shared_listener_view(
         gaps.append("hub_not_confirmed")
     if nas_client is None:
         gaps.append("nas_not_registered")
-    ap_mac = canonical_mac(getattr(router, "mac_address", None))
+    ap_mac = recorded_ap_mac(router)
+    # ``routers.mac_address`` is NOT NULL: a site added without its AP's MAC
+    # carries a minted, locally administered one. Say so, rather than show
+    # it as the MAC the AP must present (no real AP ever will).
+    ap_mac_placeholder = (
+        ap_mac is None
+        and canonical_mac(getattr(router, "mac_address", None)) is not None
+    )
     if ap_mac is None:
         gaps.append("no_ap_mac")
     server = _shared_radius_server_view()
@@ -2543,6 +2551,7 @@ async def _shared_listener_view(
             else would_be_nas_identifier(router.id)
         ),
         ap_mac=ap_mac,
+        ap_mac_placeholder=ap_mac_placeholder,
         secret_configured=state.configured,
         secret_fingerprint=state.fingerprint,
         secret_length=state.length,
@@ -2657,10 +2666,20 @@ async def register_shared_radius_nas(
     Idempotent: a device that already has a NAS row (registered by public
     IP, say) keeps it -- its identifier works on both listeners at once.
     Refused unless the device has a recorded AP MAC: without one there is
-    nothing to bind the packets to.
+    nothing to bind the packets to. The minted, locally administered MAC a
+    site added without one carries (``routers.mac_address`` is NOT NULL)
+    counts as none -- no real AP would ever present it.
     """
     router = await _nas_only_router(service, router_id)
-    if canonical_mac(getattr(router, "mac_address", None)) is None:
+    if recorded_ap_mac(router) is None:
+        if canonical_mac(getattr(router, "mac_address", None)) is not None:
+            raise PublicNasRegistrationRefusedError(
+                "This device's MAC address on record is a placeholder the "
+                "platform generated when the site was added without one, not "
+                "the access point's real MAC. The shared Aruba listener "
+                "identifies a venue by NAS-Identifier AND the AP MAC, so "
+                "record the AP's real MAC on the device first."
+            )
         raise PublicNasRegistrationRefusedError(
             "This device has no AP MAC address on record. The shared Aruba "
             "listener identifies a venue by NAS-Identifier AND the access "
@@ -3459,6 +3478,27 @@ async def radius_aruba_shared_accounting(
     except ArubaSharedRequestRejected as exc:
         log_rejection(exc, kind="accounting")
         raise RadiusNasAuthenticationError() from None
+    if payload.status_type in (
+        RADIUS_ACCT_STATUS_ACCOUNTING_ON,
+        RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
+    ):
+        # Accounting-On/Off closes EVERY active session of the NAS. On this
+        # listener the only credentials are the RADIUS secret every Aruba
+        # customer holds plus a NAS-Identifier and AP MAC that are not
+        # secret, so honouring it would let any customer log out a whole
+        # other venue with one packet. Acknowledged, logged, and nothing
+        # closed: an AP reboot's stale sessions end by their own timeout
+        # (or the venue's next Stop) instead.
+        logger.warning(
+            "radius_aruba_shared_nas_event_ignored",
+            extra={
+                "status_type": payload.status_type,
+                "nas_identifier": getattr(nas_client, "nas_identifier", None),
+            },
+        )
+        return RadiusAccountingResponse(
+            session_id=None, status=payload.status_type, closed_session_count=0
+        )
     return await _radius_accounting(payload, nas_client, service)
 
 

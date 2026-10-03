@@ -24,9 +24,18 @@ FreeRADIUS forwards, as headers, the shared client's ``backend_secret``, the
 packet's ``NAS-Identifier`` and its ``Called-Station-Id``. This module turns
 those into a NAS row, or a logged refusal:
 
-1. the header secret must equal the platform's stored Aruba shared secret
-   (constant-time) -- proof the packet came through the shared listener and
-   passed its Message-Authenticator check;
+1. the header secret must equal the shared listener's HUB-ONLY backend
+   secret (constant-time) -- proof the packet came through the shared
+   listener and passed its Message-Authenticator check. It is NOT the
+   RADIUS shared secret: that one is typed into every Aruba customer's
+   Instant On profile, so it is known to every customer and cannot be an
+   HTTP credential (review of #342: a direct HTTPS POST with it and forged
+   NAS-ID / Called-Station-Id headers was answered). The backend secret is
+   ``backend_secret_for(radius_secret, hub agent secret)``: an HMAC keyed
+   with the hub agent secret, which only the backend and the hub hold. The
+   agent derives and writes it (``radius_agent.set_shared_secret``); the
+   backend derives it again to compare. Nothing new is stored, and rotating
+   the RADIUS secret rotates it too;
 2. ``NAS-Identifier`` must name an ACTIVE NAS row whose router is an
    ``aruba_instant_on`` fleet row -- no MikroTik or Omada NAS can ever be
    reached through this listener;
@@ -41,6 +50,8 @@ and returned exactly once. Only its fingerprint is ever shown again.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import re
 import secrets
@@ -79,6 +90,10 @@ CALLED_STATION_ID_HEADER = "X-RADIUS-Called-Station-Id"
 #: ``register_public_radius_nas`` / ``register_shared_radius_nas`` mint.
 ARUBA_NAS_IDENTIFIER_RE = re.compile(r"^cg-aruba-[0-9a-f]{8}$")
 
+#: Domain-separation label of the backend-secret derivation. Must match
+#: ``radius_agent.BACKEND_SECRET_LABEL`` byte for byte (pinned by a test).
+BACKEND_SECRET_LABEL = b"wyfy-aruba-shared-backend-v1:"
+
 # A MAC at the START of Called-Station-Id, in any of the usual spellings,
 # optionally followed by ":<SSID>" (RFC 3580 s3.20's "AA-BB-..:SSID" form).
 _MAC_PREFIX_RE = re.compile(
@@ -95,6 +110,7 @@ class SharedRejectReason:
     with the request, never sent to the NAS."""
 
     SECRET_NOT_CONFIGURED = "shared_secret_not_configured"
+    BACKEND_SECRET_UNAVAILABLE = "backend_secret_unavailable"
     SECRET_MISMATCH = "shared_secret_mismatch"
     NAS_IDENTIFIER_MISSING = "nas_identifier_missing"
     NAS_IDENTIFIER_MALFORMED = "nas_identifier_malformed"
@@ -133,6 +149,46 @@ def canonical_mac(raw: str | None) -> str | None:
     if len(hexed) != 12:
         return None
     return ":".join(hexed[i : i + 2] for i in range(0, 12, 2)).upper()
+
+
+def is_placeholder_mac(mac: str | None) -> bool:
+    """True for a MAC no real access point carries: all zeros, broadcast,
+    multicast, or locally administered (bit 1 of the first octet).
+
+    ``routers.mac_address`` is NOT NULL, so an Instant On site added without
+    its AP's MAC gets a minted one (``synthesize_nas_only_identity``), which
+    is locally administered precisely so it can never collide with real
+    hardware. Treating that value as "the AP MAC" would make the shared
+    listener's MAC check unpassable for the real AP (and the "no AP MAC"
+    refusal unreachable), so it counts as no MAC at all."""
+    canonical = canonical_mac(mac)
+    if canonical is None:
+        return True
+    first = int(canonical[:2], 16)
+    if canonical in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+        return True
+    return bool(first & 0b01) or bool(first & 0b10)
+
+
+def recorded_ap_mac(router: Any) -> str | None:
+    """The router's AP MAC, canonical, or None when it has none -- missing,
+    unparseable, or a minted placeholder (``is_placeholder_mac``)."""
+    canonical = canonical_mac(getattr(router, "mac_address", None))
+    if canonical is None or is_placeholder_mac(canonical):
+        return None
+    return canonical
+
+
+def backend_secret_for(radius_secret: str, hub_agent_secret: str) -> str:
+    """The shared listener's hub-only backend secret: what FreeRADIUS sends
+    in ``X-RADIUS-Shared-Secret``. HMAC-SHA256 keyed with the hub agent
+    secret (never typed into any device), over the RADIUS shared secret (so
+    it rotates with it). Hex, 64 chars: safe as a FreeRADIUS config value."""
+    return hmac.new(
+        hub_agent_secret.encode(),
+        BACKEND_SECRET_LABEL + radius_secret.encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def ap_mac_from_called_station_id(raw: str | None) -> str | None:
@@ -213,9 +269,11 @@ class ArubaSharedSecretStore:
         )
 
 
-async def push_shared_secret(secret: str) -> str:
+async def push_shared_secret(secret: str) -> tuple[str, str]:
     """Hand the new secret to the hub agent (``POST /radius/shared-client``)
-    and return the fingerprint the agent reports it wrote. Same retry and
+    and return ``(fingerprint, backend_fingerprint)`` the agent reports it
+    wrote (an agent that predates the hub-only backend secret reports no
+    backend fingerprint). Same retry and
     error contract as the per-NAS push: 5xx/transport retried on
     ``RETRY_DELAYS``, a 4xx reported at once with the agent's own detail."""
     settings = get_settings()
@@ -256,10 +314,12 @@ async def push_shared_secret(secret: str) -> str:
             status_code=resp.status_code,
         )
     try:
-        reported = str(resp.json().get("fingerprint") or "")
+        body = resp.json()
+        reported = str(body.get("fingerprint") or "")
+        reported_backend = str(body.get("backend_fingerprint") or "")
     except (ValueError, AttributeError):
-        reported = ""
-    return reported
+        reported, reported_backend = "", ""
+    return reported, reported_backend
 
 
 async def rotate_shared_secret(
@@ -270,11 +330,26 @@ async def rotate_shared_secret(
     secret (and every venue already typed with it) exactly as it was."""
     secret = generate_alphanumeric_shared_secret()
     fp = secret_fingerprint(secret)
-    reported = await push_shared_secret(secret)
+    reported, reported_backend = await push_shared_secret(secret)
     if reported != fp:
         raise RadiusBridgePushError(
             "The RADIUS server bridge reported a different secret fingerprint "
             f"({reported or 'none'}) than the one sent ({fp}); nothing was stored.",
+            transport=False,
+            status_code=None,
+        )
+    expected_backend = secret_fingerprint(
+        backend_secret_for(secret, get_settings().hub_radius_agent_secret)
+    )
+    if reported_backend != expected_backend:
+        # The hub wrote the RADIUS secret but not the backend secret this
+        # platform expects (an agent from before the split, or a different
+        # agent key): every shared-listener request would be refused.
+        raise RadiusBridgePushError(
+            "The RADIUS server bridge did not confirm the shared listener's "
+            f"backend secret (reported {reported_backend or 'none'}, expected "
+            f"{expected_backend}); upgrade radius_agent.py on the hub. "
+            "Nothing was stored.",
             transport=False,
             status_code=None,
         )
@@ -300,13 +375,29 @@ async def resolve_shared_nas(
     called_station_id: str | None,
     store: ArubaSharedSecretStore,
     radius_service: Any,
+    hub_agent_secret: str | None = None,
 ):  # noqa: ANN201 -- RadiusNasClient
     """The NAS row a shared-listener request belongs to, or
     ``ArubaSharedRequestRejected`` with the reason. Secret first, so a
-    request without it learns nothing about which NAS identifiers exist."""
-    expected = await store.secret()
-    if expected is None:
+    request without it learns nothing about which NAS identifiers exist.
+
+    ``presented_secret`` must be the hub-only BACKEND secret
+    (``backend_secret_for``), never the RADIUS shared secret the APs hold:
+    presenting the latter is a ``shared_secret_mismatch`` like any other
+    wrong value. ``hub_agent_secret`` defaults to this deployment's
+    ``hub_radius_agent_secret``."""
+    radius_secret = await store.secret()
+    if radius_secret is None:
         raise ArubaSharedRequestRejected(SharedRejectReason.SECRET_NOT_CONFIGURED)
+    if hub_agent_secret is None:
+        hub_agent_secret = get_settings().hub_radius_agent_secret
+    if not hub_agent_secret:
+        # Without the hub-only key there is no backend secret to compare
+        # against; falling back to the RADIUS secret would reopen the hole.
+        raise ArubaSharedRequestRejected(
+            SharedRejectReason.BACKEND_SECRET_UNAVAILABLE
+        )
+    expected = backend_secret_for(radius_secret, hub_agent_secret)
     if not presented_secret or not secrets.compare_digest(
         presented_secret.encode(), expected.encode()
     ):
@@ -338,7 +429,7 @@ async def resolve_shared_nas(
         raise ArubaSharedRequestRejected(
             SharedRejectReason.NOT_ARUBA, nas_identifier=ident
         )
-    recorded = canonical_mac(getattr(router, "mac_address", None))
+    recorded = recorded_ap_mac(router)
     if recorded is None:
         raise ArubaSharedRequestRejected(
             SharedRejectReason.ROUTER_HAS_NO_AP_MAC, nas_identifier=ident
@@ -385,10 +476,14 @@ __all__ = [
     "SHARED_SECRET_HEADER",
     "SharedRejectReason",
     "SharedSecretState",
+    "BACKEND_SECRET_LABEL",
     "ap_mac_from_called_station_id",
+    "backend_secret_for",
     "canonical_mac",
+    "is_placeholder_mac",
     "log_rejection",
     "push_shared_secret",
+    "recorded_ap_mac",
     "resolve_shared_nas",
     "rotate_shared_secret",
     "would_be_nas_identifier",
