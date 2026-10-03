@@ -246,6 +246,7 @@ def add_client(
     nas_identifier: str,
     secret: str,
     require_message_authenticator: bool | None = None,
+    additional_addresses: list[str] | None = None,
 ) -> dict:
     """Serialised against every other mutating call -- see `_WRITE_LOCK`.
 
@@ -275,11 +276,69 @@ def add_client(
         raise ValueError("invalid nas_identifier")
     if not secret or len(secret) < 8:
         raise ValueError("secret too short")
+    extra = _normalise_additional(address, additional_addresses)
 
     with _WRITE_LOCK:
         return _add_client_locked(
-            address, nas_identifier, secret, require_message_authenticator
+            address,
+            nas_identifier,
+            secret,
+            require_message_authenticator,
+            extra,
         )
+
+
+#: Hard ceiling on how many stanzas one NAS may own through
+#: ``additional_addresses``. The backend enforces its own, smaller cap; this
+#: one exists so a bug or a stolen agent secret cannot turn one request into
+#: thousands of client{} blocks (each one a source the hub will accept).
+MAX_ADDITIONAL_ADDRESSES = 16
+
+
+def _normalise_additional(primary: str, raw: object) -> list[str] | None:
+    """``additional_addresses`` as a validated, de-duplicated list, or
+    ``None`` when the request did not carry the key at all.
+
+    ``None`` and ``[]`` are different on purpose: ``None`` is a backend that
+    predates the multi-address protocol and gets this agent's old behaviour
+    byte for byte; ``[]`` is a new backend saying "this NAS has exactly one
+    address", which also removes every learned stanza it had.
+
+    Every entry must be a literal, global unicast host address -- the same
+    rule the backend applies before it sends anything. A private address
+    here would be a client{} that matches nothing; a prefix would widen the
+    client to a whole network.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError("additional_addresses must be a list")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not valid_ip(item):
+            raise ValueError("invalid additional address")
+        ip = ipaddress.ip_address(item)
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError(f"additional address {item} is not public")
+        text = str(ip)
+        if text != str(ipaddress.ip_address(primary)) and text not in out:
+            out.append(text)
+    if len(out) > MAX_ADDITIONAL_ADDRESSES:
+        raise ValueError(
+            f"at most {MAX_ADDITIONAL_ADDRESSES} additional addresses per NAS"
+        )
+    return out
+
+
+def _stanza_label(nas_identifier: str, address: str | None) -> str:
+    """``cg-<nas_identifier>`` for the primary stanza (unchanged), and
+    ``cg-<nas_identifier>-<address>`` for each additional one. FreeRADIUS
+    indexes clients by address, not label, but a unique label keeps
+    ``freeradius -CX`` output and a human reading the file unambiguous."""
+    base = f"cg-{nas_identifier}".replace(".", "-")
+    if address is None:
+        return base
+    return f"{base}-" + re.sub(r"[^0-9A-Za-z]", "-", address)
 
 
 def _add_client_locked(
@@ -287,11 +346,11 @@ def _add_client_locked(
     nas_identifier: str,
     secret: str,
     require_message_authenticator: bool | None = None,
+    additional_addresses: list[str] | None = None,
 ) -> dict:
-    backup_path = _backup()
-
     with open(CLIENTS_CONF) as f:
-        current = f.read()
+        original = f.read()
+    current = original
 
     # Replace, don't append. Appending is what produced the live hub's
     # seven-stanzas-for-one-NAS state: every secret rotation left the
@@ -324,22 +383,49 @@ def _add_client_locked(
     if require_message_authenticator:
         require_msg_auth = "yes"
 
-    block_name = f"cg-{nas_identifier}".replace(".", "-")
-    block = (
-        f"\nclient {block_name} {{\n"
-        f"\tipaddr = {address}/32\n"
-        f"\tsecret = {secret}\n"
-        f"\tshortname = {nas_identifier}\n"
-        f"\tbackend_secret = {secret}\n"
-        f"\trequire_message_authenticator = {require_msg_auth}\n"
-        f"\tnas_type = other\n"
-        f"}}\n"
-    )
+    def _block(label: str, ip: str) -> str:
+        return (
+            f"\nclient {label} {{\n"
+            f"\tipaddr = {ip}/32\n"
+            f"\tsecret = {secret}\n"
+            f"\tshortname = {nas_identifier}\n"
+            f"\tbackend_secret = {secret}\n"
+            f"\trequire_message_authenticator = {require_msg_auth}\n"
+            f"\tnas_type = other\n"
+            f"}}\n"
+        )
+
+    # One stanza per address, all carrying the SAME shortname and secret, so
+    # whichever of the venue's public addresses an Access-Request arrives
+    # from, `%{client:shortname}` names the same NAS row. The strip above
+    # already removed every earlier stanza for this shortname, so the set
+    # written here IS the NAS's whole address set -- an address dropped from
+    # `additional_addresses` is revoked by this same write.
+    blocks = [_block(_stanza_label(nas_identifier, None), address)]
+    for extra in additional_addresses or []:
+        blocks.append(_block(_stanza_label(nas_identifier, extra), extra))
+    updated = current.rstrip("\n") + "\n" + "".join(blocks)
+
+    result: dict = {"status": "ok", "superseded": len(superseded)}
+    if additional_addresses is not None:
+        # Only a new-protocol caller gets the address list back. Its presence
+        # is how the backend tells this agent from one that silently ignored
+        # `additional_addresses` and wrote the primary stanza alone.
+        result["addresses"] = [address, *additional_addresses]
+        if updated == original:
+            # A re-push of the set already on disk: no write, no parse
+            # check and, above all, no restart -- a restart drops in-flight
+            # requests for every NAS on this server. Limited to new-protocol
+            # callers so the old path keeps its exact behaviour.
+            result["unchanged"] = True
+            return result
+
+    backup_path = _backup()
     with open(CLIENTS_CONF, "w") as f:
-        f.write(current.rstrip("\n") + "\n" + block)
+        f.write(updated)
 
     _validate_and_restart(backup_path)
-    return {"status": "ok", "superseded": len(superseded)}
+    return result
 
 
 def remove_client(nas_identifier: str) -> dict:
@@ -434,6 +520,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload["nas_identifier"],
                 payload["secret"],
                 bool(payload.get("require_message_authenticator")) or None,
+                # Absent on every backend older than the multi-address
+                # protocol; see `_normalise_additional` for None vs [].
+                payload.get("additional_addresses"),
             )
             self._json(200, result)
         except Exception as e:  # noqa: BLE001 -- single-purpose agent

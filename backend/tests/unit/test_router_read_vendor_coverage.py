@@ -444,6 +444,14 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "if a legacy integration is invisible to the query and the venue "
         "reads as having no controller at all."
     ),
+    "app/domains/guest/nas_egress.py::SqlLearnedAddressStore.get_router": (
+        "Reads one row by id for the NAS egress auto-learn hint, and the "
+        "caller's FIRST check is `vendor == aruba_instant_on`: every other "
+        "vendor (MikroTik, Omada) returns `not_aruba_instant_on` and nothing "
+        "else happens. The row it needs is a controller-managed NAS-only "
+        "router by definition, so `agent_managed_only` would make it find "
+        "nothing; it feeds no device work, only a vendor/MAC check."
+    ),
     "app/domains/network_integration/repository.py::"
     "NetworkIntegrationRepository.nas_only_vendor_for_location": (
         "Narrowed to `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant On) "

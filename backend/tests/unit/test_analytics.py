@@ -992,6 +992,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # CLOUDGUEST_INSTANT_ON_POLLER_ENABLED is true. See
         # app.domains.network_integration.instant_on_tasks.
         "instant-on-poll-sweep",
+        # Daily prune of auto-learned NAS egress addresses (Aruba Instant On
+        # on a dynamic IP). No-op unless CLOUDGUEST_NAS_EGRESS_LEARNING_ENABLED.
+        # See app.domains.guest.nas_egress_tasks.
+        "guest-nas-egress-prune",
     }
 
 

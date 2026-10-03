@@ -9186,6 +9186,10 @@ class TestNasSecretRotationIsPlatformOnly:
         endpoint is for."""
         paths = sorted(r.path for r in self._routes_requiring("radius.execute"))
         assert paths == [
+            # Removing an auto-learned venue egress address rewrites the
+            # hub's client{} stanzas for that venue -- same blast radius as
+            # a rotate, so the same key and the same platform namespace.
+            "/api/v1/platform/radius/nas/public/{router_id}/learned/{ip_address}",
             "/api/v1/platform/radius/nas/{nas_id}/activate",
             "/api/v1/platform/radius/nas/{nas_id}/disable",
             "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret",

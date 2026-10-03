@@ -264,13 +264,51 @@ async def push_controller_nas_client(
     return address
 
 
+async def push_nas_address_set(
+    *,
+    primary_ip: str,
+    additional_addresses: list[str],
+    nas_identifier: str,
+    secret: str,
+) -> list[str] | None:
+    """Writes a NAS-only device's WHOLE address set to the hub: the
+    registered ``primary_ip`` plus every auto-learned egress address (see
+    ``app.domains.guest.nas_egress``), one ``client{}`` stanza each, all with
+    the same shortname and secret.
+
+    Returns the addresses the agent confirmed it wrote, or ``None`` when the
+    agent predates the multi-address protocol -- it then silently wrote the
+    primary stanza alone, and the caller must not record the learned ones
+    as live on the hub. Every address is validated exactly like the primary
+    before anything leaves this process.
+    """
+    primary = validate_controller_nas_address(primary_ip)
+    extra: list[str] = []
+    for raw in additional_addresses:
+        address = validate_controller_nas_address(raw)
+        if address != primary and address not in extra:
+            extra.append(address)
+    body = await _push_client_stanza(
+        address=primary,
+        nas_identifier=nas_identifier,
+        secret=secret,
+        require_message_authenticator=True,
+        additional_addresses=extra,
+    )
+    confirmed = body.get("addresses") if isinstance(body, dict) else None
+    if not isinstance(confirmed, list):
+        return None
+    return [str(a) for a in confirmed]
+
+
 async def _push_client_stanza(
     *,
     address: str,
     nas_identifier: str,
     secret: str,
     require_message_authenticator: bool | None,
-) -> None:
+    additional_addresses: list[str] | None = None,
+) -> dict:
     """The one HTTP conversation with the hub agent, shared by both shapes.
 
     ## Why the payload carries the address twice
@@ -319,6 +357,14 @@ async def _push_client_stanza(
                         }
                         if require_message_authenticator is not None
                         else {}
+                    )
+                    # Only the multi-address caller sends this key: an
+                    # absent key is the agent's old single-stanza path,
+                    # byte for byte.
+                    | (
+                        {"additional_addresses": additional_addresses}
+                        if additional_addresses is not None
+                        else {}
                     ),
                 )
         except httpx.HTTPError as exc:
@@ -362,11 +408,17 @@ async def _push_client_stanza(
             transport=False,
             status_code=resp.status_code,
         )
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 __all__ = [
     "push_nas_client",
     "push_controller_nas_client",
+    "push_nas_address_set",
     "validate_controller_nas_address",
     "bridge_error_detail",
     "RadiusBridgePushError",

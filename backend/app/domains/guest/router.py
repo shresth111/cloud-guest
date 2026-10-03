@@ -43,9 +43,11 @@ from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
+from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.location.scoping import enforce_target_location
 from app.domains.marketing.dependencies import (
@@ -91,6 +93,12 @@ from .exceptions import (
     RadiusNasNotFoundError,
 )
 from .models import Guest, GuestDevice, GuestLoginHistory, GuestSession, RadiusNasClient
+from .nas_egress import (
+    EgressHint,
+    learner_for_radius_service,
+    learner_for_session,
+    trusted_client_ip,
+)
 from .nas_number_generator import (
     generate_alphanumeric_shared_secret,
     secret_fingerprint,
@@ -99,6 +107,7 @@ from .radius_bridge import (
     RadiusBridgePushError,
     RadiusClientAddressRejected,
     push_controller_nas_client,
+    push_nas_address_set,
     push_nas_client,
     validate_controller_nas_address,
 )
@@ -135,6 +144,9 @@ from .schemas import (
     GuestUpdateProfileRequest,
     GuestUpdateProfileResponse,
     GuestVoucherLoginRequest,
+    LearnedNasAddressView,
+    NasEgressHintRequest,
+    NasEgressHintResponse,
     OtpSuccessRateResponse,
     PublicNasRegistrationRequest,
     PublicNasRegistrationResponse,
@@ -2425,6 +2437,22 @@ async def get_public_radius_nas_status(
     if radius_server is None:
         gaps.append("radius_server_address_not_configured")
 
+    settings = get_settings()
+    learned: list[LearnedNasAddressView] = []
+    learner = learner_for_radius_service(service, settings)
+    if learner is not None and nas_client is not None:
+        learned = [
+            LearnedNasAddressView(
+                ip_address=row.ip_address,
+                source=row.source,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at,
+                hit_count=row.hit_count,
+                hub_confirmed=row.hub_confirmed_at is not None,
+            )
+            for row in await learner.store.list_for_nas(nas_client.id)
+        ]
+
     payload = PublicNasStatusResponse(
         router_id=str(router.id),
         vendor=vendor,
@@ -2443,11 +2471,142 @@ async def get_public_radius_nas_status(
         allowed_domains=_nas_only_allowed_domains(),
         portal_url=None if gaps else _nas_only_portal_url(router),
         gaps=gaps,
+        egress_learning_enabled=bool(
+            getattr(settings, "nas_egress_learning_enabled", False)
+        ),
+        learned_addresses=learned,
     )
     return build_response(
         success=True,
         message="NAS-only device RADIUS status",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+async def _push_nas_only_set(
+    learner,  # noqa: ANN001 -- NasEgressLearner | None
+    nas_client,  # noqa: ANN001
+    *,
+    nas_ip: str,
+    nas_identifier: str,
+    secret: str,
+) -> None:
+    """A NAS-only device's hub write on rotate/re-register. With no learned
+    addresses (or learning off) it is exactly the old single-stanza push.
+    With some, it writes the whole set with the new secret -- otherwise the
+    rotation would leave learned stanzas behind holding the OLD secret, or
+    (on an agent that strips by shortname) silently drop them."""
+    learned = (
+        await learner.learned_addresses_for_push(nas_client, primary_ip=nas_ip)
+        if learner is not None
+        else []
+    )
+    if not learned:
+        await push_controller_nas_client(
+            controller_ip=nas_ip, nas_identifier=nas_identifier, secret=secret
+        )
+        if learner is not None:
+            await learner.record_confirmed(nas_client, [])
+        return
+    confirmed = await push_nas_address_set(
+        primary_ip=nas_ip,
+        additional_addresses=learned,
+        nas_identifier=nas_identifier,
+        secret=secret,
+    )
+    await learner.record_confirmed(nas_client, confirmed)
+
+
+@guest_router.post(
+    "/portal/nas-egress-hint",
+    response_model=ApiResponse[NasEgressHintResponse],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def portal_nas_egress_hint(
+    request: Request,
+    payload: NasEgressHintRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """The guest portal's one hint per page load at an Aruba Instant On
+    venue: "this venue's traffic currently leaves from the address this
+    request came from". See ``app.domains.guest.nas_egress``.
+
+    Public (the guest is not signed in yet) and deliberately uninformative:
+    the answer is ``202 {"accepted": true}`` whatever happened, and any
+    failure is logged, never raised -- this must never break a portal load
+    and must not tell a caller whether a router or NAS exists.
+    """
+    settings = get_settings()
+    if settings.nas_egress_learning_enabled:
+        client_ip = trusted_client_ip(
+            peer=request.client.host if request.client else None,
+            headers=request.headers,
+            trusted_proxy_cidrs=settings.trusted_proxy_cidrs,
+        )
+        try:
+            await learner_for_session(db, settings).learn(
+                EgressHint(
+                    router_id=payload.router_id,
+                    client_ip=client_ip,
+                    nas_id=payload.nas_id,
+                    ap_mac=payload.ap_mac,
+                )
+            )
+            # Commit now rather than at teardown: it releases the per-NAS
+            # advisory lock the learn path took as early as possible.
+            await db.commit()
+        except Exception:  # noqa: BLE001 -- a hint must never fail a portal
+            logger.warning(
+                "nas_egress_hint_failed",
+                extra={"router_id": str(payload.router_id)},
+                exc_info=True,
+            )
+            await db.rollback()
+    return build_response(
+        success=True,
+        message="Accepted",
+        data=NasEgressHintResponse(accepted=True).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.delete(
+    "/public/{router_id}/learned/{ip_address}",
+    response_model=ApiResponse[dict],
+    status_code=status.HTTP_200_OK,
+    # GLOBAL, pinned, `radius.execute`: this rewrites the hub's client{}
+    # stanzas for a venue -- the same blast radius as a rotate.
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
+)
+async def remove_learned_nas_address(
+    request: Request,
+    router_id: uuid.UUID,
+    ip_address: str,
+    service: RadiusService = Depends(get_radius_service),
+):
+    """Remove one auto-learned egress address from a NAS-only device and
+    re-push its address set. The registered address is not removable here
+    (re-register to change it)."""
+    await _nas_only_router(service, router_id)
+    learner = learner_for_radius_service(service, get_settings())
+    existing, _meta = await service.list_nas_clients(
+        requesting_organization_id=None, router_id=router_id, page=1, page_size=1
+    )
+    if learner is None or not existing:
+        raise HTTPException(status_code=404, detail="No learned address to remove")
+    try:
+        removed = await learner.remove(existing[0], ip_address.strip())
+    except RadiusBridgePushError as exc:
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="No learned address to remove")
+    return build_response(
+        success=True,
+        message="Learned RADIUS address removed",
+        data={"router_id": str(router_id), "ip_address": ip_address.strip()},
         request_id=_request_id(request),
     )
 
@@ -2516,6 +2675,13 @@ async def register_public_radius_nas(
             f"Another device already uses {nas_ip} as its RADIUS address. Two "
             "venues behind one public IP can't share RADIUS safely."
         )
+    learner = learner_for_radius_service(service, get_settings())
+    if learner is not None and await learner.learned_elsewhere(nas_ip, router.id):
+        raise PublicNasRegistrationRefusedError(
+            f"{nas_ip} was auto-learned as a RADIUS address for another "
+            "device. Remove it from that device's setup panel first: two "
+            "venues behind one public IP can't share RADIUS safely."
+        )
 
     new_secret = generate_alphanumeric_shared_secret()
     existing, _meta = await service.list_nas_clients(
@@ -2524,10 +2690,15 @@ async def register_public_radius_nas(
     rotated = bool(existing)
     if existing:
         nas_identifier = existing[0].nas_identifier
+        existing_nas = existing[0]
 
         async def _push_rotated(secret: str) -> None:
-            await push_controller_nas_client(
-                controller_ip=nas_ip, nas_identifier=nas_identifier, secret=secret
+            await _push_nas_only_set(
+                learner,
+                existing_nas,
+                nas_ip=nas_ip,
+                nas_identifier=nas_identifier,
+                secret=secret,
             )
 
         try:
@@ -2674,10 +2845,13 @@ async def regenerate_radius_nas_secret(
                 "This device's RADIUS client has no public address on record. "
                 "Register it again with the venue's public IP."
             )
+        learner = learner_for_radius_service(service, get_settings())
 
         async def _push_public(secret: str) -> None:
-            await push_controller_nas_client(
-                controller_ip=public_ip,
+            await _push_nas_only_set(
+                learner,
+                nas_client,
+                nas_ip=public_ip,
                 nas_identifier=nas_client.nas_identifier,
                 secret=secret,
             )

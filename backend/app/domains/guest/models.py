@@ -913,6 +913,54 @@ class RadiusNasCodeCounter(BaseModel):
         )
 
 
+class RadiusNasLearnedAddress(BaseModel):
+    """One public egress address auto-learned for a NAS-only device (Aruba
+    Instant On) from its guests' portal traffic, and written to the hub as
+    an ADDITIONAL ``client{}`` stanza beside the operator-registered one.
+
+    See ``app.domains.guest.nas_egress`` for the design. Stored: the address
+    (the venue's public NAT address, never a guest's), when it was first and
+    last seen, how often, where the observation came from, and whether the
+    hub confirmed the stanza. Not stored: any guest MAC, LAN IP, AP MAC or
+    user agent -- they were needed to decide, not to remember.
+
+    Hard-deleted when it expires or an operator removes it; the
+    ``nas_egress_*`` log lines are the history.
+    """
+
+    __tablename__ = "radius_nas_learned_addresses"
+    __table_args__ = (
+        UniqueConstraint(
+            "nas_client_id", "ip_address", name="uq_radius_nas_learned_address"
+        ),
+    )
+
+    nas_client_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("radius_nas_clients.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    ip_address: Mapped[str] = mapped_column(String(45), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    hub_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 __all__ = [
     "Guest",
     "GuestDevice",
@@ -921,4 +969,5 @@ __all__ = [
     "GuestConsent",
     "RadiusNasClient",
     "RadiusNasCodeCounter",
+    "RadiusNasLearnedAddress",
 ]
