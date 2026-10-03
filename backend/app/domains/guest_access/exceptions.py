@@ -15,6 +15,7 @@ from app.common.exceptions import CloudGuestError
 
 __all__ = [
     "ControllerSessionTerminationUnavailableError",
+    "NasOnlyLiveSessionUnreachableError",
     "GuestAccessError",
     "AccessRuleNotFoundError",
     "CrossLocationAccessRuleError",
@@ -486,6 +487,33 @@ class ControllerSessionTerminationUnavailableError(GuestAccessError):
             "now.",
             status_code=status.HTTP_502_BAD_GATEWAY,
             data={"router_id": str(router_id)},
+        )
+
+
+class NasOnlyLiveSessionUnreachableError(GuestAccessError):
+    """The session is on a NAS-only access point (Aruba Instant On), which
+    this platform cannot reach at all: no router API, no controller API, and
+    no CoA into the venue's NAT.
+
+    Distinct from ``ControllerSessionTerminationUnavailableError``, whose
+    sentence ("could not reach [the controller]") describes a transient fault
+    at an Omada venue and would read here as something to retry or repair.
+    Nothing is broken and nothing can be retried: this is what the venue's
+    hardware is. The message is the Aruba spec's copy U2 (block half) --
+    plain, names no protocol -- because it reaches the venue owner verbatim
+    via ``enforcement_error``.
+
+    Non-2xx for the reason ``GuestAccessService._enforce_block`` gives: the
+    frontend reads any 2xx as success, and "this person is still online" is
+    not success. 409 rather than 502: no upstream failed.
+    """
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            "Blocking stops this person signing in again. If they're online "
+            "right now, they stay online until their session ends.",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"router_id": str(router_id), "nas_only": True},
         )
 
 
