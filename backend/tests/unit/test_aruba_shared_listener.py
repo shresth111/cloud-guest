@@ -4,7 +4,9 @@ Venue identity comes from INSIDE the packet -- NAS-Identifier plus the AP MAC
 in Called-Station-Id -- never from the source address, so a venue on a
 dynamic public IP keeps working. Pinned here:
 
-* the resolver: shared secret first (constant-time), then an ACTIVE
+* the resolver: the hub-only BACKEND secret first (constant-time; the
+  RADIUS secret every Aruba customer types into Instant On is refused as an
+  HTTP credential -- review of #342), then an ACTIVE
   ``aruba_instant_on`` NAS by identifier, then the AP MAC; every refusal has
   its own logged reason, and MikroTik / Omada NAS rows are unreachable;
 * Called-Station-Id parsing across the spellings APs use;
@@ -14,7 +16,9 @@ dynamic public IP keeps working. Pinned here:
 * the shared secret: minted by the platform, pushed to the hub FIRST and
   confirmed by fingerprint, stored encrypted, shown once, never in the
   platform-settings read;
-* the Master routes are GLOBAL-pinned; register-shared needs an AP MAC.
+* the Master routes are GLOBAL-pinned; register-shared needs an AP MAC, and
+  the minted placeholder MAC of a site added without one does not count;
+* Accounting-On/Off on the shared listener closes nothing.
 """
 
 from __future__ import annotations
@@ -32,6 +36,8 @@ from app.domains.guest.aruba_shared import (
     ArubaSharedSecretStore,
     SharedRejectReason,
     ap_mac_from_called_station_id,
+    backend_secret_for,
+    is_placeholder_mac,
     resolve_shared_nas,
     rotate_shared_secret,
 )
@@ -41,6 +47,21 @@ from app.domains.rbac.enums import ScopeType
 SECRET = "A" * 16 + "b" * 16
 AP = "54:F0:B1:C8:A9:0A"
 NAS_ID = "cg-aruba-9e6069de"
+AGENT = "hub-agent-secret-" + "x" * 23
+#: What FreeRADIUS's shared listener sends: derived, hub-only.
+BACKEND = backend_secret_for(SECRET, AGENT)
+
+
+@pytest.fixture(autouse=True)
+def _hub_agent_secret(monkeypatch):  # noqa: ANN001, ANN202
+    monkeypatch.setattr(
+        aruba_shared,
+        "get_settings",
+        lambda: SimpleNamespace(
+            hub_radius_agent_secret=AGENT,
+            hub_radius_aruba_shared_agent_url="http://agent/radius/shared-client",
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +139,7 @@ class FakeRadiusService:
 
 async def _resolve(
     *,
-    secret: str | None = SECRET,
+    secret: str | None = BACKEND,
     stored: str | None = SECRET,
     nas_id: str | None = NAS_ID,
     csid: str | None = "54-F0-B1-C8-A9-0A:WYFY_ARUBA",
@@ -188,7 +209,9 @@ class TestResolver:
     async def test_no_secret_configured(self) -> None:
         assert await _reason(stored=None) == SharedRejectReason.SECRET_NOT_CONFIGURED
 
-    @pytest.mark.parametrize("presented", [None, "", "B" * 32, SECRET[:-1]])
+    @pytest.mark.parametrize(
+        "presented", [None, "", "B" * 32, BACKEND[:-1], SECRET]
+    )
     async def test_wrong_secret_is_checked_before_any_lookup(
         self, presented: str | None
     ) -> None:
@@ -252,6 +275,52 @@ class TestResolver:
         service = FakeRadiusService(router, _nas(router))
         assert await _reason(service=service) == SharedRejectReason.ROUTER_HAS_NO_AP_MAC
 
+    async def test_a_placeholder_mac_is_no_ap_mac(self) -> None:
+        """``routers.mac_address`` is NOT NULL: a site added without the AP's
+        MAC carries a minted one. Even a packet presenting exactly that value
+        is refused as "no AP MAC" -- the refusal is reachable, and nothing
+        can match a MAC no real AP has."""
+        from app.domains.router.service import synthesize_nas_only_identity
+
+        _serial, minted = synthesize_nas_only_identity(uuid.uuid4())
+        router = _router(mac=minted)
+        service = FakeRadiusService(router, _nas(router))
+        assert (
+            await _reason(csid=minted.replace(":", "-"), service=service)
+            == SharedRejectReason.ROUTER_HAS_NO_AP_MAC
+        )
+
+    async def test_the_radius_secret_alone_is_not_an_http_credential(self) -> None:
+        """The #342 review's H1: the RADIUS secret is typed into every Aruba
+        customer's Instant On profile. Presented directly (no hub), with a
+        valid NAS-ID and AP MAC, it must be refused before any lookup."""
+        service = FakeRadiusService()
+        assert (
+            await _reason(secret=SECRET, service=service)
+            == SharedRejectReason.SECRET_MISMATCH
+        )
+        assert service.lookups == []
+
+    async def test_no_hub_agent_secret_refuses_everything(self, monkeypatch) -> None:  # noqa: ANN001
+        monkeypatch.setattr(
+            aruba_shared,
+            "get_settings",
+            lambda: SimpleNamespace(hub_radius_agent_secret=""),
+        )
+        for presented in (SECRET, BACKEND, backend_secret_for(SECRET, "")):
+            assert (
+                await _reason(secret=presented)
+                == SharedRejectReason.BACKEND_SECRET_UNAVAILABLE
+            )
+
+    def test_backend_secret_is_hub_only_and_rotates_with_the_radius_secret(
+        self,
+    ) -> None:
+        assert BACKEND != SECRET and SECRET not in BACKEND
+        assert backend_secret_for(SECRET, AGENT + "y") != BACKEND
+        assert backend_secret_for(SECRET + "z", AGENT) != BACKEND
+        assert len(BACKEND) == 64 and int(BACKEND, 16) >= 0
+
     @pytest.mark.parametrize("csid", [None, "", "   "])
     async def test_missing_called_station_id(self, csid: str | None) -> None:
         assert await _reason(csid=csid) == SharedRejectReason.CALLED_STATION_ID_MISSING
@@ -295,7 +364,7 @@ def _http(headers: dict[str, str]) -> SimpleNamespace:
 
 def _shared_headers(**over: str) -> dict[str, str]:
     h = {
-        "X-RADIUS-Shared-Secret": SECRET,
+        "X-RADIUS-Shared-Secret": BACKEND,
         "X-RADIUS-Packet-NAS-Identifier": NAS_ID,
         "X-RADIUS-Called-Station-Id": "54-F0-B1-C8-A9-0A:WYFY_ARUBA",
     }
@@ -345,6 +414,7 @@ class TestRadiusRoutes:
         "over",
         [
             {"X-RADIUS-Shared-Secret": "nope"},
+            {"X-RADIUS-Shared-Secret": SECRET},
             {"X-RADIUS-Packet-NAS-Identifier": "cg-aruba-00000000"},
             {"X-RADIUS-Called-Station-Id": "AA-BB-CC-00-00-01:WYFY_ARUBA"},
             {"X-RADIUS-Called-Station-Id": ""},
@@ -395,6 +465,29 @@ class TestRadiusRoutes:
             )
         assert calls == [("accounting", service.nas)]
 
+    @pytest.mark.parametrize("status_type", ["accounting-on", "accounting-off"])
+    async def test_accounting_on_off_closes_nothing_on_the_shared_listener(
+        self, wired, status_type: str, caplog
+    ) -> None:  # noqa: ANN001
+        """Review of #342: Accounting-On/Off closes every active session of
+        the NAS, and on this listener its only credentials are known to every
+        Aruba customer or not secret at all. Acked, logged, nothing closed."""
+        guest_router, calls = wired
+        from app.domains.guest.schemas import RadiusAccountingRequest
+
+        with caplog.at_level("WARNING"):
+            resp = await guest_router.radius_aruba_shared_accounting(
+                _http(_shared_headers()),
+                RadiusAccountingRequest(status_type=status_type),
+                service=FakeRadiusService(),
+            )
+        assert calls == []
+        assert resp.closed_session_count == 0 and resp.session_id is None
+        assert any(
+            r.getMessage() == "radius_aruba_shared_nas_event_ignored"
+            for r in caplog.records
+        )
+
     def test_per_venue_routes_still_use_current_nas(self) -> None:
         """The shared listener must not have widened the existing path."""
         from app.domains.guest.dependencies import CurrentNas
@@ -426,9 +519,12 @@ class TestSharedSecret:
 
         pushed: list[str] = []
 
-        async def _push(secret: str) -> str:
+        async def _push(secret: str) -> tuple[str, str]:
             pushed.append(secret)
-            return secret_fingerprint(secret)
+            return (
+                secret_fingerprint(secret),
+                secret_fingerprint(backend_secret_for(secret, AGENT)),
+            )
 
         monkeypatch.setattr(aruba_shared, "push_shared_secret", _push)
         store = _store_with(None)
@@ -456,14 +552,46 @@ class TestSharedSecret:
     async def test_a_hub_reporting_another_fingerprint_stores_nothing(
         self, monkeypatch
     ) -> None:  # noqa: ANN001
-        async def _push(secret: str) -> str:
-            return "000000000000"
+        async def _push(secret: str) -> tuple[str, str]:
+            return "000000000000", "000000000000"
 
         monkeypatch.setattr(aruba_shared, "push_shared_secret", _push)
         store = _store_with(SECRET)
         with pytest.raises(RadiusBridgePushError):
             await rotate_shared_secret(store, actor_user_id="u1")
         assert store.repository.upserts == []
+
+    async def test_a_hub_without_the_backend_secret_split_stores_nothing(
+        self, monkeypatch
+    ) -> None:  # noqa: ANN001
+        """An agent from before the split writes backend_secret = the RADIUS
+        secret and reports no backend fingerprint: every shared request
+        would then be refused, so the rotation must not be recorded."""
+        from app.domains.guest.nas_number_generator import secret_fingerprint
+
+        async def _push(secret: str) -> tuple[str, str]:
+            return secret_fingerprint(secret), ""
+
+        monkeypatch.setattr(aruba_shared, "push_shared_secret", _push)
+        store = _store_with(SECRET)
+        with pytest.raises(RadiusBridgePushError) as exc:
+            await rotate_shared_secret(store, actor_user_id="u1")
+        assert "backend secret" in exc.value.detail
+        assert store.repository.upserts == []
+
+    def test_backend_label_matches_the_agent(self) -> None:
+        import importlib.util
+        from pathlib import Path
+
+        path = (
+            Path(__file__).resolve().parents[2] / "ops/hub-agents/radius_agent.py"
+        )
+        spec = importlib.util.spec_from_file_location("_agent_label", path)
+        agent = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(agent)  # type: ignore[union-attr]
+        assert agent.BACKEND_SECRET_LABEL == aruba_shared.BACKEND_SECRET_LABEL
+        agent.SHARED_SECRET = AGENT
+        assert agent.shared_backend_secret(SECRET) == BACKEND
 
     async def test_push_needs_an_agent_url(self, monkeypatch) -> None:  # noqa: ANN001
         monkeypatch.setattr(
@@ -550,6 +678,45 @@ class TestMasterRoutes:
             )
         assert "AP MAC" in exc.value.message
 
+    async def test_register_shared_refuses_a_placeholder_mac(self, monkeypatch) -> None:  # noqa: ANN001
+        from app.domains.guest import router as guest_router
+        from app.domains.guest.exceptions import PublicNasRegistrationRefusedError
+        from app.domains.router.service import synthesize_nas_only_identity
+
+        router = _router(mac=synthesize_nas_only_identity(uuid.uuid4())[1])
+        service = FakeRadiusService(router, None)
+
+        async def _nas_only(svc, rid):  # noqa: ANN001, ANN202
+            return router
+
+        monkeypatch.setattr(guest_router, "_nas_only_router", _nas_only)
+        with pytest.raises(PublicNasRegistrationRefusedError) as exc:
+            await guest_router.register_shared_radius_nas(
+                _http({}),
+                router.id,
+                user=SimpleNamespace(id=str(uuid.uuid4())),
+                service=service,
+            )
+        assert "placeholder" in exc.value.message
+
+    async def test_setup_panel_flags_a_placeholder_mac(self, monkeypatch) -> None:  # noqa: ANN001
+        from app.domains.guest import router as guest_router
+        from app.domains.router.service import synthesize_nas_only_identity
+
+        router = _router(mac=synthesize_nas_only_identity(uuid.uuid4())[1])
+        monkeypatch.setattr(
+            guest_router, "_aruba_shared_store", lambda s: _store_with(SECRET)
+        )
+        view = await guest_router._shared_listener_view(
+            FakeRadiusService(router, None), router, _nas(router)
+        )
+        assert view.ap_mac is None and view.ap_mac_placeholder is True
+        assert "no_ap_mac" in view.gaps and view.available is False
+        real = await guest_router._shared_listener_view(
+            FakeRadiusService(), _router(), _nas(_router())
+        )
+        assert real.ap_mac == AP and real.ap_mac_placeholder is False
+
     async def test_register_shared_creates_an_addressless_nas_once(
         self, monkeypatch
     ) -> None:  # noqa: ANN001
@@ -611,6 +778,30 @@ class TestMasterRoutes:
             "accounting_port": 1913,
         }
         assert SECRET not in json.dumps(data)
+
+
+@pytest.mark.parametrize(
+    ("mac", "placeholder"),
+    [
+        (AP, False),
+        ("54-f0-b1-c8-a9-0a", False),
+        ("00:00:00:00:00:00", True),
+        ("FF:FF:FF:FF:FF:FF", True),
+        ("02:11:22:33:44:55", True),  # locally administered
+        ("01:00:5E:00:00:01", True),  # multicast
+        (None, True),
+        ("not-a-mac", True),
+    ],
+)
+def test_is_placeholder_mac(mac: str | None, placeholder: bool) -> None:
+    assert is_placeholder_mac(mac) is placeholder
+
+
+def test_minted_nas_only_macs_are_always_placeholders() -> None:
+    from app.domains.router.service import synthesize_nas_only_identity
+
+    for _ in range(200):
+        assert is_placeholder_mac(synthesize_nas_only_identity(uuid.uuid4())[1])
 
 
 def test_module_exports() -> None:

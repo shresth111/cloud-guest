@@ -38,6 +38,8 @@ indexes clients by IP/CIDR rather than by label, and renaming it would
 churn every live stanza for no behavioural gain.
 """
 
+import hashlib
+import hmac
 import http.server
 import ipaddress
 import json
@@ -76,6 +78,21 @@ SHARED_CLIENTS_CONF = os.environ.get(
 )
 SHARED_SHORTNAME = "wyfy-aruba-shared"
 _SHARED_SECRET_RE = re.compile(r"^[A-Za-z0-9]{24,64}$")
+
+# The shared listener's `backend_secret` (what FreeRADIUS sends the backend
+# in X-RADIUS-Shared-Secret) is NOT the RADIUS secret: that one is typed into
+# every Aruba customer's Instant On profile, so it is no proof the request
+# came through this hub. It is HMAC-SHA256(key=RADIUS_AGENT_SECRET,
+# LABEL + radius secret) -- hub-only, and the backend derives the same value
+# (app.domains.guest.aruba_shared.backend_secret_for). Must match the
+# backend's BACKEND_SECRET_LABEL byte for byte.
+BACKEND_SECRET_LABEL = b"wyfy-aruba-shared-backend-v1:"
+
+
+def shared_backend_secret(secret: str) -> str:
+    return hmac.new(
+        SHARED_SECRET.encode(), BACKEND_SECRET_LABEL + secret.encode(), hashlib.sha256
+    ).hexdigest()
 BACKUP_DIR = "/root/freeradius-backups"
 
 # ONE WRITER AT A TIME.
@@ -423,16 +440,19 @@ class SharedListenerNotInstalled(Exception):
 
 
 def shared_fingerprint(secret: str) -> str:
-    import hashlib
-
     return hashlib.sha256(secret.encode()).hexdigest()[:12]
 
 
 def set_shared_secret(secret: str) -> dict:
     """Replace the shared Aruba listener's secret: rewrite its catch-all
     client list (IPv4 + IPv6), parse-check, restart. Returns the new secret's
-    ``sha256[:12]`` so the caller can confirm what landed without the secret
-    ever being echoed. Same revert-on-any-failure contract as ``add_client``.
+    ``sha256[:12]`` and the derived backend secret's, so the caller can
+    confirm what landed without either secret ever being echoed. Same
+    revert-on-any-failure contract as ``add_client``.
+
+    Re-posting the CURRENT secret is how a hub written before the backend
+    secret split is migrated: the RADIUS secret (what the APs hold) stays
+    byte-identical, only ``backend_secret`` changes.
     """
     if not isinstance(secret, str) or not _SHARED_SECRET_RE.match(secret):
         raise ValueError("secret must be 24-64 ASCII letters/digits")
@@ -442,6 +462,9 @@ def set_shared_secret(secret: str) -> dict:
                 f"{SHARED_CLIENTS_CONF} does not exist: this RADIUS server has "
                 "no shared Aruba listener installed"
             )
+        if not SHARED_SECRET:
+            raise ValueError("RADIUS_AGENT_SECRET is not set: no backend secret")
+        backend_secret = shared_backend_secret(secret)
         body = (
             "# Written by radius_agent.py (set_shared_secret). The shared Aruba\n"
             "# Instant On listener's ONLY clients: any source address, one secret.\n"
@@ -456,7 +479,7 @@ def set_shared_secret(secret: str) -> dict:
                 f"\t{key} = {network}\n"
                 f"\tsecret = {secret}\n"
                 f"\tshortname = {SHARED_SHORTNAME}\n"
-                f"\tbackend_secret = {secret}\n"
+                f"\tbackend_secret = {backend_secret}\n"
                 f"\trequire_message_authenticator = yes\n"
                 f"\tnas_type = other\n"
                 f"}}\n"
@@ -466,13 +489,18 @@ def set_shared_secret(secret: str) -> dict:
                 return {
                     "status": "ok",
                     "fingerprint": shared_fingerprint(secret),
+                    "backend_fingerprint": shared_fingerprint(backend_secret),
                     "unchanged": True,
                 }
         backup_path = _backup(SHARED_CLIENTS_CONF)
         with open(SHARED_CLIENTS_CONF, "w") as f:
             f.write(body)
         _validate_and_restart(backup_path, SHARED_CLIENTS_CONF)
-        return {"status": "ok", "fingerprint": shared_fingerprint(secret)}
+        return {
+            "status": "ok",
+            "fingerprint": shared_fingerprint(secret),
+            "backend_fingerprint": shared_fingerprint(backend_secret),
+        }
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
