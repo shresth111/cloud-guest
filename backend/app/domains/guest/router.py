@@ -2495,8 +2495,8 @@ ARUBA_SHARED_ROTATION_DEVICE_ACTION = (
 def _shared_ports() -> tuple[int, int]:
     settings = get_settings()
     return (
-        int(settings.aruba_shared_radius_auth_port),
-        int(settings.aruba_shared_radius_acct_port),
+        int(getattr(settings, "aruba_shared_radius_auth_port", 1912)),
+        int(getattr(settings, "aruba_shared_radius_acct_port", 1913)),
     )
 
 
@@ -2516,7 +2516,7 @@ async def _shared_listener_view(
     settings = get_settings()
     auth, acct = _shared_ports()
     gaps: list[str] = []
-    installed = bool(settings.hub_radius_aruba_shared_agent_url)
+    installed = bool(getattr(settings, "hub_radius_aruba_shared_agent_url", ""))
     if not installed:
         gaps.append("listener_not_installed")
     state = await _aruba_shared_store(service).state()
@@ -3388,9 +3388,20 @@ async def _radius_accounting(
 def _aruba_shared_store(radius_service: RadiusService) -> ArubaSharedSecretStore:
     from app.domains.system_settings.repository import SystemSettingsRepository
 
-    return ArubaSharedSecretStore(
-        SystemSettingsRepository(radius_service.repository.session)
-    )
+    session = getattr(getattr(radius_service, "repository", None), "session", None)
+    if session is None:
+        # No database behind this service (a unit-test fake): an unset
+        # secret, which every caller already handles.
+        return ArubaSharedSecretStore(_NoSettings())
+    return ArubaSharedSecretStore(SystemSettingsRepository(session))
+
+
+class _NoSettings:
+    async def get_value(self, key: str) -> None:
+        return None
+
+    async def upsert(self, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("no settings store behind this RadiusService")
 
 
 async def _resolve_shared(request: Request, service: RadiusService):  # noqa: ANN202
