@@ -539,6 +539,7 @@ def shared_conf(conf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         "# PLACEHOLDER\nclient x {\n\tipaddr = 0.0.0.0/0\n\tsecret = zzz\n}\n"
     )
     monkeypatch.setattr(radius_agent, "SHARED_CLIENTS_CONF", str(path))
+    monkeypatch.setattr(radius_agent, "SHARED_SECRET", "agent-s3cret")
     return path
 
 
@@ -550,13 +551,20 @@ class TestSharedClient:
     ) -> None:
         before = conf.read_text()
         result = radius_agent.set_shared_secret(self.SECRET)
+        backend = radius_agent.shared_backend_secret(self.SECRET)
         assert result == {
             "status": "ok",
             "fingerprint": radius_agent.shared_fingerprint(self.SECRET),
+            "backend_fingerprint": radius_agent.shared_fingerprint(backend),
         }
         text = shared_conf.read_text()
         assert "ipaddr = 0.0.0.0/0" in text and "ipv6addr = ::/0" in text
-        assert text.count(f"secret = {self.SECRET}") == 4  # secret + backend x2
+        # The RADIUS secret (typed into every AP) is NOT what the backend
+        # receives: backend_secret is the hub-only derived value.
+        assert text.count(f"\tsecret = {self.SECRET}\n") == 2
+        assert text.count(f"\tbackend_secret = {backend}\n") == 2
+        assert f"backend_secret = {self.SECRET}" not in text
+        assert backend != self.SECRET
         assert text.count("require_message_authenticator = yes") == 2
         assert text.count("shortname = wyfy-aruba-shared") == 2
         assert "PLACEHOLDER" not in text
@@ -580,6 +588,44 @@ class TestSharedClient:
         before = shared_conf.read_text()
         with pytest.raises(ValueError):
             radius_agent.set_shared_secret(bad)  # type: ignore[arg-type]
+        assert shared_conf.read_text() == before
+
+    def test_backend_secret_is_keyed_by_the_agent_secret(
+        self, shared_conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first = radius_agent.shared_backend_secret(self.SECRET)
+        monkeypatch.setattr(radius_agent, "SHARED_SECRET", "another-agent-secret")
+        assert radius_agent.shared_backend_secret(self.SECRET) != first
+
+    def test_reposting_the_current_secret_migrates_only_backend_secret(
+        self, shared_conf: Path
+    ) -> None:
+        """A hub written before the split (backend_secret == secret) is
+        migrated by re-posting the SAME secret: the AP-facing secret lines
+        stay byte-identical, only backend_secret changes."""
+        legacy = "".join(
+            f"client {label} {{\n\t{key} = {net}\n\tsecret = {self.SECRET}\n"
+            f"\tshortname = wyfy-aruba-shared\n\tbackend_secret = {self.SECRET}\n"
+            "\trequire_message_authenticator = yes\n\tnas_type = other\n}\n"
+            for label, key, net in (
+                ("wyfy-aruba-shared-v4", "ipaddr", "0.0.0.0/0"),
+                ("wyfy-aruba-shared-v6", "ipv6addr", "::/0"),
+            )
+        )
+        shared_conf.write_text(legacy)
+        result = radius_agent.set_shared_secret(self.SECRET)
+        assert "unchanged" not in result
+        text = shared_conf.read_text()
+        assert text.count(f"\tsecret = {self.SECRET}\n") == 2
+        assert f"backend_secret = {self.SECRET}" not in text
+
+    def test_no_agent_secret_refuses_the_write(
+        self, shared_conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = shared_conf.read_text()
+        monkeypatch.setattr(radius_agent, "SHARED_SECRET", "")
+        with pytest.raises(ValueError):
+            radius_agent.set_shared_secret(self.SECRET)
         assert shared_conf.read_text() == before
 
     def test_no_listener_installed_is_refused(
@@ -642,7 +688,13 @@ class TestSharedClientOverHttp:
         assert body["fingerprint"] == radius_agent.shared_fingerprint(
             TestSharedClient.SECRET
         )
+        assert body["backend_fingerprint"] == radius_agent.shared_fingerprint(
+            radius_agent.shared_backend_secret(TestSharedClient.SECRET)
+        )
         assert TestSharedClient.SECRET not in str(body)
+        assert radius_agent.shared_backend_secret(TestSharedClient.SECRET) not in str(
+            body
+        )
 
     def test_malformed_is_400_not_a_retryable_500(self, shared_conf: Path) -> None:
         assert self._call("POST", "/radius/shared-client", {"secret": "x"})[0] == 400
