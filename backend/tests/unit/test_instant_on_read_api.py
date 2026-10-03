@@ -444,7 +444,7 @@ class TestRoutes:
             instant_on_platform_router,
         )
 
-        assert len(instant_on_platform_router.routes) == 9
+        assert len(instant_on_platform_router.routes) == 11
         for route in instant_on_platform_router.routes:
             (closure,) = _permission_closures(route)
             assert closure[ScopeType] == ScopeType.GLOBAL, route.path

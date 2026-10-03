@@ -548,7 +548,9 @@ class LiveSessionTerminator:
         # before any lookup. The block itself is unaffected: the sign-in gate
         # and the RADIUS authorize re-check both refuse this guest.
         if is_nas_only(router):
-            raise NasOnlyLiveSessionUnreachableError(router.id)
+            return await self._end_on_nas_only_cloud(
+                router, session=session, organization_id=organization_id
+            )
         if is_controller_managed(router):
             return await self._end_on_controller(
                 router, session=session, organization_id=organization_id
@@ -573,6 +575,48 @@ class LiveSessionTerminator:
                 coa_port=outcome.control.coa_port,
             )
         return outcome
+
+    async def _end_on_nas_only_cloud(
+        self,
+        router: BlockRouterRow,
+        *,
+        session: LiveSessionRow,
+        organization_id: uuid.UUID | None,
+    ) -> SessionEndOutcome:
+        """A NAS-only access point (Aruba Instant On) is unreachable from
+        here -- except through the vendor's own cloud, when cloud control is
+        switched on for this router (``network_integration.instant_on_control``,
+        OFF by default). Reached through the controller terminator's
+        ``end_nas_only`` attribute so no wiring site changes.
+
+        Anything short of a confirmed write raises
+        ``NasOnlyLiveSessionUnreachableError`` -- the exact answer this
+        branch gave before cloud control existed -- so a gate that is closed,
+        a session with no device MAC, or a failed Instant On write all keep
+        the honest "they stay online until their session ends"."""
+        end_nas_only = getattr(self.controller_terminator, "end_nas_only", None)
+        if end_nas_only is None:
+            raise NasOnlyLiveSessionUnreachableError(router.id)
+        client_mac = await self._session_mac_address(session)
+        if not client_mac:
+            raise NasOnlyLiveSessionUnreachableError(router.id)
+        ended = await end_nas_only(
+            router_id=router.id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+        )
+        if not ended:
+            raise NasOnlyLiveSessionUnreachableError(router.id)
+        # Instant On listed the device as blocked on read-back, which is what
+        # makes the AP drop it. ``removed=1`` claims exactly that much.
+        return SessionEndOutcome(
+            control=SessionControlSnapshot(
+                hotspot_servers=1, coa_accept=False, coa_port=None
+            ),
+            matched=1,
+            removed=1,
+            still_active=0,
+        )
 
     async def _end_on_controller(
         self,
