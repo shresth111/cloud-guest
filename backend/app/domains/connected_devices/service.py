@@ -57,8 +57,12 @@ from app.domains.rbac.location_scope import (
     LocationScope,
     enforce_entity_location,
 )
-from app.domains.router.exceptions import RouterNotFoundError
+from app.domains.router.exceptions import (
+    RouterNasOnlyOperationError,
+    RouterNotFoundError,
+)
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_nas_only
 
 from .constants import (
     MONITORED_HARDWARE_LIVENESS_PING_COUNT,
@@ -627,6 +631,11 @@ class ConnectedDeviceService:
     # ========================================================================
 
     def _resolve_credentials(self, router: Router) -> DeviceCredentials:
+        # Before the credential check: an Aruba Instant On row has no
+        # RouterOS API by design, and "missing credentials" told the
+        # operator to add some. Only NAS-only rows reach this branch.
+        if is_nas_only(router):
+            raise RouterNasOnlyOperationError(router.id, "connected_devices")
         host = router.management_ip_address or router.public_ip_address
         secret = self.router_lookup.get_decrypted_api_secret(router)
         if not host or not router.api_username or not secret:
