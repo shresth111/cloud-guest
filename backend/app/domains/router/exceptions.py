@@ -33,6 +33,7 @@ __all__ = [
     "RouterVendorChangeRefusedError",
     "RouterLiveCredentialRotationFailedError",
     "NasOnlySiteRefusedError",
+    "RouterNasOnlyOperationError",
 ]
 
 
@@ -341,3 +342,21 @@ class NasOnlySiteRefusedError(RouterError):
                 str(existing_router_id) if existing_router_id else None
             ),
         }
+
+
+class RouterNasOnlyOperationError(RouterError):
+    """A device operation that needs a RouterOS API session was asked of an
+    Aruba Instant On (NAS-only) row, which has none: it is configured in the
+    Instant On app and reaches this platform only over RADIUS. 409 with
+    ``data.code = NAS_ONLY_DEVICE`` so a console can say so, instead of the
+    "missing credentials" refusal that invited an operator to add some."""
+
+    CODE = "NAS_ONLY_DEVICE"
+
+    def __init__(self, router_id: uuid.UUID, operation: str) -> None:
+        super().__init__(
+            f"'{operation}' is not available for router {router_id}: it is an "
+            "Aruba Instant On access point, managed in the Instant On app.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+        self.data = {"code": self.CODE, "operation": operation}
