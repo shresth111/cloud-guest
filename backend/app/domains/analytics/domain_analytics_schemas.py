@@ -106,7 +106,8 @@ class RouterAnalyticsItem(BaseModel):
     bandwidth_downloaded_bytes: int
     bandwidth_total_bytes: int
 
-    internet_available: bool
+    #: ``None`` for an Aruba Instant On (NAS-only) row: not measured.
+    internet_available: bool | None
     last_seen_at: str | None
 
     wireguard: WireGuardStatusItem

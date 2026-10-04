@@ -650,7 +650,9 @@ class _FakeDashboardRepository:
     async def count_platform_locations(self) -> int:
         return self.total_locations
 
-    async def count_routers_by_status(self, *, organization_id=None, location_id=None):
+    async def count_routers_by_status(
+        self, *, organization_id=None, location_id=None, exclude_nas_only=False
+    ):
         return self.router_status_rows
 
     async def count_platform_guests_total(self) -> int:
