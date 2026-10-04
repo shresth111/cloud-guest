@@ -484,6 +484,72 @@ NETWORK_CONTROLLER_TARGET_STATES: dict[str, str] = {
     ALERT_TARGET_NETWORK_CONTROLLER_SETUP: NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE,
 }
 
+# ----------------------------------------------------------------------------
+# Aruba Instant On: "access point silent" (P2-P)
+# ----------------------------------------------------------------------------
+#
+# An Instant On venue reaches this platform only as a RADIUS NAS. There is no
+# agent, no tunnel and no controller API, so the router targets above can
+# never see it (``AlertService._agent_managed_routers`` drops the row on
+# purpose). The only liveness that exists is RADIUS traffic itself:
+# ``radius_nas_clients.last_request_at``/``last_accounting_at`` (P1-E, #358)
+# per venue and ``aruba_access_points.last_seen_at`` (P0-A2, #355) per AP.
+#
+# ## Why not "no packet for N minutes"
+#
+# An access point with no guests sends nothing. A time-of-day-unaware
+# threshold would page every Aruba owner every night. So silence alone is
+# never a finding; it must be paired with evidence that traffic was
+# *expected*:
+#
+# * guests were still connected when the venue went quiet -- a session the
+#   AP never closed with an Accounting-Stop (still ``active``, or swept by
+#   our own idle sweep as ``inactivity_timeout``) whose last report is no
+#   older than the venue's last packet minus
+#   ``ACCESS_POINT_SILENT_GUEST_SLACK_MINUTES``. A guest who walked away
+#   produced a Stop and does not count; or
+# * (opt-in, ``use_open_hours``) the venue's own Open Hours say it is open,
+#   and it has been both open and silent for ``open_hours_silence_minutes``.
+#
+# ## Resolution needs positive evidence
+#
+# An open alert resolves only when the venue (or AP) is heard again, never
+# because the guest evidence aged out or the venue closed for the night. The
+# same "no answer is not an answer" rule the rogue-DHCP and controller
+# targets follow.
+#
+# ## Scope
+#
+# NAS-only rows only (``vendor_capabilities.is_nas_only``); MikroTik and
+# Omada rows are never read by this target. A rule must belong to one
+# organization (an organization-less rule evaluates nothing) and may only be
+# created for an organization that has an Instant On venue. It is NOT in
+# ``default_alerting.DEFAULT_ALERT_RULES``: off unless an owner turns it on,
+# and never backfilled.
+ALERT_TARGET_ACCESS_POINT_SILENT = "access_point_silent"
+ACCESS_POINT_SILENT_STATE = "silent"
+
+# condition_config keys, defaults and bounds. Minutes throughout.
+# 30 = six missed ~5-minute Interim-Updates (measured on the AP21, 306 s).
+ACCESS_POINT_SILENT_DEFAULT_SILENCE_MINUTES = 30
+ACCESS_POINT_SILENT_MIN_SILENCE_MINUTES = 15
+ACCESS_POINT_SILENT_MAX_SILENCE_MINUTES = 24 * 60
+ACCESS_POINT_SILENT_DEFAULT_OPEN_HOURS_SILENCE_MINUTES = 120
+ACCESS_POINT_SILENT_MIN_OPEN_HOURS_SILENCE_MINUTES = 30
+ACCESS_POINT_SILENT_DEFAULT_AP_SILENCE_MINUTES = 120
+ACCESS_POINT_SILENT_MIN_AP_SILENCE_MINUTES = 30
+# A guest counts as "connected when the venue went quiet" if their last
+# report is at most this much older than the venue's last packet: two
+# Interim-Update intervals plus the 60 s write throttle.
+ACCESS_POINT_SILENT_GUEST_SLACK_MINUTES = 12
+# How far back the guest evidence is read at all. Bounded so the query is
+# cheap; an alert already open is held by silence alone, not by this.
+ACCESS_POINT_SILENT_GUEST_LOOKBACK_HOURS = 24
+# Per-AP: the AP must have served guests within this window to be judged
+# (an AP silent for a week is a known state, not news), and a sibling counts
+# as active if seen within the rule's ``silence_minutes``.
+ACCESS_POINT_SILENT_AP_SEEN_LOOKBACK_HOURS = 24
+
 # How many consecutive failed syncs before "failing" fires.
 #
 # Three, because the sync backs off: the interval doubles per failure
@@ -935,6 +1001,8 @@ __all__ = [
     "NETWORK_CONTROLLER_STATE_REFUSING_GUESTS",
     "NETWORK_CONTROLLER_STATE_SETUP_INCOMPLETE",
     "NETWORK_CONTROLLER_TARGET_STATES",
+    "ALERT_TARGET_ACCESS_POINT_SILENT",
+    "ACCESS_POINT_SILENT_STATE",
     "NETWORK_CONTROLLER_FAILING_MIN_CONSECUTIVE_FAILURES",
     "NETWORK_CONTROLLER_SETUP_GRACE_HOURS",
     "NETWORK_CONTROLLER_AUTHORIZE_WINDOW_MINUTES",
