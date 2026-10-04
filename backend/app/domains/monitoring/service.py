@@ -113,14 +113,19 @@ from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.models import Router
 from app.domains.router.vendor_capabilities import (
     agent_managed_rows,
+    is_nas_only,
     supports_zero_touch_provisioning,
 )
 from app.domains.router_provisioning.constants import EnrollmentStatus
 from app.domains.router_provisioning.models import RouterEvent
 
+from . import access_point_silence as ap_silence
 from .channel_config import ChannelConfigSummary, summarize_channel_config
 from .constants import (
+    ACCESS_POINT_SILENT_AP_SEEN_LOOKBACK_HOURS,
+    ACCESS_POINT_SILENT_GUEST_LOOKBACK_HOURS,
     ALERT_EVENT_LOOKBACK_MINUTES,
+    ALERT_TARGET_ACCESS_POINT_SILENT,
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
     ALERT_TARGET_NETWORK_CONTROLLER,
@@ -189,6 +194,7 @@ from .exceptions import (
     CrossLocationAlertAccessError,
     IncidentNotFoundError,
     InsufficientSlaDataError,
+    InvalidAlertRuleConfigError,
     NotificationChannelNotFoundError,
     SlaTargetNotFoundError,
 )
@@ -1444,6 +1450,9 @@ class AlertService:
         validate_alert_rule_condition_config(
             trigger_type, target_component, condition_config
         )
+        await self._require_access_point_silent_scope(
+            target_component, organization_id
+        )
         rule = await self.repository.create_alert_rule(
             name=name,
             description=description,
@@ -1459,6 +1468,25 @@ class AlertService:
                 rule.id, notification_channel_ids
             )
         return rule
+
+    async def _require_access_point_silent_scope(
+        self, target_component: object, organization_id: uuid.UUID | None
+    ) -> None:
+        """``ALERT_TARGET_ACCESS_POINT_SILENT`` is one organization's rule, for
+        an organization that has an Aruba Instant On venue. No-op for every
+        other target, so no existing rule's create/update path changes."""
+        if target_component != ALERT_TARGET_ACCESS_POINT_SILENT:
+            return
+        if organization_id is None:
+            raise InvalidAlertRuleConfigError(
+                "access_point_silent rules must belong to one organization"
+            )
+        routers = await self.repository.list_routers(organization_id=organization_id)
+        if not any(is_nas_only(router) for router in routers):
+            raise InvalidAlertRuleConfigError(
+                "access_point_silent rules are only for organizations with an "
+                "Aruba Instant On venue"
+            )
 
     async def get_alert_rule(
         self,
@@ -1497,6 +1525,11 @@ class AlertService:
             prospective_target_component,
             prospective_condition_config,
         )
+        if prospective_target_component != rule.target_component:
+            await self._require_access_point_silent_scope(
+                prospective_target_component,
+                data.get("organization_id", rule.organization_id),
+            )
         if "trigger_type" in data:
             data["trigger_type"] = prospective_trigger_type.value
         updated = await self.repository.update_alert_rule(rule, data)
@@ -1954,6 +1987,9 @@ class AlertService:
         if rule.target_component in NETWORK_CONTROLLER_TARGET_STATES:
             return await self._evaluate_network_controller_rule(rule, expected_status)
 
+        if rule.target_component == ALERT_TARGET_ACCESS_POINT_SILENT:
+            return await self._evaluate_access_point_silent_rule(rule)
+
         if rule.target_component == ALERT_TARGET_ROUTER_REACHABILITY:
             routers = await self._agent_managed_routers(rule.organization_id)
             for router in routers:
@@ -2326,6 +2362,218 @@ class AlertService:
                         resolved_message=_NETWORK_CONTROLLER_GONE_MESSAGE,
                     )
                 )
+        return triggered, resolved
+
+    async def _evaluate_access_point_silent_rule(
+        self, rule: AlertRule
+    ) -> tuple[list[Alert], list[Alert]]:
+        """``ALERT_TARGET_ACCESS_POINT_SILENT`` (Aruba Instant On, P2-P).
+
+        Reads persisted RADIUS liveness only -- no Instant On I/O. The
+        decisions live in ``access_point_silence`` (pure); this does the
+        reads and the alert bookkeeping. See the constant's comment for the
+        design.
+
+        ## Scope
+
+        * The rule's own organization only. An organization-less rule would
+          evaluate every tenant's venues, and ``create_alert_rule`` refuses
+          one; a row inserted around it evaluates nothing here.
+        * NAS-only rows only (``is_nas_only``). MikroTik and Omada rows are
+          dropped before any read, so this target cannot change what any
+          other venue is told.
+
+        ## Keys
+
+        Venue: ``(org, location, router, subject=None)``. Per AP:
+        ``subject_id = aruba_access_points.id``. The two cannot both open
+        for one outage: a per-AP alert needs a sibling heard recently, which
+        means the venue is not silent.
+        """
+        triggered: list[Alert] = []
+        resolved: list[Alert] = []
+        organization_id = rule.organization_id
+        if organization_id is None:
+            logger.warning(
+                "access_point_silent_rule_without_organization",
+                extra={"rule_id": str(rule.id)},
+            )
+            return triggered, resolved
+        repo = self.repository
+        if not hasattr(repo, "radius_activity_for_routers"):
+            return triggered, resolved
+
+        config = ap_silence.AccessPointSilentConfig.from_condition_config(
+            rule.condition_config or {}
+        )
+        now = datetime.now(UTC)
+        routers = [
+            router
+            for router in await repo.list_routers(organization_id=organization_id)
+            if is_nas_only(router) and router.organization_id == organization_id
+        ]
+        router_ids = [router.id for router in routers]
+        last_radius = await repo.radius_activity_for_routers(router_ids)
+        guests = await repo.unclosed_guest_activity_for_routers(
+            router_ids,
+            since=now - timedelta(hours=ACCESS_POINT_SILENT_GUEST_LOOKBACK_HOURS),
+        )
+        open_hours = {}
+        if config.use_open_hours:
+            open_hours = await repo.open_hours_for_locations(
+                organization_id=organization_id,
+                location_ids=sorted(
+                    {r.location_id for r in routers if r.location_id is not None},
+                    key=str,
+                ),
+            )
+        access_points = []
+        if config.per_access_point:
+            access_points = [
+                ap
+                for ap in await repo.list_aruba_access_points(
+                    organization_id=organization_id, router_ids=router_ids
+                )
+                if ap.organization_id == organization_id
+            ]
+
+        AlertKey = tuple[uuid.UUID | None, uuid.UUID | None]
+        open_alerts: dict[AlertKey, Alert] = {}
+        for alert in await repo.list_open_alerts_for_rule(rule_id=rule.id):
+            open_alerts.setdefault((alert.router_id, alert.subject_id), alert)
+        seen_keys: set[AlertKey] = set()
+
+        for router in routers:
+            key: AlertKey = (router.id, None)
+            seen_keys.add(key)
+            heard = last_radius.get(router.id)
+            existing = open_alerts.get(key)
+            if existing is not None:
+                if ap_silence.venue_heard_again(
+                    now=now, last_radius_at=heard, config=config
+                ):
+                    resolved.append(
+                        await self._auto_resolve(
+                            existing,
+                            resolved_message=ap_silence.venue_heard_message(
+                                router.name
+                            ),
+                        )
+                    )
+                continue
+            hours = open_hours.get(router.location_id)
+            open_since = (
+                ap_silence.opened_at(
+                    enabled=hours.enabled,
+                    timezone=hours.timezone,
+                    schedule=hours.schedule,
+                    now=now,
+                )
+                if hours is not None
+                else None
+            )
+            activity = guests.get(router.id)
+            reason = ap_silence.venue_silence_reason(
+                now=now,
+                last_radius_at=heard,
+                unclosed_guest_last_activity_at=(
+                    activity.last_activity_at if activity else None
+                ),
+                open_since=open_since,
+                config=config,
+            )
+            if reason is None or heard is None:
+                continue
+            triggered.append(
+                await self._create_alert(
+                    rule,
+                    organization_id=organization_id,
+                    location_id=router.location_id,
+                    router_id=router.id,
+                    message=ap_silence.venue_silent_message(
+                        router.name,
+                        reason=reason,
+                        quiet_for=now - heard,
+                        guests=activity.sessions if activity else 0,
+                    ),
+                )
+            )
+
+        routers_by_id = {router.id: router for router in routers}
+        approved_by_router: dict[uuid.UUID, list[object]] = {}
+        for ap in access_points:
+            if ap.status == "approved":
+                approved_by_router.setdefault(ap.router_id, []).append(ap)
+        seen_lookback = timedelta(hours=ACCESS_POINT_SILENT_AP_SEEN_LOOKBACK_HOURS)
+        for router_id, aps in approved_by_router.items():
+            router = routers_by_id[router_id]
+            for ap in aps:
+                key = (router_id, ap.id)
+                seen_keys.add(key)
+                label = ap_silence.access_point_label(ap.name, ap.mac)
+                existing = open_alerts.get(key)
+                if existing is not None:
+                    if ap_silence.access_point_heard_again(
+                        now=now, last_seen_at=ap.last_seen_at, config=config
+                    ):
+                        resolved.append(
+                            await self._auto_resolve(
+                                existing,
+                                resolved_message=(
+                                    ap_silence.access_point_heard_message(
+                                        router.name, label
+                                    )
+                                ),
+                            )
+                        )
+                    continue
+                if not ap_silence.access_point_is_silent(
+                    now=now,
+                    last_seen_at=ap.last_seen_at,
+                    sibling_last_seen=[
+                        other.last_seen_at for other in aps if other.id != ap.id
+                    ],
+                    config=config,
+                    seen_lookback=seen_lookback,
+                ):
+                    continue
+                triggered.append(
+                    await self._create_alert(
+                        rule,
+                        organization_id=organization_id,
+                        location_id=router.location_id,
+                        router_id=router_id,
+                        subject_id=ap.id,
+                        message=ap_silence.access_point_silent_message(
+                            router.name, label, quiet_for=now - ap.last_seen_at
+                        ),
+                    )
+                )
+
+        # Open alerts no current venue/AP produces: the venue is no longer
+        # an Instant On venue, or the AP was removed/unapproved -- or the
+        # owner switched per-AP off. Close them with copy that says so;
+        # nothing would ever evaluate their key again.
+        labels = {
+            ap.id: ap_silence.access_point_label(ap.name, ap.mac)
+            for ap in access_points
+        }
+        for key, alert in open_alerts.items():
+            if key in seen_keys:
+                continue
+            router_id, subject_id = key
+            if subject_id is None:
+                message = ap_silence.VENUE_GONE_MESSAGE
+            elif not config.per_access_point and router_id in routers_by_id:
+                message = (
+                    "Per-access-point alerts were switched off for this "
+                    "rule, so this alert was closed."
+                )
+            else:
+                message = ap_silence.access_point_gone_message(
+                    labels.get(subject_id)
+                )
+            resolved.append(await self._auto_resolve(alert, resolved_message=message))
         return triggered, resolved
 
     async def _evaluate_threshold_rule(
