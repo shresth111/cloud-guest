@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -3525,6 +3525,47 @@ def _clean_ssid(raw: str | None) -> str | None:
     return cleaned[:64] or None
 
 
+#: ``radius_nas_clients.last_request_at`` / ``last_accounting_at`` are
+#: stamped at most this often per NAS: one RADIUS packet must not mean one
+#: row write.
+NAS_ACTIVITY_WRITE_INTERVAL = timedelta(seconds=60)
+
+
+async def _stamp_nas_activity(
+    service: RadiusService, nas_client, *, column: str  # noqa: ANN001
+) -> None:
+    """P1-E RADIUS liveness, shared Aruba listener only: stamp when this NAS
+    last sent an Access-Request (``last_request_at``) or Accounting-Request
+    (``last_accounting_at``). A conditional UPDATE, throttled to
+    :data:`NAS_ACTIVITY_WRITE_INTERVAL`. Best-effort: never changes the
+    RADIUS answer."""
+    session = getattr(getattr(service, "repository", None), "session", None)
+    nas_id = getattr(nas_client, "id", None)
+    if session is None or nas_id is None:
+        return
+    try:
+        from sqlalchemy import or_, update
+
+        from .models import RadiusNasClient
+
+        col = getattr(RadiusNasClient, column)
+        now = datetime.now(UTC)
+        await session.execute(
+            update(RadiusNasClient)
+            .where(
+                RadiusNasClient.id == nas_id,
+                or_(col.is_(None), col < now - NAS_ACTIVITY_WRITE_INTERVAL),
+            )
+            .values({column: now})
+            .execution_options(synchronize_session=False)
+        )
+    except Exception:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "radius_aruba_shared_nas_activity_failed",
+            extra={"nas_id": str(nas_id), "column": column},
+        )
+
+
 async def _record_session_ap(
     request: Request,
     service: RadiusService,
@@ -3584,6 +3625,7 @@ async def radius_aruba_shared_authorize(
     except ArubaSharedRequestRejected as exc:
         log_rejection(exc, kind="authorize")
         return {"control:Auth-Type": "Reject"}
+    await _stamp_nas_activity(service, nas_client, column="last_request_at")
     # The AP21 sends a bare-MAC Called-Station-Id; the SSID arrives in
     # Aruba-Essid-Name (see aruba_packet_context). Hand the speed-tier gate
     # the RFC 3580 "MAC:SSID" form it parses.
@@ -3617,6 +3659,7 @@ async def radius_aruba_shared_accounting(
     except ArubaSharedRequestRejected as exc:
         log_rejection(exc, kind="accounting")
         raise RadiusNasAuthenticationError() from None
+    await _stamp_nas_activity(service, nas_client, column="last_accounting_at")
     if payload.status_type in (
         RADIUS_ACCT_STATUS_ACCOUNTING_ON,
         RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
