@@ -341,6 +341,7 @@ class FakePolicyRepository:
         target_type: str,
         target_id: uuid.UUID,
         exclude_policy_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
     ) -> PolicyAssignment | None:
         matches = []
         for assignment in self.assignments.values():
@@ -359,6 +360,11 @@ class FakePolicyRepository:
             if policy is None or not policy.is_active or policy.is_deleted:
                 continue
             if policy.policy_type != policy_type:
+                continue
+            if (
+                organization_id is not None
+                and policy.organization_id != organization_id
+            ):
                 continue
             matches.append(assignment)
         matches.sort(key=lambda a: a.created_at)
