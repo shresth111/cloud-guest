@@ -558,6 +558,13 @@ class GuestSessionResponse(BaseModel):
     disconnect_enforced: bool | None = None
     user_agent: str | None
     created_at: datetime
+    #: Aruba Instant On only: the access point (canonical MAC) and SSID this
+    #: session was last reported from by RADIUS accounting, and the AP's name
+    #: from the venue's access-point list. Always ``None`` for MikroTik and
+    #: Omada sessions (nothing else writes ``guest_sessions.ap_mac``).
+    ap_mac: str | None = None
+    ap_ssid: str | None = None
+    ap_name: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -71,6 +71,7 @@ from .aruba_shared import (
     ArubaSharedNotConfiguredError,
     ArubaSharedRequestRejected,
     ArubaSharedSecretStore,
+    ap_mac_from_called_station_id,
     canonical_mac,
     log_rejection,
     recorded_ap_mac,
@@ -370,6 +371,7 @@ def _session_response(
     guest_identifier: str | None = None,
     router_name: str | None = None,
     device_online: bool | None = None,
+    ap_name: str | None = None,
 ) -> GuestSessionResponse:
     """``device_mac``, ``guest_identifier``, ``router_name`` and
     ``device_online`` are passed in, never looked up here, because the only
@@ -417,6 +419,9 @@ def _session_response(
         disconnect_enforced=session.disconnect_enforced,
         user_agent=session.user_agent,
         created_at=session.created_at,
+        ap_mac=getattr(session, "ap_mac", None),
+        ap_ssid=getattr(session, "ap_ssid", None),
+        ap_name=ap_name,
     )
 
 
@@ -612,6 +617,7 @@ def _session_responses(
     identifiers: dict[str, str] | None = None,
     router_names: dict[str, str] | None = None,
     presence: dict[str, bool | None] | None = None,
+    ap_names: dict[tuple[uuid.UUID, str], str] | None = None,
 ) -> list[GuestSessionResponse]:
     """Zip a page of sessions with already-resolved MAC, guest-identifier and
     router-name maps. A session whose device is absent from ``macs`` (no
@@ -627,6 +633,7 @@ def _session_responses(
     identifiers = identifiers or {}
     router_names = router_names or {}
     presence = presence or {}
+    ap_names = ap_names or {}
     return [
         _session_response(
             s,
@@ -634,9 +641,37 @@ def _session_responses(
             guest_identifier=identifiers.get(str(s.guest_id)),
             router_name=router_names.get(str(s.router_id)),
             device_online=presence.get(str(s.id)),
+            ap_name=(
+                ap_names.get((s.router_id, ap_mac))
+                if (ap_mac := getattr(s, "ap_mac", None))
+                else None
+            ),
         )
         for s in sessions
     ]
+
+
+async def _resolve_ap_names(
+    sessions: Sequence[GuestSession], *, service: GuestService
+) -> dict[tuple[uuid.UUID, str], str]:
+    """``(router_id, ap_mac) -> AP name`` for the Aruba sessions on this
+    page, in one query. A page with no ``ap_mac`` (every MikroTik / Omada
+    page) issues no query at all."""
+    pairs = [
+        (s.router_id, ap_mac)
+        for s in sessions
+        if (ap_mac := getattr(s, "ap_mac", None))
+    ]
+    if not pairs:
+        return {}
+    db = getattr(getattr(service, "repository", None), "session", None)
+    if db is None:
+        return {}
+    from app.domains.network_integration.aruba_access_points import (
+        ArubaAccessPointRepository,
+    )
+
+    return await ArubaAccessPointRepository(db).names_for(pairs)
 
 
 async def _session_response_resolved(
@@ -1380,6 +1415,15 @@ async def list_guest_sessions(
     router_id: uuid.UUID | None = Query(default=None),
     guest_id: uuid.UUID | None = Query(default=None),
     status_filter: GuestSessionStatus | None = Query(default=None, alias="status"),
+    ap_mac: str | None = Query(
+        default=None,
+        max_length=32,
+        description=(
+            "Aruba Instant On only: sessions last reported from this access "
+            "point (any MAC spelling). Applies to the non-date-range listing "
+            "only, like router_id/guest_id/status."
+        ),
+    ),
     start_date: datetime | None = Query(
         default=None,
         description=(
@@ -1423,6 +1467,7 @@ async def list_guest_sessions(
             status=status_filter,
             page=page,
             page_size=page_size,
+            **({"ap_mac": canonical_mac(ap_mac) or ap_mac.strip()} if ap_mac else {}),
         )
     macs = await _resolve_session_macs(
         sessions,
@@ -1436,9 +1481,10 @@ async def list_guest_sessions(
     )
     router_names = await _resolve_router_names(sessions, service=service)
     presence = await _resolve_session_presence(sessions, macs, service=service)
+    ap_names = await _resolve_ap_names(sessions, service=service)
     payload = GuestSessionListResponse(
         items=_session_responses(
-            sessions, macs, identifiers, router_names, presence
+            sessions, macs, identifiers, router_names, presence, ap_names
         ),
         page=meta.page,
         page_size=meta.page_size,
@@ -3437,6 +3483,29 @@ class _NoSettings:
         raise RuntimeError("no settings store behind this RadiusService")
 
 
+#: Forwarded by the shared listener (ARUBA lane, P0-B) from the Aruba VSAs
+#: 14823/5 ``Aruba-Essid-Name`` and 14823/6 ``Aruba-Location-Id`` (the AP
+#: serial on Instant On). Absent on a hub that predates that change.
+ARUBA_ESSID_HEADER = "X-RADIUS-Aruba-Essid-Name"
+ARUBA_LOCATION_ID_HEADER = "X-RADIUS-Aruba-Location-Id"
+
+
+def _aruba_ap_registry(request: Request, radius_service: RadiusService):  # noqa: ANN202
+    """The multi-AP registry on the request's DB session, or None for a
+    service with no database behind it (a unit-test fake) -- in which case
+    the resolver keeps its single recorded-MAC check."""
+    session = getattr(getattr(radius_service, "repository", None), "session", None)
+    if session is None:
+        return None
+    from app.domains.network_integration.aruba_access_points import (
+        DbArubaApRegistry,
+    )
+
+    return DbArubaApRegistry(
+        session, serial_hint=request.headers.get(ARUBA_LOCATION_ID_HEADER)
+    )
+
+
 async def _resolve_shared(request: Request, service: RadiusService):  # noqa: ANN202
     return await resolve_shared_nas(
         presented_secret=request.headers.get(SHARED_SECRET_HEADER),
@@ -3444,7 +3513,52 @@ async def _resolve_shared(request: Request, service: RadiusService):  # noqa: AN
         called_station_id=request.headers.get(CALLED_STATION_ID_HEADER),
         store=_aruba_shared_store(service),
         radius_service=service,
+        ap_registry=_aruba_ap_registry(request, service),
     )
+
+
+def _clean_ssid(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    cleaned = "".join(ch for ch in raw.strip() if ch.isprintable())
+    return cleaned[:64] or None
+
+
+async def _record_session_ap(
+    request: Request,
+    service: RadiusService,
+    response: RadiusAccountingResponse,
+) -> None:
+    """Stamp ``guest_sessions.ap_mac``/``ap_ssid`` from this packet's
+    Called-Station-Id. Shared Aruba listener only (no other caller), and
+    best-effort: accounting is already recorded and the AP must get its
+    Accounting-Response."""
+    session = getattr(getattr(service, "repository", None), "session", None)
+    session_id = getattr(response, "session_id", None)
+    if session is None or not session_id:
+        return
+    raw = request.headers.get(CALLED_STATION_ID_HEADER)
+    ap_mac = ap_mac_from_called_station_id(raw)
+    if ap_mac is None:
+        return
+    try:
+        from app.domains.network_integration.aruba_access_points import (
+            set_session_ap,
+            ssid_from_called_station_id,
+        )
+
+        await set_session_ap(
+            session,
+            guest_session_id=uuid.UUID(session_id),
+            ap_mac=ap_mac,
+            ap_ssid=_clean_ssid(request.headers.get(ARUBA_ESSID_HEADER))
+            or ssid_from_called_station_id(raw),
+        )
+    except Exception:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "radius_aruba_shared_session_ap_failed",
+            extra={"session_id": session_id},
+        )
 
 
 @radius_router.post(
@@ -3519,6 +3633,7 @@ async def radius_aruba_shared_accounting(
             session_id=None, status=payload.status_type, closed_session_count=0
         )
     response = await _radius_accounting(payload, nas_client, service)
+    await _record_session_ap(request, service, response)
     await _dispatch_aruba_hybrid_speed(payload, nas_client, response, service)
     return response
 

@@ -5216,6 +5216,7 @@ class GuestService:
         status: GuestSessionStatus | None = None,
         page: int = 1,
         page_size: int = 25,
+        ap_mac: str | None = None,
     ) -> tuple[list[GuestSession], object]:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
@@ -5229,6 +5230,10 @@ class GuestService:
             filters["guest_id"] = guest_id
         if status is not None:
             filters["status"] = status.value
+        if ap_mac is not None:
+            # Aruba Instant On multi-AP filter; NULL on every other vendor's
+            # session, so it can only ever narrow.
+            filters["ap_mac"] = ap_mac
         return await self.repository.list_sessions(
             page=page, page_size=page_size, filters=filters or None
         )
