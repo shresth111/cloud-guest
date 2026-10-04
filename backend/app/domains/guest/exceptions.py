@@ -32,6 +32,7 @@ __all__ = [
     "GuestSessionNotFoundError",
     "GuestAuthMethodNotEnabledError",
     "VenueClosedError",
+    "AccessTierOutsideLoginHoursError",
     "GuestTeamSharedQuotaExceededError",
     "RouterNotEligibleForGuestSessionError",
     "InvalidSessionStatusTransitionError",
@@ -196,6 +197,21 @@ class VenueClosedError(GuestError):
             closed_message or "This WiFi network is closed right now.",
             status_code=status.HTTP_403_FORBIDDEN,
             data={"code": "venue_closed"},
+        )
+
+
+class AccessTierOutsideLoginHoursError(GuestError):
+    """The guest's Access Tier only allows sign-in during its login hours,
+    and now is outside them. Enforced at Aruba Instant On venues only (see
+    ``app.domains.policy.access_tier``). Same machine-readable
+    ``data["code"]`` contract as ``VenueClosedError`` so the portal can tell
+    it apart from a generic 403."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Your WiFi access isn't available at this time of day.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "access_tier_outside_login_hours"},
         )
 
 

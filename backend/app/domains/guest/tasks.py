@@ -81,6 +81,7 @@ from .constants import (
 )
 from .repository import GuestRepository
 from .service import (
+    aruba_access_tier_lookup,
     enforce_open_hours_online_guests,
     enforce_session_timeouts,
     enforce_whitelist_only_online_guests,
@@ -113,6 +114,25 @@ def _build_policy_service(session: AsyncSession) -> PolicyService:
     )
     return PolicyService(
         PolicyRepository(session), organization_service, location_service
+    )
+
+
+def _build_router_lookup(session: AsyncSession):
+    """A real ``RouterService`` used only as a read-only ``get_router`` --
+    the Access Tier sweep lookup needs a session's router vendor and
+    nothing else. Imported inside the function, like
+    ``_build_queue_management_service``'s identical construction."""
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    return RouterService(
+        RouterRepository(session), organization_service, location_service
     )
 
 
@@ -172,6 +192,10 @@ async def _run_fup_time_accrual_sweep_async() -> dict[str, int]:
                 policy_service,
                 now=datetime.now(UTC),
                 terminator=_build_session_terminator(session, repository),
+                # Access Tier daily limits, Aruba Instant On only.
+                access_tier_lookup=aruba_access_tier_lookup(
+                    repository, _build_router_lookup(session), policy_service
+                ),
             )
             await session.commit()
             return result

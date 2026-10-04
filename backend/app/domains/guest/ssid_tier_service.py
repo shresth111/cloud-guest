@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exceptions import CloudGuestError
@@ -294,6 +294,7 @@ class SsidTierRepository:
             PolicyType,
         )
         from app.domains.policy.models import Policy, PolicyAssignment
+        from app.domains.rbac.enums import ScopeType
         from app.domains.voucher.constants import VoucherStatus
         from app.domains.voucher.models import Voucher
 
@@ -328,6 +329,18 @@ class SsidTierRepository:
                 Policy.policy_type == PolicyType.BANDWIDTH.value,
                 Policy.is_active.is_(True),
                 Policy.is_deleted.is_(False),
+                Policy.current_version_id.is_not(None),
+                # Mapped into the tier HERE (the dashboard writes
+                # scope_type=location), not at another of the account's
+                # venues -- the same scope rule Access Tier enforcement
+                # (PolicyService.resolve_access_tier) applies.
+                or_(
+                    PolicyAssignment.scope_type == ScopeType.GLOBAL.value,
+                    (PolicyAssignment.scope_type == ScopeType.ORGANIZATION.value)
+                    & (PolicyAssignment.scope_id == organization_id),
+                    (PolicyAssignment.scope_type == ScopeType.LOCATION.value)
+                    & (PolicyAssignment.scope_id == location_id),
+                ),
             )
         )
         tiers = {pid for (pid,) in tier_rows.all() if pid is not None}

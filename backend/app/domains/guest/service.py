@@ -239,7 +239,7 @@ import logging
 import math
 import secrets
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -272,6 +272,11 @@ from app.domains.mac_authorization.validators import (
 from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
+from app.domains.policy.access_tier import (
+    AccessTier,
+    login_hours_standing,
+    tier_overrides,
+)
 from app.domains.policy.constants import PolicyType
 from app.domains.policy.schemas import BandwidthPolicyRules
 from app.domains.queue_management.constants import QueueTargetType
@@ -354,6 +359,7 @@ from .events import (
     WhitelistOnlyLoginRefused,
 )
 from .exceptions import (
+    AccessTierOutsideLoginHoursError,
     ConcurrentSessionLimitExceededError,
     CrossLocationGuestAccessError,
     CrossOrganizationGuestAccessError,
@@ -1785,12 +1791,67 @@ class PolicyLookupProtocol(Protocol):
     ) -> ResolvedDevicePolicyProtocol: ...
 
 
+#: ``(guest_id, organization_id, location_id) -> AccessTier | None`` -- the
+#: guest's Access Tier at that location when they are online there on an
+#: Aruba Instant On router, else ``None``. Built by
+#: ``aruba_access_tier_lookup`` below; injected into the FUP time-accrual
+#: sweep so the sweep itself stays vendor-agnostic.
+AccessTierForGuestLookup = Callable[
+    [uuid.UUID, uuid.UUID, uuid.UUID | None], Awaitable[AccessTier | None]
+]
+
+
+def aruba_access_tier_lookup(
+    repository: GuestRepositoryProtocol,
+    router_lookup: RouterLookupProtocol,
+    policy_lookup: object,
+) -> AccessTierForGuestLookup:
+    """The sweep-side twin of ``GuestService._aruba_access_tier``: resolves
+    a guest's tier only when one of their ACTIVE sessions at that location
+    runs on a NAS-only (Aruba Instant On) router. Never raises (``None``)."""
+    resolver = getattr(policy_lookup, "resolve_access_tier", None)
+
+    async def lookup(
+        guest_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+    ) -> AccessTier | None:
+        if resolver is None or location_id is None:
+            return None
+        try:
+            sessions = await repository.list_active_sessions_for_guest(guest_id)
+            router_ids = {
+                s.router_id
+                for s in sessions
+                if s.location_id == location_id and s.router_id is not None
+            }
+            for router_id in router_ids:
+                router = await router_lookup.get_router(
+                    router_id, include_deleted=True
+                )
+                if is_nas_only(router):
+                    return await resolver(
+                        organization_id=organization_id,
+                        location_id=location_id,
+                        guest_id=guest_id,
+                    )
+        except Exception as exc:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                "access_tier_sweep_lookup_failed",
+                extra={"guest_id": str(guest_id), "error": str(exc)},
+            )
+        return None
+
+    return lookup
+
+
 async def run_fup_time_accrual(
     repository: GuestRepositoryProtocol,
     policy_lookup: PolicyLookupProtocol,
     *,
     now: datetime,
     terminator: LiveSessionTerminatorProtocol | None = None,
+    access_tier_lookup: AccessTierForGuestLookup | None = None,
 ) -> dict[str, int]:
     """Guest-level FUP time-quota accrual + enforcement, pulled out to
     module scope for the exact same reason ``enforce_session_timeouts``
@@ -1872,8 +1933,17 @@ async def run_fup_time_accrual(
                 location_id=location_id,
                 guest_id=guest_id,
             )
+            # Access Tier daily limit -- Aruba Instant On only: the lookup
+            # answers None unless this guest is online here on an Aruba
+            # router, so MikroTik/Omada guests resolve exactly as before.
+            access_tier = (
+                await access_tier_lookup(guest_id, organization_id, location_id)
+                if access_tier_lookup is not None
+                else None
+            )
+            rules = _with_access_tier(PolicyType.FUP, resolved.rules, access_tier)
             for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items():
-                candidate = resolved.rules.get(rule_key)
+                candidate = rules.get(rule_key)
                 if candidate is None:
                     continue
                 current = time_limits[period_type]
@@ -2395,6 +2465,55 @@ def _min_present(*values: int | None) -> int | None:
     and must never be read as zero."""
     present = [v for v in values if v is not None]
     return min(present) if present else None
+
+
+def _with_access_tier(
+    policy_type: PolicyType, rules: dict[str, Any], access_tier: AccessTier | None
+) -> dict[str, Any]:
+    """``rules`` with ``access_tier``'s fields for ``policy_type`` laid over
+    them (``policy.access_tier.tier_overrides``). ``rules`` unchanged -- the
+    same object -- when there is no tier, which is always the case at a
+    MikroTik or Omada venue: Access Tiers are enforced at Aruba Instant On
+    only (owner decision 2026-10-04)."""
+    if access_tier is None:
+        return rules
+    overrides = tier_overrides(policy_type, access_tier)
+    if not overrides:
+        return rules
+    return {**rules, **overrides}
+
+
+def _with_tier_session_data_limit(
+    data_limit_mb: int | None, access_tier: AccessTier | None
+) -> int | None:
+    """A new session's per-session data allowance: the smaller of what the
+    sign-in already granted (a voucher batch's ``data_limit_mb``, or
+    ``None``) and the tier's "Per session" data limit. Never loosens a
+    voucher's cap; ``None`` stays ``None`` without a tier."""
+    if access_tier is None:
+        return data_limit_mb
+    return _min_present(data_limit_mb, access_tier.session_data_limit_mb)
+
+
+def _tier_session_seconds_left(
+    session: GuestSession, access_tier: AccessTier | None, now: datetime | None = None
+) -> int | None:
+    """Seconds left of the tier's session timeout, counted from this
+    session's own start -- so a guest mapped into a shorter tier *after*
+    signing in is cut at the tier's length on the next Access-Request, not
+    only from their next sign-in (the session row's own
+    ``session_timeout_minutes`` was stamped before the mapping). ``None``
+    without a tier session timeout. Only ever *shortens*: the caller takes
+    the minimum with the session's own remaining time."""
+    if access_tier is None or not access_tier.session_timeout_minutes:
+        return None
+    started = session.started_at
+    if started is None:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    elapsed = ((now or datetime.now(UTC)) - started).total_seconds()
+    return math.ceil(access_tier.session_timeout_minutes * 60 - elapsed)
 
 
 def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | None:
@@ -3082,7 +3201,20 @@ class GuestService:
             ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
+        # The Access Tier this guest is mapped into here -- resolved for an
+        # Aruba Instant On router only (None at MikroTik/Omada, which keep
+        # their behaviour exactly). A brand-new guest cannot be mapped yet.
+        access_tier: AccessTier | None = None
         if existing_guest is not None:
+            access_tier = await self._aruba_access_tier(
+                router_id=router_id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+                guest_id=existing_guest.id,
+            )
+            await self._enforce_access_tier_login_hours(
+                access_tier, organization_id=resolved_org_id
+            )
             # A brand-new guest (``existing_guest is None``) trivially holds
             # zero active sessions -- skip the query entirely rather than
             # counting against a guest_id that doesn't exist yet. Checked
@@ -3105,12 +3237,14 @@ class GuestService:
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
             # Same skip -- see _enforce_fup_quota's own docstring.
             await self._enforce_fup_quota(
                 guest_id=existing_guest.id,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -3147,11 +3281,13 @@ class GuestService:
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -3163,7 +3299,7 @@ class GuestService:
             ip_address=ip_address,
             user_agent=user_agent,
             accept_language=accept_language,
-            data_limit_mb=None,
+            data_limit_mb=_with_tier_session_data_limit(None, access_tier),
             session_timeout_minutes=resolved_session_timeout,
             idle_timeout_minutes=resolved_idle_timeout,
         )
@@ -3254,7 +3390,20 @@ class GuestService:
             ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
+        # The Access Tier this guest is mapped into here -- resolved for an
+        # Aruba Instant On router only (None at MikroTik/Omada, which keep
+        # their behaviour exactly). A brand-new guest cannot be mapped yet.
+        access_tier: AccessTier | None = None
         if existing_guest is not None:
+            access_tier = await self._aruba_access_tier(
+                router_id=router_id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+                guest_id=existing_guest.id,
+            )
+            await self._enforce_access_tier_login_hours(
+                access_tier, organization_id=resolved_org_id
+            )
             # See the identical comment in login_via_otp: skip the query for
             # a brand-new guest, and check before the voucher is redeemed
             # below, not after, so a guest already at the limit never
@@ -3270,11 +3419,13 @@ class GuestService:
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
             await self._enforce_fup_quota(
                 guest_id=existing_guest.id,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -3320,6 +3471,7 @@ class GuestService:
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         # Copied, not referenced -- see module docstring.
         session, created = await self._reuse_or_create_session(
@@ -3332,7 +3484,9 @@ class GuestService:
             ip_address=ip_address,
             user_agent=user_agent,
             accept_language=accept_language,
-            data_limit_mb=batch.data_limit_mb,
+            data_limit_mb=_with_tier_session_data_limit(
+                batch.data_limit_mb, access_tier
+            ),
             session_timeout_minutes=batch.validity_minutes,
             idle_timeout_minutes=resolved_idle_timeout,
         )
@@ -3463,7 +3617,20 @@ class GuestService:
             ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
+        # The Access Tier this guest is mapped into here -- resolved for an
+        # Aruba Instant On router only (None at MikroTik/Omada, which keep
+        # their behaviour exactly). A brand-new guest cannot be mapped yet.
+        access_tier: AccessTier | None = None
         if existing_guest is not None:
+            access_tier = await self._aruba_access_tier(
+                router_id=router_id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+                guest_id=existing_guest.id,
+            )
+            await self._enforce_access_tier_login_hours(
+                access_tier, organization_id=resolved_org_id
+            )
             await self._enforce_concurrent_session_limit(
                 existing_guest.id,
                 organization_id=resolved_org_id,
@@ -3474,11 +3641,13 @@ class GuestService:
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
             await self._enforce_fup_quota(
                 guest_id=existing_guest.id,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -3507,11 +3676,13 @@ class GuestService:
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -3523,7 +3694,7 @@ class GuestService:
             ip_address=ip_address,
             user_agent=user_agent,
             accept_language=accept_language,
-            data_limit_mb=None,
+            data_limit_mb=_with_tier_session_data_limit(None, access_tier),
             session_timeout_minutes=resolved_session_timeout,
             idle_timeout_minutes=resolved_idle_timeout,
         )
@@ -3733,7 +3904,20 @@ class GuestService:
             ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
+        # The Access Tier this guest is mapped into here -- resolved for an
+        # Aruba Instant On router only (None at MikroTik/Omada, which keep
+        # their behaviour exactly). A brand-new guest cannot be mapped yet.
+        access_tier: AccessTier | None = None
         if existing_guest is not None:
+            access_tier = await self._aruba_access_tier(
+                router_id=router_id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+                guest_id=existing_guest.id,
+            )
+            await self._enforce_access_tier_login_hours(
+                access_tier, organization_id=resolved_org_id
+            )
             await self._enforce_concurrent_session_limit(
                 existing_guest.id,
                 organization_id=resolved_org_id,
@@ -3744,11 +3928,13 @@ class GuestService:
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
             await self._enforce_fup_quota(
                 guest_id=existing_guest.id,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -3816,11 +4002,13 @@ class GuestService:
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -3832,7 +4020,7 @@ class GuestService:
             ip_address=ip_address,
             user_agent=user_agent,
             accept_language=accept_language,
-            data_limit_mb=None,
+            data_limit_mb=_with_tier_session_data_limit(None, access_tier),
             session_timeout_minutes=resolved_session_timeout,
             idle_timeout_minutes=resolved_idle_timeout,
         )
@@ -3980,7 +4168,20 @@ class GuestService:
             device_mac_already_authorized=True,
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
+        # The Access Tier this guest is mapped into here -- resolved for an
+        # Aruba Instant On router only (None at MikroTik/Omada, which keep
+        # their behaviour exactly). A brand-new guest cannot be mapped yet.
+        access_tier: AccessTier | None = None
         if existing_guest is not None:
+            access_tier = await self._aruba_access_tier(
+                router_id=router_id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+                guest_id=existing_guest.id,
+            )
+            await self._enforce_access_tier_login_hours(
+                access_tier, organization_id=resolved_org_id
+            )
             await self._enforce_concurrent_session_limit(
                 existing_guest.id,
                 organization_id=resolved_org_id,
@@ -3991,11 +4192,13 @@ class GuestService:
                 mac_address=normalized_mac,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
             await self._enforce_fup_quota(
                 guest_id=existing_guest.id,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                access_tier=access_tier,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -4016,11 +4219,13 @@ class GuestService:
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
             organization_id=resolved_org_id,
             location_id=location_id,
             guest_id=guest.id,
+            access_tier=access_tier,
         )
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -4032,7 +4237,7 @@ class GuestService:
             ip_address=ip_address,
             user_agent=user_agent,
             accept_language=accept_language,
-            data_limit_mb=None,
+            data_limit_mb=_with_tier_session_data_limit(None, access_tier),
             session_timeout_minutes=resolved_session_timeout,
             idle_timeout_minutes=resolved_idle_timeout,
         )
@@ -5768,6 +5973,19 @@ class GuestService:
             location_id=updated.location_id,
             delta_bytes=total_delta_bytes,
             now=now,
+            # Aruba Instant On only (None at MikroTik/Omada, whose
+            # behaviour is unchanged). Skipped entirely on a zero delta,
+            # where the tracker is a no-op anyway.
+            access_tier=(
+                await self._aruba_access_tier(
+                    router_id=updated.router_id,
+                    organization_id=updated.organization_id,
+                    location_id=updated.location_id,
+                    guest_id=updated.guest_id,
+                )
+                if total_delta_bytes > 0
+                else None
+            ),
         )
         session_cap_reached = is_quota_exceeded(updated)
         if (
@@ -5939,11 +6157,16 @@ class GuestService:
                 refusal="session_data_limit_reached",
                 session_timeout_cap_seconds=None,
             )
+        # The guest's Access Tier at this venue. This method is only ever
+        # asked about a NAS-only (Aruba Instant On) router, so the tier is
+        # read directly; see ``policy.access_tier`` for the precedence.
+        access_tier = await self._nas_only_access_tier(session)
         try:
             await self._enforce_fup_quota(
                 guest_id=session.guest_id,
                 organization_id=session.organization_id,
                 location_id=session.location_id,
+                access_tier=access_tier,
             )
         except FairUsagePolicyExceededError as exc:
             return NasOnlyAuthorizeStanding(
@@ -5973,14 +6196,50 @@ class GuestService:
             return NasOnlyAuthorizeStanding(
                 refusal="venue_closed", session_timeout_cap_seconds=None
             )
+        tier_hours = await self._access_tier_login_hours_standing(
+            access_tier, organization_id=session.organization_id
+        )
+        if tier_hours == "closed":
+            return NasOnlyAuthorizeStanding(
+                refusal="access_tier_outside_login_hours",
+                session_timeout_cap_seconds=None,
+            )
+        tier_session_left = _tier_session_seconds_left(session, access_tier)
+        if tier_session_left is not None and tier_session_left <= 0:
+            return NasOnlyAuthorizeStanding(
+                refusal="access_tier_session_time_used",
+                session_timeout_cap_seconds=None,
+            )
         return NasOnlyAuthorizeStanding(
             refusal=None,
             session_timeout_cap_seconds=_min_present(
-                await self._fup_time_remaining_seconds(session),
+                await self._fup_time_remaining_seconds(session, access_tier),
                 open_hours,
                 voucher,
+                tier_hours if isinstance(tier_hours, int) else None,
+                tier_session_left,
             ),
         )
+
+    async def _nas_only_access_tier(self, session: GuestSession) -> AccessTier | None:
+        """The Access Tier for a session already known to run on a NAS-only
+        router (``nas_only_authorize_standing`` is only asked about those).
+        Never raises; ``None`` when no tier applies or the lookup fails."""
+        resolver = getattr(self.policy_lookup, "resolve_access_tier", None)
+        if resolver is None:
+            return None
+        try:
+            return await resolver(
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+                guest_id=session.guest_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- never raises, see caller
+            logger.warning(
+                "nas_only_authorize_access_tier_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+            return None
 
     async def _voucher_standing(self, session: GuestSession) -> int | str | None:
         """For a voucher sign-in: a refusal reason when the voucher behind
@@ -6090,7 +6349,9 @@ class GuestService:
             return None
         return NasOnlyBandwidthRates(download_kbps=download, upload_kbps=upload)
 
-    async def _fup_time_remaining_seconds(self, session: GuestSession) -> int | None:
+    async def _fup_time_remaining_seconds(
+        self, session: GuestSession, access_tier: AccessTier | None = None
+    ) -> int | None:
         """Seconds left of the guest's tightest FUP *time* allowance at this
         session's location, or ``None`` when no time limit is configured (or
         the answer cannot be read -- see ``nas_only_authorize_standing``).
@@ -6106,8 +6367,9 @@ class GuestService:
                 location_id=session.location_id,
                 guest_id=session.guest_id,
             )
+            rules = _with_access_tier(PolicyType.FUP, resolved.rules, access_tier)
             time_limits = {
-                period_type: resolved.rules.get(rule_key)
+                period_type: rules.get(rule_key)
                 for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items()
             }
             capped = [p for p, limit in time_limits.items() if limit]
@@ -6723,6 +6985,91 @@ class GuestService:
         ):
             raise ConcurrentSessionLimitExceededError(guest_id=guest_id, limit=limit)
 
+    # ========================================================================
+    # Access Tiers -- Aruba Instant On only
+    # ========================================================================
+
+    async def _aruba_access_tier(
+        self,
+        *,
+        router: Router | None = None,
+        router_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None,
+    ) -> AccessTier | None:
+        """The Access Tier ``guest_id`` is mapped into at ``location_id``,
+        **only when the router is an Aruba Instant On (NAS-only) device**;
+        ``None`` everywhere else.
+
+        Vendor-gated on purpose (owner, 2026-10-04: MikroTik and Omada stay
+        exactly as they are). At those vendors this returns ``None`` before
+        touching the policy tables, so every reader that takes an
+        ``access_tier`` behaves byte-for-byte as before.
+
+        Never raises: a router or policy lookup that fails yields ``None``
+        (the venue's own limits apply), because this runs on the sign-in
+        path and on every RADIUS interim."""
+        if guest_id is None or organization_id is None or location_id is None:
+            return None
+        resolver = getattr(self.policy_lookup, "resolve_access_tier", None)
+        if resolver is None:
+            return None
+        try:
+            if router is None:
+                if router_id is None:
+                    return None
+                router = await self.router_lookup.get_router(
+                    router_id, include_deleted=True
+                )
+            if not is_nas_only(router):
+                return None
+            return await resolver(
+                organization_id=organization_id,
+                location_id=location_id,
+                guest_id=guest_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "access_tier_lookup_failed",
+                extra={
+                    "guest_id": str(guest_id),
+                    "location_id": str(location_id),
+                    "error": str(exc),
+                },
+            )
+            return None
+
+    async def _access_tier_login_hours_standing(
+        self, access_tier: AccessTier | None, *, organization_id: uuid.UUID
+    ) -> int | str | None:
+        """``policy.access_tier.login_hours_standing`` for ``access_tier``,
+        evaluated in the organization's timezone (the same clock the FUP
+        daily limit resets on). ``None`` = no restriction."""
+        if access_tier is None or access_tier.login_hours is None:
+            return None
+        try:
+            tz_name = await self.repository.get_organization_timezone(
+                organization_id
+            )
+        except Exception:  # noqa: BLE001 -- UTC rather than no WiFi
+            tz_name = None
+        return login_hours_standing(access_tier.login_hours, tz_name=tz_name)
+
+    async def _enforce_access_tier_login_hours(
+        self, access_tier: AccessTier | None, *, organization_id: uuid.UUID
+    ) -> None:
+        """Refuse a sign-in outside the guest's Access Tier login hours.
+        A no-op without a tier (every MikroTik/Omada sign-in) or without a
+        usable window. The venue's own Open Hours are checked separately and
+        still apply: a tier can narrow when a guest may sign in, never widen
+        it."""
+        standing = await self._access_tier_login_hours_standing(
+            access_tier, organization_id=organization_id
+        )
+        if standing == "closed":
+            raise AccessTierOutsideLoginHoursError()
+
     async def _resolve_device_limit(
         self,
         *,
@@ -6776,6 +7123,7 @@ class GuestService:
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         guest_id: uuid.UUID | None = None,
+        access_tier: AccessTier | None = None,
     ) -> int:
         """Resolves how long this location's sessions last, via
         ``PolicyType.SESSION``.
@@ -6809,6 +7157,9 @@ class GuestService:
             location_id=location_id,
             guest_id=guest_id,
         )
+        if access_tier is not None and access_tier.session_timeout_minutes:
+            # Access Tier (Aruba Instant On only): overrides the venue's.
+            return access_tier.session_timeout_minutes
         return rules.get("session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES)
 
     async def _resolve_idle_timeout_minutes(
@@ -6817,6 +7168,7 @@ class GuestService:
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         guest_id: uuid.UUID | None = None,
+        access_tier: AccessTier | None = None,
     ) -> int:
         """Resolves how long a guest's device at this location may pass zero
         bytes before the NAS closes the session, via the same
@@ -6856,6 +7208,9 @@ class GuestService:
             location_id=location_id,
             guest_id=guest_id,
         )
+        if access_tier is not None and access_tier.idle_timeout_minutes:
+            # Access Tier (Aruba Instant On only): overrides the venue's.
+            return access_tier.idle_timeout_minutes
         return rules.get("idle_timeout_minutes", DEFAULT_IDLE_TIMEOUT_MINUTES)
 
     async def _resolve_session_policy_rules(
@@ -6933,6 +7288,7 @@ class GuestService:
         mac_address: str | None,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        access_tier: AccessTier | None = None,
     ) -> GuestDevice | None:
         """Guest Session Engine (Phase 1): raises
         ``GuestDeviceLimitExceededError`` if this connection would put
@@ -6989,6 +7345,10 @@ class GuestService:
         limit = await self._resolve_device_limit(
             organization_id=organization_id, location_id=location_id, guest_id=guest_id
         )
+        # Access Tier (Aruba Instant On only -- ``access_tier`` is None at
+        # every other vendor): a tier's devices-per-user replaces the venue's.
+        if access_tier is not None and access_tier.devices_per_user is not None:
+            limit = access_tier.devices_per_user
         if is_device_limit_reached(device_count=connected_devices, limit=limit):
             raise GuestDeviceLimitExceededError(guest_id=guest_id, limit=limit)
         return existing_device
@@ -6999,6 +7359,7 @@ class GuestService:
         guest_id: uuid.UUID,
         organization_id: uuid.UUID,
         location_id: uuid.UUID | None = None,
+        access_tier: AccessTier | None = None,
     ) -> None:
         """Guest Session Engine (Phase 1): raises
         ``FairUsagePolicyExceededError`` if ``guest_id`` already meets or
@@ -7047,7 +7408,9 @@ class GuestService:
             location_id=location_id,
             guest_id=guest_id,
         )
-        rules = resolved.rules
+        # Access Tier (Aruba Instant On only): the tier's data / daily limit
+        # replaces the venue's -- see ``policy.access_tier.tier_overrides``.
+        rules = _with_access_tier(PolicyType.FUP, resolved.rules, access_tier)
         data_limits = {
             QuotaPeriodType.DAILY: rules.get("daily_data_limit_mb"),
             QuotaPeriodType.WEEKLY: rules.get("weekly_data_limit_mb"),
@@ -7113,6 +7476,7 @@ class GuestService:
         location_id: uuid.UUID | None = None,
         delta_bytes: int,
         now: datetime,
+        access_tier: AccessTier | None = None,
     ) -> str | None:
         """Best-effort, additive: bumps every ``GuestQuotaUsage`` period
         row's ``bytes_used`` by ``delta_bytes`` -- called from
@@ -7163,10 +7527,12 @@ class GuestService:
                 location_id=location_id,
                 guest_id=guest_id,
             )
+            # Access Tier (Aruba Instant On only; None elsewhere).
+            rules = _with_access_tier(PolicyType.FUP, resolved.rules, access_tier)
             data_limits = {
-                QuotaPeriodType.DAILY: resolved.rules.get("daily_data_limit_mb"),
-                QuotaPeriodType.WEEKLY: resolved.rules.get("weekly_data_limit_mb"),
-                QuotaPeriodType.MONTHLY: resolved.rules.get("monthly_data_limit_mb"),
+                QuotaPeriodType.DAILY: rules.get("daily_data_limit_mb"),
+                QuotaPeriodType.WEEKLY: rules.get("weekly_data_limit_mb"),
+                QuotaPeriodType.MONTHLY: rules.get("monthly_data_limit_mb"),
             }
             violated_period: str | None = None
             # Same S9 batching as _enforce_fup_quota. This path runs on
