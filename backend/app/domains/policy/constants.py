@@ -124,16 +124,13 @@ class PolicyAssignmentTargetType(StrEnum):
     > Group Policies flow: create a group, map it to a location, then map
     specific guests into it) targets one specific
     ``app.domains.guest.models.Guest`` row instead of a platform ``User``.
-    Deliberately unvalidated against a real guest existence check (no
-    ``guest_lookup`` composed into ``PolicyService``, unlike
-    ``user_lookup``/``role_lookup``): ``policy`` composes no *feature*
-    domain (see ``service.py``'s module docstring) and ``guest`` already
-    depends on ``policy`` the other way round via ``PolicyLookupProtocol``,
-    so validating this target here would be circular. ``target_id`` is
-    trusted the same way ``PolicyAssignment.scope_id``/
-    ``QueueAssignment.target_id`` already are -- the caller (the real
-    guest picker UI, fed from the same organization's own guest list) is
-    responsible for supplying a real id, not this column."""
+    Validated at write time: ``PolicyService.create_assignment`` checks the
+    guest exists and belongs to the policy's organization (or a direct MSP
+    child), through ``GuestLookupProtocol`` -- implemented by
+    ``PolicyRepository.get_guest_organization_id`` as a column-only read of
+    ``guests``, so ``policy`` still imports nothing from the ``guest``
+    domain. Resolution additionally ignores any candidate whose policy
+    belongs to another organization (rows written before that check)."""
 
     NONE = "none"
     USER = "user"
