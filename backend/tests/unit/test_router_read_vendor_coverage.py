@@ -483,6 +483,13 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "would make an Omada venue's own controller show as an unlabelled "
         "uuid. Read-only, every row genuinely belongs."
     ),
+    "app/domains/network_integration/aruba_access_points.py::"
+    "ArubaAccessPointService._aruba_routers_at": (
+        "The customer per-AP read: the NAS-only (Aruba Instant On) rows of one "
+        "location, filtered by `vendor IN NAS_ONLY_VENDORS` plus the caller's "
+        "organization. `agent_managed_only` would make it empty by "
+        "definition. Read-only; never device work."
+    ),
     "app/domains/network_integration/instant_on_repository.py::"
     "InstantOnRepository.get_live_site_by_site_id": (
         "'Is this Instant On site already mapped to a live fleet device?' "
