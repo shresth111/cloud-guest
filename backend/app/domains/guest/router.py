@@ -64,6 +64,7 @@ from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 from app.domains.wireguard.validators import hub_reserved_ip
 
+from .aruba_packet_context import aruba_packet_context
 from .aruba_shared import (
     CALLED_STATION_ID_HEADER,
     PACKET_NAS_IDENTIFIER_HEADER,
@@ -3469,11 +3470,16 @@ async def radius_aruba_shared_authorize(
     except ArubaSharedRequestRejected as exc:
         log_rejection(exc, kind="authorize")
         return {"control:Auth-Type": "Reject"}
+    # The AP21 sends a bare-MAC Called-Station-Id; the SSID arrives in
+    # Aruba-Essid-Name (see aruba_packet_context). Hand the speed-tier gate
+    # the RFC 3580 "MAC:SSID" form it parses.
     return await _radius_authorize_reply(
         payload,
         nas_client,
         service,
-        called_station_id=request.headers.get(CALLED_STATION_ID_HEADER),
+        called_station_id=aruba_packet_context(
+            request.headers
+        ).called_station_id_with_ssid,
     )
 
 
