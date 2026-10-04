@@ -271,6 +271,7 @@ def _router_response(
         controller_state_reason=controller.reason,
         controller_last_contacted_at=controller.last_contacted_at,
         vendor_claim_is_contradicted=controller.vendor_claim_is_contradicted,
+        last_radius_at=controller.last_radius_at,
         created_at=router_device.created_at,
         updated_at=router_device.updated_at,
     )

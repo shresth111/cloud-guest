@@ -136,6 +136,9 @@ class ControllerContext:
     reason: str | None = None
     last_contacted_at: datetime | None = None
     vendor_claim_is_contradicted: bool = False
+    #: NAS-only rows only (Aruba Instant On): the last RADIUS packet the
+    #: shared listener resolved to this device. ``None`` on every other row.
+    last_radius_at: datetime | None = None
 
 
 logger = logging.getLogger(__name__)
@@ -396,6 +399,11 @@ class RouterService:
         integrations = await self.repository.integrations_for_routers(
             [r.id for r in controller_rows]
         )
+        radius_activity: dict[uuid.UUID, datetime] = {}
+        nas_only_ids = [r.id for r in controller_rows if is_nas_only(r)]
+        lookup = getattr(self.repository, "radius_activity_for_routers", None)
+        if nas_only_ids and lookup is not None:
+            radius_activity = await lookup(nas_only_ids)
         for router in controller_rows:
             integration = integrations.get(router.id)
             derived = controller_state_for(router, integration)
@@ -413,6 +421,7 @@ class RouterService:
                 # second, more optimistic answer to the same question.
                 last_contacted_at=getattr(integration, "last_sync_at", None),
                 vendor_claim_is_contradicted=False,
+                last_radius_at=radius_activity.get(router.id),
             )
         return contexts
 
