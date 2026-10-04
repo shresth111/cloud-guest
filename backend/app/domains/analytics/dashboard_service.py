@@ -556,8 +556,12 @@ class DashboardService:
     async def _compute_health_score(
         self, organization_id: uuid.UUID, now: datetime
     ) -> HealthScoreResponse:
+        # NAS-only (Aruba Instant On) rows are left out of the online ratio:
+        # they never heartbeat, so counting them pinned an Aruba-only org's
+        # router component at 0. Only the kwarg is new; an org with no
+        # NAS-only row gets the identical counts.
         router_rows = await self.repository.count_routers_by_status(
-            organization_id=organization_id, location_id=None
+            organization_id=organization_id, location_id=None, exclude_nas_only=True
         )
         online, _, total = _reduce_router_counts(router_rows)
 
