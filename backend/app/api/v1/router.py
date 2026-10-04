@@ -80,6 +80,12 @@ from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
+from app.domains.network_integration.aruba_ap_router import (
+    aruba_ap_customer_router as network_integration_aruba_ap_customer_router,
+)
+from app.domains.network_integration.aruba_ap_router import (
+    aruba_ap_platform_router as network_integration_aruba_ap_platform_router,
+)
 from app.domains.network_integration.customer_router import (
     customer_router as network_integration_customer_router,
 )
@@ -244,6 +250,8 @@ api_v1_router.include_router(network_integration_customer_router)
 # license-gated: nothing here changes a venue's network.
 api_v1_router.include_router(network_integration_instant_on_customer_router)
 api_v1_router.include_router(network_integration_instant_on_platform_router)
+api_v1_router.include_router(network_integration_aruba_ap_customer_router)
+api_v1_router.include_router(network_integration_aruba_ap_platform_router)
 # Aruba AP + MikroTik gateway hybrid: Master links a venue MikroTik as an
 # Instant On access point's speed gateway (GLOBAL, platform DB only); the
 # customer reads one boolean. Queue writes happen in the worker, behind

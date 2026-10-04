@@ -778,6 +778,10 @@ class ErrorCode(StrEnum):
     # Master mapping of a fleet router to an Aruba Instant On site was
     # refused: not a NAS-only device, no location, or a malformed site id.
     INSTANT_ON_SITE_NOT_CONFIGURABLE = "INSTANT_ON_SITE_NOT_CONFIGURABLE"
+    # Master AP-registry write refused (not an Instant On router, bad MAC,
+    # duplicate, or an edit the primary AP cannot take).
+    ARUBA_ACCESS_POINT_INVALID = "ARUBA_ACCESS_POINT_INVALID"
+    ARUBA_ACCESS_POINT_NOT_FOUND = "ARUBA_ACCESS_POINT_NOT_FOUND"
 
 
 # ============================================================================

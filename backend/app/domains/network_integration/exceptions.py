@@ -1049,3 +1049,35 @@ class InstantOnSiteNotConfigurableError(NetworkIntegrationError):
             code=ErrorCode.INSTANT_ON_SITE_NOT_CONFIGURABLE,
             data={"reason": reason},
         )
+
+
+class ArubaAccessPointInvalidError(NetworkIntegrationError):
+    """Master AP-registry write refused. 422 with ``data.reason``."""
+
+    _MESSAGES = {
+        "not_nas_only_vendor": "Access points can only be added to an Aruba "
+        "Instant On device.",
+        "no_location": "This device has no location.",
+        "invalid_mac": "That is not a valid access point MAC address.",
+        "duplicate_mac": "That access point is already listed for this site.",
+        "primary_ap": "The site's primary access point is the device's own "
+        "MAC; change it on the device, not here.",
+    }
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(
+            self._MESSAGES.get(reason, "That access point change was refused."),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code=ErrorCode.ARUBA_ACCESS_POINT_INVALID,
+            data={"reason": reason},
+        )
+
+
+class ArubaAccessPointNotFoundError(NetworkIntegrationError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Access point not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            code=ErrorCode.ARUBA_ACCESS_POINT_NOT_FOUND,
+        )

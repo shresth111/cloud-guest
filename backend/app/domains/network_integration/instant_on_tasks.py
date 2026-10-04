@@ -69,6 +69,9 @@ from .providers.aruba_instant_on_client import (
     InstantOnUpstreamError,
 )
 
+#: ``(site, access_points payload, now)`` -> the multi-AP registry upsert.
+ApSync = Callable[[InstantOnSite, Any, datetime], Awaitable[None]]
+
 logger = get_logger(__name__)
 
 __all__ = [
@@ -204,8 +207,12 @@ async def poll_site(
     settings: Settings,
     now: datetime,
     summary: InstantOnPollSummary,
+    ap_sync: ApSync | None = None,
 ) -> None:
-    """Poll one site's due kinds and record the outcome. Raises
+    """Poll one site's due kinds and record the outcome. ``ap_sync``, when
+    given, receives every successfully read ``access_points`` payload (the
+    multi-AP registry upsert); its failure is logged and changes nothing
+    about the poll's own outcome. Raises
     :class:`_AccountWideFailure` / :class:`_StopSweep` for the sweep to act
     on; everything else is contained here."""
     snapshots = await repository.get_snapshots(site)
@@ -289,6 +296,14 @@ async def poll_site(
             at=now,
         )
         summary.kinds_read += 1
+        if ap_sync is not None and kind == InstantOnKind.ACCESS_POINTS:
+            try:
+                await ap_sync(site, payload, now)
+            except Exception:  # noqa: BLE001 -- see docstring
+                logger.exception(
+                    "instant_on_ap_registry_sync_failed",
+                    extra={"instant_on_site_id": str(site.id)},
+                )
 
     summary.kinds_failed += len(failures)
     if failures:
@@ -372,6 +387,7 @@ async def run_instant_on_poll(
     commit: Callable[[], Awaitable[None]],
     rollback: Callable[[], Awaitable[None]],
     clock: Callable[[], datetime] = _utcnow,
+    ap_sync: ApSync | None = None,
 ) -> InstantOnPollSummary:
     """One sweep. Commits after every site so one venue's failure (or a DB
     error while recording it) cannot roll back another's results."""
@@ -429,6 +445,7 @@ async def run_instant_on_poll(
                 settings=settings,
                 now=now,
                 summary=summary,
+                ap_sync=ap_sync,
             )
             await commit()
         except _AccountWideFailure as failure:
@@ -514,6 +531,20 @@ def build_live_provider(http: Any, settings: Settings) -> ArubaInstantOnProvider
     return ArubaInstantOnProvider(client)
 
 
+def _ap_registry_sync(session: Any) -> ApSync:
+    """Upsert the polled inventory into ``aruba_access_points`` in a
+    SAVEPOINT, so a failure there cannot roll back the snapshot."""
+    from .aruba_access_points import sync_from_instant_on_inventory
+
+    async def sync(site: InstantOnSite, payload: Any, now: datetime) -> None:
+        async with session.begin_nested():
+            await sync_from_instant_on_inventory(
+                session, site=site, access_points=payload or [], now=now
+            )
+
+    return sync
+
+
 async def _run_instant_on_poll_async() -> InstantOnPollSummary:
     import httpx
 
@@ -542,6 +573,7 @@ async def _run_instant_on_poll_async() -> InstantOnPollSummary:
                 settings=settings,
                 commit=session.commit,
                 rollback=session.rollback,
+                ap_sync=_ap_registry_sync(session),
             )
     finally:
         try:
