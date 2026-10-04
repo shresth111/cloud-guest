@@ -1134,6 +1134,10 @@ async def delete_notification_channel(
 )
 async def list_notification_logs(
     request: Request,
+    # Tenant scoping (was absent: every tenant's delivery log was returned to
+    # any holder of notifications.read). ``None`` only for a GLOBAL-role caller
+    # who explicitly asked for every organization.
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     channel_id: uuid.UUID | None = Query(default=None),
     alert_id: uuid.UUID | None = Query(default=None),
     log_status: str | None = Query(default=None, alias="status"),
@@ -1142,6 +1146,8 @@ async def list_notification_logs(
     service: NotificationService = Depends(get_notification_service),
 ):
     items, meta = await service.list_logs(
+        organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         channel_id=channel_id,
         alert_id=alert_id,
         status=log_status,

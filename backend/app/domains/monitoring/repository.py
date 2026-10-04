@@ -318,11 +318,13 @@ class MonitoringRepositoryProtocol(Protocol):
     async def list_notification_logs(
         self,
         *,
-        channel_id: uuid.UUID | None,
-        alert_id: uuid.UUID | None,
-        status: str | None,
-        page: int,
-        page_size: int,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
+        channel_id: uuid.UUID | None = None,
+        alert_id: uuid.UUID | None = None,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 25,
     ) -> tuple[list[NotificationLog], PaginationMeta]: ...
 
     # -- incidents -------------------------------------------------------------
@@ -1209,18 +1211,48 @@ class MonitoringRepository:
     async def list_notification_logs(
         self,
         *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         channel_id: uuid.UUID | None = None,
         alert_id: uuid.UUID | None = None,
         status: str | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[NotificationLog], PaginationMeta]:
-        return await self.notification_logs.paginate(
-            page=page,
-            page_size=page_size,
-            filters={"channel_id": channel_id, "alert_id": alert_id, "status": status},
-            sort_by="sent_at",
-            sort_order=SortOrder.DESC,
+        """Delivery logs, newest first. A log has no ``organization_id`` of
+        its own; it belongs to its channel's organization, so an org-scoped
+        read joins ``notification_channels`` and keeps only that org's
+        channels (platform-wide channels, ``organization_id IS NULL``, carry
+        alerts about every tenant and are excluded). ``None`` without
+        ``include_all_organizations`` is refused, like the channel list."""
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
+        params = PageParams(page=page, page_size=page_size)
+        conditions = [NotificationLog.is_deleted.is_(False)]
+        if channel_id is not None:
+            conditions.append(NotificationLog.channel_id == channel_id)
+        if alert_id is not None:
+            conditions.append(NotificationLog.alert_id == alert_id)
+        if status is not None:
+            conditions.append(NotificationLog.status == status)
+
+        count_statement = (
+            select(func.count()).select_from(NotificationLog).where(*conditions)
+        )
+        statement = select(NotificationLog).where(*conditions)
+        if organization_id is not None:
+            owner = (
+                NotificationChannel,
+                NotificationChannel.id == NotificationLog.channel_id,
+            )
+            owned = NotificationChannel.organization_id == organization_id
+            count_statement = count_statement.join(*owner).where(owned)
+            statement = statement.join(*owner).where(owned)
+        total_items = int((await self.session.execute(count_statement)).scalar_one())
+        statement = statement.order_by(NotificationLog.sent_at.desc())
+        result = await self.session.execute(paginate(statement, params))
+        return list(result.scalars().all()), PaginationMeta.from_total(
+            params, total_items
         )
 
     async def latest_notification_logs_by_channel(

@@ -59,6 +59,9 @@ from app.domains.billing.dependencies import get_super_admin_billing_dashboard_s
 from app.domains.billing.service import SuperAdminBillingDashboardService
 from app.domains.monitoring.dependencies import get_platform_dashboard_service
 from app.domains.monitoring.service import PlatformDashboardService
+from app.domains.organization.dependencies import get_organization_service
+from app.domains.organization.scoping import enforce_target_organization
+from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -224,8 +227,21 @@ async def list_snapshots(
 async def trigger_snapshot_aggregation(
     request: Request,
     payload: TriggerAggregationRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
     service: AnalyticsService = Depends(get_analytics_service),
 ):
+    # ``organization_id`` comes from the BODY, which ``RequirePermission``
+    # never sees: without this an org caller holding ``reports.manage``
+    # (seeded down to LOCATION scope) could aggregate any tenant and read its
+    # snapshots back in the response. Platform caller (``None``, i.e. GLOBAL
+    # role + explicit all-organizations) may target any org; MSP parent may
+    # target a direct child.
+    await enforce_target_organization(
+        target_organization_id=payload.organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     snapshots = await service.trigger_aggregation(
         payload.organization_id, target_date_iso=payload.target_date_iso
     )
