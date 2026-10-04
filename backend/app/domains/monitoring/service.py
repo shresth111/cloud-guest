@@ -3680,6 +3680,8 @@ class NotificationService:
     async def list_logs(
         self,
         *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         channel_id: uuid.UUID | None = None,
         alert_id: uuid.UUID | None = None,
         status: str | None = None,
@@ -3687,6 +3689,8 @@ class NotificationService:
         page_size: int = DEFAULT_LIST_PAGE_SIZE,
     ) -> tuple[list[NotificationLog], PaginationMeta]:
         return await self.repository.list_notification_logs(
+            organization_id=organization_id,
+            include_all_organizations=include_all_organizations,
             channel_id=channel_id,
             alert_id=alert_id,
             status=status,
