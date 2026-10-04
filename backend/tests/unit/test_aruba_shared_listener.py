@@ -418,6 +418,34 @@ class TestRadiusRoutes:
             {"called_station_id": _shared_headers()["X-RADIUS-Called-Station-Id"]}
         ]
 
+    async def test_authorize_passes_the_ssid_from_aruba_essid_name(
+        self, wired
+    ) -> None:  # noqa: ANN001
+        """MEASURED on the AP21: Called-Station-Id is the bare AP MAC and the
+        SSID is only in Aruba-Essid-Name. The speed-tier gate must still get
+        the RFC 3580 MAC:SSID form."""
+        guest_router, calls = wired
+        from app.domains.guest.schemas import RadiusAuthorizeRequest
+
+        service = FakeRadiusService()
+        reply = await guest_router.radius_aruba_shared_authorize(
+            _http(
+                _shared_headers(
+                    **{
+                        "X-RADIUS-Called-Station-Id": "54f0b1c8a90a",
+                        "X-RADIUS-Aruba-Essid-Name": "WYFY_PREMIUM",
+                        "X-RADIUS-Aruba-Location-Id": "VNV5M1K1M6",
+                    }
+                )
+            ),
+            RadiusAuthorizeRequest(username="+919999900077"),
+            service=service,
+        )
+        assert reply == {"control:Auth-Type": "Accept"}
+        assert guest_router._test_calls_kw == [
+            {"called_station_id": "54-F0-B1-C8-A9-0A:WYFY_PREMIUM"}
+        ]
+
     @pytest.mark.parametrize(
         "over",
         [
