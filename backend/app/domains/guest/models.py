@@ -527,6 +527,15 @@ class GuestSession(BaseModel):
     internet_confirmed_source: Mapped[str | None] = mapped_column(
         String(40), nullable=True
     )
+    #: Aruba Instant On only: the access point (canonical MAC from the front
+    #: of ``Called-Station-Id``) and SSID this session was last reported
+    #: from. Written ONLY by the shared Aruba RADIUS listener
+    #: (``/radius/aruba-shared/accounting``), updated on every Start /
+    #: Interim / Stop so a roaming guest reads as the last AP. NULL on every
+    #: MikroTik and Omada session, and on Aruba sessions accounted before
+    #: this column existed.
+    ap_mac: Mapped[str | None] = mapped_column(String(17), nullable=True)
+    ap_ssid: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_guest_sessions_guest_id", "guest_id"),
@@ -553,6 +562,12 @@ class GuestSession(BaseModel):
             "location_id",
             "internet_confirmed_at",
             postgresql_where=text("internet_confirmed_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_guest_sessions_router_ap_mac",
+            "router_id",
+            "ap_mac",
+            postgresql_where=text("ap_mac IS NOT NULL"),
         ),
     )
 

@@ -58,7 +58,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -131,6 +131,18 @@ class ArubaSharedRequestRejected(Exception):
         super().__init__(reason)
         self.reason = reason
         self.context = context
+
+
+class ApRegistry(Protocol):
+    """The approved access points of a multi-AP Instant On site. See
+    ``app.domains.network_integration.aruba_access_points``. ``touch`` and
+    ``record_unknown`` are best-effort and never raise."""
+
+    async def approved_macs(self, router_id: uuid.UUID) -> set[str]: ...
+
+    async def touch(self, router_id: uuid.UUID, mac: str) -> None: ...
+
+    async def record_unknown(self, router: Any, mac: str) -> None: ...
 
 
 class ArubaSharedNotConfiguredError(Exception):
@@ -376,6 +388,7 @@ async def resolve_shared_nas(
     store: ArubaSharedSecretStore,
     radius_service: Any,
     hub_agent_secret: str | None = None,
+    ap_registry: ApRegistry | None = None,
 ):  # noqa: ANN201 -- RadiusNasClient
     """The NAS row a shared-listener request belongs to, or
     ``ArubaSharedRequestRejected`` with the reason. Secret first, so a
@@ -385,7 +398,14 @@ async def resolve_shared_nas(
     (``backend_secret_for``), never the RADIUS shared secret the APs hold:
     presenting the latter is a ``shared_secret_mismatch`` like any other
     wrong value. ``hub_agent_secret`` defaults to this deployment's
-    ``hub_radius_agent_secret``."""
+    ``hub_radius_agent_secret``.
+
+    ``ap_registry`` (multi-AP sites): the AP MAC may also be any
+    ``approved`` row of ``aruba_access_points`` for this router. A MAC that
+    matches nothing is still refused, and is handed to
+    ``ap_registry.record_unknown`` so Master can review it -- never approved
+    from the packet. Without a registry the check is exactly the single
+    recorded-MAC comparison it always was."""
     radius_secret = await store.secret()
     if radius_secret is None:
         raise ArubaSharedRequestRejected(SharedRejectReason.SECRET_NOT_CONFIGURED)
@@ -430,7 +450,10 @@ async def resolve_shared_nas(
             SharedRejectReason.NOT_ARUBA, nas_identifier=ident
         )
     recorded = recorded_ap_mac(router)
-    if recorded is None:
+    allowed: set[str] = {recorded} if recorded is not None else set()
+    if ap_registry is not None:
+        allowed |= await ap_registry.approved_macs(router.id)
+    if not allowed:
         raise ArubaSharedRequestRejected(
             SharedRejectReason.ROUTER_HAS_NO_AP_MAC, nas_identifier=ident
         )
@@ -445,13 +468,17 @@ async def resolve_shared_nas(
             nas_identifier=ident,
             called_station_id=(called_station_id or "")[:80],
         )
-    if presented != recorded:
+    if presented not in allowed:
+        if ap_registry is not None:
+            await ap_registry.record_unknown(router, presented)
         raise ArubaSharedRequestRejected(
             SharedRejectReason.AP_MAC_MISMATCH,
             nas_identifier=ident,
             called_station_id=(called_station_id or "")[:80],
             expected_ap_mac=recorded,
         )
+    if ap_registry is not None:
+        await ap_registry.touch(router.id, presented)
     return nas
 
 
@@ -468,6 +495,7 @@ def would_be_nas_identifier(router_id: uuid.UUID) -> str:
 
 __all__ = [
     "ARUBA_NAS_IDENTIFIER_RE",
+    "ApRegistry",
     "ArubaSharedNotConfiguredError",
     "ArubaSharedRequestRejected",
     "ArubaSharedSecretStore",
