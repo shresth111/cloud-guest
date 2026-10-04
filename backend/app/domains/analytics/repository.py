@@ -55,6 +55,7 @@ from app.domains.otp.models import OtpRequest
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import NAS_ONLY_VENDORS
 from app.domains.router_provisioning.models import RouterHealthSnapshot
 from app.domains.voucher.models import Voucher, VoucherBatch
 from app.domains.wireguard.models import WireGuardPeer
@@ -112,6 +113,9 @@ class RouterSummaryRow:
     location_id: uuid.UUID
     status: str
     last_seen_at: datetime | None
+    #: ``routers.vendor``. Defaulted so a row built without it reads as the
+    #: column's own default (agent-managed), i.e. exactly as before.
+    vendor: str = "mikrotik"
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +253,7 @@ class AnalyticsRepositoryProtocol(Protocol):
         *,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        exclude_nas_only: bool = False,
     ) -> list[tuple[str, int]]: ...
 
     async def count_active_guest_sessions(
@@ -695,6 +700,7 @@ class AnalyticsRepository:
         *,
         organization_id: uuid.UUID | None = None,
         location_id: uuid.UUID | None = None,
+        exclude_nas_only: bool = False,
     ) -> list[tuple[str, int]]:
         """Real SQL ``GROUP BY`` -- never a Python-side loop over fetched
         rows. Mirrors ``app.domains.monitoring.repository
@@ -731,6 +737,11 @@ class AnalyticsRepository:
             statement = statement.where(Router.organization_id == organization_id)
         if location_id is not None:
             statement = statement.where(Router.location_id == location_id)
+        if exclude_nas_only:
+            # NAS-only (Aruba Instant On) rows never heartbeat, so they are
+            # never ONLINE; an online ratio must not count them. A fleet with
+            # no NAS-only row gets the identical statement result.
+            statement = statement.where(Router.vendor.notin_(NAS_ONLY_VENDORS))
         result = await self.session.execute(statement)
         return [(row[0], int(row[1])) for row in result.all()]
 
@@ -1286,6 +1297,7 @@ class AnalyticsRepository:
                 Router.location_id,
                 Router.status,
                 Router.last_seen_at,
+                Router.vendor,
             )
             .where(
                 Router.is_deleted.is_(False), Router.organization_id == organization_id
@@ -1302,6 +1314,7 @@ class AnalyticsRepository:
                 location_id=row[2],
                 status=row[3],
                 last_seen_at=row[4],
+                vendor=row[5],
             )
             for row in result.all()
         ]
