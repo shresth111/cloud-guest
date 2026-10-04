@@ -65,6 +65,7 @@ from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction, ScopeType
 
+from .access_tier import AccessTier, access_tier_from_rules
 from .constants import (
     PLATFORM_DEFAULT_RULES,
     PolicyAssignmentTargetType,
@@ -800,6 +801,76 @@ class PolicyService:
             user_id=user_id,
             guest_id=guest_id,
         )
+
+    async def resolve_access_tier(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None,
+    ) -> AccessTier | None:
+        """The Access Tier ``guest_id`` is mapped into at ``location_id``, or
+        ``None`` -- see ``access_tier.py`` for what a tier carries and the
+        precedence its fields follow.
+
+        A tier is the guest's active **GUEST-targeted** ``BANDWIDTH``
+        assignment whose WHERE scope covers this location (the dashboard's
+        "Map guests" step writes ``scope_type=location``). Mapping a tier to
+        a location for everyone (``target_type=none``) is the venue-wide
+        speed and is deliberately not a tier here.
+
+        **Organization-scoped, unconditionally.** A guest-targeted assignment
+        whose policy belongs to a different organization is skipped (and
+        logged), never applied: ``target_id`` is not validated against the
+        guest's organization at write time (see
+        ``constants.PolicyAssignmentTargetType.GUEST``), so the read is where
+        this has to hold. A platform policy (``organization_id IS NULL``) is
+        allowed, like every other platform-wide resolution candidate.
+
+        Read-only and additive: ``resolve_effective_policy`` is untouched,
+        so nothing that already resolves a policy changes behaviour. Callers
+        decide where a tier is enforced (today: Aruba Instant On only)."""
+        if guest_id is None or organization_id is None:
+            return None
+        candidates = await self.repository.list_candidate_assignments(
+            policy_type=PolicyType.BANDWIDTH.value,
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        mapped = [
+            a
+            for a in candidates
+            if a.target_type == PolicyAssignmentTargetType.GUEST.value
+            and a.target_id == guest_id
+        ]
+        for assignment in sorted(mapped, key=_resolution_key, reverse=True):
+            policy = await self.repository.get_policy_by_id(assignment.policy_id)
+            if policy is None or policy.current_version_id is None:
+                continue
+            if (
+                policy.organization_id is not None
+                and policy.organization_id != organization_id
+            ):
+                logger.warning(
+                    "access_tier_foreign_organization_ignored",
+                    extra={
+                        "assignment_id": str(assignment.id),
+                        "policy_id": str(policy.id),
+                        "guest_id": str(guest_id),
+                        "organization_id": str(organization_id),
+                    },
+                )
+                continue
+            version = await self.repository.get_version_by_id(
+                policy.current_version_id
+            )
+            if version is None:
+                continue
+            return access_tier_from_rules(
+                policy.id, dict(version.rules or {}), name=policy.name
+            )
+        return None
 
     # ========================================================================
     # Internal helpers

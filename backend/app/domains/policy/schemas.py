@@ -174,7 +174,9 @@ class BandwidthPolicyRules(BaseModel):
     session_timeout_minutes: int | None = Field(default=None, ge=1)
     idle_timeout_minutes: int | None = Field(default=None, ge=1)
     devices_per_user: int | None = Field(default=None, ge=1)
-    daily_limit_minutes: int | None = Field(default=None, ge=1)
+    # 0 = "No limit" for an Access Tier (lifts the venue's daily cap) -- see
+    # ``access_tier.py``. ``None`` = not set (the venue's own cap applies).
+    daily_limit_minutes: int | None = Field(default=None, ge=0)
     login_hours: GroupLoginHoursRules | None = None
     data_limit: GroupDataLimitRules | None = None
 
