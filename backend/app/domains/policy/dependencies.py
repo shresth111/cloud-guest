@@ -57,6 +57,8 @@ def get_policy_service(
         # as PolicyService's RoleLookupProtocol rather than a second
         # dependency.
         role_lookup=audit_repository,
+        # PolicyRepository.get_guest_organization_id: GUEST-target ownership.
+        guest_lookup=repository,
     )
 
 
