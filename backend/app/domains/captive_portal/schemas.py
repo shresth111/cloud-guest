@@ -188,6 +188,18 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "collected here may be mailed offers."
         ),
     )
+    require_guest_name: bool = Field(
+        default=True,
+        description=(
+            "Name required at sign-in. A guest who signs in with a "
+            "one-time code (SMS/WhatsApp/email) and has no name on file "
+            "is asked for it on one screen right after the code verifies, "
+            "and the network is not opened until it is stored -- enforced "
+            "server-side, error code `guest_name_required`. Implies "
+            "`collect_guest_name` (forced on by the server). Defaults ON "
+            "for every venue (owner decision); a venue can switch it off."
+        ),
+    )
     review_card_enabled: bool = Field(
         default=False,
         description=(
@@ -403,6 +415,14 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     content_survey: dict | None = Field(default=None)
     collect_guest_name: bool | None = Field(default=None)
     collect_guest_email: bool | None = Field(default=None)
+    require_guest_name: bool | None = Field(
+        default=None,
+        description=(
+            "Name required at sign-in. When the merged value is true the "
+            "server also sets `collect_guest_name` true, overriding an "
+            "explicit false in the same payload."
+        ),
+    )
     review_card_enabled: bool | None = Field(default=None)
     review_url: str | None = Field(
         default=None,
@@ -524,6 +544,7 @@ class CaptivePortalConfigResponse(BaseModel):
     content_survey: dict | None
     collect_guest_name: bool
     collect_guest_email: bool
+    require_guest_name: bool
     review_card_enabled: bool
     review_url: str | None
     guest_feedback_enabled: bool

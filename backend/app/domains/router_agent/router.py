@@ -33,8 +33,15 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
+from app.common.exceptions import CloudGuestError
+from app.domains.captive_portal.dependencies import get_captive_portal_service
+from app.domains.captive_portal.exceptions import (
+    CaptivePortalConfigNotConfiguredError,
+)
+from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest.dependencies import get_guest_repository
 from app.domains.guest.repository import GuestRepositoryProtocol
+from app.domains.guest.validators import session_awaits_required_name
 from app.domains.guest_access.dependencies import get_access_decision_service
 from app.domains.guest_access.service import GuestAccessService, is_blocklisted
 from app.domains.isp.dependencies import get_isp_service
@@ -227,6 +234,43 @@ async def agent_complete_action(
     return AgentActionCompleteResponse(job_id=str(job.id), status=job.status)
 
 
+async def _awaits_required_name(
+    session: object,
+    guest: object,
+    captive_portal_service: CaptivePortalService,
+    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], bool],
+) -> bool:
+    """``validators.session_awaits_required_name`` with the venue's
+    ``require_guest_name`` resolved once per (organization, location) per
+    poll. Only resolved for a session that could be held at all (OTP, no
+    name on file), so a fleet of named guests costs no config reads.
+
+    Same resolution rule as ``GuestService.session_awaits_required_name``:
+    no config at all reads as the owner's default (required); any other
+    resolution failure fails OPEN, since this list is what keeps admitted
+    guests online and an unrelated error must not strip them."""
+    if not session_awaits_required_name(
+        session=session,  # type: ignore[arg-type]
+        guest=guest,  # type: ignore[arg-type]
+        require_guest_name=True,
+    ):
+        return False
+    key = (session.organization_id, session.location_id)  # type: ignore[attr-defined]
+    if key not in require_cache:
+        try:
+            resolved = await captive_portal_service.resolve_portal_config(
+                organization_id=key[0], location_id=key[1]
+            )
+            require_cache[key] = bool(
+                getattr(resolved.config, "require_guest_name", True)
+            )
+        except CaptivePortalConfigNotConfiguredError:
+            require_cache[key] = True
+        except CloudGuestError:
+            require_cache[key] = False
+    return require_cache[key]
+
+
 @router.get(
     "/authorized-macs",
     response_model=AuthorizedMacsResponse,
@@ -239,6 +283,7 @@ async def agent_authorized_macs(
         get_mac_authorization_service
     ),
     access_decision_service: GuestAccessService = Depends(get_access_decision_service),
+    captive_portal_service: CaptivePortalService = Depends(get_captive_portal_service),
 ) -> AuthorizedMacsResponse:
     """Every MAC this router should let straight through: guests with a
     currently ``ACTIVE`` session that no ``BLOCKLIST`` rule now covers,
@@ -280,6 +325,7 @@ async def agent_authorized_macs(
         identity.router.id
     )
     macs: list[str] = []
+    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], bool] = {}
     for session in sessions:
         if session.device_id is None:
             continue
@@ -293,6 +339,16 @@ async def agent_authorized_macs(
         # login and no expiry. Leaving it out makes the agent's own
         # reconciliation withdraw that binding on its next poll.
         guest = await guest_repository.get_guest_by_id(session.guest_id)
+        # Name required at sign-in. A session that verified its OTP but
+        # whose guest has not yet given the name the venue requires exists
+        # and is ACTIVE -- and without this, the next 60-second poll would
+        # put a ``type=bypassed`` binding on it and the guest would be
+        # online without ever answering the "Your name" screen. Same
+        # predicate as RADIUS Authorize; config by the SESSION's location.
+        if await _awaits_required_name(
+            session, guest, captive_portal_service, require_cache
+        ):
+            continue
         if await is_blocklisted(
             access_decision_service,
             organization_id=session.organization_id,

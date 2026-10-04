@@ -16,8 +16,10 @@ from .constants import (
     BYTES_PER_MB,
     DASHBOARD_SERIES_BUCKET_SECONDS,
     DEFAULT_IDLE_TIMEOUT_MINUTES,
+    GUEST_DISPLAY_NAME_MAX_LENGTH,
     GUEST_SESSION_STATUS_TRANSITIONS,
     MAX_DASHBOARD_SERIES_WINDOW_DAYS,
+    NAME_REQUIRED_AUTH_METHODS,
     NAS_STATUS_TRANSITIONS,
     SESSION_ACTIVITY_GRACE_MINUTES,
     DashboardSeriesBucket,
@@ -26,6 +28,7 @@ from .constants import (
     QuotaPeriodType,
 )
 from .exceptions import (
+    GuestNameInvalidError,
     InvalidAnalyticsDateRangeError,
     InvalidDashboardSeriesRangeError,
     InvalidExtensionMinutesError,
@@ -33,6 +36,56 @@ from .exceptions import (
     InvalidSessionStatusTransitionError,
 )
 from .models import Guest, GuestSession
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def normalize_guest_display_name(raw: str | None) -> str:
+    """The one place a sign-in name is cleaned and checked.
+
+    Trims, collapses internal runs of whitespace to one space (a name typed
+    on a phone keyboard often carries a double space or a trailing one),
+    then refuses empty, over-long (``GUEST_DISPLAY_NAME_MAX_LENGTH``, the
+    column's own width, measured after cleaning) and control characters.
+    Raises ``GuestNameInvalidError`` (``data.code == "guest_name_invalid"``).
+    """
+    if raw is None:
+        raise GuestNameInvalidError("Please enter your name.")
+    if _CONTROL_CHARS.search(raw.replace("\t", " ").replace("\n", " ")):
+        raise GuestNameInvalidError("Your name contains characters we can't store.")
+    cleaned = " ".join(raw.split())
+    if not cleaned:
+        raise GuestNameInvalidError("Please enter your name.")
+    if len(cleaned) > GUEST_DISPLAY_NAME_MAX_LENGTH:
+        raise GuestNameInvalidError(
+            f"Please keep your name under {GUEST_DISPLAY_NAME_MAX_LENGTH} characters."
+        )
+    return cleaned
+
+
+def session_awaits_required_name(
+    *, session: GuestSession, guest: Guest | None, require_guest_name: bool
+) -> bool:
+    """Whether ``session`` must be held off the network until the guest
+    gives a name.
+
+    True only when all three hold: the venue requires a name
+    (``require_guest_name``, resolved by the caller against the SESSION's
+    location -- never ``Guest.location_id``, the guest's "home" venue),
+    the session was opened by an OTP method (``NAME_REQUIRED_AUTH_METHODS``
+    -- voucher/password/PIN/MAC-whitelist sessions are out of scope), and
+    the guest has no non-blank name on file.
+
+    Pure, so the four enforcement points (RADIUS Authorize,
+    ``/agent/authorized-macs``, and both network-integration portal
+    authorize routes) apply literally the same rule.
+    """
+    if not require_guest_name:
+        return False
+    if str(session.auth_method) not in NAME_REQUIRED_AUTH_METHODS:
+        return False
+    name = (guest.display_name if guest is not None else None) or ""
+    return not name.strip()
 
 
 def guest_has_profile(guest: Guest) -> bool:

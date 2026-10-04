@@ -321,6 +321,12 @@ class FakeCaptivePortalService:
         # rather than inherited from the column default.
         collect_guest_name: bool = True,
         collect_guest_email: bool = True,
+        # Name required at sign-in. **Off by default in this fake, ON in
+        # production** (owner decision, migration 0143). Off here so the
+        # hundreds of OTP-login tests that are about something else are not
+        # silently held for a name; tests about the requirement set it, and
+        # ``test_require_guest_name.py`` pins the production default.
+        require_guest_name: bool = False,
         whitelist_only_enabled: bool = False,
         whitelist_only_denied_message: str | None = None,
         # Open Hours. Set explicitly for the same reason
@@ -367,6 +373,7 @@ class FakeCaptivePortalService:
                 social_login_providers=[],
                 collect_guest_name=collect_guest_name,
                 collect_guest_email=collect_guest_email,
+                require_guest_name=require_guest_name,
                 review_card_enabled=False,
                 review_url=None,
                 guest_feedback_enabled=False,
@@ -1657,6 +1664,7 @@ def make_fixture(
     # care about the flags set them explicitly.
     collect_guest_name: bool = True,
     collect_guest_email: bool = True,
+    require_guest_name: bool = False,
     whitelist_only_enabled: bool = False,
     whitelist_only_denied_message: str | None = None,
     business_hours_enabled: bool = False,
@@ -1684,6 +1692,7 @@ def make_fixture(
         pin_login_enabled=pin_login_enabled,
         collect_guest_name=collect_guest_name,
         collect_guest_email=collect_guest_email,
+        require_guest_name=require_guest_name,
         whitelist_only_enabled=whitelist_only_enabled,
         whitelist_only_denied_message=whitelist_only_denied_message,
         business_hours_enabled=business_hours_enabled,
