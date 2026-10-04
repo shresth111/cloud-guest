@@ -29,6 +29,7 @@ __all__ = [
     "PolicyRollbackTargetNotPublishedError",
     "PolicyRollbackTargetMismatchError",
     "PolicyAssignmentGuestAlreadyMappedError",
+    "PolicyAssignmentTargetGuestNotFoundError",
 ]
 
 
@@ -184,6 +185,19 @@ class PolicyAssignmentTargetRoleNotFoundError(PolicyError):
     def __init__(self, role_id: object) -> None:
         super().__init__(
             f"Cannot target a policy assignment at unknown role: {role_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class PolicyAssignmentTargetGuestNotFoundError(PolicyError):
+    """The guest a GUEST-targeted assignment names does not exist, or does
+    not belong to the organization that owns the policy. Both read as the
+    same 404 so a caller cannot probe whether another tenant's guest id is
+    real."""
+
+    def __init__(self, guest_id: object) -> None:
+        super().__init__(
+            f"Cannot target a policy assignment at unknown guest: {guest_id}",
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
