@@ -265,6 +265,16 @@ class RouterResponse(BaseModel):
             "as 'Last contacted the controller', never as 'last seen'."
         ),
     )
+    last_radius_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Aruba Instant On (NAS-only) rows only: when the venue's access "
+            "points last sent this platform a RADIUS packet (a guest sign-in "
+            "or accounting update). Always null for MikroTik and Omada rows. "
+            "An idle venue sends nothing, so an old value means 'no recent "
+            "guest activity', never 'offline'."
+        ),
+    )
     vendor_claim_is_contradicted: bool = Field(
         default=False,
         description=(

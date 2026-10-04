@@ -319,6 +319,31 @@ class RouterRepository:
                 found.setdefault(key, integration)
         return found
 
+    async def radius_activity_for_routers(
+        self, router_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, datetime]:
+        """The latest RADIUS packet (Access-Request or Accounting) the shared
+        Aruba listener resolved to each router's NAS -- ``{router_id: at}``,
+        routers with none absent. ONE query; same "caller already owns these
+        router ids" posture as :meth:`integrations_for_routers`."""
+        if not router_ids:
+            return {}
+        from app.domains.guest.models import RadiusNasClient
+
+        latest = func.greatest(
+            func.max(RadiusNasClient.last_request_at),
+            func.max(RadiusNasClient.last_accounting_at),
+        )
+        result = await self.session.execute(
+            select(RadiusNasClient.router_id, latest)
+            .where(
+                RadiusNasClient.router_id.in_(list(router_ids)),
+                RadiusNasClient.is_deleted.is_(False),
+            )
+            .group_by(RadiusNasClient.router_id)
+        )
+        return {rid: at for rid, at in result.all() if at is not None}
+
     async def names_for_routers(
         self, router_ids: Sequence[uuid.UUID]
     ) -> dict[uuid.UUID, str]:

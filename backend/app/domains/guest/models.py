@@ -837,6 +837,17 @@ class RadiusNasClient(BaseModel):
     hub_client_synced_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    #: Shared Aruba listener only (P1-E): when this NAS last sent an
+    #: Access-Request / an Accounting-Request that resolved to it. Throttled
+    #: writes (at most one per ``NAS_ACTIVITY_WRITE_INTERVAL``). NULL on every
+    #: per-venue NAS (MikroTik, Omada, address-keyed Aruba). An idle AP sends
+    #: nothing, so an old value means "no guest activity", not "down".
+    last_request_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_accounting_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # -- Router-side push state, the other half of the two above. The pair
     # above records that the HUB's FreeRADIUS confirmed a client{} stanza;
