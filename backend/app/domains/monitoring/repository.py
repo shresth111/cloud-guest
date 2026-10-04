@@ -40,12 +40,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
+from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.dhcp.models import RouterRogueDhcpStatus
+from app.domains.guest.constants import GuestSessionStatus
 from app.domains.guest.models import GuestSession, RadiusNasClient
 from app.domains.isp.models import IspLink
 from app.domains.location.models import Location
 from app.domains.network_integration.constants import AuthorizationStatus
 from app.domains.network_integration.models import (
+    ArubaAccessPoint,
     NetworkIntegration,
     NetworkIntegrationAuthorization,
 )
@@ -78,6 +81,32 @@ from .models import (
     SlaReport,
     SlaTarget,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class UnclosedGuestActivity:
+    """Guest sessions an Instant On AP never closed, per router -- see
+    ``MonitoringRepository.unclosed_guest_activity_for_routers``."""
+
+    router_id: uuid.UUID
+    sessions: int
+    last_activity_at: datetime
+
+
+@dataclass(frozen=True)
+class VenueOpenHours:
+    """A venue's resolved Open Hours (most-specific portal config wins)."""
+
+    enabled: bool
+    timezone: str
+    schedule: dict
+
+
+# The ``disconnect_reason`` ``guest.service.enforce_session_timeouts`` writes
+# when it expires a session nobody reported on -- i.e. the AP sent no Stop.
+# Held as a literal so this repository does not import guest.service;
+# ``tests/unit/test_access_point_silent_alert.py`` pins the two together.
+IDLE_SWEEP_DISCONNECT_REASON = "inactivity_timeout"
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +284,22 @@ class MonitoringRepositoryProtocol(Protocol):
     async def count_authorization_outcomes_since(
         self, *, since: datetime, organization_id: uuid.UUID | None
     ) -> list[AuthorizationOutcomeCounts]: ...
+
+    async def radius_activity_for_routers(
+        self, router_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, datetime]: ...
+
+    async def unclosed_guest_activity_for_routers(
+        self, router_ids: list[uuid.UUID], *, since: datetime
+    ) -> dict[uuid.UUID, UnclosedGuestActivity]: ...
+
+    async def list_aruba_access_points(
+        self, *, organization_id: uuid.UUID, router_ids: list[uuid.UUID]
+    ) -> list[ArubaAccessPoint]: ...
+
+    async def open_hours_for_locations(
+        self, *, organization_id: uuid.UUID, location_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, VenueOpenHours]: ...
 
     async def get_organization_and_location_names(
         self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
@@ -1005,6 +1050,134 @@ class MonitoringRepository:
             )
             for row in result.all()
         ]
+
+    # -- Aruba Instant On "access point silent" (P2-P) ------------------------
+    #
+    # Four read-only reads of other domains' tables, the same precedent
+    # ``list_isp_links``/``list_network_integrations`` set. None of them reads
+    # ``routers``: the evaluator takes the roster from ``list_routers`` and
+    # narrows it to NAS-only rows itself, so these only ever receive router
+    # ids that already passed that gate.
+
+    async def radius_activity_for_routers(
+        self, router_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, datetime]:
+        """The latest RADIUS packet the shared Aruba listener resolved to each
+        router's NAS (Access-Request or Accounting) -- ``{router_id: at}``,
+        routers never heard from absent. One grouped query. Same expression
+        as ``RouterRepository.radius_activity_for_routers`` (P1-E), so the
+        alert and the dashboard's "last guest activity" cannot disagree."""
+        if not router_ids:
+            return {}
+        latest = func.greatest(
+            func.max(RadiusNasClient.last_request_at),
+            func.max(RadiusNasClient.last_accounting_at),
+        )
+        result = await self.session.execute(
+            select(RadiusNasClient.router_id, latest)
+            .where(
+                RadiusNasClient.router_id.in_(list(router_ids)),
+                RadiusNasClient.is_deleted.is_(False),
+            )
+            .group_by(RadiusNasClient.router_id)
+        )
+        return {rid: at for rid, at in result.all() if at is not None}
+
+    async def unclosed_guest_activity_for_routers(
+        self, router_ids: list[uuid.UUID], *, since: datetime
+    ) -> dict[uuid.UUID, UnclosedGuestActivity]:
+        """Per router: guest sessions the access point never closed, reported
+        on since ``since`` -- still ``active``, or expired by our own idle
+        sweep (``IDLE_SWEEP_DISCONNECT_REASON``), which only happens when no
+        Accounting-Stop arrived. A guest who left produced a Stop and is
+        ``disconnected``; they are deliberately not counted. One grouped
+        query."""
+        if not router_ids:
+            return {}
+        unclosed = or_(
+            GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            (GuestSession.status == GuestSessionStatus.EXPIRED.value)
+            & (GuestSession.disconnect_reason == IDLE_SWEEP_DISCONNECT_REASON),
+        )
+        result = await self.session.execute(
+            select(
+                GuestSession.router_id,
+                func.count(GuestSession.id),
+                func.max(GuestSession.last_activity_at),
+            )
+            .where(
+                GuestSession.router_id.in_(list(router_ids)),
+                GuestSession.is_deleted.is_(False),
+                GuestSession.last_activity_at >= since,
+                unclosed,
+            )
+            .group_by(GuestSession.router_id)
+        )
+        return {
+            rid: UnclosedGuestActivity(
+                router_id=rid, sessions=int(count), last_activity_at=at
+            )
+            for rid, count, at in result.all()
+            if at is not None
+        }
+
+    async def list_aruba_access_points(
+        self, *, organization_id: uuid.UUID, router_ids: list[uuid.UUID]
+    ) -> list[ArubaAccessPoint]:
+        """Every non-deleted AP row of these routers, every status -- the
+        evaluator needs to see a no-longer-approved AP to close its alert.
+        Scoped by organization as well as router, belt and braces."""
+        if not router_ids:
+            return []
+        result = await self.session.execute(
+            select(ArubaAccessPoint)
+            .where(
+                ArubaAccessPoint.organization_id == organization_id,
+                ArubaAccessPoint.router_id.in_(list(router_ids)),
+                ArubaAccessPoint.is_deleted.is_(False),
+            )
+            .order_by(ArubaAccessPoint.router_id, ArubaAccessPoint.mac)
+        )
+        return list(result.scalars().all())
+
+    async def open_hours_for_locations(
+        self, *, organization_id: uuid.UUID, location_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, VenueOpenHours]:
+        """Each venue's Open Hours, resolved most-specific-wins exactly as
+        ``CaptivePortalService.resolve_portal_config`` does: the newest active
+        location override, else the organization's active default. One query
+        for the organization's candidate rows; venues with neither absent."""
+        if not location_ids:
+            return {}
+        result = await self.session.execute(
+            select(CaptivePortalConfig)
+            .where(
+                CaptivePortalConfig.organization_id == organization_id,
+                CaptivePortalConfig.is_active.is_(True),
+                CaptivePortalConfig.is_deleted.is_(False),
+                or_(
+                    CaptivePortalConfig.location_id.in_(list(location_ids)),
+                    CaptivePortalConfig.location_id.is_(None)
+                    & CaptivePortalConfig.is_default.is_(True),
+                ),
+            )
+            .order_by(CaptivePortalConfig.updated_at.desc())
+        )
+        rows = list(result.scalars().all())
+        default = next((r for r in rows if r.location_id is None), None)
+        resolved: dict[uuid.UUID, VenueOpenHours] = {}
+        for location_id in location_ids:
+            config = next(
+                (r for r in rows if r.location_id == location_id), default
+            )
+            if config is None:
+                continue
+            resolved[location_id] = VenueOpenHours(
+                enabled=bool(config.business_hours_enabled),
+                timezone=config.business_hours_timezone or "UTC",
+                schedule=dict(config.business_hours_schedule or {}),
+            )
+        return resolved
 
     async def get_organization_and_location_names(
         self,
@@ -1820,6 +1993,9 @@ class MonitoringRepository:
 
 __all__ = [
     "AuthorizationOutcomeCounts",
+    "IDLE_SWEEP_DISCONNECT_REASON",
+    "UnclosedGuestActivity",
+    "VenueOpenHours",
     "MonitoringRepositoryProtocol",
     "MonitoringRepository",
 ]

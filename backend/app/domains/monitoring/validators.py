@@ -23,7 +23,13 @@ from app.domains.router_provisioning.models import (
 )
 
 from .constants import (
+    ACCESS_POINT_SILENT_MAX_SILENCE_MINUTES,
+    ACCESS_POINT_SILENT_MIN_AP_SILENCE_MINUTES,
+    ACCESS_POINT_SILENT_MIN_OPEN_HOURS_SILENCE_MINUTES,
+    ACCESS_POINT_SILENT_MIN_SILENCE_MINUTES,
+    ACCESS_POINT_SILENT_STATE,
     ALERT_STATUS_TRANSITIONS,
+    ALERT_TARGET_ACCESS_POINT_SILENT,
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
     ALERT_TARGET_ROGUE_DHCP_GUARD,
@@ -90,6 +96,63 @@ def classify_storage_health(*, percent_used: float, writable: bool) -> HealthSta
 # ============================================================================
 
 
+def _optional_minutes(
+    condition_config: dict[str, object], key: str, *, minimum: int
+) -> None:
+    value = condition_config.get(key)
+    if value is None:
+        return
+    # bool is an int subclass; True is not "1 minute".
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidAlertRuleConfigError(
+            f"condition_config.{key} must be a whole number of minutes"
+        )
+    if not minimum <= value <= ACCESS_POINT_SILENT_MAX_SILENCE_MINUTES:
+        raise InvalidAlertRuleConfigError(
+            f"condition_config.{key} must be between {minimum} and "
+            f"{ACCESS_POINT_SILENT_MAX_SILENCE_MINUTES} minutes"
+        )
+
+
+def validate_access_point_silent_config(condition_config: dict[str, object]) -> None:
+    """The ``ALERT_TARGET_ACCESS_POINT_SILENT`` shape -- see that constant.
+
+    ``{"expected_status": "silent", "silence_minutes"?: int,
+    "use_open_hours"?: bool, "open_hours_silence_minutes"?: int,
+    "per_access_point"?: bool, "access_point_silence_minutes"?: int}``.
+    Every optional key falls back to the conservative default in
+    ``constants``. The floors exist because an Instant On AP reports a
+    connected guest only every ~5 minutes: a 5-minute window would page on
+    one late Interim-Update.
+    """
+    if condition_config.get("expected_status") != ACCESS_POINT_SILENT_STATE:
+        raise InvalidAlertRuleConfigError(
+            "access_point_silent rules require condition_config"
+            f".expected_status == '{ACCESS_POINT_SILENT_STATE}'"
+        )
+    _optional_minutes(
+        condition_config,
+        "silence_minutes",
+        minimum=ACCESS_POINT_SILENT_MIN_SILENCE_MINUTES,
+    )
+    _optional_minutes(
+        condition_config,
+        "open_hours_silence_minutes",
+        minimum=ACCESS_POINT_SILENT_MIN_OPEN_HOURS_SILENCE_MINUTES,
+    )
+    _optional_minutes(
+        condition_config,
+        "access_point_silence_minutes",
+        minimum=ACCESS_POINT_SILENT_MIN_AP_SILENCE_MINUTES,
+    )
+    for key in ("use_open_hours", "per_access_point"):
+        value = condition_config.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise InvalidAlertRuleConfigError(
+                f"condition_config.{key} must be true or false"
+            )
+
+
 def validate_alert_rule_condition_config(
     trigger_type: AlertTriggerType,
     target_component: str | None,
@@ -115,6 +178,7 @@ def validate_alert_rule_condition_config(
                 ALERT_TARGET_ISP_LINK,
                 ALERT_TARGET_MONITORED_HARDWARE,
                 ALERT_TARGET_ROGUE_DHCP_GUARD,
+                ALERT_TARGET_ACCESS_POINT_SILENT,
             }
             | set(NETWORK_CONTROLLER_TARGET_STATES)
         )
@@ -172,6 +236,8 @@ def validate_alert_rule_condition_config(
                 "the detector could not reach the router, which is an "
                 "unanswered question, not an alert"
             )
+        if target_component == ALERT_TARGET_ACCESS_POINT_SILENT:
+            validate_access_point_silent_config(condition_config)
         required_state = NETWORK_CONTROLLER_TARGET_STATES.get(target_component)
         if required_state is not None and expected_status != required_state:
             # Same discipline again: each network-controller target has
@@ -496,6 +562,7 @@ __all__ = [
     "validate_date_range",
     "classify_storage_health",
     "validate_alert_rule_condition_config",
+    "validate_access_point_silent_config",
     "validate_alert_status_transition",
     "compare_threshold",
     "validate_notification_channel_config",
