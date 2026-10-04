@@ -155,7 +155,7 @@ from .device_adapters import (
     reboot_device,
 )
 from .enums import RouterStatus
-from .exceptions import NasOnlySiteRefusedError
+from .exceptions import NasOnlySiteRefusedError, RouterNasOnlyOperationError
 from .instant_on_onboarding import onboard_instant_on_site
 from .models import Router
 from .schemas import (
@@ -1211,6 +1211,8 @@ async def reboot_router(
     router_row = await router_service.get_router(
         router_id, requesting_organization_id=requesting_organization_id
     )
+    if is_nas_only(router_row):
+        raise RouterNasOnlyOperationError(router_row.id, "reboot")
     host = router_row.management_ip_address or router_row.public_ip_address
     password = router_service.get_decrypted_api_secret(router_row)
     if not host or not router_row.api_username or not password:
