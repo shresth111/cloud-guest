@@ -235,3 +235,36 @@ class InstantOnGuestRateLimitResponse(BaseModel):
     before: InstantOnGuestRateLimitState | None = None
     requested: InstantOnGuestRateLimitState | None = None
     after: InstantOnGuestRateLimitState | None = None
+
+
+class InstantOnVenueGuestSpeedRequest(BaseModel):
+    """Customer: one speed for every device on a guest WiFi network.
+    Each direction is a preset (10, 20, ... 100 Mbps) or ``None`` (no
+    limit); the preset set is enforced in ``set_venue_guest_speed``.
+    ``extra="forbid"`` so a misspelt field is a 422, never a silent no-op."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    network_id: str = Field(min_length=1, max_length=128)
+    download_mbps: int | None = Field(default=None, ge=1, le=1000)
+    upload_mbps: int | None = Field(default=None, ge=1, le=1000)
+
+
+class InstantOnVenueGuestNetwork(BaseModel):
+    network_id: str
+    network_name: str | None = None
+    enabled: bool
+    download_mbps: int | None = None
+    upload_mbps: int | None = None
+
+
+class InstantOnVenueGuestSpeedResponse(BaseModel):
+    """Never carries a network secret: five fields per network, nothing else."""
+
+    source: Literal["instant_on"] = "instant_on"
+    status: Literal["ok", "applied", "unavailable", "failed"]
+    reason: str | None = None
+    message: str | None = None
+    presets_mbps: list[int]
+    networks: list[InstantOnVenueGuestNetwork] = Field(default_factory=list)
+    applied: InstantOnVenueGuestNetwork | None = None

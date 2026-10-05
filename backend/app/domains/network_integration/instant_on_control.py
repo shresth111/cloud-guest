@@ -62,11 +62,15 @@ __all__ = [
     "ControlTarget",
     "build_live_control_client",
     "cloud_control_allowed",
+    "GUEST_SPEED_PRESETS_MBPS",
+    "VenueGuestSpeed",
     "end_nas_only_session",
     "instant_on_block_device",
     "instant_on_release_device",
+    "read_venue_guest_speed",
     "release_transient_block",
     "resolve_control_target",
+    "set_venue_guest_speed",
     "transient_marker_key",
 ]
 
@@ -426,6 +430,181 @@ async def instant_on_control_present(
         )
         is not None
     )
+
+
+# -- venue guest speed (the guest network's per-client cap) -----------------
+
+#: The speeds a venue owner can pick for every device on the guest network.
+#: Instant On holds an integer number of Mbps per direction, 1..1000
+#: (``qos.perClient*BandwidthLimitInMbps``, measured), so every preset is a
+#: value it stores as-is -- nothing is rounded or mapped.
+GUEST_SPEED_PRESETS_MBPS: tuple[int, ...] = (10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+
+
+@dataclass(frozen=True, slots=True)
+class VenueGuestNetworkSpeed:
+    network_id: str
+    network_name: str | None
+    enabled: bool
+    download_mbps: int | None
+    upload_mbps: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class VenueGuestSpeed:
+    """What a venue owner's speed screen can say about the guest network.
+
+    ``status``:
+    * ``ok`` -- read live from Instant On; ``networks`` is every guest
+      network on the venue's site with its current cap.
+    * ``applied`` -- a write landed AND the read-back shows the requested
+      cap (``applied``). Never set on a 2xx alone.
+    * ``unavailable`` -- a cloud-control gate is closed (``reason`` says
+      ``cloud_control_not_enabled``); nothing was sent to Instant On.
+    * ``failed`` -- Instant On answered, but not with what was asked
+      (``reason`` is the error code, e.g. ``write_not_confirmed``).
+
+    Carries no network secret: only the five fields above per network, so
+    the PSK and RADIUS secret that ``networksSummary`` returns can never
+    reach a response or a log through this type.
+    """
+
+    status: str
+    reason: str | None = None
+    message: str | None = None
+    networks: tuple[VenueGuestNetworkSpeed, ...] = ()
+    applied: VenueGuestNetworkSpeed | None = None
+
+
+def _network_speed(limit: Any) -> VenueGuestNetworkSpeed:
+    return VenueGuestNetworkSpeed(
+        network_id=limit.network_id,
+        network_name=limit.network_name,
+        enabled=limit.enabled,
+        download_mbps=limit.download_mbps,
+        upload_mbps=limit.upload_mbps,
+    )
+
+
+def _check_preset(value: int | None, what: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or value not in GUEST_SPEED_PRESETS_MBPS:
+        raise ValueError(
+            f"{what} must be one of {', '.join(map(str, GUEST_SPEED_PRESETS_MBPS))} "
+            "Mbps, or no limit"
+        )
+    return value
+
+
+async def read_venue_guest_speed(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None,
+    location_id: uuid.UUID,
+    settings: Settings | None = None,
+) -> VenueGuestSpeed:
+    """The venue's guest networks and their per-client caps, read live.
+    Tenant-scoped through ``resolve_control_target`` (organization AND
+    location in the query). Read-only."""
+    settings = settings or get_settings()
+    target = await resolve_control_target(
+        session,
+        organization_id=organization_id,
+        location_id=location_id,
+        settings=settings,
+    )
+    if target is None:
+        return VenueGuestSpeed(status="unavailable", reason="cloud_control_not_enabled")
+    try:
+        limits = await _with_client(
+            target,
+            settings,
+            lambda client: client.list_guest_network_rate_limits(target.site_id),
+        )
+    except InstantOnError as error:
+        return VenueGuestSpeed(status="failed", reason=error.code, message=str(error))
+    return VenueGuestSpeed(
+        status="ok", networks=tuple(_network_speed(limit) for limit in limits)
+    )
+
+
+async def set_venue_guest_speed(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None,
+    location_id: uuid.UUID,
+    network_id: str,
+    download_mbps: int | None,
+    upload_mbps: int | None,
+    actor_user_id: uuid.UUID | None = None,
+    settings: Settings | None = None,
+) -> VenueGuestSpeed:
+    """Set (or, with both ``None``, clear) one guest network's per-client cap.
+
+    The same cap for EVERY device on that network: Instant On has no
+    per-client rate on any path we can reach (INSTANT_ON_CLOUD_CONTROL.md).
+    Only a GUEST network of the venue's own site can be written -- the
+    network id is looked up in that site's own list, so another site's id
+    (or the venue's staff network) is refused before any write. Success is
+    the provider's read-back alone (``set_guest_network_rate_limit`` raises
+    ``write_not_confirmed`` when Instant On did not keep the value)."""
+    down = _check_preset(download_mbps, "download")
+    up = _check_preset(upload_mbps, "upload")
+    settings = settings or get_settings()
+    target = await resolve_control_target(
+        session,
+        organization_id=organization_id,
+        location_id=location_id,
+        settings=settings,
+    )
+    if target is None:
+        return VenueGuestSpeed(status="unavailable", reason="cloud_control_not_enabled")
+
+    async def apply(client: InstantOnControlClient) -> VenueGuestSpeed:
+        guest = {
+            n.network_id: n
+            for n in await client.list_guest_network_rate_limits(target.site_id)
+        }
+        if network_id not in guest:
+            return VenueGuestSpeed(
+                status="failed",
+                reason="network_not_found",
+                message=(
+                    "That guest WiFi network is not on this venue's Instant On site."
+                ),
+                networks=tuple(_network_speed(n) for n in guest.values()),
+            )
+        after = await client.set_guest_network_rate_limit(
+            target.site_id, network_id, download_mbps=down, upload_mbps=up
+        )
+        refreshed = await client.list_guest_network_rate_limits(target.site_id)
+        return VenueGuestSpeed(
+            status="applied",
+            networks=tuple(_network_speed(n) for n in refreshed),
+            applied=_network_speed(after),
+        )
+
+    try:
+        result = await _with_client(target, settings, apply)
+    except InstantOnError as error:
+        logger.warning(
+            "instant_on_venue_guest_speed_failed",
+            extra={"router_id": str(target.router_id), "error_code": error.code},
+        )
+        return VenueGuestSpeed(status="failed", reason=error.code, message=str(error))
+    if result.status == "applied":
+        logger.info(
+            "instant_on_venue_guest_speed_applied",
+            extra={
+                "router_id": str(target.router_id),
+                "network_id": network_id,
+                "download_mbps": down,
+                "upload_mbps": up,
+                "actor_user_id": str(actor_user_id) if actor_user_id else None,
+            },
+        )
+    return result
 
 
 # -- Celery ------------------------------------------------------------------
