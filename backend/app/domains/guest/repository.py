@@ -132,6 +132,25 @@ class AuthMethodOutcomeCounts:
 
 
 @dataclass(frozen=True, slots=True)
+class GuestSessionGroupRow:
+    """One guest's sessions at the filtered venue, aggregated -- see
+    ``GuestRepository.list_session_groups``. ``primary`` is the session the
+    venue Guests table shows for this guest: the newest ACTIVE one, else the
+    newest of any status."""
+
+    guest_id: uuid.UUID
+    session_count: int
+    active_session_count: int
+    device_count: int
+    first_started_at: datetime
+    last_started_at: datetime
+    bytes_downloaded_total: int
+    bytes_uploaded_total: int
+    primary: GuestSession
+    active_session_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveGuestOrgPair:
     """One distinct ``(guest_id, organization_id, location_id)`` triple
     drawn from currently ``ACTIVE`` ``GuestSession`` rows -- see
@@ -321,6 +340,18 @@ class GuestRepositoryProtocol(Protocol):
         page: int,
         page_size: int,
     ) -> tuple[list[GuestSession], PaginationMeta]: ...
+
+    async def list_session_groups(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
+        ap_mac: str | None,
+        active: bool | None,
+        search: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestSessionGroupRow], PaginationMeta]: ...
 
     async def list_sessions_for_guest(
         self, guest_id: uuid.UUID, *, limit: int | None = None
@@ -1116,6 +1147,170 @@ class GuestRepository:
         rows = list(result.scalars().all())
         params = PageParams(page=page, page_size=page_size)
         meta = PaginationMeta.from_total(params, total_items)
+        return rows, meta
+
+    async def list_session_groups(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
+        ap_mac: str | None,
+        active: bool | None,
+        search: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestSessionGroupRow], PaginationMeta]:
+        """The venue Guests table, one row per GUEST, paginated by guest.
+
+        ``GenericRepository.paginate`` pages rows, and the rows here are
+        sessions -- so a guest who reconnected six times took six of a page's
+        slots and the table read as the same person over and over. This
+        groups in SQL (``GROUP BY guest_id``) so the page boundary falls
+        between people, ``total_items`` counts people, and the guests that
+        are on the network right now (any ACTIVE session) sort first, newest
+        visit first after that.
+
+        ``active`` narrows to guests with (``True``) or without (``False``)
+        an ACTIVE session. ``search`` matches the guest's identifier, display
+        name or email (case-insensitive substring). ``ap_mac`` (Aruba
+        Instant On) narrows the *sessions* first, exactly like
+        ``list_sessions`` does, so a guest appears under the access points
+        they actually used.
+
+        Three statements for the page: the grouped page itself, the primary
+        session of each guest on it (``row_number()`` per guest, ACTIVE
+        first), and the ids of their ACTIVE sessions. Never one per guest."""
+        conditions: list[ColumnElement[bool]] = [GuestSession.is_deleted.is_(False)]
+        if organization_id is not None:
+            conditions.append(GuestSession.organization_id == organization_id)
+        if location_id is not None:
+            conditions.append(
+                _location_condition(GuestSession.location_id, location_id)
+            )
+        if ap_mac is not None:
+            conditions.append(GuestSession.ap_mac == ap_mac)
+        if search:
+            pattern = f"%{search.strip()}%"
+            guest_match = select(Guest.id).where(
+                or_(
+                    Guest.identifier.ilike(pattern),
+                    Guest.display_name.ilike(pattern),
+                    Guest.email.ilike(pattern),
+                )
+            )
+            if organization_id is not None:
+                guest_match = guest_match.where(
+                    Guest.organization_id == organization_id
+                )
+            conditions.append(GuestSession.guest_id.in_(guest_match))
+
+        is_active = case(
+            (GuestSession.status == GuestSessionStatus.ACTIVE.value, 1), else_=0
+        )
+        active_count = func.coalesce(func.sum(is_active), 0)
+        grouped = (
+            select(
+                GuestSession.guest_id.label("guest_id"),
+                func.count(GuestSession.id).label("session_count"),
+                active_count.label("active_count"),
+                func.count(func.distinct(GuestSession.device_id)).label("device_count"),
+                func.min(GuestSession.started_at).label("first_started_at"),
+                func.max(GuestSession.started_at).label("last_started_at"),
+                func.coalesce(func.sum(GuestSession.bytes_downloaded), 0).label(
+                    "bytes_down"
+                ),
+                func.coalesce(func.sum(GuestSession.bytes_uploaded), 0).label(
+                    "bytes_up"
+                ),
+            )
+            .where(*conditions)
+            .group_by(GuestSession.guest_id)
+        )
+        if active is True:
+            grouped = grouped.having(active_count > 0)
+        elif active is False:
+            grouped = grouped.having(active_count == 0)
+        groups = grouped.subquery("guest_session_groups")
+
+        total_items = int(
+            (
+                await self.session.execute(select(func.count()).select_from(groups))
+            ).scalar_one()
+        )
+        page_statement = (
+            select(groups)
+            .order_by(
+                (groups.c.active_count > 0).desc(),
+                groups.c.last_started_at.desc(),
+                groups.c.guest_id,
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        page_rows = list((await self.session.execute(page_statement)).mappings().all())
+        params = PageParams(page=page, page_size=page_size)
+        meta = PaginationMeta.from_total(params, total_items)
+        if not page_rows:
+            return [], meta
+
+        guest_ids = [row["guest_id"] for row in page_rows]
+        ranked = (
+            select(
+                GuestSession.id.label("id"),
+                func.row_number()
+                .over(
+                    partition_by=GuestSession.guest_id,
+                    order_by=(
+                        (1 - is_active).asc(),
+                        GuestSession.started_at.desc(),
+                        GuestSession.id,
+                    ),
+                )
+                .label("rank"),
+            )
+            .where(*conditions, GuestSession.guest_id.in_(guest_ids))
+            .subquery("ranked_guest_sessions")
+        )
+        primary_statement = (
+            select(GuestSession)
+            .join(ranked, ranked.c.id == GuestSession.id)
+            .where(ranked.c.rank == 1)
+        )
+        primaries = {
+            session.guest_id: session
+            for session in (await self.session.execute(primary_statement))
+            .scalars()
+            .all()
+        }
+        active_statement = select(GuestSession.id, GuestSession.guest_id).where(
+            *conditions,
+            GuestSession.guest_id.in_(guest_ids),
+            GuestSession.status == GuestSessionStatus.ACTIVE.value,
+        ).order_by(GuestSession.started_at.desc(), GuestSession.id)
+        active_ids: dict[uuid.UUID, list[uuid.UUID]] = {}
+        active_rows = (await self.session.execute(active_statement)).all()
+        for session_id, guest_id in active_rows:
+            active_ids.setdefault(guest_id, []).append(session_id)
+
+        rows: list[GuestSessionGroupRow] = []
+        for row in page_rows:
+            primary = primaries.get(row["guest_id"])
+            if primary is None:  # deleted between the two reads
+                continue
+            rows.append(
+                GuestSessionGroupRow(
+                    guest_id=row["guest_id"],
+                    session_count=int(row["session_count"]),
+                    active_session_count=int(row["active_count"]),
+                    device_count=int(row["device_count"]),
+                    first_started_at=row["first_started_at"],
+                    last_started_at=row["last_started_at"],
+                    bytes_downloaded_total=int(row["bytes_down"]),
+                    bytes_uploaded_total=int(row["bytes_up"]),
+                    primary=primary,
+                    active_session_ids=tuple(active_ids.get(row["guest_id"], [])),
+                )
+            )
         return rows, meta
 
     async def list_sessions_for_guest(

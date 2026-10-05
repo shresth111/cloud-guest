@@ -417,6 +417,7 @@ from .repository import (
     DashboardSeriesAggregate,
     DeviceSessionCount,
     GuestRepositoryProtocol,
+    GuestSessionGroupRow,
     LocationSessionCount,
     VoucherRedemptionRow,
 )
@@ -5500,6 +5501,31 @@ class GuestService:
             filters["ap_mac"] = ap_mac
         return await self.repository.list_sessions(
             page=page, page_size=page_size, filters=filters or None
+        )
+
+    async def list_session_groups(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
+        active: bool | None = None,
+        search: str | None = None,
+        page: int = 1,
+        page_size: int = 25,
+        ap_mac: str | None = None,
+    ) -> tuple[list[GuestSessionGroupRow], object]:
+        """The venue Guests table: one row per guest, not per session -- see
+        ``GuestRepository.list_session_groups``. Scoped exactly like
+        ``list_sessions``: the caller's organization, and the location
+        filter confined to the caller's own sites."""
+        return await self.repository.list_session_groups(
+            organization_id=requesting_organization_id,
+            location_id=self._confined_location_filter(location_id),
+            ap_mac=ap_mac,
+            active=active,
+            search=(search or "").strip() or None,
+            page=page,
+            page_size=page_size,
         )
 
     async def list_sessions_in_range(

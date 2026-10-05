@@ -580,6 +580,49 @@ class GuestSessionListResponse(BaseModel):
     has_previous: bool
 
 
+class GuestSessionGroupResponse(BaseModel):
+    """One guest at one venue: their sessions there, folded into a row.
+
+    The venue Guests table used to list ``GET /guest-sessions`` row by row,
+    so a guest who reconnected six times was six rows under a "Total guests"
+    tile that counted them once. ``latest_session`` is the session the row
+    describes and acts on -- the newest *active* one when there is one, else
+    the newest -- and ``active_session_ids`` is every session a guest-level
+    Disconnect has to end (a guest on a phone and a laptop has two). The
+    history itself stays one ``GET /guest-sessions?guest_id=`` away."""
+
+    guest_id: str
+    guest_identifier: str | None = None
+    session_count: int
+    active_session_count: int
+    #: Distinct devices across these sessions (a MAC-less session counts none).
+    device_count: int
+    first_started_at: datetime
+    last_started_at: datetime
+    bytes_downloaded_total: int
+    bytes_uploaded_total: int
+    active_session_ids: list[str]
+    latest_session: GuestSessionResponse
+
+
+class GuestSessionGroupListResponse(BaseModel):
+    """Paginated by GUEST, so ``total_items`` is a count of people."""
+
+    items: list[GuestSessionGroupResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+    #: Aruba Instant On only: whether a Disconnect at this venue can take the
+    #: device off through the Instant On cloud right now (every cloud-control
+    #: gate open and an Instant On site on record for the location). ``False``
+    #: everywhere else, including every MikroTik and Omada venue, whose
+    #: Disconnect does not read it.
+    instant_on_cloud_disconnect: bool = False
+
+
 class GuestLoginResponse(BaseModel):
     """Returned to the guest themselves, right after they submit this
     same identifier to log in -- deliberately **not** masked (unlike

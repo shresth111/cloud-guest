@@ -40,12 +40,15 @@ import logging
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
+from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.location.scoping import enforce_target_location
 from app.domains.marketing.dependencies import (
@@ -146,6 +149,8 @@ from .schemas import (
     GuestResponse,
     GuestReviewLinkOpenedRequest,
     GuestReviewLinkOpenedResponse,
+    GuestSessionGroupListResponse,
+    GuestSessionGroupResponse,
     GuestSessionListResponse,
     GuestSessionResponse,
     GuestSetPasswordRequest,
@@ -1532,6 +1537,116 @@ async def list_guest_sessions(
     return build_response(
         success=True,
         message="Guest sessions retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
+    "/guest-session-groups",
+    response_model=ApiResponse[GuestSessionGroupListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def list_guest_session_groups(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    location_id: uuid.UUID | None = Query(default=None),
+    session_state: Literal["active", "ended"] | None = Query(
+        default=None,
+        alias="status",
+        description=(
+            "active: guests with at least one ACTIVE session here; ended: "
+            "guests with none."
+        ),
+    ),
+    search: str | None = Query(default=None, max_length=255),
+    ap_mac: str | None = Query(
+        default=None,
+        max_length=32,
+        description="Aruba Instant On only: sessions last reported from this AP.",
+    ),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
+    service: GuestService = Depends(get_guest_service),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """The venue Guests table, one row per guest (see
+    ``GuestSessionGroupResponse``). Same permission, tenant and location
+    scoping as ``GET /guest-sessions``, which it summarises -- and which
+    still answers the per-guest history (``?guest_id=``)."""
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    groups, meta = await service.list_session_groups(
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
+        active=None if session_state is None else session_state == "active",
+        search=search,
+        page=page,
+        page_size=page_size,
+        ap_mac=(canonical_mac(ap_mac) or ap_mac.strip()) if ap_mac else None,
+    )
+    sessions = [group.primary for group in groups]
+    macs = await _resolve_session_macs(
+        sessions,
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
+    identifiers = await _resolve_session_guest_identifiers(
+        sessions,
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
+    router_names = await _resolve_router_names(sessions, service=service)
+    presence = await _resolve_session_presence(sessions, macs, service=service)
+    ap_names = await _resolve_ap_names(sessions, service=service)
+    primaries = _session_responses(
+        sessions, macs, identifiers, router_names, presence, ap_names
+    )
+    cloud_disconnect = False
+    if location_id is not None and requesting_organization_id is not None:
+        # Aruba Instant On: one indexed lookup, and only once every
+        # cloud-control env gate is already open (``resolve_control_target``
+        # returns before touching the database otherwise).
+        from app.domains.network_integration.instant_on_control import (
+            instant_on_control_present,
+        )
+
+        cloud_disconnect = await instant_on_control_present(
+            db, location_id=location_id, organization_id=requesting_organization_id
+        )
+    payload = GuestSessionGroupListResponse(
+        items=[
+            GuestSessionGroupResponse(
+                guest_id=str(group.guest_id),
+                guest_identifier=primary.guest_identifier,
+                session_count=group.session_count,
+                active_session_count=group.active_session_count,
+                device_count=group.device_count,
+                first_started_at=group.first_started_at,
+                last_started_at=group.last_started_at,
+                bytes_downloaded_total=group.bytes_downloaded_total,
+                bytes_uploaded_total=group.bytes_uploaded_total,
+                active_session_ids=[str(i) for i in group.active_session_ids],
+                latest_session=primary,
+            )
+            for group, primary in zip(groups, primaries, strict=True)
+        ],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+        instant_on_cloud_disconnect=cloud_disconnect,
+    )
+    return build_response(
+        success=True,
+        message="Guest session groups retrieved",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )
