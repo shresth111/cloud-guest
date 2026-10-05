@@ -423,6 +423,7 @@ from .repository import (
 from .validators import (
     as_utc,
     canonical_mac_key,
+    canonicalize_calling_station_id,
     compute_period_start,
     dashboard_series_bucket_starts,
     has_session_reached_time_limit,
@@ -5389,6 +5390,64 @@ class GuestService:
             session_timeout_minutes=session.session_timeout_minutes,
             idle_timeout_minutes=session.idle_timeout_minutes,
         )
+
+    async def trusted_device_login_identifier(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_mac: str,
+    ) -> str | None:
+        """Trusted Devices at a NAS-only venue (Aruba Instant On): the
+        ``User-Name`` the captive portal should hand the AP for this
+        device, or ``None`` for every kind of no.
+
+        At MikroTik a trusted device never sees the portal: the router asks
+        RADIUS on connect and ``RadiusService.authorize`` admits it by its
+        NAS-asserted ``Calling-Station-Id``. Instant On has no MAC
+        authentication on a guest network (RECON.md), so the AP only ever
+        asks RADIUS after the portal's login POST. This answer lets the
+        portal make that POST at once instead of showing a sign-in form.
+
+        **It is a hint, never a credential.** Nothing is created here. The
+        AP's Access-Request still carries the device's real MAC as
+        ``Calling-Station-Id``, and ``authorize`` admits it only through
+        ``login_via_mac_whitelist`` on that NAS-asserted value -- a browser
+        that names a trusted MAC it does not hold is refused there (and,
+        if the trusted device is online, by the device binding). The one
+        thing this discloses is whether a MAC is trusted at this venue,
+        which is less than ``/session/active`` already returns for any MAC.
+
+        ``None`` for MikroTik/Omada (their path is untouched), an
+        ineligible router, a malformed MAC, no MAC Authorization hook, an
+        untrusted device, or a blocked guest -- the portal then shows its
+        ordinary sign-in, where a refusal is explained properly."""
+        if self.mac_authorization_hook is None:
+            return None
+        try:
+            router = await self._get_eligible_router(router_id)
+        except CloudGuestError:
+            return None
+        if not is_nas_only(router) or router.location_id is None:
+            return None
+        try:
+            normalized = normalize_whitelist_mac_address(
+                canonicalize_calling_station_id(device_mac) or ""
+            )
+        except MacAuthorizationError:
+            return None
+        if not await self.mac_authorization_hook.is_mac_authorized(
+            normalized,
+            organization_id=router.organization_id,
+            location_id=router.location_id,
+        ):
+            return None
+        identifier = f"mac:{normalized}"
+        guest = await self.repository.get_guest_by_identifier(
+            router.organization_id, identifier
+        )
+        if guest is not None and guest.is_blocked:
+            return None
+        return identifier
 
     # ========================================================================
     # Session management

@@ -152,6 +152,7 @@ from .schemas import (
     GuestSetPasswordResponse,
     GuestSetPinRequest,
     GuestSetPinResponse,
+    GuestTrustedDeviceResponse,
     GuestUpdateProfileRequest,
     GuestUpdateProfileResponse,
     GuestVoucherLoginRequest,
@@ -1043,6 +1044,40 @@ async def guest_last_ended_session(
                 idle_timeout_minutes=result.idle_timeout_minutes,
             ).model_dump()
             if result
+            else None
+        ),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.get(
+    "/session/trusted-device",
+    response_model=ApiResponse[GuestTrustedDeviceResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_trusted_device(
+    request: Request,
+    router_id: uuid.UUID = Query(...),
+    device_mac: str = Query(..., max_length=64),
+    service: GuestService = Depends(get_guest_service),
+):
+    """Guest-facing, unauthenticated (same posture as ``/session/active``
+    above). Trusted Devices at an Aruba Instant On venue: asked by the
+    portal once ``/session/active`` has answered no, so a trusted device
+    skips the sign-in form and the portal submits the AP login straight
+    away. ``data`` is ``null`` for every kind of no, including every
+    MikroTik and Omada router. Admission itself happens only in RADIUS
+    Authorize, on the AP-asserted MAC -- see
+    ``GuestService.trusted_device_login_identifier``."""
+    identifier = await service.trusted_device_login_identifier(
+        router_id=router_id, device_mac=device_mac
+    )
+    return build_response(
+        success=True,
+        message="Trusted device" if identifier else "Not a trusted device",
+        data=(
+            GuestTrustedDeviceResponse(identifier=identifier).model_dump()
+            if identifier
             else None
         ),
         request_id=_request_id(request),

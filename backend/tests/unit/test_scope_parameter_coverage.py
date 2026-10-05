@@ -120,6 +120,16 @@ _UNAUTHENTICATED_BY_DESIGN: dict[tuple[str, str], str] = {
         "'a session on some device ended recently', bounded by "
         "LAST_ENDED_SESSION_WINDOW_MINUTES."
     ),
+    ("GET", "/api/v1/guest/session/trusted-device"): (
+        "Guest-facing, for the same reason as `/session/last-ended` above: "
+        "the portal has only the AP's own `mac`. `router_id` narrows the "
+        "lookup to that router's venue (the trust check is scoped to its "
+        "organization and location), so a guessed id answers about a "
+        "different venue's list, never returns another tenant's data. The "
+        "answer is `mac:<the MAC the caller sent>` or null -- nothing the "
+        "caller did not already hold -- and it is a hint, not a credential: "
+        "admission happens only in RADIUS Authorize on the AP-asserted MAC."
+    ),
     # -- authorized in the handler rather than by a dependency ---------------
     #
     # These three are checked, just not somewhere this test can see. Listed
