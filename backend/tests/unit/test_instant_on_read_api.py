@@ -462,10 +462,22 @@ class TestRoutes:
             instant_on_customer_router,
         )
 
-        assert len(instant_on_customer_router.routes) == 4
+        # 4 reads + the guest network speed (GET + PUT).
+        assert len(instant_on_customer_router.routes) == 6
         for route in instant_on_customer_router.routes:
             (closure,) = _permission_closures(route)
             assert closure[ScopeType] == ScopeType.ORGANIZATION
+            if route.methods == {"PUT"}:
+                # The one write: the guest network's speed. Its body names an
+                # Instant On network, which is only ever looked up inside the
+                # site resolved from the caller's organization + location
+                # (``set_venue_guest_speed``), never read unscoped.
+                assert route.path.endswith("/instant-on/guest-speed")
+                assert closure[str] == "bandwidth.update"
+                assert [p.name for p in route.dependant.path_params] == [
+                    "location_id"
+                ]
+                continue
             assert closure[str] == "locations.read"
             assert route.methods == {"GET"}
             assert route.path.startswith(

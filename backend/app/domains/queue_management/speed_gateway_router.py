@@ -88,6 +88,13 @@ class SpeedGatewayLinkRequest(BaseModel):
 
 class SpeedControlView(BaseModel):
     per_guest_speed: bool
+    #: Aruba Instant On only: every Instant On cloud-control gate is open for
+    #: this location's access point (global flag, router allowlist, write
+    #: account, site mapping), so the dashboard may offer the device block,
+    #: the guest network's speed cap and the mid-session data-cap cut.
+    #: ``False`` everywhere else, and for a location outside the caller's
+    #: grants -- the same answer, so it discloses nothing.
+    instant_on_cloud_control: bool = False
 
 
 def _request_id(request: Request) -> str:
@@ -197,16 +204,31 @@ async def get_location_speed_control(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     caller_location_scope: LocationScope = Depends(CallerLocationScope),
     service: SpeedGatewayService = Depends(get_speed_gateway_service),
+    db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Whether guests at this location get a per-guest speed limit from a
-    Wyfy gateway router (the Aruba AP + MikroTik hybrid)."""
+    Wyfy gateway router (the Aruba AP + MikroTik hybrid), and whether
+    Instant On cloud control is switched on for its access point."""
+    from app.domains.network_integration.instant_on_control import (
+        instant_on_control_present,
+    )
+
     allowed = caller_location_scope is None or location_id in caller_location_scope
     per_guest = allowed and await service.customer_per_guest_speed(
         location_id=location_id, organization_id=requesting_organization_id
     )
+    cloud = bool(
+        allowed
+        and requesting_organization_id is not None
+        and await instant_on_control_present(
+            db, location_id=location_id, organization_id=requesting_organization_id
+        )
+    )
     return build_response(
         success=True,
         message="Speed control",
-        data=SpeedControlView(per_guest_speed=per_guest).model_dump(mode="json"),
+        data=SpeedControlView(
+            per_guest_speed=per_guest, instant_on_cloud_control=cloud
+        ).model_dump(mode="json"),
         request_id=_request_id(request),
     )
