@@ -212,7 +212,14 @@ async def _run_device_block_release_async() -> ControllerBlockReleaseSummary:
     async with SessionLocal() as session:
         try:
             repository = GuestAccessRepository(session)
-            blocker = RouterDeviceBlocker(router_lookup=_build_router_service(session))
+            from app.domains.network_integration.client_hooks import (
+                build_instant_on_device_blocker,
+            )
+
+            blocker = RouterDeviceBlocker(
+                router_lookup=_build_router_service(session),
+                nas_only=build_instant_on_device_blocker(session),
+            )
             now = datetime.now(UTC)
             open_blocks = await repository.list_open_router_blocks_for_expired_rules(
                 now=now, limit=DEVICE_BLOCK_RELEASE_MAX_PER_RUN

@@ -1227,3 +1227,46 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
             return reported
 
     return _ActivityReporting()
+
+
+def build_instant_on_device_blocker(session: AsyncSession):  # noqa: ANN201
+    """The Aruba Instant On leg of a ``BLOCKLIST`` *device* rule
+    (``guest_access.device_blocking.RouterDeviceBlocker``, ``nas_only=``):
+    a persistent Instant On MAC block / release, each read back, for the
+    venue of one Instant On router row. Keyed on that row's own organization
+    and location, so the site written to is always the row's tenant's.
+    Answers ``unavailable`` (nothing sent) unless every cloud-control gate is
+    open for that router."""
+
+    class _InstantOnDeviceBlocker:
+        @staticmethod
+        async def _call(router, mac_address: str, action: str):  # noqa: ANN001, ANN205
+            from .instant_on_control import (
+                instant_on_block_device,
+                instant_on_release_device,
+            )
+
+            organization_id = getattr(router, "organization_id", None)
+            location_id = getattr(router, "location_id", None)
+            if organization_id is None or location_id is None:
+                return "unavailable", None
+            call = (
+                instant_on_block_device
+                if action == "block"
+                else instant_on_release_device
+            )
+            outcome = await call(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=mac_address,
+            )
+            return outcome.status, outcome.error_message
+
+        async def block(self, *, router, mac_address: str):  # noqa: ANN001, ANN201
+            return await self._call(router, mac_address, "block")
+
+        async def release(self, *, router, mac_address: str):  # noqa: ANN001, ANN201
+            return await self._call(router, mac_address, "unblock")
+
+    return _InstantOnDeviceBlocker()

@@ -794,6 +794,15 @@ NAS_ONLY_DISCONNECT_REASON = (
     "Wyfy can't disconnect a device from Aruba Instant On access points. The "
     "guest stays online until their session time runs out."
 )
+#: A device block at an Aruba Instant On venue whose Instant On cloud control
+#: is not switched on. Says what DOES work (the sign-in block, our own record)
+#: and what is needed for the device half -- never "can't disconnect".
+NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON = (
+    "Keeping this device off the WiFi needs Instant On cloud control, which "
+    "isn't switched on for this venue yet. Ask your Wyfy Guest contact to turn "
+    "it on. Blocking the guest under Blocked Guests already stops them signing "
+    "in again."
+)
 NAS_ONLY_STATS_REASON = "Data usage isn't reported for this venue yet."
 NAS_ONLY_LIVENESS_REASON = (
     "This venue's access points are managed in Aruba's Instant On app. Wyfy "
@@ -801,22 +810,31 @@ NAS_ONLY_LIVENESS_REASON = (
 )
 
 
-def nas_only_client_capabilities() -> ClientCapabilitiesReport:
-    """Every client action unsupported, each with the sentence the venue
-    owner reads, and a liveness of ``None`` -- nothing here ever measures a
-    NAS-only vendor's access points, which is "not measured", not "down"."""
-    reasons = {
+def nas_only_client_capabilities(
+    *, cloud_control: bool = False
+) -> ClientCapabilitiesReport:
+    """What a NAS-only venue's per-client actions can do, each with the
+    sentence the venue owner reads, and a liveness of ``None`` -- nothing here
+    ever measures a NAS-only vendor's access points, which is "not measured",
+    not "down".
+
+    ``cloud_control`` (Aruba Instant On, every cloud-control gate open): block
+    and unblock are supported -- a persistent Instant On MAC block, read back
+    (``instant_on_control.instant_on_block_device``). Per-client speed stays
+    unsupported on every path: Instant On has no per-client rate."""
+    block_reason = NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON
+    reasons: dict[str, str | None] = {
         "set_rate_limit": NAS_ONLY_SPEED_REASON,
         "clear_rate_limit": NAS_ONLY_SPEED_REASON,
-        "block": NAS_ONLY_DISCONNECT_REASON,
-        "unblock": NAS_ONLY_DISCONNECT_REASON,
+        "block": None if cloud_control else block_reason,
+        "unblock": None if cloud_control else block_reason,
         "list_blocked": NAS_ONLY_DISCONNECT_REASON,
         "disconnect": NAS_ONLY_DISCONNECT_REASON,
         "client_stats": NAS_ONLY_STATS_REASON,
     }
     return ClientCapabilitiesReport(
         capabilities={
-            name: {"supported": False, "reason": reason}
+            name: {"supported": reason is None, "reason": reason}
             for name, reason in reasons.items()
         },
         controller=ControllerLiveness(
@@ -4918,7 +4936,11 @@ class NetworkIntegrationService:
                 caller_location_scope=self.caller_location_scope,
                 error=CrossLocationNetworkIntegrationAccessError(),
             )
-            return nas_only_client_capabilities()
+            return nas_only_client_capabilities(
+                cloud_control=await self._instant_on_cloud_control(
+                    location_id=location_id, organization_id=organization_id
+                )
+            )
         capabilities = provider_impl.client_capabilities(config)
         return ClientCapabilitiesReport(
             capabilities={
@@ -5072,6 +5094,103 @@ class NetworkIntegrationService:
             during_sync=False,
         )
 
+    async def _nas_only_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> bool:
+        """A live NAS-only router at this location of the caller's own
+        organization (both in the WHERE clause), and the caller's location
+        confinement allows it."""
+        if organization_id is None:
+            return False
+        vendor = await self.repository.nas_only_vendor_for_location(
+            location_id=location_id, organization_id=organization_id
+        )
+        if vendor is None:
+            return False
+        enforce_entity_location(
+            entity_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationNetworkIntegrationAccessError(),
+        )
+        return True
+
+    async def _instant_on_cloud_control(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> bool:
+        session = getattr(self.repository, "session", None)
+        if session is None or organization_id is None:
+            return False
+        from .instant_on_control import instant_on_control_present
+
+        return await instant_on_control_present(
+            session, location_id=location_id, organization_id=organization_id
+        )
+
+    async def _instant_on_device_write(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        action: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> ClientActionResult:
+        """Block / unblock one device at an Aruba Instant On venue, through
+        Instant On's cloud (a persistent MAC block, read back before it is
+        reported). Reached only when no Omada controller resolves for the
+        location, so an Omada venue never gets here.
+
+        * Not a NAS-only location of the caller -> the same
+          :class:`LocationHasNoControllerError` as before (no probing).
+        * Cloud control not switched on -> :class:`ClientActionUnavailableError`
+          with the sentence saying what is needed. Nothing is sent.
+        * Instant On did not confirm -> ``performed: False`` (never a success
+          on a 2xx alone).
+        """
+        if not await self._nas_only_location(
+            location_id=location_id, organization_id=organization_id
+        ):
+            raise LocationHasNoControllerError()
+        try:
+            mac = normalize_client_mac(client_mac)
+        except ValueError as exc:
+            raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
+        session = getattr(self.repository, "session", None)
+        if session is None:
+            raise ClientActionUnavailableError(
+                action, NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON
+            )
+        from .instant_on_control import (
+            instant_on_block_device,
+            instant_on_release_device,
+        )
+
+        call = (
+            instant_on_block_device if action == "block" else instant_on_release_device
+        )
+        outcome = await call(
+            session,
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=mac,
+        )
+        if outcome.status == "unavailable":
+            raise ClientActionUnavailableError(
+                action, NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON
+            )
+        performed = outcome.status == "enforced"
+        logger.info(
+            "instant_on_client_action",
+            extra={
+                "location_id": str(location_id),
+                "action": action,
+                "performed": performed,
+                "error_code": outcome.error_code,
+                "actor_user_id": str(actor_user_id) if actor_user_id else None,
+            },
+        )
+        return ClientActionResult(action=action, performed=performed, client_mac=mac)
+
     async def block_client(
         self,
         *,
@@ -5099,13 +5218,22 @@ class NetworkIntegrationService:
         the grant survives while the device can no longer associate, but
         nobody has watched it happen.
         """
-        integration, provider_impl, config, mac = await self._client_action(
-            location_id=location_id,
-            organization_id=organization_id,
-            client_mac=client_mac,
-            action="block",
-            actor_user_id=actor_user_id,
-        )
+        try:
+            integration, provider_impl, config, mac = await self._client_action(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="block",
+                actor_user_id=actor_user_id,
+            )
+        except LocationHasNoControllerError:
+            return await self._instant_on_device_write(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="block",
+                actor_user_id=actor_user_id,
+            )
         try:
             performed = await provider_impl.block_client(
                 config, str(integration.external_site_id), mac
@@ -5129,13 +5257,22 @@ class NetworkIntegrationService:
         actor_user_id: uuid.UUID | None,
     ) -> ClientActionResult:
         """Clear a controller-side block. Idempotent on the controller."""
-        integration, provider_impl, config, mac = await self._client_action(
-            location_id=location_id,
-            organization_id=organization_id,
-            client_mac=client_mac,
-            action="unblock",
-            actor_user_id=actor_user_id,
-        )
+        try:
+            integration, provider_impl, config, mac = await self._client_action(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="unblock",
+                actor_user_id=actor_user_id,
+            )
+        except LocationHasNoControllerError:
+            return await self._instant_on_device_write(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="unblock",
+                actor_user_id=actor_user_id,
+            )
         try:
             performed = await provider_impl.unblock_client(
                 config, str(integration.external_site_id), mac
