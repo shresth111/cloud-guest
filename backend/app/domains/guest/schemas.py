@@ -73,6 +73,7 @@ __all__ = [
     "GuestSessionListResponse",
     "GuestLoginResponse",
     "GuestLastEndedSessionResponse",
+    "GuestTrustedDeviceResponse",
     "GuestResponse",
     "GuestDetailResponse",
     "GuestListResponse",
@@ -693,6 +694,16 @@ class GuestLoginResponse(BaseModel):
     name_required: bool = False
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
+
+
+class GuestTrustedDeviceResponse(BaseModel):
+    """What ``GET /guest/session/trusted-device`` returns for a Trusted
+    Device at an Aruba Instant On venue: the ``User-Name`` the portal posts
+    to the AP's login form. Always ``mac:<MAC>`` -- the MAC the caller sent,
+    so it discloses nothing the caller did not already have. A hint, not a
+    credential: see ``GuestService.trusted_device_login_identifier``."""
+
+    identifier: str
 
 
 class GuestLastEndedSessionResponse(BaseModel):
