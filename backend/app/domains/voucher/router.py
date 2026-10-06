@@ -113,6 +113,7 @@ def _batch_response(batch: VoucherBatch) -> VoucherBatchResponse:
         validity_minutes=batch.validity_minutes,
         batch_expires_at=batch.batch_expires_at,
         max_uses_per_voucher=batch.max_uses_per_voucher,
+        max_devices_per_voucher=batch.device_allowance(),
         data_limit_mb=batch.data_limit_mb,
         status=batch.status,
         created_by_user_id=str(batch.created_by_user_id)
@@ -388,6 +389,7 @@ async def create_voucher_batch(
         validity_minutes=payload.validity_minutes,
         batch_expires_at=payload.batch_expires_at,
         max_uses_per_voucher=payload.max_uses_per_voucher,
+        max_devices_per_voucher=payload.max_devices_per_voucher,
         data_limit_mb=payload.data_limit_mb,
         notes=payload.notes,
         has_manage_permission=has_manage_permission,
@@ -732,6 +734,7 @@ async def validate_voucher(
         is_first_use=result.is_first_use,
         uses_remaining=result.uses_remaining,
         max_uses_per_voucher=result.batch.max_uses_per_voucher,
+        max_devices_per_voucher=result.batch.device_allowance(),
         expires_at=result.voucher.expires_at,
         batch_status=result.batch.status,
     )
@@ -762,6 +765,7 @@ async def redeem_voucher(
         status=voucher.status,
         use_count=voucher.use_count,
         max_uses_per_voucher=batch.max_uses_per_voucher,
+        max_devices_per_voucher=batch.device_allowance(),
         redeemed_at=voucher.redeemed_at,
         expires_at=voucher.expires_at,
     )

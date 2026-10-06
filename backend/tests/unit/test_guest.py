@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -144,7 +144,11 @@ from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
-from app.domains.voucher.exceptions import VoucherNotFoundError
+from app.domains.voucher.exceptions import (
+    VoucherExhaustedError,
+    VoucherExpiredError,
+    VoucherNotFoundError,
+)
 from app.domains.voucher.models import Voucher, VoucherBatch
 
 # ============================================================================
@@ -232,10 +236,18 @@ class FakeOtpService:
 
 @dataclass
 class FakeVoucherService:
-    """Stand-in for ``VoucherRedeemProtocol``."""
+    """Stand-in for ``VoucherRedeemProtocol``.
+
+    A code registered with ``max_devices`` follows the real device-allowance
+    rule (``VoucherService.redeem_voucher``): each new device takes a slot,
+    a device the code already admitted (``is_admitted_device``) re-enters
+    without one, and a full code refuses anyone else. A code registered
+    without it keeps this fake's original "always redeems" behaviour, which
+    the tests that are not about the allowance rely on."""
 
     vouchers: dict[str, tuple[Voucher, VoucherBatch]] = field(default_factory=dict)
     plan_queue_profiles: dict[uuid.UUID, uuid.UUID | None] = field(default_factory=dict)
+    enforced_codes: set[str] = field(default_factory=set)
 
     def register(
         self,
@@ -244,6 +256,7 @@ class FakeVoucherService:
         data_limit_mb: int | None,
         validity_minutes: int,
         plan_id: uuid.UUID | None = None,
+        max_devices: int | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         batch = VoucherBatch(
             **_base_fields(
@@ -257,7 +270,8 @@ class FakeVoucherService:
                 code_prefix=None,
                 validity_minutes=validity_minutes,
                 batch_expires_at=None,
-                max_uses_per_voucher=1,
+                max_uses_per_voucher=max_devices or 1,
+                max_devices_per_voucher=max_devices,
                 data_limit_mb=data_limit_mb,
                 status="active",
                 created_by_user_id=None,
@@ -280,6 +294,8 @@ class FakeVoucherService:
             )
         )
         self.vouchers[code] = (voucher, batch)
+        if max_devices is not None:
+            self.enforced_codes.add(code)
         return voucher, batch
 
     def register_plan_queue_profile(
@@ -288,11 +304,37 @@ class FakeVoucherService:
         self.plan_queue_profiles[plan_id] = queue_profile_id
 
     async def redeem_voucher(
-        self, *, code: str, identifier: str, source: str
+        self,
+        *,
+        code: str,
+        identifier: str,
+        source: str,
+        is_admitted_device: Callable[[Voucher], Awaitable[bool]] | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         if code not in self.vouchers:
             raise VoucherNotFoundError()
-        return self.vouchers[code]
+        voucher, batch = self.vouchers[code]
+        if code not in self.enforced_codes:
+            return voucher, batch
+        now = datetime.now(UTC)
+        if voucher.is_post_redemption_expired(now=now):
+            raise VoucherExpiredError()
+        if (
+            voucher.use_count > 0
+            and is_admitted_device is not None
+            and await is_admitted_device(voucher)
+        ):
+            return voucher, batch
+        if voucher.use_count >= batch.device_allowance():
+            raise VoucherExhaustedError()
+        if voucher.use_count == 0:
+            voucher.redeemed_at = now
+            voucher.expires_at = now + timedelta(minutes=batch.validity_minutes)
+        voucher.use_count += 1
+        voucher.status = (
+            "exhausted" if voucher.use_count >= batch.device_allowance() else "active"
+        )
+        return voucher, batch
 
     async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
         return self.plan_queue_profiles.get(plan_id)
@@ -1169,6 +1211,14 @@ class FakeGuestRepository:
             1
             for s in self.sessions.values()
             if s.guest_id == guest_id and s.status == GuestSessionStatus.ACTIVE.value
+        )
+
+    async def has_session_for_voucher_on_device(
+        self, *, voucher_id: uuid.UUID, device_id: uuid.UUID
+    ) -> bool:
+        return any(
+            s.voucher_id == voucher_id and s.device_id == device_id
+            for s in self.sessions.values()
         )
 
     async def count_active_devices_for_guest(
