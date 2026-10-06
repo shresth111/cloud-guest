@@ -196,8 +196,9 @@ class Router(BaseModel):
     # "private" defaults many devices ship with, which is exactly why a
     # real deployment should never leave it at a guessable default).
     snmp_community_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # "1" or "2c" only -- see wyfy_device_gateway.snmp_poller's own module
-    # docstring for why SNMPv3 is honestly out of scope for this pass. NULL
+    # "1", "2c" or "3" (v3 since migration 0150 -- for v3 the user name is
+    # stored in snmp_community_encrypted: on RouterOS a v3 user *is* an
+    # /snmp community row). NULL
     # (rather than a hardcoded default here) lets Settings
     # .snmp_default_version supply the platform-wide fallback -- see that
     # field's own docstring for the same "per-router override, platform
@@ -208,6 +209,35 @@ class Router(BaseModel):
     # real per-router override (a router behind a NAT/port-forward rule
     # exposing SNMP on a non-standard port) is still representable.
     snmp_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # SNMPv3 (migration 0150). Passphrases Fernet-encrypted like the
+    # community; never returned by any endpoint.
+    snmp_v3_auth_protocol: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    snmp_v3_auth_password_encrypted: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    snmp_v3_priv_protocol: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    snmp_v3_priv_password_encrypted: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    # Outcome of the most recent SNMP poll the sweep made (or declined to
+    # make) for this router -- see app.domains.router.snmp.SnmpPollStatus.
+    # NULL = never considered by the sweep. A failed poll never touches
+    # snmp_last_success_at, so "last good reading" stays honest.
+    snmp_last_poll_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    snmp_last_poll_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    snmp_last_poll_detail: Mapped[str | None] = mapped_column(
+        String(500), nullable=True
+    )
+    snmp_last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # When the platform last wrote SNMP config to the device over the
+    # RouterOS API AND read it back as matching. NULL = never verified.
+    snmp_device_applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # How this router's own RouterOS setup script combines 2+ enabled
     # app.domains.isp.IspLink rows -- see

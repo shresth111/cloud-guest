@@ -1799,6 +1799,31 @@ class RouterService:
             return None
         return decrypt_secret(router.snmp_community_encrypted)
 
+    def get_snmp_credentials(self, router: Router):  # noqa: ANN201
+        """Fully resolved SNMP credentials for the poller (per-router values,
+        platform defaults for v1/v2c), or ``None`` when there is nothing to
+        poll with. See :func:`app.domains.router.snmp.resolve_snmp_credentials`."""
+        from .snmp import resolve_snmp_credentials
+
+        return resolve_snmp_credentials(router)
+
+    async def record_snmp_poll_outcome(
+        self, router: Router, *, status: str, detail: str | None = None
+    ) -> None:
+        """Persist the outcome of one SNMP poll on the router row, so the
+        Master console can say when it last worked and why it did not. A
+        failure never touches ``snmp_last_success_at``. Not audited: this is
+        telemetry, written every sweep."""
+        now = datetime.now(UTC)
+        update: dict[str, object] = {
+            "snmp_last_poll_at": now,
+            "snmp_last_poll_status": status,
+            "snmp_last_poll_detail": (detail[:500] if detail else None),
+        }
+        if status == "ok":
+            update["snmp_last_success_at"] = now
+        await self.repository.update_router(router, update)
+
     async def reveal_credentials(
         self,
         *,

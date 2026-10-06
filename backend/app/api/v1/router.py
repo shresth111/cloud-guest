@@ -102,6 +102,7 @@ from app.domains.quotation.router import router as quotation_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.readiness.router import router as readiness_router
 from app.domains.router.router import router as router_router
+from app.domains.router.snmp_router import router as router_snmp_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.security.router import router as security_router
@@ -175,6 +176,7 @@ api_v1_router.include_router(organization_router)
 api_v1_router.include_router(location_router)
 api_v1_router.include_router(user_router)
 api_v1_router.include_router(router_router)
+api_v1_router.include_router(router_snmp_router)
 api_v1_router.include_router(router_provisioning_router)
 api_v1_router.include_router(router_agent_router)
 api_v1_router.include_router(wireguard_router)
