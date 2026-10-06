@@ -451,6 +451,7 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "content_survey",
     "collect_guest_name",
     "collect_guest_email",
+    "require_guest_name",
     "review_card_enabled",
     "review_url",
     "guest_feedback_enabled",
@@ -520,6 +521,7 @@ class _CachedCaptivePortalConfig:
     content_survey: dict[str, Any] | None
     collect_guest_name: bool
     collect_guest_email: bool
+    require_guest_name: bool
     review_card_enabled: bool
     review_url: str | None
     guest_feedback_enabled: bool
@@ -651,6 +653,7 @@ _NOT_NULL_BOOLEAN_UPDATE_FIELDS = frozenset(
         "powered_by_enabled",
         "collect_guest_name",
         "collect_guest_email",
+        "require_guest_name",
         "review_card_enabled",
         "guest_feedback_enabled",
         "otp_sms_enabled",
@@ -790,6 +793,11 @@ class CaptivePortalService:
         # Business Profile. See the columns' own comments in models.py.
         collect_guest_name: bool = False,
         collect_guest_email: bool = False,
+        # Name required at sign-in. The one exception to "off by default"
+        # above: an owner decision (migration 0143) turned it on for every
+        # venue, new and existing. It implies collect_guest_name -- see
+        # the forced-on line below.
+        require_guest_name: bool = True,
         review_card_enabled: bool = False,
         review_url: str | None = None,
         guest_feedback_enabled: bool = False,
@@ -876,8 +884,11 @@ class CaptivePortalService:
             content_body=content_body,
             content_image_url=content_image_url,
             content_survey=content_survey,
-            collect_guest_name=collect_guest_name,
+            # Required implies collected: a venue cannot require a name it
+            # has not agreed to hold.
+            collect_guest_name=collect_guest_name or require_guest_name,
             collect_guest_email=collect_guest_email,
+            require_guest_name=require_guest_name,
             review_card_enabled=review_card_enabled,
             review_url=review_url,
             guest_feedback_enabled=guest_feedback_enabled,
@@ -1129,6 +1140,19 @@ class CaptivePortalService:
         # stored earlier.
         if "feedback_dwell_minutes" in update_data:
             validate_feedback_dwell_minutes(update_data["feedback_dwell_minutes"])
+        # Name required at sign-in implies the name is collected. Required
+        # WINS over an explicit ``collect_guest_name: false`` in the same
+        # payload rather than refusing the save: the dashboard PUTs its
+        # whole form, and a settings bundle that predates the require
+        # toggle would otherwise be unable to save anything at a venue
+        # whose collect flag is off. To stop collecting, a venue turns the
+        # requirement off first (the settings UI greys the collect toggle
+        # while required is on, so the two cannot be seen to disagree).
+        merged_require_name = bool(
+            update_data.get("require_guest_name", config.require_guest_name)
+        )
+        if merged_require_name:
+            update_data["collect_guest_name"] = True
         if "background_overlay_strength" in update_data:
             validate_background_overlay_strength(
                 update_data["background_overlay_strength"]

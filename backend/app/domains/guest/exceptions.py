@@ -23,7 +23,11 @@ from fastapi import status
 
 from app.common.exceptions import CloudGuestError
 
+from .constants import GUEST_NAME_INVALID_CODE, GUEST_NAME_REQUIRED_CODE
+
 __all__ = [
+    "GuestNameInvalidError",
+    "GuestNameRequiredError",
     "GuestError",
     "GuestNotFoundError",
     "CrossOrganizationGuestAccessError",
@@ -730,6 +734,44 @@ class GuestProfileFieldNotCollectedError(GuestError):
         super().__init__(
             f"This venue doesn't collect a guest {field_label}.",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class GuestNameRequiredError(GuestError):
+    """The venue requires a name at sign-in
+    (``captive_portal_configs.require_guest_name``), this is an OTP session,
+    and the guest has no name on file -- so the step that opens the network
+    is refused.
+
+    Raised by ``POST /network-integrations/portal/authorize`` and
+    ``/portal/radius-authorize`` (via
+    ``GuestService.require_session_name``). RADIUS Authorize and the router
+    agent's ``/agent/authorized-macs`` list apply the same predicate but
+    answer in their own vocabulary (Access-Reject / MAC left out), since
+    neither has an HTTP error to give.
+
+    A 403 with the stable ``data.code == "guest_name_required"``: the
+    caller's proof of session is fine; what is missing is a precondition
+    the guest can satisfy with ``POST /guest/sign-in-name``."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Please enter your name to connect to the WiFi.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": GUEST_NAME_REQUIRED_CODE},
+        )
+
+
+class GuestNameInvalidError(GuestError):
+    """``POST /guest/sign-in-name`` was sent a name that is empty after
+    trimming, too long, or contains control characters. 400 with the
+    stable ``data.code == "guest_name_invalid"``."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            reason,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"code": GUEST_NAME_INVALID_CODE},
         )
 
 

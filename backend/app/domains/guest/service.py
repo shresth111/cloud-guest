@@ -253,6 +253,9 @@ from app.domains.auth.password import (
     PasswordStrengthError,
     PasswordVerificationError,
 )
+from app.domains.captive_portal.exceptions import (
+    CaptivePortalConfigNotConfiguredError,
+)
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.captive_portal.validators import (
     compute_terms_version,
@@ -311,6 +314,7 @@ from .constants import (
     LAST_ENDED_SESSION_WINDOW_MINUTES,
     MAX_BULK_DEVICE_LOOKUP_IDS,
     MAX_BULK_VOUCHER_LOOKUP_IDS,
+    NAME_REQUIRED_AUTH_METHODS,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     PIN_LENGTH,
     PIN_LOCKOUT_MINUTES,
@@ -368,6 +372,7 @@ from .exceptions import (
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
     GuestDeviceLimitExceededError,
+    GuestNameRequiredError,
     GuestNotFoundError,
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
@@ -435,8 +440,10 @@ from .validators import (
     is_session_presence_judgeable,
     is_session_stale,
     is_weak_pin,
+    normalize_guest_display_name,
     normalize_identifier,
     normalize_mac_address,
+    session_awaits_required_name,
     validate_dashboard_series_window,
     validate_date_range,
     validate_extension_minutes,
@@ -2320,6 +2327,17 @@ class GuestLoginResult:
     session: GuestSession
     device: GuestDevice | None
     is_new_guest: bool
+    # True when this session is being held off the network until the guest
+    # gives a name -- see ``validators.session_awaits_required_name``. The
+    # portal shows its one "Your name" screen on this bit, and only on it.
+    name_required: bool = False
+
+
+def _venue_requires_name(config: object) -> bool:
+    """``require_guest_name`` off a resolved config. Every real config (ORM
+    row or cache payload) carries the attribute; one that somehow does not
+    reads as the owner's default -- ON -- never as a silent "off"."""
+    return bool(getattr(config, "require_guest_name", True))
 
 
 #: The single ``disconnect_reason`` literal that means "this session ran
@@ -3348,8 +3366,23 @@ class GuestService:
             is_new_guest=is_new,
         )
         logger.info("guest_logged_in", extra=_event_extra(event))
+        # Name required at sign-in. ``resolved`` is this request's -- i.e.
+        # the session's -- location config, never the guest's home venue.
+        # The session is issued either way (the OTP is spent and must not
+        # be asked for twice); what the bit does is hold the NETWORK: every
+        # step that opens it refuses this session until
+        # ``submit_sign_in_name`` stores a name.
+        name_required = session_awaits_required_name(
+            session=session,
+            guest=guest,
+            require_guest_name=_venue_requires_name(resolved.config),
+        )
         return GuestLoginResult(
-            guest=guest, session=session, device=device, is_new_guest=is_new
+            guest=guest,
+            session=session,
+            device=device,
+            is_new_guest=is_new,
+            name_required=name_required,
         )
 
     async def login_via_voucher(
@@ -4485,7 +4518,18 @@ class GuestService:
         mid-handoff. It was tried, in the funnel, and reverted on purpose:
         a third screen between a verified guest and their internet is where
         they close the sheet, and the venue loses the *connection*, which
-        is the thing they are paying for. Keep it here."""
+        is the thing they are paying for. This *optional* ask stays here.
+
+        **The one exception is a separate, opt-out path:**
+        ``captive_portal_configs.require_guest_name`` (default ON, owner
+        decision, migration 0143). There the owner chose the in-funnel
+        screen anyway, knowingly accepting the abandonment risk above in
+        exchange for a name on every OTP guest. It does NOT go through
+        this method -- see ``submit_sign_in_name``, which writes the name
+        *before* the portal starts the hotspot login POST (sequential, not
+        racing), and ``session_awaits_required_name``, which holds every
+        network-opening step until it has. This method's checks are
+        unchanged for its own post-connect use."""
         guest = await self._require_guest(guest_id)
         session = await self.repository.get_session_by_id(session_id)
         now = datetime.now(UTC)
@@ -4558,6 +4602,151 @@ class GuestService:
             extra={
                 "event_guest_id": str(updated.id),
                 "event_fields": list(update_data.keys()),
+            },
+        )
+        return updated
+
+    # ========================================================================
+    # Name required at sign-in (captive_portal_configs.require_guest_name)
+    # ========================================================================
+
+    async def session_awaits_required_name(
+        self, session: GuestSession, *, guest: Guest | None = None
+    ) -> bool:
+        """Whether ``session`` is held off the network for want of a name.
+
+        The config is resolved against the SESSION's organization and
+        location -- ``Guest.location_id`` is the guest's "home" venue and
+        is never constrained to match (see ``update_guest_profile``'s
+        identical reasoning), so reading it would enforce the wrong
+        venue's setting at a multi-location chain.
+
+        **No config resolves to the default: required.** When neither a
+        location nor an organization default config exists any more
+        (``CaptivePortalConfigNotConfiguredError`` -- e.g. deleted after
+        this session's login), the venue's setting is the owner's default,
+        ON. That never strands a guest: ``submit_sign_in_name`` accepts the
+        same case, so the name screen always clears the hold. Any OTHER
+        resolution failure fails open (logged): this gate exists to collect
+        a name, not to take a connection away on an unrelated error.
+        Non-OTP sessions are never held (no config read at all).
+        """
+        if str(session.auth_method) not in NAME_REQUIRED_AUTH_METHODS:
+            return False
+        if guest is None:
+            guest = await self.repository.get_guest_by_id(session.guest_id)
+        if guest is not None and (guest.display_name or "").strip():
+            return False
+        try:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+        except CaptivePortalConfigNotConfiguredError:
+            return session_awaits_required_name(
+                session=session, guest=guest, require_guest_name=True
+            )
+        except CloudGuestError:
+            logger.warning(
+                "guest_name_gate_config_unresolved",
+                extra={"event_session_id": str(session.id)},
+            )
+            return False
+        return session_awaits_required_name(
+            session=session,
+            guest=guest,
+            require_guest_name=_venue_requires_name(resolved.config),
+        )
+
+    async def require_session_name(self, *, session_id: uuid.UUID) -> None:
+        """Raise ``GuestNameRequiredError`` (403, ``guest_name_required``)
+        if this session is held for a name. A session that does not exist
+        is NOT refused here -- the caller's own proof-of-session check owns
+        that answer, opaquely, and this method must not become a second,
+        distinguishable oracle for it."""
+        session = await self.repository.get_session_by_id(session_id)
+        if session is None:
+            return
+        if await self.session_awaits_required_name(session):
+            raise GuestNameRequiredError()
+
+    async def submit_sign_in_name(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+        display_name: str | None,
+    ) -> Guest:
+        """Store the name a guest typed on the portal's "Your name" screen,
+        between OTP verify and the hotspot login.
+
+        **Ordering, and why there is no race.** ``update_guest_profile``'s
+        docstring records why its write is post-connect only: inside the
+        funnel it would race the hotspot login POST. Here the portal awaits
+        this call to completion and only then starts the login POST, so the
+        two are sequential by construction -- and the network-opening steps
+        consult the stored name, so a login POST that somehow went first is
+        refused, not silently admitted without a name.
+
+        Proof of session is the same as the post-connect profile write: the
+        session belongs to this guest, was opened by an OTP method, is
+        ``ACTIVE`` in this platform's records (the row exists from the
+        moment the code verified; "ACTIVE" here does not mean the device is
+        on the network yet -- the gate holds it), and started within
+        ``SET_PASSWORD_SESSION_WINDOW_MINUTES``. Failing any leg raises
+        ``GuestProfileUpdateNotAuthorizedError`` (403).
+
+        The venue must collect names (``collect_guest_name`` or
+        ``require_guest_name``, resolved by the session's location),
+        otherwise ``GuestProfileFieldNotCollectedError`` (400) -- the DPDP
+        rule ``update_guest_profile`` enforces, unchanged. No resolvable
+        config reads as the default (required, so collected).
+
+        **Overwrite semantics: the latest name the guest typed wins.** The
+        screen is only shown when no name is on file, so in practice this
+        fills an empty field; if a name did arrive in between (a second
+        device, the post-connect card), the guest's own most recent entry
+        replaces it -- the same last-write-wins rule
+        ``update_guest_profile`` already applies to ``display_name``.
+        """
+        cleaned = normalize_guest_display_name(display_name)
+        guest = await self._require_guest(guest_id)
+        session = await self.repository.get_session_by_id(session_id)
+        now = datetime.now(UTC)
+        window_start = now - timedelta(minutes=SET_PASSWORD_SESSION_WINDOW_MINUTES)
+        eligible = (
+            session is not None
+            and session.guest_id == guest.id
+            and str(session.auth_method) in NAME_REQUIRED_AUTH_METHODS
+            and session.status == GuestSessionStatus.ACTIVE.value
+            and session.started_at >= window_start
+        )
+        if not eligible:
+            raise GuestProfileUpdateNotAuthorizedError()
+
+        try:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+        except CaptivePortalConfigNotConfiguredError:
+            # No config resolves to the default (required, hence collected)
+            # -- the same reading ``session_awaits_required_name`` holds the
+            # session on, so the screen can always clear what it gates.
+            resolved = None
+        if resolved is not None:
+            config = resolved.config
+            if not (config.collect_guest_name or _venue_requires_name(config)):
+                raise GuestProfileFieldNotCollectedError("name")
+
+        if guest.display_name == cleaned:
+            return guest
+        updated = await self.repository.update_guest(guest, {"display_name": cleaned})
+        logger.info(
+            "guest_sign_in_name_stored",
+            extra={
+                "event_guest_id": str(updated.id),
+                "event_session_id": str(session.id),
             },
         )
         return updated
@@ -5225,8 +5414,18 @@ class GuestService:
             session, guest=guest, mac_address=device.mac_address
         ):
             return None
+        # A session still held for its required name is reported WITH that
+        # bit, not hidden: a guest who reloaded the portal on the "Your
+        # name" screen must land back on it (the portal reads
+        # ``name_required``), not on "You're online" with no internet.
         return GuestLoginResult(
-            guest=guest, session=session, device=device, is_new_guest=False
+            guest=guest,
+            session=session,
+            device=device,
+            is_new_guest=False,
+            name_required=await self.session_awaits_required_name(
+                session, guest=guest
+            ),
         )
 
     async def _active_session_past_its_limit(
@@ -9081,6 +9280,20 @@ class RadiusService:
         ):
             logger.info(
                 "radius_authorize_session_blocklisted",
+                extra={**decision_extra, "event_session_id": str(session.id)},
+            )
+            session = None
+        # Name required at sign-in: an OTP session whose guest has not yet
+        # given the name this venue requires is not an authorization. This
+        # is the hop the hotspot login POST lands on, so without it the
+        # portal's "Your name" screen would be a UI-only gate. Reject, not
+        # raise -- RADIUS has no "why"; the portal shows the screen.
+        if (
+            session is not None
+            and await self.guest_service.session_awaits_required_name(session)
+        ):
+            logger.info(
+                "radius_authorize_session_awaits_guest_name",
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
             session = None

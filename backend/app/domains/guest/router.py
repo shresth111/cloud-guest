@@ -157,6 +157,8 @@ from .schemas import (
     GuestSetPasswordResponse,
     GuestSetPinRequest,
     GuestSetPinResponse,
+    GuestSignInNameRequest,
+    GuestSignInNameResponse,
     GuestTrustedDeviceResponse,
     GuestUpdateProfileRequest,
     GuestUpdateProfileResponse,
@@ -799,6 +801,7 @@ def _login_response(result: GuestLoginResult) -> GuestLoginResponse:
         has_pin=bool(result.guest.hashed_pin),
         has_profile=guest_has_profile(result.guest),
         has_opened_review_link=guest_has_opened_review_link(result.guest),
+        name_required=result.name_required,
         session=_session_response(result.session),
         device=_device_response(result.device) if result.device else None,
     )
@@ -1161,6 +1164,38 @@ async def guest_update_profile(
             guest_id=str(guest.id),
             display_name=guest.display_name,
             email=guest.email,
+            has_profile=guest_has_profile(guest),
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/sign-in-name",
+    response_model=ApiResponse[GuestSignInNameResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_submit_sign_in_name(
+    request: Request,
+    payload: GuestSignInNameRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    """Name required at sign-in: store the name from the portal's one
+    "Your name" screen. The portal awaits this before it starts the hotspot
+    login, so the write is never racing the network handoff. Errors:
+    400 ``guest_name_invalid`` (empty/whitespace/too long), 403 (no
+    eligible session), 400 (venue does not collect names)."""
+    guest = await service.submit_sign_in_name(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        display_name=payload.display_name,
+    )
+    return build_response(
+        success=True,
+        message="Name saved",
+        data=GuestSignInNameResponse(
+            guest_id=str(guest.id),
+            display_name=guest.display_name or "",
             has_profile=guest_has_profile(guest),
         ).model_dump(),
         request_id=_request_id(request),

@@ -227,6 +227,32 @@ BYTES_PER_MB = 1024 * 1024
 SET_PASSWORD_SESSION_WINDOW_MINUTES = 15
 
 # ============================================================================
+# Name required at sign-in (captive_portal_configs.require_guest_name)
+# ============================================================================
+
+#: Matches ``Guest.display_name``'s own ``String(200)`` column and the
+#: post-connect profile request's ``max_length``. Applied AFTER trimming
+#: and whitespace collapsing.
+GUEST_DISPLAY_NAME_MAX_LENGTH = 200
+
+#: The OTP methods the requirement applies to. Voucher, password, PIN and
+#: MAC-whitelist sessions are deliberately out of scope (owner decision):
+#: their sign-in is unchanged, and their sessions are never held for a
+#: name.
+NAME_REQUIRED_AUTH_METHODS = frozenset(
+    {
+        GuestAuthMethod.OTP_SMS.value,
+        GuestAuthMethod.OTP_EMAIL.value,
+        GuestAuthMethod.OTP_WHATSAPP.value,
+    }
+)
+
+#: Stable error codes, carried in the error body's ``data.code``. The
+#: portal keys its copy on these, never on the message text.
+GUEST_NAME_REQUIRED_CODE = "guest_name_required"
+GUEST_NAME_INVALID_CODE = "guest_name_invalid"
+
+# ============================================================================
 # Portal PIN -- device-scoped quick-login (Phase 1 BhaiFi-parity follow-on).
 # ============================================================================
 
@@ -793,6 +819,10 @@ WHITELIST_ONLY_LOGIN_FAILURE_REASON = "WhitelistOnlyAccessDeniedError"
 
 
 __all__ = [
+    "GUEST_DISPLAY_NAME_MAX_LENGTH",
+    "GUEST_NAME_INVALID_CODE",
+    "GUEST_NAME_REQUIRED_CODE",
+    "NAME_REQUIRED_AUTH_METHODS",
     "WHITELIST_ONLY_LOGIN_FAILURE_REASON",
     "GuestAuthMethod",
     "GuestSessionStatus",
