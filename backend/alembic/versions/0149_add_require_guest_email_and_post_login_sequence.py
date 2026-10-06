@@ -14,8 +14,8 @@ and left NULL on every existing row: NULL means "derive the old single
 choice from post_login_html / redirect_url", so no venue's guests see a
 different flow on deploy.
 
-Revision ID: 0148_add_require_guest_email_and_post_login_sequence
-Revises: 0147_merge_main_require_guest_name
+Revision ID: 0149_add_require_guest_email_and_post_login_sequence
+Revises: 0148_merge_main_require_guest_name
 Create Date: 2026-10-06
 """
 
@@ -26,8 +26,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0148_add_require_guest_email_and_post_login_sequence"
-down_revision = "0147_merge_main_require_guest_name"
+revision = "0149_add_require_guest_email_and_post_login_sequence"
+down_revision = "0148_merge_main_require_guest_name"
 branch_labels = None
 depends_on = None
 
