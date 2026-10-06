@@ -197,6 +197,28 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- device_logs (syslog) -----------------------------------------------
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.owners_by_tunnel_ip": (
+        "Attribution of a received syslog line: joins wireguard_peers to "
+        "routers to learn which router owns a tunnel address. A controller "
+        "has no peer, so it can never match -- the join itself excludes it, "
+        "and no judgement about device health is made from the result."
+    ),
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.get_router_context": (
+        "Loads one router by id for the Master drawer. Every vendor belongs "
+        "in the answer: a non-MikroTik is reported as blocker NOT_MIKROTIK "
+        "(Aruba Instant On is named as unable to send syslog), never as "
+        "broken hardware, and nothing is written to it."
+    ),
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.list_configs": (
+        "Display-name join for routers Wyfy has set up remote logging on "
+        "(router_remote_logging rows). Only routers with such a row appear, "
+        "and a row can only be created through the MikroTik writer."
+    ),
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.list_events": (
+        "Outer join for the router name on stored log lines. Names only; "
+        "the set of rows is decided by device_log_events, not by routers."
+    ),
     # -- security -----------------------------------------------------------
     "app/domains/security/repository.py::SecurityRepository.fleet_counts": (
         "Narrowing happened upstream and this method cannot undo it: every "

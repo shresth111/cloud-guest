@@ -1,0 +1,42 @@
+# Device Logs collector -- add under `services:` in the BOX's own
+# ~/deploy/docker-compose.yml (the box does not run the repo copy; see
+# deploy/docker-compose.prod.yml's header). One-time manual edit, owner step.
+#
+#   mkdir -p ~/deploy/device-logs
+#   cp vector.yaml ~/deploy/device-logs/vector.yaml
+#   install -m 600 /dev/null ~/deploy/device-logs/collector.env   # then fill it
+#   docker compose up -d device-logs-collector
+#
+# collector.env (mode 600, never committed):
+#   DEVICE_LOGS_INGEST_URL=http://api:8000/api/v1/internal/device-logs/ingest
+#   DEVICE_LOGS_INGEST_SECRET=<same value as CLOUDGUEST_DEVICE_LOGS_INGEST_SECRET>
+#
+# Port 5514/udp is published on the host. The instance security group must
+# allow it from the HUB ONLY (its private IP / SG), never 0.0.0.0/0.
+# Docker's published-port DNAT keeps the external source address, which the
+# API's attribution depends on (DESIGN §14 H3 verifies it).
+
+services:
+  device-logs-collector:
+    image: timberio/vector:0.41.1-alpine
+    command: ["--config", "/etc/vector/vector.yaml"]
+    env_file:
+      - ./device-logs/collector.env
+    ports:
+      - "5514:5514/udp"
+    volumes:
+      - ./device-logs/vector.yaml:/etc/vector/vector.yaml:ro
+      - device_logs_raw:/var/lib/wyfy-device-logs
+      - device_logs_buffer:/var/lib/vector
+    depends_on:
+      - api
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  device_logs_raw:
+  device_logs_buffer:
