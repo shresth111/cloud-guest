@@ -172,6 +172,8 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         collect_guest_name=config.collect_guest_name,
         collect_guest_email=config.collect_guest_email,
         require_guest_name=config.require_guest_name,
+        require_guest_email=config.require_guest_email,
+        post_login_sequence=config.post_login_sequence,
         review_card_enabled=config.review_card_enabled,
         review_url=config.review_url,
         guest_feedback_enabled=config.guest_feedback_enabled,
@@ -254,6 +256,12 @@ async def create_captive_portal_config(
         collect_guest_name=payload.collect_guest_name,
         collect_guest_email=payload.collect_guest_email,
         require_guest_name=payload.require_guest_name,
+        require_guest_email=payload.require_guest_email,
+        post_login_sequence=(
+            payload.post_login_sequence.model_dump()
+            if payload.post_login_sequence is not None
+            else None
+        ),
         review_card_enabled=payload.review_card_enabled,
         review_url=payload.review_url,
         guest_feedback_enabled=payload.guest_feedback_enabled,

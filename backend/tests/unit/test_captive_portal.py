@@ -2584,7 +2584,7 @@ class TestResolveCacheKeyVersion:
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v9:org:loc"
+        assert key == "captive_portal:resolve:v10:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it

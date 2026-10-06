@@ -23,11 +23,18 @@ from fastapi import status
 
 from app.common.exceptions import CloudGuestError
 
-from .constants import GUEST_NAME_INVALID_CODE, GUEST_NAME_REQUIRED_CODE
+from .constants import (
+    GUEST_EMAIL_INVALID_CODE,
+    GUEST_EMAIL_REQUIRED_CODE,
+    GUEST_NAME_INVALID_CODE,
+    GUEST_NAME_REQUIRED_CODE,
+)
 
 __all__ = [
     "GuestNameInvalidError",
     "GuestNameRequiredError",
+    "GuestEmailInvalidError",
+    "GuestEmailRequiredError",
     "GuestError",
     "GuestNotFoundError",
     "CrossOrganizationGuestAccessError",
@@ -759,6 +766,38 @@ class GuestNameRequiredError(GuestError):
             "Please enter your name to connect to the WiFi.",
             status_code=status.HTTP_403_FORBIDDEN,
             data={"code": GUEST_NAME_REQUIRED_CODE},
+        )
+
+
+class GuestEmailRequiredError(GuestError):
+    """The email twin of ``GuestNameRequiredError``: the venue requires an
+    email at sign-in (``captive_portal_configs.require_guest_email``), this
+    is an OTP session, and the guest has none on file. Same enforcement
+    points, same 403, stable ``data.code == "guest_email_required"``; the
+    guest satisfies it with ``POST /guest/sign-in-details``.
+
+    When both a name and an email are missing, the name error is raised
+    (one code per refusal); the portal's details screen asks for both
+    either way, because the login response names every missing field."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Please enter your email to connect to the WiFi.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": GUEST_EMAIL_REQUIRED_CODE},
+        )
+
+
+class GuestEmailInvalidError(GuestError):
+    """``POST /guest/sign-in-details`` was sent an email that is empty,
+    too long, or not shaped like an address. 400 with the stable
+    ``data.code == "guest_email_invalid"``."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            reason,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"code": GUEST_EMAIL_INVALID_CODE},
         )
 
 

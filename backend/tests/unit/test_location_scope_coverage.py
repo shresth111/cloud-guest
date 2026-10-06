@@ -565,6 +565,12 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "location (`get_next_campaign_for_session`), so being unconfined here does not "
         "widen what they can see."
     ),
+    ("GET", "/api/v1/portal/campaigns/queue"): (
+        "A guest at the portal reading the ordered list of campaigns their own session "
+        "may be shown (the post-login survey and offer steps). They hold no roles, so "
+        "there is no confinement to derive; the list is chosen by their own session's "
+        "location (`list_campaign_queue_for_session`), exactly like `/next`."
+    ),
     ("POST", "/api/v1/portal/campaigns/{campaign_id}/impression"): (
         "A guest at the portal being shown a campaign, recording that it was shown, or "
         "answering its survey. They hold no roles, so there is no confinement to "
@@ -620,6 +626,12 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "the same shape as `/guest/profile` above. They hold no roles, so there "
         "is no confinement to derive; the anonymous-tolerant dependency resolves "
         "them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/sign-in-details"): (
+        "The name-and/or-email form of `/guest/sign-in-name` above, same caller: "
+        "a guest acting on their own just-verified OTP session, during login. "
+        "No roles, so no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined."
     ),
     ("POST", "/api/v1/guest/review-link-opened"): (
         "A guest tapping the review card on their own connected session -- the same "

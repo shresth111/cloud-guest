@@ -32,6 +32,8 @@ from .constants import (
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
     MIN_FEEDBACK_DWELL_MINUTES,
+    POST_LOGIN_FINISHES,
+    POST_LOGIN_STEP_TYPES,
     REVIEW_URL_ALLOWED_HOST_SUFFIXES,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
@@ -48,6 +50,7 @@ from .exceptions import (
     InvalidHexColorError,
     InvalidPortalContentModeError,
     InvalidPortalContentSourceError,
+    InvalidPostLoginSequenceError,
     InvalidReviewUrlError,
     InvalidUserPortalUrlError,
     SplashTextTooLongError,
@@ -200,6 +203,53 @@ def compute_terms_version(
         digest.update(b":")
         digest.update(value)
     return f"sha256:{digest.hexdigest()[:_TERMS_VERSION_DIGEST_CHARS]}"
+
+
+def validate_post_login_sequence(
+    value: object, *, post_login_html: str | None, redirect_url: str | None
+) -> dict | None:
+    """Check (and normalise) a ``post_login_sequence`` against the venue's
+    merged ``post_login_html``/``redirect_url``; returns the value to store.
+
+    ``None`` is legal and means "never configured" (the portal derives the
+    old single choice). Otherwise: ``steps`` is a list of distinct
+    ``POST_LOGIN_STEP_TYPES`` (so at most three), ``finish`` one of
+    ``POST_LOGIN_FINISHES``. A ``page`` step needs a stored page and a
+    ``redirect`` finish needs a URL -- both checked against the MERGED
+    values, so a PUT that clears the page while keeping a ``page`` step is
+    refused rather than leaving a step guests can never see.
+
+    Unknown keys are dropped, so the stored document is exactly the
+    contract and nothing a client invented rides along."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise InvalidPostLoginSequenceError("expected an object with steps and finish")
+    steps = value.get("steps", [])
+    finish = value.get("finish", "connected")
+    if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
+        raise InvalidPostLoginSequenceError("steps must be a list of step names")
+    unknown = [s for s in steps if s not in POST_LOGIN_STEP_TYPES]
+    if unknown:
+        raise InvalidPostLoginSequenceError(
+            f"unknown step {unknown[0]!r} (allowed: "
+            f"{', '.join(POST_LOGIN_STEP_TYPES)})"
+        )
+    if len(set(steps)) != len(steps):
+        raise InvalidPostLoginSequenceError("each step can appear only once")
+    if finish not in POST_LOGIN_FINISHES:
+        raise InvalidPostLoginSequenceError(
+            f"finish must be one of {', '.join(POST_LOGIN_FINISHES)}"
+        )
+    if "page" in steps and not (post_login_html or "").strip():
+        raise InvalidPostLoginSequenceError(
+            "the 'Show my page' step needs a page -- write one or remove the step"
+        )
+    if finish == "redirect" and not (redirect_url or "").strip():
+        raise InvalidPostLoginSequenceError(
+            "sending guests to a website needs the website address"
+        )
+    return {"steps": list(steps), "finish": finish}
 
 
 def validate_feedback_dwell_minutes(value: object) -> None:
@@ -636,6 +686,7 @@ __all__ = [
     "validate_single_content_source",
     "validate_review_url",
     "validate_feedback_dwell_minutes",
+    "validate_post_login_sequence",
     "compute_terms_version",
     "validate_splash_text_length",
     "default_splash_headline",

@@ -333,6 +333,7 @@ class FakeCaptivePortalService:
         # silently held for a name; tests about the requirement set it, and
         # ``test_require_guest_name.py`` pins the production default.
         require_guest_name: bool = False,
+        require_guest_email: bool = False,
         whitelist_only_enabled: bool = False,
         whitelist_only_denied_message: str | None = None,
         # Open Hours. Set explicitly for the same reason
@@ -380,6 +381,7 @@ class FakeCaptivePortalService:
                 collect_guest_name=collect_guest_name,
                 collect_guest_email=collect_guest_email,
                 require_guest_name=require_guest_name,
+                require_guest_email=require_guest_email,
                 review_card_enabled=False,
                 review_url=None,
                 guest_feedback_enabled=False,
@@ -1671,6 +1673,7 @@ def make_fixture(
     collect_guest_name: bool = True,
     collect_guest_email: bool = True,
     require_guest_name: bool = False,
+    require_guest_email: bool = False,
     whitelist_only_enabled: bool = False,
     whitelist_only_denied_message: str | None = None,
     business_hours_enabled: bool = False,
@@ -1699,6 +1702,7 @@ def make_fixture(
         collect_guest_name=collect_guest_name,
         collect_guest_email=collect_guest_email,
         require_guest_name=require_guest_name,
+        require_guest_email=require_guest_email,
         whitelist_only_enabled=whitelist_only_enabled,
         whitelist_only_denied_message=whitelist_only_denied_message,
         business_hours_enabled=business_hours_enabled,

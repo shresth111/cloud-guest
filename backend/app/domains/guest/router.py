@@ -157,6 +157,8 @@ from .schemas import (
     GuestSetPasswordResponse,
     GuestSetPinRequest,
     GuestSetPinResponse,
+    GuestSignInDetailsRequest,
+    GuestSignInDetailsResponse,
     GuestSignInNameRequest,
     GuestSignInNameResponse,
     GuestTrustedDeviceResponse,
@@ -198,7 +200,12 @@ from .service import (
     GuestService,
     RadiusService,
 )
-from .validators import guest_has_opened_review_link, guest_has_profile
+from .validators import (
+    guest_has_email_on_file,
+    guest_has_name_on_file,
+    guest_has_opened_review_link,
+    guest_has_profile,
+)
 
 guest_router = APIRouter(prefix="/guest", tags=["Guest"])
 admin_router = APIRouter(tags=["Guest Admin"])
@@ -802,6 +809,10 @@ def _login_response(result: GuestLoginResult) -> GuestLoginResponse:
         has_profile=guest_has_profile(result.guest),
         has_opened_review_link=guest_has_opened_review_link(result.guest),
         name_required=result.name_required,
+        email_required=result.email_required,
+        has_name=guest_has_name_on_file(result.guest),
+        has_email=guest_has_email_on_file(result.guest),
+        profile_declined=result.guest.profile_prompt_declined_at is not None,
         session=_session_response(result.session),
         device=_device_response(result.device) if result.device else None,
     )
@@ -1196,6 +1207,41 @@ async def guest_submit_sign_in_name(
         data=GuestSignInNameResponse(
             guest_id=str(guest.id),
             display_name=guest.display_name or "",
+            has_profile=guest_has_profile(guest),
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/sign-in-details",
+    response_model=ApiResponse[GuestSignInDetailsResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_submit_sign_in_details(
+    request: Request,
+    payload: GuestSignInDetailsRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    """Sign-in details the venue requires (name and/or email), from the
+    portal's details screen. The portal awaits this before it starts the
+    hotspot login / controller authorize, so the write never races the
+    network handoff. Errors: 400 ``guest_name_invalid`` /
+    ``guest_email_invalid``, 403 (no eligible session), 400 (venue does not
+    collect that field)."""
+    guest = await service.submit_sign_in_details(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        display_name=payload.display_name,
+        email=payload.email,
+    )
+    return build_response(
+        success=True,
+        message="Details saved",
+        data=GuestSignInDetailsResponse(
+            guest_id=str(guest.id),
+            has_name=guest_has_name_on_file(guest),
+            has_email=guest_has_email_on_file(guest),
             has_profile=guest_has_profile(guest),
         ).model_dump(),
         request_id=_request_id(request),

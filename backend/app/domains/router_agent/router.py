@@ -41,7 +41,7 @@ from app.domains.captive_portal.exceptions import (
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest.dependencies import get_guest_repository
 from app.domains.guest.repository import GuestRepositoryProtocol
-from app.domains.guest.validators import session_awaits_required_name
+from app.domains.guest.validators import session_missing_required_details
 from app.domains.guest_access.dependencies import get_access_decision_service
 from app.domains.guest_access.service import GuestAccessService, is_blocklisted
 from app.domains.isp.dependencies import get_isp_service
@@ -238,21 +238,24 @@ async def _awaits_required_name(
     session: object,
     guest: object,
     captive_portal_service: CaptivePortalService,
-    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], bool],
+    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], tuple[bool, bool]],
 ) -> bool:
-    """``validators.session_awaits_required_name`` with the venue's
-    ``require_guest_name`` resolved once per (organization, location) per
-    poll. Only resolved for a session that could be held at all (OTP, no
-    name on file), so a fleet of named guests costs no config reads.
+    """``validators.session_missing_required_details`` with the venue's
+    ``require_guest_name``/``require_guest_email`` resolved once per
+    (organization, location) per poll. Only resolved for a session that
+    could be held at all (OTP, a detail not on file), so a fleet of guests
+    with both on file costs no config reads. (Name kept from #353; it now
+    covers the email twin too.)
 
-    Same resolution rule as ``GuestService.session_awaits_required_name``:
-    no config at all reads as the owner's default (required); any other
-    resolution failure fails OPEN, since this list is what keeps admitted
-    guests online and an unrelated error must not strip them."""
-    if not session_awaits_required_name(
+    Same resolution rule as ``GuestService.session_missing_required_details``:
+    no config at all reads as the defaults (name required, email not); any
+    other resolution failure fails OPEN, since this list is what keeps
+    admitted guests online and an unrelated error must not strip them."""
+    if not session_missing_required_details(
         session=session,  # type: ignore[arg-type]
         guest=guest,  # type: ignore[arg-type]
         require_guest_name=True,
+        require_guest_email=True,
     ):
         return False
     key = (session.organization_id, session.location_id)  # type: ignore[attr-defined]
@@ -261,14 +264,23 @@ async def _awaits_required_name(
             resolved = await captive_portal_service.resolve_portal_config(
                 organization_id=key[0], location_id=key[1]
             )
-            require_cache[key] = bool(
-                getattr(resolved.config, "require_guest_name", True)
+            require_cache[key] = (
+                bool(getattr(resolved.config, "require_guest_name", True)),
+                bool(getattr(resolved.config, "require_guest_email", False)),
             )
         except CaptivePortalConfigNotConfiguredError:
-            require_cache[key] = True
+            require_cache[key] = (True, False)
         except CloudGuestError:
-            require_cache[key] = False
-    return require_cache[key]
+            require_cache[key] = (False, False)
+    require_name, require_email = require_cache[key]
+    return bool(
+        session_missing_required_details(
+            session=session,  # type: ignore[arg-type]
+            guest=guest,  # type: ignore[arg-type]
+            require_guest_name=require_name,
+            require_guest_email=require_email,
+        )
+    )
 
 
 @router.get(
@@ -325,7 +337,7 @@ async def agent_authorized_macs(
         identity.router.id
     )
     macs: list[str] = []
-    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], bool] = {}
+    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], tuple[bool, bool]] = {}
     for session in sessions:
         if session.device_id is None:
             continue

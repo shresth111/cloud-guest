@@ -322,6 +322,8 @@ from .constants import (
     PIN_STALE_AFTER_DAYS,
     RADIUS_ACCOUNTING_DEVICE_MATCH_SCAN_LIMIT,
     RECONNECT_GRACE_MINUTES,
+    REQUIRED_DETAIL_EMAIL,
+    REQUIRED_DETAIL_NAME,
     SESSION_PRESENCE_DISCONNECT_REASON,
     SESSION_PRESENCE_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
@@ -372,6 +374,8 @@ from .exceptions import (
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
     GuestDeviceLimitExceededError,
+    GuestEmailRequiredError,
+    GuestNameInvalidError,
     GuestNameRequiredError,
     GuestNotFoundError,
     GuestPasswordLoginFailedError,
@@ -441,9 +445,10 @@ from .validators import (
     is_session_stale,
     is_weak_pin,
     normalize_guest_display_name,
+    normalize_guest_email,
     normalize_identifier,
     normalize_mac_address,
-    session_awaits_required_name,
+    session_missing_required_details,
     validate_dashboard_series_window,
     validate_date_range,
     validate_extension_minutes,
@@ -2331,6 +2336,10 @@ class GuestLoginResult:
     # gives a name -- see ``validators.session_awaits_required_name``. The
     # portal shows its one "Your name" screen on this bit, and only on it.
     name_required: bool = False
+    # The email twin (``require_guest_email``, migration 0148): the session
+    # is held until an email is on file. Both bits can be true at once; the
+    # portal's details screen asks for exactly the fields that are.
+    email_required: bool = False
 
 
 def _venue_requires_name(config: object) -> bool:
@@ -2338,6 +2347,13 @@ def _venue_requires_name(config: object) -> bool:
     row or cache payload) carries the attribute; one that somehow does not
     reads as the owner's default -- ON -- never as a silent "off"."""
     return bool(getattr(config, "require_guest_name", True))
+
+
+def _venue_requires_email(config: object) -> bool:
+    """``require_guest_email`` off a resolved config. Unlike the name, the
+    default is OFF (migration 0148): a config that somehow lacks the
+    attribute reads as "not required"."""
+    return bool(getattr(config, "require_guest_email", False))
 
 
 #: The single ``disconnect_reason`` literal that means "this session ran
@@ -3372,17 +3388,36 @@ class GuestService:
         # be asked for twice); what the bit does is hold the NETWORK: every
         # step that opens it refuses this session until
         # ``submit_sign_in_name`` stores a name.
-        name_required = session_awaits_required_name(
+        #
+        # Email required at sign-in rides the same hold. An email-OTP guest
+        # already proved an address; when the venue collects emails it is
+        # stored as their email now, so the venue's guest record has it and
+        # nothing downstream (the post-connect card, the details screen) ever
+        # asks for it again.
+        config = resolved.config
+        if (
+            auth_method == GuestAuthMethod.OTP_EMAIL
+            and not (guest.email or "").strip()
+            and "@" in identifier
+            and (
+                bool(getattr(config, "collect_guest_email", False))
+                or _venue_requires_email(config)
+            )
+        ):
+            guest = await self.repository.update_guest(guest, {"email": identifier})
+        missing = session_missing_required_details(
             session=session,
             guest=guest,
-            require_guest_name=_venue_requires_name(resolved.config),
+            require_guest_name=_venue_requires_name(config),
+            require_guest_email=_venue_requires_email(config),
         )
         return GuestLoginResult(
             guest=guest,
             session=session,
             device=device,
             is_new_guest=is_new,
-            name_required=name_required,
+            name_required=REQUIRED_DETAIL_NAME in missing,
+            email_required=REQUIRED_DETAIL_EMAIL in missing,
         )
 
     async def login_via_voucher(
@@ -4610,10 +4645,12 @@ class GuestService:
     # Name required at sign-in (captive_portal_configs.require_guest_name)
     # ========================================================================
 
-    async def session_awaits_required_name(
+    async def session_missing_required_details(
         self, session: GuestSession, *, guest: Guest | None = None
-    ) -> bool:
-        """Whether ``session`` is held off the network for want of a name.
+    ) -> tuple[str, ...]:
+        """Which sign-in details (``"name"``/``"email"``) hold ``session``
+        off the network -- empty when none do. The generalisation of the
+        name-only gate (#353) to ``require_guest_email`` (migration 0148).
 
         The config is resolved against the SESSION's organization and
         location -- ``Guest.location_id`` is the guest's "home" venue and
@@ -4621,54 +4658,91 @@ class GuestService:
         identical reasoning), so reading it would enforce the wrong
         venue's setting at a multi-location chain.
 
-        **No config resolves to the default: required.** When neither a
-        location nor an organization default config exists any more
-        (``CaptivePortalConfigNotConfiguredError`` -- e.g. deleted after
-        this session's login), the venue's setting is the owner's default,
-        ON. That never strands a guest: ``submit_sign_in_name`` accepts the
-        same case, so the name screen always clears the hold. Any OTHER
-        resolution failure fails open (logged): this gate exists to collect
-        a name, not to take a connection away on an unrelated error.
-        Non-OTP sessions are never held (no config read at all).
+        **No config resolves to the defaults: name required, email not.**
+        When neither a location nor an organization default config exists
+        any more (``CaptivePortalConfigNotConfiguredError`` -- e.g. deleted
+        after this session's login), the name follows the owner's default
+        (ON) and the email its own (OFF). That never strands a guest:
+        ``submit_sign_in_details`` accepts the same case, so the details
+        screen always clears the hold. Any OTHER resolution failure fails
+        open (logged): this gate exists to collect details, not to take a
+        connection away on an unrelated error. Non-OTP sessions are never
+        held (no config read at all), and a guest with both details on file
+        costs no config read either.
         """
         if str(session.auth_method) not in NAME_REQUIRED_AUTH_METHODS:
-            return False
+            return ()
         if guest is None:
             guest = await self.repository.get_guest_by_id(session.guest_id)
-        if guest is not None and (guest.display_name or "").strip():
-            return False
+        # Nothing could be missing whatever the venue requires: skip the read.
+        if not session_missing_required_details(
+            session=session,
+            guest=guest,
+            require_guest_name=True,
+            require_guest_email=True,
+        ):
+            return ()
         try:
             resolved = await self.captive_portal_service.resolve_portal_config(
                 organization_id=session.organization_id,
                 location_id=session.location_id,
             )
         except CaptivePortalConfigNotConfiguredError:
-            return session_awaits_required_name(
-                session=session, guest=guest, require_guest_name=True
+            return session_missing_required_details(
+                session=session,
+                guest=guest,
+                require_guest_name=True,
+                require_guest_email=False,
             )
         except CloudGuestError:
             logger.warning(
                 "guest_name_gate_config_unresolved",
                 extra={"event_session_id": str(session.id)},
             )
-            return False
-        return session_awaits_required_name(
+            return ()
+        return session_missing_required_details(
             session=session,
             guest=guest,
             require_guest_name=_venue_requires_name(resolved.config),
+            require_guest_email=_venue_requires_email(resolved.config),
         )
+
+    async def session_awaits_required_details(
+        self, session: GuestSession, *, guest: Guest | None = None
+    ) -> bool:
+        """Whether ``session`` is held off the network for want of a
+        required sign-in detail. The predicate every network-opening step
+        applies (RADIUS Authorize here; the router agent and the
+        network-integration authorize routes via ``require_session_name``)."""
+        return bool(await self.session_missing_required_details(session, guest=guest))
+
+    async def session_awaits_required_name(
+        self, session: GuestSession, *, guest: Guest | None = None
+    ) -> bool:
+        """Whether ``session`` is held for want of a NAME specifically.
+        Kept for callers that only care about the name; the network gate is
+        ``session_awaits_required_details``."""
+        missing = await self.session_missing_required_details(session, guest=guest)
+        return REQUIRED_DETAIL_NAME in missing
 
     async def require_session_name(self, *, session_id: uuid.UUID) -> None:
         """Raise ``GuestNameRequiredError`` (403, ``guest_name_required``)
-        if this session is held for a name. A session that does not exist
-        is NOT refused here -- the caller's own proof-of-session check owns
-        that answer, opaquely, and this method must not become a second,
-        distinguishable oracle for it."""
+        or ``GuestEmailRequiredError`` (403, ``guest_email_required``) if
+        this session is held for a required sign-in detail -- the name
+        first when both are missing. (Name kept for the
+        ``GuestNameGateProtocol`` seam; it now covers both details.)
+
+        A session that does not exist is NOT refused here -- the caller's
+        own proof-of-session check owns that answer, opaquely, and this
+        method must not become a second, distinguishable oracle for it."""
         session = await self.repository.get_session_by_id(session_id)
         if session is None:
             return
-        if await self.session_awaits_required_name(session):
+        missing = await self.session_missing_required_details(session)
+        if REQUIRED_DETAIL_NAME in missing:
             raise GuestNameRequiredError()
+        if REQUIRED_DETAIL_EMAIL in missing:
+            raise GuestEmailRequiredError()
 
     async def submit_sign_in_name(
         self,
@@ -4677,16 +4751,37 @@ class GuestService:
         session_id: uuid.UUID,
         display_name: str | None,
     ) -> Guest:
-        """Store the name a guest typed on the portal's "Your name" screen,
-        between OTP verify and the hotspot login.
+        """Store the name from the portal's "Your name" screen -- the
+        name-only form of ``submit_sign_in_details`` (``POST
+        /guest/sign-in-name``, kept for portals that predate the email
+        twin)."""
+        return await self.submit_sign_in_details(
+            guest_id=guest_id,
+            session_id=session_id,
+            display_name=display_name,
+            email=None,
+            name_supplied=True,
+        )
+
+    async def submit_sign_in_details(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+        display_name: str | None,
+        email: str | None,
+        name_supplied: bool | None = None,
+    ) -> Guest:
+        """Store the details a guest typed on the portal's sign-in details
+        screen, between OTP verify and the hotspot login.
 
         **Ordering, and why there is no race.** ``update_guest_profile``'s
         docstring records why its write is post-connect only: inside the
         funnel it would race the hotspot login POST. Here the portal awaits
         this call to completion and only then starts the login POST, so the
         two are sequential by construction -- and the network-opening steps
-        consult the stored name, so a login POST that somehow went first is
-        refused, not silently admitted without a name.
+        consult the stored details, so a login POST that somehow went first
+        is refused, not silently admitted without them.
 
         Proof of session is the same as the post-connect profile write: the
         session belongs to this guest, was opened by an OTP method, is
@@ -4696,20 +4791,25 @@ class GuestService:
         ``SET_PASSWORD_SESSION_WINDOW_MINUTES``. Failing any leg raises
         ``GuestProfileUpdateNotAuthorizedError`` (403).
 
-        The venue must collect names (``collect_guest_name`` or
-        ``require_guest_name``, resolved by the session's location),
-        otherwise ``GuestProfileFieldNotCollectedError`` (400) -- the DPDP
-        rule ``update_guest_profile`` enforces, unchanged. No resolvable
-        config reads as the default (required, so collected).
+        Each supplied field must be one the venue collects (``collect_*`` or
+        ``require_*``, resolved by the session's location), otherwise
+        ``GuestProfileFieldNotCollectedError`` (400) -- the DPDP rule
+        ``update_guest_profile`` enforces, unchanged. No resolvable config
+        reads as the defaults (name required, hence collected; email not).
 
-        **Overwrite semantics: the latest name the guest typed wins.** The
-        screen is only shown when no name is on file, so in practice this
-        fills an empty field; if a name did arrive in between (a second
-        device, the post-connect card), the guest's own most recent entry
-        replaces it -- the same last-write-wins rule
-        ``update_guest_profile`` already applies to ``display_name``.
+        Both fields are validated before anything is written, so a bad
+        email never leaves a half-stored pair. **Overwrite semantics: the
+        latest value the guest typed wins** -- the same last-write-wins rule
+        ``update_guest_profile`` applies.
         """
-        cleaned = normalize_guest_display_name(display_name)
+        if name_supplied is None:
+            name_supplied = display_name is not None
+        if not name_supplied and email is None:
+            raise GuestNameInvalidError("Please enter your details.")
+        cleaned_name = (
+            normalize_guest_display_name(display_name) if name_supplied else None
+        )
+        cleaned_email = normalize_guest_email(email) if email is not None else None
         guest = await self._require_guest(guest_id)
         session = await self.repository.get_session_by_id(session_id)
         now = datetime.now(UTC)
@@ -4730,23 +4830,37 @@ class GuestService:
                 location_id=session.location_id,
             )
         except CaptivePortalConfigNotConfiguredError:
-            # No config resolves to the default (required, hence collected)
-            # -- the same reading ``session_awaits_required_name`` holds the
-            # session on, so the screen can always clear what it gates.
+            # No config resolves to the defaults -- the same reading
+            # ``session_missing_required_details`` holds the session on, so
+            # the screen can always clear what it gates.
             resolved = None
         if resolved is not None:
             config = resolved.config
-            if not (config.collect_guest_name or _venue_requires_name(config)):
+            if cleaned_name is not None and not (
+                config.collect_guest_name or _venue_requires_name(config)
+            ):
                 raise GuestProfileFieldNotCollectedError("name")
+            if cleaned_email is not None and not (
+                config.collect_guest_email or _venue_requires_email(config)
+            ):
+                raise GuestProfileFieldNotCollectedError("email")
+        elif cleaned_email is not None:
+            raise GuestProfileFieldNotCollectedError("email")
 
-        if guest.display_name == cleaned:
+        update_data: dict[str, object] = {}
+        if cleaned_name is not None and guest.display_name != cleaned_name:
+            update_data["display_name"] = cleaned_name
+        if cleaned_email is not None and guest.email != cleaned_email:
+            update_data["email"] = cleaned_email
+        if not update_data:
             return guest
-        updated = await self.repository.update_guest(guest, {"display_name": cleaned})
+        updated = await self.repository.update_guest(guest, update_data)
         logger.info(
-            "guest_sign_in_name_stored",
+            "guest_sign_in_details_stored",
             extra={
                 "event_guest_id": str(updated.id),
                 "event_session_id": str(session.id),
+                "event_fields": sorted(update_data),
             },
         )
         return updated
@@ -5418,14 +5532,16 @@ class GuestService:
         # bit, not hidden: a guest who reloaded the portal on the "Your
         # name" screen must land back on it (the portal reads
         # ``name_required``), not on "You're online" with no internet.
+        missing_details = await self.session_missing_required_details(
+            session, guest=guest
+        )
         return GuestLoginResult(
             guest=guest,
             session=session,
             device=device,
             is_new_guest=False,
-            name_required=await self.session_awaits_required_name(
-                session, guest=guest
-            ),
+            name_required=REQUIRED_DETAIL_NAME in missing_details,
+            email_required=REQUIRED_DETAIL_EMAIL in missing_details,
         )
 
     async def _active_session_past_its_limit(
@@ -9290,7 +9406,7 @@ class RadiusService:
         # raise -- RADIUS has no "why"; the portal shows the screen.
         if (
             session is not None
-            and await self.guest_service.session_awaits_required_name(session)
+            and await self.guest_service.session_awaits_required_details(session)
         ):
             logger.info(
                 "radius_authorize_session_awaits_guest_name",

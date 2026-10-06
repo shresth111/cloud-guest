@@ -1044,5 +1044,6 @@ class TestTheCacheKeyMovedWithTheFieldSet:
             "feedback_dwell_minutes",
         ):
             assert field in _CACHED_CONFIG_SCALAR_FIELDS
-        # v9 since require_guest_name joined the same tuple.
-        assert _CACHE_KEY_TEMPLATE.split(":")[2] == "v9"
+        # v9 since require_guest_name joined the same tuple; v10 since
+        # require_guest_email + post_login_sequence (migration 0148) did.
+        assert _CACHE_KEY_TEMPLATE.split(":")[2] == "v10"

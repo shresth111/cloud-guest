@@ -144,6 +144,10 @@ class CampaignsRepositoryProtocol(Protocol):
         self, campaign_id: uuid.UUID
     ) -> list[CampaignImpression]: ...
 
+    async def list_campaign_ids_shown_in_session(
+        self, guest_session_id: uuid.UUID
+    ) -> set[uuid.UUID]: ...
+
 
 class CampaignsRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -352,6 +356,21 @@ class CampaignsRepository:
         self, campaign_id: uuid.UUID
     ) -> list[CampaignImpression]:
         return await self.impressions.get_all(filters={"campaign_id": campaign_id})
+
+    async def list_campaign_ids_shown_in_session(
+        self, guest_session_id: uuid.UUID
+    ) -> set[uuid.UUID]:
+        """Every campaign already shown (an impression row exists) in this
+        one guest session. The serving path excludes these so an
+        ``EVERY_LOGIN`` campaign is shown once per login, not once per load
+        of the connected page -- and so the next campaign in the queue can
+        get its turn after the first is dismissed."""
+        statement = select(CampaignImpression.campaign_id).where(
+            CampaignImpression.is_deleted.is_(False),
+            CampaignImpression.guest_session_id == guest_session_id,
+        )
+        result = await self.session.execute(statement)
+        return set(result.scalars().all())
 
 
 __all__ = ["CampaignsRepositoryProtocol", "CampaignsRepository"]

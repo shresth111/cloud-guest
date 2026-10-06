@@ -284,6 +284,28 @@ class GuestSignInNameResponse(BaseModel):
     has_profile: bool
 
 
+class GuestSignInDetailsRequest(BaseModel):
+    """The portal's sign-in details screen (name and/or email the venue
+    requires), between OTP verify and the hotspot login -- the
+    generalisation of ``GuestSignInNameRequest``. At least one field is
+    required; each is cleaned and checked by the service
+    (``normalize_guest_display_name`` / ``normalize_guest_email``) so a bad
+    value comes back as a stable ``data.code`` the portal can show inline,
+    not as a generic 422."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+    display_name: str | None = Field(default=None, max_length=1000)
+    email: str | None = Field(default=None, max_length=1000)
+
+
+class GuestSignInDetailsResponse(BaseModel):
+    guest_id: str
+    has_name: bool
+    has_email: bool
+    has_profile: bool
+
+
 class GuestUpdateProfileResponse(BaseModel):
     guest_id: str
     display_name: str | None
@@ -709,6 +731,22 @@ class GuestLoginResponse(BaseModel):
     # name. The portal shows its one "Your name" screen on this bit and
     # starts the hotspot login only after that call returns.
     name_required: bool = False
+    # The email twin (``require_guest_email``, migration 0148), code
+    # ``guest_email_required``, cleared by ``POST /guest/sign-in-details``.
+    email_required: bool = False
+    # Which profile details this platform already holds for the guest --
+    # booleans only, never the values (this response is also served by the
+    # unauthenticated ``GET /guest/session/active``, keyed on a MAC). The
+    # post-connect card reads them so it never asks for a detail the guest
+    # already gave, at sign-in or on an earlier visit. ``has_email`` is
+    # also true for an email-OTP guest, whose identifier IS their email.
+    has_name: bool = False
+    has_email: bool = False
+    # The guest said "not now" to the post-connect card. With the per-field
+    # bits above, the card asks only for what is missing -- and never again
+    # once declined (``has_profile`` alone could not tell "gave an email at
+    # sign-in" from "answered the card").
+    profile_declined: bool = False
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
 

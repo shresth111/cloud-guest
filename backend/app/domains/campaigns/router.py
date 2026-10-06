@@ -838,6 +838,32 @@ async def get_next_campaign(
     )
 
 
+@guest_router.get(
+    "/queue",
+    response_model=ApiResponse[list[NextCampaignResponse]],
+    status_code=status.HTTP_200_OK,
+)
+async def get_campaign_queue(
+    request: Request,
+    session_id: uuid.UUID = Query(...),
+    service: CampaignsService = Depends(get_campaigns_service),
+):
+    """Every campaign this guest session may be shown, in serving order
+    (newest start first, then newest created, then id) -- the same order
+    ``/next`` serves them one at a time, minus anything already shown in
+    this session. The portal's post-login sequence reads it once to run a
+    survey step and an offer step in the order the venue configured, so
+    neither starves the other. ``data`` is an empty list when there is
+    nothing to show."""
+    results = await service.list_campaign_queue_for_session(session_id)
+    return build_response(
+        success=True,
+        message="Campaign queue resolved",
+        data=[_next_campaign_response(r).model_dump() for r in results],
+        request_id=_request_id(request),
+    )
+
+
 @guest_router.post(
     "/{campaign_id}/respond",
     response_model=ApiResponse[MessageResponse],
