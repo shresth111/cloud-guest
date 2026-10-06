@@ -284,6 +284,17 @@ LOCATION_SCOPED: dict[str, str] = {
 PENDING: dict[str, str] = {}
 
 EXEMPT: dict[str, str] = {
+    "device_logs": (
+        "Device Logs. `device_log_events.location_id` is attribution "
+        "(which venue a syslog line came from), and every read route is "
+        "Master-only: `device_logs.read` / `device_logs.manage` pinned to "
+        "ScopeType.GLOBAL, a module whose narrowest scope is GLOBAL and which "
+        "every location/organization role holds at NONE. A location-confined "
+        "caller cannot reach any of these routes, so there is no "
+        "cross-site path to confine. The ingest route takes no location at "
+        "all (attribution is derived from the tunnel IP). If a customer-"
+        "facing read is ever added, it moves to PENDING."
+    ),
     "otp": (
         "Exempt from *this* class, not from scrutiny. `OtpRequest` carries a "
         "location, but the domain has **no by-id route at all** -- only "

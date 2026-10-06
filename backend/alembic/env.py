@@ -51,6 +51,7 @@ from app.domains.content_filtering import (
 # autogenerate coverage, not something this migration introduced.)
 from app.domains.demo_booking import models as demo_booking_models  # noqa: F401
 from app.domains.demo_request import models as demo_request_models  # noqa: F401
+from app.domains.device_logs import models as device_logs_models  # noqa: F401
 from app.domains.device_sync import models as device_sync_models  # noqa: F401
 from app.domains.dhcp import models as dhcp_models  # noqa: F401
 from app.domains.dns import models as dns_models  # noqa: F401

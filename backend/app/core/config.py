@@ -561,6 +561,49 @@ class Settings(BaseSettings):
             for token in self.radius_bandwidth_attribute_router_ids.split(",")
             if token
         )
+    # -- Device Logs (syslog) -- see app.domains.device_logs ---------------
+    device_logs_enabled: bool = Field(
+        default=False,
+        description=(
+            "Device Logs master switch: the collector's ingest endpoint "
+            "accepts batches, the Master log viewer shows data, and Master "
+            "may write/remove remote logging on a MikroTik over the API. "
+            "False (the default) means the ingest endpoint answers 404, the "
+            "viewer reports the feature as switched off, and no router is "
+            "ever written. Override via CLOUDGUEST_DEVICE_LOGS_ENABLED."
+        ),
+    )
+    device_logs_ingest_secret: str = Field(
+        default="",
+        description=(
+            "Shared secret the syslog collector (Vector) sends as the "
+            "X-Device-Logs-Secret header. Empty means the ingest endpoint "
+            "refuses every batch even with device_logs_enabled on -- fail "
+            "closed, never 'no secret configured, so anyone may post'. "
+            "Override via CLOUDGUEST_DEVICE_LOGS_INGEST_SECRET."
+        ),
+    )
+    device_logs_remote_host: str = Field(
+        default="",
+        description=(
+            "Address routers send syslog to. Empty (the default) means the "
+            "hub's own tunnel address, derived per router from its WireGuard "
+            "server's tunnel_network_cidr -- the only address a router's "
+            "/32 allowed-address lets into the tunnel. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_REMOTE_HOST."
+        ),
+    )
+    device_logs_remote_port: int = Field(
+        default=514,
+        ge=1,
+        le=65535,
+        description=(
+            "UDP port on the hub routers send syslog to. The hub DNATs it to "
+            "the environment's collector, so staging uses its own port "
+            "(5140) on the shared hub. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_REMOTE_PORT."
+        ),
+    )
     # ------------------------------------------------------------------
     # WHAT THE DEPLOYED HUB AGENT CAN ACTUALLY DO.
     #

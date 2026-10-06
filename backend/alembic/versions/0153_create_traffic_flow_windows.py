@@ -12,8 +12,8 @@ Indexed on ``window_start`` for the overview and the 7-day retention delete.
 ``traffic_flow_ingest_state`` -- single row (id = 1): the pull cursor and the
 last pull's outcome.
 
-Revision ID: 0152_create_traffic_flow_windows
-Revises: 0151_merge_snmp_main_copy
+Revision ID: 0153_create_traffic_flow_windows
+Revises: 0152_merge_device_logs_into_staging
 Create Date: 2026-10-06
 """
 
@@ -24,8 +24,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0152_create_traffic_flow_windows"
-down_revision = "0151_merge_snmp_main_copy"
+revision = "0153_create_traffic_flow_windows"
+down_revision = "0152_merge_device_logs_into_staging"
 branch_labels = None
 depends_on = None
 
