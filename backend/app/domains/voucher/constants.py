@@ -105,15 +105,15 @@ class VoucherStatus(StrEnum):
 
     * ``UNUSED`` -- generated/imported, never redeemed. The only state a
       voucher starts in.
-    * ``ACTIVE`` -- redeemed at least once, with uses remaining
-      (``use_count < batch.max_uses_per_voucher``) and, once
-      ``batch.validity_minutes`` has elapsed since first redemption, still
-      within its own ``expires_at``.
-    * ``EXHAUSTED`` -- ``use_count`` has reached
-      ``batch.max_uses_per_voucher``. For a single-use voucher
-      (``max_uses_per_voucher == 1``, the default), this is reached directly
-      from ``UNUSED`` on the very first redemption -- it never passes
-      through ``ACTIVE`` at all.
+    * ``ACTIVE`` -- redeemed at least once, with device slots remaining
+      (``use_count < batch.device_allowance()``; ``use_count`` counts the
+      distinct devices admitted) and, once ``batch.validity_minutes`` has
+      elapsed since first redemption, still within its own ``expires_at``.
+    * ``EXHAUSTED`` -- every device slot is taken. For a single-device
+      voucher (the default), this is reached directly from ``UNUSED`` on the
+      very first redemption -- it never passes through ``ACTIVE`` at all.
+      Not terminal for the devices already admitted: they may sign in again
+      until ``expires_at`` (see ``VoucherService.redeem_voucher``).
     * ``EXPIRED`` -- its own post-redemption ``expires_at`` has passed (set
       at first redemption, see ``models.Voucher.expires_at``'s docstring for
       why this is computed then, not at generation time), reached lazily on

@@ -118,6 +118,7 @@ import dataclasses
 import io
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from secrets import choice as secrets_choice
@@ -372,8 +373,15 @@ class VoucherService:
         has_manage_permission: bool,
         plan_id: uuid.UUID | None = None,
         series_id: uuid.UUID | None = None,
+        max_devices_per_voucher: int | None = None,
     ) -> VoucherBatch:
         validate_quantity(quantity)
+        # One allowance, two columns: ``max_devices_per_voucher`` is the one
+        # enforced, and ``max_uses_per_voucher`` is written equal to it so a
+        # client still reading the legacy field sees the real number. A
+        # caller that only sends the legacy field (older dashboards) gets
+        # exactly that many devices.
+        device_allowance = max(max_devices_per_voucher or max_uses_per_voucher, 1)
         validate_code_length(code_length)
 
         organization = await self.organization_lookup.get_organization(organization_id)
@@ -409,7 +417,8 @@ class VoucherService:
             code_prefix=code_prefix,
             validity_minutes=validity_minutes,
             batch_expires_at=batch_expires_at,
-            max_uses_per_voucher=max_uses_per_voucher,
+            max_uses_per_voucher=device_allowance,
+            max_devices_per_voucher=device_allowance,
             data_limit_mb=data_limit_mb,
             status=VoucherBatchStatus.DRAFT.value,
             created_by_user_id=actor_user_id,
@@ -889,6 +898,11 @@ class VoucherService:
         if voucher.status == VoucherStatus.REVOKED.value:
             return "revoked"
         if voucher.status == VoucherStatus.EXHAUSTED.value:
+            # A full voucher past its validity is, to the guest, expired --
+            # "in use on the maximum number of devices" would send them
+            # looking for the other devices.
+            if voucher.is_post_redemption_expired(now=now):
+                return "expired"
             return "exhausted"
         if voucher.status == VoucherStatus.EXPIRED.value:
             return "expired"
@@ -957,13 +971,31 @@ class VoucherService:
             voucher=voucher,
             batch=batch,
             is_first_use=voucher.use_count == 0,
-            uses_remaining=batch.max_uses_per_voucher - voucher.use_count,
+            uses_remaining=max(batch.device_allowance() - voucher.use_count, 0),
         )
 
     async def redeem_voucher(
-        self, *, code: str, identifier: str, source: str
+        self,
+        *,
+        code: str,
+        identifier: str,
+        source: str,
+        is_admitted_device: Callable[[Voucher], Awaitable[bool]] | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         """Redeems ``code`` exactly once, atomically.
+
+        ## Device allowance
+
+        ``use_count`` counts the distinct devices a code has admitted, and
+        ``batch.device_allowance()`` caps it. ``is_admitted_device`` lets the
+        caller (``GuestService.login_via_voucher``, which owns sessions and
+        devices) say "this device already signed in with this voucher": such
+        a sign-in is a re-entry -- it takes no new slot, so it is allowed
+        even once the voucher is ``EXHAUSTED`` (every slot taken), while a
+        revoked/expired voucher or an inactive batch still refuses it. Any
+        other device takes a slot through the compare-and-swap below. With
+        no callback (``POST /vouchers/redeem``, a sign-in without a MAC)
+        every call is a new device, exactly as before.
 
         The read/validate phase below and the write that follows it form a
         check-then-act, and the write is deliberately **not** a blind
@@ -1000,6 +1032,29 @@ class VoucherService:
         voucher, batch = await self._get_voucher_and_batch(code)
         now = datetime.now(UTC)
         reason = self._redemption_failure_reason(voucher, batch, now=now)
+        if (
+            # "exhausted" is checked before expiry and batch state by
+            # ``_redemption_failure_reason``, so both are re-checked here: a
+            # full voucher re-admits its own devices only while it is valid.
+            reason in (None, "exhausted")
+            and voucher.status != VoucherStatus.UNUSED.value
+            and not voucher.is_post_redemption_expired(now=now)
+            and VoucherBatchStatus(batch.status) == VoucherBatchStatus.ACTIVE
+            and is_admitted_device is not None
+            and await is_admitted_device(voucher)
+        ):
+            # Re-entry by a device this code already admitted: no slot taken,
+            # nothing written. Logged so a re-entry is distinguishable from a
+            # redemption in the API log.
+            logger.info(
+                "voucher_reentry_by_admitted_device",
+                extra={
+                    "event_voucher_id": str(voucher.id),
+                    "event_batch_id": str(batch.id),
+                    "event_use_count": voucher.use_count,
+                },
+            )
+            return voucher, batch
         if reason is not None:
             await self._record_redemption_failure(voucher, reason=reason)
             self._raise_for_reason(reason, batch_status=batch.status)
@@ -1018,7 +1073,7 @@ class VoucherService:
             batch,
             expected_status=voucher.status,
             expected_use_count=voucher.use_count,
-            max_uses_per_voucher=batch.max_uses_per_voucher,
+            max_uses_per_voucher=batch.device_allowance(),
             last_used_at=now,
             first_use_fields=first_use_fields,
         )
@@ -1055,8 +1110,8 @@ class VoucherService:
             None,
             AuditAction.VOUCHER_REDEEMED,
             batch,
-            f"Voucher '{updated.code}' redeemed (use {updated.use_count}/"
-            f"{batch.max_uses_per_voucher})",
+            f"Voucher '{updated.code}' redeemed (device {updated.use_count}/"
+            f"{batch.device_allowance()})",
             entity_type="voucher",
             entity_id=updated.id,
         )
@@ -1142,7 +1197,7 @@ class VoucherService:
                     voucher.code,
                     voucher.status,
                     voucher.use_count,
-                    batch.max_uses_per_voucher,
+                    batch.device_allowance(),
                     voucher.redeemed_at.isoformat() if voucher.redeemed_at else "",
                     voucher.last_used_at.isoformat() if voucher.last_used_at else "",
                     voucher.expires_at.isoformat() if voucher.expires_at else "",

@@ -171,7 +171,24 @@ class VoucherBatchCreate(BaseModel):
         default=None,
         description="Codes not redeemed by this timestamp become permanently invalid.",
     )
-    max_uses_per_voucher: int = Field(default=1, ge=1)
+    max_uses_per_voucher: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Legacy name for max_devices_per_voucher, used only when that "
+            "field is omitted."
+        ),
+    )
+    max_devices_per_voucher: int | None = Field(
+        default=None,
+        ge=1,
+        le=1000,
+        description=(
+            "How many different devices one code admits. A device that "
+            "already signed in with the code can sign in again while it is "
+            "valid. Omitted: max_uses_per_voucher."
+        ),
+    )
     data_limit_mb: int | None = Field(default=None, ge=0)
     notes: str | None = Field(default=None, max_length=2000)
 
@@ -186,7 +203,7 @@ class VoucherBatchCreate(BaseModel):
                 "code_prefix": "JULY-",
                 "validity_minutes": 1440,
                 "batch_expires_at": None,
-                "max_uses_per_voucher": 1,
+                "max_devices_per_voucher": 1,
                 "data_limit_mb": None,
                 "notes": None,
             }
@@ -245,6 +262,7 @@ class VoucherBatchResponse(BaseModel):
     validity_minutes: int
     batch_expires_at: datetime | None
     max_uses_per_voucher: int
+    max_devices_per_voucher: int
     data_limit_mb: int | None
     status: str
     created_by_user_id: str | None
@@ -324,6 +342,7 @@ class VoucherValidateResponse(BaseModel):
     is_first_use: bool
     uses_remaining: int
     max_uses_per_voucher: int
+    max_devices_per_voucher: int
     expires_at: datetime | None
     batch_status: str
 
@@ -337,6 +356,7 @@ class VoucherRedeemResponse(BaseModel):
     status: str
     use_count: int
     max_uses_per_voucher: int
+    max_devices_per_voucher: int
     redeemed_at: datetime | None
     expires_at: datetime | None
 

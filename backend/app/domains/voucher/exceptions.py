@@ -185,11 +185,13 @@ class VoucherRevokedError(VoucherError):
 
 
 class VoucherExhaustedError(VoucherError):
-    """``use_count`` has already reached ``max_uses_per_voucher``."""
+    """``use_count`` -- the distinct devices this code has admitted -- has
+    already reached the batch's device allowance, and the device asking is
+    not one of them. Shown verbatim on the guest portal."""
 
     def __init__(self) -> None:
         super().__init__(
-            "This voucher has already been used the maximum number of times",
+            "This voucher is already in use on the maximum number of devices",
             status_code=status.HTTP_409_CONFLICT,
         )
 

@@ -231,8 +231,21 @@ class VoucherBatch(BaseModel):
     batch_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Legacy mirror of ``max_devices_per_voucher`` (written equal to it by
+    # ``VoucherService.create_batch``, backfilled equal by migration 0147).
+    # Kept so existing API clients and CSV exports keep reading a number;
+    # nothing enforces it any more.
     max_uses_per_voucher: Mapped[int] = mapped_column(
         Integer, default=1, nullable=False
+    )
+    # How many DISTINCT devices one code of this batch admits. A device that
+    # already signed in with the code may sign in again while the voucher is
+    # valid without taking another slot; the (N+1)th different device is
+    # refused (``VoucherExhaustedError``). At a voucher sign-in this replaces
+    # the venue's "Devices per user" -- see
+    # ``GuestService.login_via_voucher``.
+    max_devices_per_voucher: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
     )
     # Bandwidth/data cap hint for the future guest/session-management module
     # to enforce -- stored, not enforced, here. See module scope note.
@@ -259,6 +272,15 @@ class VoucherBatch(BaseModel):
         Index("ix_voucher_batches_plan_id", "plan_id"),
         Index("ix_voucher_batches_series_id", "series_id"),
     )
+
+    def device_allowance(self) -> int:
+        """How many distinct devices one code of this batch admits.
+
+        Falls back to ``max_uses_per_voucher`` for a row built in memory
+        without the newer column (the column's own default only applies on
+        INSERT), so every reader gets the same number the migration's
+        backfill would have written."""
+        return max(self.max_devices_per_voucher or self.max_uses_per_voucher or 1, 1)
 
     def is_batch_expired(self, *, now: datetime) -> bool:
         return self.batch_expires_at is not None and now > self.batch_expires_at
