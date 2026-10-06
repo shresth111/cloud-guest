@@ -417,3 +417,90 @@ class TestSnmpV1UsesWalkNotBulkWalk:
         assert result == 5.0
         assert called["walk_cmd"] is True
         assert called["bulk_walk_cmd"] is False
+
+
+# ============================================================================
+# SNMPv3 + identity read (2026-10-06)
+# ============================================================================
+
+
+class TestSnmpV3:
+    def test_v3_refuses_no_auth(self) -> None:
+        from wyfy_device_gateway.snmp_poller import SnmpCredentialError, v3_user_data
+
+        with pytest.raises(SnmpCredentialError):
+            v3_user_data(SnmpCredentials(host="h", community="user", version="3"))
+
+    def test_v3_auth_priv_builds_usm_user(self) -> None:
+        from pysnmp.hlapi.v3arch.asyncio import (
+            UsmUserData,
+            usmAesCfb128Protocol,
+            usmHMACSHAAuthProtocol,
+        )
+        from wyfy_device_gateway.snmp_poller import v3_user_data
+
+        user = v3_user_data(
+            SnmpCredentials(
+                host="h",
+                community="wyfy",
+                version="3",
+                v3_auth_protocol="SHA1",
+                v3_auth_password="authpass1",
+                v3_priv_protocol="AES",
+                v3_priv_password="privpass1",
+            )
+        )
+        assert isinstance(user, UsmUserData)
+        assert user.authentication_protocol == usmHMACSHAAuthProtocol
+        assert user.privacy_protocol == usmAesCfb128Protocol
+
+    def test_v3_unknown_protocol_refused(self) -> None:
+        from wyfy_device_gateway.snmp_poller import SnmpCredentialError, v3_user_data
+
+        with pytest.raises(SnmpCredentialError):
+            v3_user_data(
+                SnmpCredentials(
+                    host="h",
+                    community="u",
+                    version="3",
+                    v3_auth_protocol="SHA512",
+                    v3_auth_password="authpass1",
+                )
+            )
+
+    def test_credentials_repr_hides_secrets(self) -> None:
+        creds = SnmpCredentials(
+            host="10.0.0.1", community="topsecret", v3_auth_password="authpass1"
+        )
+        assert "topsecret" not in repr(creds)
+        assert "authpass1" not in repr(creds)
+
+    async def test_read_identity_reads_three_system_scalars(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # read_identity asks name, descr, uptime -- in that order.
+        answers = [
+            ("1.3.6.1.2.1.1.5.0", OctetString("hall-router")),
+            ("1.3.6.1.2.1.1.1.0", OctetString("RouterOS RB750r2")),
+            (SYS_UPTIME_OID, TimeTicks(720000)),
+        ]
+
+        async def fake_get_cmd(engine, auth, target, context, object_type, **kwargs):  # noqa: ANN001
+            oid, value = answers.pop(0)
+            return (None, _NO_ERROR, 0, (_var_bind(oid, value),))
+
+        monkeypatch.setattr(poller_module, "get_cmd", fake_get_cmd)
+        identity = await SnmpPoller().read_identity(CREDS)
+        assert identity.sys_name == "hall-router"
+        assert identity.sys_descr == "RouterOS RB750r2"
+        assert identity.uptime_seconds == 7200
+
+    async def test_read_identity_timeout_raises_never_fabricates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_get_cmd(engine, auth, target, context, object_type, **kwargs):  # noqa: ANN001
+            return ("No SNMP response received before timeout", _NO_ERROR, 0, ())
+
+        monkeypatch.setattr(poller_module, "get_cmd", fake_get_cmd)
+        with pytest.raises(SnmpConnectionError):
+            await SnmpPoller().read_identity(CREDS)

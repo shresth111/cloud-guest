@@ -464,9 +464,9 @@ class Settings(BaseSettings):
         default="2c",
         description=(
             'Platform-wide default SNMP protocol version ("1" or '
-            '"2c" -- see wyfy_device_gateway.snmp_poller\'s own module '
-            "docstring for why SNMPv3 is out of scope), used when a "
-            "router has no per-router Router.snmp_version override."
+            '"2c"), used when a router has no per-router '
+            "Router.snmp_version override. SNMPv3 is per-router only "
+            "(it needs per-router USM credentials)."
         ),
     )
     snmp_default_port: int = Field(
@@ -477,6 +477,22 @@ class Settings(BaseSettings):
             "Platform-wide default SNMP agent UDP port (161 is the real "
             "IANA-assigned SNMP port), used when a router has no "
             "per-router Router.snmp_port override."
+        ),
+    )
+    snmp_poller_source_addresses: str = Field(
+        default="172.31.38.118/32",
+        description=(
+            "Comma-separated CIDRs the platform's SNMP poller sends from, as "
+            "the ROUTER sees them -- written into the RouterOS "
+            "'/snmp community addresses=' of the read-only community the "
+            "platform installs (app.domains.router.snmp). The worker reaches "
+            "routers over the VPC route 10.20.0.0/24 -> hub ENI -> wg0 with "
+            "no NAT (the router's hub peer allowed-address carries "
+            "172.31.0.0/16 for exactly this), so the source is the worker "
+            "host's VPC address: prod wyfy-app-server 172.31.38.118 as of "
+            "2026-10-06. Staging (172.31.45.127) must override this via "
+            "CLOUDGUEST_SNMP_POLLER_SOURCE_ADDRESSES. Never empty: RouterOS "
+            "reads an empty addresses= as 'any address'."
         ),
     )
     snmp_poll_timeout_seconds: int = Field(
