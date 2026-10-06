@@ -803,26 +803,37 @@ class CampaignsService:
         interval_days = campaign.display_interval_days or DEFAULT_DISPLAY_INTERVAL_DAYS
         return now - last_shown_at >= timedelta(days=interval_days)
 
-    async def get_next_campaign_for_session(
-        self, guest_session_id: uuid.UUID
-    ) -> NextCampaignResult | None:
-        """The core guest-facing resolution: loads the candidate set for
-        this session's org/location, keeps only those whose *effective*
-        status (``validators.compute_effective_status``) is ``ACTIVE``
-        right now, filters by ``target_networks``/``display_rule``
-        eligibility, and returns exactly one -- or ``None`` if nothing
-        qualifies. Tie-break among multiple eligible campaigns: the one
-        with the most recent ``starts_at`` wins (falls back to
-        ``created_at`` for org-wide campaigns with no explicit start) --
-        a simple, documented policy, not a "smartest" one."""
-        session = await self._get_active_guest_session(guest_session_id)
+    async def _eligible_campaigns_for_session(self, session: object) -> list[Campaign]:
+        """Every campaign this guest session may be shown right now, in
+        serving order.
+
+        Eligibility: *effective* status ``ACTIVE``
+        (``validators.compute_effective_status``), ``target_networks``
+        (empty = every router), the ``display_rule`` for this guest, and --
+        new -- not already shown in THIS guest session. ``EVERY_LOGIN``
+        means once per login, not once per load of the connected page, and
+        excluding what this session has already seen is what lets the
+        second campaign get its turn after the first is dismissed.
+
+        Order is deterministic: (``starts_at`` or ``created_at``) newest
+        first, then ``created_at`` newest first, then ``id``. The previous
+        ``max()`` over an unordered SQL result picked arbitrarily between
+        two campaigns with the same start (staging 2026-10-06: a survey and
+        an offer both starting at midnight -- the offer won every time and
+        the survey, starved behind an ``EVERY_LOGIN`` offer, never
+        showed)."""
         candidates = await self.repository.list_candidate_campaigns(
             organization_id=session.organization_id, location_id=session.location_id
+        )
+        shown_in_session = await self.repository.list_campaign_ids_shown_in_session(
+            session.id
         )
         now = datetime.now(UTC)
         router_id_str = str(session.router_id)
         eligible: list[Campaign] = []
         for campaign in candidates:
+            if campaign.id in shown_in_session:
+                continue
             effective = compute_effective_status(
                 CampaignStatus(campaign.status),
                 starts_at=campaign.starts_at,
@@ -839,17 +850,48 @@ class CampaignsService:
             if not await self._is_eligible_for_guest(campaign, session.guest_id, now):
                 continue
             eligible.append(campaign)
-        if not eligible:
-            return None
-        chosen = max(eligible, key=lambda c: c.starts_at or c.created_at)
+        # Stable sorts, least significant key first: id ascending, then
+        # created_at newest first, then the primary key newest first.
+        eligible.sort(key=lambda c: str(c.id))
+        eligible.sort(key=lambda c: c.created_at, reverse=True)
+        eligible.sort(key=lambda c: c.starts_at or c.created_at, reverse=True)
+        return eligible
+
+    async def _servable(self, campaign: Campaign) -> NextCampaignResult:
         questions: list[CampaignQuestion] = []
         asset: CampaignAsset | None = None
-        if chosen.campaign_type == CampaignType.SURVEY.value:
-            questions = await self.repository.list_questions_for_campaign(chosen.id)
+        if campaign.campaign_type == CampaignType.SURVEY.value:
+            questions = await self.repository.list_questions_for_campaign(campaign.id)
         else:
-            assets = await self.repository.list_assets_for_campaign(chosen.id)
+            assets = await self.repository.list_assets_for_campaign(campaign.id)
             asset = assets[0] if assets else None
-        return NextCampaignResult(campaign=chosen, questions=questions, asset=asset)
+        return NextCampaignResult(campaign=campaign, questions=questions, asset=asset)
+
+    async def get_next_campaign_for_session(
+        self, guest_session_id: uuid.UUID
+    ) -> NextCampaignResult | None:
+        """The core guest-facing resolution: exactly one campaign -- the
+        first of ``_eligible_campaigns_for_session``'s deterministic order
+        -- or ``None`` if nothing qualifies. A campaign already shown in
+        this session is not served again by this call; ask again after an
+        impression and the next one comes back."""
+        session = await self._get_active_guest_session(guest_session_id)
+        eligible = await self._eligible_campaigns_for_session(session)
+        if not eligible:
+            return None
+        return await self._servable(eligible[0])
+
+    async def list_campaign_queue_for_session(
+        self, guest_session_id: uuid.UUID
+    ) -> list[NextCampaignResult]:
+        """Every campaign this session may be shown, in the same order
+        ``get_next_campaign_for_session`` would serve them one at a time.
+        The portal's post-login sequence reads this once and runs its
+        survey step and its offer step in the order the venue chose, so a
+        survey is never starved by an offer (or the reverse)."""
+        session = await self._get_active_guest_session(guest_session_id)
+        eligible = await self._eligible_campaigns_for_session(session)
+        return [await self._servable(c) for c in eligible]
 
     async def _get_campaign_for_guest_session(
         self, campaign_id: uuid.UUID, session: object

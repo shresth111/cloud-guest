@@ -47,6 +47,7 @@ __all__ = [
     "WhitelistOnlyRequiresLocationError",
     "InvalidReviewUrlError",
     "InvalidFeedbackDwellMinutesError",
+    "InvalidPostLoginSequenceError",
 ]
 
 
@@ -163,6 +164,23 @@ class InvalidFeedbackDwellMinutesError(CaptivePortalError):
             f"{MIN_FEEDBACK_DWELL_MINUTES} and {MAX_FEEDBACK_DWELL_MINUTES} "
             f"-- got {value!r}.",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidPostLoginSequenceError(CaptivePortalError):
+    """``post_login_sequence`` is malformed, or names something the venue
+    has not set up: a ``page`` step without a stored post-login page, or a
+    ``redirect`` finish without a redirect URL.
+
+    Refused rather than silently dropped at guest time: an owner who adds
+    "Show my page" and saves must find out now that there is no page, not
+    by wondering why no guest ever saw it."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"After-they-connect sequence: {reason}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"field": "post_login_sequence"},
         )
 
 

@@ -376,6 +376,23 @@ class GuestSessionTerminatorProtocol(Protocol):
     ) -> Any: ...
 
 
+class GuestNameGateProtocol(Protocol):
+    """Name required at sign-in, asked at the network-enforcement step.
+
+    Satisfied as-is by ``GuestService.require_session_name``: raises
+    ``GuestNameRequiredError`` (403, ``data.code == "guest_name_required"``)
+    when the venue requires a name, the session is an OTP session, and the
+    guest has none on file. Consulted only AFTER ``_resolve_portal_session``
+    has proven the session, so it never answers anything about a session id
+    the caller could not already authorize with.
+
+    Optional like the other guest-domain seams; absent (a unit test
+    constructing this service directly) means no name gate.
+    """
+
+    async def require_session_name(self, *, session_id: uuid.UUID) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class SyncOutcome:
     integration_id: uuid.UUID
@@ -873,6 +890,7 @@ class NetworkIntegrationService:
         guest_session_lookup: GuestSessionLookupProtocol | None = None,
         guest_session_terminator: GuestSessionTerminatorProtocol | None = None,
         fleet_device_provisioner: FleetDeviceProvisionerProtocol | None = None,
+        guest_name_gate: GuestNameGateProtocol | None = None,
         provider_resolver=get_network_provider,
         url_resolver=None,
         redis: Redis | None = None,
@@ -892,6 +910,8 @@ class NetworkIntegrationService:
         # outright when it is missing. See
         # ``create_integration_with_fleet_device``.
         self.fleet_device_provisioner = fleet_device_provisioner
+        # See ``GuestNameGateProtocol``.
+        self.guest_name_gate = guest_name_gate
         # Injectable so tests substitute a fake provider without the
         # gateway package installed, and so a second provider needs no
         # change here. Production always passes the real registry.
@@ -4092,6 +4112,13 @@ class NetworkIntegrationService:
                 },
             )
             raise GuestSessionNotActiveError()
+        # Name required at sign-in -- after the session is proven, so the
+        # distinct ``guest_name_required`` answer is only ever given to a
+        # caller already holding a real, matching session and device. This
+        # is the step that opens the network at Omada/Aruba venues; without
+        # it the portal's "Your name" screen would be UI-only.
+        if self.guest_name_gate is not None:
+            await self.guest_name_gate.require_session_name(session_id=session_id)
         return session, normalized_mac
 
     async def authorize_portal_client(

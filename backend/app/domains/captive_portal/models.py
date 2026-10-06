@@ -410,6 +410,51 @@ class CaptivePortalConfig(BaseModel):
         Boolean, default=False, nullable=False
     )
 
+    # Name required at sign-in (OTP methods). Unlike the optional
+    # post-connect ask above, this one gates the network: a guest who
+    # verified a one-time code and has no name on file gets one "Your
+    # name" screen, and nothing opens the network for that session until
+    # the name is stored -- see
+    # ``app.domains.guest.service.GuestService.session_awaits_required_name``
+    # for every enforcement point.
+    #
+    # **Defaults TRUE** (owner decision, migration 0143), with a
+    # server_default so every creation path agrees. It implies
+    # ``collect_guest_name``; ``CaptivePortalService.update_config`` and
+    # ``create_config`` keep the pair consistent. A venue can switch it off.
+    require_guest_name: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+
+    # Email required at sign-in -- the email twin of ``require_guest_name``,
+    # same hold mechanism and the same enforcement points (see
+    # ``GuestService.session_awaits_required_details``). An email-OTP guest
+    # already satisfies it (their sign-in identifier IS an email).
+    #
+    # **Defaults FALSE** (migration 0148): unlike the name, nobody decided
+    # to require an email at every venue, and switching on collection of a
+    # contact channel for a venue is not ours to decide. It implies
+    # ``collect_guest_email``; ``update_config``/``create_config`` keep the
+    # pair consistent, exactly like the name pair.
+    require_guest_email: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+
+    # The venue's ordered post-login sequence (migration 0148):
+    # ``{"steps": ["survey", "offer", "page"], "finish": "connected" |
+    # "redirect"}``. ``steps`` run in order on ``/portal/session`` AFTER the
+    # gate has opened (the NAS/controller/AP login always happens first);
+    # ``finish`` is where the guest ends up. ``survey``/``offer`` show the
+    # venue's eligible Login Page Offers campaigns of that kind (a step with
+    # nothing eligible is skipped), ``page`` is ``post_login_html``.
+    #
+    # NULL means "never configured" and keeps every existing venue's
+    # behaviour exactly: the portal derives the old single choice from
+    # ``post_login_html``/``redirect_url`` -- see the frontend's
+    # ``resolvePostLoginSequence``. Shape and cross-field rules are checked
+    # in ``validators.validate_post_login_sequence``.
+    post_login_sequence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     # The post-connect "would you review us on Google" card. Defaults off:
     # it is greenfield, it has no value at all without ``review_url``
     # below, and switching a review request on for a venue that has not

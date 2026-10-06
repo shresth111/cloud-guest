@@ -426,6 +426,15 @@ class FakeCampaignsRepository:
     ) -> list[CampaignImpression]:
         return [i for i in self.impressions.values() if i.campaign_id == campaign_id]
 
+    async def list_campaign_ids_shown_in_session(
+        self, guest_session_id: uuid.UUID
+    ) -> set[uuid.UUID]:
+        return {
+            i.campaign_id
+            for i in self.impressions.values()
+            if i.guest_session_id == guest_session_id and not i.is_deleted
+        }
+
 
 @dataclass
 class FakeOrganizationLookup:
@@ -1018,10 +1027,12 @@ class TestGetNextCampaignForSession:
             display_interval_days=7,
         )
         campaign.status = CampaignStatus.ACTIVE.value
-        h.repository.session_guest_map[session.id] = guest.id
+        # Ten days ago is an earlier login -- a different guest session.
+        earlier_session_id = uuid.uuid4()
+        h.repository.session_guest_map[earlier_session_id] = guest.id
         await h.repository.create_impression(
             campaign_id=campaign.id,
-            guest_session_id=session.id,
+            guest_session_id=earlier_session_id,
             shown_at=_now() - timedelta(days=10),
             was_skipped=False,
             was_clicked=False,
@@ -1043,6 +1054,136 @@ class TestGetNextCampaignForSession:
 
         with pytest.raises(GuestSessionNotActiveError):
             await h.service.get_next_campaign_for_session(session.id)
+
+
+class TestCampaignQueueForSession:
+    """Item 4 of the 2026-10-06 portal QA: an offer and a survey with the
+    same start used to be tie-broken arbitrarily, one campaign per session,
+    so the survey never showed behind an ``EVERY_LOGIN`` offer."""
+
+    _setup = TestGetNextCampaignForSession._setup
+
+    async def _active(
+        self, h: Harness, org: Organization, **kwargs: object
+    ) -> Campaign:
+        campaign = await _create_campaign(h, org, **kwargs)
+        campaign.status = CampaignStatus.ACTIVE.value
+        return campaign
+
+    async def _shown(self, h: Harness, campaign: Campaign, session_id: uuid.UUID):
+        await h.repository.create_impression(
+            campaign_id=campaign.id,
+            guest_session_id=session_id,
+            shown_at=_now(),
+            was_skipped=True,
+            was_clicked=False,
+        )
+
+    async def test_empty_queue(self) -> None:
+        h = make_harness()
+        *_, session = self._setup(h)
+        assert await h.service.list_campaign_queue_for_session(session.id) == []
+
+    async def test_queue_returns_survey_and_banner_together(self) -> None:
+        h = make_harness()
+        org, *_, session = self._setup(h)
+        start = _now() - timedelta(hours=1)
+        survey = await self._active(h, org, name="Quality Survey", starts_at=start)
+        offer = await self._active(
+            h,
+            org,
+            name="Winter Offer",
+            campaign_type=CampaignType.BANNER,
+            starts_at=start,
+        )
+
+        queue = await h.service.list_campaign_queue_for_session(session.id)
+
+        assert {r.campaign.id for r in queue} == {survey.id, offer.id}
+        by_id = {r.campaign.id: r for r in queue}
+        assert by_id[offer.id].questions == []
+        assert by_id[survey.id].asset is None
+
+    async def test_order_is_deterministic_on_a_tied_start(self) -> None:
+        h = make_harness()
+        org, *_, session = self._setup(h)
+        start = _now() - timedelta(hours=1)
+        older = await self._active(h, org, name="A", starts_at=start)
+        newer = await self._active(
+            h, org, name="B", campaign_type=CampaignType.BANNER, starts_at=start
+        )
+        older.created_at = _now() - timedelta(minutes=5)
+        newer.created_at = _now()
+
+        for _ in range(3):
+            queue = await h.service.list_campaign_queue_for_session(session.id)
+            assert [r.campaign.id for r in queue] == [newer.id, older.id]
+            nxt = await h.service.get_next_campaign_for_session(session.id)
+            assert nxt is not None and nxt.campaign.id == newer.id
+
+    async def test_full_tie_breaks_on_id(self) -> None:
+        h = make_harness()
+        org, *_, session = self._setup(h)
+        start = _now() - timedelta(hours=1)
+        a = await self._active(h, org, name="A", starts_at=start)
+        b = await self._active(h, org, name="B", starts_at=start)
+        a.created_at = b.created_at = start
+        expected = sorted([a.id, b.id], key=str)
+
+        queue = await h.service.list_campaign_queue_for_session(session.id)
+
+        assert [r.campaign.id for r in queue] == expected
+
+    async def test_next_skips_what_this_session_already_saw(self) -> None:
+        h = make_harness()
+        org, _, _, guest, session = self._setup(h)
+        start = _now() - timedelta(hours=1)
+        survey = await self._active(h, org, name="Survey", starts_at=start)
+        offer = await self._active(
+            h, org, name="Offer", campaign_type=CampaignType.BANNER, starts_at=start
+        )
+        survey.created_at = _now() - timedelta(minutes=5)
+        offer.created_at = _now()
+        h.repository.session_guest_map[session.id] = guest.id
+
+        first = await h.service.get_next_campaign_for_session(session.id)
+        assert first is not None and first.campaign.id == offer.id
+        await self._shown(h, offer, session.id)
+
+        second = await h.service.get_next_campaign_for_session(session.id)
+        assert second is not None and second.campaign.id == survey.id
+        await self._shown(h, survey, session.id)
+
+        assert await h.service.get_next_campaign_for_session(session.id) is None
+        assert await h.service.list_campaign_queue_for_session(session.id) == []
+
+    async def test_every_login_returns_on_the_next_session(self) -> None:
+        h = make_harness()
+        org, location, router, guest, session = self._setup(h)
+        offer = await self._active(
+            h,
+            org,
+            campaign_type=CampaignType.BANNER,
+            display_rule=DisplayRule.EVERY_LOGIN,
+        )
+        h.repository.session_guest_map[session.id] = guest.id
+        await self._shown(h, offer, session.id)
+        later = _make_guest_session(
+            guest_id=guest.id,
+            router_id=router.id,
+            location_id=location.id,
+            organization_id=org.id,
+        )
+        h.guest_session_lookup.add_session(later)
+
+        queue = await h.service.list_campaign_queue_for_session(later.id)
+
+        assert [r.campaign.id for r in queue] == [offer.id]
+
+    async def test_unknown_session_raises(self) -> None:
+        h = make_harness()
+        with pytest.raises(GuestSessionNotFoundError):
+            await h.service.list_campaign_queue_for_session(uuid.uuid4())
 
 
 # ============================================================================
@@ -1282,7 +1423,7 @@ class TestRoutePermissionStructure:
     def test_every_guest_facing_campaigns_route_has_no_permission_dependency(
         self,
     ) -> None:
-        assert len(campaigns_guest_router.routes) == 3
+        assert len(campaigns_guest_router.routes) == 4
         for route in campaigns_guest_router.routes:
             assert route.dependencies == [], (
                 f"{route.path} ({route.methods}) unexpectedly carries a "

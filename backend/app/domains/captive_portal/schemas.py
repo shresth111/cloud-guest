@@ -49,6 +49,33 @@ __all__ = [
 # ============================================================================
 
 
+class PostLoginSequencePayload(BaseModel):
+    """The venue's ordered post-login sequence -- see the
+    ``captive_portal_configs.post_login_sequence`` column comment.
+
+    Deliberately loose types here (plain strings) so the service's
+    ``validate_post_login_sequence`` gives one friendly 400 for every
+    mistake, including the cross-field ones a schema cannot see (a
+    ``page`` step with no page, a ``redirect`` finish with no URL)."""
+
+    steps: list[str] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "Ordered, distinct steps run after the gate opens: `survey` "
+            "(eligible survey campaigns), `offer` (eligible banner/discount "
+            "campaigns), `page` (the venue's post_login_html). A step with "
+            "nothing eligible is skipped for that guest."
+        ),
+    )
+    finish: str = Field(
+        default="connected",
+        description=(
+            "`connected` (the built-in connected page) or `redirect` (redirect_url)."
+        ),
+    )
+
+
 class CaptivePortalConfigCreateRequest(BaseModel):
     organization_id: uuid.UUID
     location_id: uuid.UUID | None = Field(
@@ -186,6 +213,34 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "contact attribute, not a marketing list: there is no "
             "marketing-consent artifact in this codebase yet, so nothing "
             "collected here may be mailed offers."
+        ),
+    )
+    require_guest_name: bool = Field(
+        default=True,
+        description=(
+            "Name required at sign-in. A guest who signs in with a "
+            "one-time code (SMS/WhatsApp/email) and has no name on file "
+            "is asked for it on one screen right after the code verifies, "
+            "and the network is not opened until it is stored -- enforced "
+            "server-side, error code `guest_name_required`. Implies "
+            "`collect_guest_name` (forced on by the server). Defaults ON "
+            "for every venue (owner decision); a venue can switch it off."
+        ),
+    )
+    require_guest_email: bool = Field(
+        default=False,
+        description=(
+            "Email required at sign-in -- the email twin of "
+            "`require_guest_name`, same hold, error code "
+            "`guest_email_required`. An email-OTP guest already satisfies "
+            "it. Implies `collect_guest_email`. Defaults OFF."
+        ),
+    )
+    post_login_sequence: PostLoginSequencePayload | None = Field(
+        default=None,
+        description=(
+            "Ordered post-login steps + final destination. Null keeps the "
+            "derived single choice (post_login_html / redirect_url)."
         ),
     )
     review_card_enabled: bool = Field(
@@ -403,6 +458,29 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     content_survey: dict | None = Field(default=None)
     collect_guest_name: bool | None = Field(default=None)
     collect_guest_email: bool | None = Field(default=None)
+    require_guest_name: bool | None = Field(
+        default=None,
+        description=(
+            "Name required at sign-in. When the merged value is true the "
+            "server also sets `collect_guest_name` true, overriding an "
+            "explicit false in the same payload."
+        ),
+    )
+    require_guest_email: bool | None = Field(
+        default=None,
+        description=(
+            "Email required at sign-in. When the merged value is true the "
+            "server also sets `collect_guest_email` true."
+        ),
+    )
+    post_login_sequence: PostLoginSequencePayload | None = Field(
+        default=None,
+        description=(
+            "Ordered post-login steps + final destination. Omit to leave "
+            "it unchanged; send null to clear it (back to the derived "
+            "single choice)."
+        ),
+    )
     review_card_enabled: bool | None = Field(default=None)
     review_url: str | None = Field(
         default=None,
@@ -524,6 +602,9 @@ class CaptivePortalConfigResponse(BaseModel):
     content_survey: dict | None
     collect_guest_name: bool
     collect_guest_email: bool
+    require_guest_name: bool
+    require_guest_email: bool = False
+    post_login_sequence: dict | None = None
     review_card_enabled: bool
     review_url: str | None
     guest_feedback_enabled: bool

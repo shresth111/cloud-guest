@@ -114,6 +114,7 @@ from .validators import (
     validate_feedback_dwell_minutes,
     validate_guest_font_choice,
     validate_hex_color,
+    validate_post_login_sequence,
     validate_review_url,
     validate_single_content_source,
     validate_splash_text_length,
@@ -451,6 +452,9 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "content_survey",
     "collect_guest_name",
     "collect_guest_email",
+    "require_guest_name",
+    "require_guest_email",
+    "post_login_sequence",
     "review_card_enabled",
     "review_url",
     "guest_feedback_enabled",
@@ -520,6 +524,9 @@ class _CachedCaptivePortalConfig:
     content_survey: dict[str, Any] | None
     collect_guest_name: bool
     collect_guest_email: bool
+    require_guest_name: bool
+    require_guest_email: bool
+    post_login_sequence: dict[str, Any] | None
     review_card_enabled: bool
     review_url: str | None
     guest_feedback_enabled: bool
@@ -651,6 +658,8 @@ _NOT_NULL_BOOLEAN_UPDATE_FIELDS = frozenset(
         "powered_by_enabled",
         "collect_guest_name",
         "collect_guest_email",
+        "require_guest_name",
+        "require_guest_email",
         "review_card_enabled",
         "guest_feedback_enabled",
         "otp_sms_enabled",
@@ -790,6 +799,17 @@ class CaptivePortalService:
         # Business Profile. See the columns' own comments in models.py.
         collect_guest_name: bool = False,
         collect_guest_email: bool = False,
+        # Name required at sign-in. The one exception to "off by default"
+        # above: an owner decision (migration 0143) turned it on for every
+        # venue, new and existing. It implies collect_guest_name -- see
+        # the forced-on line below.
+        require_guest_name: bool = True,
+        # Email required at sign-in -- off by default (migration 0148);
+        # implies collect_guest_email exactly as the name pair does.
+        require_guest_email: bool = False,
+        # The ordered post-login sequence. None (the default) is "never
+        # configured": the portal keeps deriving the old single choice.
+        post_login_sequence: dict | None = None,
         review_card_enabled: bool = False,
         review_url: str | None = None,
         guest_feedback_enabled: bool = False,
@@ -827,6 +847,13 @@ class CaptivePortalService:
         # (400) before any DB work if the submitted payload is over the
         # byte ceiling.
         post_login_html = sanitize_post_login_html(post_login_html)
+        # Against the SANITIZED page: a page that sanitizes to nothing is no
+        # page, and a "Show my page" step pointing at it is refused here.
+        post_login_sequence = validate_post_login_sequence(
+            post_login_sequence,
+            post_login_html=post_login_html,
+            redirect_url=redirect_url,
+        )
 
         organization = await self.organization_lookup.get_organization(organization_id)
         if (
@@ -876,8 +903,13 @@ class CaptivePortalService:
             content_body=content_body,
             content_image_url=content_image_url,
             content_survey=content_survey,
-            collect_guest_name=collect_guest_name,
-            collect_guest_email=collect_guest_email,
+            # Required implies collected: a venue cannot require a name it
+            # has not agreed to hold.
+            collect_guest_name=collect_guest_name or require_guest_name,
+            collect_guest_email=collect_guest_email or require_guest_email,
+            require_guest_name=require_guest_name,
+            require_guest_email=require_guest_email,
+            post_login_sequence=post_login_sequence,
             review_card_enabled=review_card_enabled,
             review_url=review_url,
             guest_feedback_enabled=guest_feedback_enabled,
@@ -1129,6 +1161,25 @@ class CaptivePortalService:
         # stored earlier.
         if "feedback_dwell_minutes" in update_data:
             validate_feedback_dwell_minutes(update_data["feedback_dwell_minutes"])
+        # Name required at sign-in implies the name is collected. Required
+        # WINS over an explicit ``collect_guest_name: false`` in the same
+        # payload rather than refusing the save: the dashboard PUTs its
+        # whole form, and a settings bundle that predates the require
+        # toggle would otherwise be unable to save anything at a venue
+        # whose collect flag is off. To stop collecting, a venue turns the
+        # requirement off first (the settings UI greys the collect toggle
+        # while required is on, so the two cannot be seen to disagree).
+        merged_require_name = bool(
+            update_data.get("require_guest_name", config.require_guest_name)
+        )
+        if merged_require_name:
+            update_data["collect_guest_name"] = True
+        # Same rule for the email twin (migration 0148).
+        merged_require_email = bool(
+            update_data.get("require_guest_email", config.require_guest_email)
+        )
+        if merged_require_email:
+            update_data["collect_guest_email"] = True
         if "background_overlay_strength" in update_data:
             validate_background_overlay_strength(
                 update_data["background_overlay_strength"]
@@ -1178,6 +1229,27 @@ class CaptivePortalService:
             update_data["post_login_html"] = sanitize_post_login_html(
                 submitted if submitted is None else str(submitted)
             )
+
+        # The post-login sequence is checked against the MERGED page and
+        # redirect URL -- after the page is sanitized -- whenever any of the
+        # three is in the payload. So clearing the page while a stored
+        # sequence still has a "page" step is refused, not silently left as
+        # a step no guest can ever see. An explicit null clears the
+        # sequence (back to the derived single choice) and needs no check.
+        sequence_inputs = {"post_login_sequence", "post_login_html", "redirect_url"}
+        if sequence_inputs & set(update_data):
+            merged_sequence = update_data.get(
+                "post_login_sequence", config.post_login_sequence
+            )
+            validated_sequence = validate_post_login_sequence(
+                merged_sequence,
+                post_login_html=update_data.get(
+                    "post_login_html", config.post_login_html
+                ),
+                redirect_url=update_data.get("redirect_url", config.redirect_url),
+            )
+            if "post_login_sequence" in update_data:
+                update_data["post_login_sequence"] = validated_sequence
 
         if "powered_by_enabled" in update_data:
             await self._enforce_powered_by_entitlement(

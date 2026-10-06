@@ -540,7 +540,11 @@ class TestReviewUrlOnTheConfig:
         config. See migration 0114 for why that is not the usual
         "unchanged means unchanged" default."""
         fx = make_service()
-        config = await _create_config(fx)
+        # ``require_guest_name`` defaults ON (owner decision, migration
+        # 0143) and implies collecting the name, so the name half of the
+        # card is only off at a venue that also switched the requirement
+        # off. See test_require_guest_name.TestDefaults for the default.
+        config = await _create_config(fx, require_guest_name=False)
         assert config.collect_guest_name is False
         assert config.collect_guest_email is False
         assert config.review_card_enabled is False
@@ -1040,4 +1044,6 @@ class TestTheCacheKeyMovedWithTheFieldSet:
             "feedback_dwell_minutes",
         ):
             assert field in _CACHED_CONFIG_SCALAR_FIELDS
-        assert _CACHE_KEY_TEMPLATE.split(":")[2] == "v8"
+        # v9 since require_guest_name joined the same tuple; v10 since
+        # require_guest_email + post_login_sequence (migration 0148) did.
+        assert _CACHE_KEY_TEMPLATE.split(":")[2] == "v10"

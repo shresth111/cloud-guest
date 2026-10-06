@@ -16,9 +16,13 @@ from .constants import (
     BYTES_PER_MB,
     DASHBOARD_SERIES_BUCKET_SECONDS,
     DEFAULT_IDLE_TIMEOUT_MINUTES,
+    GUEST_DISPLAY_NAME_MAX_LENGTH,
     GUEST_SESSION_STATUS_TRANSITIONS,
     MAX_DASHBOARD_SERIES_WINDOW_DAYS,
+    NAME_REQUIRED_AUTH_METHODS,
     NAS_STATUS_TRANSITIONS,
+    REQUIRED_DETAIL_EMAIL,
+    REQUIRED_DETAIL_NAME,
     SESSION_ACTIVITY_GRACE_MINUTES,
     DashboardSeriesBucket,
     GuestSessionStatus,
@@ -26,6 +30,8 @@ from .constants import (
     QuotaPeriodType,
 )
 from .exceptions import (
+    GuestEmailInvalidError,
+    GuestNameInvalidError,
     InvalidAnalyticsDateRangeError,
     InvalidDashboardSeriesRangeError,
     InvalidExtensionMinutesError,
@@ -33,6 +39,124 @@ from .exceptions import (
     InvalidSessionStatusTransitionError,
 )
 from .models import Guest, GuestSession
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def normalize_guest_display_name(raw: str | None) -> str:
+    """The one place a sign-in name is cleaned and checked.
+
+    Trims, collapses internal runs of whitespace to one space (a name typed
+    on a phone keyboard often carries a double space or a trailing one),
+    then refuses empty, over-long (``GUEST_DISPLAY_NAME_MAX_LENGTH``, the
+    column's own width, measured after cleaning) and control characters.
+    Raises ``GuestNameInvalidError`` (``data.code == "guest_name_invalid"``).
+    """
+    if raw is None:
+        raise GuestNameInvalidError("Please enter your name.")
+    if _CONTROL_CHARS.search(raw.replace("\t", " ").replace("\n", " ")):
+        raise GuestNameInvalidError("Your name contains characters we can't store.")
+    cleaned = " ".join(raw.split())
+    if not cleaned:
+        raise GuestNameInvalidError("Please enter your name.")
+    if len(cleaned) > GUEST_DISPLAY_NAME_MAX_LENGTH:
+        raise GuestNameInvalidError(
+            f"Please keep your name under {GUEST_DISPLAY_NAME_MAX_LENGTH} characters."
+        )
+    return cleaned
+
+
+def session_awaits_required_name(
+    *, session: GuestSession, guest: Guest | None, require_guest_name: bool
+) -> bool:
+    """Whether ``session`` must be held off the network until the guest
+    gives a name.
+
+    True only when all three hold: the venue requires a name
+    (``require_guest_name``, resolved by the caller against the SESSION's
+    location -- never ``Guest.location_id``, the guest's "home" venue),
+    the session was opened by an OTP method (``NAME_REQUIRED_AUTH_METHODS``
+    -- voucher/password/PIN/MAC-whitelist sessions are out of scope), and
+    the guest has no non-blank name on file.
+
+    Pure, so the four enforcement points (RADIUS Authorize,
+    ``/agent/authorized-macs``, and both network-integration portal
+    authorize routes) apply literally the same rule.
+    """
+    if not require_guest_name:
+        return False
+    if str(session.auth_method) not in NAME_REQUIRED_AUTH_METHODS:
+        return False
+    name = (guest.display_name if guest is not None else None) or ""
+    return not name.strip()
+
+
+#: Deliberately permissive -- the portal's own rule (``isValidGuestEmail``).
+#: Every stricter pattern rejects real addresses; this catches "priya@gmail"
+#: and a stray space, nothing more.
+_GUEST_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_GUEST_EMAIL_MAX_LENGTH = 255  # Guest.email's own width
+
+
+def normalize_guest_email(raw: str | None) -> str:
+    """The one place a sign-in email is cleaned and checked: trimmed,
+    lower-cased (an address is matched case-insensitively everywhere this
+    product looks one up), then refused when empty, wider than the column,
+    or not shaped like ``x@y.z``. Raises ``GuestEmailInvalidError``
+    (``data.code == "guest_email_invalid"``)."""
+    cleaned = (raw or "").strip().lower()
+    if not cleaned:
+        raise GuestEmailInvalidError("Please enter your email address.")
+    if len(cleaned) > _GUEST_EMAIL_MAX_LENGTH or not _GUEST_EMAIL_PATTERN.match(
+        cleaned
+    ):
+        raise GuestEmailInvalidError("Please enter a valid email address.")
+    return cleaned
+
+
+def guest_has_email_on_file(guest: Guest | None) -> bool:
+    """Whether this platform already holds an email for the guest: the
+    profile email, or -- for an email-OTP guest -- the sign-in identifier
+    itself, which IS an address the guest just proved they own. Asking that
+    guest for their email again is asking a question we know the answer
+    to."""
+    if guest is None:
+        return False
+    if (guest.email or "").strip():
+        return True
+    return "@" in (guest.identifier or "")
+
+
+def guest_has_name_on_file(guest: Guest | None) -> bool:
+    return bool(guest is not None and (guest.display_name or "").strip())
+
+
+def session_missing_required_details(
+    *,
+    session: GuestSession,
+    guest: Guest | None,
+    require_guest_name: bool,
+    require_guest_email: bool,
+) -> tuple[str, ...]:
+    """Which sign-in details (``"name"``, ``"email"``, in that order) hold
+    ``session`` off the network. Empty means nothing is missing.
+
+    The generalisation of ``session_awaits_required_name`` to the email
+    twin (``require_guest_email``, migration 0148), with the identical
+    scope rule: only OTP sessions (``NAME_REQUIRED_AUTH_METHODS``) are ever
+    held -- voucher/password/PIN/MAC-whitelist sign-ins are out of scope
+    (owner decision on #353, kept for email). Pure, so every enforcement
+    point applies literally the same rule."""
+    if not (require_guest_name or require_guest_email):
+        return ()
+    if str(session.auth_method) not in NAME_REQUIRED_AUTH_METHODS:
+        return ()
+    missing: list[str] = []
+    if require_guest_name and not guest_has_name_on_file(guest):
+        missing.append(REQUIRED_DETAIL_NAME)
+    if require_guest_email and not guest_has_email_on_file(guest):
+        missing.append(REQUIRED_DETAIL_EMAIL)
+    return tuple(missing)
 
 
 def guest_has_profile(guest: Guest) -> bool:

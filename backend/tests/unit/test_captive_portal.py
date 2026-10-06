@@ -489,6 +489,8 @@ async def _create_config(
     whitelist_only_denied_message: str | None = None,
     collect_guest_name: bool = False,
     collect_guest_email: bool = False,
+    # None = do not pass it, so the service's own default (True) applies.
+    require_guest_name: bool | None = None,
     review_card_enabled: bool = False,
     review_url: str | None = None,
     guest_feedback_enabled: bool = False,
@@ -543,6 +545,11 @@ async def _create_config(
         review_url=review_url,
         guest_feedback_enabled=guest_feedback_enabled,
         feedback_dwell_minutes=feedback_dwell_minutes,
+        **(
+            {}
+            if require_guest_name is None
+            else {"require_guest_name": require_guest_name}
+        ),
     )
 
 
@@ -2566,7 +2573,8 @@ class TestResolveCacheKeyVersion:
         anything reading the new fields. v8 is the post-connect ask
         columns -- ``collect_guest_name``, ``collect_guest_email``,
         ``review_card_enabled``, ``review_url``, ``guest_feedback_enabled``
-        and ``feedback_dwell_minutes`` -- joining it again.
+        and ``feedback_dwell_minutes`` -- joining it again. v9 is
+        ``require_guest_name`` (name required at sign-in).
 
         Two changes claimed v7 independently, in parallel worktrees. Had
         both landed spelling it v7, the second would have served a new
@@ -2576,7 +2584,7 @@ class TestResolveCacheKeyVersion:
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v8:org:loc"
+        assert key == "captive_portal:resolve:v10:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it

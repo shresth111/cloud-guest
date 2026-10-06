@@ -418,3 +418,19 @@ __all__ = [
     "TERMS_AND_CONDITIONS_LABEL",
     "PRIVACY_POLICY_LABEL",
 ]
+
+
+# ``captive_portal_configs.post_login_sequence`` -- the venue's ordered
+# post-login steps (run on ``/portal/session`` after the gate has opened)
+# and the place the guest ends up. See the column's comment in models.py.
+#
+#   ``survey`` -- the venue's eligible Login Page Offers *survey* campaigns
+#   ``offer``  -- its eligible banner / discount campaigns
+#   ``page``   -- the venue's own ``post_login_html`` page
+#
+# A step with nothing behind it at that moment (no eligible campaign) is
+# skipped by the portal; a ``page`` step with no stored page, or a
+# ``redirect`` finish with no ``redirect_url``, is refused on write instead,
+# because those are configuration mistakes the venue can see and fix.
+POST_LOGIN_STEP_TYPES = ("survey", "offer", "page")
+POST_LOGIN_FINISHES = ("connected", "redirect")

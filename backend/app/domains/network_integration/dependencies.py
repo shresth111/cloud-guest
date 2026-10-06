@@ -179,6 +179,7 @@ def get_network_integration_service(
     fleet_device_provisioner: FleetDeviceProvisionerProtocol = Depends(
         get_fleet_device_provisioner
     ),
+    guest_service: GuestService = Depends(get_guest_service),
 ) -> NetworkIntegrationService:
     return NetworkIntegrationService(
         repository,
@@ -186,6 +187,8 @@ def get_network_integration_service(
         guest_session_lookup=guest_session_lookup,
         guest_session_terminator=guest_session_terminator,
         fleet_device_provisioner=fleet_device_provisioner,
+        # Name required at sign-in -- see ``GuestNameGateProtocol``.
+        guest_name_gate=guest_service,
         redis=redis,
         caller_location_scope=caller_location_scope,
     )

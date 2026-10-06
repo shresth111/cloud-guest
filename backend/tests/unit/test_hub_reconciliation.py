@@ -280,6 +280,45 @@ class TestReconcilePass:
 
         assert len(pushes) == 1
 
+    @pytest.mark.parametrize("synced_ip", ["10.20.0.37", "10.20.0.35"])
+    async def test_known_orphans_never_drive_a_rebind(
+        self, pushes, synced_ip
+    ) -> None:
+        """A router regenerated with rotation leaves superseded peers on the
+        hub, still attributed to it. Only the live peer may decide the NAS
+        binding, or the binding flaps every pass and each flap restarts
+        FreeRADIUS for the fleet."""
+        from app.domains.wireguard.constants import FleetPeerStatus
+
+        radius = FakeRadiusService()
+        router_id = uuid.uuid4()
+        _nas(radius, router_id, hub_client_synced_ip=synced_ip)
+        entries = [
+            self._entry(
+                status=FleetPeerStatus.KNOWN_ORPHAN,
+                public_key=f"ORPHAN-{n}",
+                router_id=router_id,
+                tunnel_ip_address=f"10.20.0.{n}",
+                hub_tunnel_ip_address=f"10.20.0.{n}",
+            )
+            for n in (34, 35, 36)
+        ] + [
+            self._entry(
+                public_key="LIVE",
+                router_id=router_id,
+                tunnel_ip_address="10.20.0.37",
+                hub_tunnel_ip_address="10.20.0.37",
+            )
+        ]
+        wireguard = FakeWireGuardService(fleet=self._fleet(entries))
+        service = HubReconciliationService(wireguard, radius)
+
+        await service.reconcile()
+        await service.reconcile()
+
+        expected = [] if synced_ip == "10.20.0.37" else ["10.20.0.37"]
+        assert [p["tunnel_ip"] for p in pushes] == expected
+
     async def test_ambiguous_and_unattributable_peers_are_reported_never_pushed(
         self, pushes
     ) -> None:
