@@ -996,6 +996,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # CLOUDGUEST_INSTANT_ON_POLLER_ENABLED is true. See
         # app.domains.network_integration.instant_on_tasks.
         "instant-on-poll-sweep",
+        # NetFlow/IPFIX: pulls 5-minute windows from the hub flow agent.
+        # Inert unless CLOUDGUEST_TRAFFIC_FLOW_ENABLED is true. See
+        # app.domains.traffic_flow.tasks.
+        "traffic-flow-pull-sweep",
     }
 
 
