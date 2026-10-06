@@ -439,6 +439,8 @@ def _router(vendor="mikrotik", creds=True):
     return SimpleNamespace(
         id=ROUTER_ID,
         name="Lab hEX",
+        organization_id=ORG_ID,
+        location_id=LOC_ID,
         vendor=vendor,
         management_ip_address="10.20.0.31",
         public_ip_address=None,
