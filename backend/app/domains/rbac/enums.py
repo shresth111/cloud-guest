@@ -358,6 +358,11 @@ class AuditAction(StrEnum):
         "router_configuration_plan_final_verified"
     )
     ROUTER_WAN_ROUTING_MODE_CHANGED = "router_wan_routing_mode_changed"
+    # SNMP (Master console, app.domains.router.snmp). Metadata carries
+    # field NAMES and outcomes only, never a community or passphrase.
+    ROUTER_SNMP_CONFIG_UPDATED = "router_snmp_config_updated"
+    ROUTER_SNMP_TESTED = "router_snmp_tested"
+    ROUTER_SNMP_APPLIED = "router_snmp_applied"
 
     # WireGuard domain events (Module 009 Part 3) -- written through this
     # same table by ``app.domains.wireguard.service.WireGuardService`` via

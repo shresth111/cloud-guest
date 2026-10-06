@@ -84,6 +84,7 @@ from librouteros.exceptions import LibRouterosError
 
 from . import mikrotik_firewall as _fw
 from . import mikrotik_guest_isolation as _iso
+from . import mikrotik_snmp as _snmp
 from . import mikrotik_traffic_flow as _tflow
 from .contract import (
     ConnectedDevice,
@@ -6872,6 +6873,42 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"{op}_guest_isolation: {exc}"
                 ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # SNMP agent (for the platform's own read-only poller)
+    # ------------------------------------------------------------------
+
+    async def read_snmp_state(self, creds: DeviceCredentials) -> _snmp.SnmpDeviceState:
+        """Read-only: see :func:`wyfy_device_gateway.mikrotik_snmp.read_snmp_state`."""
+        return await asyncio.to_thread(self._snmp_sync, creds, "read", None)
+
+    async def apply_snmp_config(
+        self, creds: DeviceCredentials, config: _snmp.SnmpDeviceConfig
+    ) -> _snmp.SnmpApplyResult:
+        """Enable the agent with the platform's read-only community, fence
+        the factory ``public`` one, and read back."""
+        return await asyncio.to_thread(self._snmp_sync, creds, "apply", config)
+
+    async def remove_snmp_config(
+        self, creds: DeviceCredentials
+    ) -> _snmp.SnmpApplyResult:
+        """Remove the platform's community (see the module for when the
+        agent itself is turned off)."""
+        return await asyncio.to_thread(self._snmp_sync, creds, "remove", None)
+
+    def _snmp_sync(self, creds: DeviceCredentials, op: str, config):  # noqa: ANN001, ANN202
+        api = self._connect_api(creds)
+        try:
+            try:
+                if op == "read":
+                    return _snmp.read_snmp_state(api)
+                if op == "apply":
+                    return _snmp.apply_snmp_config(api, config)
+                return _snmp.remove_snmp_config(api)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"{op}_snmp: {exc}") from exc
         finally:
             self._safe_close(api)
 

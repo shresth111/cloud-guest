@@ -3193,8 +3193,8 @@ def render_network_config(
     # Pre-rendered by app.domains.traffic_flow.routeros (the single source
     # the device writer also uses -- parity by construction), already gated
     # there on CLOUDGUEST_TRAFFIC_FLOW_ENABLED + the router allowlist + a
-    # tunnel. None/empty = no section. Kept self-contained so the sibling
-    # SNMP generator work only overlaps at this call site.
+    # tunnel. None/empty = no section. Kept self-contained: one keyword
+    # argument and this block are the whole footprint in this function.
     if traffic_flow_lines:
         sections.extend(_idempotent_lines(traffic_flow_lines))
     # THE GUEST DATA PATH RIDES ALONG WITH ANY REAL PUSH, but does not by
