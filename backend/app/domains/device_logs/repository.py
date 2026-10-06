@@ -225,13 +225,17 @@ class DeviceLogsRepository:
 
     async def list_configs(
         self,
-    ) -> list[tuple[RouterRemoteLogging, str, str | None, str | None]]:
+    ) -> list[tuple[Any, ...]]:
+        """(config, router name, location name, organization name,
+        organization id, location id) per configured router."""
         stmt = (
             select(
                 RouterRemoteLogging,
                 Router.name,
                 Location.name,
                 Organization.name,
+                Router.organization_id,
+                Router.location_id,
             )
             .join(Router, Router.id == RouterRemoteLogging.router_id)
             .outerjoin(Location, Location.id == Router.location_id)

@@ -341,11 +341,15 @@ class DeviceLogsService:
         router_name: str | None,
         location_name: str | None,
         organization_name: str | None,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
         last_received_at: datetime | None,
     ) -> dict[str, Any]:
         return {
             "router_id": str(config.router_id),
             "router_name": router_name,
+            "organization_id": _id(organization_id),
+            "location_id": _id(location_id),
             "location_name": location_name,
             "organization_name": organization_name,
             "enabled": config.enabled,
@@ -375,9 +379,18 @@ class DeviceLogsService:
                 router_name=router_name,
                 location_name=location_name,
                 organization_name=organization_name,
+                organization_id=organization_id,
+                location_id=location_id,
                 last_received_at=last.get(config.router_id),
             )
-            for config, router_name, location_name, organization_name in configs
+            for (
+                config,
+                router_name,
+                location_name,
+                organization_name,
+                organization_id,
+                location_id,
+            ) in configs
         ]
         unattributed = 0
         if self.enabled:
@@ -463,6 +476,8 @@ class DeviceLogsService:
                 router_name=router.name,
                 location_name=ctx["location_name"],
                 organization_name=ctx["organization_name"],
+                organization_id=router.organization_id,
+                location_id=router.location_id,
                 last_received_at=last,
             )
             if row is not None

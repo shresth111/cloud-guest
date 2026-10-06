@@ -69,6 +69,8 @@ class DeviceLogPage(BaseModel):
 class RouterLoggingStatus(BaseModel):
     router_id: str
     router_name: str | None
+    organization_id: str | None
+    location_id: str | None
     location_name: str | None
     organization_name: str | None
     enabled: bool
