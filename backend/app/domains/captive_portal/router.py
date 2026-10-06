@@ -466,15 +466,16 @@ def _content_image_asset_response(
 ) -> Response:
     """Serves uploaded content-image bytes with the same strong-ETag
     browser caching the branding public proxies use (branding/router.py's
-    ``_asset_response``) -- content-addressed hash, ``max-age`` from the
-    branding asset TTL setting. The image URL never changes (it is the
+    ``_asset_response``) -- content-addressed hash, ``no-cache`` so a
+    replaced picture shows at once. The image URL never changes (it is the
     config's public path), so without the ETag every guest page load
     re-downloads the same bytes."""
     etag = hashlib.sha256(content).hexdigest()
     quoted_etag = f'"{etag}"'
-    ttl = get_settings().branding_asset_cache_ttl_seconds
+    # `no-cache` for the same reason as branding's `_asset_response`: the
+    # URL stays the same when the picture is replaced.
     headers = {
-        "Cache-Control": f"public, max-age={ttl}, must-revalidate",
+        "Cache-Control": "public, no-cache",
         "ETag": quoted_etag,
     }
     if_none_match = request.headers.get("if-none-match")
