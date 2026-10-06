@@ -239,6 +239,13 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ),
     ("POST", "/api/v1/radius/authorize"): "FreeRADIUS -- CurrentNas shared secret.",
     ("POST", "/api/v1/radius/accounting"): "FreeRADIUS -- CurrentNas shared secret.",
+    ("POST", "/api/v1/internal/device-logs/ingest"): (
+        "Syslog collector (Vector) -- no platform user exists. Authenticated "
+        "by the X-Device-Logs-Secret shared secret (constant-time compare, "
+        "empty configured secret refuses all) and 404 while "
+        "CLOUDGUEST_DEVICE_LOGS_ENABLED is off. See "
+        "app.domains.device_logs.router."
+    ),
     ("POST", "/api/v1/router-enrollment"): (
         "First-contact device enrollment -- no credential exists yet; "
         "nothing happens to real state until an RBAC-gated admin "
