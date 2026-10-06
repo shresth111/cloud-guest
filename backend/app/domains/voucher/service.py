@@ -1197,7 +1197,7 @@ class VoucherService:
                     voucher.code,
                     voucher.status,
                     voucher.use_count,
-                    batch.device_allowance(),
+                    batch.max_uses_per_voucher,
                     voucher.redeemed_at.isoformat() if voucher.redeemed_at else "",
                     voucher.last_used_at.isoformat() if voucher.last_used_at else "",
                     voucher.expires_at.isoformat() if voucher.expires_at else "",
