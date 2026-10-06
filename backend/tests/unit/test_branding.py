@@ -675,8 +675,10 @@ class TestAssetResponseCacheHeaders:
         assert etag == f'"{hashlib.sha256(b"fake-image-bytes").hexdigest()}"'
         cache_control = response.headers["cache-control"]
         assert "public" in cache_control
-        assert "max-age=" in cache_control
-        assert "must-revalidate" in cache_control
+        # Revalidate on every use: the URL is the same before and after a
+        # re-upload, so a freshness window serves the old image.
+        assert "no-cache" in cache_control
+        assert "max-age" not in cache_control
 
     def test_private_visibility_for_authenticated_endpoints(self) -> None:
         response = _asset_response(

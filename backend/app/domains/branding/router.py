@@ -17,7 +17,6 @@ import uuid
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
 
 from app.common.responses import ApiResponse, build_response
-from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
 from app.domains.billing.constants import PlanFeatureKey
 from app.domains.billing.dependencies import RequireFeature
@@ -47,10 +46,9 @@ def _asset_response(
 ) -> Response:
     """Builds the actual image response for every logo/background-image
     serving endpoint below, with real browser caching: a strong ETag
-    hashed from the returned bytes (content-addressed -- see
-    ``Settings.branding_asset_cache_ttl_seconds``'s own docstring for why
-    that's correct even though the URL itself never changes) plus a
-    ``Cache-Control`` max-age.
+    hashed from the returned bytes plus ``Cache-Control: no-cache`` -- the
+    browser keeps the bytes but revalidates on every use, because the URL
+    itself never changes when the image does.
 
     Without this, every one of these endpoints -- including
     ``get_logo_public``/``get_background_image_public``, exactly what a
@@ -69,9 +67,14 @@ def _asset_response(
     """
     etag = hashlib.sha256(content).hexdigest()
     quoted_etag = f'"{etag}"'
-    ttl = get_settings().branding_asset_cache_ttl_seconds
+    # `no-cache`, not a max-age: the URL never changes when the image does
+    # (re-upload or remove-then-upload), so any freshness window made the
+    # browser keep showing the OLD logo/background for that long without
+    # asking -- staging QA 2026-10-06, "same purana wala hi aa rha h".
+    # `no-cache` still stores the bytes; every use revalidates with the
+    # ETag, and an unchanged image costs one empty 304.
     headers = {
-        "Cache-Control": f"{visibility}, max-age={ttl}, must-revalidate",
+        "Cache-Control": f"{visibility}, no-cache",
         "ETag": quoted_etag,
     }
     if_none_match = request.headers.get("if-none-match")
