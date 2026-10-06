@@ -49,11 +49,23 @@ _COLUMNS: tuple[tuple[str, sa.types.TypeEngine], ...] = (
 )
 
 
+def _existing_columns() -> set[str]:
+    return {c["name"] for c in sa.inspect(op.get_bind()).get_columns("routers")}
+
+
 def upgrade() -> None:
+    # Idempotent on purpose: SNMP shipped to prod first, from main, as
+    # ``0143a_add_router_snmp_v3_and_poll_status`` (same columns, parented on
+    # main's 0143). When staging is promoted, a prod database that already
+    # has these columns must pass through this revision as a no-op.
+    existing = _existing_columns()
     for name, type_ in _COLUMNS:
-        op.add_column("routers", sa.Column(name, type_, nullable=True))
+        if name not in existing:
+            op.add_column("routers", sa.Column(name, type_, nullable=True))
 
 
 def downgrade() -> None:
+    existing = _existing_columns()
     for name, _type in reversed(_COLUMNS):
-        op.drop_column("routers", name)
+        if name in existing:
+            op.drop_column("routers", name)
