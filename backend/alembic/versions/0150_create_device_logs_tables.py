@@ -11,18 +11,20 @@
 Both new and empty; the feature flag (CLOUDGUEST_DEVICE_LOGS_ENABLED)
 defaults off, so this migration changes no behaviour.
 
-## Why 0150 on top of main's 0143
+## Why it chains on main's 0143a
 
 Built to ship to ``main`` on its own, ahead of the staging promotion, so it
-chains on main's head (``0143_add_require_guest_name...``). Numbered 0150 so
-its file name cannot be confused with staging's own 0144-0149 chain. On
-staging this makes a second head; the staging branch carries
-``0151_merge_device_logs_into_staging`` (a no-op merge revision) to join
-them. When staging is promoted, main already has this exact file, and the
-merge revision comes along with staging -- one head.
+chains on main's head, ``0143a_add_router_snmp_v3_and_poll_status`` (SNMP,
+#371), which staging also carries. On staging that makes a second head; the
+staging branch carries ``0152_merge_device_logs_into_staging`` (a no-op
+merge revision) to join it with ``0151_merge_snmp_main_copy``. When staging
+is promoted, main already has this exact file, and the merge revision comes
+along with staging -- one head. The revision id ``0150_create_device_logs``
+is distinct from staging's ``0150_add_router_snmp_v3_and_poll_status``;
+only the numeric prefix coincides.
 
 Revision ID: 0150_create_device_logs_tables
-Revises: 0143_add_require_guest_name_to_captive_portal_configs
+Revises: 0143a_add_router_snmp_v3_and_poll_status
 Create Date: 2026-10-06
 """
 
@@ -32,7 +34,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "0150_create_device_logs_tables"
-down_revision = "0143_add_require_guest_name_to_captive_portal_configs"
+down_revision = "0143a_add_router_snmp_v3_and_poll_status"
 branch_labels = None
 depends_on = None
 
