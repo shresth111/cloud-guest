@@ -492,6 +492,22 @@ _DUMMY_PIN_HASH = PasswordManager.hash_raw("047183")
 # getting the original real, fresh lookup.
 _DEVICE_NOT_PREFETCHED: Any = object()
 
+
+def _cap_timeout_at_deadline(
+    timeout_minutes: int | None, *, started_at: datetime, ends_by: datetime | None
+) -> int | None:
+    """``timeout_minutes`` shortened so a session starting at ``started_at``
+    ends no later than ``ends_by`` (a voucher's own ``expires_at``).
+
+    Rounded up and floored at 1 minute: a session is never created already
+    over its limit (the voucher itself refuses once ``expires_at`` passes),
+    and rounding down would shave up to a minute off the voucher. ``None``
+    for either input leaves the timeout exactly as given."""
+    if ends_by is None or timeout_minutes is None:
+        return timeout_minutes
+    remaining = math.ceil((ends_by - started_at).total_seconds() / 60)
+    return max(min(timeout_minutes, remaining), 1)
+
 # Redis key template for GuestPinSecurity's brute-force lockout counter --
 # scoped by (organization_id, identifier), mirroring
 # app.domains.auth.security.AuthSecurity's own ``_RATE_LIMIT_KEY``
@@ -1473,7 +1489,12 @@ class OtpVerifyProtocol(Protocol):
 
 class VoucherRedeemProtocol(Protocol):
     async def redeem_voucher(
-        self, *, code: str, identifier: str, source: str
+        self,
+        *,
+        code: str,
+        identifier: str,
+        source: str,
+        is_admitted_device: Callable[[Voucher], Awaitable[bool]] | None = None,
     ) -> tuple[Voucher, VoucherBatch]: ...
 
     async def get_plan_queue_profile_id(
@@ -3484,13 +3505,15 @@ class GuestService:
                 organization_id=resolved_org_id,
                 location_id=location_id,
             )
-            known_device = await self._enforce_device_limit(
-                guest_id=existing_guest.id,
-                mac_address=device_mac,
-                organization_id=resolved_org_id,
-                location_id=location_id,
-                access_tier=access_tier,
-            )
+            # Deliberately NO ``_enforce_device_limit`` here. A voucher
+            # carries its own device allowance (``VoucherBatch
+            # .max_devices_per_voucher``), enforced by ``redeem_voucher``
+            # below, and that allowance -- not the venue's "Devices per
+            # user" or an Access Tier's devices-per-user -- is what decides
+            # how many phones one code puts online. Applying the per-user
+            # default as well made a 2-device voucher admit one device for a
+            # guest who typed the same phone number twice (QA, staging,
+            # 2026-10-06: Devices per user = 1 -> 409 on the second phone).
             await self._enforce_fup_quota(
                 guest_id=existing_guest.id,
                 organization_id=resolved_org_id,
@@ -3500,10 +3523,29 @@ class GuestService:
 
         router = await self._get_eligible_router(router_id)
 
+        # The device presenting the code, looked up once by MAC and handed
+        # to ``_maybe_get_or_create_device`` below as ``known_device``. It
+        # is what tells a re-entry (this device already signed in with this
+        # voucher, so it takes no new device slot) from a new device.
+        if device_mac:
+            known_device = await self.repository.get_device_by_mac(
+                normalize_mac_address(device_mac)
+            )
+
+        async def is_admitted_device(voucher: Voucher) -> bool:
+            if known_device is None or known_device is _DEVICE_NOT_PREFETCHED:
+                return False
+            return await self.repository.has_session_for_voucher_on_device(
+                voucher_id=voucher.id, device_id=known_device.id
+            )
+
         source = ip_address or "unknown"
         try:
             voucher, batch = await self.voucher_service.redeem_voucher(
-                code=code, identifier=identifier, source=source
+                code=code,
+                identifier=identifier,
+                source=source,
+                is_admitted_device=is_admitted_device,
             )
         except CloudGuestError as exc:
             await self._record_login_failure(
@@ -3559,6 +3601,11 @@ class GuestService:
             ),
             session_timeout_minutes=batch.validity_minutes,
             idle_timeout_minutes=resolved_idle_timeout,
+            # A second device signing in 20 minutes into a 60-minute voucher
+            # gets the voucher's remaining 40, not a fresh 60: the voucher's
+            # own ``expires_at`` (fixed at its first redemption) is the end
+            # of every session it admits, on every vendor.
+            session_ends_by=voucher.expires_at,
         )
         if created:
             # BE-011 Part 3: additive, best-effort real-time broadcast --
@@ -8168,6 +8215,7 @@ class GuestService:
         data_limit_mb: int | None,
         session_timeout_minutes: int | None,
         idle_timeout_minutes: int | None = None,
+        session_ends_by: datetime | None = None,
     ) -> tuple[GuestSession, bool]:
         """Shared by every guest self-service login method: returns
         ``(session, created)``, where ``created`` is ``False`` when an
@@ -8238,7 +8286,11 @@ class GuestService:
             update_data: dict[str, object] = {
                 "last_activity_at": datetime.now(UTC),
                 "data_limit_mb": data_limit_mb,
-                "session_timeout_minutes": session_timeout_minutes,
+                "session_timeout_minutes": _cap_timeout_at_deadline(
+                    session_timeout_minutes,
+                    started_at=reusable.started_at,
+                    ends_by=session_ends_by,
+                ),
                 # Refreshed with the rest of this login's entitlement, for
                 # the same reason session_timeout_minutes is: the reused row
                 # represents the login that just happened, and the NAS is
@@ -8266,7 +8318,11 @@ class GuestService:
             user_agent=user_agent,
             accept_language=accept_language,
             data_limit_mb=data_limit_mb,
-            session_timeout_minutes=session_timeout_minutes,
+            session_timeout_minutes=_cap_timeout_at_deadline(
+                session_timeout_minutes,
+                started_at=datetime.now(UTC),
+                ends_by=session_ends_by,
+            ),
             idle_timeout_minutes=idle_timeout_minutes,
         )
         return session, True
@@ -9640,7 +9696,26 @@ class RadiusService:
             and candidate.router_id == router.id
         ):
             return candidate
-        return None
+        if candidate is None:
+            return None
+        # One guest, several devices (a multi-device voucher, or Devices per
+        # user > 1): the newest session can have ended while an older one,
+        # on another phone, is still online. Answering from the newest row
+        # alone refused that phone's next Authorize (an AP re-asking after
+        # a roam) although it holds a live session. Only reached when the
+        # newest row is not the answer, so a single-device guest costs the
+        # same one query as before; ``authorize``'s NAS-only device binding
+        # still decides which of the guest's sessions the Accept is for.
+        active_here = [
+            session
+            for session in await self.repository.list_active_sessions_for_guest(
+                guest.id
+            )
+            if session.is_active() and session.router_id == router.id
+        ]
+        if not active_here:
+            return None
+        return max(active_here, key=lambda session: session.started_at)
 
     async def _resolve_rate_limit_reply(self, session_id: uuid.UUID) -> str | None:
         """Best-effort, additive ``Mikrotik-Rate-Limit`` resolution -- see

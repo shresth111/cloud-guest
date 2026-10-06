@@ -367,6 +367,10 @@ class GuestRepositoryProtocol(Protocol):
 
     async def count_active_sessions_for_guest(self, guest_id: uuid.UUID) -> int: ...
 
+    async def has_session_for_voucher_on_device(
+        self, *, voucher_id: uuid.UUID, device_id: uuid.UUID
+    ) -> bool: ...
+
     async def count_active_devices_for_guest(
         self, *, guest_id: uuid.UUID, exclude_device_id: uuid.UUID | None = None
     ) -> int: ...
@@ -1360,6 +1364,30 @@ class GuestRepository:
                 "status": GuestSessionStatus.ACTIVE.value,
             }
         )
+
+    async def has_session_for_voucher_on_device(
+        self, *, voucher_id: uuid.UUID, device_id: uuid.UUID
+    ) -> bool:
+        """Has ``device_id`` ever held a session admitted by ``voucher_id``?
+
+        Backs the voucher device allowance (``GuestService
+        .login_via_voucher``): a device that already signed in with a code
+        signs in again without taking another of its device slots. Any
+        status counts -- the question is "did this voucher admit this
+        device", not "is it online now" -- and ``guest_id`` is deliberately
+        not part of it: a device row is unique per MAC, so the same phone
+        signing in under a different name is still the same device."""
+        statement = (
+            select(GuestSession.id)
+            .where(
+                GuestSession.voucher_id == voucher_id,
+                GuestSession.device_id == device_id,
+                GuestSession.is_deleted.is_(False),
+            )
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalars().first() is not None
 
     async def count_active_devices_for_guest(
         self, *, guest_id: uuid.UUID, exclude_device_id: uuid.UUID | None = None
