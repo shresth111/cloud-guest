@@ -186,6 +186,13 @@ class PermissionModule(StrEnum):
     # integration belongs to the customer, and this module gates who may
     # point this platform at it.
     NETWORK_INTEGRATIONS = "network_integrations"
+    # Device Logs: syslog (and, later, controller/cloud event feeds) that
+    # venue devices send to the platform, viewed in the Master console. A
+    # separate module because the lines carry guest identifiers (MAC, IP,
+    # masked logins) -- who may read the device-side event stream is a
+    # different grant from who may configure a router. GLOBAL-only for now;
+    # see app.domains.device_logs.
+    DEVICE_LOGS = "device_logs"
 
 
 class OverrideEffect(StrEnum):
