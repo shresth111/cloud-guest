@@ -228,6 +228,10 @@ from app.domains.router.constants import (
     TASK_RUN_ROUTER_REACHABILITY_SWEEP,
     TASK_RUN_STALE_HEARTBEAT_SWEEP,
 )
+from app.domains.traffic_flow.constants import (
+    TASK_RUN_TRAFFIC_FLOW_PULL_SWEEP,
+    TRAFFIC_FLOW_PULL_SWEEP_INTERVAL_SECONDS,
+)
 
 _settings = get_settings()
 
@@ -287,6 +291,7 @@ celery_app = Celery(
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
         "app.domains.router.tasks",
+        "app.domains.traffic_flow.tasks",
     ],
 )
 
@@ -909,6 +914,13 @@ celery_app.conf.update(
         "instant-on-poll-sweep": {
             "task": TASK_RUN_INSTANT_ON_POLL_SWEEP,
             "schedule": INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS,
+        },
+        # NetFlow/IPFIX: pull 5-minute windows from the hub's flow_agent.
+        # Returns without a network call unless
+        # CLOUDGUEST_TRAFFIC_FLOW_ENABLED is true (app.domains.traffic_flow).
+        "traffic-flow-pull-sweep": {
+            "task": TASK_RUN_TRAFFIC_FLOW_PULL_SWEEP,
+            "schedule": TRAFFIC_FLOW_PULL_SWEEP_INTERVAL_SECONDS,
         },
         # Controller-side block release. The only scheduled thing standing
         # between a time-bound block and a permanently blocked customer

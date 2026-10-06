@@ -125,6 +125,7 @@ from app.domains.security.router import router as security_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
+from app.domains.traffic_flow.router import traffic_flow_platform_router
 from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
@@ -250,6 +251,7 @@ api_v1_router.include_router(network_integration_customer_router)
 # license-gated: nothing here changes a venue's network.
 api_v1_router.include_router(network_integration_instant_on_customer_router)
 api_v1_router.include_router(network_integration_instant_on_platform_router)
+api_v1_router.include_router(traffic_flow_platform_router)
 api_v1_router.include_router(network_integration_aruba_ap_customer_router)
 api_v1_router.include_router(network_integration_aruba_ap_platform_router)
 # Aruba AP + MikroTik gateway hybrid: Master links a venue MikroTik as an
