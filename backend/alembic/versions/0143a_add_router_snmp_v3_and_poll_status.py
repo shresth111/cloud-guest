@@ -20,8 +20,8 @@ anywhere. This adds:
 All nullable, no backfill: NULL is the true value for every existing row
 (no router has ever been polled successfully or configured by us).
 
-Revision ID: 0150_add_router_snmp_v3_and_poll_status
-Revises: 0149_add_require_guest_email_and_post_login_sequence
+Revision ID: 0143a_add_router_snmp_v3_and_poll_status
+Revises: 0143_add_require_guest_name_to_captive_portal_configs
 Create Date: 2026-10-06
 """
 
@@ -31,8 +31,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0150_add_router_snmp_v3_and_poll_status"
-down_revision = "0149_add_require_guest_email_and_post_login_sequence"
+revision = "0143a_add_router_snmp_v3_and_poll_status"
+down_revision = "0143_add_require_guest_name_to_captive_portal_configs"
 branch_labels = None
 depends_on = None
 
@@ -54,10 +54,10 @@ def _existing_columns() -> set[str]:
 
 
 def upgrade() -> None:
-    # Idempotent on purpose: SNMP shipped to prod first, from main, as
-    # ``0143a_add_router_snmp_v3_and_poll_status`` (same columns, parented on
-    # main's 0143). When staging is promoted, a prod database that already
-    # has these columns must pass through this revision as a no-op.
+    # Idempotent on purpose: this is the main-branch copy of staging's
+    # ``0150_add_router_snmp_v3_and_poll_status`` (same columns), so SNMP can
+    # ship to prod before the rest of staging. 0150 is idempotent too, so
+    # whichever runs second is a no-op.
     existing = _existing_columns()
     for name, type_ in _COLUMNS:
         if name not in existing:
