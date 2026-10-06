@@ -72,20 +72,19 @@ exact "mock at the third-party-library boundary" convention
 ``mikrotik_adapter.py`` (mocking ``librouteros.connect``) already
 establishes for this package.
 
-## SNMPv3: honestly out of scope for this pass
+## SNMPv3 (added 2026-10-06)
 
-Only SNMPv1 (``version="1"``) and SNMPv2c (``version="2c"``, the default,
-and by far the most common real-world configuration on deployed
-MikroTik/consumer-grade hardware) are implemented -- both authenticate
-with a single plaintext "community string"
-(``SnmpCredentials.community``), matching the one secret this platform's
-per-router SNMP configuration (``Router.snmp_community_encrypted``)
-actually stores. SNMPv3 needs a materially different credential shape
-(username + auth protocol/passphrase + optional privacy
-protocol/passphrase, via ``pysnmp``'s own ``UsmUserData``) that a single
-encrypted community-string column cannot represent -- a real future
-extension, not implemented here rather than silently mis-mapped onto the
-wrong credential shape.
+SNMPv1/v2c authenticate with one plaintext community string
+(``SnmpCredentials.community``). SNMPv3 (``version="3"``) uses the USM
+user model instead: ``community`` then carries the **USM user name** --
+on RouterOS a v3 "user" *is* an ``/snmp community`` row, so the name is
+the same field on the device -- plus an auth protocol/passphrase and an
+optional privacy protocol/passphrase (``v3_auth_*``/``v3_priv_*``).
+Security level follows from what is present: no auth passphrase is
+refused (noAuthNoPriv would send the user name in clear and authenticate
+nothing, which is v2c with extra steps), auth only is authNoPriv, auth +
+priv is authPriv. Only the protocols RouterOS 7 offers on every model are
+accepted: MD5/SHA1 auth, DES/AES(-128 CFB) privacy.
 
 ## OIDs used below are real, standard OIDs -- verified against the real
 MIB definitions cited beside each one (RFC 1213, RFC 2790, RFC 2863), not
@@ -107,8 +106,13 @@ from pysnmp.hlapi.v3arch.asyncio import (
     ObjectType,
     SnmpEngine,
     UdpTransportTarget,
+    UsmUserData,
     bulk_walk_cmd,
     get_cmd,
+    usmAesCfb128Protocol,
+    usmDESPrivProtocol,
+    usmHMACMD5AuthProtocol,
+    usmHMACSHAAuthProtocol,
     walk_cmd,
 )
 
@@ -231,13 +235,24 @@ class SnmpCredentials:
     call."""
 
     host: str
+    # v1/v2c: the community string. v3: the USM user name.
     community: str
     port: int = _DEFAULT_SNMP_PORT
-    # "1" or "2c" only -- see module docstring's "SNMPv3: honestly out of
-    # scope" section.
+    # "1", "2c" or "3" -- see the module docstring's SNMPv3 section.
     version: str = "2c"
     timeout_seconds: int = 5
     retries: int = 1
+    # SNMPv3 only. Ignored for v1/v2c.
+    v3_auth_protocol: str | None = None  # "MD5" | "SHA1"
+    v3_auth_password: str | None = None
+    v3_priv_protocol: str | None = None  # "DES" | "AES"
+    v3_priv_password: str | None = None
+
+    def __repr__(self) -> str:  # never let a secret reach a log line
+        return (
+            f"SnmpCredentials(host={self.host!r}, port={self.port}, "
+            f"version={self.version!r})"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +287,59 @@ class SnmpDeviceMetrics:
     interfaces: list[SnmpInterfaceCounters] = field(default_factory=list)
 
 
+#: RouterOS 7 ``/snmp community`` authentication/encryption vocabularies,
+#: mapped onto pysnmp's USM protocol identifiers.
+V3_AUTH_PROTOCOLS = {"MD5": usmHMACMD5AuthProtocol, "SHA1": usmHMACSHAAuthProtocol}
+V3_PRIV_PROTOCOLS = {"DES": usmDESPrivProtocol, "AES": usmAesCfb128Protocol}
+
+
+class SnmpCredentialError(ValueError):
+    """The credentials cannot form a valid request (unknown version, a v3
+    user with no auth passphrase, an unknown protocol). Raised before any
+    packet is sent."""
+
+
+def v3_user_data(creds: SnmpCredentials) -> UsmUserData:
+    """USM user for an SNMPv3 request. Refuses noAuthNoPriv -- see the
+    module docstring."""
+    if not creds.community:
+        raise SnmpCredentialError("SNMPv3 needs a user name")
+    if not creds.v3_auth_password:
+        raise SnmpCredentialError("SNMPv3 needs an authentication passphrase")
+    auth = V3_AUTH_PROTOCOLS.get((creds.v3_auth_protocol or "SHA1").upper())
+    if auth is None:
+        raise SnmpCredentialError(
+            f"unsupported SNMPv3 auth protocol {creds.v3_auth_protocol!r}"
+        )
+    if not creds.v3_priv_password:
+        return UsmUserData(
+            creds.community, authKey=creds.v3_auth_password, authProtocol=auth
+        )
+    priv = V3_PRIV_PROTOCOLS.get((creds.v3_priv_protocol or "AES").upper())
+    if priv is None:
+        raise SnmpCredentialError(
+            f"unsupported SNMPv3 privacy protocol {creds.v3_priv_protocol!r}"
+        )
+    return UsmUserData(
+        creds.community,
+        authKey=creds.v3_auth_password,
+        privKey=creds.v3_priv_password,
+        authProtocol=auth,
+        privProtocol=priv,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SnmpIdentity:
+    """What :meth:`SnmpPoller.read_identity` read back -- the "Test SNMP"
+    answer. Every field is what the agent said, or ``None`` if it did not
+    implement that OID; an agent that answered nothing raises instead."""
+
+    sys_name: str | None
+    sys_descr: str | None
+    uptime_seconds: int | None
+
+
 def _int_value(value: object) -> int | None:
     if value is None:
         return None
@@ -292,7 +360,9 @@ class SnmpPoller:
     """See module docstring for the full "vendor-neutral, not a
     ``DeviceGatewayAdapter``" architecture write-up."""
 
-    def _auth_data(self, creds: SnmpCredentials) -> CommunityData:
+    def _auth_data(self, creds: SnmpCredentials) -> CommunityData | UsmUserData:
+        if creds.version == "3":
+            return v3_user_data(creds)
         # mpModel: 0 = SNMPv1, 1 = SNMPv2c (pysnmp's own real encoding --
         # confirmed against its own CommunityData source/docstring).
         mp_model = 0 if creds.version == "1" else 1
@@ -488,6 +558,19 @@ class SnmpPoller:
         interfaces.sort(key=lambda i: i.if_index)
         return interfaces
 
+    async def read_identity(self, creds: SnmpCredentials) -> SnmpIdentity:
+        """The cheapest real proof that SNMP works end to end: three MIB-II
+        ``system`` scalars (mandatory on every agent). Raises
+        :class:`SnmpConnectionError`/:class:`SnmpDeviceError` exactly like
+        the poll does -- a wrong v2c community and a firewall drop are
+        indistinguishable on the wire (the agent stays silent for both), and
+        this method does not pretend otherwise."""
+        return SnmpIdentity(
+            sys_name=await self.get_system_name(creds),
+            sys_descr=await self.get_system_description(creds),
+            uptime_seconds=await self.get_uptime_seconds(creds),
+        )
+
     # ------------------------------------------------------------------
     # combined poll
     # ------------------------------------------------------------------
@@ -525,7 +608,12 @@ __all__ = [
     "IF_HC_IN_OCTETS_OID",
     "IF_HC_OUT_OCTETS_OID",
     "IF_OPER_STATUS_OID",
+    "V3_AUTH_PROTOCOLS",
+    "V3_PRIV_PROTOCOLS",
     "SnmpConnectionError",
+    "SnmpCredentialError",
+    "SnmpIdentity",
+    "v3_user_data",
     "SnmpDeviceError",
     "SnmpCredentials",
     "SnmpInterfaceCounters",
