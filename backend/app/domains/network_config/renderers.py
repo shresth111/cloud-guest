@@ -3095,6 +3095,7 @@ def render_network_config(
     radius_server_host: str | None = None,
     mac_authorization_entries: list[MacAuthorizationEntry] | None = None,
     content_filter_rules: list[ContentFilterRule] | None = None,
+    traffic_flow_lines: list[str] | None = None,
 ) -> str:
     """Combines every enabled row across all categories into one
     router-wide RouterOS script -- a full desired-state snapshot, mirroring
@@ -3188,6 +3189,14 @@ def render_network_config(
                 )
             )
         )
+    # --- Traffic flow (NetFlow/IPFIX) -- its own block, on purpose ---
+    # Pre-rendered by app.domains.traffic_flow.routeros (the single source
+    # the device writer also uses -- parity by construction), already gated
+    # there on CLOUDGUEST_TRAFFIC_FLOW_ENABLED + the router allowlist + a
+    # tunnel. None/empty = no section. Kept self-contained: one keyword
+    # argument and this block are the whole footprint in this function.
+    if traffic_flow_lines:
+        sections.extend(_idempotent_lines(traffic_flow_lines))
     # THE GUEST DATA PATH RIDES ALONG WITH ANY REAL PUSH, but does not by
     # itself make an empty push non-empty.
     #
