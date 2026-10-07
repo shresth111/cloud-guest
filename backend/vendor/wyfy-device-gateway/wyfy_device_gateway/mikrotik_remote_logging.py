@@ -49,11 +49,12 @@ _BOOLEAN_FIELDS = frozenset({"bsd-syslog", "disabled"})
 # RouterOS renamed the RFC 3164 switch: older releases take ``bsd-syslog=yes``;
 # newer RouterOS 7 releases dropped that parameter ("unknown parameter
 # bsd-syslog", seen on a prod router 2026-10-07) for
-# ``remote-log-format=bsd-syslog``. Which one a router speaks is read off the
+# ``remote-log-format=syslog`` + ``syslog-time-format=bsd-syslog``. Which one a router speaks is read off the
 # device itself -- every RouterOS ships a default ``remote`` action, and its
 # row carries ``remote-log-format`` exactly when the router uses the new name.
 _LEGACY_FORMAT_FIELD = "bsd-syslog"
 _MODERN_FORMAT_FIELD = "remote-log-format"
+_MODERN_TIME_FORMAT_FIELD = "syslog-time-format"
 
 
 def uses_remote_log_format(action_rows: Sequence[Mapping[str, Any]]) -> bool:
@@ -71,7 +72,15 @@ def adapt_action_for_device(
     if not modern or _LEGACY_FORMAT_FIELD not in row:
         return row
     legacy = _norm(_LEGACY_FORMAT_FIELD, row.pop(_LEGACY_FORMAT_FIELD))
-    row[_MODERN_FORMAT_FIELD] = "bsd-syslog" if legacy == "yes" else "default"
+    if legacy == "yes":
+        # Measured on RouterOS 7.21.4 (prod, 2026-10-07): ``bsd-syslog`` is
+        # not a value of remote-log-format ("input does not match any value");
+        # BSD framing is remote-log-format=syslog + syslog-time-format=bsd-syslog,
+        # and that pair applied and read back verified.
+        row[_MODERN_FORMAT_FIELD] = "syslog"
+        row[_MODERN_TIME_FORMAT_FIELD] = "bsd-syslog"
+    else:
+        row[_MODERN_FORMAT_FIELD] = "default"
     return row
 
 
