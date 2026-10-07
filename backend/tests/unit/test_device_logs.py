@@ -189,9 +189,11 @@ class TestRouterOs:
     def test_both_routeros_dialects_are_rendered(self) -> None:
         """Older RouterOS takes bsd-syslog=yes; newer RouterOS 7 rejects it
         ("unknown parameter bsd-syslog", prod 2026-10-07) and takes
-        remote-log-format=bsd-syslog."""
+        remote-log-format=syslog + syslog-time-format=bsd-syslog (bsd-syslog
+        is not a value of remote-log-format on RouterOS 7.21.4)."""
         line = render_action_add(_config())
-        assert "remote-log-format=bsd-syslog" in line
+        assert "remote-log-format=syslog" in line
+        assert "syslog-time-format=bsd-syslog" in line
         assert "bsd-syslog=yes" in line
         assert line.count("/system logging action add ") == 2
 

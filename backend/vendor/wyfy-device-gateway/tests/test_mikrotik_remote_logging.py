@@ -207,7 +207,8 @@ def test_modern_router_gets_remote_log_format_not_bsd_syslog():
     ours = [r for r in api._menus[ACTION] if r.get("name") == "wyfysyslog"]
     assert len(ours) == 1
     assert "bsd-syslog" not in ours[0]
-    assert ours[0]["remote-log-format"] == "bsd-syslog"
+    assert ours[0]["remote-log-format"] == "syslog"
+    assert ours[0]["syslog-time-format"] == "bsd-syslog"
     assert readback.ok, readback.detail
 
 
