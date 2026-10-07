@@ -87,3 +87,20 @@ SEVERITY_NAMES: dict[int, str] = {
     6: "info",
     7: "debug",
 }
+
+
+#: Matching window for linking a MAC-carrying router event (DHCP) to a guest
+#: session (see ``session_events``): from this long before the session
+#: started (a phone gets its DHCP lease when it joins the WiFi, before the
+#: guest finishes the portal) until this long after it ended (the lease is
+#: released when the phone leaves).
+GUEST_EVENT_LEAD_MINUTES = 10
+GUEST_EVENT_TRAIL_MINUTES = 10
+#: The same for IP-only events (hotspot sign-in/out). These happen at the
+#: session's own start/end -- the router signing the guest in IS what starts
+#: the RADIUS session -- so only clock skew is allowed. A wide window here
+#: would make every IP that DHCP hands to the next guest ambiguous.
+GUEST_EVENT_IP_SKEW_MINUTES = 2
+
+#: Most events returned for one session.
+MAX_SESSION_DEVICE_EVENTS = 200

@@ -8,6 +8,16 @@ platform's highest-volume table are pure cost. It is NOT the compliance
 record: the collector's raw archive is (DESIGN §7). Prune it (30 days) only
 once that archive is live.
 
+``guest_device_events`` -- the guest-relevant subset of those lines (DHCP
+assign/release, hotspot sign-in/out), parsed into kind/IP/MAC at ingest so
+the customer's Guest Connection Records can show a session's device events
+without ever reading raw lines. Derived, so it follows its source row: the
+FK cascades, and when ``device_log_events`` is pruned these go with it.
+No guest-session column on purpose -- the link is computed at read time
+(``GuestDeviceEventsReader``), because the DHCP assign normally arrives
+*before* the guest signs in, and because a link that was unique when written
+can become ambiguous when a later session appears.
+
 ``router_remote_logging`` -- the one place "Wyfy configured remote logging
 on this router" lives, with the last read-back verdict. Not
 ``routers.settings``: that JSON is writable by a venue owner through
@@ -31,6 +41,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -80,6 +91,69 @@ class DeviceLogEvent(Base):
         Index("ix_device_log_events_received_at", "received_at"),
         Index("ix_device_log_events_router_received", "router_id", "received_at"),
         Index("ix_device_log_events_org_received", "organization_id", "received_at"),
+    )
+
+
+class GuestDeviceEvent(Base):
+    __tablename__ = "guest_device_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    #: Source line. One derived row per line at most (unique), which is what
+    #: makes ingest + backfill idempotent.
+    device_log_event_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("device_log_events.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: The collector's clock (the source row's ``received_at``) -- the time
+    #: matching uses. The router's own clock is kept for display only.
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    device_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: ``GuestEventKind`` value.
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
+    #: Upper-case colon form; NULL for hotspot lines (they carry no MAC).
+    mac_address: Mapped[str | None] = mapped_column(String(17), nullable=True)
+    #: Hotspot sign-out reason in RouterOS's words, when it looked like one.
+    detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "device_log_event_id", name="uq_guest_device_events_source_event"
+        ),
+        Index("ix_guest_device_events_location_occurred", "location_id", "occurred_at"),
+        Index("ix_guest_device_events_mac_occurred", "mac_address", "occurred_at"),
+        # The collector retries a batch the API did not acknowledge, which
+        # stores the same line twice in device_log_events (same received_at,
+        # to the microsecond). One derived event per real router event.
+        Index(
+            "uq_guest_device_events_natural",
+            "router_id",
+            "occurred_at",
+            "kind",
+            "ip_address",
+            text("coalesce(mac_address, '')"),
+            unique=True,
+        ),
     )
 
 

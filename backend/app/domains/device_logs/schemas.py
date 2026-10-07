@@ -108,3 +108,38 @@ class RouterLoggingDetail(BaseModel):
     #: uses). None when ``blocker`` is NO_TUNNEL or NOT_MIKROTIK.
     script: list[str] | None
     state: str
+
+
+class SessionDeviceEventView(BaseModel):
+    """One router event linked to one guest session. No raw line, no host
+    name, no user name: kind, time, IP and MAC only."""
+
+    occurred_at: datetime
+    #: The router's own clock, best-effort (RFC 3164 carries no year/zone).
+    device_time: datetime | None
+    #: ``ip_assigned`` | ``ip_released`` | ``router_sign_in`` |
+    #: ``router_sign_out``
+    kind: str
+    ip_address: str
+    mac_address: str | None
+    #: Sign-out reason in RouterOS's words, when known.
+    detail: str | None
+
+
+class SessionDeviceEvents(BaseModel):
+    """``GET /guest-sessions/{id}/device-events``. ``coverage`` says whether
+    an empty ``events`` means "nothing happened" (``covered``) or "we could
+    not have known" (``not_sending`` / ``not_sending_during_session``)."""
+
+    session_id: str
+    coverage: str
+    logging_since: datetime | None
+    #: False when the session has neither a device MAC nor an IP on record,
+    #: so nothing could ever be linked to it.
+    linkable: bool
+    window_start: datetime
+    window_end: datetime
+    events: list[SessionDeviceEventView]
+    #: Events that matched this session but also another one, so are not
+    #: shown (never guessed).
+    ambiguous_count: int

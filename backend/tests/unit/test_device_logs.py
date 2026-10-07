@@ -243,12 +243,19 @@ class FakeRepo:
         self.config: Any = None
         self.last: dict[uuid.UUID, datetime] = {}
         self.saved: list[Any] = []
+        self.guest_rows: list[dict[str, Any]] = []
 
     async def owners_by_tunnel_ip(self, ips):
         return {ip: self.owners[ip] for ip in ips if ip in self.owners}
 
     async def insert_events(self, rows):
+        start = len(self.inserted)
         self.inserted.extend(rows)
+        return list(range(start + 1, start + 1 + len(rows)))
+
+    async def insert_guest_events(self, rows):
+        self.guest_rows.extend(rows)
+        return len(rows)
 
     async def list_events(self, filters, *, limit):
         self.list_calls += 1

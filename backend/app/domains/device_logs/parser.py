@@ -44,6 +44,9 @@ _BSD_TS = re.compile(
 _RFC5424_HEAD = re.compile(r"^1 (\S+) ")
 _TAG = re.compile(rf"^{re.escape(TAG_PREFIX)}([0-9a-f]{{{TAG_HEX_LENGTH}}}):?$")
 _TOPIC_WORD = re.compile(r"^[a-z0-9-]+$")
+#: How many tokens a RouterOS identity may span before our tag (see
+#: ``parse_line``).
+_MAX_IDENTITY_TOKENS = 6
 _SEVERITY_TOPICS = frozenset({"critical", "error", "warning", "info", "debug"})
 _MONTHS = {
     m: i
@@ -164,6 +167,21 @@ def parse_line(raw: str, *, received_at: datetime) -> ParsedLine:
         if tag_match:
             tag = tag_match.group(1)
             index += 1
+        elif bsd and hostname is not None:
+            # A RouterOS identity may contain spaces ("Signature Global
+            # Office", measured on prod 2026-10-07, RouterOS 7.21.4). The
+            # identity then spans several tokens before our tag, and without
+            # this the tag was read as message text -- claimed_tag stayed
+            # NULL and the tag cross-check never ran. Only a tag within the
+            # first few tokens counts: identities are short, and a ``wyfy-``
+            # word deep inside a message is message text.
+            for k in range(index, min(len(tokens), _MAX_IDENTITY_TOKENS + 1)):
+                tag_match = _TAG.match(tokens[k])
+                if tag_match:
+                    hostname = " ".join(tokens[:k])[:255]
+                    tag = tag_match.group(1)
+                    index = k + 1
+                    break
     if index < len(tokens) and _is_topic_list(tokens[index]):
         topics = tokens[index].rstrip(":")[:200]
         index += 1

@@ -6,18 +6,21 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, func, insert, or_, select
+from sqlalchemy import and_, case, func, insert, literal, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domains.guest.models import GuestDevice, GuestSession
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.router.models import Router
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
 
-from .models import DeviceLogEvent, RouterRemoteLogging
+from .constants import Attribution
+from .models import DeviceLogEvent, GuestDeviceEvent, RouterRemoteLogging
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,23 @@ class PeerOwner:
     router_id: uuid.UUID
     organization_id: uuid.UUID | None
     location_id: uuid.UUID | None
+
+
+@dataclass(frozen=True)
+class SessionMatchKey:
+    """What one guest session is matched on (see ``session_events``)."""
+
+    organization_id: uuid.UUID
+    location_id: uuid.UUID
+    router_id: uuid.UUID
+    #: Window for MAC-carrying events (DHCP).
+    window_start: datetime
+    window_end: datetime
+    #: Narrower window for IP-only events (hotspot).
+    ip_window_start: datetime
+    ip_window_end: datetime
+    mac_address: str | None
+    ip_address: str | None
 
 
 @dataclass(frozen=True)
@@ -76,10 +96,60 @@ class DeviceLogsRepository:
             result.setdefault(ip, []).append(PeerOwner(router_id, org_id, loc_id))
         return result
 
-    async def insert_events(self, rows: list[dict[str, Any]]) -> None:
-        if rows:
-            await self.session.execute(insert(DeviceLogEvent), rows)
-            await self.session.flush()
+    async def insert_events(self, rows: list[dict[str, Any]]) -> list[int]:
+        """Insert lines; returns their ids in the order of ``rows``."""
+        if not rows:
+            return []
+        result = await self.session.execute(
+            insert(DeviceLogEvent).returning(
+                DeviceLogEvent.id, sort_by_parameter_order=True
+            ),
+            rows,
+        )
+        ids = [int(i) for i in result.scalars().all()]
+        await self.session.flush()
+        return ids
+
+    async def insert_guest_events(self, rows: list[dict[str, Any]]) -> int:
+        """Insert derived guest events, skipping any that already exist (same
+        source line, or the same router event stored twice by a collector
+        retry). Returns how many were new."""
+        if not rows:
+            return 0
+        stmt = (
+            pg_insert(GuestDeviceEvent)
+            .values(rows)
+            .on_conflict_do_nothing()
+            .returning(GuestDeviceEvent.id)
+        )
+        inserted = len((await self.session.execute(stmt)).all())
+        await self.session.flush()
+        return inserted
+
+    async def lines_without_guest_event(
+        self, *, after_id: int, limit: int
+    ) -> list[DeviceLogEvent]:
+        """Backfill page: attributed lines (by tunnel IP, with a router,
+        location and organization) that have no derived row yet, oldest id
+        first, keyset on id."""
+        stmt = (
+            select(DeviceLogEvent)
+            .outerjoin(
+                GuestDeviceEvent,
+                GuestDeviceEvent.device_log_event_id == DeviceLogEvent.id,
+            )
+            .where(
+                DeviceLogEvent.id > after_id,
+                DeviceLogEvent.attribution == Attribution.TUNNEL_IP.value,
+                DeviceLogEvent.router_id.is_not(None),
+                DeviceLogEvent.location_id.is_not(None),
+                DeviceLogEvent.organization_id.is_not(None),
+                GuestDeviceEvent.id.is_(None),
+            )
+            .order_by(DeviceLogEvent.id)
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
 
     # -- viewer ---------------------------------------------------------
     async def list_events(
@@ -247,3 +317,125 @@ class DeviceLogsRepository:
             .order_by(Organization.name, Location.name, Router.name)
         )
         return [tuple(r) for r in (await self.session.execute(stmt)).all()]  # type: ignore[misc]
+
+    # -- customer: one guest session's device events ------------------------
+    async def device_mac(self, device_id: uuid.UUID | None) -> str | None:
+        if device_id is None:
+            return None
+        mac = (
+            await self.session.execute(
+                select(GuestDevice.mac_address).where(GuestDevice.id == device_id)
+            )
+        ).scalar_one_or_none()
+        return mac.strip().upper() if mac else None
+
+    async def first_guest_line_at(
+        self, *, organization_id: uuid.UUID, location_id: uuid.UUID
+    ) -> datetime | None:
+        """When this venue's routers were first heard from (any attributed
+        line). None: no router at this venue has ever sent device logs."""
+        stmt = select(func.min(DeviceLogEvent.received_at)).where(
+            DeviceLogEvent.organization_id == organization_id,
+            DeviceLogEvent.location_id == location_id,
+            DeviceLogEvent.router_id.is_not(None),
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def candidate_guest_events(
+        self, key: SessionMatchKey, *, limit: int
+    ) -> list[GuestDeviceEvent]:
+        """Events at the session's venue, inside its window, carrying its
+        device's MAC -- or, for MAC-less hotspot lines, its IP on its own
+        router. Candidates only: the caller still drops any that another
+        session also matches."""
+        key_match = []
+        if key.mac_address:
+            key_match.append(
+                and_(
+                    GuestDeviceEvent.mac_address.is_not(None),
+                    GuestDeviceEvent.mac_address == key.mac_address,
+                    GuestDeviceEvent.occurred_at >= key.window_start,
+                    GuestDeviceEvent.occurred_at <= key.window_end,
+                )
+            )
+        if key.ip_address:
+            key_match.append(
+                and_(
+                    GuestDeviceEvent.mac_address.is_(None),
+                    GuestDeviceEvent.ip_address == key.ip_address,
+                    GuestDeviceEvent.router_id == key.router_id,
+                    GuestDeviceEvent.occurred_at >= key.ip_window_start,
+                    GuestDeviceEvent.occurred_at <= key.ip_window_end,
+                )
+            )
+        if not key_match:
+            return []
+        stmt = (
+            select(GuestDeviceEvent)
+            .where(
+                GuestDeviceEvent.organization_id == key.organization_id,
+                GuestDeviceEvent.location_id == key.location_id,
+                or_(*key_match),
+            )
+            .order_by(GuestDeviceEvent.occurred_at, GuestDeviceEvent.id)
+            .limit(limit)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def sessions_matching_events(
+        self,
+        event_ids: list[int],
+        *,
+        now: datetime,
+        lead: timedelta,
+        trail: timedelta,
+        ip_skew: timedelta,
+        open_statuses: tuple[str, ...],
+    ) -> dict[int, int]:
+        """For each event id, how many guest sessions (any guest, same
+        organization and venue) it matches under the same rule. 1 means
+        unambiguous."""
+        if not event_ids:
+            return {}
+        session_end = case(
+            (GuestSession.ended_at.is_not(None), GuestSession.ended_at),
+            (GuestSession.status.in_(open_statuses), literal(now)),
+            else_=GuestSession.last_activity_at,
+        )
+        stmt = (
+            select(GuestDeviceEvent.id, func.count(func.distinct(GuestSession.id)))
+            .join(
+                GuestSession,
+                and_(
+                    GuestSession.organization_id == GuestDeviceEvent.organization_id,
+                    GuestSession.location_id == GuestDeviceEvent.location_id,
+                    GuestSession.is_deleted.is_(False),
+                ),
+            )
+            .outerjoin(GuestDevice, GuestDevice.id == GuestSession.device_id)
+            .where(
+                GuestDeviceEvent.id.in_(event_ids),
+                or_(
+                    and_(
+                        GuestDeviceEvent.mac_address.is_not(None),
+                        func.upper(func.trim(GuestDevice.mac_address))
+                        == GuestDeviceEvent.mac_address,
+                        GuestSession.started_at - lead <= GuestDeviceEvent.occurred_at,
+                        GuestDeviceEvent.occurred_at <= session_end + trail,
+                    ),
+                    and_(
+                        GuestDeviceEvent.mac_address.is_(None),
+                        GuestSession.ip_address == GuestDeviceEvent.ip_address,
+                        GuestSession.router_id == GuestDeviceEvent.router_id,
+                        GuestSession.started_at - ip_skew
+                        <= GuestDeviceEvent.occurred_at,
+                        GuestDeviceEvent.occurred_at <= session_end + ip_skew,
+                    ),
+                ),
+            )
+            .group_by(GuestDeviceEvent.id)
+        )
+        return {
+            int(event_id): int(count)
+            for event_id, count in (await self.session.execute(stmt)).all()
+        }
