@@ -3,7 +3,14 @@ from functools import lru_cache
 from pathlib import Path
 
 from email_validator import EmailNotValidError, validate_email
-from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator
+from pydantic import (
+    Field,
+    PostgresDsn,
+    RedisDsn,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The default for every Fernet key below. It is base64 of the ASCII string
@@ -457,9 +464,68 @@ class Settings(BaseSettings):
         ),
     )
 
-    @field_validator("radius_bandwidth_attribute_router_ids")
+    # ------------------------------------------------------------------
+    # Traffic flow (NetFlow v9 / IPFIX) -- app.domains.traffic_flow.
+    # Design: ~/wyfy-ops/netflow/DESIGN.md. Staging-only MVP; every gate
+    # below defaults to OFF/empty so a deploy changes nothing anywhere.
+    # ------------------------------------------------------------------
+    traffic_flow_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for MikroTik /ip traffic-flow export (IPFIX over "
+            "the WireGuard tunnel to the hub's nfacctd) and for ingesting the "
+            "hub's 5-minute flow windows. False (the default): the generator "
+            "renders no traffic-flow section, the Master apply endpoint "
+            "refuses, and the pull sweep returns without a network call. "
+            "Override via CLOUDGUEST_TRAFFIC_FLOW_ENABLED."
+        ),
+    )
+    traffic_flow_router_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated router UUIDs allowed to receive the traffic-flow "
+            "config (generator section + Master apply). Empty (the default) "
+            "means no router. An environment setting, not a routers.settings "
+            "key, for the same reason as radius_bandwidth_attribute_router_ids: "
+            "routers.settings is writable by a venue owner. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_ROUTER_IDS."
+        ),
+    )
+    traffic_flow_collector_port: int = Field(
+        default=2055,
+        ge=1,
+        le=65535,
+        description=(
+            "UDP port nfacctd listens on at the hub's TUNNEL address (the "
+            "collector address itself is derived from the router's WireGuard "
+            "server, never configured by hand). Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_COLLECTOR_PORT."
+        ),
+    )
+    traffic_flow_agent_url: str = Field(
+        default="",
+        description=(
+            "Base URL of ops/hub-agents/flow_agent.py on the hub's PRIVATE "
+            "address, e.g. http://172.31.40.230:9094 . Empty = not deployed: "
+            "the overview says so instead of showing an empty table. Override "
+            "via CLOUDGUEST_TRAFFIC_FLOW_AGENT_URL."
+        ),
+    )
+    traffic_flow_agent_secret: str = Field(
+        default="",
+        description=(
+            "X-Agent-Secret for traffic_flow_agent_url; must equal "
+            "FLOW_AGENT_SECRET in the hub's /etc/wyfy/hub-agents.env. Empty "
+            "fails closed (the agent rejects it too). Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_AGENT_SECRET."
+        ),
+    )
+
+    @field_validator("radius_bandwidth_attribute_router_ids", "traffic_flow_router_ids")
     @classmethod
-    def _normalize_radius_bandwidth_attribute_router_ids(cls, value: str) -> str:
+    def _normalize_radius_bandwidth_attribute_router_ids(
+        cls, value: str, info: ValidationInfo
+    ) -> str:
         """Lower-cased canonical UUIDs, de-duplicated, order-preserving --
         naming the offending token on a typo."""
         ids: list[str] = []
@@ -471,12 +537,20 @@ class Settings(BaseSettings):
                 normalized = str(uuid.UUID(candidate))
             except ValueError as exc:
                 raise ValueError(
-                    "radius_bandwidth_attribute_router_ids: "
-                    f"{candidate!r} is not a UUID"
+                    f"{info.field_name}: {candidate!r} is not a UUID"
                 ) from exc
             if normalized not in ids:
                 ids.append(normalized)
         return ",".join(ids)
+
+    @property
+    def traffic_flow_router_id_set(self) -> frozenset[uuid.UUID]:
+        """``traffic_flow_router_ids`` parsed."""
+        return frozenset(
+            uuid.UUID(token)
+            for token in self.traffic_flow_router_ids.split(",")
+            if token
+        )
 
     @property
     def radius_bandwidth_attribute_router_id_set(self) -> frozenset[uuid.UUID]:

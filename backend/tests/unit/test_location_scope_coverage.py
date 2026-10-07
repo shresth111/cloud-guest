@@ -339,6 +339,14 @@ EXEMPT: dict[str, str] = {
         "route already carries an explicit `scope=ScopeType.ORGANIZATION` plus "
         "`RequireOrganization`, which a narrower grant cannot satisfy."
     ),
+    "traffic_flow": (
+        "`TrafficFlowWindow` carries a denormalized `location_id`, but every "
+        "route on the domain is Master-only and pinned to ScopeType.GLOBAL "
+        "on the GLOBAL-only `traffic_flows` module (held by Super Admin and "
+        "Platform Admin only). No location- or organization-scoped caller "
+        "can reach any of its rows, so there is no confinement to apply. A "
+        "future venue-owner view must move it to PENDING first."
+    ),
 }
 
 

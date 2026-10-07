@@ -1,0 +1,22 @@
+[Unit]
+Description=Wyfy hub flow agent (serves nfacctd 5-minute windows to the app server)
+# NOT DEPLOYED -- see ~/wyfy-ops/netflow/DESIGN.md §9 for the owner-run steps.
+After=network-online.target wyfy-nfacctd.service flow-agent-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# FLOW_AGENT_SECRET lives in the 0600 root-only env file, never inline.
+EnvironmentFile=/etc/wyfy/hub-agents.env
+# The hub's VPC-private address (the app server reaches 9091/9092 on it).
+Environment=AGENT_BIND_ADDR=172.31.40.230
+Environment=FLOW_AGENT_PORT=9094
+ExecStart=/usr/bin/python3 /usr/local/sbin/flow_agent.py
+Restart=always
+RestartSec=3
+# Reads and prunes /var/spool/wyfy-flows only; no root needed.
+User=pmacct
+Group=pmacct
+
+[Install]
+WantedBy=multi-user.target

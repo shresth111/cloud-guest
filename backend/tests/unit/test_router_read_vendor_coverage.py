@@ -206,6 +206,21 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "only decides whether the idle sweep observes `last_activity_at` "
         "instead of assuming it moves; it feeds no device work."
     ),
+    # -- traffic_flow (NetFlow/IPFIX) ---------------------------------------
+    "app/domains/traffic_flow/service.py::TrafficFlowRepository.exporter_router_map": (
+        "Attribution of a received flow window: joins wireguard_peers to "
+        "routers to learn which router owns an exporter tunnel address. A "
+        "controller has no peer, so the join itself excludes it; an "
+        "address that matches nothing is reported as an unknown exporter, "
+        "and no judgement about device health is made from the result."
+    ),
+    "app/domains/traffic_flow/service.py::TrafficFlowRepository.router_labels": (
+        "Name/vendor/location labels for routers that already have flow "
+        "windows or are allowlisted, for the Master overview. Every vendor "
+        "belongs in the answer (a non-MikroTik is shown with its vendor and "
+        "is refused by the apply path, never reported as broken hardware); "
+        "nothing is written to it."
+    ),
     # -- device_logs (syslog) -----------------------------------------------
     "app/domains/device_logs/repository.py::DeviceLogsRepository.owners_by_tunnel_ip": (
         "Attribution of a received syslog line: joins wireguard_peers to "

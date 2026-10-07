@@ -582,6 +582,10 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # folds DELETE into FULL, so Super Admin and Platform Admin (the two
     # roles holding channel_partners.manage) get it with no role changes.
     PermissionModule.CHANNEL_PARTNERS: (_A.CREATE, _A.READ, _A.DELETE, _A.MANAGE),
+    # Traffic Flows: READ (the Master overview + config preview) and UPDATE
+    # (apply/disable /ip traffic-flow on a router, dry-run by default).
+    # NOTE FOR DEPLOY: new keys -- re-run ``python -m app.domains.rbac.seed``.
+    PermissionModule.TRAFFIC_FLOWS: (_A.READ, _A.UPDATE),
     # Network Integrations: plain CRUD on the integration row plus MANAGE
     # (the platform-console enable/disable, a real admin action distinct
     # from a field edit -- the same reasoning
@@ -676,6 +680,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.READINESS: "Router Readiness Checklist",
     PermissionModule.CHANNEL_PARTNERS: "Channel Partners",
     PermissionModule.NETWORK_INTEGRATIONS: "Network Integrations",
+    PermissionModule.TRAFFIC_FLOWS: "Traffic Flows",
     PermissionModule.DEVICE_LOGS: "Device Logs",
 }
 
@@ -843,6 +848,8 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # non-GLOBAL system role below now carries the same explicit
     # ``_L.NONE`` override those three do.
     PermissionModule.NETWORK_INTEGRATIONS: ScopeType.GLOBAL,
+    # Guest browsing metadata, Master console only -- see the enum comment.
+    PermissionModule.TRAFFIC_FLOWS: ScopeType.GLOBAL,
     # Device Logs is a Master-console surface: the lines span every tenant
     # and carry guest identifiers. Same GLOBAL-only shape (and the same
     # explicit NONE on every non-GLOBAL role) as NETWORK_INTEGRATIONS.
@@ -1017,6 +1024,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # for this job -- FULL, not just OPERATE like this role's other
             # overrides above.
             _M.SUPPORT_TICKETS: _L.FULL,
+            # Guest browsing metadata: Super Admin / Platform Admin only.
+            _M.TRAFFIC_FLOWS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1080,6 +1089,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # is onboarded and credentialled from the Master console only.
             # See MODULE_NARROWEST_SCOPE's own entry.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1114,6 +1124,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
             # identical override above.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1160,6 +1171,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
             # identical override above.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1197,6 +1209,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
             # identical override above.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1265,6 +1278,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # additive. See RETIRED_NON_GLOBAL_MODULES below, which is
             # what actually revokes the rows this line used to create.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
@@ -1341,6 +1355,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             _M.CHANNEL_PARTNERS: _L.NONE,
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1384,6 +1399,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # _L.OPERATE for the same "this location's own network
             # controller" reason, retired for the same product decision.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
             # Day-to-day network operations plainly includes knowing
             # whether THIS location's own internet uplink is up (ISP) and
@@ -1547,6 +1563,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # base_url, its Omada id and its site/SSID mapping to anyone
             # with tenant-wide "read-only visibility".
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1582,6 +1599,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # is the audit log (_L.FULL above), which records every
             # controller action without exposing the controller.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),

@@ -69,6 +69,7 @@ from app.domains.qos.models import QosTrafficRule
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
+from app.domains.traffic_flow.routeros import traffic_flow_lines_for_router
 from app.domains.vlan.models import Vlan
 from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
@@ -502,6 +503,38 @@ class NetworkConfigService:
         )
         return [r for r in rules if r.is_enabled]
 
+    async def _gather_traffic_flow_lines(
+        self,
+        router_id: uuid.UUID,
+        peer: WireGuardPeer | None,
+        server: WireGuardServer | None,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> list[str] | None:
+        """The traffic-flow section, or ``None``. Every gate lives in
+        ``traffic_flow_lines_for_router`` (flag, allowlist, vendor, tunnel);
+        this only supplies the router's vendor and RouterOS version."""
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        if not settings.traffic_flow_enabled:
+            return None
+        vendor: str | None = None
+        version: str | None = None
+        if self.router_lookup is not None:
+            router = await self.router_lookup.get_router(
+                router_id, requesting_organization_id=requesting_organization_id
+            )
+            vendor, version = router.vendor, router.routeros_version
+        return traffic_flow_lines_for_router(
+            router_id=router_id,
+            vendor=vendor,
+            routeros_version=version,
+            peer=peer,
+            server=server,
+            settings=settings,
+        )
+
     async def preview_config(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> NetworkConfigPreview:
@@ -550,6 +583,12 @@ class NetworkConfigService:
             radius_server_host=_radius_server_address(server),
             mac_authorization_entries=mac_authorization_entries,
             content_filter_rules=content_filter_rules,
+            traffic_flow_lines=await self._gather_traffic_flow_lines(
+                router_id,
+                peer,
+                server,
+                requesting_organization_id=requesting_organization_id,
+            ),
         )
         return NetworkConfigPreview(
             router_id=router_id,
@@ -645,6 +684,12 @@ class NetworkConfigService:
             radius_server_host=_radius_server_address(server),
             mac_authorization_entries=mac_authorization_entries,
             content_filter_rules=content_filter_rules,
+            traffic_flow_lines=await self._gather_traffic_flow_lines(
+                router_id,
+                peer,
+                server,
+                requesting_organization_id=requesting_organization_id,
+            ),
         )
         if not rendered:
             raise EmptyNetworkConfigError(router_id)
