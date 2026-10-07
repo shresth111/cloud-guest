@@ -123,6 +123,32 @@ def render_removal() -> list[str]:
     ]
 
 
+def modern_action_row(row: dict[str, str]) -> dict[str, str]:
+    """``row`` for RouterOS releases that replaced ``bsd-syslog=yes`` with
+    ``remote-log-format=bsd-syslog`` (the gateway writer makes the same
+    switch, by reading the device: ``adapt_action_for_device``)."""
+    out = dict(row)
+    if out.pop("bsd-syslog", None) == "yes":
+        out["remote-log-format"] = "bsd-syslog"
+    return out
+
+
+def render_action_add(config: RemoteLoggingConfig) -> str:
+    """One line that adds the action in whichever dialect the router speaks.
+    The probe reads ``remote-log-format`` off the default ``remote`` action
+    (present on every RouterOS); only the probe sits in ``on-error`` -- the
+    ``add`` itself is never swallowed, so a rejected parameter still stops
+    the paste loudly."""
+    legacy = _args(config.action_row())
+    modern = _args(modern_action_row(config.action_row()))
+    return (
+        ":local m false; :do { /system logging action get [find name=remote] "
+        "remote-log-format; :set m true } on-error={}; "
+        f":if ($m) do={{ /system logging action add {modern} }} "
+        f"else={{ /system logging action add {legacy} }}"
+    )
+
+
 def render_script(config: RemoteLoggingConfig) -> list[str]:
     """Paste script: remove-then-add (idempotent by replacement), then print
     what the router now holds so the operator sees the read-back.
@@ -131,7 +157,7 @@ def render_script(config: RemoteLoggingConfig) -> list[str]:
     (e.g. an older RouterOS without ``src-address``) must stop the paste
     loudly instead of leaving a half-configured router that looks done."""
     lines = render_removal()
-    lines.append(f"/system logging action add {_args(config.action_row())}")
+    lines.append(render_action_add(config))
     lines.extend(f"/system logging add {_args(row)}" for row in config.rule_rows())
     lines.append(
         f':put ("Wyfy remote logging: " . [:len [/system logging find '
@@ -143,6 +169,8 @@ def render_script(config: RemoteLoggingConfig) -> list[str]:
 
 __all__ = [
     "RemoteLoggingConfig",
+    "modern_action_row",
+    "render_action_add",
     "desired_config",
     "hub_tunnel_address",
     "render_removal",
