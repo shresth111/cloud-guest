@@ -46,6 +46,34 @@ _ACTION_MENU = ("system", "logging", "action")
 _RULE_MENU = ("system", "logging")
 _BOOLEAN_FIELDS = frozenset({"bsd-syslog", "disabled"})
 
+# RouterOS renamed the RFC 3164 switch: older releases take ``bsd-syslog=yes``;
+# newer RouterOS 7 releases dropped that parameter ("unknown parameter
+# bsd-syslog", seen on a prod router 2026-10-07) for
+# ``remote-log-format=bsd-syslog``. Which one a router speaks is read off the
+# device itself -- every RouterOS ships a default ``remote`` action, and its
+# row carries ``remote-log-format`` exactly when the router uses the new name.
+_LEGACY_FORMAT_FIELD = "bsd-syslog"
+_MODERN_FORMAT_FIELD = "remote-log-format"
+
+
+def uses_remote_log_format(action_rows: Sequence[Mapping[str, Any]]) -> bool:
+    """True when this router's action rows carry ``remote-log-format``."""
+    return any(_MODERN_FORMAT_FIELD in row for row in action_rows)
+
+
+def adapt_action_for_device(
+    desired_action: Mapping[str, str], *, modern: bool
+) -> dict[str, str]:
+    """The caller's row in the dialect this router speaks. The caller always
+    describes the legacy form (``bsd-syslog=yes``); on a modern router that
+    becomes ``remote-log-format=bsd-syslog``. Nothing else changes."""
+    row = dict(desired_action)
+    if not modern or _LEGACY_FORMAT_FIELD not in row:
+        return row
+    legacy = _norm(_LEGACY_FORMAT_FIELD, row.pop(_LEGACY_FORMAT_FIELD))
+    row[_MODERN_FORMAT_FIELD] = "bsd-syslog" if legacy == "yes" else "default"
+    return row
+
 
 @dataclass(frozen=True)
 class RemoteLoggingReadback:
@@ -91,11 +119,12 @@ def read_remote_logging(
 ) -> RemoteLoggingReadback:
     """Compare the device with the desired state. ``desired_action=None``
     means "expect it gone" (the read-back after a removal)."""
-    actions = [
-        r
-        for r in api.path(*_ACTION_MENU)
-        if _norm("name", r.get("name")) == action_name
-    ]
+    all_actions = list(api.path(*_ACTION_MENU))
+    actions = [r for r in all_actions if _norm("name", r.get("name")) == action_name]
+    if desired_action is not None:
+        desired_action = adapt_action_for_device(
+            desired_action, modern=uses_remote_log_format(all_actions)
+        )
     rules = _ours(list(api.path(*_RULE_MENU)), action_name)
     enabled = [r for r in rules if _norm("disabled", r.get("disabled")) != "yes"]
     topics = tuple(sorted(_norm("topics", r.get("topics")) or "" for r in enabled))
@@ -161,9 +190,11 @@ def apply_remote_logging(
 ) -> RemoteLoggingReadback:
     action_name = desired_action["name"]
     action_menu = api.path(*_ACTION_MENU)
-    existing = [
-        r for r in action_menu if _norm("name", r.get("name")) == action_name
-    ]
+    all_actions = list(action_menu)
+    desired_action = adapt_action_for_device(
+        desired_action, modern=uses_remote_log_format(all_actions)
+    )
+    existing = [r for r in all_actions if _norm("name", r.get("name")) == action_name]
     if not existing:
         action_menu.add(**dict(desired_action))
     else:
@@ -294,6 +325,8 @@ class MikroTikRemoteLogging:
 
 __all__ = [
     "MikroTikRemoteLogging",
+    "adapt_action_for_device",
+    "uses_remote_log_format",
     "RemoteLoggingReadback",
     "apply_remote_logging",
     "read_remote_logging",

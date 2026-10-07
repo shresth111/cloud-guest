@@ -31,6 +31,8 @@ from app.domains.device_logs.routeros import (
     RemoteLoggingConfig,
     desired_config,
     hub_tunnel_address,
+    modern_action_row,
+    render_action_add,
     render_removal,
     render_script,
     router_tag,
@@ -156,12 +158,14 @@ class TestRouterOs:
         differ if this fails."""
         cfg = _config()
         lines = render_script(cfg)
-        action_lines = [
-            ln for ln in lines if ln.startswith("/system logging action add ")
-        ]
+        action_lines = [ln for ln in lines if "/system logging action add " in ln]
         rule_lines = [ln for ln in lines if ln.startswith("/system logging add ")]
         assert len(action_lines) == 1
-        assert _kv(action_lines[0]) == cfg.action_row()
+        modern_part, legacy_part = re.findall(
+            r"/system logging action add ([^}]*) \}", action_lines[0]
+        )
+        assert _kv(legacy_part) == cfg.action_row()
+        assert _kv(modern_part) == modern_action_row(cfg.action_row())
         assert [_kv(ln) for ln in rule_lines] == cfg.rule_rows()
         assert [r["topics"] for r in cfg.rule_rows()] == list(ROUTEROS_TOPICS)
 
@@ -176,8 +180,27 @@ class TestRouterOs:
 
     def test_add_lines_are_not_swallowed_by_on_error(self) -> None:
         for line in render_script(_config()):
-            if " add " in line:
-                assert "on-error" not in line
+            for handler in re.findall(r"on-error=\{([^}]*)\}", line):
+                assert "add" not in handler
+            if " add " in line and "on-error" in line:
+                # Only the dialect probe may sit in a :do; the add is in :if.
+                assert re.search(r":if \(\$m\) do=\{ /system logging action add ", line)
+
+    def test_both_routeros_dialects_are_rendered(self) -> None:
+        """Older RouterOS takes bsd-syslog=yes; newer RouterOS 7 rejects it
+        ("unknown parameter bsd-syslog", prod 2026-10-07) and takes
+        remote-log-format=bsd-syslog."""
+        line = render_action_add(_config())
+        assert "remote-log-format=bsd-syslog" in line
+        assert "bsd-syslog=yes" in line
+        assert line.count("/system logging action add ") == 2
+
+    def test_renderer_and_writer_agree_on_the_modern_dialect(self) -> None:
+        from wyfy_device_gateway.mikrotik_remote_logging import adapt_action_for_device
+
+        row = _config().action_row()
+        assert adapt_action_for_device(row, modern=True) == modern_action_row(row)
+        assert adapt_action_for_device(row, modern=False) == row
 
     def test_script_targets_the_tunnel(self) -> None:
         row = _config().action_row()

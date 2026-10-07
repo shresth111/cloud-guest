@@ -184,3 +184,51 @@ async def test_async_entry_point_closes_and_maps_errors():
     with pytest.raises(MikroTikDeviceError):
         await client.remove(creds, action_name="wyfysyslog")
     assert broken.closed
+
+
+# -- RouterOS dialects: bsd-syslog=yes vs remote-log-format=bsd-syslog --------
+
+MODERN_DEFAULTS = [
+    {".id": "*0", "name": "memory", "target": "memory"},
+    {
+        ".id": "*1",
+        "name": "remote",
+        "target": "remote",
+        "remote": "0.0.0.0",
+        "remote-log-format": "default",
+    },
+]
+
+
+def test_modern_router_gets_remote_log_format_not_bsd_syslog():
+    """Prod 2026-10-07: "unknown parameter bsd-syslog" on a newer RouterOS 7."""
+    api = _api({ACTION: [dict(r) for r in MODERN_DEFAULTS]})
+    readback = _apply(api)
+    ours = [r for r in api._menus[ACTION] if r.get("name") == "wyfysyslog"]
+    assert len(ours) == 1
+    assert "bsd-syslog" not in ours[0]
+    assert ours[0]["remote-log-format"] == "bsd-syslog"
+    assert readback.ok, readback.detail
+
+
+def test_modern_router_second_apply_writes_nothing():
+    api = _api({ACTION: [dict(r) for r in MODERN_DEFAULTS]})
+    _apply(api)
+    before = [dict(r) for r in api._menus[ACTION]]
+    readback = _apply(api)
+    assert [dict(r) for r in api._menus[ACTION]] == before
+    assert readback.ok, readback.detail
+
+
+def test_legacy_router_keeps_bsd_syslog():
+    legacy = [dict(r) for r in DEFAULTS]
+    legacy[1]["bsd-syslog"] = False
+    api = _api({ACTION: legacy})
+    readback = _apply(api)
+    ours = [r for r in api._menus[ACTION] if r.get("name") == "wyfysyslog"][0]
+    assert _truthy(ours["bsd-syslog"]) and "remote-log-format" not in ours
+    assert readback.ok, readback.detail
+
+
+def _truthy(v):
+    return v is True or str(v).lower() in {"yes", "true"}
