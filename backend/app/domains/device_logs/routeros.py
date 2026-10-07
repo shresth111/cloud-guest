@@ -125,11 +125,13 @@ def render_removal() -> list[str]:
 
 def modern_action_row(row: dict[str, str]) -> dict[str, str]:
     """``row`` for RouterOS releases that replaced ``bsd-syslog=yes`` with
-    ``remote-log-format=bsd-syslog`` (the gateway writer makes the same
+    ``remote-log-format=syslog`` + ``syslog-time-format=bsd-syslog``
+    (measured on RouterOS 7.21.4; the gateway writer makes the same
     switch, by reading the device: ``adapt_action_for_device``)."""
     out = dict(row)
     if out.pop("bsd-syslog", None) == "yes":
-        out["remote-log-format"] = "bsd-syslog"
+        out["remote-log-format"] = "syslog"
+        out["syslog-time-format"] = "bsd-syslog"
     return out
 
 
