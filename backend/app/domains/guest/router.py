@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -47,6 +47,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
+from app.domains.device_logs.dependencies import get_guest_device_events_reader
+from app.domains.device_logs.schemas import SessionDeviceEvents
+from app.domains.device_logs.session_events import GuestDeviceEventsReader
 from app.domains.location.scoping import enforce_target_location
 from app.domains.marketing.dependencies import (
     MarketingConsentOfferResolver,
@@ -1668,6 +1671,43 @@ async def get_guest_session(
                 requesting_organization_id=requesting_organization_id,
             )
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
+    "/guest-sessions/{session_id}/device-events",
+    response_model=ApiResponse[SessionDeviceEvents],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def get_guest_session_device_events(
+    request: Request,
+    session_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+    reader: GuestDeviceEventsReader = Depends(get_guest_device_events_reader),
+):
+    """Guest Connection Records: what the venue's router logged about this
+    session's device (IP assigned/released, hotspot sign-in/out).
+
+    Same permission and the same scoped getter as ``GET
+    /guest-sessions/{id}`` -- organization (header org vs the session's own,
+    so a foreign session id is a 404/403, not a read) and the caller's
+    location grants. The reader then keys everything on that fetched row,
+    never on request input. Only events linked to exactly this session are
+    returned; raw device log lines stay Master-only (``device_logs.read``,
+    pinned GLOBAL)."""
+    session = await service.get_session(
+        session_id, requesting_organization_id=requesting_organization_id
+    )
+    data = await reader.for_session(session, now=datetime.now(UTC))
+    return build_response(
+        success=True,
+        message="Guest session device events retrieved",
+        data=SessionDeviceEvents.model_validate(
+            {"session_id": str(session.id), **data}
+        ).model_dump(mode="json"),
         request_id=_request_id(request),
     )
 
