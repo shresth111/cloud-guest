@@ -44,6 +44,7 @@ from .exceptions import (
     DeviceLogsRouterBlockedError,
     DeviceLogsRouterNotFoundError,
 )
+from .guest_events import guest_event_row
 from .models import RouterRemoteLogging
 from .parser import parse_line
 from .repository import DeviceLogsRepository, EventFilters
@@ -172,6 +173,20 @@ def receiving_state(
     return ReceivingState.RECEIVING
 
 
+def _guest_row(event_id: int, row: dict[str, Any]) -> dict[str, Any] | None:
+    return guest_event_row(
+        device_log_event_id=event_id,
+        attribution=row["attribution"],
+        organization_id=row["organization_id"],
+        location_id=row["location_id"],
+        router_id=row["router_id"],
+        received_at=row["received_at"],
+        device_time=row["device_time"],
+        topics=row["topics"],
+        message=row["message"],
+    )
+
+
 def _id(value: uuid.UUID | None) -> str | None:
     return str(value) if value is not None else None
 
@@ -240,10 +255,48 @@ class DeviceLogsService:
                     "claimed_tag": parsed.tag,
                 }
             )
-        await self.repository.insert_events(rows)
+        ids = await self.repository.insert_events(rows)
+        guest_rows = [
+            derived
+            for event_id, row in zip(ids, rows, strict=True)
+            if (derived := _guest_row(event_id, row)) is not None
+        ]
+        await self.repository.insert_guest_events(guest_rows)
         if counts["tag_mismatch"] or counts["unattributed"]:
             logger.warning("device_logs_ingest_attribution_gaps", extra=counts)
         return {"accepted": len(rows), **counts}
+
+    async def backfill_guest_events(self, *, batch_size: int = 1000) -> int:
+        """Derive ``guest_device_events`` for stored lines that have none yet.
+        Idempotent: re-running finds nothing new. Returns rows inserted."""
+        inserted = 0
+        after_id = 0
+        while True:
+            lines = await self.repository.lines_without_guest_event(
+                after_id=after_id, limit=batch_size
+            )
+            if not lines:
+                return inserted
+            after_id = lines[-1].id
+            guest_rows = [
+                derived
+                for line in lines
+                if (
+                    derived := guest_event_row(
+                        device_log_event_id=line.id,
+                        attribution=line.attribution,
+                        organization_id=line.organization_id,
+                        location_id=line.location_id,
+                        router_id=line.router_id,
+                        received_at=line.received_at,
+                        device_time=line.device_time,
+                        topics=line.topics,
+                        message=line.message,
+                    )
+                )
+                is not None
+            ]
+            inserted += await self.repository.insert_guest_events(guest_rows)
 
     # -- viewer --------------------------------------------------------
     async def list_events(
