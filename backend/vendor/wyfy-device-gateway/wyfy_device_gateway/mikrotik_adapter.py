@@ -1724,9 +1724,21 @@ class MikroTikAdapter:
         try:
             leases = self._safe_query(api, "ip", "dhcp-server", "lease")
             arp_entries = self._safe_query(api, "ip", "arp")
+            route_rows = self._safe_query(api, "ip", "route")
+            address_rows = self._safe_query(api, "ip", "address")
+            interface_rows = self._safe_query(api, "interface")
+            dhcp_client_rows = self._safe_query(api, "ip", "dhcp-client")
         finally:
             api.close()
-        return _merge_connected_devices(leases, arp_entries)
+        uplinks = _uplink_interfaces(
+            route_rows, address_rows, dhcp_client_rows, interface_rows
+        )
+        guest_side_arp = [
+            row
+            for row in arp_entries
+            if _safe_str(row.get("interface")) not in uplinks
+        ]
+        return _merge_connected_devices(leases, guest_side_arp)
 
     async def disconnect_device(
         self, creds: DeviceCredentials, *, mac_address: str, interface: str | None
@@ -8180,6 +8192,42 @@ def _lease_from_row(row: Mapping[str, object]) -> DhcpLease | None:
         comment=_safe_str(row.get("comment")),
         disabled=_is_truthy(row.get("disabled")),
     )
+
+
+def _uplink_interfaces(
+    route_rows: list[dict[str, object]],
+    address_rows: list[dict[str, object]],
+    dhcp_client_rows: list[dict[str, object]],
+    interface_rows: list[dict[str, object]],
+) -> set[str]:
+    """Interfaces that face the ISP rather than the guests: the egress of
+    every default route (named by the same :func:`_route_interface` rule
+    the NAT push uses, so failover WANs count too) plus every interface
+    the router is itself a DHCP *client* on.
+
+    ``/ip/arp`` lists neighbours on every interface, so without this the
+    ISP's own router and anything else on the upstream LAN showed up as
+    "connected devices" next to the guest LAN, and read as guests getting
+    internet without a login. A router whose route and
+    dhcp-client menus cannot be read yields an empty set, which keeps the
+    old behaviour rather than hiding real guests on a guess."""
+    interface_names = {
+        str(row["name"]) for row in interface_rows if row.get("name")
+    }
+    uplinks: set[str] = set()
+    for row in route_rows:
+        if row.get("dst-address") != "0.0.0.0/0":
+            continue
+        name = _route_interface(
+            row, address_rows, dhcp_client_rows, interface_names
+        )
+        if name:
+            uplinks.add(name)
+    for row in dhcp_client_rows:
+        name = _safe_str(row.get("interface"))
+        if name:
+            uplinks.add(name)
+    return uplinks
 
 
 def _merge_connected_devices(
