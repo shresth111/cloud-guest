@@ -114,6 +114,39 @@ def _assignment_response(assignment: PolicyAssignment) -> PolicyAssignmentRespon
 # ============================================================================
 
 
+_REAPPLY_DISPATCH_COUNTDOWN_SECONDS = 3
+
+
+def _dispatch_bandwidth_reapply(
+    policy_id: uuid.UUID, *, version_id: uuid.UUID | None = None
+) -> None:
+    """Ask the worker to re-resolve the live guest queues this policy
+    reaches. Never raises: the policy change it follows has already been
+    saved and is correct for every next login either way.
+
+    The task import is function-local to keep the module-import graph
+    acyclic (see the note above the router definition)."""
+    try:
+        from app.domains.queue_management.tasks import (  # noqa: PLC0415
+            reapply_policy_assignments,
+        )
+
+        # A short countdown, not ``.delay()``: the request's transaction
+        # commits only after this handler returns (``get_db_session``
+        # commits after its ``yield``), so a worker that picks the task up
+        # at once reads the policy as it was *before* this change -- and a
+        # brand-new assignment is simply not there yet.
+        reapply_policy_assignments.apply_async(
+            kwargs={
+                "policy_id": str(policy_id),
+                "version_id": str(version_id) if version_id is not None else "",
+            },
+            countdown=_REAPPLY_DISPATCH_COUNTDOWN_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 -- never fail the request over a dispatch hiccup
+        logger.exception("bandwidth_publish_reapply_dispatch_failed")
+
+
 @router.get(
     "/resolve",
     response_model=ApiResponse[ResolvedPolicyResponse],
@@ -423,17 +456,7 @@ async def publish_policy_version(
     # correct for every *next* login either way. The import is
     # function-local to keep the module-import graph acyclic (see the note
     # above the router definition).
-    try:
-        from app.domains.queue_management.tasks import (
-            reapply_policy_assignments,
-        )
-
-        reapply_policy_assignments.delay(
-            policy_id=str(policy_id),
-            version_id=str(version_id),
-        )
-    except Exception:  # noqa: BLE001 -- never fail a publish over a dispatch hiccup
-        logger.exception("bandwidth_publish_reapply_dispatch_failed")
+    _dispatch_bandwidth_reapply(policy_id, version_id=version_id)
     return build_response(
         success=True,
         message="Policy version published",
@@ -499,6 +522,14 @@ async def create_policy_assignment(
         target_type=payload.target_type,
         target_id=payload.target_id,
     )
+    # Mapping a policy to a location changes what that location's guests
+    # are entitled to exactly as a publish does, and it was the one of the
+    # two that told nobody. The dashboard's first save of a venue's speed
+    # publishes the version and THEN creates this assignment, so the
+    # publish-time re-apply above ran against a policy mapped to no
+    # location, found nothing to do, and the guests already online kept
+    # the speed they signed in with. Same task, same best-effort posture.
+    _dispatch_bandwidth_reapply(policy_id)
     return build_response(
         success=True,
         message="Policy assignment created",

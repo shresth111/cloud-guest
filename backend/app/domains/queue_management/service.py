@@ -65,8 +65,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from typing import Any, Protocol
 
 from app.domains.policy.constants import PolicyType
@@ -83,6 +84,7 @@ from app.domains.router.vendor_capabilities import is_controller_managed
 from .constants import (
     APPLICABLE_QUEUE_STATUSES,
     DEFAULT_QUEUE_PRIORITY,
+    RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS,
     REMOVABLE_QUEUE_STATUSES,
     UNLIMITED_RATE_KBPS,
     QueueScheduleType,
@@ -97,6 +99,8 @@ from .exceptions import (
     QueueAssignmentNotApplicableError,
     QueueAssignmentNotFoundError,
     QueueAssignmentNotRemovableError,
+    QueueDeviceConnectionError,
+    QueueDeviceOperationError,
     QueueMissingCredentialsError,
     QueueProfileNotFoundError,
     QueueScheduleNotFoundError,
@@ -178,6 +182,28 @@ class PolicyLookupProtocol(Protocol):
     ) -> ResolvedPolicyProtocol: ...
 
 
+class SessionLivenessLookupProtocol(Protocol):
+    """Which guest sessions are still live -- the one question this domain
+    has to ask the guest domain, and the only thing it learns from it.
+
+    A SESSION-targeted assignment names its session by id and nothing else
+    (``QueueAssignment.target_id`` is deliberately not a foreign key), so
+    this service cannot see a session end. Without this it never did: a
+    session's queue stayed ACTIVE, and on the router, for ever.
+
+    ``live_session_ids`` returns the subset of ``session_ids`` whose session
+    exists and can still carry traffic or be resumed (active or paused).
+    An id it does not return is a session that has ended.
+
+    ``None``-by-default on the service, like ``controller_speed_hook``: a
+    deployment or a test without it wired releases nothing and re-applies
+    exactly as before."""
+
+    async def live_session_ids(
+        self, session_ids: Collection[uuid.UUID]
+    ) -> set[uuid.UUID]: ...
+
+
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
@@ -215,6 +241,7 @@ class QueueManagementService:
         device_adapter_resolver=get_queue_adapter,
         caller_location_scope: LocationScope = None,
         controller_speed_hook: ControllerSpeedHookProtocol | None = None,
+        session_liveness_lookup: SessionLivenessLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -227,6 +254,9 @@ class QueueManagementService:
         # network-integration domain wired -- and produces a refusal that
         # names the situation, never a silent success.
         self.controller_speed_hook = controller_speed_hook
+        # How this service learns that a guest session has ended -- see
+        # ``SessionLivenessLookupProtocol``. ``None`` releases nothing.
+        self.session_liveness_lookup = session_liveness_lookup
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
 
@@ -901,9 +931,27 @@ class QueueManagementService:
             else:
                 credentials = self._resolve_device_credentials(router)
                 adapter = self._get_device_adapter(router.vendor)
-                await adapter.remove_queue(
-                    credentials, device_queue_id=assignment.device_queue_id
-                )
+                try:
+                    await adapter.remove_queue(
+                        credentials, device_queue_id=assignment.device_queue_id
+                    )
+                except QueueDeviceOperationError as exc:
+                    # The router answered and said the row is not there --
+                    # removed by hand, or lost with a configuration reset.
+                    # That is the state this call exists to reach, so it is
+                    # not a failure; treating it as one left the assignment
+                    # ACTIVE for good, re-tried and re-failed by every sweep
+                    # and every supersede pass. Anything else the router
+                    # says is still an error.
+                    if not _device_says_row_is_gone(exc):
+                        raise
+                    logger.warning(
+                        "queue_remove_row_already_gone",
+                        extra={
+                            "assignment_id": str(assignment.id),
+                            "router_id": str(assignment.router_id),
+                        },
+                    )
 
         validate_status_transition(current=current, target=QueueStatus.DISABLED)
         updated = await self.repository.update_assignment(
@@ -1516,12 +1564,35 @@ class QueueManagementService:
             page=1,
             page_size=1000,
         )
+        candidates = [
+            a
+            for a in assignments
+            if a.target_type == QueueTargetType.SESSION.value
+            and a.router_id is not None
+            and a.target_id is not None
+        ]
+        # Sessions that have ended are not re-applied. Their rows used to be:
+        # nothing told this service a session was over, so every publish
+        # rebuilt a queue for a guest who had left -- and, where that dead
+        # row shared an address with a live one, whichever happened to be
+        # iterated last retired the other. The periodic
+        # ``release_queues_for_ended_sessions`` is what removes them; here
+        # they are only kept out of the way.
+        if self.session_liveness_lookup is not None and candidates:
+            live = await self.session_liveness_lookup.live_session_ids(
+                {a.target_id for a in candidates}
+            )
+            candidates = [a for a in candidates if a.target_id in live]
+        # Newest first, so that where two rows still name one address the
+        # most recent sign-in is the one that keeps it: its re-resolve
+        # retires the older row, and the status re-read below then skips
+        # that older row instead of letting it take the address back.
+        candidates.sort(key=lambda a: a.created_at, reverse=True)
         reapplied = 0
         failed = 0
-        for assignment in assignments:
-            if assignment.target_type != QueueTargetType.SESSION.value:
-                continue
-            if assignment.router_id is None:
+        for assignment in candidates:
+            current = await self.repository.get_assignment_by_id(assignment.id)
+            if current is None or current.status != QueueStatus.ACTIVE.value:
                 continue
             try:
                 await self.resolve_and_assign_queue(
@@ -1542,6 +1613,122 @@ class QueueManagementService:
                     extra={"assignment_id": str(assignment.id), "error": str(exc)},
                 )
         return {"reapplied": reapplied, "failed": failed}
+
+    async def release_queues_for_ended_sessions(
+        self,
+        *,
+        now: datetime | None = None,
+        grace_seconds: float = RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS,
+    ) -> dict[str, int]:
+        """Expire every SESSION assignment whose guest session has ended,
+        taking its ``/queue simple`` row (or controller limit) off the
+        device.
+
+        ## Why this exists
+
+        Nothing else does it. A session ends in a dozen places -- an
+        operator's disconnect, the guest's own logout, the timeout, FUP and
+        data-cap sweeps, RADIUS Accounting-Stop, a NAS restart, the
+        presence reconciliation -- and none of them touched the session's
+        queue. The assignment stayed ACTIVE and the row stayed on the
+        router. RouterOS applies the first matching ``/queue simple`` for
+        an address in list order, so a dead session's row went on deciding
+        the speed of whoever held that address next: observed live as an
+        ``0/0`` (unlimited) row from an ended session sitting above a
+        30 Mbps row for the same device.
+
+        A periodic reconciliation rather than a hook on each of those
+        paths, deliberately: it cannot be forgotten by the next path
+        somebody adds, and it also clears the rows the old behaviour has
+        already left on routers.
+
+        ## What it decides from, and what it never does
+
+        It reconciles **database rows against database rows**:
+        ``QueueAssignment`` against the guest session it names. The device
+        row removed is the one whose id this platform stored when it
+        created it. Nothing here lists the router's queues and picks one --
+        the device cannot say which of two rows for an address is correct.
+        A row this platform has no assignment for is therefore out of this
+        method's reach, by design.
+
+        * An assignment younger than ``grace_seconds`` is not judged (see
+          ``constants.RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS``).
+        * A paused session is live: it resumes onto the same assignment.
+        * No lookup wired -> nothing is released.
+
+        ## Failure
+
+        One row's failure never stops the rest. A router that cannot be
+        reached is skipped for the remainder of the run after its first
+        connection failure -- each attempt costs a full connect timeout,
+        and a venue that is offline may have dozens of rows waiting. Its
+        assignments stay as they are and are retried on the next run.
+
+        Returns ``{"released", "failed", "skipped_unreachable"}``."""
+        result = {"released": 0, "failed": 0, "skipped_unreachable": 0}
+        if self.session_liveness_lookup is None:
+            return result
+        now = now or datetime.now(UTC)
+        cutoff = now - timedelta(seconds=grace_seconds)
+
+        candidates: list[QueueAssignment] = []
+        for status_value in (
+            QueueStatus.ACTIVE,
+            QueueStatus.SUSPENDED,
+            QueueStatus.PENDING,
+            QueueStatus.DISABLED,
+        ):
+            for row in await self.repository.list_assignments_by_status(
+                status=status_value.value
+            ):
+                if (
+                    row.target_type == QueueTargetType.SESSION.value
+                    and row.target_id is not None
+                    and not row.is_deleted
+                    and row.created_at <= cutoff
+                ):
+                    candidates.append(row)
+        if not candidates:
+            return result
+
+        live = await self.session_liveness_lookup.live_session_ids(
+            {row.target_id for row in candidates}
+        )
+        unreachable_routers: set[uuid.UUID] = set()
+        for row in sorted(candidates, key=lambda a: a.created_at):
+            if row.target_id in live:
+                continue
+            if row.router_id in unreachable_routers:
+                result["skipped_unreachable"] += 1
+                continue
+            try:
+                await self.expire_assignment(
+                    row.id,
+                    actor_user_id=None,
+                    requesting_organization_id=row.organization_id,
+                    reason="guest session ended",
+                )
+                result["released"] += 1
+            except QueueDeviceConnectionError as exc:
+                if row.router_id is not None:
+                    unreachable_routers.add(row.router_id)
+                result["failed"] += 1
+                logger.warning(
+                    "queue_release_router_unreachable",
+                    extra={
+                        "assignment_id": str(row.id),
+                        "router_id": str(row.router_id),
+                        "error": str(exc),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 -- per-row isolation, see docstring
+                result["failed"] += 1
+                logger.warning(
+                    "queue_release_failed",
+                    extra={"assignment_id": str(row.id), "error": str(exc)},
+                )
+        return result
 
     # ========================================================================
     # Internal helpers
@@ -1651,6 +1838,16 @@ class QueueManagementService:
             description=description,
             organization_id=organization_id,
         )
+
+
+def _device_says_row_is_gone(exc: Exception) -> bool:
+    """Whether a device error means "there is no such row".
+
+    RouterOS answers a ``remove`` of an id it does not hold with a trap
+    whose message is ``no such item``; the gateway carries that text
+    through unchanged. Matched on the message because that is all the
+    device gives -- there is no error code for it."""
+    return "no such item" in str(exc).lower()
 
 
 def _is_routeros_session_target(router: Router, device_target: str | None) -> bool:

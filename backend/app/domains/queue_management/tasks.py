@@ -45,6 +45,7 @@ from app.domains.router.service import RouterService
 
 from .constants import (
     TASK_REAPPLY_POLICY_ASSIGNMENTS,
+    TASK_RELEASE_ENDED_SESSION_QUEUES,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from .repository import QueueManagementRepository
@@ -69,6 +70,50 @@ logger = get_logger(__name__)
 #: ``network_integration.dependencies`` imports ``guest.dependencies``, so a
 #: module-scope import would pull that whole graph into any process that
 #: merely imports this task module.
+
+
+class GuestSessionLiveness:
+    """``service.SessionLivenessLookupProtocol`` against the real
+    ``guest_sessions`` table.
+
+    Lives here, not in ``service.py`` and not in the guest domain: the
+    guest domain already depends on this one (it enqueues queue work and
+    imports ``QueueTargetType``), so this is the one place the dependency
+    can point the other way without a cycle -- and the guest imports are
+    function-local for the same reason every other cross-domain import in
+    this module is.
+
+    One ``SELECT id`` per 500 ids, no row is loaded and none is locked."""
+
+    _CHUNK = 500
+
+    def __init__(self, session) -> None:  # noqa: ANN001 -- AsyncSession
+        self._session = session
+
+    @staticmethod
+    def statement(session_ids: list[uuid.UUID]):  # noqa: ANN205
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
+        from app.domains.guest.models import GuestSession  # noqa: PLC0415
+
+        return select(GuestSession.id).where(
+            GuestSession.id.in_(session_ids),
+            GuestSession.is_deleted.is_(False),
+            GuestSession.status.in_(
+                [GuestSessionStatus.ACTIVE.value, GuestSessionStatus.PAUSED.value]
+            ),
+        )
+
+    async def live_session_ids(self, session_ids) -> set[uuid.UUID]:  # noqa: ANN001
+        ids = list(session_ids)
+        live: set[uuid.UUID] = set()
+        for start in range(0, len(ids), self._CHUNK):
+            rows = await self._session.execute(
+                self.statement(ids[start : start + self._CHUNK])
+            )
+            live.update(rows.scalars().all())
+        return live
 
 
 async def _reapply_policy_assignments_async(
@@ -123,6 +168,9 @@ async def _reapply_policy_assignments_async(
             # passes. Without it this task refuses every controller-managed
             # venue -- see the module-level note above.
             controller_speed_hook=build_controller_speed_hook(session),
+            # So a publish is not re-applied to guests who have left -- see
+            # ``reapply_active_sessions_for_location``.
+            session_liveness_lookup=GuestSessionLiveness(session),
         )
         policy_repository = PolicyRepository(session)
         policy = await policy_repository.get_policy_by_id(uuid.UUID(policy_id))
@@ -248,4 +296,69 @@ def sweep_schedule_transitions() -> dict[str, int]:
     return result
 
 
-__all__ = ["sweep_schedule_transitions", "reapply_policy_assignments"]
+async def _release_ended_session_queues_async() -> dict[str, int]:
+    """The actual async work behind ``release_ended_session_queues`` -- a
+    fresh session per run, composed exactly as
+    ``_sweep_schedule_transitions_async`` composes it, plus the liveness
+    lookup this sweep cannot work without."""
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
+    settings = get_settings()
+    async with SessionLocal() as session:
+        audit_repository = RBACRepository(session)
+        organization_service = OrganizationService(
+            OrganizationRepository(session), audit_writer=audit_repository
+        )
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+            audit_writer=audit_repository,
+        )
+        router_service = RouterService(
+            RouterRepository(session),
+            location_service,
+            organization_service,
+            audit_writer=audit_repository,
+            provisioning_token_ttl_hours=settings.router_provisioning_token_expire_hours,
+        )
+        policy_service = PolicyService(
+            PolicyRepository(session),
+            organization_service,
+            location_service,
+            audit_writer=audit_repository,
+        )
+        service = QueueManagementService(
+            QueueManagementRepository(session),
+            router_service,
+            policy_service,
+            audit_writer=audit_repository,
+            controller_speed_hook=build_controller_speed_hook(session),
+            session_liveness_lookup=GuestSessionLiveness(session),
+        )
+        result = await service.release_queues_for_ended_sessions()
+        await session.commit()
+        return result
+
+
+@celery_app.task(name=TASK_RELEASE_ENDED_SESSION_QUEUES)
+def release_ended_session_queues() -> dict[str, int]:
+    """Beat-scheduled (see ``app.core.celery_app``'s ``beat_schedule`` --
+    every ``constants.RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS``).
+    Takes the speed-limit row of every ended guest session off its router;
+    see ``QueueManagementService.release_queues_for_ended_sessions``."""
+    result = run_celery_task(_release_ended_session_queues_async())
+    logger.info(
+        "queue_management_task_release_ended_session_queues_completed", extra=result
+    )
+    return result
+
+
+__all__ = [
+    "GuestSessionLiveness",
+    "sweep_schedule_transitions",
+    "reapply_policy_assignments",
+    "release_ended_session_queues",
+]

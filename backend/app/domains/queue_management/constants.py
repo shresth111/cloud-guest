@@ -230,6 +230,28 @@ TASK_REAPPLY_POLICY_ASSIGNMENTS = (
 SCHEDULE_SWEEP_INTERVAL_SECONDS = 300.0
 
 
+TASK_RELEASE_ENDED_SESSION_QUEUES = (
+    "app.domains.queue_management.tasks.release_ended_session_queues"
+)
+
+# Every 2 minutes. A session's ``/queue simple`` row has no lifetime of its
+# own on the router: nothing there removes it when the guest's session ends,
+# and RouterOS applies the FIRST matching row for an address, so a row left
+# behind keeps deciding the speed of whoever holds that address next. The
+# login path already retires a previous holder's row when the next guest
+# signs in on the same address, so this cadence is not what protects the
+# next guest -- it bounds how long a dead session's row stays on the device
+# and how long its assignment keeps reading ACTIVE.
+RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS = 120.0
+
+# An assignment younger than this is never judged. ``assign_guest_queue``
+# runs in the worker and can create the assignment before the login
+# request that enqueued it has committed the session row (see
+# ``guest.tasks._assign_guest_queue_async``), so "no live session with this
+# id" is briefly true of a guest who is signing in right now.
+RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS = 300.0
+
+
 __all__ = [
     "QueueType",
     "MIN_QUEUE_PRIORITY",
@@ -246,5 +268,8 @@ __all__ = [
     "QueueTemplatePersona",
     "TASK_SWEEP_SCHEDULE_TRANSITIONS",
     "TASK_REAPPLY_POLICY_ASSIGNMENTS",
+    "TASK_RELEASE_ENDED_SESSION_QUEUES",
+    "RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS",
+    "RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS",
     "SCHEDULE_SWEEP_INTERVAL_SECONDS",
 ]
