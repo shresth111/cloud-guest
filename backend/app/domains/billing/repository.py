@@ -110,6 +110,10 @@ class PlanRepositoryProtocol(Protocol):
 
     async def list_plan_features(self, plan_id: uuid.UUID) -> list[PlanFeature]: ...
 
+    async def list_plan_features_for_plans(
+        self, plan_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, list[PlanFeature]]: ...
+
     async def delete_plan_features(self, plan_id: uuid.UUID) -> None: ...
 
 
@@ -173,6 +177,33 @@ class PlanRepository:
             sort_by="feature_key",
             sort_order=SortOrder.ASC,
         )
+
+    async def list_plan_features_for_plans(
+        self, plan_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, list[PlanFeature]]:
+        """``list_plan_features`` for a whole page of plans in one
+        statement. ``GET /plans`` used to call the single-plan version once
+        per plan: 41 of that request's 44 statements on production
+        (2026-10-10), on an endpoint every Master billing surface loads
+        twice. Same rows, same ``feature_key`` order within each plan; a
+        plan with no features maps to an empty list."""
+        grouped: dict[uuid.UUID, list[PlanFeature]] = {
+            plan_id: [] for plan_id in plan_ids
+        }
+        if not plan_ids:
+            return grouped
+        statement = (
+            select(PlanFeature)
+            .where(
+                PlanFeature.plan_id.in_(plan_ids),
+                PlanFeature.is_deleted.is_(False),
+            )
+            .order_by(PlanFeature.plan_id, PlanFeature.feature_key.asc())
+        )
+        result = await self.session.execute(statement)
+        for feature in result.scalars().all():
+            grouped[feature.plan_id].append(feature)
+        return grouped
 
     async def delete_plan_features(self, plan_id: uuid.UUID) -> None:
         for feature in await self.list_plan_features(plan_id):

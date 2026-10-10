@@ -68,6 +68,8 @@ from .dashboard_schemas import (
     OrganizationSummaryItem,
     PeakDayItem,
     PeakHourItem,
+    PlatformOrganizationSummaryItem,
+    PlatformOrganizationSummaryResponse,
     RevenueMetricsResponse,
     SuperAdminDashboardResponse,
 )
@@ -216,6 +218,82 @@ class DashboardService:
             trial_customers=trial_customers,
             paid_customers=paid_customers,
             revenue=RevenueMetricsResponse(),
+        )
+
+    async def get_platform_organization_summaries(
+        self, user_id: uuid.UUID, *, limit: int
+    ) -> PlatformOrganizationSummaryResponse:
+        """The Master console's organization table in a fixed number of
+        statements.
+
+        That table shows three figures per organization and used to obtain
+        them by calling :meth:`get_organization_dashboard` once per row,
+        which computes some twenty other things nobody on that screen reads
+        (auth breakdown, OTP stats, vouchers, peak hour, traffic trend,
+        health score ...). Measured on production 2026-10-10 with 12 rows:
+        12 requests, 312 SQL statements, 407 ms of a single-process API's
+        time -- 58% of everything the landing page asked the server for.
+
+        Every figure here is defined as the same-named field of
+        :meth:`get_organization_dashboard`, so the two can never disagree
+        about an organization:
+
+        * ``guest_count_unique`` -- ``guest_count_unique`` of the latest
+          ``ORG_DAILY_SUMMARY`` snapshot, summed over the organization and,
+          for an MSP, its children;
+        * ``router_count`` -- that snapshot's ``router_count_total``, summed
+          the same way;
+        * ``location_count`` -- active, non-deleted locations, summed the
+          same way.
+
+        Deliberately not audited: this is a list of rows, not a view of one
+        tenant's dashboard, and the per-tenant views it replaces on this
+        screen were incidental to drawing a table.
+        """
+        scope = await self.scope_resolver.resolve(user_id)
+        scope.require_global()
+
+        organizations, meta = await self.organization_lookup.list_organizations(
+            requesting_organization_id=None, page=1, page_size=limit
+        )
+        msp_ids = [org.id for org in organizations if org.is_msp()]
+        children = await self.repository.list_child_organization_ids(msp_ids)
+
+        target_ids: dict[uuid.UUID, list[uuid.UUID]] = {
+            org.id: [org.id, *children.get(org.id, [])] for org in organizations
+        }
+        every_id = list({i for ids in target_ids.values() for i in ids})
+        snapshots = await self.repository.get_latest_snapshots_for_organizations(
+            every_id, snapshot_type=AnalyticsSnapshotType.ORG_DAILY_SUMMARY.value
+        )
+        location_counts = await self.repository.count_active_locations_by_organization(
+            every_id
+        )
+
+        def _metric(organization_id: uuid.UUID, key: str) -> int:
+            snapshot = snapshots.get(organization_id)
+            metrics = snapshot.metrics if snapshot else {}
+            return int(metrics.get(key, 0) or 0)
+
+        items = [
+            PlatformOrganizationSummaryItem(
+                organization_id=org.id,
+                organization_name=org.name,
+                guest_count_unique=sum(
+                    _metric(i, "guest_count_unique") for i in target_ids[org.id]
+                ),
+                router_count=sum(
+                    _metric(i, "router_count_total") for i in target_ids[org.id]
+                ),
+                location_count=sum(
+                    location_counts.get(i, 0) for i in target_ids[org.id]
+                ),
+            )
+            for org in organizations
+        ]
+        return PlatformOrganizationSummaryResponse(
+            items=items,
+            total_organizations=int(getattr(meta, "total_items", len(items))),
         )
 
     async def _compute_platform_growth(
