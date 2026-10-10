@@ -144,11 +144,14 @@ from app.domains.dns_filtering.constants import (
 )
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
+    HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS,
     OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
     QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
     SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS,
     SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+    TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP,
     TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
@@ -342,6 +345,13 @@ celery_app.conf.update(
         # per ended session's row), so it belongs with the other device
         # round trips rather than on the pure-DB default queue.
         TASK_RELEASE_ENDED_SESSION_QUEUES: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The session-bypass reconciliation: one RouterOS API connection
+        # per router, sequentially, so the sweep and the scope fan-in belong
+        # with the other device round trips. The single-router, event-driven
+        # task is deliberately NOT routed here: it is what makes a dashboard
+        # disconnect prompt, and it must not queue behind a fleet poll.
+        TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE: {"queue": DEVICE_IO_QUEUE_NAME},
         # Single sequential sweep issuing real SNMP UDP round trips per
         # router (like TASK_RUN_ISP_HEALTH_CHECK_SWEEP immediately above,
         # not yet fanned out -- see constants
@@ -708,6 +718,16 @@ celery_app.conf.update(
         "queue-management-release-ended-session-queues": {
             "task": TASK_RELEASE_ENDED_SESSION_QUEUES,
             "schedule": RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS,
+        },
+        # Takes a `cloudguest-authmac` hotspot bypass off a router once
+        # nothing lists its MAC -- the removal the router's own script was
+        # meant to do and, on every router provisioned before it was
+        # repaired, never has. Does nothing unless switched on (see
+        # Settings.guest_hotspot_gate_remove_enabled / _router_ids). See
+        # app.domains.guest.hotspot_binding_reconcile.
+        "guest-hotspot-binding-reconcile-sweep": {
+            "task": TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP,
+            "schedule": HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS,
         },
         # ISP Management domain: real RouterOS-backed health-check sweep --
         # every 10 minutes. See

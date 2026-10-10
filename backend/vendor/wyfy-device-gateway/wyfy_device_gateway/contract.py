@@ -880,6 +880,81 @@ class HotspotBypassBindingResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HotspotBypassBindingRow:
+    """One ``/ip hotspot ip-binding`` row carrying exactly
+    ``comment=cloudguest-authmac``, as the router reported it.
+    ``mac_address`` is in the canonical ``AA:BB:CC:DD:EE:FF`` spelling."""
+
+    binding_id: str
+    mac_address: str
+    disabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotBypassBindingSnapshot:
+    """A read of the session bypasses a router currently holds. Nothing is
+    written to produce it.
+
+    ``bindings`` holds only rows whose comment is exactly
+    ``cloudguest-authmac``; every other binding on the router is invisible
+    here on purpose, so a caller cannot remove what it was never shown.
+    ``unreadable`` counts tagged rows whose ``mac-address`` did not parse
+    as a MAC (left out, never guessed at). ``reconciler_enabled`` says
+    whether the router's own ``cloudguest-authmac-sched`` exists and is
+    enabled -- reported, not acted on."""
+
+    hotspot_servers: int
+    reconciler_enabled: bool
+    bindings: tuple[HotspotBypassBindingRow, ...]
+    unreadable: int
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotBypassRemovalResult:
+    """What a router holds after being asked to take one session bypass
+    away, by ``.id``.
+
+    ``outcome`` is exactly one of:
+
+    * ``"removed"`` -- the row was still this platform's (same ``.id``,
+      comment exactly ``cloudguest-authmac``, same MAC), it was removed,
+      and a second read no longer shows it.
+    * ``"gone"`` -- no row with that ``.id`` any more. Nothing was written.
+    * ``"changed"`` -- a row with that ``.id`` exists but is no longer the
+      one that was listed: its comment or its MAC differs (an operator
+      re-tagged or edited it). Nothing was written.
+
+    The rest describe the device after a ``"removed"`` and are reads:
+
+    * ``other_bindings`` -- rows still naming the MAC, as
+      ``"<type>:<comment>"``: an operator's own bypass, a trusted-device
+      bypass, a block. While one exists the device's access is that row's
+      business and nothing further is done.
+    * ``active_session`` -- the MAC is an authenticated ``/ip hotspot
+      active`` session, which a bypass binding had nothing to do with.
+    * ``host_before`` / ``host_after`` -- the ``/ip hotspot host`` row for
+      the MAC before the removal and immediately after it: ``"absent"``,
+      ``"bypassed"`` or ``"unbypassed"`` (``None`` if unreadable). This is
+      the evidence for what RouterOS does to a bypassed host when its
+      binding goes.
+    * ``hosts_removed`` -- host rows removed by this call: only ones that
+      still read ``bypassed`` after the binding was gone, only when asked
+      to, and only with no other binding and no live session for the MAC.
+    """
+
+    outcome: str
+    other_bindings: tuple[str, ...] = ()
+    active_session: bool = False
+    host_before: str | None = None
+    host_after: str | None = None
+    hosts_removed: int = 0
+
+    @property
+    def removed(self) -> bool:
+        return self.outcome == "removed"
+
+
+@dataclass(frozen=True, slots=True)
 class DhcpLease:
     """One ``/ip dhcp-server lease`` row, as the router reported it.
 
@@ -2165,6 +2240,9 @@ __all__ = [
     "HotspotDisconnectResult",
     "HotspotDeviceBlockResult",
     "HotspotBypassBindingResult",
+    "HotspotBypassBindingRow",
+    "HotspotBypassBindingSnapshot",
+    "HotspotBypassRemovalResult",
     "DhcpLease",
     "DhcpLeaseKeepResult",
     "HotspotDeviceUnblockResult",

@@ -97,6 +97,14 @@ NARROWING_HELPERS = frozenset({"agent_managed_only", "agent_managed_vendor_crite
 # ---------------------------------------------------------------------------
 
 AGENT_MANAGED_ONLY: dict[str, str] = {
+    "app/domains/guest/tasks.py::_run_hotspot_binding_reconcile_sweep_async": (
+        "The routers the session-bypass reconciliation sweep runs on: each "
+        "row gets an 8728 session with its own stored credentials and may "
+        "have `cloudguest-authmac` ip-bindings removed. A controller's "
+        "synthetic row has no RouterOS and no ip-binding table; the "
+        "per-router function refuses it again by vendor "
+        "(`hotspot_gate.router_takes_hotspot_bindings`)."
+    ),
     "app/domains/router/repository.py::RouterRepository.list_routers_in_scope": (
         "The routers a blocklist device rule is written to "
         "(`guest_access.device_blocking`): each row gets an 8728 session and "
