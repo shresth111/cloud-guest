@@ -273,6 +273,7 @@ from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
 from app.domains.policy.constants import PolicyType
 from app.domains.queue_management.constants import QueueTargetType
+from app.domains.queue_management.validators import routeros_guest_queue_target
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
@@ -2890,9 +2891,10 @@ class GuestService:
         write addresses", never specifically an IP.
 
         * **A router this platform logs in to** takes an IP: a
-          ``/queue simple`` entry matches one concrete address, so
-          ``session.ip_address`` is the only correct value and stays the only
-          value. Unchanged, deliberately and completely.
+          ``/queue simple`` entry matches one concrete LAN address, so
+          ``session.ip_address`` is the only candidate -- and it is used
+          only when it can actually be the guest's own address (see the
+          comment in the body).
         * **A venue run from a vendor controller** takes the **client MAC**.
           Its per-client limit is a field on the client's own record, keyed by
           MAC within the site; it has no notion of a guest's IP and would not
@@ -2913,7 +2915,39 @@ class GuestService:
         and it is the same ``GuestDevice`` the login just recorded.
         """
         if not is_controller_managed(router):
-            return session.ip_address
+            # ``session.ip_address`` has two sources and only one of them is
+            # an address a queue can match. The login endpoints record
+            # ``payload.ip_address or request.client.host``: the first is
+            # the LAN address the hotspot redirect handed the portal, the
+            # second is the address this API saw the request come from --
+            # the venue's public WAN address, for a guest who opened the
+            # portal without being redirected (already bypassed, a
+            # bookmark, a second tab). A ``/queue simple`` against that one
+            # is created, reads back, shows ACTIVE, and limits nobody.
+            #
+            # So the address is used only if it can be a guest's own, and
+            # otherwise this returns ``None`` and says so: the outcome this
+            # docstring already names for "does not know the right
+            # identifier".
+            target = routeros_guest_queue_target(
+                session.ip_address,
+                router_addresses=(
+                    getattr(router, "public_ip_address", None),
+                    getattr(router, "management_ip_address", None),
+                ),
+            )
+            if target is None:
+                logger.warning(
+                    "guest_queue_target_not_lan_address",
+                    extra={
+                        "session_id": str(session.id),
+                        "router_id": str(router.id),
+                        "has_address": bool(session.ip_address),
+                        "has_device": session.device_id is not None,
+                        "speed_limit_applied": False,
+                    },
+                )
+            return target
         if is_nas_only(router):
             # A venue whose controller we have no API to (Aruba Instant On).
             # There is no device-side write a speed could ever reach, so the

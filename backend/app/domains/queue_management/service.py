@@ -100,11 +100,16 @@ from .exceptions import (
     QueueMissingCredentialsError,
     QueueProfileNotFoundError,
     QueueScheduleNotFoundError,
+    QueueTargetNotLanAddressError,
     QueueTemplateNotFoundError,
 )
 from .models import QueueAssignment, QueueProfile, QueueSchedule, QueueTemplate
 from .repository import QueueManagementRepositoryProtocol
-from .validators import validate_status_transition, validate_target
+from .validators import (
+    routeros_guest_queue_target,
+    validate_status_transition,
+    validate_target,
+)
 
 _SYSTEM_UNLIMITED_PROFILE_NAME = "Unlimited"
 
@@ -789,6 +794,23 @@ class QueueManagementService:
         credentials = self._resolve_device_credentials(router)
         adapter = self._get_device_adapter(router.vendor)
 
+        # The last line of defence before a row is created on the device,
+        # for every caller: a login, a policy re-apply, an admin's own POST.
+        # A per-session ``/queue simple`` against an address that is not on
+        # the venue's LAN is created, reads back, turns this assignment
+        # ACTIVE -- and matches nothing. See
+        # ``validators.routeros_guest_queue_target``.
+        if (
+            assignment.device_queue_id is None
+            and assignment.target_type == QueueTargetType.SESSION.value
+            and not _is_routeros_session_target(router, assignment.device_target)
+        ):
+            refusal = QueueTargetNotLanAddressError(router.id)
+            await self.repository.update_assignment(
+                assignment, {"error_message": str(refusal)}
+            )
+            raise refusal
+
         priority = assignment.priority_override or profile.priority
         try:
             if assignment.device_queue_id is None:
@@ -1346,6 +1368,30 @@ class QueueManagementService:
             target_type=target_type.value, target_id=target_id
         )
 
+        # Refuse a target that cannot be this guest's own address *before*
+        # anything is created, moved or retired. ``apply_queue`` refuses it
+        # too, but by then ``move_queue`` has already inserted the
+        # replacement row, and a policy re-apply would leave one more
+        # never-applied assignment behind on every publish. Refusing here
+        # also means a wrong address never retires the row that is still
+        # correctly limiting whoever really holds it.
+        if target_type == QueueTargetType.SESSION:
+            target_router = await self.router_lookup.get_router(
+                router_id, requesting_organization_id=requesting_organization_id
+            )
+            if not is_controller_managed(
+                target_router
+            ) and not _is_routeros_session_target(target_router, device_target):
+                logger.warning(
+                    "queue_assignment_target_not_lan_address",
+                    extra={
+                        "router_id": str(router_id),
+                        "target_id": str(target_id),
+                        "has_target": bool(device_target),
+                    },
+                )
+                raise QueueTargetNotLanAddressError(router_id)
+
         resolved = await self.policy_lookup.resolve_effective_policy(
             policy_type=PolicyType.BANDWIDTH,
             organization_id=requesting_organization_id,
@@ -1605,6 +1651,21 @@ class QueueManagementService:
             description=description,
             organization_id=organization_id,
         )
+
+
+def _is_routeros_session_target(router: Router, device_target: str | None) -> bool:
+    """Whether a per-session ``/queue simple`` on ``router`` may target
+    ``device_target`` -- see ``validators.routeros_guest_queue_target``."""
+    return (
+        routeros_guest_queue_target(
+            device_target,
+            router_addresses=(
+                getattr(router, "public_ip_address", None),
+                getattr(router, "management_ip_address", None),
+            ),
+        )
+        is not None
+    )
 
 
 def _enforce_org_scope(

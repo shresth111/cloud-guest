@@ -16,6 +16,7 @@ from app.common.exceptions import CloudGuestError
 from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
+    "QueueTargetNotLanAddressError",
     "QueueManagementError",
     "QueueProfileNotFoundError",
     "QueueScheduleNotFoundError",
@@ -199,6 +200,32 @@ class QueueMissingCredentialsError(QueueManagementError):
             f"Router '{router_id}' is missing device connection credentials "
             "(management IP, API username, or API secret)",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class QueueTargetNotLanAddressError(QueueManagementError):
+    """A per-session speed limit was about to be written to a RouterOS
+    router against an address that cannot be the guest's own.
+
+    A ``/queue simple`` matches one LAN-side address. When a session's
+    recorded address is the one the internet saw -- the venue's WAN
+    address, which is what a login made without the hotspot redirect
+    records -- the queue is created, reads back, shows as ACTIVE, and
+    matches no packet. Refusing is the honest outcome: the venue's speed
+    limit did not reach this guest, and a row on the device saying
+    otherwise is worse than no row.
+
+    The address itself is deliberately not in the message: this text is
+    stored on the assignment and returned to API callers."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"No speed limit was written to router '{router_id}': the "
+            "address recorded for this guest session is not an address on "
+            "the venue's own network, so a queue against it would limit "
+            "nobody. The guest needs to sign in through the venue's WiFi "
+            "login page for the limit to apply.",
+            status_code=status.HTTP_409_CONFLICT,
         )
 
 
