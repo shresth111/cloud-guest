@@ -688,6 +688,41 @@ OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS = 4
 # is, and an unreachable router should give it back quickly.
 HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS = 5
 
+# ----------------------------------------------------------------------------
+# Taking a session bypass back off the router -- see
+# ``hotspot_binding_reconcile``'s module docstring.
+# ----------------------------------------------------------------------------
+TASK_RECONCILE_HOTSPOT_BINDINGS = "app.domains.guest.tasks.reconcile_hotspot_bindings"
+TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE = (
+    "app.domains.guest.tasks.reconcile_hotspot_bindings_for_scope"
+)
+TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP = (
+    "app.domains.guest.tasks.run_hotspot_binding_reconcile_sweep"
+)
+
+# Every 2 minutes, the cadence of the ended-session queue release it sits
+# beside. The event-driven runs are what make a disconnect prompt; this is
+# the net under them -- a path that ends a session without asking, an event
+# whose task was lost, a Trusted Device entry that simply expired -- and it
+# is what clears the rows the old router script has already left behind.
+# One RouterOS API connection per switched-on router per run, and nothing at
+# all while the feature is off.
+HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS = 120.0
+
+# A binding is removed only if its MAC is unlisted at two reads this far
+# apart (and the second is taken immediately before the removal). It is the
+# window in which a guest who is signing in again -- an ended session, then
+# a new one a moment later -- becomes listed and is kept. Short on purpose:
+# it is slept per router that has something to remove, inside a sequential
+# sweep.
+HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS = 3.0
+
+# How long one event-driven request stands for every other request about
+# the same router, on top of the configured delay. A sweep that expires
+# thirty sessions at one venue should cost that venue's router one
+# connection, not thirty.
+HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY = "guest:hotspot-binding-reconcile:{router_id}"
+
 # ============================================================================
 # FreeRADIUS ``rlm_rest``-style integration -- see ``service.py``'s module
 # docstring for the full architectural write-up on why HTTP (rlm_rest), not
@@ -876,6 +911,12 @@ __all__ = [
     "OPEN_HOTSPOT_GATE_MAX_RETRIES",
     "OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS",
     "HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS",
+    "TASK_RECONCILE_HOTSPOT_BINDINGS",
+    "TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE",
+    "TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP",
+    "HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS",
+    "HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS",
+    "HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY",
     "ASSIGN_GUEST_QUEUE_MAX_RETRIES",
     "ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS",
     "QUOTA_RESET_SWEEP_INTERVAL_SECONDS",

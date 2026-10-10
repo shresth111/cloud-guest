@@ -1961,6 +1961,50 @@ class Settings(BaseSettings):
     guest_hotspot_gate_push_router_ids: str = ""
     guest_hotspot_gate_push_delay_seconds: float = Field(default=3.0, ge=0, le=30)
 
+    # Taking a session bypass back off the router
+    # (app.domains.guest.hotspot_binding_reconcile).
+    #
+    # The other half of the above. The router's own authorized-MAC script
+    # is meant to remove its `cloudguest-authmac` binding once a MAC is no
+    # longer listed, and on every router provisioned before that pass was
+    # repaired it never does -- so a disconnected guest, a blocked guest
+    # and a deleted Trusted Device all stay online until somebody removes
+    # the row by hand. With this on, a worker removes those rows over the
+    # RouterOS API: shortly after a session ends, a block or a Trusted
+    # Device change, and on a periodic sweep as the net. It runs on a
+    # router whose scheduler is disabled or missing too; that is where
+    # nothing else ever would.
+    #
+    # OFF BY DEFAULT for the same reason the push is: it removes rows on
+    # real routers, and at the time it was written it had run against a
+    # fake RouterOS API only. Merging it changes nothing until one of
+    # these is set:
+    #
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_REMOVE_ROUTER_IDS=<uuid>[,<uuid>...]
+    #       only these routers;
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_REMOVE_ENABLED=true
+    #       every platform-managed MikroTik.
+    #
+    # `delay_seconds`: how long after the event the event-driven run
+    #   starts. It has to be long enough for the request that ended the
+    #   session to have committed, and is also the window in which several
+    #   endings at one venue become one run.
+    # `max_per_run`: the most rows one run removes from one router. A
+    #   defect that made every guest look unlisted would otherwise empty a
+    #   venue in one pass; hitting the cap logs at ERROR and the rest wait
+    #   for the next run. Zero removes nothing (a dry run that still logs
+    #   what it would have judged stale).
+    # `drop_host`: after removing a binding, also remove the device's
+    #   `/ip hotspot host` row if it STILL reads bypassed. Whether RouterOS
+    #   drops that row by itself is not established on hardware; without
+    #   this, a router that does not would keep forwarding for the device
+    #   until the host times out. Set false to remove bindings only.
+    guest_hotspot_gate_remove_enabled: bool = False
+    guest_hotspot_gate_remove_router_ids: str = ""
+    guest_hotspot_gate_remove_delay_seconds: float = Field(default=5.0, ge=0, le=120)
+    guest_hotspot_gate_remove_max_per_run: int = Field(default=20, ge=0, le=500)
+    guest_hotspot_gate_remove_drop_host: bool = True
+
     # One incoming-webhook URL, one internal ops channel. This is NOT a
     # per-tenant setting and deliberately has no database column and no
     # customer-facing UI: the messages describe Master/GLOBAL-scope

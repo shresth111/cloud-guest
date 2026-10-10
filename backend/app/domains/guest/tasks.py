@@ -67,6 +67,8 @@ from app.domains.queue_management.constants import QueueTargetType
 from .constants import (
     ASSIGN_GUEST_QUEUE_MAX_RETRIES,
     ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS,
+    HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY,
+    HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS,
     OPEN_HOTSPOT_GATE_MAX_RETRIES,
     OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS,
     SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
@@ -74,8 +76,11 @@ from .constants import (
     SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
     TASK_ASSIGN_GUEST_QUEUE,
     TASK_OPEN_HOTSPOT_GATE,
+    TASK_RECONCILE_HOTSPOT_BINDINGS,
+    TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE,
     TASK_RECONCILE_ROUTER_SESSION_PRESENCE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP,
     TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
@@ -646,7 +651,7 @@ async def _open_hotspot_gate_async(*, session_id: str, router_id: str):  # noqa:
             access_decision_service=_build_access_decision_service(session),
             captive_portal_service=_build_captive_portal_service(session),
             router_lookup=RouterService(
-                RouterRepository(session), organization_service, location_service
+                RouterRepository(session), location_service, organization_service
             ),
         )
 
@@ -698,6 +703,213 @@ def open_hotspot_gate(self, *, session_id: str, router_id: str) -> dict[str, obj
         },
     )
     return {"session_id": session_id, "outcome": result.outcome}
+
+
+# ============================================================================
+# Taking a session bypass back off the router -- see
+# ``hotspot_binding_reconcile``'s docstring
+# ============================================================================
+
+
+def _build_hotspot_binding_reconcile_kwargs(session: AsyncSession) -> dict[str, object]:
+    """Everything ``reconcile_hotspot_bindings_for_router`` reads this
+    platform's database through, on one ``AsyncSession``.
+
+    **The ``MacAuthorizationService`` here is given a ``router_lookup``, and
+    it has to be.** ``list_active_entries_for_router`` returns an empty list
+    when none is wired (``_build_mac_authorization_service`` above builds
+    it that way, correctly, for a sweep that only calls
+    ``is_mac_authorized``). An empty list is not an error -- it is the
+    answer "this venue has no Trusted Devices" -- so a reconciler built
+    with that service would read every trusted device as unlisted and take
+    its bypass away. The router's script tags a trusted device's binding
+    with the same ``cloudguest-authmac`` comment as a guest's, so nothing
+    downstream could tell the difference. Pinned by
+    ``tests/unit/test_hotspot_binding_reconcile``."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    router_service = RouterService(
+        RouterRepository(session), location_service, organization_service
+    )
+    return {
+        "guest_repository": GuestRepository(session),
+        "mac_authorization_service": MacAuthorizationService(
+            MacAuthorizationRepository(session), router_lookup=router_service
+        ),
+        "access_decision_service": _build_access_decision_service(session),
+        "captive_portal_service": _build_captive_portal_service(session),
+        "router_lookup": router_service,
+        # A second list read inside one session must not be answered from
+        # what the first one loaded.
+        "refresh": session.expire_all,
+    }
+
+
+def hotspot_gate_remove_applies(router_id: uuid.UUID, settings: object) -> bool:
+    """Whether the removal is switched on for ``router_id`` -- the same
+    two-setting rule as the push (``hotspot_gate_push_applies``), on its own
+    pair of settings so the two can be turned on independently."""
+    return hotspot_gate_push_applies(
+        router_id,
+        enabled=bool(settings.guest_hotspot_gate_remove_enabled),  # type: ignore[attr-defined]
+        router_ids=str(settings.guest_hotspot_gate_remove_router_ids or ""),  # type: ignore[attr-defined]
+    )
+
+
+def _hotspot_gate_remove_is_on_anywhere(settings: object) -> bool:
+    return bool(settings.guest_hotspot_gate_remove_enabled) or bool(  # type: ignore[attr-defined]
+        str(settings.guest_hotspot_gate_remove_router_ids or "").strip()  # type: ignore[attr-defined]
+    )
+
+
+async def _reconcile_hotspot_bindings_for_routers(
+    session: AsyncSession, router_ids: list[uuid.UUID], *, trigger: str
+) -> dict[str, int]:
+    """Runs the reconciliation for each router in turn, one after another,
+    each isolated from the rest.
+
+    A router that cannot be reached, or whose run fails for any other
+    reason, is logged and left for the next run; it is attempted exactly
+    once here, because each attempt costs a full connect timeout. Nothing
+    one router does can stop the next from being tried."""
+    from app.core.config import get_settings
+
+    from .hotspot_binding_reconcile import reconcile_hotspot_bindings_for_router
+
+    settings = get_settings()
+    totals = {"routers": 0, "removed": 0, "failed": 0, "deferred": 0}
+    kwargs = _build_hotspot_binding_reconcile_kwargs(session)
+    for router_id in router_ids:
+        if not hotspot_gate_remove_applies(router_id, settings):
+            continue
+        totals["routers"] += 1
+        extra: dict[str, object] = {"router_id": str(router_id), "trigger": trigger}
+        try:
+            result = await reconcile_hotspot_bindings_for_router(
+                router_id=router_id,
+                max_removals=settings.guest_hotspot_gate_remove_max_per_run,
+                grace_seconds=HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS,
+                drop_bypassed_host=settings.guest_hotspot_gate_remove_drop_host,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        except Exception as exc:  # noqa: BLE001 -- per-router isolation
+            totals["failed"] += 1
+            logger.warning(
+                "guest_hotspot_binding_reconcile_failed",
+                extra={**extra, "error": str(exc)},
+            )
+            # A failed statement leaves the transaction unusable for the
+            # next router; this run only reads, so there is nothing to lose.
+            await session.rollback()
+            continue
+        totals["removed"] += result.removed
+        totals["deferred"] += result.deferred
+        log = logger.info if (result.removed or result.stale) else logger.debug
+        log(
+            "guest_hotspot_binding_reconcile_completed",
+            extra={**extra, **result.as_log_extra()},
+        )
+    return totals
+
+
+async def _reconcile_hotspot_bindings_async(*, router_id: str) -> dict[str, int]:
+    async with SessionLocal() as session:
+        return await _reconcile_hotspot_bindings_for_routers(
+            session, [uuid.UUID(router_id)], trigger="event"
+        )
+
+
+@celery_app.task(name=TASK_RECONCILE_HOTSPOT_BINDINGS)
+def reconcile_hotspot_bindings(*, router_id: str) -> dict[str, int]:
+    """One router, shortly after something that may have taken a MAC off
+    its authorized list. Enqueued by
+    ``hotspot_binding_events.request_hotspot_binding_reconcile``.
+
+    Not retried. A router that does not answer is picked up by
+    ``run_hotspot_binding_reconcile_sweep`` within its interval, which is
+    exactly what a retry would be."""
+    return run_celery_task(_reconcile_hotspot_bindings_async(router_id=router_id))
+
+
+async def _reconcile_hotspot_bindings_for_scope_async(
+    *, organization_id: str, location_id: str | None
+) -> dict[str, int]:
+    from app.domains.router.repository import RouterRepository
+
+    async with SessionLocal() as session:
+        # ``list_routers_in_scope`` is agent-managed-only by construction.
+        routers = await RouterRepository(session).list_routers_in_scope(
+            organization_id=uuid.UUID(organization_id),
+            location_id=uuid.UUID(location_id) if location_id else None,
+        )
+        return await _reconcile_hotspot_bindings_for_routers(
+            session, [router.id for router in routers], trigger="scope"
+        )
+
+
+@celery_app.task(name=TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE)
+def reconcile_hotspot_bindings_for_scope(
+    *, organization_id: str, location_id: str | None = None
+) -> dict[str, int]:
+    """Every router a Trusted Device entry applies at -- the organization's,
+    or one location's -- after that entry was deleted, disabled or changed.
+    Enqueued by
+    ``hotspot_binding_events.request_hotspot_binding_reconcile_for_scope``."""
+    return run_celery_task(
+        _reconcile_hotspot_bindings_for_scope_async(
+            organization_id=organization_id, location_id=location_id
+        )
+    )
+
+
+async def _run_hotspot_binding_reconcile_sweep_async() -> dict[str, int]:
+    from sqlalchemy import select
+
+    from app.core.config import get_settings
+    from app.domains.router.fleet_scope import agent_managed_only
+    from app.domains.router.models import Router
+
+    settings = get_settings()
+    if not _hotspot_gate_remove_is_on_anywhere(settings):
+        return {"routers": 0, "removed": 0, "failed": 0, "deferred": 0}
+    async with SessionLocal() as session:
+        # Agent-managed rows with API credentials on file: the only routers
+        # a RouterOS API write can reach. ``hotspot_gate_remove_applies``
+        # then narrows to the ones the removal is switched on for.
+        statement = agent_managed_only(
+            select(Router.id)
+            .where(
+                Router.is_deleted.is_(False),
+                Router.api_credentials_encrypted.is_not(None),
+            )
+            .order_by(Router.created_at.asc())
+        )
+        router_ids = list((await session.execute(statement)).scalars().all())
+        return await _reconcile_hotspot_bindings_for_routers(
+            session, router_ids, trigger="sweep"
+        )
+
+
+@celery_app.task(name=TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP)
+def run_hotspot_binding_reconcile_sweep() -> dict[str, int]:
+    """Beat-scheduled (see ``app.core.celery_app``'s ``beat_schedule`` --
+    every ``constants.HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS``).
+    The net under the event-driven runs; returns at once, without a
+    database read, while the removal is switched off everywhere."""
+    result = run_celery_task(_run_hotspot_binding_reconcile_sweep_async())
+    logger.info(
+        "guest_task_run_hotspot_binding_reconcile_sweep_completed", extra=result
+    )
+    return result
 
 
 # ============================================================================
@@ -981,6 +1193,93 @@ async def enqueue_hotspot_gate_open(
         )
 
 
+async def enqueue_hotspot_binding_reconcile(*, router_id: uuid.UUID) -> None:
+    """Publishes ``reconcile_hotspot_bindings`` for one router, after
+    ``guest_hotspot_gate_remove_delay_seconds`` -- and not at all unless the
+    removal is switched on for that router.
+
+    The delay is what lets the request that ended the session commit before
+    the worker reads the authorized list. It is also a coalescing window:
+    a Redis ``SET NX`` with that lifetime means a second request about the
+    same router inside it publishes nothing, because the run already queued
+    reads the state as it is when it starts and so covers both. If Redis
+    cannot be asked, the task is published anyway -- a duplicate run finds
+    nothing to do; a dropped one would leave a guest online.
+
+    Never raises; see ``hotspot_binding_events``."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not hotspot_gate_remove_applies(router_id, settings):
+        return
+    delay = float(settings.guest_hotspot_gate_remove_delay_seconds)
+    try:
+        from app.database.redis import redis_client
+
+        first = await redis_client.set(
+            HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY.format(router_id=router_id),
+            "1",
+            nx=True,
+            ex=max(1, int(delay)),
+        )
+        if not first:
+            return
+    except Exception as exc:  # noqa: BLE001 -- see docstring: publish anyway
+        logger.debug(
+            "guest_hotspot_binding_reconcile_dedupe_unavailable",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+
+    def _publish() -> None:
+        reconcile_hotspot_bindings.apply_async(
+            kwargs={"router_id": str(router_id)}, countdown=delay
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_binding_reconcile_enqueue_failed",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+
+
+async def enqueue_hotspot_binding_reconcile_for_scope(
+    *, organization_id: uuid.UUID, location_id: uuid.UUID | None
+) -> None:
+    """Publishes ``reconcile_hotspot_bindings_for_scope`` after the same
+    delay. Which of the scope's routers the removal is switched on for is
+    decided in the worker, router by router; here it is only checked that
+    it is on somewhere, so a deployment with it off publishes nothing.
+    Never raises."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not _hotspot_gate_remove_is_on_anywhere(settings):
+        return
+
+    def _publish() -> None:
+        reconcile_hotspot_bindings_for_scope.apply_async(
+            kwargs={
+                "organization_id": str(organization_id),
+                "location_id": str(location_id) if location_id else None,
+            },
+            countdown=float(settings.guest_hotspot_gate_remove_delay_seconds),
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_binding_reconcile_enqueue_failed",
+            extra={"organization_id": str(organization_id), "error": str(exc)},
+        )
+
+
 __all__ = [
     "run_session_timeout_sweep",
     "run_fup_time_accrual_sweep",
@@ -991,4 +1290,10 @@ __all__ = [
     "enqueue_guest_queue_assignment",
     "open_hotspot_gate",
     "enqueue_hotspot_gate_open",
+    "reconcile_hotspot_bindings",
+    "reconcile_hotspot_bindings_for_scope",
+    "run_hotspot_binding_reconcile_sweep",
+    "enqueue_hotspot_binding_reconcile",
+    "enqueue_hotspot_binding_reconcile_for_scope",
+    "hotspot_gate_remove_applies",
 ]

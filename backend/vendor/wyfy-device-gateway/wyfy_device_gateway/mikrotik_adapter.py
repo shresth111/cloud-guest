@@ -113,6 +113,9 @@ from .contract import (
     FirewallSyncResult,
     HotspotActiveSession,
     HotspotBypassBindingResult,
+    HotspotBypassBindingRow,
+    HotspotBypassBindingSnapshot,
+    HotspotBypassRemovalResult,
     HotspotCertificatePush,
     HotspotCertificatePushResult,
     HotspotDeviceBlockResult,
@@ -2550,6 +2553,213 @@ class MikroTikAdapter:
                 )
             return _result(
                 "created", servers, binding_id=binding_id, host_state=host_state
+            )
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # session bypass removal (the authorized-MAC loop's REMOVE pass)
+    # ------------------------------------------------------------------
+
+    async def read_hotspot_bypass_bindings(
+        self, creds: DeviceCredentials
+    ) -> HotspotBypassBindingSnapshot:
+        """List the ``cloudguest-authmac`` bindings this router holds.
+        Read-only. See :class:`HotspotBypassBindingSnapshot`."""
+        return await asyncio.to_thread(self._read_hotspot_bypass_bindings_sync, creds)
+
+    def _read_hotspot_bypass_bindings_sync(
+        self, creds: DeviceCredentials
+    ) -> HotspotBypassBindingSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                servers = len(list(api.path("ip", "hotspot")))
+                reconciler_enabled = any(
+                    _safe_str(r.get("name")) == _AUTHMAC_SCHEDULER_NAME
+                    and not _is_truthy(r.get("disabled"))
+                    for r in api.path("system", "scheduler")
+                )
+                rows: list[HotspotBypassBindingRow] = []
+                unreadable = 0
+                for r in api.path("ip", "hotspot", "ip-binding"):
+                    # Exactly the tag. Not a prefix, not a substring: a
+                    # trusted-device or device-block row, or an operator's
+                    # own note that happens to mention it, is not ours.
+                    if _safe_str(r.get("comment")) != _AUTHMAC_BINDING_COMMENT:
+                        continue
+                    mac = normalize_mac_address(r.get("mac-address"))
+                    if mac is None or not r.get(".id"):
+                        unreadable += 1
+                        continue
+                    rows.append(
+                        HotspotBypassBindingRow(
+                            binding_id=str(r[".id"]),
+                            mac_address=mac,
+                            disabled=_is_truthy(r.get("disabled")),
+                        )
+                    )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_hotspot_bypass_bindings: {exc}"
+                ) from exc
+            return HotspotBypassBindingSnapshot(
+                hotspot_servers=servers,
+                reconciler_enabled=reconciler_enabled,
+                bindings=tuple(rows),
+                unreadable=unreadable,
+            )
+        finally:
+            self._safe_close(api)
+
+    async def remove_hotspot_bypass_binding(
+        self,
+        creds: DeviceCredentials,
+        *,
+        binding_id: str,
+        mac_address: str,
+        drop_bypassed_host: bool = True,
+    ) -> HotspotBypassRemovalResult:
+        """Remove one session bypass, by the ``.id`` a
+        :meth:`read_hotspot_bypass_bindings` listed it under.
+
+        The router's own ``cloudguest-authmac-sched`` is meant to do this
+        and, on every router provisioned before its removal pass was
+        repaired, never has: a MAC once bypassed stayed bypassed. This is
+        that pass for one row, performed by the platform.
+
+        The row is read again on this connection and removed only if it is
+        still the row that was listed -- same ``.id``, comment exactly
+        ``cloudguest-authmac``, same MAC. Anything else is reported and
+        left alone. No other binding is ever touched, and nothing is added.
+
+        **The host row.** A binding is configuration; what forwards the
+        device's traffic is its ``/ip hotspot host`` entry, which was
+        created ``bypassed`` because of the binding. Whether RouterOS drops
+        that entry itself when the binding goes has not been established on
+        hardware, so both states are read and reported
+        (``host_before``/``host_after``). With ``drop_bypassed_host`` a
+        host that *still* reads ``bypassed`` after the removal is removed
+        too, so the hotspot re-creates it from the device's next packet
+        with no binding to bypass it -- behind the login page. That is
+        never done while another binding still names the MAC (the device
+        is then bypassed by a row that is not ours), nor while the MAC is a
+        live ``/ip hotspot active`` session, nor to a host that is not
+        bypassed. Its failure is logged and does not undo the removal.
+
+        Connections already established through the router are not
+        touched: no connection-tracking entry is removed here.
+        """
+        return await asyncio.to_thread(
+            self._remove_hotspot_bypass_binding_sync,
+            creds,
+            binding_id,
+            mac_address,
+            drop_bypassed_host,
+        )
+
+    def _remove_hotspot_bypass_binding_sync(
+        self,
+        creds: DeviceCredentials,
+        binding_id: str,
+        mac_address: str,
+        drop_bypassed_host: bool,
+    ) -> HotspotBypassRemovalResult:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+        if not binding_id:
+            raise ValueError("binding_id is required")
+
+        def _for_mac(rows: object) -> list[dict]:
+            return [
+                dict(r)
+                for r in rows  # type: ignore[attr-defined]
+                if normalize_mac_address(r.get("mac-address")) == mac
+            ]
+
+        def _host_state(api) -> tuple[str | None, list[dict]]:  # noqa: ANN001
+            try:
+                hosts = _for_mac(api.path("ip", "hotspot", "host"))
+            except LibRouterosError as exc:
+                logger.info(
+                    "mikrotik_hotspot_host_read_failed",
+                    extra={"host": creds.host, "detail": str(exc)},
+                )
+                return None, []
+            if not hosts:
+                return "absent", hosts
+            if any(_is_truthy(r.get("bypassed")) for r in hosts):
+                return "bypassed", hosts
+            return "unbypassed", hosts
+
+        api = self._connect_api(creds)
+        try:
+            try:
+                bindings = api.path("ip", "hotspot", "ip-binding")
+                row = next(
+                    (dict(r) for r in bindings if str(r.get(".id")) == binding_id),
+                    None,
+                )
+                if row is None:
+                    return HotspotBypassRemovalResult(outcome="gone")
+                if (
+                    _safe_str(row.get("comment")) != _AUTHMAC_BINDING_COMMENT
+                    or normalize_mac_address(row.get("mac-address")) != mac
+                ):
+                    return HotspotBypassRemovalResult(outcome="changed")
+
+                host_before, _ = _host_state(api)
+                bindings.remove(binding_id)
+
+                after = [dict(r) for r in api.path("ip", "hotspot", "ip-binding")]
+                if any(str(r.get(".id")) == binding_id for r in after):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "remove_hotspot_bypass_binding: the binding was still on "
+                        "the router after removing it",
+                    )
+                others = tuple(
+                    f"{_safe_str(r.get('type')) or 'regular'}:"
+                    f"{_safe_str(r.get('comment')) or ''}"
+                    for r in _for_mac(after)
+                )
+                active_session = bool(_for_mac(api.path("ip", "hotspot", "active")))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"remove_hotspot_bypass_binding: {exc}"
+                ) from exc
+
+            host_after, hosts = _host_state(api)
+            hosts_removed = 0
+            if (
+                drop_bypassed_host
+                and host_after == "bypassed"
+                and not others
+                and not active_session
+            ):
+                try:
+                    table = api.path("ip", "hotspot", "host")
+                    for r in hosts:
+                        if (
+                            _is_truthy(r.get("bypassed"))
+                            and not _is_truthy(r.get("authorized"))
+                            and r.get(".id")
+                        ):
+                            table.remove(str(r[".id"]))
+                            hosts_removed += 1
+                except LibRouterosError as exc:
+                    logger.warning(
+                        "mikrotik_hotspot_host_remove_failed",
+                        extra={"host": creds.host, "detail": str(exc)},
+                    )
+            return HotspotBypassRemovalResult(
+                outcome="removed",
+                other_bindings=others,
+                active_session=active_session,
+                host_before=host_before,
+                host_after=host_after,
+                hosts_removed=hosts_removed,
             )
         finally:
             self._safe_close(api)

@@ -391,6 +391,7 @@ from .exceptions import (
     TooManyVoucherIdsError,
     VenueClosedError,
 )
+from .hotspot_binding_events import request_hotspot_binding_reconcile
 from .models import (
     Guest,
     GuestConsent,
@@ -2121,6 +2122,15 @@ async def issue_live_disconnect(
                 "guest_live_disconnect_record_failed",
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
+
+    # The session has ended in this platform's records, whichever path
+    # brought it here, so its MAC may no longer be one the router should
+    # let through. Asked for before any of the returns below, including
+    # ``already_ended_on_device``: the bypass binding is a different object
+    # from the live session, the NAS reporting the session over says
+    # nothing about it, and on most of the fleet nothing on the router
+    # removes it. Publishes nothing unless switched on; never raises.
+    await request_hotspot_binding_reconcile(session.router_id)
 
     if already_ended_on_device:
         #  The NAS itself reported this session over -- a RADIUS

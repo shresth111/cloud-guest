@@ -948,6 +948,14 @@ class BlocklistEnforcer:
             session_locations=frozenset(s.location_id for s in sessions),
         )
 
+        # The sessions above are now ended in this platform's records, and
+        # a blocklisted guest is left off the authorized list even while a
+        # row still reads active. Their bypass binding is a separate object
+        # on the router that ending the live session does not remove. Ask
+        # for it to be reconciled; publishes nothing unless switched on,
+        # never raises.
+        await self._request_binding_reconcile(contacted_routers)
+
         logger.info(
             "guest_access_block_enforced",
             extra={
@@ -1116,6 +1124,17 @@ class BlocklistEnforcer:
         return results
 
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    async def _request_binding_reconcile(router_ids: set[uuid.UUID]) -> None:
+        """Imported here rather than at module scope: ``guest`` imports this
+        domain, so the reverse import has to be late."""
+        from app.domains.guest.hotspot_binding_events import (  # noqa: PLC0415
+            request_hotspot_binding_reconcile,
+        )
+
+        for router_id in router_ids:
+            await request_hotspot_binding_reconcile(router_id)
 
     @staticmethod
     def _disconnect_reason(reason: str | None) -> str:

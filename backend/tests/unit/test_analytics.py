@@ -878,6 +878,11 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # Nothing else did: the row stayed first in `/queue simple` and
         # went on deciding the speed of whoever held that address next.
         "queue-management-release-ended-session-queues",
+        # Takes a session's hotspot bypass off the router once nothing
+        # lists its MAC. The router's own script was meant to and, on every
+        # router provisioned before it was repaired, never has. Inert unless
+        # switched on.
+        "guest-hotspot-binding-reconcile-sweep",
         "guest-fup-time-accrual-sweep",
         "guest-quota-reset-sweep",
         # Only Allowed. The flag used to be answered once, at sign-in, and
