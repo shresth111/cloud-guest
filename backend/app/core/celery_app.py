@@ -215,7 +215,9 @@ from app.domains.provisioning_engine.constants import (
     TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
 )
 from app.domains.queue_management.constants import (
+    RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS,
     SCHEDULE_SWEEP_INTERVAL_SECONDS,
+    TASK_RELEASE_ENDED_SESSION_QUEUES,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from app.domains.router.constants import (
@@ -336,6 +338,10 @@ celery_app.conf.update(
         TASK_POLL_SINGLE_ROUTER_HEALTH: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_SYNC_SINGLE_ROUTER_DEVICES: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_RUN_ISP_HEALTH_CHECK_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # One sequential pass of real RouterOS API removes (one connection
+        # per ended session's row), so it belongs with the other device
+        # round trips rather than on the pure-DB default queue.
+        TASK_RELEASE_ENDED_SESSION_QUEUES: {"queue": DEVICE_IO_QUEUE_NAME},
         # Single sequential sweep issuing real SNMP UDP round trips per
         # router (like TASK_RUN_ISP_HEALTH_CHECK_SWEEP immediately above,
         # not yet fanned out -- see constants
@@ -694,6 +700,14 @@ celery_app.conf.update(
         "queue-management-sweep-schedule-transitions": {
             "task": TASK_SWEEP_SCHEDULE_TRANSITIONS,
             "schedule": SCHEDULE_SWEEP_INTERVAL_SECONDS,
+        },
+        # Takes an ended guest session's speed-limit row off its router --
+        # nothing else does. See QueueManagementService
+        # .release_queues_for_ended_sessions and constants
+        # .RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS for the cadence.
+        "queue-management-release-ended-session-queues": {
+            "task": TASK_RELEASE_ENDED_SESSION_QUEUES,
+            "schedule": RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS,
         },
         # ISP Management domain: real RouterOS-backed health-check sweep --
         # every 10 minutes. See
