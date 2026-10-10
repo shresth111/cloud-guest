@@ -867,7 +867,10 @@ class TestSpeedProfilesReachAControllerVenue:
             target_type=QueueTargetType.SESSION,
             target_id=uuid.uuid4(),
             router_id=router.id,
-            device_target=CLIENT_MAC,
+            # Each vendor's own vocabulary: a controller is addressed by the
+            # client MAC, a RouterOS `/queue simple` by the guest's LAN
+            # address -- and a MAC there is now refused, as it matches nothing.
+            device_target="10.5.50.20" if vendor == "mikrotik" else CLIENT_MAC,
             queue_profile_id=profile.id,
         )
         return harness, router, assignment, speed_hook
