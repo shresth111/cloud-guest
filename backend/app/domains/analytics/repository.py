@@ -266,6 +266,19 @@ class AnalyticsRepositoryProtocol(Protocol):
 
     async def count_platform_locations(self) -> int: ...
 
+    # -- platform organization table (one query each, never one per org) ----
+    async def get_latest_snapshots_for_organizations(
+        self, organization_ids: Sequence[uuid.UUID], *, snapshot_type: str
+    ) -> dict[uuid.UUID, AnalyticsSnapshot]: ...
+
+    async def count_active_locations_by_organization(
+        self, organization_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, int]: ...
+
+    async def list_child_organization_ids(
+        self, parent_organization_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, list[uuid.UUID]]: ...
+
     # -- BE-012 Part 2: Super Admin Dashboard --------------------------------
     async def count_platform_guests_total(self) -> int: ...
 
@@ -782,6 +795,84 @@ class AnalyticsRepository:
         )
         result = await self.session.execute(statement)
         return int(result.scalar_one())
+
+    # ========================================================================
+    # Platform organization table
+    #
+    # The set-based twins of ``get_latest_snapshot`` /
+    # ``list_active_location_ids_for_organization`` / ``OrganizationService
+    # .list_children``. The Master console's organization table used to get
+    # these three figures by calling ``GET /dashboard/organization`` once per
+    # row -- 26 statements a row, 312 for the twelve rows it asked for --
+    # and each of the three below answers the same question for every row
+    # in ONE statement. Each must stay row-for-row equivalent to its
+    # single-organization twin; ``DashboardService
+    # .get_platform_organization_summaries`` documents which is which.
+    # ========================================================================
+
+    async def get_latest_snapshots_for_organizations(
+        self, organization_ids: Sequence[uuid.UUID], *, snapshot_type: str
+    ) -> dict[uuid.UUID, AnalyticsSnapshot]:
+        """The newest organization-level (``location_id IS NULL``) snapshot
+        of ``snapshot_type`` for each given organization -- the same row
+        ``get_latest_snapshot(organization_id=..., location_id=None, ...)``
+        returns, for all of them at once (``DISTINCT ON``)."""
+        if not organization_ids:
+            return {}
+        statement = (
+            select(AnalyticsSnapshot)
+            .where(
+                AnalyticsSnapshot.is_deleted.is_(False),
+                AnalyticsSnapshot.snapshot_type == snapshot_type,
+                AnalyticsSnapshot.organization_id.in_(organization_ids),
+                AnalyticsSnapshot.location_id.is_(None),
+            )
+            .distinct(AnalyticsSnapshot.organization_id)
+            .order_by(
+                AnalyticsSnapshot.organization_id,
+                AnalyticsSnapshot.period_start.desc(),
+            )
+        )
+        result = await self.session.execute(statement)
+        return {row.organization_id: row for row in result.scalars().all()}
+
+    async def count_active_locations_by_organization(
+        self, organization_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        """``len(list_active_location_ids_for_organization(org))`` for every
+        given organization, as one ``GROUP BY``. Organizations with no
+        active location are simply absent from the result."""
+        if not organization_ids:
+            return {}
+        statement = (
+            select(Location.organization_id, func.count())
+            .where(
+                Location.organization_id.in_(organization_ids),
+                Location.is_deleted.is_(False),
+                Location.status == LocationStatus.ACTIVE.value,
+            )
+            .group_by(Location.organization_id)
+        )
+        result = await self.session.execute(statement)
+        return {org_id: int(count) for org_id, count in result.all()}
+
+    async def list_child_organization_ids(
+        self, parent_organization_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, list[uuid.UUID]]:
+        """Non-deleted child organization ids keyed by parent -- the ids
+        ``OrganizationRepository.list_children`` returns, for several
+        parents at once."""
+        if not parent_organization_ids:
+            return {}
+        statement = select(Organization.parent_organization_id, Organization.id).where(
+            Organization.parent_organization_id.in_(parent_organization_ids),
+            Organization.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        children: dict[uuid.UUID, list[uuid.UUID]] = {}
+        for parent_id, child_id in result.all():
+            children.setdefault(parent_id, []).append(child_id)
+        return children
 
     # ========================================================================
     # BE-012 Part 2: Super Admin Dashboard
