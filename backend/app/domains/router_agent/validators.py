@@ -18,6 +18,7 @@ exercise either one directly.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 
@@ -100,7 +101,42 @@ def netwatch_status_to_ping_result(status: str) -> PingResult:
     )
 
 
+_ROUTEROS_MAC = re.compile(
+    r"^([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})"
+    r"[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})$"
+)
+
+
+def routeros_mac_address(value: object) -> str | None:
+    """``value`` spelled the one way RouterOS itself spells a MAC --
+    ``AA:BB:CC:DD:EE:FF`` -- or ``None`` if it is not a six-octet MAC.
+
+    ``GET /agent/authorized-macs`` is consumed by a script on the router,
+    not by a person, and the script has no way to cope with anything else:
+
+    * It asks the router ``find where mac-address=<entry>``. A value
+      RouterOS cannot parse as a MAC is a script error, and the script's
+      statements run as one unit -- so a single malformed entry stops the
+      sync for *every* guest at that venue, admitted or leaving.
+    * It decides "is this binding's MAC still listed?" by comparing the
+      router's own spelling against this list. A second spelling of the
+      same address reads as "not listed", and the binding is removed and
+      re-added on every one-minute tick; RouterOS drops the device's
+      connection each time a binding changes.
+
+    ``guest_devices.mac_address`` is upper-cased on the way in but is
+    otherwise whatever a portal request carried, so the list is normalised
+    here, at the one place it leaves the platform. Never raises."""
+    if not isinstance(value, str):
+        return None
+    match = _ROUTEROS_MAC.match(value.strip())
+    if match is None:
+        return None
+    return ":".join(octet.upper() for octet in match.groups())
+
+
 __all__ = [
+    "routeros_mac_address",
     "validate_router_eligible_for_agent",
     "validate_credential_not_revoked",
     "validate_credential_not_expired",
