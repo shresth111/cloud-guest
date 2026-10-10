@@ -112,6 +112,7 @@ from .contract import (
     FirewallFilterRuleConfig,
     FirewallSyncResult,
     HotspotActiveSession,
+    HotspotBypassBindingResult,
     HotspotCertificatePush,
     HotspotCertificatePushResult,
     HotspotDeviceBlockResult,
@@ -1279,6 +1280,11 @@ def _smallest_enclosing_network(
 #: docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md §1.4). The one binding a
 #: device block removes that it did not write itself.
 _AUTHMAC_BINDING_COMMENT = "cloudguest-authmac"
+#: The ``/system scheduler`` entry that runs that loop. It is the only thing
+#: that ever removes a ``cloudguest-authmac`` binding, so
+#: :meth:`MikroTikAdapter.ensure_hotspot_bypass_binding` writes one only on a
+#: router where this entry exists and is enabled.
+_AUTHMAC_SCHEDULER_NAME = "cloudguest-authmac-sched"
 #: ``cloudguest-devblock:<device rule uuid>`` -- the only shape
 #: :meth:`MikroTikAdapter.block_hotspot_device` writes or removes.
 DEVICE_BLOCK_MARKER_PREFIX = "cloudguest-devblock:"
@@ -2377,6 +2383,176 @@ class MikroTikAdapter:
         finally:
             self._safe_close(api)
         return HotspotDeviceUnblockResult(removed_ids=tuple(removed), remaining=remaining)
+
+    # ------------------------------------------------------------------
+    # session bypass at sign-in (the authorized-MAC loop's own write, early)
+    # ------------------------------------------------------------------
+
+    async def ensure_hotspot_bypass_binding(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> HotspotBypassBindingResult:
+        """Add the session bypass for one MAC -- the row the router's own
+        ``cloudguest-authmac-sched`` adds on its next one-minute poll --
+        unless the router's script would not add it either.
+
+        The script (``buildAuthorizedMacStatements`` in the console's setup
+        generator) is the reconciler and stays the only thing that removes
+        these rows. This method is its ADD pass for a single MAC, performed
+        early, under the same two guards and with the same three fields, so
+        that the next poll finds the row and has nothing to do:
+
+        * **No binding of any kind for the MAC** -- not "none of ours". The
+          script asks ``find where mac-address=<mac>`` with no comment
+          filter. An operator's own binding for the device, a trusted-device
+          bypass, a ``type=blocked`` device rule and a disabled row all
+          count, and all are left exactly as found.
+        * **No live** ``/ip hotspot active`` **session for the MAC.** A
+          device that authenticated through the hotspot is already online;
+          RouterOS answers a binding appearing under it by removing the host
+          (``logged out: host removed: ip binding changed``).
+
+        The row written is ``mac-address=<mac> type=bypassed
+        comment=cloudguest-authmac`` and nothing else, which is the
+        script's own ``add``. The comment is not a parameter: a row tagged
+        anything else would never be removed by the script.
+
+        * **And only on a router whose** ``cloudguest-authmac-sched`` **exists
+          and is enabled** (``"no_reconciler"`` otherwise). That scheduler is
+          the only thing that removes these rows. A venue that has switched
+          it off, or a router that never had it, would keep every binding
+          written here for good -- one sign-in would be internet with no
+          login and no expiry. Where the router's own loop does not run,
+          this method does nothing, which is what that router does today.
+          Read on the same connection, immediately before the write, so it
+          is the router's answer and not a record of what was once pushed.
+
+        Nothing is ever removed or edited, with one exception: a row this
+        very call added a moment ago, when the read-back shows the router's
+        own poll added one for the same MAC in between (``"raced"``).
+
+        ``/ip hotspot host`` is read after a successful add and reported;
+        it is not written. See :class:`HotspotBypassBindingResult`.
+        """
+        return await asyncio.to_thread(
+            self._ensure_hotspot_bypass_binding_sync, creds, mac_address
+        )
+
+    def _ensure_hotspot_bypass_binding_sync(
+        self, creds: DeviceCredentials, mac_address: str
+    ) -> HotspotBypassBindingResult:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+
+        def _for_mac(rows: object) -> list[dict]:
+            return [
+                dict(r)
+                for r in rows  # type: ignore[attr-defined]
+                if normalize_mac_address(r.get("mac-address")) == mac
+            ]
+
+        def _describe(rows: list[dict]) -> tuple[str, ...]:
+            return tuple(
+                f"{_safe_str(r.get('type')) or 'regular'}:"
+                f"{_safe_str(r.get('comment')) or ''}"
+                for r in rows
+            )
+
+        def _result(
+            outcome: str,
+            servers: int,
+            *,
+            binding_id: str | None = None,
+            existing: tuple[str, ...] = (),
+            host_state: str | None = None,
+        ) -> HotspotBypassBindingResult:
+            return HotspotBypassBindingResult(
+                outcome=outcome,
+                hotspot_servers=servers,
+                binding_id=binding_id,
+                existing_bindings=existing,
+                host_state=host_state,
+            )
+
+        api = self._connect_api(creds)
+        try:
+            try:
+                servers = len(list(api.path("ip", "hotspot")))
+                if not servers:
+                    return _result("no_hotspot", 0)
+                reconcilers = [
+                    r
+                    for r in api.path("system", "scheduler")
+                    if _safe_str(r.get("name")) == _AUTHMAC_SCHEDULER_NAME
+                    and not _is_truthy(r.get("disabled"))
+                ]
+                if not reconcilers:
+                    return _result("no_reconciler", servers)
+                bindings = api.path("ip", "hotspot", "ip-binding")
+                existing = _for_mac(bindings)
+                if existing:
+                    return _result(
+                        "already_bound", servers, existing=_describe(existing)
+                    )
+                if _for_mac(api.path("ip", "hotspot", "active")):
+                    return _result("active_session", servers)
+
+                binding_id = str(
+                    bindings.add(
+                        **{
+                            "mac-address": mac,
+                            "type": "bypassed",
+                            "comment": _AUTHMAC_BINDING_COMMENT,
+                        }
+                    )
+                )
+                after = _for_mac(api.path("ip", "hotspot", "ip-binding"))
+                mine = [r for r in after if str(r.get(".id")) == binding_id]
+                if (
+                    len(mine) != 1
+                    or _safe_str(mine[0].get("type")) != "bypassed"
+                    or _safe_str(mine[0].get("comment")) != _AUTHMAC_BINDING_COMMENT
+                ):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "ensure_hotspot_bypass_binding: the bypassed ip-binding "
+                        "was not found on the router after writing it",
+                    )
+                others = [r for r in after if str(r.get(".id")) != binding_id]
+                if others:
+                    # The router's own poll added the same binding between
+                    # our read and our add. Take back the one row we know is
+                    # ours -- by the .id the add returned -- rather than
+                    # leave the MAC bound twice.
+                    bindings.remove(binding_id)
+                    return _result("raced", servers, existing=_describe(others))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_hotspot_bypass_binding: {exc}"
+                ) from exc
+
+            host_state: str | None = None
+            try:
+                hosts = _for_mac(api.path("ip", "hotspot", "host"))
+                if not hosts:
+                    host_state = "absent"
+                elif all(_is_truthy(r.get("bypassed")) for r in hosts):
+                    host_state = "bypassed"
+                else:
+                    host_state = "pending"
+            except LibRouterosError as exc:
+                # A diagnostic read. The binding above is written and read
+                # back; not being able to look at the host table changes
+                # nothing about it.
+                logger.info(
+                    "mikrotik_hotspot_host_read_failed",
+                    extra={"host": creds.host, "detail": str(exc)},
+                )
+            return _result(
+                "created", servers, binding_id=binding_id, host_state=host_state
+            )
+        finally:
+            self._safe_close(api)
 
     # ------------------------------------------------------------------
     # diagnostics (shared by network_diagnostics + isp call sites)

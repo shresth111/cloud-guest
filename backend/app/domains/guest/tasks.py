@@ -67,10 +67,13 @@ from app.domains.queue_management.constants import QueueTargetType
 from .constants import (
     ASSIGN_GUEST_QUEUE_MAX_RETRIES,
     ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS,
+    OPEN_HOTSPOT_GATE_MAX_RETRIES,
+    OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS,
     SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
     SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY,
     SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
     TASK_ASSIGN_GUEST_QUEUE,
+    TASK_OPEN_HOTSPOT_GATE,
     TASK_RECONCILE_ROUTER_SESSION_PRESENCE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
     TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
@@ -609,6 +612,95 @@ def assign_guest_queue(
 
 
 # ============================================================================
+# Opening the hotspot gate at sign-in -- see ``hotspot_gate``'s docstring
+# ============================================================================
+
+
+async def _open_hotspot_gate_async(*, session_id: str, router_id: str):  # noqa: ANN202
+    """One attempt, on a fresh ``AsyncSession``. Read-only against this
+    platform's database -- the only write is the one on the router -- so
+    there is nothing to commit and nothing to roll back.
+
+    Unlike ``_assign_guest_queue_async`` this *does* re-read
+    ``guest_sessions``, deliberately: whether the session is still one the
+    router should let through is the whole question, and it has to be
+    answered at the moment of the write, not at the moment of the login.
+    The read-your-own-write race that creates (the request's commit may not
+    have landed) is handled by the caller as a retry."""
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    from .hotspot_gate import open_hotspot_gate_for_session
+
+    async with SessionLocal() as session:
+        organization_service = OrganizationService(OrganizationRepository(session))
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+        )
+        return await open_hotspot_gate_for_session(
+            session_id=uuid.UUID(session_id),
+            router_id=uuid.UUID(router_id),
+            guest_repository=GuestRepository(session),
+            access_decision_service=_build_access_decision_service(session),
+            captive_portal_service=_build_captive_portal_service(session),
+            router_lookup=RouterService(
+                RouterRepository(session), organization_service, location_service
+            ),
+        )
+
+
+@celery_app.task(
+    name=TASK_OPEN_HOTSPOT_GATE,
+    bind=True,
+    max_retries=OPEN_HOTSPOT_GATE_MAX_RETRIES,
+)
+def open_hotspot_gate(self, *, session_id: str, router_id: str) -> dict[str, object]:
+    """Adds a just-signed-in guest's hotspot bypass on the venue's router.
+    Enqueued per login by ``GuestService._open_hotspot_gate``; never
+    Beat-scheduled.
+
+    Never raises past its retries. A router that cannot be reached is
+    logged and given up on: the router's own one-minute poll adds the same
+    binding, so the worst outcome here is exactly what happened before this
+    task existed."""
+    extra: dict[str, object] = {
+        "session_id": session_id,
+        "router_id": router_id,
+        "attempt": self.request.retries + 1,
+    }
+    last_attempt = self.request.retries >= OPEN_HOTSPOT_GATE_MAX_RETRIES
+    try:
+        result = run_celery_task(
+            _open_hotspot_gate_async(session_id=session_id, router_id=router_id)
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+        logger.warning(
+            "guest_task_open_hotspot_gate_failed",
+            extra={**extra, "error": str(exc), "gave_up": last_attempt},
+        )
+        if last_attempt:
+            return {"session_id": session_id, "outcome": "device_error"}
+        raise self.retry(
+            exc=exc, countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS
+        ) from exc
+    if result.retry and not last_attempt:
+        raise self.retry(countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS)
+    logger.info(
+        "guest_task_open_hotspot_gate_completed",
+        extra={
+            **extra,
+            "outcome": result.outcome,
+            "wrote": result.wrote,
+            "host_state": result.host_state,
+            "existing_bindings": list(result.existing_bindings),
+        },
+    )
+    return {"session_id": session_id, "outcome": result.outcome}
+
+
+# ============================================================================
 # Session presence reconciliation -- close sessions whose device has left
 # ============================================================================
 
@@ -835,6 +927,60 @@ async def enqueue_guest_queue_assignment(
         )
 
 
+def hotspot_gate_push_applies(
+    router_id: uuid.UUID, *, enabled: bool, router_ids: str
+) -> bool:
+    """Whether the sign-in push is switched on for ``router_id``: either for
+    every router (``enabled``), or for this one by name in the
+    comma-separated ``router_ids`` allow-list. An entry that is not a UUID
+    matches nothing -- it never widens the list."""
+    if enabled:
+        return True
+    wanted = {part.strip().lower() for part in (router_ids or "").split(",")}
+    return str(router_id).lower() in wanted
+
+
+async def enqueue_hotspot_gate_open(
+    *, router_id: uuid.UUID, session_id: uuid.UUID
+) -> None:
+    """The dispatcher ``GuestService`` is wired with for the hotspot gate --
+    publishes ``open_hotspot_gate`` and returns.
+
+    Published with a countdown (``guest_hotspot_gate_push_delay_seconds``;
+    see that setting for why the browser is given the first go), and not at
+    all unless the push is switched on for this router (off by default --
+    see ``hotspot_gate_push_applies`` and the settings' own note).
+
+    Same two properties as ``enqueue_guest_queue_assignment``: the broker
+    publish runs in a thread so the event loop is never blocked on it, and
+    it never raises -- a broker hiccup must not fail a login."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not hotspot_gate_push_applies(
+        router_id,
+        enabled=settings.guest_hotspot_gate_push_enabled,
+        router_ids=settings.guest_hotspot_gate_push_router_ids,
+    ):
+        return
+
+    def _publish() -> None:
+        open_hotspot_gate.apply_async(
+            kwargs={"session_id": str(session_id), "router_id": str(router_id)},
+            countdown=settings.guest_hotspot_gate_push_delay_seconds,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_gate_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
 __all__ = [
     "run_session_timeout_sweep",
     "run_fup_time_accrual_sweep",
@@ -843,4 +989,6 @@ __all__ = [
     "reconcile_router_session_presence",
     "assign_guest_queue",
     "enqueue_guest_queue_assignment",
+    "open_hotspot_gate",
+    "enqueue_hotspot_gate_open",
 ]

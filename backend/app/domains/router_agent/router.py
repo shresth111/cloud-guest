@@ -33,18 +33,13 @@ import uuid
 
 from fastapi import APIRouter, Depends, Request, status
 
-from app.common.exceptions import CloudGuestError
 from app.core.logging import get_logger
 from app.domains.captive_portal.dependencies import get_captive_portal_service
-from app.domains.captive_portal.exceptions import (
-    CaptivePortalConfigNotConfiguredError,
-)
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest.dependencies import get_guest_repository
 from app.domains.guest.repository import GuestRepositoryProtocol
-from app.domains.guest.validators import session_awaits_required_name
 from app.domains.guest_access.dependencies import get_access_decision_service
-from app.domains.guest_access.service import GuestAccessService, is_blocklisted
+from app.domains.guest_access.service import GuestAccessService
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
 from app.domains.mac_authorization.dependencies import (
@@ -56,6 +51,7 @@ from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
 from app.domains.router.enums import RouterStatus
 
+from .authorized_macs import list_authorized_macs
 from .dependencies import AgentIdentity, CurrentAgent, get_router_agent_service
 from .schemas import (
     AgentActionCompleteRequest,
@@ -74,7 +70,6 @@ from .schemas import (
 from .service import RouterAgentService
 from .validators import (
     netwatch_status_to_ping_result,
-    routeros_mac_address,
     validate_netwatch_link_owned_by_router,
 )
 
@@ -240,43 +235,6 @@ async def agent_complete_action(
     return AgentActionCompleteResponse(job_id=str(job.id), status=job.status)
 
 
-async def _awaits_required_name(
-    session: object,
-    guest: object,
-    captive_portal_service: CaptivePortalService,
-    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], bool],
-) -> bool:
-    """``validators.session_awaits_required_name`` with the venue's
-    ``require_guest_name`` resolved once per (organization, location) per
-    poll. Only resolved for a session that could be held at all (OTP, no
-    name on file), so a fleet of named guests costs no config reads.
-
-    Same resolution rule as ``GuestService.session_awaits_required_name``:
-    no config at all reads as the owner's default (required); any other
-    resolution failure fails OPEN, since this list is what keeps admitted
-    guests online and an unrelated error must not strip them."""
-    if not session_awaits_required_name(
-        session=session,  # type: ignore[arg-type]
-        guest=guest,  # type: ignore[arg-type]
-        require_guest_name=True,
-    ):
-        return False
-    key = (session.organization_id, session.location_id)  # type: ignore[attr-defined]
-    if key not in require_cache:
-        try:
-            resolved = await captive_portal_service.resolve_portal_config(
-                organization_id=key[0], location_id=key[1]
-            )
-            require_cache[key] = bool(
-                getattr(resolved.config, "require_guest_name", True)
-            )
-        except CaptivePortalConfigNotConfiguredError:
-            require_cache[key] = True
-        except CloudGuestError:
-            require_cache[key] = False
-    return require_cache[key]
-
-
 @router.get(
     "/authorized-macs",
     response_model=AuthorizedMacsResponse,
@@ -327,66 +285,24 @@ async def agent_authorized_macs(
     be ignored by every script already deployed, so the fix would do
     nothing until every router in the fleet was re-provisioned by hand.
     """
-    sessions = await guest_repository.list_active_sessions_for_router(
-        identity.router.id
+    # The rule itself lives in ``authorized_macs`` so that the sign-in push
+    # (``app.domains.guest.hotspot_gate``) applies literally the same one:
+    # a binding written for a session this list leaves out would be removed
+    # by the router's script one poll later.
+    listed = await list_authorized_macs(
+        identity.router.id,
+        guest_repository=guest_repository,
+        mac_authorization_service=mac_authorization_service,
+        access_decision_service=access_decision_service,
+        captive_portal_service=captive_portal_service,
     )
-    macs: list[str] = []
-    require_cache: dict[tuple[uuid.UUID, uuid.UUID | None], bool] = {}
-    for session in sessions:
-        if session.device_id is None:
-            continue
-        device = await guest_repository.get_device_by_id(session.device_id)
-        if device is None:
-            continue
-        # A guest blocked after they were admitted keeps an ``ACTIVE`` row
-        # whenever the device-side removal failed (see
-        # ``guest_access.enforcement``). Returning their MAC here kept a
-        # ``type=bypassed`` binding on the router -- internet with no
-        # login and no expiry. Leaving it out makes the agent's own
-        # reconciliation withdraw that binding on its next poll.
-        guest = await guest_repository.get_guest_by_id(session.guest_id)
-        # Name required at sign-in. A session that verified its OTP but
-        # whose guest has not yet given the name the venue requires exists
-        # and is ACTIVE -- and without this, the next 60-second poll would
-        # put a ``type=bypassed`` binding on it and the guest would be
-        # online without ever answering the "Your name" screen. Same
-        # predicate as RADIUS Authorize; config by the SESSION's location.
-        if await _awaits_required_name(
-            session, guest, captive_portal_service, require_cache
-        ):
-            continue
-        if await is_blocklisted(
-            access_decision_service,
-            organization_id=session.organization_id,
-            location_id=session.location_id,
-            identifier=guest.identifier if guest is not None else None,
-            mac_address=device.mac_address,
-        ):
-            continue
-        macs.append(device.mac_address)
-
-    # Scoped by the service against this router's own organization and
-    # location; the agent identity is the router, so there is no caller
-    # organization to pass and none to check against.
-    trusted = await mac_authorization_service.list_active_entries_for_router(
-        identity.router.id, requesting_organization_id=None
-    )
-    macs.extend(entry.mac_address for entry in trusted)
-
-    # One spelling, and only real MACs -- see ``routeros_mac_address`` for
-    # what either failure does to the script that reads this. An entry that
-    # is dropped is a device the router will not let through, so it is
-    # counted and logged rather than vanishing: that guest's sign-in
-    # recorded something that is not a MAC address.
-    canonical = {mac for raw in macs if (mac := routeros_mac_address(raw)) is not None}
-    dropped = sum(1 for raw in macs if routeros_mac_address(raw) is None)
-    if dropped:
+    if listed.dropped:
         logger.warning(
             "agent_authorized_macs_dropped_malformed",
-            extra={"router_id": str(identity.router.id), "dropped": dropped},
+            extra={"router_id": str(identity.router.id), "dropped": listed.dropped},
         )
 
-    return AuthorizedMacsResponse(mac_addresses=sorted(canonical))
+    return AuthorizedMacsResponse(mac_addresses=list(listed.mac_addresses))
 
 
 @router.post(
