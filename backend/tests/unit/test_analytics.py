@@ -874,6 +874,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-session-presence-sweep",
         "provisioning-engine-drain-queue",
         "queue-management-sweep-schedule-transitions",
+        # Takes an ended guest session's speed-limit row off its router.
+        # Nothing else did: the row stayed first in `/queue simple` and
+        # went on deciding the speed of whoever held that address next.
+        "queue-management-release-ended-session-queues",
         "guest-fup-time-accrual-sweep",
         "guest-quota-reset-sweep",
         # Only Allowed. The flag used to be answered once, at sign-in, and
