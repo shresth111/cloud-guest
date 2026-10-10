@@ -1927,6 +1927,40 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Slack: Master-console onboarding status posts
     # ------------------------------------------------------------------
+    # Opening the hotspot gate at sign-in (app.domains.guest.hotspot_gate).
+    #
+    # After a successful login at a platform-managed MikroTik, a worker
+    # task adds the same `/ip hotspot ip-binding type=bypassed
+    # comment=cloudguest-authmac` row the router's own one-minute
+    # authorized-MAC poll would add, so the guest is not left without
+    # internet until that poll comes round.
+    #
+    # OFF BY DEFAULT, and that is a statement about evidence, not about the
+    # code: this is a device write on every login, and at the time it was
+    # written it had run against a fake RouterOS API only. Merging it
+    # changes nothing on any router until one of these is set:
+    #
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_PUSH_ROUTER_IDS=<uuid>[,<uuid>...]
+    #       only these routers -- the way to watch it on one device first;
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_PUSH_ENABLED=true
+    #       every platform-managed MikroTik.
+    #
+    # With neither, nothing is enqueued, which is exactly the behaviour
+    # before this existed (the router's poll opens the gate within a
+    # minute).
+    #
+    # `delay_seconds` is deliberate, not slack. The portal opens the gate
+    # itself where it can: straight after login the guest's browser posts
+    # to the router's own hotspot login URL, and RouterOS asks RADIUS. A
+    # binding that lands BEFORE that post turns the device into a bypassed
+    # host, and a bypassed host's post is no longer answered by the hotspot
+    # at all; one that lands AFTER a successful post is skipped, because
+    # the MAC is then a live hotspot session. The delay lets the browser go
+    # first. Zero is allowed and means "immediately".
+    guest_hotspot_gate_push_enabled: bool = False
+    guest_hotspot_gate_push_router_ids: str = ""
+    guest_hotspot_gate_push_delay_seconds: float = Field(default=3.0, ge=0, le=30)
+
     # One incoming-webhook URL, one internal ops channel. This is NOT a
     # per-tenant setting and deliberately has no database column and no
     # customer-facing UI: the messages describe Master/GLOBAL-scope

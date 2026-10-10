@@ -1738,6 +1738,22 @@ class QueueAssignmentProtocol(Protocol):
     ) -> object: ...
 
 
+class HotspotGateDispatcherProtocol(Protocol):
+    """Publishes "open this session's hotspot gate on its router" to the
+    background worker. Satisfied by ``tasks.enqueue_hotspot_gate_open``,
+    which is what ``dependencies.get_guest_service`` wires in; a Protocol
+    for the same two reasons ``QueueAssignmentDispatcherProtocol`` is one.
+
+    Carries two ids and nothing else. Who is admitted is decided in the
+    worker, at the moment of the write, by the same function that builds
+    ``GET /agent/authorized-macs`` -- never here, and never from values
+    captured during the login request."""
+
+    async def __call__(
+        self, *, router_id: uuid.UUID, session_id: uuid.UUID
+    ) -> None: ...
+
+
 class QueueAssignmentDispatcherProtocol(Protocol):
     """Publishes the bandwidth-queue assignment to the background worker
     instead of performing it inline -- design spec §5 S9.
@@ -2702,6 +2718,7 @@ class GuestService:
         access_control_hook: AccessDecisionProtocol | None = None,
         queue_assignment_hook: QueueAssignmentProtocol | None = None,
         queue_assignment_dispatcher: QueueAssignmentDispatcherProtocol | None = None,
+        hotspot_gate_dispatcher: HotspotGateDispatcherProtocol | None = None,
         session_end_hook: LiveSessionTerminatorProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
@@ -2719,6 +2736,7 @@ class GuestService:
         self.access_control_hook = access_control_hook
         self.queue_assignment_hook = queue_assignment_hook
         self.queue_assignment_dispatcher = queue_assignment_dispatcher
+        self.hotspot_gate_dispatcher = hotspot_gate_dispatcher
         self.session_end_hook = session_end_hook
         self.policy_lookup = policy_lookup
         # Request-scoped memo for _resolve_session_policy_rules -- see its
@@ -2878,6 +2896,47 @@ class GuestService:
         except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
             logger.warning(
                 "guest_queue_assignment_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+
+    async def _open_hotspot_gate(
+        self, *, session: GuestSession, router: Router | None = None
+    ) -> None:
+        """Best-effort: ask the worker to add this session's hotspot bypass
+        on the venue's router now, rather than leave the guest without
+        internet until the router's own one-minute poll. See
+        ``hotspot_gate``'s module docstring for the measurement behind it.
+
+        A no-op when no dispatcher is wired (the default, and every unit
+        test that does not ask for one); never raises.
+
+        Decides nothing about admission. A session still waiting for the
+        name the venue requires, or a blocklisted guest, is enqueued like
+        any other and refused in the worker by the rule
+        ``GET /agent/authorized-macs`` uses -- one rule, in one place. The
+        two checks here only avoid publishing a task that could never
+        write: a session with no device has no MAC to bind, and a venue
+        this platform does not log in to has no RouterOS to bind it on.
+
+        ``router`` is passed by the login methods, which have it in hand.
+        ``submit_sign_in_name`` does not, and leaves the vendor question to
+        the worker, which asks it again regardless."""
+        if self.hotspot_gate_dispatcher is None:
+            return
+        router_id = router.id if router is not None else session.router_id
+        if router_id is None or session.device_id is None:
+            return
+        if router is not None and (
+            is_controller_managed(router) or is_nas_only(router)
+        ):
+            return
+        try:
+            await self.hotspot_gate_dispatcher(
+                router_id=router_id, session_id=session.id
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "guest_hotspot_gate_dispatch_failed",
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
 
@@ -3196,6 +3255,7 @@ class GuestService:
             location_id=location_id,
             organization_id=resolved_org_id,
         )
+        await self._open_hotspot_gate(session=session, router=router)
 
         await self._record_login_success(
             guest=guest,
@@ -3390,6 +3450,7 @@ class GuestService:
             location_id=location_id,
             organization_id=resolved_org_id,
         )
+        await self._open_hotspot_gate(session=session, router=router)
 
         await self._record_login_success(
             guest=guest,
@@ -3567,6 +3628,7 @@ class GuestService:
             location_id=location_id,
             organization_id=resolved_org_id,
         )
+        await self._open_hotspot_gate(session=session, router=router)
 
         await self._record_login_success(
             guest=guest,
@@ -3876,6 +3938,7 @@ class GuestService:
             location_id=location_id,
             organization_id=resolved_org_id,
         )
+        await self._open_hotspot_gate(session=session, router=router)
 
         await self._record_login_success(
             guest=guest,
@@ -4076,6 +4139,7 @@ class GuestService:
             location_id=location_id,
             organization_id=resolved_org_id,
         )
+        await self._open_hotspot_gate(session=session, router=router)
 
         await self._record_login_success(
             guest=guest,
@@ -4527,6 +4591,11 @@ class GuestService:
                 "event_session_id": str(session.id),
             },
         )
+        # The name was the last thing holding this session off the network.
+        # The login that created it already asked for the gate and was
+        # refused in the worker (``awaiting_name``); ask again now that the
+        # answer has changed.
+        await self._open_hotspot_gate(session=session)
         return updated
 
     async def record_review_link_opened(

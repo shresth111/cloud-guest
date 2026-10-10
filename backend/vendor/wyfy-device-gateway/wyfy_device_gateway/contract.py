@@ -831,6 +831,55 @@ class HotspotDeviceUnblockResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HotspotBypassBindingResult:
+    """What a router holds after being asked to let one signed-in device
+    through its hotspot now, rather than at the router's next authorized-MAC
+    poll.
+
+    ``outcome`` is exactly one of:
+
+    * ``"created"`` -- there was no ``/ip hotspot ip-binding`` row for the
+      MAC and no live ``/ip hotspot active`` session; one
+      ``type=bypassed comment=cloudguest-authmac`` row was added and read
+      back. ``binding_id`` is its ``.id``.
+    * ``"already_bound"`` -- a binding for the MAC already exists (this
+      platform's, an operator's, a block). Nothing was written.
+      ``existing_bindings`` lists what was found, as ``"<type>:<comment>"``.
+    * ``"active_session"`` -- the MAC is an authenticated hotspot session
+      right now. It is already through the gate; a binding added under it
+      makes RouterOS drop the session. Nothing was written.
+    * ``"no_hotspot"`` -- the router runs no hotspot server, so an
+      ip-binding would bind nothing. Nothing was written.
+    * ``"no_reconciler"`` -- the router has no enabled
+      ``cloudguest-authmac-sched``. Nothing on it would ever remove the
+      row, so none is written. Nothing was written.
+    * ``"raced"`` -- the row was added, and the read-back found a second
+      row for the same MAC that was not there a moment earlier (the
+      router's own poll adding the same binding in the same instant). The
+      row this call added was removed again, by its own ``.id``, so the MAC
+      is left with exactly the row it did not write.
+
+    ``host_state`` is a read, not a write, taken after a ``"created"``:
+    ``"absent"`` (no ``/ip hotspot host`` row for the MAC), ``"bypassed"``,
+    or ``"pending"`` (a host row exists and does not yet read
+    ``bypassed=true``). ``None`` for every other outcome, and when the host
+    table could not be read. It is reported so that what RouterOS does with
+    an existing host when a binding appears can be learned from a fleet's
+    logs; nothing here acts on it.
+    """
+
+    outcome: str
+    hotspot_servers: int
+    binding_id: str | None
+    existing_bindings: tuple[str, ...]
+    host_state: str | None
+
+    @property
+    def created(self) -> bool:
+        return self.outcome == "created"
+
+
+@dataclass(frozen=True, slots=True)
 class DhcpLease:
     """One ``/ip dhcp-server lease`` row, as the router reported it.
 
@@ -2115,6 +2164,7 @@ __all__ = [
     "HotspotSessionControl",
     "HotspotDisconnectResult",
     "HotspotDeviceBlockResult",
+    "HotspotBypassBindingResult",
     "DhcpLease",
     "DhcpLeaseKeepResult",
     "HotspotDeviceUnblockResult",

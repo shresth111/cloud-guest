@@ -194,7 +194,7 @@ def get_guest_service(
     ``GuestRepository`` already injected here rather than through another
     ``Depends`` -- both are exactly what it needs, and ``GuestRepository``
     already satisfies ``DeviceLookupProtocol``."""
-    from .tasks import enqueue_guest_queue_assignment
+    from .tasks import enqueue_guest_queue_assignment, enqueue_hotspot_gate_open
 
     return GuestService(
         repository,
@@ -207,6 +207,10 @@ def get_guest_service(
         access_control_hook=guest_access_service,
         queue_assignment_hook=queue_management_service,
         queue_assignment_dispatcher=enqueue_guest_queue_assignment,
+        # Opens the router's hotspot gate a few seconds after sign-in,
+        # from the worker, instead of leaving the guest without internet
+        # until the router's own one-minute poll -- see ``hotspot_gate``.
+        hotspot_gate_dispatcher=enqueue_hotspot_gate_open,
         session_end_hook=LiveSessionTerminator(
             router_lookup=router_service,
             device_lookup=repository,

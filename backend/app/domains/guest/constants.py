@@ -670,6 +670,25 @@ ASSIGN_GUEST_QUEUE_MAX_RETRIES = 3
 ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS = 30
 
 # ============================================================================
+# Opening the hotspot gate at sign-in -- see ``hotspot_gate``'s module
+# docstring for the measurement and the design.
+# ============================================================================
+TASK_OPEN_HOTSPOT_GATE = "app.domains.guest.tasks.open_hotspot_gate"
+
+# Few and close together. A retry exists for two things only: the sign-in
+# request's own commit not having landed when the worker looked (the session
+# is not yet among the router's ACTIVE sessions), and a router that did not
+# answer once. Past ~15 seconds there is nothing left to win -- the router's
+# own one-minute poll opens the gate regardless, exactly as it does today.
+OPEN_HOTSPOT_GATE_MAX_RETRIES = 2
+OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS = 4
+
+# One RouterOS API connection, bounded well under the retry spacing. The
+# login is not waiting on this (it runs in the worker), but a worker slot
+# is, and an unreachable router should give it back quickly.
+HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS = 5
+
+# ============================================================================
 # FreeRADIUS ``rlm_rest``-style integration -- see ``service.py``'s module
 # docstring for the full architectural write-up on why HTTP (rlm_rest), not
 # raw RADIUS-UDP.
@@ -853,6 +872,10 @@ __all__ = [
     "TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP",
     "OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
     "TASK_ASSIGN_GUEST_QUEUE",
+    "TASK_OPEN_HOTSPOT_GATE",
+    "OPEN_HOTSPOT_GATE_MAX_RETRIES",
+    "OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS",
+    "HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS",
     "ASSIGN_GUEST_QUEUE_MAX_RETRIES",
     "ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS",
     "QUOTA_RESET_SWEEP_INTERVAL_SECONDS",
