@@ -34,6 +34,7 @@ import uuid
 from fastapi import APIRouter, Depends, Request, status
 
 from app.common.exceptions import CloudGuestError
+from app.core.logging import get_logger
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.exceptions import (
     CaptivePortalConfigNotConfiguredError,
@@ -73,8 +74,11 @@ from .schemas import (
 from .service import RouterAgentService
 from .validators import (
     netwatch_status_to_ping_result,
+    routeros_mac_address,
     validate_netwatch_link_owned_by_router,
 )
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["Router Agent"])
 
@@ -369,7 +373,20 @@ async def agent_authorized_macs(
     )
     macs.extend(entry.mac_address for entry in trusted)
 
-    return AuthorizedMacsResponse(mac_addresses=sorted(set(macs)))
+    # One spelling, and only real MACs -- see ``routeros_mac_address`` for
+    # what either failure does to the script that reads this. An entry that
+    # is dropped is a device the router will not let through, so it is
+    # counted and logged rather than vanishing: that guest's sign-in
+    # recorded something that is not a MAC address.
+    canonical = {mac for raw in macs if (mac := routeros_mac_address(raw)) is not None}
+    dropped = sum(1 for raw in macs if routeros_mac_address(raw) is None)
+    if dropped:
+        logger.warning(
+            "agent_authorized_macs_dropped_malformed",
+            extra={"router_id": str(identity.router.id), "dropped": dropped},
+        )
+
+    return AuthorizedMacsResponse(mac_addresses=sorted(canonical))
 
 
 @router.post(
