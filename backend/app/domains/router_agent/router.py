@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 
 from app.common.exceptions import CloudGuestError
 from app.domains.captive_portal.dependencies import get_captive_portal_service
@@ -85,6 +85,7 @@ router = APIRouter(prefix="/agent", tags=["Router Agent"])
     status_code=status.HTTP_200_OK,
 )
 async def agent_heartbeat(
+    request: Request,
     payload: AgentHeartbeatRequest,
     identity: AgentIdentity = Depends(CurrentAgent),
     service: RouterAgentService = Depends(get_router_agent_service),
@@ -111,6 +112,7 @@ async def agent_heartbeat(
         routeros_version=payload.routeros_version,
         management_ip_address=payload.management_ip_address,
         public_ip_address=payload.public_ip_address,
+        source_ip_address=request.client.host if request.client else None,
     )
     await monitoring_service.record_heartbeat(
         component_type=HeartbeatComponentType.ROUTER,

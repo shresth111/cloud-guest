@@ -321,6 +321,7 @@ class RouterAgentService:
         routeros_version: str | None = None,
         management_ip_address: str | None = None,
         public_ip_address: str | None = None,
+        source_ip_address: str | None = None,
     ) -> Router:
         """Composes with ``RouterService.heartbeat`` directly -- the real
         device-authenticated counterpart to BE-008's admin-testing
@@ -329,7 +330,19 @@ class RouterAgentService:
         use). Deliberately not recorded as a ``RouterEvent`` -- heartbeats
         are frequent device telemetry, not a notable status change, the
         identical reasoning BE-008 itself already documents for why they are
-        never audited either."""
+        never audited either.
+
+        ``source_ip_address`` is the address this heartbeat arrived from.
+        A router behind ISP CPE/CGNAT cannot read its own egress address
+        and its ``/tool fetch`` to api.ipify.org can fail on the device
+        (seen live: ``SSL: internal error (6)``), in which case the key is
+        omitted -- but the request itself left through that same egress,
+        so its source is the answer. Only a fallback: a device-reported
+        value wins, and ``RouterService.heartbeat`` still discards a
+        non-public address (e.g. the proxy's own, when forwarded headers
+        are not trusted)."""
+        if public_ip_address is None:
+            public_ip_address = source_ip_address
         previous_status = router.status
         updated = await self.router_lookup.heartbeat(
             router_id=router.id,
