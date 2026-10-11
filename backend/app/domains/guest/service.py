@@ -1778,6 +1778,7 @@ class QueueAssignmentDispatcherProtocol(Protocol):
         session_id: uuid.UUID,
         device_target: str,
         guest_id: uuid.UUID | None,
+        device_mac: str | None = None,
     ) -> None: ...
 
 
@@ -2869,8 +2870,20 @@ class GuestService:
         no find-or-reuse step, so running it per login would accumulate
         duplicate assignments rather than converge on one."""
         device_target = await self._queue_device_target(session=session, router=router)
-        if not device_target:
+        # On a router this platform logs in to, the worker asks the router
+        # itself what address this device has, by MAC, and targets that
+        # (``QueueManagementService._routers_address_for_device``): the
+        # address recorded on the session is whatever the portal URL
+        # carried. So a session with a device is handed on even when its
+        # recorded address is unusable -- the router may well know better.
+        device_mac = (
+            None
+            if is_controller_managed(router)
+            else await self._session_device_mac(session)
+        )
+        if not device_target and not device_mac:
             return
+        device_target = device_target or ""
 
         # Design spec §5 S9. Applying the queue means opening a fresh TCP
         # connection to the venue's MikroTik -- no pooling, 10-second
@@ -2889,6 +2902,7 @@ class GuestService:
                 session_id=session.id,
                 device_target=device_target,
                 guest_id=session.guest_id,
+                device_mac=device_mac,
             )
             return
 
@@ -2899,7 +2913,7 @@ class GuestService:
         # here. Kept rather than made a no-op so that a deployment without
         # a worker still gets queues applied, just slowly, instead of
         # silently not at all.
-        if self.queue_assignment_hook is None:
+        if self.queue_assignment_hook is None or not device_target:
             return
         try:
             await self.queue_assignment_hook.resolve_and_assign_queue(
@@ -2957,6 +2971,14 @@ class GuestService:
                 "guest_hotspot_gate_dispatch_failed",
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
+
+    async def _session_device_mac(self, session: GuestSession) -> str | None:
+        """The MAC of the device this session signed in from, or ``None``
+        when the login recorded none."""
+        if session.device_id is None:
+            return None
+        device = await self.repository.get_device_by_id(session.device_id)
+        return getattr(device, "mac_address", None) if device is not None else None
 
     async def _queue_device_target(
         self, *, session: GuestSession, router: Router

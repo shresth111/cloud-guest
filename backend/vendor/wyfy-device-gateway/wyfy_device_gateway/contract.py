@@ -1964,7 +1964,11 @@ class DeviceGatewayAdapter(Protocol):
     ) -> str:
         """Creates a real ``/queue simple`` entry. Returns the device-side
         queue id. Ported from
-        ``app.domains.queue_management.device_adapters.create_simple_queue``."""
+        ``app.domains.queue_management.device_adapters.create_simple_queue``.
+
+        The new row is then moved to the top of the list, best effort: the
+        first matching row wins, and a dynamic hotspot queue for the same
+        address would otherwise sit above it."""
         ...
 
     async def update_simple_queue(
@@ -1981,7 +1985,16 @@ class DeviceGatewayAdapter(Protocol):
         priority: int = _DEFAULT_QUEUE_PRIORITY,
     ) -> None:
         """Updates an existing ``/queue simple`` entry's rate/burst/
-        priority fields."""
+        priority fields, and moves it back to the top of the list (see
+        ``create_simple_queue``)."""
+        ...
+
+    async def find_client_address(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> str | None:
+        """The address the device currently has for the client with this
+        MAC (hotspot host, then DHCP lease), or ``None`` if it knows no
+        such client. Read-only."""
         ...
 
     async def delete_simple_queue(

@@ -7426,9 +7426,12 @@ class MikroTikAdapter:
         api = self._connect_api(creds)
         try:
             try:
-                return api.path(*path_segments).add(**fields)
+                device_queue_id = api.path(*path_segments).add(**fields)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
+            if path_segments == _SIMPLE_QUEUE_PATH:
+                _raise_simple_queue_to_top(api, creds.host, str(device_queue_id))
+            return device_queue_id
         finally:
             api.close()
 
@@ -7445,6 +7448,8 @@ class MikroTikAdapter:
                 api.path(*path_segments).update(**fields)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
+            if path_segments == _SIMPLE_QUEUE_PATH and fields.get(".id"):
+                _raise_simple_queue_to_top(api, creds.host, str(fields[".id"]))
         finally:
             api.close()
 
@@ -7529,6 +7534,88 @@ class MikroTikAdapter:
             fields,
             "update_simple_queue",
         )
+
+    async def find_client_address(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> str | None:
+        """The address this router currently has for the device with this
+        MAC -- its hotspot host entry first, then its DHCP lease -- or
+        ``None`` when the router knows no such device.
+
+        This is what a per-guest ``/queue simple`` has to target. The
+        address a guest's browser *says* it has is not evidence: a portal
+        URL carries it as a query parameter, and a bookmarked or copied URL
+        carries somebody else's, or yesterday's.
+
+        The hotspot host is asked first because it exists for every device
+        the hotspot has seen, including one that is bypassed and one with a
+        static address the DHCP server never leased. The ARP table is the
+        last resort, for a venue where neither exists for a device the
+        router nevertheless routes for. Its ``to-address`` is
+        preferred over ``address``: where the hotspot is translating a
+        client's own address, ``to-address`` is the one the router routes.
+        A router with no hotspot package is not an error; the lease is then
+        the only source. Among several leases for one MAC a ``bound`` one
+        wins.
+
+        Read-only. Raises ``MikroTikConnectionError`` /
+        ``MikroTikDeviceError`` like every other call here; an unparsable
+        MAC is ``None``, never an exception."""
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            return None
+        return await asyncio.to_thread(self._find_client_address_sync, creds, mac)
+
+    def _find_client_address_sync(
+        self, creds: DeviceCredentials, mac: str
+    ) -> str | None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                hosts = [
+                    row
+                    for row in api.path("ip", "hotspot", "host")
+                    if _row_mac(dict(row)) == mac
+                ]
+            except LibRouterosError:
+                hosts = []
+            for row in hosts:
+                address = _safe_str(row.get("to-address")) or _safe_str(
+                    row.get("address")
+                )
+                if address:
+                    return address
+            try:
+                leases = [
+                    lease
+                    for lease in self._leases_for_mac(api.path(*_DHCP_LEASE_PATH), mac)
+                    if lease.address and not lease.disabled
+                ]
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"find_client_address: {exc}"
+                ) from exc
+            leases.sort(key=lambda lease: lease.status != "bound")
+            if leases:
+                return leases[0].address
+            # Neither: a venue where something else hands out addresses and
+            # the hotspot is not in the path (the router still routes for
+            # the device, so it has resolved its MAC).
+            try:
+                for row in api.path("ip", "arp"):
+                    if (
+                        _row_mac(dict(row)) == mac
+                        and not _is_truthy(row.get("disabled"))
+                        and not _is_truthy(row.get("invalid"))
+                    ):
+                        address = _safe_str(row.get("address"))
+                        if address:
+                            return address
+            except LibRouterosError:
+                return None
+            return None
+        finally:
+            api.close()
 
     async def delete_simple_queue(
         self, creds: DeviceCredentials, *, device_queue_id: str
@@ -8436,6 +8523,99 @@ def _build_hop(hop_number: int, row: dict[str, object]) -> TracerouteHop:
         or loss_default,
         avg_rtt_ms=_parse_routeros_duration_ms(row.get("avg")),
     )
+
+
+_SIMPLE_QUEUE_PATH = ("queue", "simple")
+
+
+def _simple_queue_targets(row: Mapping[str, object]) -> set[str]:
+    """The single hosts a ``/queue simple`` row targets, without the
+    ``/32`` RouterOS prints after them."""
+    return {
+        part.strip().removesuffix("/32")
+        for part in str(row.get("target") or "").split(",")
+        if part.strip()
+    }
+
+
+def _targets_single_hosts(row: Mapping[str, object]) -> bool:
+    """Whether every target of a ``/queue simple`` row is one IPv4 host
+    (``10.5.50.7`` or ``10.5.50.7/32``) -- not a subnet, not an interface."""
+    targets = _simple_queue_targets(row)
+    if not targets:
+        return False
+    for target in targets:
+        try:
+            if ipaddress.ip_address(target).version != 4:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _raise_simple_queue_to_top(api, host: str, device_queue_id: str) -> None:  # noqa: ANN001
+    """Best effort: make ``device_queue_id`` the first ``/queue simple``
+    row, and say so in the log if another row for the same address still
+    sits above it afterwards.
+
+    RouterOS applies the first matching simple queue in list order. A guest
+    who signed in through RADIUS also has a dynamic ``<hotspot-...>`` queue
+    for the same address, made from the rate-limit reply attribute, and the
+    hotspot inserts those at the top -- so the row this adapter just wrote
+    sat below it, matched nothing, and a speed the venue changed afterwards
+    reached nobody until the guest signed in again (observed live: the
+    platform's row at 0 bytes under a dynamic row carrying the traffic).
+
+    Only a row whose every target is one host is raised. A venue-wide row
+    -- a subnet, an interface -- matches every guest, and putting *that*
+    first would shadow each guest's own row, which is the opposite of the
+    point; it stays where ``add`` put it, at the bottom.
+
+    It never raises. The row has already been written; failing the caller
+    here would have it roll back its own record of a row that is on the
+    device. And it does not assume the move worked: whether RouterOS lets a
+    static row sit above a dynamic one has not been established on
+    hardware, so the list is read back and a row that is still shadowed is
+    reported, not presumed fixed."""
+    try:
+        rows = [dict(row) for row in api.path(*_SIMPLE_QUEUE_PATH)]
+        ids = [str(row.get(".id")) for row in rows]
+        if device_queue_id not in ids or ids[0] == device_queue_id:
+            return
+        if not _targets_single_hosts(rows[ids.index(device_queue_id)]):
+            return
+        tuple(
+            api(
+                "/queue/simple/move",
+                numbers=device_queue_id,
+                destination=ids[0],
+            )
+        )
+        rows = [dict(row) for row in api.path(*_SIMPLE_QUEUE_PATH)]
+    except LibRouterosError as exc:
+        logger.warning(
+            "simple_queue_raise_failed",
+            extra={"host": host, "device_queue_id": device_queue_id, "error": str(exc)},
+        )
+        return
+    ours = next((r for r in rows if str(r.get(".id")) == device_queue_id), None)
+    if ours is None:
+        return
+    targets = _simple_queue_targets(ours)
+    for row in rows:
+        if str(row.get(".id")) == device_queue_id:
+            return
+        if targets & _simple_queue_targets(row):
+            logger.warning(
+                "simple_queue_shadowed",
+                extra={
+                    "host": host,
+                    "device_queue_id": device_queue_id,
+                    "shadowed_by": _safe_str(row.get("name")),
+                    "shadowed_by_dynamic": _is_truthy(row.get("dynamic")),
+                },
+            )
+            return
 
 
 def _max_limit_field(upload_rate_kbps: int, download_rate_kbps: int) -> dict[str, str]:

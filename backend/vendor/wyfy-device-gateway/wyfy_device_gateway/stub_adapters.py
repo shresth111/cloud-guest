@@ -195,6 +195,11 @@ class _StubAdapter:
     ) -> None:
         raise self._not_implemented()
 
+    async def find_client_address(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> str | None:
+        raise self._not_implemented()
+
     async def delete_simple_queue(
         self, creds: DeviceCredentials, *, device_queue_id: str
     ) -> None:
@@ -398,6 +403,7 @@ class _StubAdapter:
             "push_hotspot_certificate": False,
             "create_simple_queue": False,
             "update_simple_queue": False,
+            "find_client_address": False,
             "delete_simple_queue": False,
             "create_queue_tree": False,
             "apply_pcq": False,

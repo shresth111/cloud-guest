@@ -130,6 +130,13 @@ class BaseQueueAdapter(Protocol):
         priority fields."""
         ...
 
+    async def resolve_client_address(
+        self, credentials: QueueCredentials, *, mac_address: str
+    ) -> str | None:
+        """The address the device currently has for the client with this
+        MAC, or ``None`` if it knows no such client. Read-only."""
+        ...
+
     async def delete_simple_queue(
         self, credentials: QueueCredentials, *, device_queue_id: str
     ) -> None:
@@ -288,6 +295,24 @@ class MikroTikQueueAdapter:
             raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
         except MikroTikDeviceError as exc:
             raise QueueDeviceOperationError("update_simple_queue", exc.detail) from exc
+
+    async def resolve_client_address(
+        self, credentials: QueueCredentials, *, mac_address: str
+    ) -> str | None:
+        """The address the router currently has for this MAC (hotspot host,
+        then DHCP lease), or ``None`` if it knows no such device -- see the
+        gateway's ``find_client_address``."""
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).find_client_address(
+                creds, mac_address=mac_address
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError(
+                "resolve_client_address", exc.detail
+            ) from exc
 
     async def delete_simple_queue(
         self, credentials: QueueCredentials, *, device_queue_id: str
