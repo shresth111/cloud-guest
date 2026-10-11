@@ -391,7 +391,10 @@ from .exceptions import (
     TooManyVoucherIdsError,
     VenueClosedError,
 )
-from .hotspot_binding_events import request_hotspot_binding_reconcile
+from .hotspot_binding_events import (
+    request_hotspot_binding_reconcile,
+    request_trusted_device_hotspot_gate_open_for_ended_session,
+)
 from .models import (
     Guest,
     GuestConsent,
@@ -2131,6 +2134,11 @@ async def issue_live_disconnect(
     # nothing about it, and on most of the fleet nothing on the router
     # removes it. Publishes nothing unless switched on; never raises.
     await request_hotspot_binding_reconcile(session.router_id)
+    # And the other way round: a device marked Trusted while this session
+    # was live could not be given its bypass then, and can be now.
+    await request_trusted_device_hotspot_gate_open_for_ended_session(
+        session_id=session.id, router_id=session.router_id
+    )
 
     if already_ended_on_device:
         #  The NAS itself reported this session over -- a RADIUS

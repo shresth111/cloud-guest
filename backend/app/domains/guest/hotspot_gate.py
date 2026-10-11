@@ -293,6 +293,37 @@ async def open_hotspot_gate_for_trusted_entry(
     )
 
 
+async def trusted_entry_for_session_device(
+    *,
+    session_id: uuid.UUID,
+    router_id: uuid.UUID,
+    guest_repository: Any,
+    mac_authorization_service: _TrustedEntryLookup,
+) -> uuid.UUID | None:
+    """The Trusted Device entry, active at ``router_id``, for the device
+    ``session_id`` was on -- or ``None``.
+
+    Asked when a session ends: a device marked Trusted while it was signed
+    in got no binding then (the gateway refuses a MAC with a live hotspot
+    session), so it is the end of that session that makes the write
+    possible. Compared in the router's own spelling of a MAC, as the list
+    itself is."""
+    session = await guest_repository.get_session_by_id(session_id)
+    if session is None or session.device_id is None:
+        return None
+    device = await guest_repository.get_device_by_id(session.device_id)
+    mac_address = routeros_mac_address(getattr(device, "mac_address", None))
+    if mac_address is None:
+        return None
+    entries = await mac_authorization_service.list_active_entries_for_router(
+        router_id, requesting_organization_id=None
+    )
+    for entry in entries:
+        if routeros_mac_address(entry.mac_address) == mac_address:
+            return entry.id
+    return None
+
+
 __all__ = [
     "HotspotGateResult",
     "OUTCOME_HELD",
@@ -302,4 +333,5 @@ __all__ = [
     "open_hotspot_gate_for_session",
     "open_hotspot_gate_for_trusted_entry",
     "router_takes_hotspot_bindings",
+    "trusted_entry_for_session_device",
 ]

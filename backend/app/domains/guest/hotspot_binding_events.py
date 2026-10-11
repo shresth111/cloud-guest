@@ -97,8 +97,29 @@ async def request_trusted_device_hotspot_gate_open(
         )
 
 
+async def request_trusted_device_hotspot_gate_open_for_ended_session(
+    *, session_id: uuid.UUID | None, router_id: uuid.UUID | None
+) -> None:
+    """A session has ended; if its device is a Trusted Device, add the
+    bypass it could not be given while the session was live. Never raises."""
+    if session_id is None or router_id is None:
+        return
+    try:
+        from .tasks import enqueue_ended_session_trusted_gate_open  # noqa: PLC0415
+
+        await enqueue_ended_session_trusted_gate_open(
+            session_id=session_id, router_id=router_id
+        )
+    except Exception as exc:  # noqa: BLE001 -- see module docstring
+        logger.warning(
+            "guest_hotspot_gate_ended_session_request_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
 __all__ = [
     "request_hotspot_binding_reconcile",
     "request_hotspot_binding_reconcile_for_scope",
     "request_trusted_device_hotspot_gate_open",
+    "request_trusted_device_hotspot_gate_open_for_ended_session",
 ]
