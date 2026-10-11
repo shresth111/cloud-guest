@@ -44,6 +44,7 @@ bridge, call the plain task function directly" contract
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime
 
@@ -69,6 +70,7 @@ from .constants import (
     ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS,
     HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY,
     HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS,
+    HOTSPOT_GATE_NOT_BEFORE_KEY,
     OPEN_HOTSPOT_GATE_MAX_RETRIES,
     OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS,
     SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
@@ -76,6 +78,7 @@ from .constants import (
     SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
     TASK_ASSIGN_GUEST_QUEUE,
     TASK_OPEN_HOTSPOT_GATE,
+    TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE,
     TASK_RECONCILE_HOTSPOT_BINDINGS,
     TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE,
     TASK_RECONCILE_ROUTER_SESSION_PRESENCE,
@@ -86,7 +89,9 @@ from .constants import (
     TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
     TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
+    TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS,
 )
+from .hotspot_gate import OUTCOME_HELD, HotspotGateResult
 from .repository import GuestRepository
 from .service import (
     enforce_open_hours_online_guests,
@@ -621,6 +626,45 @@ def assign_guest_queue(
 # ============================================================================
 
 
+async def _hotspot_gate_hold_remaining(session_id: str) -> float:
+    """Seconds until this session's binding may be written -- ``0.0`` when
+    nothing asks it to wait.
+
+    ``enqueue_hotspot_gate_open`` records the instant; see
+    ``constants.HOTSPOT_GATE_NOT_BEFORE_KEY`` for why a countdown alone is
+    not enough. Read on a fresh client, closed inside this run's own event
+    loop, as ``_dispatch_session_presence_sweep_async`` does.
+
+    **Fails open.** A Redis that cannot be asked, or a value that is not a
+    number, is ``0.0``: the task then does exactly what it did before the
+    hold existed. Never more than the configured delay either, so a clock
+    that disagrees with the one that wrote the value cannot park a task."""
+    from app.core.config import get_settings
+    from app.database.redis import create_redis_client
+
+    delay = float(get_settings().guest_hotspot_gate_push_delay_seconds)
+    if delay <= 0:
+        return 0.0
+    try:
+        redis = create_redis_client()
+        try:
+            not_before = await redis.get(
+                HOTSPOT_GATE_NOT_BEFORE_KEY.format(session_id=session_id)
+            )
+        finally:
+            await redis.aclose()
+        if not_before is None:
+            return 0.0
+        remaining = float(not_before) - time.time()
+    except Exception as exc:  # noqa: BLE001 -- see docstring: fails open
+        logger.debug(
+            "guest_hotspot_gate_hold_unavailable",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return 0.0
+    return min(max(0.0, remaining), delay)
+
+
 async def _open_hotspot_gate_async(*, session_id: str, router_id: str):  # noqa: ANN202
     """One attempt, on a fresh ``AsyncSession``. Read-only against this
     platform's database -- the only write is the one on the router -- so
@@ -636,6 +680,12 @@ async def _open_hotspot_gate_async(*, session_id: str, router_id: str):  # noqa:
     from app.domains.router.service import RouterService
 
     from .hotspot_gate import open_hotspot_gate_for_session
+
+    # Before the database and before the router: a request after the one
+    # that started this task may have asked for more time.
+    hold_seconds = await _hotspot_gate_hold_remaining(session_id)
+    if hold_seconds > 0:
+        return HotspotGateResult(OUTCOME_HELD, hold_seconds=hold_seconds)
 
     async with SessionLocal() as session:
         organization_service = OrganizationService(OrganizationRepository(session))
@@ -669,7 +719,13 @@ def open_hotspot_gate(self, *, session_id: str, router_id: str) -> dict[str, obj
     Never raises past its retries. A router that cannot be reached is
     logged and given up on: the router's own one-minute poll adds the same
     binding, so the worst outcome here is exactly what happened before this
-    task existed."""
+    task existed.
+
+    ``held`` -- started before the session's "not before" instant -- is
+    published again as a new task for that instant rather than retried: a
+    retry would spend one of the few attempts kept for a session that is
+    not visible yet and a router that does not answer, on a run that has
+    touched neither."""
     extra: dict[str, object] = {
         "session_id": session_id,
         "router_id": router_id,
@@ -690,6 +746,27 @@ def open_hotspot_gate(self, *, session_id: str, router_id: str) -> dict[str, obj
         raise self.retry(
             exc=exc, countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS
         ) from exc
+    if result.outcome == OUTCOME_HELD:
+        try:
+            self.apply_async(
+                kwargs={"session_id": session_id, "router_id": router_id},
+                countdown=result.hold_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+            logger.warning(
+                "guest_task_open_hotspot_gate_hold_reschedule_failed",
+                extra={**extra, "error": str(exc)},
+            )
+        logger.info(
+            "guest_task_open_hotspot_gate_completed",
+            extra={
+                **extra,
+                "outcome": result.outcome,
+                "wrote": False,
+                "hold_seconds": round(result.hold_seconds, 3),
+            },
+        )
+        return {"session_id": session_id, "outcome": result.outcome}
     if result.retry and not last_attempt:
         raise self.retry(countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS)
     logger.info(
@@ -703,6 +780,167 @@ def open_hotspot_gate(self, *, session_id: str, router_id: str) -> dict[str, obj
         },
     )
     return {"session_id": session_id, "outcome": result.outcome}
+
+
+async def _open_trusted_device_gate_on_routers(
+    session: AsyncSession,
+    router_ids: list[uuid.UUID],
+    *,
+    entry_id: uuid.UUID,
+    mac_authorization_service: object,
+    router_lookup: object,
+    adapter: object | None = None,
+) -> dict[str, int]:
+    """One attempt at each router in turn, each isolated from the rest.
+    Only routers the sign-in push is switched on for are tried
+    (``hotspot_gate_push_applies`` -- the same two settings, so a router
+    that is not being pushed to at sign-in is not pushed to here either).
+
+    A router that does not answer is logged and counted, and not tried
+    again: its own poll adds the binding within the minute, and a retry of
+    the whole task would reconnect to every router that did answer.
+    ``not_listed`` counts routers where the entry was not among the active
+    ones -- the one thing the task does look at again."""
+    from app.core.config import get_settings
+
+    from .hotspot_gate import open_hotspot_gate_for_trusted_entry
+
+    settings = get_settings()
+    totals = {"routers": 0, "wrote": 0, "failed": 0, "not_listed": 0}
+    for router_id in router_ids:
+        if not hotspot_gate_push_applies(
+            router_id,
+            enabled=settings.guest_hotspot_gate_push_enabled,
+            router_ids=settings.guest_hotspot_gate_push_router_ids,
+        ):
+            continue
+        totals["routers"] += 1
+        extra: dict[str, object] = {
+            "entry_id": str(entry_id),
+            "router_id": str(router_id),
+        }
+        try:
+            result = await open_hotspot_gate_for_trusted_entry(
+                entry_id=entry_id,
+                router_id=router_id,
+                mac_authorization_service=mac_authorization_service,  # type: ignore[arg-type]
+                router_lookup=router_lookup,  # type: ignore[arg-type]
+                adapter=adapter,  # type: ignore[arg-type]
+            )
+        except Exception as exc:  # noqa: BLE001 -- per-router isolation
+            totals["failed"] += 1
+            logger.warning(
+                "guest_hotspot_gate_trusted_device_failed",
+                extra={**extra, "error": str(exc)},
+            )
+            # A failed statement leaves the transaction unusable for the
+            # next router; this run only reads, so there is nothing to lose.
+            await session.rollback()
+            continue
+        totals["wrote"] += int(result.wrote)
+        totals["not_listed"] += int(result.retry)
+        logger.info(
+            "guest_hotspot_gate_trusted_device_completed",
+            extra={
+                **extra,
+                "outcome": result.outcome,
+                "wrote": result.wrote,
+                "host_state": result.host_state,
+                "existing_bindings": list(result.existing_bindings),
+            },
+        )
+    return totals
+
+
+async def _open_hotspot_gate_for_trusted_device_async(
+    *, entry_id: str, organization_id: str, location_id: str | None
+) -> dict[str, int]:
+    """Read-only against this platform's database, like
+    ``_open_hotspot_gate_async``. The ``MacAuthorizationService`` is built
+    with a ``router_lookup`` for the reason
+    ``_build_hotspot_binding_reconcile_kwargs`` gives: without one,
+    ``list_active_entries_for_router`` answers "no trusted devices"."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    async with SessionLocal() as session:
+        organization_service = OrganizationService(OrganizationRepository(session))
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+        )
+        router_service = RouterService(
+            RouterRepository(session), location_service, organization_service
+        )
+        # The routers an entry scoped this way applies at -- the same query
+        # the removal uses for a deleted one. Agent-managed-only by
+        # construction; each is asked again, by the entry, before a write.
+        routers = await RouterRepository(session).list_routers_in_scope(
+            organization_id=uuid.UUID(organization_id),
+            location_id=uuid.UUID(location_id) if location_id else None,
+        )
+        return await _open_trusted_device_gate_on_routers(
+            session,
+            [router.id for router in routers],
+            entry_id=uuid.UUID(entry_id),
+            mac_authorization_service=MacAuthorizationService(
+                MacAuthorizationRepository(session), router_lookup=router_service
+            ),
+            router_lookup=router_service,
+        )
+
+
+@celery_app.task(
+    name=TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE,
+    bind=True,
+    max_retries=OPEN_HOTSPOT_GATE_MAX_RETRIES,
+)
+def open_hotspot_gate_for_trusted_device(
+    self, *, entry_id: str, organization_id: str, location_id: str | None = None
+) -> dict[str, object]:
+    """Adds a just-trusted device's hotspot bypass on every router its
+    entry applies at. Enqueued by ``hotspot_binding_events
+    .request_trusted_device_hotspot_gate_open``; never Beat-scheduled.
+
+    Retried only while the entry is not yet among a router's active ones
+    (the request that saved it may not have committed) or the run itself
+    failed before reaching a router. Never raises past its retries: the
+    routers' own one-minute poll adds the same binding."""
+    extra: dict[str, object] = {
+        "entry_id": entry_id,
+        "organization_id": organization_id,
+        "location_id": location_id,
+        "attempt": self.request.retries + 1,
+    }
+    last_attempt = self.request.retries >= OPEN_HOTSPOT_GATE_MAX_RETRIES
+    try:
+        totals = run_celery_task(
+            _open_hotspot_gate_for_trusted_device_async(
+                entry_id=entry_id,
+                organization_id=organization_id,
+                location_id=location_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+        logger.warning(
+            "guest_task_open_hotspot_gate_for_trusted_device_failed",
+            extra={**extra, "error": str(exc), "gave_up": last_attempt},
+        )
+        if last_attempt:
+            return {"entry_id": entry_id, "outcome": "error"}
+        raise self.retry(
+            exc=exc, countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS
+        ) from exc
+    if totals["not_listed"] and not last_attempt:
+        raise self.retry(countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS)
+    logger.info(
+        "guest_task_open_hotspot_gate_for_trusted_device_completed",
+        extra={**extra, **totals},
+    )
+    return {"entry_id": entry_id, **totals}
 
 
 # ============================================================================
@@ -1163,6 +1401,12 @@ async def enqueue_hotspot_gate_open(
     all unless the push is switched on for this router (off by default --
     see ``hotspot_gate_push_applies`` and the settings' own note).
 
+    The same delay is first recorded as the session's "not before" instant
+    (``constants.HOTSPOT_GATE_NOT_BEFORE_KEY``), so that a task an earlier
+    request published for this session waits for this request's delay too.
+    If Redis cannot be told, the task is published all the same and runs on
+    its countdown alone, as it did before the instant existed.
+
     Same two properties as ``enqueue_guest_queue_assignment``: the broker
     publish runs in a thread so the event loop is never blocked on it, and
     it never raises -- a broker hiccup must not fail a login."""
@@ -1177,6 +1421,21 @@ async def enqueue_hotspot_gate_open(
         router_ids=settings.guest_hotspot_gate_push_router_ids,
     ):
         return
+    delay = float(settings.guest_hotspot_gate_push_delay_seconds)
+    if delay > 0:
+        try:
+            from app.database.redis import redis_client
+
+            await redis_client.set(
+                HOTSPOT_GATE_NOT_BEFORE_KEY.format(session_id=session_id),
+                repr(time.time() + delay),
+                ex=int(delay) + 1,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: publish anyway
+            logger.debug(
+                "guest_hotspot_gate_hold_unavailable",
+                extra={"session_id": str(session_id), "error": str(exc)},
+            )
 
     def _publish() -> None:
         open_hotspot_gate.apply_async(
@@ -1190,6 +1449,53 @@ async def enqueue_hotspot_gate_open(
         logger.warning(
             "guest_hotspot_gate_enqueue_failed",
             extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+def _hotspot_gate_push_is_on_anywhere(settings: object) -> bool:
+    return bool(settings.guest_hotspot_gate_push_enabled) or bool(  # type: ignore[attr-defined]
+        str(settings.guest_hotspot_gate_push_router_ids or "").strip()  # type: ignore[attr-defined]
+    )
+
+
+async def enqueue_trusted_device_hotspot_gate_open(
+    *,
+    entry_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+) -> None:
+    """Publishes ``open_hotspot_gate_for_trusted_device`` for one Trusted
+    Device entry and the scope it applies at, after
+    ``TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS``.
+
+    Which of the scope's routers the push is switched on for is decided in
+    the worker, router by router; here it is only checked that it is on
+    somewhere, so a deployment with it off publishes nothing. Never raises;
+    see ``hotspot_binding_events``."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not _hotspot_gate_push_is_on_anywhere(settings):
+        return
+
+    def _publish() -> None:
+        open_hotspot_gate_for_trusted_device.apply_async(
+            kwargs={
+                "entry_id": str(entry_id),
+                "organization_id": str(organization_id),
+                "location_id": str(location_id) if location_id else None,
+            },
+            countdown=TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_gate_trusted_device_enqueue_failed",
+            extra={"entry_id": str(entry_id), "error": str(exc)},
         )
 
 
@@ -1290,6 +1596,8 @@ __all__ = [
     "enqueue_guest_queue_assignment",
     "open_hotspot_gate",
     "enqueue_hotspot_gate_open",
+    "open_hotspot_gate_for_trusted_device",
+    "enqueue_trusted_device_hotspot_gate_open",
     "reconcile_hotspot_bindings",
     "reconcile_hotspot_bindings_for_scope",
     "run_hotspot_binding_reconcile_sweep",

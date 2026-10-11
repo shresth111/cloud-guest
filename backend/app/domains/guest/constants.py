@@ -688,6 +688,33 @@ OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS = 4
 # is, and an unreachable router should give it back quickly.
 HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS = 5
 
+# The instant before which a session's binding must not be written: every
+# request that (re-)enqueues the push for a session moves it to "now + the
+# configured delay". The delay exists so the guest's browser can log in to
+# the hotspot first, and a countdown alone only keeps that promise for the
+# request that started it -- a task enqueued at sign-in ran a fraction of a
+# second after a guest submitted the name the venue requires, found the
+# session admitted, and wrote the binding under the browser's own login
+# POST (measured: sign-in at T, name at T+3.6 s, binding at T+4.2 s; the
+# POST then reached a bypassed host and was answered "501"). The value is
+# epoch seconds; the key lives one second longer than the delay it records,
+# so one that is still there always means "not yet".
+HOTSPOT_GATE_NOT_BEFORE_KEY = "guest:hotspot-gate-not-before:{session_id}"
+
+# The same push for a device an admin has just marked Trusted -- see
+# ``hotspot_gate.open_hotspot_gate_for_trusted_entry``. Without it the
+# device waits for the router's next one-minute poll like a guest did, and
+# is shown the login page in the meantime.
+TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE = (
+    "app.domains.guest.tasks.open_hotspot_gate_for_trusted_device"
+)
+
+# Only long enough for the request that created or changed the entry to
+# commit. There is no browser login to wait for here: nobody has signed in.
+# An entry the worker cannot see yet is retried on the sign-in push's own
+# spacing (``OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS``).
+TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS = 1.0
+
 # ----------------------------------------------------------------------------
 # Taking a session bypass back off the router -- see
 # ``hotspot_binding_reconcile``'s module docstring.

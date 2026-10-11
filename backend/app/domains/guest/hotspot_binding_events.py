@@ -18,6 +18,13 @@ by default -- see ``app.core.config``). The periodic sweep
 (``tasks.run_hotspot_binding_reconcile_sweep``) is the net under every path
 that does not call this, and under time-based changes that have no event at
 all, such as a Trusted Device entry expiring.
+
+The opposite event has one call here too, with the same promise:
+``request_trusted_device_hotspot_gate_open``, for a Trusted Device entry
+that has just put a MAC *on* the list. It asks the worker to add that
+device's binding now (``hotspot_gate.open_hotspot_gate_for_trusted_entry``)
+instead of leaving it to each router's next one-minute poll, and publishes
+nothing unless the sign-in push is switched on.
 """
 
 from __future__ import annotations
@@ -64,7 +71,34 @@ async def request_hotspot_binding_reconcile_for_scope(
         )
 
 
+async def request_trusted_device_hotspot_gate_open(
+    *,
+    entry_id: uuid.UUID,
+    organization_id: uuid.UUID | None,
+    location_id: uuid.UUID | None,
+) -> None:
+    """Add one Trusted Device entry's bypass soon, on every router an
+    organization-wide (``location_id`` is ``None``) or one-location entry
+    applies at. Never raises."""
+    if organization_id is None:
+        return
+    try:
+        from .tasks import enqueue_trusted_device_hotspot_gate_open  # noqa: PLC0415
+
+        await enqueue_trusted_device_hotspot_gate_open(
+            entry_id=entry_id,
+            organization_id=organization_id,
+            location_id=location_id,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see module docstring
+        logger.warning(
+            "guest_hotspot_gate_trusted_device_request_failed",
+            extra={"entry_id": str(entry_id), "error": str(exc)},
+        )
+
+
 __all__ = [
     "request_hotspot_binding_reconcile",
     "request_hotspot_binding_reconcile_for_scope",
+    "request_trusted_device_hotspot_gate_open",
 ]

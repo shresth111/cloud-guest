@@ -50,6 +50,30 @@ See ``app.core.config`` for why, and for why the push waits a few seconds
 guest's browser may be about to log in to the hotspot itself, and a binding
 that lands first takes that login away from the hotspot.
 
+## Never ahead of the browser, whichever request asked last
+
+The delay is counted from the *latest* request that enqueued the push for
+a session, not from the one that happened to start a given task. A venue
+that requires a name enqueues twice -- at sign-in and when the name is
+given -- and the first task, which would have been refused a moment
+earlier, can otherwise run just after the name lands and write the binding
+while the browser's hotspot login is still in flight. Each enqueue records
+a "not before" instant for the session (``tasks.enqueue_hotspot_gate_open``)
+and a task that starts before it re-schedules itself for that instant and
+reports ``held`` without reading or writing anything on the router. If the
+instant cannot be read, the task carries on as if there were none.
+
+## A device an admin has just trusted
+
+``open_hotspot_gate_for_trusted_entry`` is the same write for the other
+half of the list: a Trusted Device entry that has just been created,
+enabled or given a different MAC. Same routers, same gateway call, and the
+same rule about *whether* -- the entry has to be one
+``MacAuthorizationService.list_active_entries_for_router`` returns for that
+router at the moment of the write, which is where the list itself gets its
+trusted MACs. Nothing waits on a browser there, so it goes as soon as the
+entry's own request has committed.
+
 ## What it must never do
 
 Fail or slow a login. Nothing here runs on the request path; a router that
@@ -76,6 +100,7 @@ from app.domains.router_agent.authorized_macs import (
     SessionGateReason,
     resolve_session_gate,
 )
+from app.domains.router_agent.validators import routeros_mac_address
 
 from .constants import HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS
 
@@ -88,12 +113,21 @@ _DEFAULT_API_PORT = 8728
 OUTCOME_ROUTER_NOT_FOUND = "router_not_found"
 OUTCOME_UNSUPPORTED_VENDOR = "unsupported_vendor"
 OUTCOME_NO_CREDENTIALS = "no_credentials"
+#: The task started before the session's "not before" instant and has
+#: re-scheduled itself; see the module docstring.
+OUTCOME_HELD = "held"
 
 
 class _RouterLookup(Protocol):
     async def get_router(self, router_id: uuid.UUID, **kwargs: Any) -> Any: ...
 
     def get_decrypted_api_secret(self, router: Any) -> str | None: ...
+
+
+class _TrustedEntryLookup(Protocol):
+    async def list_active_entries_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> Any: ...
 
 
 class _BypassBindingWriter(Protocol):
@@ -108,13 +142,15 @@ class HotspotGateResult:
     a binding was added and read back. ``retry`` is true only when the
     session was not among the router's ``ACTIVE`` sessions -- the one
     answer that can change within seconds, because the sign-in request that
-    enqueued this may not have committed yet."""
+    enqueued this may not have committed yet. ``hold_seconds`` is set only
+    with ``OUTCOME_HELD``: how long until the write is allowed."""
 
     outcome: str
     wrote: bool = False
     retry: bool = False
     host_state: str | None = None
     existing_bindings: tuple[str, ...] = ()
+    hold_seconds: float = 0.0
 
 
 def router_takes_hotspot_bindings(router: object) -> bool:
@@ -191,11 +227,79 @@ async def open_hotspot_gate_for_session(
     )
 
 
+async def open_hotspot_gate_for_trusted_entry(
+    *,
+    entry_id: uuid.UUID,
+    router_id: uuid.UUID,
+    mac_authorization_service: _TrustedEntryLookup,
+    router_lookup: _RouterLookup,
+    adapter: _BypassBindingWriter | None = None,
+) -> HotspotGateResult:
+    """One attempt, for one router, at the binding of a device an admin
+    marked Trusted. Raises only what the device raised, like
+    :func:`open_hotspot_gate_for_session`.
+
+    The entry is looked for in ``list_active_entries_for_router`` -- the
+    call ``list_authorized_macs`` takes its trusted MACs from -- so "applies
+    at this router, enabled, not expired, not deleted" cannot mean one thing
+    here and another on the list. An entry that call does not return is
+    ``not_listed`` whatever the reason, and worth one more look: the request
+    that created it may not have committed yet."""
+    try:
+        router = await router_lookup.get_router(router_id)
+    except CloudGuestError:
+        return HotspotGateResult(OUTCOME_ROUTER_NOT_FOUND)
+    if not router_takes_hotspot_bindings(router):
+        return HotspotGateResult(OUTCOME_UNSUPPORTED_VENDOR)
+
+    # Asked immediately before the write, in the worker: an entry disabled
+    # or deleted in the moment since it was saved must not get a binding.
+    entries = await mac_authorization_service.list_active_entries_for_router(
+        router_id, requesting_organization_id=None
+    )
+    entry = next((e for e in entries if e.id == entry_id), None)
+    if entry is None:
+        return HotspotGateResult(SessionGateReason.NOT_LISTED.value, retry=True)
+    # The list's own spelling, and its own rule for a value that is not one.
+    mac_address = routeros_mac_address(entry.mac_address)
+    if mac_address is None:
+        return HotspotGateResult(SessionGateReason.MALFORMED_MAC.value)
+
+    host = getattr(router, "management_ip_address", None) or getattr(
+        router, "public_ip_address", None
+    )
+    username = getattr(router, "api_username", None)
+    secret = router_lookup.get_decrypted_api_secret(router)
+    if not host or not username or not secret:
+        return HotspotGateResult(OUTCOME_NO_CREDENTIALS)
+
+    writer = adapter or get_adapter(DeviceVendor.MIKROTIK)
+    result = await writer.ensure_hotspot_bypass_binding(
+        DeviceCredentials(
+            vendor=DeviceVendor.MIKROTIK,
+            host=str(host),
+            username=username,
+            secret=secret,
+            port=getattr(router, "api_port", None) or _DEFAULT_API_PORT,
+            timeout_seconds=HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS,
+        ),
+        mac_address=mac_address,
+    )
+    return HotspotGateResult(
+        result.outcome,
+        wrote=bool(result.created),
+        host_state=result.host_state,
+        existing_bindings=tuple(result.existing_bindings),
+    )
+
+
 __all__ = [
     "HotspotGateResult",
+    "OUTCOME_HELD",
     "OUTCOME_NO_CREDENTIALS",
     "OUTCOME_ROUTER_NOT_FOUND",
     "OUTCOME_UNSUPPORTED_VENDOR",
     "open_hotspot_gate_for_session",
+    "open_hotspot_gate_for_trusted_entry",
     "router_takes_hotspot_bindings",
 ]
