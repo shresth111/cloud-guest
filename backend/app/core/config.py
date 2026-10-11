@@ -1956,7 +1956,12 @@ class Settings(BaseSettings):
     # host, and a bypassed host's post is no longer answered by the hotspot
     # at all; one that lands AFTER a successful post is skipped, because
     # the MAC is then a live hotspot session. The delay lets the browser go
-    # first. Zero is allowed and means "immediately".
+    # first. Zero is allowed and means "immediately". It is counted from
+    # the latest request that asked for the push for that session (sign-in,
+    # then the name screen where a venue has one), not from the first.
+    #
+    # The same two switches cover the push for a device an admin has just
+    # marked Trusted; that one has no browser to wait for and no delay.
     guest_hotspot_gate_push_enabled: bool = False
     guest_hotspot_gate_push_router_ids: str = ""
     guest_hotspot_gate_push_delay_seconds: float = Field(default=3.0, ge=0, le=30)

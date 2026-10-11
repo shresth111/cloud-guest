@@ -107,6 +107,29 @@ async def _request_binding_reconcile(
     )
 
 
+async def _request_binding_push(entry: MacAuthorizationEntry) -> None:
+    """Ask for this entry's bypass binding to be added now on every router
+    it applies at (see ``app.domains.guest.hotspot_gate``), rather than on
+    each router's next one-minute poll -- in that minute the device is
+    still shown the login page. Publishes nothing unless the sign-in push
+    is switched on, and never raises, like ``_request_binding_reconcile``
+    above. Whether the entry still authorizes its MAC is asked again in the
+    worker; the check here only avoids publishing for one that cannot."""
+    if not is_currently_valid(
+        is_enabled=entry.is_enabled, expires_at=entry.expires_at, now=datetime.now(UTC)
+    ):
+        return
+    from app.domains.guest.hotspot_binding_events import (  # noqa: PLC0415
+        request_trusted_device_hotspot_gate_open,
+    )
+
+    await request_trusted_device_hotspot_gate_open(
+        entry_id=entry.id,
+        organization_id=entry.organization_id,
+        location_id=entry.location_id,
+    )
+
+
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
@@ -184,7 +207,11 @@ class MacAuthorizationService:
         expires_at: datetime | None = None,
         comment: str | None = None,
         is_enabled: bool = True,
+        push_binding: bool = True,
     ) -> MacAuthorizationEntry:
+        """``push_binding`` is false only for a bulk import, which would
+        otherwise ask every router in scope once per imported row; those
+        devices are added by the routers' own poll, as before."""
         if requesting_organization_id is None:
             raise OrganizationRequiredError()
         normalized_mac = normalize_mac_address(mac_address)
@@ -220,6 +247,8 @@ class MacAuthorizationService:
             organization_id=requesting_organization_id,
             description=f"MAC authorization entry '{normalized_mac}' created",
         )
+        if push_binding:
+            await _request_binding_push(entry)
         return entry
 
     async def get_entry(
@@ -305,6 +334,12 @@ class MacAuthorizationService:
             )
 
         previous_location_id = entry.location_id
+        previous_mac_address = entry.mac_address
+        was_valid = is_currently_valid(
+            is_enabled=entry.is_enabled,
+            expires_at=entry.expires_at,
+            now=datetime.now(UTC),
+        )
         updated = await self.repository.update_entry(
             entry, {**fields, "updated_by": actor_user_id}
         )
@@ -321,6 +356,14 @@ class MacAuthorizationService:
                 else None
             ),
         )
+        # The other direction: enabling an entry, or changing its MAC or its
+        # location, puts a device on a router's list that was not there.
+        if (
+            not was_valid
+            or updated.mac_address != previous_mac_address
+            or updated.location_id != previous_location_id
+        ):
+            await _request_binding_push(updated)
         event = MacAuthorizationEntryUpdated(id=updated.id)
         logger.info("mac_authorization_entry_updated", extra=_event_extra(event))
         await self._audit(
@@ -388,6 +431,7 @@ class MacAuthorizationService:
                     expires_at=raw.get("expires_at"),
                     comment=raw.get("comment"),
                     is_enabled=bool(raw.get("is_enabled", True)),
+                    push_binding=False,
                 )
                 imported_ids.append(created.id)
             except (MacAuthorizationError, ValueError) as exc:
