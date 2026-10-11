@@ -7582,53 +7582,80 @@ class MikroTikAdapter:
     def _find_client_address_sync(
         self, creds: DeviceCredentials, mac: str
     ) -> str | None:
+        return self._list_client_addresses_sync(creds).get(mac)
+
+    async def list_client_addresses(self, creds: DeviceCredentials) -> dict[str, str]:
+        """``find_client_address`` for every device at once: canonical MAC
+        -> the address this router currently has for it, from one
+        connection and one read each of the hotspot hosts, the DHCP leases
+        and the ARP table, in that order of preference. A device the router
+        has no entry for is simply not a key. Read-only."""
+        return await asyncio.to_thread(self._list_client_addresses_sync, creds)
+
+    def _list_client_addresses_sync(self, creds: DeviceCredentials) -> dict[str, str]:
         api = self._connect_api(creds)
         try:
-            try:
-                hosts = [
-                    row
-                    for row in api.path("ip", "hotspot", "host")
-                    if _row_mac(dict(row)) == mac
-                ]
-            except LibRouterosError:
-                hosts = []
-            for row in hosts:
-                address = _safe_str(row.get("address")) or _safe_str(
-                    row.get("to-address")
-                )
-                if address:
-                    return address
-            try:
-                leases = [
-                    lease
-                    for lease in self._leases_for_mac(api.path(*_DHCP_LEASE_PATH), mac)
-                    if lease.address and not lease.disabled
-                ]
-            except LibRouterosError as exc:
-                raise MikroTikDeviceError(
-                    creds.host, f"find_client_address: {exc}"
-                ) from exc
-            leases.sort(key=lambda lease: lease.status != "bound")
-            if leases:
-                return leases[0].address
-            # Neither: a venue where something else hands out addresses and
-            # the hotspot is not in the path (the router still routes for
-            # the device, so it has resolved its MAC).
+            found: dict[str, str] = {}
+            # Lowest preference first, so each later source overwrites.
             try:
                 for row in api.path("ip", "arp"):
+                    mac = _row_mac(dict(row))
+                    address = _safe_str(row.get("address"))
                     if (
-                        _row_mac(dict(row)) == mac
+                        mac
+                        and address
                         and not _is_truthy(row.get("disabled"))
                         and not _is_truthy(row.get("invalid"))
                     ):
-                        address = _safe_str(row.get("address"))
-                        if address:
-                            return address
+                        found.setdefault(mac, address)
             except LibRouterosError:
-                return None
-            return None
+                pass
+            try:
+                leases = [
+                    lease
+                    for row in api.path(*_DHCP_LEASE_PATH)
+                    if (lease := _lease_from_row(row)) is not None
+                    and lease.address
+                    and not lease.disabled
+                ]
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"list_client_addresses: {exc}"
+                ) from exc
+            by_mac: dict[str, str] = {}
+            for lease in sorted(leases, key=lambda lease: lease.status != "bound"):
+                by_mac.setdefault(lease.mac_address, lease.address)
+            found.update(by_mac)
+            try:
+                hosts: dict[str, str] = {}
+                for row in api.path("ip", "hotspot", "host"):
+                    mac = _row_mac(dict(row))
+                    address = _safe_str(row.get("address")) or _safe_str(
+                        row.get("to-address")
+                    )
+                    if mac and address:
+                        hosts.setdefault(mac, address)
+                found.update(hosts)
+            except LibRouterosError:
+                pass
+            return found
         finally:
             api.close()
+
+    async def set_simple_queue_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        """Points an existing ``/queue simple`` entry at a different
+        address, leaving its rates as they are, and moves it back to the
+        top of the list (see ``create_simple_queue``). For a guest whose
+        lease changed mid-session: the row, its id and its counters stay."""
+        await asyncio.to_thread(
+            self._queue_update_sync,
+            creds,
+            ("queue", "simple"),
+            {".id": device_queue_id, "target": target},
+            "set_simple_queue_target",
+        )
 
     async def delete_simple_queue(
         self, creds: DeviceCredentials, *, device_queue_id: str

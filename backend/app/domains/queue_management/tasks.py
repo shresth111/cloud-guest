@@ -215,6 +215,42 @@ class GuestSessionsWithoutQueue:
         ]
 
 
+    @staticmethod
+    def device_macs_statement(session_ids: list[uuid.UUID]):  # noqa: ANN205
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
+        from app.domains.guest.models import (  # noqa: PLC0415
+            GuestDevice,
+            GuestSession,
+        )
+
+        return (
+            select(GuestSession.id, GuestDevice.mac_address)
+            .select_from(GuestSession)
+            .join(GuestDevice, GuestDevice.id == GuestSession.device_id)
+            .where(
+                GuestSession.id.in_(session_ids),
+                GuestSession.is_deleted.is_(False),
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            )
+        )
+
+    async def device_macs_for_active_sessions(  # noqa: ANN201
+        self, session_ids
+    ) -> dict[uuid.UUID, str]:
+        ids = list(session_ids)
+        found: dict[uuid.UUID, str] = {}
+        for start in range(0, len(ids), GuestSessionLiveness._CHUNK):
+            rows = await self._session.execute(
+                self.device_macs_statement(
+                    ids[start : start + GuestSessionLiveness._CHUNK]
+                )
+            )
+            found.update({row[0]: row[1] for row in rows.all() if row[1]})
+        return found
+
+
 def queue_backfill_applies(router_id: uuid.UUID, settings: object) -> bool:
     """Whether the backfill is switched on for ``router_id``: for every
     router (``guest_queue_backfill_enabled``), or for this one by name in
@@ -524,6 +560,8 @@ async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
         "skipped_unreachable": 0,
         "skipped_no_target": 0,
         "skipped_address_in_use": 0,
+        "retargeted": 0,
+        "retarget_failed": 0,
     }
     if not _queue_backfill_is_on_anywhere(settings):
         return result
@@ -573,6 +611,16 @@ async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
             # before and after it in this run is kept.
             unit_of_work=session.begin_nested,
         )
+        # The other way a live guest ends up unshaped: the queue is there,
+        # on an address the device no longer holds. Same switch, same cap,
+        # same per-row savepoint.
+        moved = await service.retarget_queues_for_moved_devices(
+            max_per_run=_queue_backfill_max_per_run(settings),
+            router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+            unit_of_work=session.begin_nested,
+        )
+        result["retargeted"] = moved["retargeted"]
+        result["retarget_failed"] = moved["failed"]
         await session.commit()
         return result
 

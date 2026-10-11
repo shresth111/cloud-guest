@@ -431,11 +431,22 @@ class FakeQueueDeviceAdapter:
     # that is not a key here is a device the router has never seen.
     client_addresses: dict[str, str] = field(default_factory=dict)
     resolve_calls: list[str] = field(default_factory=list)
+    list_address_calls: int = 0
+    retarget_calls: list[tuple[str, str]] = field(default_factory=list)
     _counter: int = 0
 
     async def resolve_client_address(self, credentials, *, mac_address) -> str | None:
         self.resolve_calls.append(mac_address)
         return self.client_addresses.get(mac_address)
+
+    async def list_client_addresses(self, credentials) -> dict[str, str]:
+        self.list_address_calls += 1
+        return dict(self.client_addresses)
+
+    async def retarget_simple_queue(
+        self, credentials, *, device_queue_id, target
+    ) -> None:
+        self.retarget_calls.append((device_queue_id, target))
 
     async def create_simple_queue(self, credentials, **kwargs) -> str:
         if self.create_should_fail:

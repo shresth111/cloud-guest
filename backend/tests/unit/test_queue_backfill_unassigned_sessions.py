@@ -76,6 +76,12 @@ class FakeSessionsWithoutQueue:
     h: Harness
     sessions: list[SessionWithoutQueue] = field(default_factory=list)
     asked: list[dict[str, object]] = field(default_factory=list)
+    # session id -> MAC, for ``device_macs_for_active_sessions``. Only
+    # sessions put here are "ACTIVE with a device on record".
+    macs: dict[uuid.UUID, str] = field(default_factory=dict)
+
+    async def device_macs_for_active_sessions(self, session_ids):
+        return {s: self.macs[s] for s in session_ids if s in self.macs}
 
     async def list_sessions_without_queue(
         self, *, started_before, location_id=None, limit
@@ -516,7 +522,11 @@ class TestTheSwitch:
         monkeypatch.setattr(queue_tasks, "get_settings", self._settings)
         monkeypatch.setattr(queue_tasks, "SessionLocal", _no_session)
 
-        assert await queue_tasks._backfill_unassigned_session_queues_async() == EMPTY
+        assert await queue_tasks._backfill_unassigned_session_queues_async() == {
+            **EMPTY,
+            "retargeted": 0,
+            "retarget_failed": 0,
+        }
 
 
 class TestTheWiringIsReal:

@@ -540,3 +540,276 @@ class TestReapplyIsSingleFlightPerLocation:
         source = inspect.getsource(queue_tasks._reapply_policy_assignments_async)
         assert "sorted(location_ids, key=str)" in source
         assert "unit_of_work=session.begin_nested" in source
+
+
+MAC_B = "F2:A8:84:00:00:D7"
+
+
+def _moved_harness():
+    h, lookup, liveness = _backfill_harness()
+    router = h.router_lookup.add(_make_router())
+    return h, lookup, router
+
+
+async def _applied_row(h, lookup, router, *, address, queue_id, mac=MAC):
+    session_id = uuid.uuid4()
+    if mac is not None:
+        lookup.macs[session_id] = mac
+    return _seed_assignment(
+        h,
+        router=router,
+        target_id=session_id,
+        device_target=address,
+        queue_profile_id=(await _profile(h, 20480)).id,
+        device_queue_id=queue_id,
+        created_at=_now() - timedelta(minutes=12),
+    )
+
+
+RETARGET_EMPTY = {
+    "retargeted": 0,
+    "failed": 0,
+    "skipped_unreachable": 0,
+    "skipped_absent": 0,
+    "skipped_address_in_use": 0,
+    "unchanged": 0,
+}
+
+
+class TestAQueueFollowsItsDeviceToANewAddress:
+    """Observed live: a device signed in on ``.254`` and got its queue
+    there; twelve minutes later the router had the same MAC on ``.253``
+    carrying the traffic, and the queue on ``.254`` idle."""
+
+    async def test_a_changed_address_is_retargeted_once_and_then_left_alone(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        h, lookup, router = _moved_harness()
+        row = await _applied_row(
+            h, lookup, router, address="10.5.50.254", queue_id="*5"
+        )
+        h.device_adapter.client_addresses[MAC] = "10.5.50.253"
+
+        with caplog.at_level("INFO"):
+            first = await h.service.retarget_queues_for_moved_devices()
+        second = await h.service.retarget_queues_for_moved_devices()
+
+        assert first == {**RETARGET_EMPTY, "retargeted": 1}
+        assert second == {**RETARGET_EMPTY, "unchanged": 1}
+        assert h.device_adapter.retarget_calls == [("*5", "10.5.50.253")]
+        assert row.device_target == "10.5.50.253"
+        assert row.device_queue_id == "*5"
+        assert row.status == QueueStatus.ACTIVE.value
+        # Never a second row, never a new device row, never a removal.
+        assert list(h.repository.assignments) == [row.id]
+        assert h.device_adapter.created_calls == []
+        assert h.device_adapter.removed_ids == []
+        (event,) = [r for r in caplog.records if r.msg == "queue_assignment_retargeted"]
+        assert event.old_address == "10.5.50.254"
+        assert event.new_address == "10.5.50.253"
+
+    async def test_an_unchanged_address_is_not_written(self) -> None:
+        h, lookup, router = _moved_harness()
+        row = await _applied_row(
+            h, lookup, router, address="10.5.50.254", queue_id="*5"
+        )
+        h.device_adapter.client_addresses[MAC.lower().replace(":", "-")] = "ignored"
+        h.device_adapter.client_addresses[MAC] = "10.5.50.254/32"
+
+        result = await h.service.retarget_queues_for_moved_devices()
+
+        assert result == {**RETARGET_EMPTY, "unchanged": 1}
+        assert h.device_adapter.retarget_calls == []
+        assert row.device_target == "10.5.50.254"
+
+    async def test_a_device_the_router_no_longer_has_is_untouched(self) -> None:
+        h, lookup, router = _moved_harness()
+        row = await _applied_row(
+            h, lookup, router, address="10.5.50.254", queue_id="*5"
+        )
+
+        result = await h.service.retarget_queues_for_moved_devices()
+
+        assert result == {**RETARGET_EMPTY, "skipped_absent": 1}
+        assert h.device_adapter.retarget_calls == []
+        assert row.device_target == "10.5.50.254"
+        assert row.status == QueueStatus.ACTIVE.value
+
+    async def test_two_devices_that_swapped_addresses_keep_their_own_queues(
+        self,
+    ) -> None:
+        h, lookup, router = _moved_harness()
+        a = await _applied_row(h, lookup, router, address="10.5.50.10", queue_id="*1")
+        b = await _applied_row(
+            h, lookup, router, address="10.5.50.11", queue_id="*2", mac=MAC_B
+        )
+        h.device_adapter.client_addresses[MAC] = "10.5.50.11"
+        h.device_adapter.client_addresses[MAC_B] = "10.5.50.10"
+
+        result = await h.service.retarget_queues_for_moved_devices()
+
+        assert result == {**RETARGET_EMPTY, "retargeted": 2}
+        assert sorted(h.device_adapter.retarget_calls) == [
+            ("*1", "10.5.50.11"),
+            ("*2", "10.5.50.10"),
+        ]
+        assert (a.device_target, a.device_queue_id) == ("10.5.50.11", "*1")
+        assert (b.device_target, b.device_queue_id) == ("10.5.50.10", "*2")
+        assert len(h.repository.assignments) == 2
+        assert h.device_adapter.removed_ids == []
+
+    async def test_an_address_another_row_still_holds_is_not_taken(self) -> None:
+        h, lookup, router = _moved_harness()
+        mover = await _applied_row(
+            h, lookup, router, address="10.5.50.10", queue_id="*1"
+        )
+        holder = await _applied_row(
+            h, lookup, router, address="10.5.50.11", queue_id="*2", mac=MAC_B
+        )
+        unknown = await _applied_row(
+            h, lookup, router, address="10.5.50.12", queue_id="*3", mac=None
+        )
+        h.device_adapter.client_addresses[MAC_B] = "10.5.50.11"
+
+        for wanted in ("10.5.50.11", "10.5.50.12"):
+            h.device_adapter.client_addresses[MAC] = wanted
+            result = await h.service.retarget_queues_for_moved_devices()
+            assert result == {
+                **RETARGET_EMPTY,
+                "skipped_address_in_use": 1,
+                "unchanged": 1,
+            }
+
+        assert h.device_adapter.retarget_calls == []
+        assert mover.device_target == "10.5.50.10"
+        assert holder.device_target == "10.5.50.11"
+        assert unknown.device_target == "10.5.50.12"
+
+    async def test_the_router_is_read_once_however_many_sessions_it_has(self) -> None:
+        h, lookup, router = _moved_harness()
+        for n in range(6):
+            mac = f"AA:BB:CC:00:00:{n:02X}"
+            await _applied_row(
+                h,
+                lookup,
+                router,
+                address=f"10.5.50.{20 + n}",
+                queue_id=f"*{n}",
+                mac=mac,
+            )
+            h.device_adapter.client_addresses[mac] = f"10.5.50.{40 + n}"
+
+        result = await h.service.retarget_queues_for_moved_devices(max_per_run=4)
+
+        assert h.device_adapter.list_address_calls == 1
+        assert result == {**RETARGET_EMPTY, "retargeted": 4}
+        assert len(h.device_adapter.retarget_calls) == 4
+
+    async def test_a_router_that_cannot_be_read_is_skipped_whole(self) -> None:
+        class Down(FakeQueueDeviceAdapter):
+            async def list_client_addresses(self, credentials):
+                self.list_address_calls += 1
+                raise QueueDeviceConnectionError(credentials.host, "timed out")
+
+        h, lookup, _ = _backfill_harness(Down())
+        router = h.router_lookup.add(_make_router())
+        rows = [
+            await _applied_row(
+                h,
+                lookup,
+                router,
+                address=f"10.5.50.{n}",
+                queue_id=f"*{n}",
+                mac=f"AA:BB:CC:00:00:{n:02X}",
+            )
+            for n in (10, 11)
+        ]
+
+        result = await h.service.retarget_queues_for_moved_devices()
+
+        assert result == {**RETARGET_EMPTY, "skipped_unreachable": 2}
+        assert h.device_adapter.list_address_calls == 1
+        assert [r.device_target for r in rows] == ["10.5.50.10", "10.5.50.11"]
+
+    async def test_a_failed_device_write_leaves_the_record_as_it_was(self) -> None:
+        class Refuses(FakeQueueDeviceAdapter):
+            async def retarget_simple_queue(
+                self, credentials, *, device_queue_id, target
+            ) -> None:
+                raise QueueDeviceOperationError("retarget_simple_queue", "no such item")
+
+        h, lookup, _ = _backfill_harness(Refuses())
+        router = h.router_lookup.add(_make_router())
+        row = await _applied_row(
+            h, lookup, router, address="10.5.50.254", queue_id="*5"
+        )
+        h.device_adapter.client_addresses[MAC] = "10.5.50.253"
+
+        result = await h.service.retarget_queues_for_moved_devices(
+            unit_of_work=_savepoint(h)
+        )
+
+        assert result == {**RETARGET_EMPTY, "failed": 1}
+        assert row.device_target == "10.5.50.254"
+
+    async def test_it_holds_the_locations_reapply_lock_and_respects_the_allow_list(
+        self,
+    ) -> None:
+        h, lookup, router = _moved_harness()
+        other = h.router_lookup.add(_make_router())
+        await _applied_row(h, lookup, router, address="10.5.50.254", queue_id="*5")
+        elsewhere = await _applied_row(
+            h, lookup, other, address="10.5.50.254", queue_id="*6", mac=MAC_B
+        )
+        h.device_adapter.client_addresses[MAC] = "10.5.50.253"
+        h.device_adapter.client_addresses[MAC_B] = "10.5.50.252"
+
+        result = await h.service.retarget_queues_for_moved_devices(
+            router_allowed=lambda router_id: router_id == router.id
+        )
+
+        assert result == {**RETARGET_EMPTY, "retargeted": 1}
+        assert h.repository.location_reapply_locks == [router.location_id]
+        assert elsewhere.device_target == "10.5.50.254"
+
+    async def test_a_controller_run_venue_is_not_read(self) -> None:
+        from app.domains.router.vendor_capabilities import CONTROLLER_MANAGED_VENDORS
+
+        h, lookup, _ = _backfill_harness()
+        router = _make_router()
+        router.vendor = sorted(CONTROLLER_MANAGED_VENDORS)[0]
+        h.router_lookup.add(router)
+        await _applied_row(h, lookup, router, address=MAC, queue_id="x")
+
+        result = await h.service.retarget_queues_for_moved_devices()
+
+        assert result == RETARGET_EMPTY
+        assert h.device_adapter.list_address_calls == 0
+
+    def test_the_mac_query_reads_active_sessions_with_a_device(self) -> None:
+        ids = [uuid.uuid4()]
+        compiled = queue_tasks.GuestSessionsWithoutQueue.device_macs_statement(
+            ids
+        ).compile()
+        sql = " ".join(str(compiled).split())
+
+        assert "SELECT guest_sessions.id, guest_devices.mac_address" in sql
+        assert (
+            "FROM guest_sessions JOIN guest_devices "
+            "ON guest_devices.id = guest_sessions.device_id" in sql
+        )
+        assert "guest_sessions.is_deleted IS false" in sql
+        assert "active" in compiled.params.values()
+
+    def test_the_sweep_runs_it_after_the_backfill_under_the_same_switch(self) -> None:
+        import inspect
+
+        source = inspect.getsource(
+            queue_tasks._backfill_unassigned_session_queues_async
+        )
+        assert source.index("backfill_queues_for_unassigned_sessions") < source.index(
+            "retarget_queues_for_moved_devices"
+        )
+        assert source.index("_queue_backfill_is_on_anywhere") < source.index(
+            "SessionLocal()"
+        )

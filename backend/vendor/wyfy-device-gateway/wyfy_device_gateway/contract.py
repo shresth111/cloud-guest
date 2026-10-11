@@ -1997,6 +1997,19 @@ class DeviceGatewayAdapter(Protocol):
         such client. Read-only."""
         ...
 
+    async def list_client_addresses(self, creds: DeviceCredentials) -> dict[str, str]:
+        """Canonical MAC -> current address for every client the device
+        knows, by the same sources and preference as
+        ``find_client_address``, in one connection. Read-only."""
+        ...
+
+    async def set_simple_queue_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        """Re-points an existing ``/queue simple`` entry at ``target``
+        without touching its rates."""
+        ...
+
     async def delete_simple_queue(
         self, creds: DeviceCredentials, *, device_queue_id: str
     ) -> None:

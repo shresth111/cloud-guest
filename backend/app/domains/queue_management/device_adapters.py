@@ -137,6 +137,20 @@ class BaseQueueAdapter(Protocol):
         MAC, or ``None`` if it knows no such client. Read-only."""
         ...
 
+    async def list_client_addresses(
+        self, credentials: QueueCredentials
+    ) -> dict[str, str]:
+        """Canonical MAC -> current address for every client the device
+        knows, in one connection. Read-only."""
+        ...
+
+    async def retarget_simple_queue(
+        self, credentials: QueueCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        """Re-points an existing ``/queue simple`` entry at ``target``
+        without touching its rates."""
+        ...
+
     async def delete_simple_queue(
         self, credentials: QueueCredentials, *, device_queue_id: str
     ) -> None:
@@ -312,6 +326,34 @@ class MikroTikQueueAdapter:
         except MikroTikDeviceError as exc:
             raise QueueDeviceOperationError(
                 "resolve_client_address", exc.detail
+            ) from exc
+
+    async def list_client_addresses(
+        self, credentials: QueueCredentials
+    ) -> dict[str, str]:
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).list_client_addresses(creds)
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError(
+                "list_client_addresses", exc.detail
+            ) from exc
+
+    async def retarget_simple_queue(
+        self, credentials: QueueCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).set_simple_queue_target(
+                creds, device_queue_id=device_queue_id, target=target
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError(
+                "retarget_simple_queue", exc.detail
             ) from exc
 
     async def delete_simple_queue(

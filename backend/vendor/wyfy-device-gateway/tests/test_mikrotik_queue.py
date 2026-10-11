@@ -601,3 +601,52 @@ async def test_a_venue_wide_row_is_not_raised_above_the_guests_own_rows(
 
     assert api.command_calls == []
     assert [r[".id"] for r in api._menus[_SIMPLE]] == ["*7", "*A"]
+
+
+@pytest.mark.asyncio
+async def test_list_client_addresses_reads_each_table_once_and_prefers_the_host(
+    patch_connect, mikrotik_creds
+):
+    other = "F2:A8:84:00:00:D7"
+    arp_only = "AA:BB:CC:00:00:01"
+    api = FakeRouterOSApi(
+        menus={
+            _HOSTS: [{".id": "*1", "mac-address": _MAC, "address": "10.5.50.253", "to-address": "10.5.50.253"}],
+            _LEASES: [
+                {".id": "*1", "mac-address": _MAC, "address": "10.5.50.254", "status": "waiting"},
+                {".id": "*2", "mac-address": other, "address": "10.5.50.20", "status": "bound"},
+            ],
+            ("ip", "arp"): [
+                {".id": "*1", "mac-address": other, "address": "10.5.50.99"},
+                {".id": "*2", "mac-address": arp_only, "address": "10.5.50.30"},
+            ],
+        }
+    )
+    patch_connect(api)
+
+    found = await MikroTikAdapter().list_client_addresses(mikrotik_creds)
+
+    assert found == {_MAC: "10.5.50.253", other: "10.5.50.20", arp_only: "10.5.50.30"}
+    assert api.closed is True
+    assert api.add_calls == api.update_calls == api.remove_calls == []
+
+
+@pytest.mark.asyncio
+async def test_set_simple_queue_target_repoints_the_row_and_keeps_its_rates(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(command_handlers={"/queue/simple/move": _move})
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    device_id = await _create(adapter, mikrotik_creds, address="10.5.50.254")
+    api._menus[_SIMPLE].insert(0, _dynamic_row("*9", "10.5.50.253"))
+
+    await adapter.set_simple_queue_target(
+        mikrotik_creds, device_queue_id=device_id, target="10.5.50.253"
+    )
+
+    rows = api._menus[_SIMPLE]
+    assert [r[".id"] for r in rows] == [device_id, "*9"]
+    assert rows[0]["target"] == "10.5.50.253"
+    assert rows[0]["max-limit"] == "20480k/20480k"
+    assert api.update_calls[-1] == (_SIMPLE, {".id": device_id, "target": "10.5.50.253"})

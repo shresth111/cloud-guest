@@ -251,6 +251,16 @@ class SessionsWithoutQueueLookupProtocol(Protocol):
         limit: int,
     ) -> list[SessionWithoutQueue]: ...
 
+    async def device_macs_for_active_sessions(
+        self, session_ids: Collection[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        """Session id -> the MAC of the device it signed in from, for those
+        of ``session_ids`` that are ACTIVE and recorded a device. An id
+        missing from the result is a session that has ended, is paused, or
+        has no device on record -- none of which
+        ``retarget_queues_for_moved_devices`` should touch."""
+        ...
+
 
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
@@ -2124,6 +2134,233 @@ class QueueManagementService:
                 )
         return result
 
+    async def retarget_queues_for_moved_devices(
+        self,
+        *,
+        max_per_run: int = BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+        router_allowed: Callable[[uuid.UUID], bool] | None = None,
+        unit_of_work: Callable[[], AbstractAsyncContextManager[Any]] | None = None,
+    ) -> dict[str, int]:
+        """Re-point a live session's queue when its device's address has
+        changed since the queue was written.
+
+        ## Why this exists
+
+        A ``/queue simple`` names one address, and a guest does not keep
+        one for the length of a session. Observed live: a device signed in
+        on one address and was correctly given a queue on it; twelve
+        minutes later the router had the same MAC, bound and bypassed, on a
+        different address, carrying a few hundred megabytes, while the
+        queue on the old address had carried a few kilobytes. The
+        assignment still read ACTIVE. Asking the router for the address at
+        sign-in is right at sign-in and says nothing about the next lease.
+
+        ## What it does
+
+        For each router this platform logs in to it reads, **once**, the
+        address the router has for every device (hotspot host, then DHCP
+        lease, then ARP), and compares that with the address each ACTIVE
+        SESSION assignment on that router names, by the session's device
+        MAC. Where they differ it re-points the *existing* device row
+        (``retarget_simple_queue`` -- same row, same id, same rates) and
+        records the new address on the *existing* assignment. It never
+        creates a row and never retires one.
+
+        * A device the router has no entry for is left alone: it is off
+          the network, and its queue is the release sweep's business once
+          its session ends.
+        * A session with no device on record, or one that is no longer
+          ACTIVE, is not looked at.
+        * Two devices that have swapped addresses each keep their own row;
+          both are re-pointed, neither is asked to give way to the other.
+        * An address already named by another session's row that is not
+          itself moving off it is not taken: that would put two rows on one
+          address. Counted as ``skipped_address_in_use`` and looked at
+          again next run, by when the release sweep has usually cleared
+          the row of a guest who has left.
+
+        It takes the per-location re-apply lock first, so it never
+        interleaves with a policy re-apply for the same location, and
+        re-reads each assignment after that before writing.
+
+        ## Failure
+
+        A router that cannot be read costs one connection attempt and all
+        of its rows wait for the next run. One row's failed write is undone
+        in its own ``unit_of_work`` and does not stop the rest.
+        ``max_per_run`` bounds device writes.
+
+        Returns ``{"retargeted", "failed", "skipped_unreachable",
+        "skipped_absent", "skipped_address_in_use", "unchanged"}``."""
+        result = {
+            "retargeted": 0,
+            "failed": 0,
+            "skipped_unreachable": 0,
+            "skipped_absent": 0,
+            "skipped_address_in_use": 0,
+            "unchanged": 0,
+        }
+        lookup = self.sessions_without_queue_lookup
+        if lookup is None or max_per_run <= 0:
+            return result
+        rows = [
+            row
+            for row in await self.repository.list_assignments_by_status(
+                status=QueueStatus.ACTIVE.value
+            )
+            if row.target_type == QueueTargetType.SESSION.value
+            and row.target_id is not None
+            and row.router_id is not None
+            and row.device_queue_id
+            and row.device_target
+            and not row.is_deleted
+            and (router_allowed is None or router_allowed(row.router_id))
+        ]
+        if not rows:
+            return result
+        macs = await lookup.device_macs_for_active_sessions(
+            {row.target_id for row in rows}
+        )
+        by_router: dict[uuid.UUID, list[QueueAssignment]] = {}
+        # Rows this cannot judge -- no device on record, or a session that
+        # is no longer ACTIVE and is waiting for the release sweep. They
+        # are not moved, and the address each names is not given away.
+        not_judged: dict[uuid.UUID, set[str]] = {}
+        for row in rows:
+            if _canonical_mac(macs.get(row.target_id)) is not None:
+                by_router.setdefault(row.router_id, []).append(row)
+            else:
+                not_judged.setdefault(row.router_id, set()).add(
+                    _plain_address(row.device_target)
+                )
+
+        writes = 0
+        for router_id in sorted(by_router, key=str):
+            if writes >= max_per_run:
+                break
+            router_rows = by_router[router_id]
+            try:
+                router = await self.router_lookup.get_router(
+                    router_id,
+                    requesting_organization_id=router_rows[0].organization_id,
+                )
+                if is_controller_managed(router):
+                    continue
+                adapter = self._get_device_adapter(router.vendor)
+                if not hasattr(adapter, "list_client_addresses"):
+                    continue
+                credentials = self._resolve_device_credentials(router)
+                for location_id in sorted(
+                    {r.location_id for r in router_rows if r.location_id}, key=str
+                ):
+                    await self.repository.acquire_location_reapply_lock(
+                        location_id=location_id
+                    )
+                addresses = await adapter.list_client_addresses(credentials)
+            except QueueDeviceConnectionError as exc:
+                result["skipped_unreachable"] += len(router_rows)
+                logger.warning(
+                    "queue_retarget_router_unreachable",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 -- per-router isolation
+                result["failed"] += len(router_rows)
+                logger.warning(
+                    "queue_retarget_router_failed",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                continue
+
+            # Where each row should point, from the one read above.
+            moves: list[tuple[QueueAssignment, str]] = []
+            staying: set[str] = set(not_judged.get(router_id, ()))
+            for row in router_rows:
+                current = await self.repository.get_assignment_by_id(row.id)
+                if current is None or current.status != QueueStatus.ACTIVE.value:
+                    continue
+                held = _plain_address(current.device_target)
+                wanted = addresses.get(_canonical_mac(macs.get(row.target_id)) or "")
+                if not wanted:
+                    result["skipped_absent"] += 1
+                    staying.add(held)
+                    continue
+                wanted = _plain_address(wanted)
+                if wanted == held:
+                    result["unchanged"] += 1
+                    staying.add(held)
+                    continue
+                if not _is_routeros_session_target(router, wanted):
+                    result["skipped_absent"] += 1
+                    staying.add(held)
+                    continue
+                moves.append((current, wanted))
+
+            claimed: set[str] = set()
+            for row, wanted in moves:
+                if writes >= max_per_run:
+                    break
+                if wanted in staying or wanted in claimed:
+                    result["skipped_address_in_use"] += 1
+                    continue
+                claimed.add(wanted)
+                old = _plain_address(row.device_target)
+                writes += 1
+                try:
+                    if unit_of_work is None:
+                        await self._retarget_one(adapter, credentials, row, wanted)
+                    else:
+                        async with unit_of_work():
+                            await self._retarget_one(adapter, credentials, row, wanted)
+                    result["retargeted"] += 1
+                    logger.info(
+                        "queue_assignment_retargeted",
+                        extra={
+                            "assignment_id": str(row.id),
+                            "session_id": str(row.target_id),
+                            "router_id": str(router_id),
+                            "old_address": old,
+                            "new_address": wanted,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 -- per-row isolation
+                    result["failed"] += 1
+                    logger.warning(
+                        "queue_retarget_failed",
+                        extra={
+                            "assignment_id": str(row.id),
+                            "router_id": str(router_id),
+                            "error": str(exc),
+                        },
+                    )
+        return result
+
+    async def _retarget_one(
+        self,
+        adapter: Any,
+        credentials: QueueCredentials,
+        row: QueueAssignment,
+        wanted: str,
+    ) -> None:
+        """The device first, then the record: a write that fails leaves the
+        assignment naming the address the device row still has."""
+        await adapter.retarget_simple_queue(
+            credentials, device_queue_id=row.device_queue_id, target=wanted
+        )
+        await self.repository.update_assignment(
+            row, {"device_target": wanted, "error_message": None}
+        )
+        await self._audit(
+            None,
+            AuditAction.QUEUE_APPLIED,
+            organization_id=row.organization_id,
+            entity_id=row.id,
+            description=(
+                f"Queue assignment {row.id} re-pointed: the device's address "
+                "changed"
+            ),
+        )
+
     async def _assign_queue_to_session(
         self, candidate: SessionWithoutQueue, device_target: str
     ) -> QueueAssignment:
@@ -2284,6 +2521,20 @@ class QueueManagementService:
             description=description,
             organization_id=organization_id,
         )
+
+
+def _plain_address(value: str | None) -> str:
+    """An address without the ``/32`` RouterOS prints after a single host."""
+    return (value or "").strip().removesuffix("/32")
+
+
+def _canonical_mac(value: str | None) -> str | None:
+    """``AA:BB:CC:DD:EE:FF`` for any spelling of a six-octet MAC, else
+    ``None`` -- the form the gateway keys ``list_client_addresses`` by."""
+    digits = "".join(ch for ch in (value or "") if ch.isalnum()).upper()
+    if len(digits) != 12 or any(ch not in "0123456789ABCDEF" for ch in digits):
+        return None
+    return ":".join(digits[i : i + 2] for i in range(0, 12, 2))
 
 
 def _device_says_row_is_gone(exc: Exception) -> bool:

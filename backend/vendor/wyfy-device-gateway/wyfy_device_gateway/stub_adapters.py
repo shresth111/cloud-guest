@@ -200,6 +200,14 @@ class _StubAdapter:
     ) -> str | None:
         raise self._not_implemented()
 
+    async def list_client_addresses(self, creds: DeviceCredentials) -> dict[str, str]:
+        raise self._not_implemented()
+
+    async def set_simple_queue_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        raise self._not_implemented()
+
     async def delete_simple_queue(
         self, creds: DeviceCredentials, *, device_queue_id: str
     ) -> None:
@@ -404,6 +412,8 @@ class _StubAdapter:
             "create_simple_queue": False,
             "update_simple_queue": False,
             "find_client_address": False,
+            "list_client_addresses": False,
+            "set_simple_queue_target": False,
             "delete_simple_queue": False,
             "create_queue_tree": False,
             "apply_pcq": False,
