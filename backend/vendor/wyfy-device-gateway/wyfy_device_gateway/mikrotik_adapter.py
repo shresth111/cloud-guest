@@ -7543,17 +7543,30 @@ class MikroTikAdapter:
         ``None`` when the router knows no such device.
 
         This is what a per-guest ``/queue simple`` has to target. The
-        address a guest's browser *says* it has is not evidence: a portal
-        URL carries it as a query parameter, and a bookmarked or copied URL
-        carries somebody else's, or yesterday's.
+        address a login *reports* is not evidence: it is a query parameter
+        on the portal URL, filled in by the hotspot's ``$(ip)``, and that is
+        a pool address rather than the device's own on a router whose
+        clients do not lease from the hotspot pool -- an honest guest on
+        such a router reports the wrong one. A copied URL carries somebody
+        else's.
 
         The hotspot host is asked first because it exists for every device
         the hotspot has seen, including one that is bypassed and one with a
         static address the DHCP server never leased. The ARP table is the
         last resort, for a venue where neither exists for a device the
-        router nevertheless routes for. Its ``to-address`` is
-        preferred over ``address``: where the hotspot is translating a
-        client's own address, ``to-address`` is the one the router routes.
+        router nevertheless routes for.
+
+        The host's ``address`` -- the device's own -- is preferred over its
+        ``to-address``. They are the same on a router whose clients lease
+        from the hotspot's own pool. Where they are not (clients leasing
+        from another subnet, so the hotspot hands each a pool address), the
+        pool address is what the hotspot's ``$(ip)`` gives the portal, and
+        it stops describing the device as soon as the device is bypassed:
+        observed live, a device holding one address signed in as a pool
+        address, was bypassed, and its queue on the pool address then
+        matched nothing. Which of the two a queue must name *while* a host
+        is still being translated has not been established on hardware.
+
         A router with no hotspot package is not an error; the lease is then
         the only source. Among several leases for one MAC a ``bound`` one
         wins.
@@ -7580,8 +7593,8 @@ class MikroTikAdapter:
             except LibRouterosError:
                 hosts = []
             for row in hosts:
-                address = _safe_str(row.get("to-address")) or _safe_str(
-                    row.get("address")
+                address = _safe_str(row.get("address")) or _safe_str(
+                    row.get("to-address")
                 )
                 if address:
                     return address

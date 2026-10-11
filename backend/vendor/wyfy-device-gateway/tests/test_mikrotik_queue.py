@@ -481,11 +481,30 @@ async def test_find_client_address_prefers_the_hotspot_host(patch_connect, mikro
 
 
 @pytest.mark.asyncio
-async def test_find_client_address_uses_the_translated_address_when_they_differ(
+async def test_find_client_address_is_the_devices_own_address_not_the_pool_one(
+    patch_connect, mikrotik_creds
+):
+    """Clients leasing from a subnet that is not the hotspot's pool: the
+    hotspot gives each a pool address (what ``$(ip)`` reports) for as long
+    as it is translating them. The device's own address is the one that
+    still describes it once it is bypassed."""
+    api = FakeRouterOSApi(
+        menus={_HOSTS: [{".id": "*1", "mac-address": _MAC, "address": "192.168.88.254", "to-address": "10.5.50.10"}]}
+    )
+    patch_connect(api)
+
+    assert (
+        await MikroTikAdapter().find_client_address(mikrotik_creds, mac_address=_MAC)
+        == "192.168.88.254"
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_client_address_uses_to_address_when_it_is_all_the_host_has(
     patch_connect, mikrotik_creds
 ):
     api = FakeRouterOSApi(
-        menus={_HOSTS: [{".id": "*1", "mac-address": _MAC, "address": "192.168.1.50", "to-address": "10.5.50.77"}]}
+        menus={_HOSTS: [{".id": "*1", "mac-address": _MAC, "to-address": "10.5.50.77"}]}
     )
     patch_connect(api)
 

@@ -1722,13 +1722,16 @@ class QueueManagementService:
         what a per-session ``/queue simple`` must target.
 
         A login records ``payload.ip_address or request.client.host``, and
-        the first of those is a query parameter on the portal URL. A guest
-        who reopens a URL from an earlier visit signs in claiming the
-        address they had then: observed live, a laptop holding one address
-        signed in claiming another, the queue was written against the
-        claimed one, the dashboard showed an active limit and the guest ran
-        unshaped. Anyone can do that deliberately. The claimed address is a
-        private one, so the LAN check alone does not catch it.
+        the first of those is a query parameter on the portal URL, filled
+        in by the hotspot's ``$(ip)``. On a router whose clients lease from
+        a subnet that is not the hotspot's own pool, that is a pool address
+        and not the device's: observed live, a laptop holding one address
+        signed in honestly, through the hotspot's own page, reporting
+        another; the queue was written against the reported one, the
+        dashboard showed an active limit and the guest ran unshaped. A
+        guest can also put any address there deliberately. Either way the
+        reported address is a private one, so the LAN check alone does not
+        catch it.
 
         So the router is asked, by MAC (hotspot host, then DHCP lease), and
         its answer replaces the claim. When it has no entry for the MAC
