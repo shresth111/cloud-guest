@@ -438,7 +438,7 @@ def _build_queue_management_service(session: AsyncSession):
         location_code_counter=LocationCodeCounterRepository(session),
     )
     router_service = RouterService(
-        RouterRepository(session), organization_service, location_service
+        RouterRepository(session), location_service, organization_service
     )
     return QueueManagementService(
         QueueManagementRepository(session),
@@ -510,7 +510,7 @@ def _build_session_terminator(session: AsyncSession, repository: GuestRepository
         location_code_counter=LocationCodeCounterRepository(session),
     )
     router_service = RouterService(
-        RouterRepository(session), organization_service, location_service
+        RouterRepository(session), location_service, organization_service
     )
     from app.domains.network_integration.client_hooks import (
         build_controller_session_terminator,
