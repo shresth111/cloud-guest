@@ -419,9 +419,10 @@ class QueueManagementRepository:
 
         One save in the venue's policy screen publishes several policies
         and so dispatches several re-applies for one location within a
-        second. Each walked the same assignments in its own transaction;
-        they took the per-target locks in whatever order they reached them
-        and one was chosen as the deadlock victim. Holding this for the
+        second. Each walked the same assignments in its own transaction,
+        and one of them failed a statement mid-run and aborted (the cause
+        was not captured; runs taking the per-target locks in different
+        orders is the likely one). Holding this for the
         whole of a location's re-apply makes the later ones wait, and by
         the time they read anything the first has committed -- so they find
         every assignment already at the published rate and write nothing.
