@@ -991,7 +991,23 @@ def ping_celery_workers(
     return celery_app.control.inspect(timeout=timeout).ping()
 
 
-from celery.signals import worker_ready  # noqa: E402
+from celery.signals import (  # noqa: E402
+    after_setup_logger,
+    after_setup_task_logger,
+    worker_ready,
+)
+
+from app.core.logging import append_extras_to_handlers  # noqa: E402
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _keep_structured_log_fields(logger=None, **_kwargs):  # noqa: ANN001
+    """Celery's handlers render ``%(message)s`` only, which dropped every
+    ``extra=`` field a task logged -- see
+    ``app.core.logging.ExtrasAppendingFormatter``."""
+    if logger is not None:
+        append_extras_to_handlers(logger)
 
 
 @worker_ready.connect
