@@ -76,6 +76,12 @@ class FakeSessionsWithoutQueue:
     h: Harness
     sessions: list[SessionWithoutQueue] = field(default_factory=list)
     asked: list[dict[str, object]] = field(default_factory=list)
+    # session id -> MAC, for ``device_macs_for_active_sessions``. Only
+    # sessions put here are "ACTIVE with a device on record".
+    macs: dict[uuid.UUID, str] = field(default_factory=dict)
+
+    async def device_macs_for_active_sessions(self, session_ids):
+        return {s: self.macs[s] for s in session_ids if s in self.macs}
 
     async def list_sessions_without_queue(
         self, *, started_before, location_id=None, limit
@@ -516,7 +522,11 @@ class TestTheSwitch:
         monkeypatch.setattr(queue_tasks, "get_settings", self._settings)
         monkeypatch.setattr(queue_tasks, "SessionLocal", _no_session)
 
-        assert await queue_tasks._backfill_unassigned_session_queues_async() == EMPTY
+        assert await queue_tasks._backfill_unassigned_session_queues_async() == {
+            **EMPTY,
+            "retargeted": 0,
+            "retarget_failed": 0,
+        }
 
 
 class TestTheWiringIsReal:
@@ -545,7 +555,11 @@ class TestTheWiringIsReal:
         ).compile()
         sql = " ".join(str(compiled).split())
 
-        assert "FROM guest_sessions" in sql
+        assert "guest_devices.mac_address" in sql
+        assert (
+            "FROM guest_sessions LEFT OUTER JOIN guest_devices "
+            "ON guest_devices.id = guest_sessions.device_id" in sql
+        )
         assert "guest_sessions.is_deleted IS false" in sql
         assert "guest_sessions.router_id IS NOT NULL" in sql
         assert "guest_sessions.started_at <=" in sql
@@ -565,7 +579,7 @@ class TestTheWiringIsReal:
     async def test_the_lookup_maps_rows_to_sessions(self) -> None:
         started = datetime(2026, 10, 11, 17, 31, tzinfo=UTC)
         ids = [uuid.uuid4() for _ in range(4)]
-        row = (*ids, "10.5.50.9", None, started)
+        row = (*ids, "10.5.50.9", None, started, "AA:BB:CC:DD:EE:01")
 
         class _Session:
             async def execute(self, statement):
@@ -583,6 +597,7 @@ class TestTheWiringIsReal:
             ip_address="10.5.50.9",
             guest_id=None,
             started_at=started,
+            device_mac="AA:BB:CC:DD:EE:01",
         )
 
 

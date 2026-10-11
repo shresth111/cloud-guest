@@ -64,6 +64,7 @@ from app.domains.organization.service import OrganizationService
 from app.domains.policy.repository import PolicyRepository
 from app.domains.policy.service import PolicyService
 from app.domains.queue_management.constants import QueueTargetType
+from app.domains.queue_management.exceptions import QueueTargetNotOnRouterError
 
 from .constants import (
     ASSIGN_GUEST_QUEUE_MAX_RETRIES,
@@ -538,6 +539,7 @@ async def _assign_guest_queue_async(
     session_id: str,
     device_target: str,
     guest_id: str | None,
+    device_mac: str | None = None,
 ) -> None:
     """The actual async work behind ``assign_guest_queue`` -- a fresh
     ``AsyncSession`` per task run, mirroring every other task in this
@@ -563,6 +565,7 @@ async def _assign_guest_queue_async(
                 target_id=uuid.UUID(session_id),
                 device_target=device_target,
                 guest_id=uuid.UUID(guest_id) if guest_id else None,
+                device_mac=device_mac,
             )
             await session.commit()
         except Exception:
@@ -584,6 +587,7 @@ def assign_guest_queue(
     session_id: str,
     device_target: str,
     guest_id: str | None = None,
+    device_mac: str | None = None,
 ) -> dict[str, object]:
     """Applies a guest session's policy-resolved bandwidth queue to the
     venue's router. Enqueued per login by
@@ -606,8 +610,19 @@ def assign_guest_queue(
                 session_id=session_id,
                 device_target=device_target,
                 guest_id=guest_id,
+                device_mac=device_mac,
             )
         )
+    except QueueTargetNotOnRouterError as exc:
+        # Not a failure a retry can fix thirty seconds from now, and not one
+        # to burn the retries on: the router is reachable and simply has no
+        # entry for this device yet. The session keeps no assignment and the
+        # periodic backfill assigns it once the device is on the network.
+        logger.warning(
+            "guest_task_assign_guest_queue_device_not_on_router",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return {"session_id": session_id, "assigned": False}
     except Exception as exc:
         logger.warning(
             "guest_task_assign_guest_queue_failed",
@@ -1417,6 +1432,7 @@ async def enqueue_guest_queue_assignment(
     session_id: uuid.UUID,
     device_target: str,
     guest_id: uuid.UUID | None,
+    device_mac: str | None = None,
 ) -> None:
     """The dispatcher ``GuestService`` is wired with -- publishes the task
     and returns, so the guest's login response no longer waits on a router.
@@ -1441,6 +1457,7 @@ async def enqueue_guest_queue_assignment(
             session_id=str(session_id),
             device_target=device_target,
             guest_id=str(guest_id) if guest_id else None,
+            device_mac=device_mac,
         )
 
     try:

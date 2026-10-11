@@ -17,6 +17,7 @@ from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
     "QueueTargetNotLanAddressError",
+    "QueueTargetNotOnRouterError",
     "QueueManagementError",
     "QueueProfileNotFoundError",
     "QueueScheduleNotFoundError",
@@ -225,6 +226,31 @@ class QueueTargetNotLanAddressError(QueueManagementError):
             "the venue's own network, so a queue against it would limit "
             "nobody. The guest needs to sign in through the venue's WiFi "
             "login page for the limit to apply.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class QueueTargetNotOnRouterError(QueueManagementError):
+    """A per-session speed limit was about to be written to a RouterOS
+    router that has no record of the guest's device.
+
+    The address a queue targets is taken from the router itself, by the
+    device's MAC -- its hotspot host entry, or its DHCP lease -- because
+    the address a login *claims* is whatever the portal URL carried. When
+    the router knows no device with that MAC there is no address to
+    target, and writing one against the claimed address is the failure
+    this replaces: a row that reads as an applied limit and matches
+    somebody else, or nobody.
+
+    Neither the MAC nor the address is in the message: this text is stored
+    and returned to API callers."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"No speed limit was written to router '{router_id}': the "
+            "router has no hotspot host or DHCP lease for this guest's "
+            "device, so there is no address a queue could target yet. It "
+            "is assigned once the device is seen on the venue's network.",
             status_code=status.HTTP_409_CONFLICT,
         )
 

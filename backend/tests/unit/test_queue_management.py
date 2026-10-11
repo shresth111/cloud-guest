@@ -134,6 +134,7 @@ class FakeQueueManagementRepository:
     # has no equivalent of (see repository._acquire_advisory_lock).
     assignment_target_locks: list[str] = field(default_factory=list)
     profile_rate_locks: list[str] = field(default_factory=list)
+    location_reapply_locks: list[uuid.UUID] = field(default_factory=list)
 
     async def create_profile(self, **fields: object) -> QueueProfile:
         profile = QueueProfile(**_base_fields(**fields))
@@ -318,6 +319,9 @@ class FakeQueueManagementRepository:
     ) -> None:
         self.profile_rate_locks.append(f"{download_rate_kbps}:{upload_rate_kbps}")
 
+    async def acquire_location_reapply_lock(self, *, location_id: uuid.UUID) -> None:
+        self.location_reapply_locks.append(location_id)
+
     async def get_active_assignment_for_target(
         self, *, target_type: str, target_id: uuid.UUID | None
     ) -> QueueAssignment | None:
@@ -423,7 +427,26 @@ class FakeQueueDeviceAdapter:
     updated_calls: list[dict[str, object]] = field(default_factory=list)
     removed_ids: list[str] = field(default_factory=list)
     create_should_fail: bool = False
+    # What the router "has" per MAC -- its hotspot host or DHCP lease. A MAC
+    # that is not a key here is a device the router has never seen.
+    client_addresses: dict[str, str] = field(default_factory=dict)
+    resolve_calls: list[str] = field(default_factory=list)
+    list_address_calls: int = 0
+    retarget_calls: list[tuple[str, str]] = field(default_factory=list)
     _counter: int = 0
+
+    async def resolve_client_address(self, credentials, *, mac_address) -> str | None:
+        self.resolve_calls.append(mac_address)
+        return self.client_addresses.get(mac_address)
+
+    async def list_client_addresses(self, credentials) -> dict[str, str]:
+        self.list_address_calls += 1
+        return dict(self.client_addresses)
+
+    async def retarget_simple_queue(
+        self, credentials, *, device_queue_id, target
+    ) -> None:
+        self.retarget_calls.append((device_queue_id, target))
 
     async def create_simple_queue(self, credentials, **kwargs) -> str:
         if self.create_should_fail:

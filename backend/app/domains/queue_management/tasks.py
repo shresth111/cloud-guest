@@ -128,9 +128,11 @@ class GuestSessionsWithoutQueue:
 
     One statement, no row loaded and none locked: seven columns of each
     ACTIVE session that has a router, started at or before the cutoff, and
-    has no SESSION assignment that is ACTIVE, SUSPENDED or DISABLED. A
-    PENDING assignment is not a queue (it never reached the device), so a
-    session holding only one of those is still returned."""
+    has no SESSION assignment that is ACTIVE, SUSPENDED or DISABLED, plus
+    the MAC of the session's device where it has one (the service asks the
+    router for that device's address rather than trusting the recorded
+    one). A PENDING assignment is not a queue (it never reached the
+    device), so a session holding only one of those is still returned."""
 
     def __init__(self, session) -> None:  # noqa: ANN001 -- AsyncSession
         self._session = session
@@ -142,7 +144,10 @@ class GuestSessionsWithoutQueue:
         from sqlalchemy import select  # noqa: PLC0415
 
         from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
-        from app.domains.guest.models import GuestSession  # noqa: PLC0415
+        from app.domains.guest.models import (  # noqa: PLC0415
+            GuestDevice,
+            GuestSession,
+        )
 
         from .constants import QueueStatus, QueueTargetType  # noqa: PLC0415
         from .models import QueueAssignment  # noqa: PLC0415
@@ -163,14 +168,19 @@ class GuestSessionsWithoutQueue:
             )
             .exists()
         )
-        statement = select(
-            GuestSession.id,
-            GuestSession.organization_id,
-            GuestSession.location_id,
-            GuestSession.router_id,
-            GuestSession.ip_address,
-            GuestSession.guest_id,
-            GuestSession.started_at,
+        statement = (
+            select(
+                GuestSession.id,
+                GuestSession.organization_id,
+                GuestSession.location_id,
+                GuestSession.router_id,
+                GuestSession.ip_address,
+                GuestSession.guest_id,
+                GuestSession.started_at,
+                GuestDevice.mac_address,
+            )
+            .select_from(GuestSession)
+            .outerjoin(GuestDevice, GuestDevice.id == GuestSession.device_id)
         ).where(
             GuestSession.status == GuestSessionStatus.ACTIVE.value,
             GuestSession.is_deleted.is_(False),
@@ -199,9 +209,46 @@ class GuestSessionsWithoutQueue:
                 ip_address=row[4],
                 guest_id=row[5],
                 started_at=row[6],
+                device_mac=row[7],
             )
             for row in rows.all()
         ]
+
+
+    @staticmethod
+    def device_macs_statement(session_ids: list[uuid.UUID]):  # noqa: ANN205
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
+        from app.domains.guest.models import (  # noqa: PLC0415
+            GuestDevice,
+            GuestSession,
+        )
+
+        return (
+            select(GuestSession.id, GuestDevice.mac_address)
+            .select_from(GuestSession)
+            .join(GuestDevice, GuestDevice.id == GuestSession.device_id)
+            .where(
+                GuestSession.id.in_(session_ids),
+                GuestSession.is_deleted.is_(False),
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            )
+        )
+
+    async def device_macs_for_active_sessions(  # noqa: ANN201
+        self, session_ids
+    ) -> dict[uuid.UUID, str]:
+        ids = list(session_ids)
+        found: dict[uuid.UUID, str] = {}
+        for start in range(0, len(ids), GuestSessionLiveness._CHUNK):
+            rows = await self._session.execute(
+                self.device_macs_statement(
+                    ids[start : start + GuestSessionLiveness._CHUNK]
+                )
+            )
+            found.update({row[0]: row[1] for row in rows.all() if row[1]})
+        return found
 
 
 def queue_backfill_applies(router_id: uuid.UUID, settings: object) -> bool:
@@ -312,10 +359,15 @@ async def _reapply_policy_assignments_async(
         total_failed = 0
         total_assigned = 0
         backfill_on = _queue_backfill_is_on_anywhere(settings)
-        for location_id in location_ids:
+        # Sorted, so two runs that cover the same locations take the
+        # per-location locks in the same order.
+        for location_id in sorted(location_ids, key=str):
             result = await service.reapply_active_sessions_for_location(
                 location_id=location_id,
                 requesting_organization_id=policy.organization_id,
+                # One assignment's failed statement is rolled back on its
+                # own instead of aborting the transaction the rest share.
+                unit_of_work=session.begin_nested,
             )
             total_reapplied += result["reapplied"]
             total_failed += result["failed"]
@@ -508,6 +560,8 @@ async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
         "skipped_unreachable": 0,
         "skipped_no_target": 0,
         "skipped_address_in_use": 0,
+        "retargeted": 0,
+        "retarget_failed": 0,
     }
     if not _queue_backfill_is_on_anywhere(settings):
         return result
@@ -557,6 +611,16 @@ async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
             # before and after it in this run is kept.
             unit_of_work=session.begin_nested,
         )
+        # The other way a live guest ends up unshaped: the queue is there,
+        # on an address the device no longer holds. Same switch, same cap,
+        # same per-row savepoint.
+        moved = await service.retarget_queues_for_moved_devices(
+            max_per_run=_queue_backfill_max_per_run(settings),
+            router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+            unit_of_work=session.begin_nested,
+        )
+        result["retargeted"] = moved["retargeted"]
+        result["retarget_failed"] = moved["failed"]
         await session.commit()
         return result
 
