@@ -68,6 +68,7 @@ from app.domains.queue_management.constants import QueueTargetType
 from .constants import (
     ASSIGN_GUEST_QUEUE_MAX_RETRIES,
     ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS,
+    ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS,
     HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY,
     HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS,
     HOTSPOT_GATE_NOT_BEFORE_KEY,
@@ -78,6 +79,7 @@ from .constants import (
     SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
     TASK_ASSIGN_GUEST_QUEUE,
     TASK_OPEN_HOTSPOT_GATE,
+    TASK_OPEN_HOTSPOT_GATE_FOR_ENDED_SESSION_DEVICE,
     TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE,
     TASK_RECONCILE_HOTSPOT_BINDINGS,
     TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE,
@@ -943,6 +945,79 @@ def open_hotspot_gate_for_trusted_device(
     return {"entry_id": entry_id, **totals}
 
 
+async def _open_hotspot_gate_for_ended_session_device_async(
+    *, session_id: str, router_id: str
+) -> dict[str, object]:
+    """Read-only against this platform's database. Finds the Trusted Device
+    entry for the ended session's device, if there is one, and puts it
+    through the same per-router write a just-trusted device gets."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    from .hotspot_gate import trusted_entry_for_session_device
+
+    async with SessionLocal() as session:
+        organization_service = OrganizationService(OrganizationRepository(session))
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+        )
+        router_service = RouterService(
+            RouterRepository(session), location_service, organization_service
+        )
+        mac_authorization_service = MacAuthorizationService(
+            MacAuthorizationRepository(session), router_lookup=router_service
+        )
+        entry_id = await trusted_entry_for_session_device(
+            session_id=uuid.UUID(session_id),
+            router_id=uuid.UUID(router_id),
+            guest_repository=GuestRepository(session),
+            mac_authorization_service=mac_authorization_service,
+        )
+        if entry_id is None:
+            return {"outcome": "not_trusted"}
+        totals = await _open_trusted_device_gate_on_routers(
+            session,
+            [uuid.UUID(router_id)],
+            entry_id=entry_id,
+            mac_authorization_service=mac_authorization_service,
+            router_lookup=router_service,
+        )
+        return {"entry_id": str(entry_id), **totals}
+
+
+@celery_app.task(name=TASK_OPEN_HOTSPOT_GATE_FOR_ENDED_SESSION_DEVICE)
+def open_hotspot_gate_for_ended_session_device(
+    *, session_id: str, router_id: str
+) -> dict[str, object]:
+    """Adds a Trusted Device's hotspot bypass once the session it was
+    signed in with has ended. Enqueued by ``hotspot_binding_events
+    .request_trusted_device_hotspot_gate_open_for_ended_session``; never
+    Beat-scheduled, never retried and never raises: the router's own
+    one-minute poll adds the same binding."""
+    extra: dict[str, object] = {"session_id": session_id, "router_id": router_id}
+    try:
+        result = run_celery_task(
+            _open_hotspot_gate_for_ended_session_device_async(
+                session_id=session_id, router_id=router_id
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+        logger.warning(
+            "guest_task_open_hotspot_gate_for_ended_session_device_failed",
+            extra={**extra, "error": str(exc)},
+        )
+        return {"session_id": session_id, "outcome": "error"}
+    logger.info(
+        "guest_task_open_hotspot_gate_for_ended_session_device_completed",
+        extra={**extra, **result},
+    )
+    return {"session_id": session_id, **result}
+
+
 # ============================================================================
 # Taking a session bypass back off the router -- see
 # ``hotspot_binding_reconcile``'s docstring
@@ -1499,6 +1574,41 @@ async def enqueue_trusted_device_hotspot_gate_open(
         )
 
 
+async def enqueue_ended_session_trusted_gate_open(
+    *, session_id: uuid.UUID, router_id: uuid.UUID
+) -> None:
+    """Publishes ``open_hotspot_gate_for_ended_session_device`` after
+    ``ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS`` -- and not at all unless
+    the sign-in push is switched on for that router. Whether the device is
+    a Trusted Device at all is worked out in the worker. Never raises; see
+    ``hotspot_binding_events``."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not hotspot_gate_push_applies(
+        router_id,
+        enabled=settings.guest_hotspot_gate_push_enabled,
+        router_ids=settings.guest_hotspot_gate_push_router_ids,
+    ):
+        return
+
+    def _publish() -> None:
+        open_hotspot_gate_for_ended_session_device.apply_async(
+            kwargs={"session_id": str(session_id), "router_id": str(router_id)},
+            countdown=ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_gate_ended_session_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
 async def enqueue_hotspot_binding_reconcile(*, router_id: uuid.UUID) -> None:
     """Publishes ``reconcile_hotspot_bindings`` for one router, after
     ``guest_hotspot_gate_remove_delay_seconds`` -- and not at all unless the
@@ -1597,7 +1707,9 @@ __all__ = [
     "open_hotspot_gate",
     "enqueue_hotspot_gate_open",
     "open_hotspot_gate_for_trusted_device",
+    "open_hotspot_gate_for_ended_session_device",
     "enqueue_trusted_device_hotspot_gate_open",
+    "enqueue_ended_session_trusted_gate_open",
     "reconcile_hotspot_bindings",
     "reconcile_hotspot_bindings_for_scope",
     "run_hotspot_binding_reconcile_sweep",

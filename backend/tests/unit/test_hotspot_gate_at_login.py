@@ -1368,3 +1368,97 @@ class TestTrustedEntryTriggers:
                     "organization_id": str(organization_id),
                     "location_id": None,
                 }
+
+
+# ---------------------------------------------------------------------------
+# A device marked Trusted while it was signed in: bound when the session ends
+# ---------------------------------------------------------------------------
+
+
+class TestEndedSessionTrustedDevice:
+    async def _lookup(self, fx: Fixture, service: MacAuthorizationService, session_id):
+        from app.domains.guest.hotspot_gate import trusted_entry_for_session_device
+
+        return await trusted_entry_for_session_device(
+            session_id=session_id,
+            router_id=fx.router.id,
+            guest_repository=fx.repository,
+            mac_authorization_service=service,
+        )
+
+    async def test_the_entry_for_the_sessions_device_is_found(self) -> None:
+        fx, _ = _fixture()
+        service = _trusted(fx)
+        result = await _login(fx, mac=TRUSTED_MAC.lower())
+        entry = await _trust(fx, service)
+        assert await self._lookup(fx, service, result.session.id) == entry.id
+
+    async def test_a_device_nobody_trusted_has_none(self) -> None:
+        fx, _ = _fixture()
+        service = _trusted(fx)
+        result = await _login(fx)
+        await _trust(fx, service)
+        assert await self._lookup(fx, service, result.session.id) is None
+
+    async def test_a_disabled_entry_is_not_one(self) -> None:
+        fx, _ = _fixture()
+        service = _trusted(fx)
+        result = await _login(fx, mac=TRUSTED_MAC)
+        await _trust(fx, service, is_enabled=False)
+        assert await self._lookup(fx, service, result.session.id) is None
+
+    async def test_an_unknown_session_has_none(self) -> None:
+        fx, _ = _fixture()
+        assert await self._lookup(fx, _trusted(fx), uuid.uuid4()) is None
+
+    async def _enqueue(self, settings: SimpleNamespace, **kwargs: Any):
+        ids = {"session_id": uuid.uuid4(), "router_id": uuid.uuid4()}
+        task = guest_tasks.open_hotspot_gate_for_ended_session_device
+        with (
+            patch("app.core.config.get_settings", return_value=settings),
+            patch.object(task, "apply_async", **kwargs) as publish,
+        ):
+            await guest_tasks.enqueue_ended_session_trusted_gate_open(**ids)
+        return ids, publish
+
+    async def test_publishes_when_the_push_is_on_for_the_router(self) -> None:
+        ids, publish = await self._enqueue(_settings())
+        publish.assert_called_once()
+        assert publish.call_args.kwargs["kwargs"] == {
+            "session_id": str(ids["session_id"]),
+            "router_id": str(ids["router_id"]),
+        }
+        assert publish.call_args.kwargs["countdown"] > 0
+
+    async def test_publishes_nothing_when_the_push_is_off(self) -> None:
+        _, publish = await self._enqueue(_settings(enabled=False))
+        publish.assert_not_called()
+
+    async def test_a_broker_failure_is_swallowed(self) -> None:
+        _, publish = await self._enqueue(
+            _settings(), side_effect=RuntimeError("broker down")
+        )
+        publish.assert_called_once()
+
+    def test_the_task_never_raises(self) -> None:
+        task = guest_tasks.open_hotspot_gate_for_ended_session_device
+        with patch.object(
+            guest_tasks, "run_celery_task", side_effect=RuntimeError("db down")
+        ):
+            out = task.run(session_id=str(uuid.uuid4()), router_id=str(uuid.uuid4()))
+        assert out["outcome"] == "error"
+
+    async def test_ending_a_session_asks_for_it(self) -> None:
+        fx, _ = _fixture()
+        result = await _login(fx)
+        with patch(
+            "app.domains.guest.service."
+            "request_trusted_device_hotspot_gate_open_for_ended_session"
+        ) as ask:
+            await fx.guest_service.disconnect_session(
+                session_id=result.session.id,
+                requesting_organization_id=fx.router.organization_id,
+            )
+        ask.assert_called_once_with(
+            session_id=result.session.id, router_id=fx.router.id
+        )

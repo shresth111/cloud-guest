@@ -715,6 +715,19 @@ TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE = (
 # spacing (``OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS``).
 TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS = 1.0
 
+# A device can be marked Trusted while it is signed in. The push above then
+# writes nothing -- the gateway will not put a bypass on a MAC with a live
+# hotspot session -- and when that session ends the device would wait for
+# the router's next one-minute poll. This task is asked for at session end
+# and adds the binding once the live session is gone.
+TASK_OPEN_HOTSPOT_GATE_FOR_ENDED_SESSION_DEVICE = (
+    "app.domains.guest.tasks.open_hotspot_gate_for_ended_session_device"
+)
+
+# Long enough for the request that ended the session to commit and for the
+# router to have dropped the live hotspot session it was asked to end.
+ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS = 4.0
+
 # ----------------------------------------------------------------------------
 # Taking a session bypass back off the router -- see
 # ``hotspot_binding_reconcile``'s module docstring.
