@@ -44,12 +44,14 @@ from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
 
 from .constants import (
+    BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+    TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES,
     TASK_REAPPLY_POLICY_ASSIGNMENTS,
     TASK_RELEASE_ENDED_SESSION_QUEUES,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from .repository import QueueManagementRepository
-from .service import QueueManagementService
+from .service import QueueManagementService, SessionWithoutQueue
 
 logger = get_logger(__name__)
 
@@ -116,6 +118,123 @@ class GuestSessionLiveness:
         return live
 
 
+class GuestSessionsWithoutQueue:
+    """``service.SessionsWithoutQueueLookupProtocol`` against the real
+    ``guest_sessions`` and ``queue_assignments`` tables.
+
+    Here, next to ``GuestSessionLiveness``, for the reason given there: the
+    guest domain already depends on this one, so this is the one place the
+    question can be asked the other way without a cycle.
+
+    One statement, no row loaded and none locked: seven columns of each
+    ACTIVE session that has a router, started at or before the cutoff, and
+    has no SESSION assignment that is ACTIVE, SUSPENDED or DISABLED. A
+    PENDING assignment is not a queue (it never reached the device), so a
+    session holding only one of those is still returned."""
+
+    def __init__(self, session) -> None:  # noqa: ANN001 -- AsyncSession
+        self._session = session
+
+    @staticmethod
+    def statement(  # noqa: ANN205
+        *, started_before, location_id: uuid.UUID | None, limit: int
+    ):
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
+        from app.domains.guest.models import GuestSession  # noqa: PLC0415
+
+        from .constants import QueueStatus, QueueTargetType  # noqa: PLC0415
+        from .models import QueueAssignment  # noqa: PLC0415
+
+        has_queue = (
+            select(QueueAssignment.id)
+            .where(
+                QueueAssignment.target_type == QueueTargetType.SESSION.value,
+                QueueAssignment.target_id == GuestSession.id,
+                QueueAssignment.is_deleted.is_(False),
+                QueueAssignment.status.in_(
+                    [
+                        QueueStatus.ACTIVE.value,
+                        QueueStatus.SUSPENDED.value,
+                        QueueStatus.DISABLED.value,
+                    ]
+                ),
+            )
+            .exists()
+        )
+        statement = select(
+            GuestSession.id,
+            GuestSession.organization_id,
+            GuestSession.location_id,
+            GuestSession.router_id,
+            GuestSession.ip_address,
+            GuestSession.guest_id,
+            GuestSession.started_at,
+        ).where(
+            GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            GuestSession.is_deleted.is_(False),
+            GuestSession.router_id.is_not(None),
+            GuestSession.started_at <= started_before,
+            ~has_queue,
+        )
+        if location_id is not None:
+            statement = statement.where(GuestSession.location_id == location_id)
+        return statement.order_by(GuestSession.started_at.desc()).limit(limit)
+
+    async def list_sessions_without_queue(
+        self, *, started_before, location_id: uuid.UUID | None = None, limit: int
+    ) -> list[SessionWithoutQueue]:
+        rows = await self._session.execute(
+            self.statement(
+                started_before=started_before, location_id=location_id, limit=limit
+            )
+        )
+        return [
+            SessionWithoutQueue(
+                session_id=row[0],
+                organization_id=row[1],
+                location_id=row[2],
+                router_id=row[3],
+                ip_address=row[4],
+                guest_id=row[5],
+                started_at=row[6],
+            )
+            for row in rows.all()
+        ]
+
+
+def queue_backfill_applies(router_id: uuid.UUID, settings: object) -> bool:
+    """Whether the backfill is switched on for ``router_id``: for every
+    router (``guest_queue_backfill_enabled``), or for this one by name in
+    the comma-separated ``guest_queue_backfill_router_ids`` allow-list. The
+    same two-setting rule as the hotspot gate's, on its own pair of
+    settings. An entry that is not a UUID matches nothing."""
+    if bool(settings.guest_queue_backfill_enabled):  # type: ignore[attr-defined]
+        return True
+    wanted = {
+        part.strip().lower()
+        for part in str(settings.guest_queue_backfill_router_ids or "").split(",")  # type: ignore[attr-defined]
+    }
+    return str(router_id).lower() in wanted
+
+
+def _queue_backfill_is_on_anywhere(settings: object) -> bool:
+    return bool(settings.guest_queue_backfill_enabled) or bool(  # type: ignore[attr-defined]
+        str(settings.guest_queue_backfill_router_ids or "").strip()  # type: ignore[attr-defined]
+    )
+
+
+def _queue_backfill_max_per_run(settings: object) -> int:
+    return int(
+        getattr(
+            settings,
+            "guest_queue_backfill_max_per_run",
+            BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+        )
+    )
+
+
 async def _reapply_policy_assignments_async(
     policy_id: str, version_id: str
 ) -> dict[str, int]:
@@ -171,11 +290,14 @@ async def _reapply_policy_assignments_async(
             # So a publish is not re-applied to guests who have left -- see
             # ``reapply_active_sessions_for_location``.
             session_liveness_lookup=GuestSessionLiveness(session),
+            # So a publish also reaches a live guest who has no queue at
+            # all -- see the backfill call below.
+            sessions_without_queue_lookup=GuestSessionsWithoutQueue(session),
         )
         policy_repository = PolicyRepository(session)
         policy = await policy_repository.get_policy_by_id(uuid.UUID(policy_id))
         if policy is None:
-            return {"reapplied": 0, "failed": 0, "locations": 0}
+            return {"reapplied": 0, "failed": 0, "locations": 0, "assigned": 0}
         assignments = await policy_repository.list_assignments_for_policy(
             uuid.UUID(policy_id)
         )
@@ -188,6 +310,8 @@ async def _reapply_policy_assignments_async(
         }
         total_reapplied = 0
         total_failed = 0
+        total_assigned = 0
+        backfill_on = _queue_backfill_is_on_anywhere(settings)
         for location_id in location_ids:
             result = await service.reapply_active_sessions_for_location(
                 location_id=location_id,
@@ -195,11 +319,26 @@ async def _reapply_policy_assignments_async(
             )
             total_reapplied += result["reapplied"]
             total_failed += result["failed"]
+            # The re-apply above walks existing assignments, so a live guest
+            # whose login never got a queue onto the router is not in it.
+            # The venue has just saved a speed; this is the moment they
+            # expect it to reach everybody who is online. Same switch and
+            # same rules as the periodic backfill, narrowed to this location.
+            if backfill_on:
+                backfilled = await service.backfill_queues_for_unassigned_sessions(
+                    location_id=location_id,
+                    max_per_run=_queue_backfill_max_per_run(settings),
+                    router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+                    unit_of_work=session.begin_nested,
+                )
+                total_assigned += backfilled["assigned"]
+                total_failed += backfilled["failed"]
         await session.commit()
         return {
             "reapplied": total_reapplied,
             "failed": total_failed,
             "locations": len(location_ids),
+            "assigned": total_assigned,
         }
 
 
@@ -356,8 +495,93 @@ def release_ended_session_queues() -> dict[str, int]:
     return result
 
 
+async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
+    """The actual async work behind ``backfill_unassigned_session_queues``
+    -- a fresh session per run, composed exactly as
+    ``_release_ended_session_queues_async`` composes it, plus the lookup
+    this sweep cannot work without. Opens nothing at all while the backfill
+    is switched off everywhere."""
+    settings = get_settings()
+    result = {
+        "assigned": 0,
+        "failed": 0,
+        "skipped_unreachable": 0,
+        "skipped_no_target": 0,
+        "skipped_address_in_use": 0,
+    }
+    if not _queue_backfill_is_on_anywhere(settings):
+        return result
+
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
+    async with SessionLocal() as session:
+        audit_repository = RBACRepository(session)
+        organization_service = OrganizationService(
+            OrganizationRepository(session), audit_writer=audit_repository
+        )
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+            audit_writer=audit_repository,
+        )
+        router_service = RouterService(
+            RouterRepository(session),
+            location_service,
+            organization_service,
+            audit_writer=audit_repository,
+            provisioning_token_ttl_hours=settings.router_provisioning_token_expire_hours,
+        )
+        policy_service = PolicyService(
+            PolicyRepository(session),
+            organization_service,
+            location_service,
+            audit_writer=audit_repository,
+        )
+        service = QueueManagementService(
+            QueueManagementRepository(session),
+            router_service,
+            policy_service,
+            audit_writer=audit_repository,
+            controller_speed_hook=build_controller_speed_hook(session),
+            session_liveness_lookup=GuestSessionLiveness(session),
+            sessions_without_queue_lookup=GuestSessionsWithoutQueue(session),
+        )
+        result = await service.backfill_queues_for_unassigned_sessions(
+            max_per_run=_queue_backfill_max_per_run(settings),
+            router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+            # One session's failed attempt is undone on its own, as the
+            # login task's rollback undoes it; everything that succeeded
+            # before and after it in this run is kept.
+            unit_of_work=session.begin_nested,
+        )
+        await session.commit()
+        return result
+
+
+@celery_app.task(name=TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES)
+def backfill_unassigned_session_queues() -> dict[str, int]:
+    """Beat-scheduled (see ``app.core.celery_app``'s ``beat_schedule`` --
+    every ``constants.BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS``).
+    Gives a queue to a live guest session whose login never got one onto
+    the router; see ``QueueManagementService
+    .backfill_queues_for_unassigned_sessions``. Does nothing unless switched
+    on (``Settings.guest_queue_backfill_enabled`` / ``_router_ids``)."""
+    result = run_celery_task(_backfill_unassigned_session_queues_async())
+    logger.info(
+        "queue_management_task_backfill_unassigned_session_queues_completed",
+        extra=result,
+    )
+    return result
+
+
 __all__ = [
     "GuestSessionLiveness",
+    "GuestSessionsWithoutQueue",
+    "queue_backfill_applies",
+    "backfill_unassigned_session_queues",
     "sweep_schedule_transitions",
     "reapply_policy_assignments",
     "release_ended_session_queues",

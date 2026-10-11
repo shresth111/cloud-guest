@@ -2010,6 +2010,34 @@ class Settings(BaseSettings):
     guest_hotspot_gate_remove_max_per_run: int = Field(default=20, ge=0, le=500)
     guest_hotspot_gate_remove_drop_host: bool = True
 
+    # Giving a queue to a live session that never got one
+    # (QueueManagementService.backfill_queues_for_unassigned_sessions).
+    #
+    # A login hands its speed-limit queue to a worker task. If the router
+    # does not answer, that task retries three times and gives up, and the
+    # guest then runs unlimited for the rest of the session: nothing came
+    # back for them, not even a policy publish. With this on, a periodic
+    # sweep (and each bandwidth-policy publish, for its own locations) puts
+    # such a session through the same assignment a login uses.
+    #
+    # OFF BY DEFAULT for the reason the two switches above are: it writes
+    # rows on real routers, on its own initiative, and at the time it was
+    # written it had run against a fake RouterOS API only. Its first run
+    # also acts on every session that is unassigned today, not just new
+    # ones. Merging it changes nothing until one of these is set:
+    #
+    #   CLOUDGUEST_GUEST_QUEUE_BACKFILL_ROUTER_IDS=<uuid>[,<uuid>...]
+    #       only these routers -- the way to watch it on one device first;
+    #   CLOUDGUEST_GUEST_QUEUE_BACKFILL_ENABLED=true
+    #       every router this platform logs in to. The allow-list only
+    #       matters while this is false.
+    #
+    # `max_per_run`: the most sessions one run tries to write a queue for.
+    #   Zero writes nothing.
+    guest_queue_backfill_enabled: bool = False
+    guest_queue_backfill_router_ids: str = ""
+    guest_queue_backfill_max_per_run: int = Field(default=25, ge=0, le=500)
+
     # One incoming-webhook URL, one internal ops channel. This is NOT a
     # per-tenant setting and deliberately has no database column and no
     # customer-facing UI: the messages describe Master/GLOBAL-scope
