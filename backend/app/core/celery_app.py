@@ -218,8 +218,10 @@ from app.domains.provisioning_engine.constants import (
     TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
 )
 from app.domains.queue_management.constants import (
+    BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS,
     RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS,
     SCHEDULE_SWEEP_INTERVAL_SECONDS,
+    TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES,
     TASK_RELEASE_ENDED_SESSION_QUEUES,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
@@ -345,6 +347,10 @@ celery_app.conf.update(
         # per ended session's row), so it belongs with the other device
         # round trips rather than on the pure-DB default queue.
         TASK_RELEASE_ENDED_SESSION_QUEUES: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The same kind of pass in the other direction: one RouterOS API
+        # connection per session being given the queue its login could not
+        # write.
+        TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES: {"queue": DEVICE_IO_QUEUE_NAME},
         # The session-bypass reconciliation: one RouterOS API connection
         # per router, sequentially, so the sweep and the scope fan-in belong
         # with the other device round trips. The single-router, event-driven
@@ -718,6 +724,16 @@ celery_app.conf.update(
         "queue-management-release-ended-session-queues": {
             "task": TASK_RELEASE_ENDED_SESSION_QUEUES,
             "schedule": RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS,
+        },
+        # Gives a queue to a live guest session whose login never got one
+        # onto the router (the router did not answer and the login's task
+        # ran out of retries) -- nothing else comes back for it. Does
+        # nothing unless switched on (see Settings
+        # .guest_queue_backfill_enabled / _router_ids). See
+        # QueueManagementService.backfill_queues_for_unassigned_sessions.
+        "queue-management-backfill-unassigned-session-queues": {
+            "task": TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES,
+            "schedule": BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS,
         },
         # Takes a `cloudguest-authmac` hotspot bypass off a router once
         # nothing lists its MAC -- the removal the router's own script was

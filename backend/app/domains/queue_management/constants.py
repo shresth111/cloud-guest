@@ -252,6 +252,41 @@ RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS = 120.0
 RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS = 300.0
 
 
+TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES = (
+    "app.domains.queue_management.tasks.backfill_unassigned_session_queues"
+)
+
+# Every 5 minutes. This is the net under the login's own queue task, not the
+# thing that normally gives a guest their speed, so it does not need the
+# release sweep's cadence: it only ever finds work after a router failed to
+# answer three times in a row. And where a router is still not answering,
+# each run costs one connection timeout on the device-I/O queue -- once
+# every five minutes is a cost worth paying to notice the router is back,
+# once every two is not.
+BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS = 300.0
+
+# A session younger than this is not looked at. The login's own task
+# (``guest.tasks.assign_guest_queue``) may still be working on it: up to
+# three retries thirty seconds apart, each of which can spend a full
+# connection timeout before failing -- about two and a half minutes at
+# worst. Five minutes is clear of that with room to spare, and is the same
+# figure the release sweep waits before judging a new assignment.
+BACKFILL_UNASSIGNED_SESSION_QUEUES_MIN_AGE_SECONDS = 300.0
+
+# The most sessions one run tries to write a queue for -- device attempts,
+# not sessions examined. Each is a fresh RouterOS API connection on the
+# shared device-I/O queue; this bounds a run to well under its own interval
+# even when every write is slow. Overridable per deployment
+# (``Settings.guest_queue_backfill_max_per_run``).
+BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN = 25
+
+# How many unassigned sessions one run reads. Much larger than the cap
+# above on purpose: sessions that can never be given a queue (an address
+# that is not on the venue's LAN, a controller-run venue) are skipped at no
+# cost and must not crowd out the ones that can.
+BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT = 1000
+
+
 __all__ = [
     "QueueType",
     "MIN_QUEUE_PRIORITY",
@@ -271,5 +306,10 @@ __all__ = [
     "TASK_RELEASE_ENDED_SESSION_QUEUES",
     "RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS",
     "RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS",
+    "TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_MIN_AGE_SECONDS",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT",
     "SCHEDULE_SWEEP_INTERVAL_SECONDS",
 ]

@@ -65,7 +65,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Collection
+from collections.abc import Callable, Collection
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from typing import Any, Protocol
@@ -83,6 +84,9 @@ from app.domains.router.vendor_capabilities import is_controller_managed
 
 from .constants import (
     APPLICABLE_QUEUE_STATUSES,
+    BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+    BACKFILL_UNASSIGNED_SESSION_QUEUES_MIN_AGE_SECONDS,
+    BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT,
     DEFAULT_QUEUE_PRIORITY,
     RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS,
     REMOVABLE_QUEUE_STATUSES,
@@ -204,6 +208,48 @@ class SessionLivenessLookupProtocol(Protocol):
     ) -> set[uuid.UUID]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class SessionWithoutQueue:
+    """One live guest session that holds no queue -- everything
+    ``backfill_queues_for_unassigned_sessions`` needs to give it one, and
+    exactly what the login path hands ``guest.tasks.assign_guest_queue``.
+    ``ip_address`` is the session's recorded address, unjudged: whether a
+    queue may target it is decided by the service, by the rule a login
+    uses."""
+
+    session_id: uuid.UUID
+    organization_id: uuid.UUID | None
+    location_id: uuid.UUID | None
+    router_id: uuid.UUID
+    ip_address: str | None
+    guest_id: uuid.UUID | None
+    started_at: datetime
+
+
+class SessionsWithoutQueueLookupProtocol(Protocol):
+    """Which live guest sessions hold no queue -- the second question
+    this domain asks the guest domain (``SessionLivenessLookupProtocol`` is
+    the first), for the same reason: ``QueueAssignment.target_id`` is not a
+    foreign key, so "a session with no assignment" is not something this
+    service can see from its own tables.
+
+    Returns ACTIVE sessions that started at or before ``started_before``,
+    have a router, and have no ACTIVE, SUSPENDED or DISABLED SESSION
+    assignment -- newest first, at most ``limit`` of them. A PENDING row
+    does not count as holding a queue: it never reached the device.
+
+    ``None``-by-default on the service, like the other two hooks: without
+    it the backfill does nothing."""
+
+    async def list_sessions_without_queue(
+        self,
+        *,
+        started_before: datetime,
+        location_id: uuid.UUID | None = None,
+        limit: int,
+    ) -> list[SessionWithoutQueue]: ...
+
+
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
@@ -242,6 +288,8 @@ class QueueManagementService:
         caller_location_scope: LocationScope = None,
         controller_speed_hook: ControllerSpeedHookProtocol | None = None,
         session_liveness_lookup: SessionLivenessLookupProtocol | None = None,
+        sessions_without_queue_lookup: SessionsWithoutQueueLookupProtocol
+        | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -257,6 +305,9 @@ class QueueManagementService:
         # How this service learns that a guest session has ended -- see
         # ``SessionLivenessLookupProtocol``. ``None`` releases nothing.
         self.session_liveness_lookup = session_liveness_lookup
+        # How this service finds live sessions that never got a queue -- see
+        # ``SessionsWithoutQueueLookupProtocol``. ``None`` backfills nothing.
+        self.sessions_without_queue_lookup = sessions_without_queue_lookup
         # Constructor-injected -- see `app.domains.rbac.location_scope`.
         self.caller_location_scope = caller_location_scope
 
@@ -1730,6 +1781,244 @@ class QueueManagementService:
                 )
         return result
 
+    async def backfill_queues_for_unassigned_sessions(
+        self,
+        *,
+        now: datetime | None = None,
+        min_age_seconds: float = BACKFILL_UNASSIGNED_SESSION_QUEUES_MIN_AGE_SECONDS,
+        max_per_run: int = BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+        location_id: uuid.UUID | None = None,
+        router_allowed: Callable[[uuid.UUID], bool] | None = None,
+        unit_of_work: Callable[[], AbstractAsyncContextManager[Any]] | None = None,
+    ) -> dict[str, int]:
+        """Give a queue to every live guest session that has none.
+
+        ## Why this exists
+
+        A login hands its queue to the worker (``guest.tasks
+        .assign_guest_queue``). When the router does not answer, that task
+        retries a few times, gives up, and rolls its transaction back: the
+        session stays ACTIVE with no assignment at all, which on the device
+        is no ``/queue simple`` row -- unlimited -- for the rest of the
+        session. Nothing came back for it. A policy publish did not either:
+        ``reapply_active_sessions_for_location`` walks existing ACTIVE
+        assignments, and this session has none to walk.
+
+        ## What it does, and what it deliberately reuses
+
+        Each such session is put through ``resolve_and_assign_queue``, the
+        entry point the login itself uses, with the arguments the login
+        would have passed. There is no second resolver and no second device
+        writer here; a session this reaches ends up exactly where a
+        successful login would have left it.
+
+        The same refusals apply, before anything is attempted:
+
+        * a venue run from a vendor controller, or one this platform has no
+          API to, is left alone -- only a router this platform logs in to;
+        * the session's recorded address must be one a queue can match
+          (``validators.routeros_guest_queue_target``). An address that is
+          not on the venue's LAN is skipped, never guessed at.
+
+        ## What it must not do
+
+        * **Race the login.** A session younger than ``min_age_seconds`` is
+          not looked at: the login's own task may still be retrying. A
+          re-login on an older session can still overlap; both then
+          serialize on the per-target lock and the second finds the first's
+          row.
+        * **Take an address from whoever holds it now.** Applying a queue
+          retires every other row naming the same address, which is right
+          for a sign-in and wrong here: two ACTIVE sessions can record one
+          address (a lease reused before the older session was closed), and
+          giving the unassigned one a queue would take it from the guest
+          who really has the address -- and the next run would take it
+          back. A session whose address already carries a live session's
+          queue is skipped, and where several unassigned sessions share an
+          address only the newest is considered.
+        * **Revive a session that has just ended.** Liveness is asked again
+          immediately before each write.
+        * **Leave a half-made row behind.** ``unit_of_work`` wraps one
+          session's attempt (the task passes the database session's own
+          savepoint); a device failure undoes that attempt's rows, as the
+          login task's rollback does. Without one, a failed attempt leaves
+          a PENDING row, which the next run applies rather than duplicates.
+
+        ## Failure
+
+        One session's failure never stops the rest. A router that cannot be
+        reached is tried once per run: every other session on it is skipped
+        without a connection attempt and waits for the next run.
+        ``max_per_run`` bounds device attempts, not sessions examined, so
+        sessions that can never be given a queue do not use it up.
+
+        Returns ``{"assigned", "failed", "skipped_unreachable",
+        "skipped_no_target", "skipped_address_in_use"}``."""
+        result = {
+            "assigned": 0,
+            "failed": 0,
+            "skipped_unreachable": 0,
+            "skipped_no_target": 0,
+            "skipped_address_in_use": 0,
+        }
+        lookup = self.sessions_without_queue_lookup
+        if lookup is None or max_per_run <= 0:
+            return result
+        now = now or datetime.now(UTC)
+        candidates = await lookup.list_sessions_without_queue(
+            started_before=now - timedelta(seconds=min_age_seconds),
+            location_id=location_id,
+            limit=BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT,
+        )
+
+        routers: dict[uuid.UUID, Router | None] = {}
+        unreachable_routers: set[uuid.UUID] = set()
+        claimed: set[tuple[uuid.UUID, str]] = set()
+        attempts = 0
+        for candidate in sorted(candidates, key=lambda c: c.started_at, reverse=True):
+            if attempts >= max_per_run:
+                break
+            router_id = candidate.router_id
+            if router_allowed is not None and not router_allowed(router_id):
+                continue
+            if router_id in unreachable_routers:
+                result["skipped_unreachable"] += 1
+                continue
+            if router_id not in routers:
+                try:
+                    routers[router_id] = await self.router_lookup.get_router(
+                        router_id,
+                        requesting_organization_id=candidate.organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- per-router isolation
+                    routers[router_id] = None
+                    logger.warning(
+                        "queue_backfill_router_lookup_failed",
+                        extra={"router_id": str(router_id), "error": str(exc)},
+                    )
+            router = routers[router_id]
+            if router is None:
+                result["failed"] += 1
+                continue
+            if is_controller_managed(router):
+                result["skipped_no_target"] += 1
+                continue
+            device_target = routeros_guest_queue_target(
+                candidate.ip_address,
+                router_addresses=(
+                    getattr(router, "public_ip_address", None),
+                    getattr(router, "management_ip_address", None),
+                ),
+            )
+            if device_target is None:
+                result["skipped_no_target"] += 1
+                continue
+            address = (router_id, device_target.removesuffix("/32"))
+            if address in claimed or await self._address_has_a_live_sessions_queue(
+                router_id=router_id,
+                device_target=device_target,
+                session_id=candidate.session_id,
+            ):
+                result["skipped_address_in_use"] += 1
+                continue
+            if self.session_liveness_lookup is not None and not (
+                await self.session_liveness_lookup.live_session_ids(
+                    {candidate.session_id}
+                )
+            ):
+                continue
+            claimed.add(address)
+
+            attempts += 1
+            try:
+                if unit_of_work is None:
+                    await self._assign_queue_to_session(candidate, device_target)
+                else:
+                    async with unit_of_work():
+                        await self._assign_queue_to_session(candidate, device_target)
+                result["assigned"] += 1
+                logger.info(
+                    "queue_backfill_assigned",
+                    extra={
+                        "session_id": str(candidate.session_id),
+                        "router_id": str(router_id),
+                    },
+                )
+            except QueueDeviceConnectionError as exc:
+                unreachable_routers.add(router_id)
+                result["failed"] += 1
+                logger.warning(
+                    "queue_backfill_router_unreachable",
+                    extra={
+                        "session_id": str(candidate.session_id),
+                        "router_id": str(router_id),
+                        "error": str(exc),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 -- per-session isolation, see docstring
+                result["failed"] += 1
+                logger.warning(
+                    "queue_backfill_failed",
+                    extra={
+                        "session_id": str(candidate.session_id),
+                        "router_id": str(router_id),
+                        "error": str(exc),
+                    },
+                )
+        return result
+
+    async def _assign_queue_to_session(
+        self, candidate: SessionWithoutQueue, device_target: str
+    ) -> QueueAssignment:
+        """One backfilled session, through the login's own entry point. A
+        row that comes back PENDING is one an earlier failed attempt left
+        behind with the rate and address already right, so
+        ``resolve_and_assign_queue`` had nothing to change and made no
+        device call; it is applied here."""
+        assignment = await self.resolve_and_assign_queue(
+            requesting_organization_id=candidate.organization_id,
+            location_id=candidate.location_id,
+            router_id=candidate.router_id,
+            target_type=QueueTargetType.SESSION,
+            target_id=candidate.session_id,
+            device_target=device_target,
+            guest_id=candidate.guest_id,
+        )
+        if assignment.status == QueueStatus.PENDING.value:
+            assignment = await self.apply_queue(
+                assignment.id,
+                actor_user_id=None,
+                requesting_organization_id=candidate.organization_id,
+            )
+        return assignment
+
+    async def _address_has_a_live_sessions_queue(
+        self, *, router_id: uuid.UUID, device_target: str, session_id: uuid.UUID
+    ) -> bool:
+        """Whether another session's queue already governs this address on
+        this router. A row whose session has ended does not count -- the
+        assignment about to be made retires it, as a sign-in would. With no
+        liveness lookup wired every such row counts: this would rather skip
+        a session than take an address from a guest it cannot ask about."""
+        rivals = [
+            row
+            for row in await self.repository.list_assignments_for_device_target(
+                router_id=router_id, device_target=device_target
+            )
+            if row.target_type == QueueTargetType.SESSION.value
+            and row.target_id is not None
+            and row.target_id != session_id
+            and row.status != QueueStatus.PENDING.value
+        ]
+        if not rivals:
+            return False
+        if self.session_liveness_lookup is None:
+            return True
+        live = await self.session_liveness_lookup.live_session_ids(
+            {row.target_id for row in rivals}
+        )
+        return bool(live)
+
     # ========================================================================
     # Internal helpers
     # ========================================================================
@@ -1953,6 +2242,8 @@ __all__ = [
     "RouterLookupProtocol",
     "PolicyLookupProtocol",
     "AuditLogWriter",
+    "SessionWithoutQueue",
+    "SessionsWithoutQueueLookupProtocol",
     "is_schedule_active_now",
     "format_mikrotik_rate_limit",
 ]

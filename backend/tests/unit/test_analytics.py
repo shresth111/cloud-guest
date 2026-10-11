@@ -878,6 +878,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # Nothing else did: the row stayed first in `/queue simple` and
         # went on deciding the speed of whoever held that address next.
         "queue-management-release-ended-session-queues",
+        # Gives a queue to a live session whose login never got one onto
+        # the router (it did not answer; the login's task ran out of
+        # retries). Nothing else came back for it. Inert unless switched on.
+        "queue-management-backfill-unassigned-session-queues",
         # Takes a session's hotspot bypass off the router once nothing
         # lists its MAC. The router's own script was meant to and, on every
         # router provisioned before it was repaired, never has. Inert unless
