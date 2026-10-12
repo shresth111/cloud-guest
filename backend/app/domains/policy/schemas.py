@@ -341,11 +341,15 @@ class PolicyAssignmentCreateRequest(BaseModel):
             "One of app.domains.policy.constants.PolicyAssignmentTargetType's "
             "values -- an orthogonal WHO axis alongside scope_type's WHERE "
             "axis. 'none' (the default) applies to everyone within the "
-            "scope; 'user'/'role' narrow it to one specific user or role."
+            "scope; 'user'/'role'/'guest' narrow it to one specific user, "
+            "role or guest. 'members' records that an Access Tier is "
+            "offered at the scope without applying it to anyone: only the "
+            "'guest' assignments beside it say who the tier reaches."
         ),
     )
     target_id: uuid.UUID | None = Field(
-        default=None, description="Required unless target_type is 'none'."
+        default=None,
+        description="Required unless target_type is 'none' or 'members'.",
     )
 
 
@@ -365,6 +369,14 @@ class PolicyResponse(BaseModel):
     created_by_user_id: str | None
     created_at: datetime
     updated_at: datetime
+    member_count: int = Field(
+        default=0,
+        description=(
+            "How many guests are mapped into this policy right now: its "
+            "active 'guest' assignments, across every location. Always 0 "
+            "for a policy that is a location's own default."
+        ),
+    )
 
     model_config = ConfigDict(from_attributes=True)
 

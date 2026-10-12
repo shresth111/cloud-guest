@@ -703,7 +703,83 @@ class PolicyService:
             organization_id=policy.organization_id,
             description=f"Policy assignment {updated.id} deactivated",
         )
+        await self._release_members_of_unmapped_scope(
+            policy=policy, unmapped=updated, actor_user_id=actor_user_id
+        )
         return updated
+
+    async def _release_members_of_unmapped_scope(
+        self,
+        *,
+        policy: Policy,
+        unmapped: PolicyAssignment,
+        actor_user_id: uuid.UUID | None,
+    ) -> int:
+        """A tier applies to its members at the locations it is mapped to,
+        and nowhere else. A member is a ``GUEST`` assignment scoped to one
+        location, and it grants the tier by itself -- so taking the tier off
+        a location while leaving those rows behind kept every member on the
+        tier's speed at a venue the tier had just been removed from, with
+        nothing on screen to say so.
+
+        Runs only when the row just deactivated was the policy's mapping to
+        a scope (``NONE`` or ``MEMBERS``) and no other mapping of the same
+        policy to that scope remains -- a tier that still has one is still
+        offered there. Returns how many memberships it ended."""
+        mapping_types = {
+            PolicyAssignmentTargetType.NONE.value,
+            PolicyAssignmentTargetType.MEMBERS.value,
+        }
+        unmapped_target = unmapped.target_type or PolicyAssignmentTargetType.NONE.value
+        if unmapped_target not in mapping_types or unmapped.scope_id is None:
+            return 0
+        siblings = [
+            a
+            for a in await self.repository.list_assignments_for_policy(policy.id)
+            if a.is_active
+            and a.id != unmapped.id
+            and a.scope_type == unmapped.scope_type
+            and a.scope_id == unmapped.scope_id
+        ]
+        if any(
+            (a.target_type or PolicyAssignmentTargetType.NONE.value) in mapping_types
+            for a in siblings
+        ):
+            return 0
+        released = 0
+        for member in siblings:
+            if member.target_type != PolicyAssignmentTargetType.GUEST.value:
+                continue
+            await self.repository.update_assignment(
+                member, {"is_active": False, "updated_by": actor_user_id}
+            )
+            released += 1
+        if released:
+            logger.info(
+                "policy_tier_members_released_on_unmap",
+                extra={
+                    "event_policy_id": str(policy.id),
+                    "event_scope_type": unmapped.scope_type,
+                    "event_scope_id": str(unmapped.scope_id),
+                    "event_released": released,
+                },
+            )
+            await self._audit(
+                actor_user_id,
+                AuditAction.POLICY_ASSIGNMENT_DEACTIVATED,
+                policy_id=policy.id,
+                organization_id=policy.organization_id,
+                description=(
+                    f"Policy '{policy.name}' unmapped from {unmapped.scope_type} "
+                    f"{unmapped.scope_id}: {released} member mapping(s) ended"
+                ),
+            )
+        return released
+
+    async def member_counts(self, policy_ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
+        """Guests currently mapped into each policy -- see
+        ``PolicyRepository.count_active_guest_members``."""
+        return await self.repository.count_active_guest_members(policy_ids)
 
     # ========================================================================
     # Resolution -- the real "read" API other modules could compose with

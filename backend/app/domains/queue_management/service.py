@@ -208,6 +208,12 @@ class SessionLivenessLookupProtocol(Protocol):
         self, session_ids: Collection[uuid.UUID]
     ) -> set[uuid.UUID]: ...
 
+    # ``guest_ids_for_sessions(session_ids) -> {session_id: guest_id}`` is
+    # the optional second question: whose session each one is, so a
+    # re-apply resolves the speed for that guest (an Access Tier member's
+    # is the tier's). A lookup without it re-applies for no guest in
+    # particular, as every re-apply used to.
+
 
 @dataclass(frozen=True, slots=True)
 class SessionWithoutQueue:
@@ -1685,18 +1691,29 @@ class QueueManagementService:
         # retires the older row, and the status re-read below then skips
         # that older row instead of letting it take the address back.
         candidates.sort(key=lambda a: a.created_at, reverse=True)
+        # Whose session each row is. A login resolves the speed for its
+        # guest, so a member of an Access Tier gets the tier's; re-applying
+        # for nobody in particular put every member back on the location's
+        # own speed the moment any policy was saved.
+        guest_ids: dict[uuid.UUID, uuid.UUID | None] = {}
+        guest_lookup = getattr(
+            self.session_liveness_lookup, "guest_ids_for_sessions", None
+        )
+        if guest_lookup is not None and candidates:
+            guest_ids = await guest_lookup({a.target_id for a in candidates})
         reapplied = 0
         failed = 0
         for assignment in candidates:
             current = await self.repository.get_assignment_by_id(assignment.id)
             if current is None or current.status != QueueStatus.ACTIVE.value:
                 continue
+            guest_id = guest_ids.get(assignment.target_id)
             try:
                 if unit_of_work is None:
-                    await self._reapply_one(assignment, actor_user_id)
+                    await self._reapply_one(assignment, actor_user_id, guest_id)
                 else:
                     async with unit_of_work():
-                        await self._reapply_one(assignment, actor_user_id)
+                        await self._reapply_one(assignment, actor_user_id, guest_id)
                 reapplied += 1
             except Exception as exc:  # noqa: BLE001 -- per-assignment isolation, see docstring
                 failed += 1
@@ -1707,7 +1724,10 @@ class QueueManagementService:
         return {"reapplied": reapplied, "failed": failed}
 
     async def _reapply_one(
-        self, assignment: QueueAssignment, actor_user_id: uuid.UUID | None
+        self,
+        assignment: QueueAssignment,
+        actor_user_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
     ) -> QueueAssignment:
         return await self.resolve_and_assign_queue(
             requesting_organization_id=assignment.organization_id,
@@ -1717,7 +1737,7 @@ class QueueManagementService:
             target_id=assignment.target_id,
             device_target=assignment.device_target or "",
             actor_user_id=actor_user_id,
-            guest_id=None,
+            guest_id=guest_id,
         )
 
     async def _routers_address_for_device(
