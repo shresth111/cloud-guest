@@ -518,6 +518,14 @@ _PATH_ID_ROUTES = [
     # customer's own controller. Loaded WITH the caller's organization in the
     # query (a foreign id is a 404), which needs that organization resolved.
     ("/api/v1/network-integrations/{integration_id}/configure-controller", "POST"),
+    # Venue traffic for the customer dashboard. The venue is named in the
+    # path while the permission check may have run against an X-Location-Id
+    # header, so the handler loads the venue against the caller's
+    # organization (a foreign venue is a 404) and filters every read on the
+    # loaded id. See tests/unit/test_traffic_flow_customer.py for the
+    # behavioural half.
+    ("/api/v1/traffic-flow/locations/{location_id}/status", "GET"),
+    ("/api/v1/traffic-flow/locations/{location_id}/summary", "GET"),
 ]
 
 

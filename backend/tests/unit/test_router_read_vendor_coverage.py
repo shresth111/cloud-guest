@@ -220,7 +220,10 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "hardware: `flow_state` gives any non-MikroTik vendor the explicit "
         "state `unsupported_vendor` before it looks at data, and the apply "
         "path refuses such a router with UNSUPPORTED_VENDOR before any "
-        "device call. Nothing is dispatched from this list."
+        "device call. Nothing is dispatched from this list. The customer "
+        "venue view reads the same rows for one location and folds them "
+        "into three states, where a venue with only controller-managed "
+        "equipment reads `not_available`, never \"not collecting\"."
     ),
     "app/domains/traffic_flow/service.py::TrafficFlowRepository.router_labels": (
         "Name/vendor/location labels for routers that already have flow "
