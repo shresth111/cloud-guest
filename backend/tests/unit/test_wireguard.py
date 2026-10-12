@@ -3140,6 +3140,11 @@ class TestHubBridgeUnavailableIsA502:
 # ============================================================================
 
 
+async def _async(value):
+    """Wraps a value in an awaitable, for one-line fake hub allocators."""
+    return value
+
+
 def _agent_allocation(
     *,
     public_key: str = "HUB-MINTED-KEY",
@@ -3271,10 +3276,71 @@ class TestAllocateTunnelViaHub:
 
         assert calls == [1]
         assert second.reused is True
-        # The platform never held this key's private half -- it was
-        # generated on the hub -- so it is not invented on the reuse path.
-        assert second.peer_private_key is None
+        # The key the bridge minted on the FIRST call is retained and handed
+        # back on reuse. Until 2026-10-02 this was None, so a router whose
+        # peer the Add Customer wizard allocated got, on its first Generate,
+        # a script that could not build the tunnel on a fresh device -- and
+        # therefore no /radius (Farmao Cafe "Lobby Router").
+        assert second.peer_private_key == "HUB-MINTED-PRIVATE-KEY"
+        assert second.peer_private_key == first.peer_private_key
         assert second.peer.public_key == first.peer.public_key
+
+    async def test_a_hub_allocated_key_is_stored_encrypted_not_as_the_sentinel(
+        self,
+    ) -> None:
+        """The bridge returns the private half exactly once. Recording the
+        sentinel threw it away, which is what made every later reuse
+        keyless."""
+        f = make_services(hub_peer_allocator=lambda: _async(_agent_allocation()))
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None, router_id=router.id, requesting_organization_id=None
+        )
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        assert peer is not None
+        assert peer.private_key_encrypted != "HUB-MINTED-PRIVATE-KEY"
+        assert decrypt_secret(peer.private_key_encrypted) == "HUB-MINTED-PRIVATE-KEY"
+
+    async def test_reuse_of_a_peer_with_no_retained_key_is_still_keyless(
+        self,
+    ) -> None:
+        """Adopted identities and peers recorded before keys were retained
+        hold only the sentinel. Reuse must hand back None -- never the
+        sentinel string, which would be written into ``private-key=``."""
+        f = make_services(hub_peer_allocator=lambda: _async(_agent_allocation()))
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.100.0.9",
+            public_key="LEGACY-PUB",
+        )
+        again = await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None, router_id=router.id, requesting_organization_id=None
+        )
+        assert again.reused is True
+        assert again.peer_private_key is None
+
+    async def test_the_bootstrap_pull_delivers_a_retained_hub_key(self) -> None:
+        """``GET /agent/wireguard-config`` refused every hub-allocated peer
+        (sentinel -> 409), so a router created by the Add Customer wizard
+        could not be enrolled by the bootstrap script either. With the key
+        retained it is delivered, and the peer flips pending -> active."""
+        f = make_services(hub_peer_allocator=lambda: _async(_agent_allocation()))
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None, router_id=router.id, requesting_organization_id=None
+        )
+        info = await f.wireguard_service.get_config_for_agent(router=router)
+        assert info.peer_private_key == "HUB-MINTED-PRIVATE-KEY"
+        assert info.peer.status == PeerStatus.ACTIVE.value
 
     async def test_a_live_device_is_never_allocated_over_even_with_rotate(
         self,
