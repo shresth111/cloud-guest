@@ -1144,6 +1144,7 @@ class TestAuthorization:
             ("/overview", "GET", "traffic_flows.read"),
             ("/status", "GET", "traffic_flows.read"),
             ("/summary", "GET", "traffic_flows.read"),
+            ("/geo", "GET", "traffic_flows.read"),
             ("/routers/{router_id}/config", "GET", "traffic_flows.read"),
             ("/routers/{router_id}/apply", "POST", "traffic_flows.update"),
             ("/routers/{router_id}/remove", "POST", "traffic_flows.update"),
@@ -1160,7 +1161,7 @@ class TestAuthorization:
     def test_no_route_exists_outside_the_pinned_set(self) -> None:
         from app.domains.traffic_flow.router import traffic_flow_platform_router
 
-        assert len(traffic_flow_platform_router.routes) == 6
+        assert len(traffic_flow_platform_router.routes) == 7
         for route in traffic_flow_platform_router.routes:
             (method,) = route.methods
             assert (
