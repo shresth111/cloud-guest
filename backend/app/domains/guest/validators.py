@@ -486,6 +486,133 @@ def is_session_presence_judgeable(
     return session.started_at <= cutoff and session.last_activity_at <= cutoff
 
 
+def last_heard_from_hotspot_hosts(
+    host_rows: Sequence[Mapping[str, object]],
+    *,
+    read_at: datetime,
+    dead_after_seconds: float,
+) -> dict[str, datetime]:
+    """For each MAC in the router's ``/ip/hotspot/host`` table, the moment
+    RouterOS last saw traffic from it: ``read_at`` minus the row's own
+    ``idle-time``.
+
+    This is the activity signal for a guest who produces no RADIUS
+    accounting. A device let through by an ``ip-binding type=bypassed`` row
+    is never an ``/ip/hotspot/active`` session, so nothing ever calls
+    ``GuestService.record_usage`` for it and ``last_activity_at`` stays at
+    the value the login wrote -- which the timeout sweep then reads as 40
+    minutes of silence from a laptop that is mid-download. The host table
+    does see that laptop: measured on a hEX lite (RouterOS 7.21.4), a
+    bypassed host passing traffic reads ``idle-time=0s`` and an authorized
+    phone left on a desk reads ``idle-time=16m43s``.
+
+    ``idle-time`` and not the byte counters, because it needs one read
+    rather than two and nothing remembered between sweeps, and because it
+    is the router's own answer to the question being asked -- the same
+    clock its ``idle-timeout`` runs on.
+
+    Only a row that states an ``idle-time`` contributes. A missing or
+    unparseable one is "RouterOS did not say", and activity is never
+    invented from that. A row past ``dead_after_seconds`` is left out for
+    the reason ``present_macs_from_hotspot_hosts`` leaves it out. Where a
+    MAC holds more than one row (``addresses-per-mac``), the most recently
+    heard wins."""
+    heard: dict[str, datetime] = {}
+    for row in host_rows:
+        mac = row.get("mac-address")
+        if not mac:
+            continue
+        dead_for = parse_routeros_duration_seconds(row.get("host-dead-time"))
+        if dead_for is not None and dead_for >= dead_after_seconds:
+            continue
+        idle_for = parse_routeros_duration_seconds(row.get("idle-time"))
+        if idle_for is None or idle_for < 0:
+            continue
+        heard_at = read_at - timedelta(seconds=idle_for)
+        normalized = normalize_mac_address(str(mac))
+        if normalized not in heard or heard_at > heard[normalized]:
+            heard[normalized] = heard_at
+    return heard
+
+
+def later_session_activity(
+    session: GuestSession, *, heard_at: datetime, now: datetime
+) -> datetime | None:
+    """The value ``last_activity_at`` should move to given that the router
+    last heard this session's device at ``heard_at`` -- or ``None`` when it
+    should not move.
+
+    Forwards only. Accounting writes the same column with the time its
+    Interim-Update arrived, and whichever source saw the device most
+    recently is right; an older observation from the other one must never
+    pull the timestamp back and start an idle countdown that had not begun.
+    Clamped to ``now`` so a reading that claims the future cannot postpone
+    an expiry."""
+    observed = min(as_utc(heard_at), as_utc(now))
+    if observed <= as_utc(session.last_activity_at):
+        return None
+    return observed
+
+
+class RouterActivityRead(NamedTuple):
+    """What is known about the presence sweep's reads of one router.
+
+    ``applies`` -- whether that sweep reads this router at all: a RouterOS
+    device with stored API credentials. ``False`` for a controller-managed
+    or NAS-only row, where the host table is not something this platform
+    can look at and the question below does not arise.
+
+    ``read_at`` -- when its host table was last read successfully, or
+    ``None`` if there is no record of that."""
+
+    applies: bool
+    read_at: datetime | None
+
+
+def idle_verdict_is_evidenced(
+    session: GuestSession, read: RouterActivityRead | None
+) -> bool:
+    """Whether "this session has gone idle" rests on something this
+    platform actually observed.
+
+    ``last_activity_at`` has two feeders on a RouterOS venue: RADIUS
+    accounting, and the presence sweep's read of the host table (see
+    ``last_heard_from_hotspot_hosts``). A session with no accounted bytes
+    has only the second -- that is the bypass-admitted guest -- and when
+    the router cannot be read, nothing moves the column at all. Elapsed
+    time since the last read is then being measured, not the guest's
+    silence, and expiring on it logs out someone who is online.
+
+    So for such a session an idle verdict stands only if the host table was
+    read successfully at or after the moment the session crossed its idle
+    cutoff. A read from before that moment could not have seen the
+    inactivity being claimed; a read from after it did look, and either
+    found the device quiet (the timestamp stayed put) or found it gone (the
+    presence sweep closes the row).
+
+    Left exactly as before:
+
+    * ``read is None`` -- the caller is not asking.
+    * a router the presence sweep does not read (``applies=False``).
+    * a session with accounted bytes: it has an accounting producer, and
+      that producer falling silent is the lost-Stop / NAS-gone case the
+      idle rule exists to clear.
+
+    ``False`` never makes a session immortal. The caller drops only the
+    idle half; the absolute ``session_timeout_minutes`` ceiling still
+    applies."""
+    if read is None or not read.applies:
+        return True
+    if session.total_bytes() > 0:
+        return True
+    if read.read_at is None:
+        return False
+    crossed_cutoff_at = as_utc(session.last_activity_at) + timedelta(
+        minutes=session_idle_cutoff_minutes(session)
+    )
+    return as_utc(read.read_at) >= crossed_cutoff_at
+
+
 class DevicePresenceObservation(NamedTuple):
     """One ``connected_devices`` row, as far as "is this guest online" cares:
     what the DHCP/ARP sync last concluded, and when that row was last
