@@ -7175,11 +7175,14 @@ class MikroTikAdapter:
     # ------------------------------------------------------------------
 
     async def read_traffic_flow(
-        self, creds: DeviceCredentials, *, marker: str
+        self, creds: DeviceCredentials, *, identity: Mapping[str, str] | None
     ) -> _tflow.TrafficFlowState:
         """Read-only: ``/ip traffic-flow``, its ``ipfix`` field toggles and
-        the export target(s) carrying ``marker``. Never writes."""
-        return await asyncio.to_thread(self._traffic_flow_sync, creds, None, marker)
+        the export target(s) whose ``dst-address`` + ``port`` equal
+        ``identity``. Never writes."""
+        return await asyncio.to_thread(
+            self._traffic_flow_sync, creds, None, identity
+        )
 
     async def apply_traffic_flow(
         self, creds: DeviceCredentials, config: _tflow.TrafficFlowConfig
@@ -7188,20 +7191,20 @@ class MikroTikAdapter:
         Refused (nothing written) -> :class:`_tflow.TrafficFlowRefusal`
         re-raised as-is so the caller sees its ``code``."""
         return await asyncio.to_thread(
-            self._traffic_flow_sync, creds, config, config.marker
+            self._traffic_flow_sync, creds, config, config.identity
         )
 
     def _traffic_flow_sync(
         self,
         creds: DeviceCredentials,
         config: _tflow.TrafficFlowConfig | None,
-        marker: str,
+        identity: Mapping[str, str] | None,
     ) -> _tflow.TrafficFlowState | _tflow.TrafficFlowApplyResult:
         api = self._connect_api(creds)
         try:
             try:
                 if config is None:
-                    return _tflow.read_traffic_flow(api, marker=marker)
+                    return _tflow.read_traffic_flow(api, identity=identity)
                 return _tflow.apply_traffic_flow(api, config)
             except LibRouterosError as exc:
                 op = "read" if config is None else "apply"
