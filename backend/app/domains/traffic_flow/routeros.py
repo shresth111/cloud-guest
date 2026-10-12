@@ -21,6 +21,8 @@ Values and why (DESIGN.md §2):
 * ``nat-src-address``/``nat-src-port`` -- not used by the MVP rollup; enabled
   now because changing the IPFIX field set later re-templates every exporter,
   and the NAT archive (DESIGN.md §6) needs them.
+* ``cache-entries`` -- one constant (``ROUTEROS_CACHE_ENTRIES``); RouterOS's
+  own default depends on the board, and the smallest value overflows early.
 * the target's ``src-address`` is the router's tunnel address -- the hub maps
   an exporter to a router by exactly that address.
 """
@@ -34,12 +36,17 @@ from wyfy_device_gateway.mikrotik_traffic_flow import TrafficFlowConfig
 
 from app.domains.wireguard.validators import hub_reserved_ip
 
-from .constants import TRAFFIC_FLOW_SECTION_HEADER, TRAFFIC_FLOW_TARGET_MARKER
+from .constants import (
+    ROUTEROS_CACHE_ENTRIES,
+    TRAFFIC_FLOW_SECTION_HEADER,
+    TRAFFIC_FLOW_TARGET_MARKER,
+)
 
 __all__ = [
     "TrafficFlowTarget",
     "desired_config",
     "disabled_config",
+    "render_removal_lines",
     "render_traffic_flow_lines",
     "routeros_major_version",
     "traffic_flow_lines_for_router",
@@ -49,7 +56,7 @@ __all__ = [
 _SETTINGS: dict[str, str] = {
     "enabled": "yes",
     "interfaces": "all",
-    "cache-entries": "4k",
+    "cache-entries": ROUTEROS_CACHE_ENTRIES,
     "active-flow-timeout": "1m",
     "inactive-flow-timeout": "15s",
     "packet-sampling": "no",
@@ -149,6 +156,18 @@ def render_traffic_flow_lines(
     ]
 
 
+def render_removal_lines() -> list[str]:
+    """RouterOS lines that undo the export, for pasting by hand. Rendered
+    from :func:`disabled_config` -- the description the device writer's
+    removal uses -- and in the writer's order: export off first, then our
+    target, so nothing is sent to a target that is about to go."""
+    config = disabled_config()
+    return [
+        f"/ip traffic-flow set {_fields(dict(config.settings))}",
+        f'/ip traffic-flow target remove [find where comment="{config.marker}"]',
+    ]
+
+
 class _Peer(Protocol):
     tunnel_ip_address: str
 
@@ -173,7 +192,7 @@ def traffic_flow_target_for(
 
 def traffic_flow_lines_for_router(
     *,
-    router_id: Any,
+    export_enabled: bool,
     vendor: str | None,
     routeros_version: str | None,
     peer: _Peer | None,
@@ -182,11 +201,12 @@ def traffic_flow_lines_for_router(
 ) -> list[str] | None:
     """What ``render_network_config`` should carry for this router, or
     ``None`` for "no traffic-flow section". The generator-side gate: flag on,
-    router allowlisted, MikroTik, and a tunnel to export over. The device
-    writer applies the same gates in ``TrafficFlowDeviceService``."""
+    export switched on for this router (``router_traffic_flow_export``),
+    MikroTik, and a tunnel to export over. The device writer applies the
+    same gates in ``TrafficFlowDeviceService``."""
     if not settings.traffic_flow_enabled:
         return None
-    if router_id not in settings.traffic_flow_router_id_set:
+    if not export_enabled:
         return None
     if (vendor or "mikrotik").lower() != "mikrotik":
         return None

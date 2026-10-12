@@ -1,12 +1,18 @@
 """Traffic flow: ingestion, the Master overview, and the device config path.
 
-Three services over one repository, all Master-only:
+Services over one repository, all Master-only:
 
 * :class:`TrafficFlowIngestService` -- one hub window in, rows out.
-* :class:`TrafficFlowOverviewService` -- last N minutes per router, with an
-  honest state for every router instead of an empty table.
+* :class:`TrafficFlowStatusService` -- every router in the fleet with an
+  honest state (``FlowState``), plus collector health.
+* :class:`TrafficFlowSummaryService` -- one venue or router over a range:
+  totals, timeline, services, devices, destinations.
+* :class:`TrafficFlowOverviewService` -- the first Master page's last N
+  minutes per router. Kept for that page; new screens use the two above.
 * :class:`TrafficFlowDeviceService` -- preview the rendered lines, and
-  apply/disable over 8728 with read-back (``dry_run`` by default).
+  apply/remove over 8728 with read-back (``dry_run`` by default). A real
+  apply or remove is recorded on ``router_traffic_flow_export``, which is
+  the per-router switch.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from fastapi import status
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,25 +39,47 @@ from app.domains.wireguard.constants import PeerStatus
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
 
 from .constants import (
+    DEFAULT_LIST_LIMIT,
+    DEFAULT_QUERY_WINDOW_SECONDS,
+    DEFAULT_TIMELINE_SERIES,
+    MAX_LIST_LIMIT,
+    MAX_QUERY_WINDOW_DAYS,
+    MAX_TIMELINE_SERIES,
+    SILENT_AFTER_SECONDS,
     STALE_AFTER_SECONDS,
     WINDOW_SECONDS,
+    BlockerCode,
+    FlowState,
     RouterFlowState,
     TrafficFlowSource,
 )
 from .ingest import (
     attribute_talkers,
     reduce_window,
+    service_rows,
     top_destinations,
     top_talkers,
 )
-from .models import TrafficFlowIngestState, TrafficFlowWindow
+from .models import (
+    RouterTrafficFlowExport,
+    TrafficFlowIngestState,
+    TrafficFlowServiceBucket,
+    TrafficFlowWindow,
+)
 from .routeros import (
     TrafficFlowTarget,
     desired_config,
     disabled_config,
+    render_removal_lines,
     render_traffic_flow_lines,
     routeros_major_version,
     traffic_flow_target_for,
+)
+from .summary import (
+    ServiceStepRow,
+    build_summary,
+    empty_summary,
+    timeline_step_seconds,
 )
 
 logger = get_logger(__name__)
@@ -62,6 +90,9 @@ __all__ = [
     "TrafficFlowIngestService",
     "TrafficFlowOverviewService",
     "TrafficFlowRepository",
+    "TrafficFlowStatusService",
+    "TrafficFlowSummaryService",
+    "flow_state",
     "traffic_flow_target_for",
 ]
 
@@ -87,9 +118,233 @@ class ExporterRouter:
     location_id: uuid.UUID | None
 
 
+@dataclass(frozen=True, slots=True)
+class FleetRouter:
+    """One router as the fleet status lists it, with its export row."""
+
+    router_id: uuid.UUID
+    router_name: str | None
+    vendor: str | None
+    organization_id: uuid.UUID | None
+    organization_name: str | None
+    location_id: uuid.UUID | None
+    location_name: str | None
+    export: RouterTrafficFlowExport | None
+
+
+@dataclass(frozen=True, slots=True)
+class RouterActivity:
+    """What is held for one router, and how much arrived recently."""
+
+    newest_window_start: datetime
+    newest_window_seconds: int
+    windows_recent: int
+    bytes_recent: int
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryScope:
+    router_id: uuid.UUID | None = None
+    location_id: uuid.UUID | None = None
+
+    def conditions(self, model: Any) -> list[Any]:
+        out: list[Any] = []
+        if self.router_id is not None:
+            out.append(model.router_id == self.router_id)
+        if self.location_id is not None:
+            out.append(model.location_id == self.location_id)
+        return out
+
+
+def service_step_statement(
+    scope: SummaryScope, *, since: datetime, until: datetime, step_seconds: int
+) -> Any:
+    """Service buckets in range, summed per (timeline step, protocol, remote
+    port). The step is the epoch floor, the same grid
+    ``summary.step_start_of`` uses for windows."""
+    bucket = TrafficFlowServiceBucket
+    step = func.to_timestamp(
+        func.floor(func.extract("epoch", bucket.window_start) / step_seconds)
+        * step_seconds
+    ).label("step_start")
+    return (
+        select(
+            step,
+            bucket.protocol,
+            bucket.remote_port,
+            func.coalesce(func.sum(bucket.bytes_up), 0),
+            func.coalesce(func.sum(bucket.bytes_down), 0),
+            func.coalesce(func.sum(bucket.flows), 0),
+        )
+        .where(
+            bucket.window_start >= since,
+            bucket.window_start < until,
+            *scope.conditions(bucket),
+        )
+        .group_by(step, bucket.protocol, bucket.remote_port)
+    )
+
+
+def router_activity_statement(recent_since: datetime) -> Any:
+    window = TrafficFlowWindow
+    recent = window.window_start >= recent_since
+    return select(
+        window.router_id,
+        func.max(window.window_start),
+        func.max(window.window_seconds),
+        func.count().filter(recent),
+        func.coalesce(
+            func.sum(window.bytes_up + window.bytes_down).filter(recent), 0
+        ),
+    ).group_by(window.router_id)
+
+
+def service_bucket_insert_statement(rows: list[dict[str, Any]]) -> Any:
+    return (
+        pg_insert(TrafficFlowServiceBucket)
+        .values(rows)
+        .on_conflict_do_nothing(constraint="uq_traffic_flow_service_buckets_key")
+    )
+
+
 class TrafficFlowRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+
+    # -- per-router switch ----------------------------------------------
+    async def get_export(self, router_id: uuid.UUID) -> RouterTrafficFlowExport | None:
+        return (
+            await self.session.execute(
+                select(RouterTrafficFlowExport).where(
+                    RouterTrafficFlowExport.router_id == router_id,
+                    RouterTrafficFlowExport.is_deleted.is_(False),
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def save_export(
+        self, row: RouterTrafficFlowExport
+    ) -> RouterTrafficFlowExport:
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def export_enabled(self, router_id: uuid.UUID) -> bool:
+        row = await self.get_export(router_id)
+        return bool(row is not None and row.enabled)
+
+    async def enabled_export_router_ids(self) -> set[uuid.UUID]:
+        stmt = select(RouterTrafficFlowExport.router_id).where(
+            RouterTrafficFlowExport.enabled.is_(True),
+            RouterTrafficFlowExport.is_deleted.is_(False),
+        )
+        return set((await self.session.execute(stmt)).scalars().all())
+
+    # -- fleet status -----------------------------------------------------
+    async def fleet_routers(
+        self, router_id: uuid.UUID | None = None
+    ) -> list[FleetRouter]:
+        """Every live router (or just one), with names and its export row."""
+        stmt = (
+            select(
+                Router.id,
+                Router.name,
+                Router.vendor,
+                Router.organization_id,
+                Organization.name,
+                Router.location_id,
+                Location.name,
+                RouterTrafficFlowExport,
+            )
+            .outerjoin(Location, Location.id == Router.location_id)
+            .outerjoin(Organization, Organization.id == Router.organization_id)
+            .outerjoin(
+                RouterTrafficFlowExport,
+                and_(
+                    RouterTrafficFlowExport.router_id == Router.id,
+                    RouterTrafficFlowExport.is_deleted.is_(False),
+                ),
+            )
+            .where(Router.is_deleted.is_(False))
+            .order_by(Organization.name, Location.name, Router.name)
+        )
+        if router_id is not None:
+            stmt = stmt.where(Router.id == router_id)
+        return [
+            FleetRouter(*row) for row in (await self.session.execute(stmt)).all()
+        ]
+
+    async def router_activity(
+        self, recent_since: datetime
+    ) -> dict[uuid.UUID, RouterActivity]:
+        stmt = router_activity_statement(recent_since)
+        rows = (await self.session.execute(stmt)).all()
+        return {
+            rid: RouterActivity(newest, int(seconds), int(count), int(nbytes))
+            for rid, newest, seconds, count, nbytes in rows
+        }
+
+    # -- summary ----------------------------------------------------------
+    async def windows_in_range(
+        self, scope: SummaryScope, *, since: datetime, until: datetime
+    ) -> list[TrafficFlowWindow]:
+        stmt = (
+            select(TrafficFlowWindow)
+            .where(
+                TrafficFlowWindow.window_start >= since,
+                TrafficFlowWindow.window_start < until,
+                *scope.conditions(TrafficFlowWindow),
+            )
+            .order_by(TrafficFlowWindow.window_start)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def data_bounds(
+        self, scope: SummaryScope
+    ) -> tuple[datetime | None, datetime | None]:
+        stmt = select(
+            func.min(TrafficFlowWindow.window_start),
+            func.max(TrafficFlowWindow.window_start),
+        ).where(*scope.conditions(TrafficFlowWindow))
+        oldest, newest = (await self.session.execute(stmt)).one()
+        return oldest, newest
+
+    async def service_steps(
+        self,
+        scope: SummaryScope,
+        *,
+        since: datetime,
+        until: datetime,
+        step_seconds: int,
+    ) -> list[ServiceStepRow]:
+        stmt = service_step_statement(
+            scope, since=since, until=until, step_seconds=step_seconds
+        )
+        return [
+            ServiceStepRow(step, int(protocol), int(port), int(up), int(down), int(n))
+            for step, protocol, port, up, down, n in (
+                await self.session.execute(stmt)
+            ).all()
+        ]
+
+    async def insert_service_buckets(self, rows: list[dict[str, Any]]) -> None:
+        if rows:
+            await self.session.execute(service_bucket_insert_statement(rows))
+
+    async def delete_service_buckets_before(
+        self, cutoff: datetime, *, limit: int
+    ) -> int:
+        """Retention, bounded like ``delete_windows_before``."""
+        ids = (
+            select(TrafficFlowServiceBucket.id)
+            .where(TrafficFlowServiceBucket.window_start < cutoff)
+            .limit(limit)
+            .scalar_subquery()
+        )
+        result = await self.session.execute(
+            delete(TrafficFlowServiceBucket).where(TrafficFlowServiceBucket.id.in_(ids))
+        )
+        return int(result.rowcount or 0)
 
     async def exporter_router_map(self) -> dict[str, ExporterRouter]:
         """Tunnel address -> router, for every non-revoked peer. A tunnel
@@ -272,16 +527,22 @@ class TrafficFlowIngestService:
             attribution = attribute_talkers(reduced.talkers.keys(), sessions)
             talkers, other_talkers = top_talkers(reduced, attribution)
             destinations, other_destinations = top_destinations(reduced)
+            identity = {
+                "router_id": router.router_id,
+                "organization_id": router.organization_id,
+                "location_id": router.location_id,
+                "source": TrafficFlowSource.MIKROTIK_IPFIX.value,
+                "window_start": window_start,
+                "window_seconds": window_seconds,
+            }
             written = await self.repository.insert_window(
                 {
-                    "router_id": router.router_id,
-                    "organization_id": router.organization_id,
-                    "location_id": router.location_id,
-                    "source": TrafficFlowSource.MIKROTIK_IPFIX.value,
-                    "window_start": window_start,
-                    "window_seconds": window_seconds,
+                    **identity,
                     "exporter_address": exporter,
                     "bytes_total": reduced.bytes_total,
+                    "bytes_up": reduced.bytes_up,
+                    "bytes_down": reduced.bytes_down,
+                    "services_measured": reduced.services_measured,
                     "packets_total": reduced.packets_total,
                     "flows_total": reduced.flows_total,
                     "bytes_internal": reduced.bytes_internal,
@@ -297,6 +558,12 @@ class TrafficFlowIngestService:
             )
             if written:
                 summary.written += 1
+                # Only with a NEW window row: a re-pulled window must not
+                # add service rows a second time. (The table's own unique
+                # key would refuse them too.)
+                await self.repository.insert_service_buckets(
+                    [{**identity, **row} for row in service_rows(reduced)]
+                )
             else:
                 summary.duplicates += 1
         summary.unknown_exporters = tuple(sorted(unknown))
@@ -388,7 +655,9 @@ class TrafficFlowOverviewService:
         since = now - timedelta(minutes=minutes)
         windows = await self.repository.windows_since(since)
         state = await self.repository.get_state()
-        allowlist = self.settings.traffic_flow_router_id_set
+        # The per-router switch (it used to be an environment allowlist; the
+        # response key keeps its name for the page already built on it).
+        allowlist = await self.repository.enabled_export_router_ids()
 
         by_router: dict[uuid.UUID, list[TrafficFlowWindow]] = {}
         for window in windows:
@@ -456,6 +725,245 @@ class TrafficFlowOverviewService:
 
 
 # ---------------------------------------------------------------------------
+# fleet status
+# ---------------------------------------------------------------------------
+
+
+def _is_mikrotik(vendor: str | None) -> bool:
+    return (vendor or "").lower() == "mikrotik"
+
+
+def flow_state(
+    *,
+    feature_enabled: bool,
+    vendor: str | None,
+    configured: bool,
+    newest_window_end: datetime | None,
+    now: datetime,
+) -> FlowState:
+    """Most-blocking first. Data decides between receiving and silent; the
+    switch only decides what "no data" means -- a router that was switched on
+    and has sent nothing is unknown, not quiet."""
+    if not feature_enabled:
+        return FlowState.FEATURE_OFF
+    if not _is_mikrotik(vendor):
+        return FlowState.UNSUPPORTED_VENDOR
+    if newest_window_end is None:
+        return FlowState.AWAITING_FIRST_DATA if configured else FlowState.NOT_CONFIGURED
+    if (now - newest_window_end).total_seconds() >= SILENT_AFTER_SECONDS:
+        return FlowState.SILENT
+    return FlowState.RECEIVING
+
+
+def _iso(moment: datetime | None) -> str | None:
+    return moment.isoformat() if moment else None
+
+
+def _id(value: uuid.UUID | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def status_row(
+    router: FleetRouter,
+    activity: RouterActivity | None,
+    *,
+    feature_enabled: bool,
+    now: datetime,
+) -> dict[str, Any]:
+    export = router.export
+    configured = bool(export is not None and export.enabled)
+    newest_start = activity.newest_window_start if activity else None
+    newest_end = (
+        newest_start + timedelta(seconds=activity.newest_window_seconds)
+        if activity and newest_start
+        else None
+    )
+    return {
+        "router_id": str(router.router_id),
+        "router_name": router.router_name,
+        "organization_id": _id(router.organization_id),
+        "organization_name": router.organization_name,
+        "location_id": _id(router.location_id),
+        "location_name": router.location_name,
+        "vendor": router.vendor,
+        "state": flow_state(
+            feature_enabled=feature_enabled,
+            vendor=router.vendor,
+            configured=configured,
+            newest_window_end=newest_end,
+            now=now,
+        ).value,
+        "configured": configured,
+        "configured_at": _iso(export.configured_at) if export else None,
+        "last_verified_at": _iso(export.last_verified_at) if export else None,
+        "last_verdict_ok": export.last_verdict_ok if export else None,
+        "last_verdict_detail": export.last_verdict_detail if export else None,
+        "last_window_start": _iso(newest_start),
+        "last_window_end": _iso(newest_end),
+        "windows_last_hour": activity.windows_recent if activity else 0,
+        "bytes_last_hour": activity.bytes_recent if activity else 0,
+    }
+
+
+class TrafficFlowStatusService:
+    def __init__(
+        self,
+        repository: TrafficFlowRepository,
+        settings: Settings,
+        *,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self.repository = repository
+        self.settings = settings
+        self.now = now
+
+    async def router_status(self, router_id: uuid.UUID) -> dict[str, Any] | None:
+        now = self.now()
+        routers = await self.repository.fleet_routers(router_id)
+        if not routers:
+            return None
+        activity = await self.repository.router_activity(now - timedelta(hours=1))
+        return status_row(
+            routers[0],
+            activity.get(router_id),
+            feature_enabled=bool(self.settings.traffic_flow_enabled),
+            now=now,
+        )
+
+    async def status(self) -> dict[str, Any]:
+        now = self.now()
+        enabled = bool(self.settings.traffic_flow_enabled)
+        routers = await self.repository.fleet_routers()
+        activity = await self.repository.router_activity(now - timedelta(hours=1))
+        state = await self.repository.get_state()
+        return {
+            "feature_enabled": enabled,
+            "generated_at": now.isoformat(),
+            "window_seconds": WINDOW_SECONDS,
+            "silent_after_seconds": SILENT_AFTER_SECONDS,
+            "collector": {
+                "agent_configured": bool(
+                    self.settings.traffic_flow_agent_url
+                    and self.settings.traffic_flow_agent_secret
+                ),
+                "last_pull_at": _iso(state.last_pull_at),
+                "last_pull_ok": state.last_pull_ok,
+                "last_error": state.last_error,
+                "last_window_start": _iso(state.last_window_start),
+                "unknown_exporters": list(state.unknown_exporters or []),
+            },
+            "routers": [
+                status_row(
+                    router,
+                    activity.get(router.router_id),
+                    feature_enabled=enabled,
+                    now=now,
+                )
+                for router in routers
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# venue summary
+# ---------------------------------------------------------------------------
+
+
+def _aware(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+class TrafficFlowSummaryService:
+    def __init__(
+        self,
+        repository: TrafficFlowRepository,
+        settings: Settings,
+        *,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self.repository = repository
+        self.settings = settings
+        self.now = now
+
+    async def summary(
+        self,
+        *,
+        router_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int | None = None,
+        series: int | None = None,
+    ) -> dict[str, Any]:
+        if router_id is None and location_id is None:
+            # A fleet-wide list would merge the same private address at two
+            # venues into one "device".
+            raise TrafficFlowError(
+                "Give a router_id or a location_id.",
+                code="TRAFFIC_FLOW_SCOPE_REQUIRED",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        until = _aware(until) if until else self.now()
+        since = (
+            _aware(since)
+            if since
+            else until - timedelta(seconds=DEFAULT_QUERY_WINDOW_SECONDS)
+        )
+        if since >= until:
+            raise TrafficFlowError(
+                "since must be before until.",
+                code="TRAFFIC_FLOW_BAD_RANGE",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        if until - since > timedelta(days=MAX_QUERY_WINDOW_DAYS):
+            # Refused, not clamped: a silently shortened range would be read
+            # as the whole range that was asked for.
+            raise TrafficFlowError(
+                f"The range may not be longer than {MAX_QUERY_WINDOW_DAYS} days.",
+                code="TRAFFIC_FLOW_WINDOW_TOO_LARGE",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        size = max(1, min(limit or DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT))
+        bands = max(1, min(series or DEFAULT_TIMELINE_SERIES, MAX_TIMELINE_SERIES))
+        step_seconds = timeline_step_seconds((until - since).total_seconds())
+        if not self.settings.traffic_flow_enabled:
+            # Not a query that comes back empty and reads as "no traffic".
+            return empty_summary(
+                feature_enabled=False,
+                since=since,
+                until=until,
+                window_seconds=WINDOW_SECONDS,
+                step_seconds=step_seconds,
+                data_oldest=None,
+                data_newest=None,
+            )
+        scope = SummaryScope(router_id=router_id, location_id=location_id)
+        oldest, newest = await self.repository.data_bounds(scope)
+        windows = await self.repository.windows_in_range(
+            scope, since=since, until=until
+        )
+        rows = (
+            await self.repository.service_steps(
+                scope, since=since, until=until, step_seconds=step_seconds
+            )
+            if windows
+            else []
+        )
+        return build_summary(
+            windows=windows,
+            service_rows=rows,
+            since=since,
+            until=until,
+            window_seconds=WINDOW_SECONDS,
+            step_seconds=step_seconds,
+            limit=size,
+            series=bands,
+            data_oldest=oldest,
+            data_newest=newest,
+        )
+
+
+# ---------------------------------------------------------------------------
 # device config path
 # ---------------------------------------------------------------------------
 
@@ -486,6 +994,10 @@ def _state_dict(state: Any) -> dict[str, Any]:
     }
 
 
+#: Blockers that do not stop a removal: switching export OFF needs no tunnel.
+_REMOVAL_IGNORES = frozenset({BlockerCode.NO_TUNNEL})
+
+
 class TrafficFlowDeviceService:
     def __init__(
         self,
@@ -496,6 +1008,7 @@ class TrafficFlowDeviceService:
         adapter_factory: Callable[[], _Adapter],
         credentials_factory: Callable[[Router, str], Any],
         audit_writer: AuditWriter | None = None,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -503,25 +1016,48 @@ class TrafficFlowDeviceService:
         self.adapter_factory = adapter_factory
         self.credentials_factory = credentials_factory
         self.audit_writer = audit_writer
+        self.now = now
+        self._status = TrafficFlowStatusService(repository, settings, now=now)
 
-    def _blockers(self, router: Router, target: TrafficFlowTarget | None) -> list[str]:
-        reasons: list[str] = []
+    def _has_credentials(self, router: Router) -> bool:
+        host = router.management_ip_address or router.public_ip_address
+        return bool(
+            host
+            and router.api_username
+            and self.router_lookup.get_decrypted_api_secret(router)
+        )
+
+    def _blockers(
+        self, router: Router, target: TrafficFlowTarget | None
+    ) -> list[tuple[BlockerCode, str]]:
+        """Why export cannot be written to this router, credentials aside."""
+        reasons: list[tuple[BlockerCode, str]] = []
         if not self.settings.traffic_flow_enabled:
-            reasons.append("CLOUDGUEST_TRAFFIC_FLOW_ENABLED is off")
-        if router.id not in self.settings.traffic_flow_router_id_set:
-            reasons.append("router is not in CLOUDGUEST_TRAFFIC_FLOW_ROUTER_IDS")
-        if (router.vendor or "").lower() != "mikrotik":
             reasons.append(
-                f"vendor {router.vendor!r} does not export flows (MikroTik only)"
+                (BlockerCode.FEATURE_OFF, "CLOUDGUEST_TRAFFIC_FLOW_ENABLED is off")
+            )
+        if not _is_mikrotik(router.vendor):
+            reasons.append(
+                (
+                    BlockerCode.UNSUPPORTED_VENDOR,
+                    f"vendor {router.vendor!r} does not export flows (MikroTik only)",
+                )
             )
         if target is None:
             reasons.append(
-                "router has no WireGuard tunnel; the collector is reached over it"
+                (
+                    BlockerCode.NO_TUNNEL,
+                    "router has no WireGuard tunnel; the collector is reached "
+                    "over it",
+                )
             )
         major = routeros_major_version(router.routeros_version)
         if major is not None and major != 7:
             reasons.append(
-                f"RouterOS 7 required (router reports {router.routeros_version})"
+                (
+                    BlockerCode.ROUTEROS_VERSION,
+                    f"RouterOS 7 required (router reports {router.routeros_version})",
+                )
             )
         return reasons
 
@@ -529,22 +1065,82 @@ class TrafficFlowDeviceService:
         router = await self.router_lookup.get_router(router_id)
         peer, server = await self.repository.peer_and_server(router.id)
         target = traffic_flow_target_for(peer, server, self.settings)
+        mikrotik = _is_mikrotik(router.vendor)
         lines: list[str] = []
-        if target is not None:
+        desired: dict[str, Any] | None = None
+        if target is not None and mikrotik:
+            config = desired_config(target)
             lines = render_traffic_flow_lines(
-                desired_config(target), routeros_version=router.routeros_version
+                config, routeros_version=router.routeros_version
             )
+            desired = {
+                "target_host": target.collector_address,
+                "target_port": target.collector_port,
+                "src_address": target.source_address,
+                "version": str((config.target or {}).get("version")),
+            }
         blockers = self._blockers(router, target)
+        if mikrotik and not self._has_credentials(router):
+            blockers.append(
+                (
+                    BlockerCode.NO_API_CREDENTIALS,
+                    "router has no API credentials on record; the script below "
+                    "can still be pasted by hand",
+                )
+            )
         return {
             "router_id": str(router.id),
+            "status": await self._status.router_status(router.id),
             "eligible": not blockers,
-            "blockers": blockers,
+            "blockers": [text for _code, text in blockers],
+            "blocker_codes": [code.value for code, _text in blockers],
+            "routeros_version": router.routeros_version,
+            "desired": desired,
+            "paste_script": list(lines),
+            "removal_script": render_removal_lines() if mikrotik else [],
+            # Names from before the per-router switch, kept for the page
+            # already built on them.
             "collector_address": target.collector_address if target else None,
             "collector_port": target.collector_port if target else None,
             "source_address": target.source_address if target else None,
-            "routeros_version": router.routeros_version,
             "lines": lines,
         }
+
+    async def remove(
+        self, router_id: uuid.UUID, *, actor_user_id: uuid.UUID | None
+    ) -> dict[str, Any]:
+        """Switch export off on the router, read back, clear the switch."""
+        return await self.apply(
+            router_id, enabled=False, dry_run=False, actor_user_id=actor_user_id
+        )
+
+    async def _record(
+        self,
+        router_id: uuid.UUID,
+        *,
+        enabled: bool,
+        target: TrafficFlowTarget | None,
+        version: str | None,
+        ok: bool,
+        detail: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> None:
+        now = self.now()
+        row = await self.repository.get_export(router_id)
+        if row is None:
+            row = RouterTrafficFlowExport(router_id=router_id, created_by=actor_user_id)
+        row.enabled = enabled
+        if enabled and target is not None:
+            row.target_host = target.collector_address
+            row.target_port = target.collector_port
+            row.src_address = target.source_address
+            row.export_version = version
+            row.configured_at = now
+        row.last_verified_at = now
+        row.last_verdict_ok = ok
+        row.last_verdict_detail = detail
+        row.updated_by = actor_user_id
+        await self.repository.save_export(row)
 
     async def apply(
         self,
@@ -566,14 +1162,10 @@ class TrafficFlowDeviceService:
         target = traffic_flow_target_for(peer, server, self.settings)
         blockers = self._blockers(router, target)
         if not enabled:
-            # Turning export OFF needs no tunnel and must work for a router
-            # that has since left the allowlist.
-            blockers = [
-                b for b in blockers if "WireGuard" not in b and "ROUTER_IDS" not in b
-            ]
+            blockers = [b for b in blockers if b[0] not in _REMOVAL_IGNORES]
         if blockers:
             raise TrafficFlowError(
-                "; ".join(blockers),
+                "; ".join(text for _code, text in blockers),
                 code="TRAFFIC_FLOW_NOT_ELIGIBLE",
                 status_code=status.HTTP_409_CONFLICT,
             )
@@ -610,6 +1202,8 @@ class TrafficFlowDeviceService:
                 exc.detail, code=exc.code, status_code=status.HTTP_409_CONFLICT
             ) from exc
         except MikroTikDeviceError as exc:
+            # Nothing is recorded: the switch and the last verdict describe
+            # what a router was last KNOWN to hold.
             raise TrafficFlowError(
                 f"router did not answer the traffic-flow "
                 f"{'read' if dry_run else 'write'}: {exc}",
@@ -617,6 +1211,22 @@ class TrafficFlowDeviceService:
                 status_code=status.HTTP_502_BAD_GATEWAY,
             ) from exc
 
+        ok = bool(result.matches)
+        detail = (
+            "verified"
+            if ok
+            else "; ".join(str(m) for m in result.mismatches)
+            or "read-back did not match"
+        )
+        await self._record(
+            router.id,
+            enabled=enabled,
+            target=target,
+            version=str((config.target or {}).get("version") or "") or None,
+            ok=ok,
+            detail=detail,
+            actor_user_id=actor_user_id,
+        )
         if self.audit_writer is not None and result.writes:
             await self.audit_writer.create_audit_log_entry(
                 actor_user_id=actor_user_id,
@@ -639,10 +1249,14 @@ class TrafficFlowDeviceService:
                 "matches": result.matches,
             },
         )
+        row = await self._status.router_status(router.id)
         return {
             "router_id": str(router.id),
             "dry_run": False,
             "enabled": enabled,
+            "ok": ok,
+            "detail": detail,
+            "state": row["state"] if row else None,
             "writes": list(result.writes),
             "matches": result.matches,
             "mismatches": list(result.mismatches),

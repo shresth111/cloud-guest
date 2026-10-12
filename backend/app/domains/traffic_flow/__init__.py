@@ -10,7 +10,9 @@ Design, sizing, privacy and the hardware plan: ``~/wyfy-ops/netflow/DESIGN.md``.
   writer (``MikroTikAdapter.apply_traffic_flow``) both consume it, so the two
   config paths cannot drift.
 * ``ingest.py`` -- pure reduction of the hub collector's aggregated rows into
-  per-router top talkers / top destinations, plus guest-session attribution.
+  per-router top talkers / top destinations / service buckets, plus
+  guest-session attribution.
+* ``summary.py`` -- pure assembly of the venue summary from stored rows.
 * ``tasks.py`` -- the pull sweep from the hub's ``flow_agent.py``.
 * ``router.py`` -- Master console only, every route pinned to
   ``ScopeType.GLOBAL`` under the GLOBAL-only ``traffic_flows`` permission.
@@ -22,9 +24,11 @@ Design, sizing, privacy and the hardware plan: ``~/wyfy-ops/netflow/DESIGN.md``.
 * **Not the per-guest byte source of truth.** RADIUS accounting is.
 * **Not a legal record.** No raw flow and no NAT translation is stored; see
   DESIGN.md §6 for the archive that would be, and why it needs legal sign-off.
-* **Not a guest browsing history.** Talkers and destinations are stored as
-  two independent lists; no stored row links a guest to a destination.
+* **Not a guest browsing history.** Talkers, destinations and services are
+  stored as three independent lists; no stored row links a guest to a
+  destination, a guest to a service, or a service to a destination.
 
-Everything is gated by ``Settings.traffic_flow_enabled`` (default False) and
-``Settings.traffic_flow_router_ids`` (default empty).
+Everything is gated by ``Settings.traffic_flow_enabled`` (default False).
+Which routers export is the per-router switch in
+``router_traffic_flow_export``, set by a Master apply -- not a setting.
 """

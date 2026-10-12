@@ -13,7 +13,9 @@ parallel construction path.
 from __future__ import annotations
 
 from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.session import get_db_session
 from app.domains.content_filtering.dependencies import get_content_filter_service
 from app.domains.content_filtering.service import ContentFilterService
 from app.domains.dhcp.dependencies import get_dhcp_service
@@ -40,6 +42,7 @@ from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
 from app.domains.router_provisioning.dependencies import get_router_provisioning_service
 from app.domains.router_provisioning.service import RouterProvisioningService
+from app.domains.traffic_flow.service import TrafficFlowRepository
 from app.domains.vlan.dependencies import get_vlan_service
 from app.domains.vlan.service import VlanService
 from app.domains.wireguard.dependencies import get_wireguard_service
@@ -72,6 +75,7 @@ def get_network_config_service(
     content_filter_service: ContentFilterService = Depends(
         get_content_filter_service
     ),
+    session: AsyncSession = Depends(get_db_session),
 ) -> NetworkConfigService:
     return NetworkConfigService(
         dhcp_service,
@@ -106,6 +110,10 @@ def get_network_config_service(
         # ContentFilterService every other content-filtering endpoint
         # composes, never a second one.
         content_filter_lookup=content_filter_service,
+        # The per-router traffic-flow switch (router_traffic_flow_export),
+        # read on the request's own session. Only consulted while
+        # CLOUDGUEST_TRAFFIC_FLOW_ENABLED is on.
+        traffic_flow_export_lookup=TrafficFlowRepository(session),
     )
 
 

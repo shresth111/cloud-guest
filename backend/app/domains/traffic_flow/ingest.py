@@ -141,7 +141,9 @@ def _port(value: Any) -> int | None:
     return number if 0 <= number <= 65535 else None
 
 
-def _service_key(row: Mapping[str, Any], *, remote_is_dst: bool) -> tuple[int, int] | None:
+def _service_key(
+    row: Mapping[str, Any], *, remote_is_dst: bool
+) -> tuple[int, int] | None:
     """(protocol, remote port) for one row, or ``None`` when the row does not
     carry them. A protocol without ports reports 0 from the collector."""
     protocol = parse_protocol(row.get("ip_proto"))

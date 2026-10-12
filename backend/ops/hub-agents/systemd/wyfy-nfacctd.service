@@ -10,6 +10,9 @@ ExecStartPre=/usr/bin/install -d -o pmacct -g pmacct -m 0750 /var/spool/wyfy-flo
 ExecStart=/usr/sbin/nfacctd -f /etc/pmacct/wyfy-nfacctd.conf
 Restart=always
 RestartSec=5
+# /var/lib/wyfy-nfacctd, owned by the service user: the IPFIX template cache
+# (nfacctd_templates_file) that lets records decode straight after a restart.
+StateDirectory=wyfy-nfacctd
 User=pmacct
 Group=pmacct
 AmbientCapabilities=

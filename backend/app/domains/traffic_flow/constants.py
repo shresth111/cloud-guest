@@ -129,6 +129,8 @@ STALE_AFTER_SECONDS = 900
 #: data, not the legal connection record -- that is guest_sessions.
 RETENTION_DAYS = 7
 RETENTION_BATCH = 5000
+#: Service buckets deleted per sweep, as a multiple of RETENTION_BATCH.
+SERVICE_BUCKET_RETENTION_FACTOR = 20
 
 #: Windows requested from the hub agent per pull (one hour).
 MAX_WINDOWS_PER_PULL = 12
