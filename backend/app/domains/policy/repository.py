@@ -102,6 +102,10 @@ class PolicyRepositoryProtocol(Protocol):
         exclude_policy_id: uuid.UUID | None = None,
     ) -> PolicyAssignment | None: ...
 
+    async def count_active_guest_members(
+        self, policy_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]: ...
+
 
 class PolicyRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -228,6 +232,11 @@ class PolicyRepository:
                 (PolicyAssignment.scope_type == ScopeType.LOCATION.value)
                 & (PolicyAssignment.scope_id == location_id)
             )
+        # ``MEMBERS`` is deliberately absent from every branch below: it
+        # records that a tier is offered at a scope and applies it to no
+        # one (see ``PolicyAssignmentTargetType.MEMBERS``). Only an
+        # enumerated target shape can be a candidate, so a row with any
+        # other ``target_type`` is never selected.
         target_conditions = [
             PolicyAssignment.target_type == PolicyAssignmentTargetType.NONE.value
         ]
@@ -303,6 +312,28 @@ class PolicyRepository:
             stmt = stmt.where(PolicyAssignment.policy_id != exclude_policy_id)
         result = await self.session.execute(stmt)
         return result.scalars().first()
+
+    async def count_active_guest_members(
+        self, policy_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        """Active ``GUEST`` assignments per policy -- the "Members" figure
+        beside an Access Tier. One grouped statement for a whole page of
+        policies; a policy with no members is simply absent from the
+        result."""
+        if not policy_ids:
+            return {}
+        stmt = (
+            select(PolicyAssignment.policy_id, func.count(PolicyAssignment.id))
+            .where(
+                PolicyAssignment.policy_id.in_(policy_ids),
+                PolicyAssignment.is_active.is_(True),
+                PolicyAssignment.is_deleted.is_(False),
+                PolicyAssignment.target_type == PolicyAssignmentTargetType.GUEST.value,
+            )
+            .group_by(PolicyAssignment.policy_id)
+        )
+        result = await self.session.execute(stmt)
+        return {row[0]: int(row[1]) for row in result.all()}
 
 
 __all__ = ["PolicyRepositoryProtocol", "PolicyRepository"]

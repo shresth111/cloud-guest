@@ -139,6 +139,16 @@ class PolicyAssignmentTargetType(StrEnum):
     USER = "user"
     ROLE = "role"
     GUEST = "guest"
+    # "This policy is offered here, to its mapped members only." An Access
+    # Tier used to be mapped to a location with a ``NONE`` assignment --
+    # the very row that makes a policy the location's default -- so mapping
+    # a tier applied it to every guest at the venue, and the newest one
+    # won. ``MEMBERS`` records the mapping without making the policy a
+    # candidate for anyone: ``PolicyRepository.list_candidate_assignments``
+    # never selects it, so it grants nothing by itself. Who the tier applies
+    # to is said only by the ``GUEST`` assignments at the same scope.
+    # ``target_id`` is always ``NULL``.
+    MEMBERS = "members"
 
 
 class PolicyVersionStatus(StrEnum):

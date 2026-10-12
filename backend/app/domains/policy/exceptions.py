@@ -167,7 +167,7 @@ class PolicyAssignmentTargetIdRequiredError(PolicyError):
 class PolicyAssignmentTargetIdNotAllowedError(PolicyError):
     def __init__(self) -> None:
         super().__init__(
-            "target_id must not be set for target_type 'none'",
+            "target_id must not be set for target_type 'none' or 'members'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

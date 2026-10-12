@@ -98,7 +98,12 @@ def validate_assignment_target(*, target_type: str, target_id: object | None) ->
         resolved_target_type = PolicyAssignmentTargetType(target_type)
     except ValueError as exc:
         raise InvalidPolicyAssignmentTargetTypeError(target_type) from exc
-    if resolved_target_type == PolicyAssignmentTargetType.NONE:
+    if resolved_target_type in (
+        PolicyAssignmentTargetType.NONE,
+        # A tier-to-location mapping names no one: its members are the
+        # ``GUEST`` assignments beside it.
+        PolicyAssignmentTargetType.MEMBERS,
+    ):
         if target_id is not None:
             raise PolicyAssignmentTargetIdNotAllowedError()
     elif target_id is None:

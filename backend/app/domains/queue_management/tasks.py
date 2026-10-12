@@ -23,6 +23,7 @@ full guest/OTP/voucher/captive-portal graph that domain's own
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 from app.core.async_task_bridge import run_celery_task
@@ -120,6 +121,33 @@ class GuestSessionLiveness:
             )
             live.update(rows.scalars().all())
         return live
+
+    @staticmethod
+    def guest_ids_statement(session_ids: list[uuid.UUID]):  # noqa: ANN205
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.models import GuestSession  # noqa: PLC0415
+
+        return select(GuestSession.id, GuestSession.guest_id).where(
+            GuestSession.id.in_(session_ids),
+            GuestSession.is_deleted.is_(False),
+        )
+
+    async def guest_ids_for_sessions(  # noqa: ANN201
+        self, session_ids
+    ) -> dict[uuid.UUID, uuid.UUID | None]:
+        """Whose session each id is -- what lets a policy re-apply resolve
+        the speed for that guest instead of for nobody (see
+        ``QueueManagementService.reapply_active_sessions_for_location``).
+        Two columns, no row loaded and none locked."""
+        ids = list(session_ids)
+        found: dict[uuid.UUID, uuid.UUID | None] = {}
+        for start in range(0, len(ids), self._CHUNK):
+            rows = await self._session.execute(
+                self.guest_ids_statement(ids[start : start + self._CHUNK])
+            )
+            found.update({row[0]: row[1] for row in rows.all()})
+        return found
 
 
 class GuestSessionsWithoutQueue:
@@ -287,7 +315,7 @@ def _queue_backfill_max_per_run(settings: object) -> int:
 
 
 async def _reapply_policy_assignments_async(
-    policy_id: str, version_id: str
+    policy_id: str, version_id: str, location_id: str = ""
 ) -> dict[str, int]:
     """The actual async work behind ``reapply_policy_assignments`` -- a
     fresh session per task run, mirroring
@@ -359,6 +387,12 @@ async def _reapply_policy_assignments_async(
             and a.scope_type == "location"
             and a.scope_id is not None
         }
+        # A mapping that has just been deactivated is no longer among the
+        # active rows above, and its location is exactly the one whose
+        # guests must be re-resolved -- so the caller names it.
+        if location_id:
+            with contextlib.suppress(ValueError):
+                location_ids.add(uuid.UUID(location_id))
         # Whether this policy has ever stated a venue total. A venue that
         # never set one has no parent row on its routers to take away, so
         # its routers are not read for one -- a publish there costs exactly
@@ -438,7 +472,7 @@ async def _reapply_policy_assignments_async(
     max_retries=3,
 )
 def reapply_policy_assignments(
-    self, *, policy_id: str, version_id: str
+    self, *, policy_id: str, version_id: str, location_id: str = ""
 ) -> dict[str, int]:
     """Fired by the Policy router after a bandwidth-policy publish. Re-runs
     every live (ACTIVE) session queue assignment in the policy's mapped
@@ -449,7 +483,7 @@ def reapply_policy_assignments(
     per-item isolation) and does not fail the task."""
     try:
         result = run_celery_task(
-            _reapply_policy_assignments_async(policy_id, version_id)
+            _reapply_policy_assignments_async(policy_id, version_id, location_id)
         )
         logger.info(
             "queue_management_task_reapply_policy_assignments_completed",

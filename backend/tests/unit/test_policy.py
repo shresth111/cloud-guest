@@ -364,6 +364,20 @@ class FakePolicyRepository:
         matches.sort(key=lambda a: a.created_at)
         return matches[0] if matches else None
 
+    async def count_active_guest_members(
+        self, policy_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        counts: dict[uuid.UUID, int] = {}
+        for assignment in self.assignments.values():
+            if (
+                assignment.policy_id in policy_ids
+                and assignment.is_active
+                and not assignment.is_deleted
+                and assignment.target_type == "guest"
+            ):
+                counts[assignment.policy_id] = counts.get(assignment.policy_id, 0) + 1
+        return counts
+
 
 def _build_service() -> (
     tuple[

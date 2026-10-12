@@ -65,8 +65,9 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
 
-def _policy_response(policy: Policy) -> PolicyResponse:
+def _policy_response(policy: Policy, *, member_count: int = 0) -> PolicyResponse:
     return PolicyResponse(
+        member_count=member_count,
         id=str(policy.id),
         organization_id=str(policy.organization_id) if policy.organization_id else None,
         policy_type=PolicyType(policy.policy_type),
@@ -119,11 +120,18 @@ _REAPPLY_DISPATCH_COUNTDOWN_SECONDS = 3
 
 
 def _dispatch_bandwidth_reapply(
-    policy_id: uuid.UUID, *, version_id: uuid.UUID | None = None
+    policy_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID | None = None,
+    location_id: uuid.UUID | None = None,
 ) -> None:
     """Ask the worker to re-resolve the live guest queues this policy
     reaches. Never raises: the policy change it follows has already been
     saved and is correct for every next login either way.
+
+    ``location_id`` names a location the task could no longer find from
+    the policy's own active mappings -- the one a mapping was just removed
+    from.
 
     The task import is function-local to keep the module-import graph
     acyclic (see the note above the router definition)."""
@@ -141,6 +149,7 @@ def _dispatch_bandwidth_reapply(
             kwargs={
                 "policy_id": str(policy_id),
                 "version_id": str(version_id) if version_id is not None else "",
+                "location_id": str(location_id) if location_id is not None else "",
             },
             countdown=_REAPPLY_DISPATCH_COUNTDOWN_SECONDS,
         )
@@ -318,8 +327,12 @@ async def list_policies(
         page=page,
         page_size=page_size,
     )
+    member_counts = await service.member_counts([policy.id for policy in policies])
     payload = PolicyListResponse(
-        items=[_policy_response(policy) for policy in policies],
+        items=[
+            _policy_response(policy, member_count=member_counts.get(policy.id, 0))
+            for policy in policies
+        ],
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -354,8 +367,11 @@ async def get_policy(
     assignments = await service.list_assignments(
         policy_id=policy.id, requesting_organization_id=requesting_organization_id
     )
+    member_counts = await service.member_counts([policy.id])
     payload = PolicyDetailResponse(
-        **_policy_response(policy).model_dump(),
+        **_policy_response(
+            policy, member_count=member_counts.get(policy.id, 0)
+        ).model_dump(),
         versions=[_version_response(v) for v in versions],
         assignments=[_assignment_response(a) for a in assignments],
     )
@@ -385,6 +401,11 @@ async def deactivate_policy(
         requesting_organization_id=requesting_organization_id,
         actor_user_id=uuid.UUID(user.id),
     )
+    # Deleting a tier, or a location's own limits, changes what the guests
+    # already online are entitled to exactly as a publish does. The policy
+    # keeps its mappings, so the task still finds every location it reached,
+    # and resolution there no longer sees it.
+    _dispatch_bandwidth_reapply(policy_id)
     return build_response(
         success=True,
         message="Policy deactivated",
@@ -581,6 +602,16 @@ async def deactivate_policy_assignment(
         assignment_id=assignment_id,
         requesting_organization_id=requesting_organization_id,
         actor_user_id=uuid.UUID(user.id),
+    )
+    # Removing a member, or taking a tier off a location, must reach the
+    # guests who are online now -- they kept the tier's speed until their
+    # next sign-in. The mapping is no longer active, so its location is
+    # passed explicitly.
+    _dispatch_bandwidth_reapply(
+        policy_id,
+        location_id=(
+            assignment.scope_id if assignment.scope_type == "location" else None
+        ),
     )
     return build_response(
         success=True,
