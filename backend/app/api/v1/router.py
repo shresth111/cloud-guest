@@ -110,6 +110,9 @@ from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
 from app.domains.traffic_flow.customer_router import traffic_flow_customer_router
+from app.domains.traffic_flow.destinations_customer_router import (
+    traffic_flow_destinations_customer_router,
+)
 from app.domains.traffic_flow.destinations_router import (
     traffic_flow_destinations_platform_router,
 )
@@ -243,6 +246,9 @@ api_v1_router.include_router(traffic_flow_destinations_platform_router)
 # TRAFFIC_FLOW add-on (RequireFeature) and venue_traffic.read. Not on
 # _PAID_WRITES: it has no writes.
 api_v1_router.include_router(traffic_flow_customer_router)
+# Destinations for the same venue page: same three guards (the list is
+# imported from the customer router), read-only, every call audited.
+api_v1_router.include_router(traffic_flow_destinations_customer_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 # Cloudflare Gateway category filtering: the provider-backed half of the same

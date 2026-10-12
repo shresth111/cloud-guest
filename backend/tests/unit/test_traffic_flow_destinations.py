@@ -1291,7 +1291,7 @@ class TestStates:
         with pytest.raises(TrafficFlowError) as caught:
             await _service(backend).search(location_id=uuid.uuid4(), actor_user_id=USER)
         assert caught.value.status_code == 404
-        assert caught.value.code == "TRAFFIC_FLOW_VENUE_NOT_FOUND"
+        assert caught.value.code == "TRAFFIC_FLOW_LOCATION_NOT_FOUND"
 
 
 # ---------------------------------------------------------------------------
@@ -1615,7 +1615,7 @@ class TestScoping:
                 await call
             # Indistinguishable from a venue that does not exist.
             assert caught.value.status_code == 404
-            assert caught.value.code == "TRAFFIC_FLOW_VENUE_NOT_FOUND"
+            assert caught.value.code == "TRAFFIC_FLOW_LOCATION_NOT_FOUND"
         assert audit.entries == []
 
     async def test_the_statements_themselves_refuse_a_foreign_venue(
@@ -1713,15 +1713,12 @@ class TestMasterRoutes:
             assert pin[ScopeType] == ScopeType.GLOBAL
             assert pin[str] == "traffic_flows.read"
 
-    def test_mounted_and_no_customer_route_exists_yet(self) -> None:
+    def test_mounted_under_the_platform_prefix(self) -> None:
         from app.api.v1.router import api_v1_router
 
         paths = {r.path for r in api_v1_router.routes}
         for path, _method in self.ROUTES:
             assert f"/platform/traffic-flow{path}" in paths
-        assert not any(
-            "destinations" in p and not p.startswith("/platform/") for p in paths
-        )
 
     def test_no_route_takes_a_device_parameter(self) -> None:
         from app.domains.traffic_flow.destinations_router import (
@@ -1829,6 +1826,329 @@ class TestMasterRoutes:
             "traffic_flow_service_destinations_viewed",
         ]
         assert {e["actor_user_id"] for e in audit.entries} == {USER}
+
+
+# ---------------------------------------------------------------------------
+# customer routes
+# ---------------------------------------------------------------------------
+
+LOC_A2 = uuid.UUID("aaaaaaaa-0000-4000-8000-0000000000a9")
+
+
+class Lookup:
+    """Stands in for ``LocationService.get_location``: the real one raises
+    for a missing venue and for another organisation's."""
+
+    owner = {LOC_A: ORG_A, LOC_A2: ORG_A, LOC_B: ORG_B}
+
+    async def get_location(self, location_id, *, requesting_organization_id=None):  # noqa: ANN001
+        from app.domains.location.exceptions import (
+            CrossOrganizationLocationAccessError,
+            LocationNotFoundError,
+        )
+
+        if location_id not in self.owner:
+            raise LocationNotFoundError(location_id)
+        if self.owner[location_id] != requesting_organization_id:
+            raise CrossOrganizationLocationAccessError()
+        return SimpleNamespace(id=location_id, organization_id=self.owner[location_id])
+
+
+def _customer(
+    backend: Any,
+    audit: Audit | None = None,
+    *,
+    confined_to: frozenset[uuid.UUID] | None = None,
+) -> Any:
+    """The customer service as the route builds it: the REAL venue check of
+    the customer venue routes in front of the destination reads."""
+    from app.domains.traffic_flow.destinations import CustomerDestinationService
+    from app.domains.traffic_flow.service import TrafficFlowCustomerService
+
+    venues = TrafficFlowCustomerService(
+        object(),  # type: ignore[arg-type]
+        Lookup(),
+        _settings(traffic_flow_agent_url="", traffic_flow_agent_secret=""),
+        caller_location_scope=confined_to,
+        now=lambda: NOW,
+    )
+    return CustomerDestinationService(_service(backend, audit), venues)
+
+
+def _dependency_calls(dependant: Any) -> set[Any]:
+    calls = {d.call for d in dependant.dependencies}
+    for d in dependant.dependencies:
+        calls |= _dependency_calls(d)
+    return calls
+
+
+class TestCustomerRoutes:
+    PATHS = (
+        "/traffic-flow/locations/{location_id}/destinations",
+        "/traffic-flow/locations/{location_id}/destinations/export",
+        "/traffic-flow/locations/{location_id}/services/destinations",
+    )
+
+    @staticmethod
+    def _routes() -> list[Any]:
+        from app.domains.traffic_flow.destinations_customer_router import (
+            traffic_flow_destinations_customer_router as router,
+        )
+
+        return list(router.routes)
+
+    def test_read_only_and_only_these_three(self) -> None:
+        assert sorted((sorted(r.methods), r.path) for r in self._routes()) == sorted(
+            (["GET"], path) for path in self.PATHS
+        )
+
+    def test_every_route_carries_the_customer_venue_routes_own_guards(self) -> None:
+        """Not three guards that look the same: the very same three objects,
+        so the add-on key and the permission cannot drift apart."""
+        from app.domains.billing.constants import PlanFeatureKey
+        from app.domains.rbac.dependencies import RequireOrganization
+        from app.domains.traffic_flow import customer_router
+
+        expected = [g.dependency for g in customer_router._GUARDS]  # noqa: SLF001
+        assert len(expected) == 3 and expected[0] is RequireOrganization
+
+        def closure(call: Any) -> list[Any]:
+            return [c.cell_contents for c in (getattr(call, "__closure__", None) or ())]
+
+        assert PlanFeatureKey.TRAFFIC_FLOW in closure(expected[1])
+        assert "venue_traffic.read" in closure(expected[2])
+        assert ScopeType.LOCATION in closure(expected[2])
+        for route in self._routes():
+            guards = [d.dependency for d in route.dependencies]
+            assert len(guards) == 3, route.path
+            for mine, theirs in zip(guards, expected, strict=True):
+                assert mine is theirs, route.path
+
+    def test_every_route_resolves_organization_location_and_confinement(self) -> None:
+        from app.domains.rbac.dependencies import (
+            CurrentLocation,
+            CurrentOrganization,
+            RequireOrganization,
+        )
+        from app.domains.rbac.location_scope import CallerLocationScope
+
+        for route in self._routes():
+            calls = _dependency_calls(route.dependant)
+            assert RequireOrganization in calls, route.path
+            assert CurrentOrganization in calls, route.path
+            assert CurrentLocation in calls, route.path
+            assert CallerLocationScope in calls, route.path
+
+    def test_no_route_takes_an_organisation_a_threshold_or_a_device(self) -> None:
+        for route in self._routes():
+            assert {p.name for p in route.dependant.path_params} == {"location_id"}
+            names = {p.name for p in route.dependant.query_params}
+            assert names <= {
+                "router_id",
+                "since",
+                "until",
+                "address",
+                "protocol",
+                "port",
+                "direction",
+                "sort",
+                "order",
+                "limit",
+            }, (route.path, names)
+            assert route.dependant.body_params == []
+
+    def test_mounted_outside_the_platform_prefix(self) -> None:
+        from app.api.v1.router import api_v1_router
+
+        paths = {r.path for r in api_v1_router.routes}
+        for path in self.PATHS:
+            assert path in paths
+
+    async def test_the_organisation_and_the_small_venue_rule_are_fixed(
+        self, backend
+    ) -> None:
+        await seed(backend)
+        audit = Audit()
+        out = await _customer(backend, audit).search(
+            LOC_A, organization_id=ORG_A, actor_user_id=USER
+        )
+        assert (out.min_devices, out.windows, out.windows_withheld) == (5, 3, 1)
+        assert out.total == 8
+        assert PLAIN_WEB not in {r.address for r in out.rows}
+        (entry,) = audit.entries
+        assert entry["event_metadata"]["console"] == "customer"
+        assert entry["organization_id"] == ORG_A and entry["actor_user_id"] == USER
+
+    async def test_a_route_cannot_switch_the_rule_off_or_name_another_venue(
+        self, backend
+    ) -> None:
+        await seed(backend)
+        service = _customer(backend)
+        out = await service.search(
+            LOC_A,
+            organization_id=ORG_A,
+            actor_user_id=USER,
+            min_devices=0,
+        )
+        assert (out.min_devices, out.total) == (5, 8)
+        with pytest.raises(TypeError):
+            await service.search(
+                LOC_A, organization_id=ORG_A, actor_user_id=USER, location_id=LOC_B
+            )
+
+    async def test_another_organisations_venue_is_a_404_and_nothing_is_read(
+        self, backend
+    ) -> None:
+        from app.domains.traffic_flow.service import TrafficFlowLocationNotFoundError
+
+        await seed(backend)
+        audit = Audit()
+        service = _customer(backend, audit)
+        for call in (
+            service.search(LOC_B, organization_id=ORG_A, actor_user_id=USER),
+            service.export_csv(LOC_B, organization_id=ORG_A, actor_user_id=USER),
+            service.service_destinations(
+                LOC_B, organization_id=ORG_A, actor_user_id=USER, protocol=6, port=443
+            ),
+            # A venue that does not exist gets the same answer.
+            service.search(uuid.uuid4(), organization_id=ORG_A, actor_user_id=USER),
+        ):
+            with pytest.raises(TrafficFlowLocationNotFoundError) as caught:
+                await call
+            assert caught.value.status_code == 404
+            assert caught.value.data["code"] == "TRAFFIC_FLOW_LOCATION_NOT_FOUND"
+        assert audit.entries == []
+
+    async def test_a_caller_confined_to_one_venue_cannot_read_a_sibling(
+        self, backend
+    ) -> None:
+        from app.domains.traffic_flow.service import TrafficFlowCrossLocationError
+
+        await seed(backend)
+        audit = Audit()
+        service = _customer(backend, audit, confined_to=frozenset({LOC_A}))
+        assert (
+            await service.search(LOC_A, organization_id=ORG_A, actor_user_id=USER)
+        ).total == 8
+        for call in (
+            service.search(LOC_A2, organization_id=ORG_A, actor_user_id=USER),
+            service.export_csv(LOC_A2, organization_id=ORG_A, actor_user_id=USER),
+            service.service_destinations(
+                LOC_A2, organization_id=ORG_A, actor_user_id=USER, protocol=6, port=443
+            ),
+        ):
+            with pytest.raises(TrafficFlowCrossLocationError) as caught:
+                await call
+            assert caught.value.status_code == 403
+        assert len(audit.entries) == 1
+
+    async def test_the_download_and_the_drill_down_follow_the_same_rules(
+        self, backend
+    ) -> None:
+        await seed(backend)
+        service = _customer(backend)
+        export = await service.export_csv(
+            LOC_A, organization_id=ORG_A, actor_user_id=USER
+        )
+        assert (export.total, export.rows) == (8, 8)
+        assert PLAIN_WEB not in export.text
+        drill = await service.service_destinations(
+            LOC_A, organization_id=ORG_A, actor_user_id=USER, protocol=6, port=443
+        )
+        assert (drill.min_devices, drill.windows_withheld) == (5, 1)
+        assert drill.service is not None and drill.service.bytes == 1955 + 2200
+
+    def test_over_http(self) -> None:
+        """What a customer actually receives: no platform switch, none of
+        the words that describe how the data is collected, and a header
+        naming another venue is refused."""
+        import asyncio
+        import json
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.common.exceptions import register_exception_handlers
+        from app.domains.rbac.dependencies import (
+            CurrentLocation,
+            CurrentUser,
+            RequireOrganization,
+        )
+        from app.domains.traffic_flow import customer_router
+        from app.domains.traffic_flow import destinations_customer_router as module
+
+        memory = MemoryBackend()
+        asyncio.run(seed(memory))
+        audit = Audit()
+        header: dict[str, uuid.UUID | None] = {"location": None}
+        app = FastAPI()
+        register_exception_handlers(app)
+        app.include_router(module.traffic_flow_destinations_customer_router)
+        user = SimpleNamespace(id=str(USER))
+        for guard in customer_router._GUARDS:  # noqa: SLF001
+            app.dependency_overrides[guard.dependency] = lambda: user
+        app.dependency_overrides[RequireOrganization] = lambda: ORG_A
+        app.dependency_overrides[CurrentLocation] = lambda: header["location"]
+        app.dependency_overrides[CurrentUser] = lambda: user
+        app.dependency_overrides[module.get_customer_destination_service] = lambda: (
+            _customer(memory, audit)
+        )
+        client = TestClient(app)
+        base = f"/traffic-flow/locations/{LOC_A}"
+
+        found = client.get(f"{base}/destinations")
+        assert found.status_code == 200, found.text
+        data = found.json()["data"]
+        assert "feature_enabled" not in data
+        assert (data["min_devices"], data["windows_withheld"], data["total"]) == (
+            5,
+            1,
+            8,
+        )
+
+        drill = client.get(
+            f"{base}/services/destinations", params={"protocol": 6, "port": 443}
+        )
+        assert (
+            drill.status_code == 200 and "feature_enabled" not in drill.json()["data"]
+        )
+
+        export = client.get(f"{base}/destinations/export", params={"port": 443})
+        assert export.status_code == 200
+        assert export.headers["x-total-rows"] == "6"
+        assert len(export.text.splitlines()) == 7
+
+        foreign = client.get(f"/traffic-flow/locations/{LOC_B}/destinations")
+        assert foreign.status_code == 404
+        old = client.get(
+            f"{base}/destinations",
+            params={"since": "2026-09-01T00:00:00Z", "until": "2026-09-02T00:00:00Z"},
+        )
+        assert old.status_code == 422
+        bad = client.get(f"{base}/destinations", params={"address": "nonsense"})
+        assert bad.status_code == 422
+
+        header["location"] = LOC_A2
+        crossed = client.get(f"{base}/destinations")
+        assert crossed.status_code == 403
+        header["location"] = LOC_A
+        assert client.get(f"{base}/destinations").status_code == 200
+
+        said = json.dumps(
+            [r.json() for r in (found, drill, foreign, old, bad, crossed)]
+        ).lower()
+        for word in (
+            "tunnel",
+            "wireguard",
+            "exporter",
+            "collector",
+            "netflow",
+            "ipfix",
+        ):
+            assert word not in said, word
+        for device in DEVICES:
+            assert device not in said and device not in export.text
+        assert len(audit.entries) == 4
 
 
 # ---------------------------------------------------------------------------

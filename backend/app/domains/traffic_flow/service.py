@@ -1114,6 +1114,13 @@ class TrafficFlowCustomerService:
         )
         return location.id
 
+    async def own_location(
+        self, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> uuid.UUID:
+        """The venue check, for the sibling customer routes that read other
+        tables of this domain (Destinations). Same check, same errors."""
+        return await self._own_location(location_id, organization_id)
+
     async def _collection(self, location_id: uuid.UUID) -> dict[str, Any]:
         now = self.now()
         routers = await self.repository.fleet_routers(location_id=location_id)

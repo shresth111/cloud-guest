@@ -1182,14 +1182,18 @@ class TestAuthorization:
 
         paths = {r.path for r in api_v1_router.routes}
         assert "/platform/traffic-flow/overview" in paths
-        # Outside /platform there are exactly the two read-only customer
-        # routes (behind the add-on and venue_traffic.read) and nothing else:
-        # no Master route is reachable without the GLOBAL pin.
+        # Outside /platform there are exactly the read-only customer routes
+        # (the venue view's two and the Destinations three, all behind the
+        # add-on and venue_traffic.read) and nothing else: no Master route is
+        # reachable without the GLOBAL pin.
         assert {
             p for p in paths if "traffic-flow" in p and not p.startswith("/platform/")
         } == {
             "/traffic-flow/locations/{location_id}/status",
             "/traffic-flow/locations/{location_id}/summary",
+            "/traffic-flow/locations/{location_id}/destinations",
+            "/traffic-flow/locations/{location_id}/destinations/export",
+            "/traffic-flow/locations/{location_id}/services/destinations",
         }
 
     def test_module_is_global_only(self) -> None:

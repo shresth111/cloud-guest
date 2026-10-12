@@ -54,6 +54,7 @@ from app.core.logging import get_logger
 from app.domains.location.models import Location
 
 from .constants import (
+    CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
     DEFAULT_LIST_LIMIT,
     DEFAULT_QUERY_WINDOW_SECONDS,
     MAX_LIST_LIMIT,
@@ -81,6 +82,7 @@ __all__ = [
     "DESTINATION_SEARCH_LIMIT",
     "RESPONSE_MODELS",
     "CsvExport",
+    "CustomerDestinationService",
     "DestinationFilters",
     "DestinationRepository",
     "DestinationScope",
@@ -1025,7 +1027,7 @@ class DestinationService:
             # not exist.
             raise TrafficFlowError(
                 "Venue not found.",
-                code="TRAFFIC_FLOW_VENUE_NOT_FOUND",
+                code="TRAFFIC_FLOW_LOCATION_NOT_FOUND",
                 status_code=status.HTTP_404_NOT_FOUND,
             )
         return _Request(
@@ -1369,4 +1371,81 @@ class DestinationService:
             unlisted_bytes=unlisted_bytes,
             unlisted_share=_share(unlisted_bytes, service.bytes if service else 0),
             items=items,
+        )
+
+
+# ---------------------------------------------------------------------------
+# customer side
+# ---------------------------------------------------------------------------
+
+
+class VenueCheck(Protocol):
+    """``TrafficFlowCustomerService.own_location``: the venue is the
+    caller's organisation's and inside the caller's own venues, or it
+    raises (404 for a missing or foreign venue, 403 for a sibling venue)."""
+
+    async def own_location(
+        self, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> uuid.UUID: ...
+
+
+class CustomerDestinationService:
+    """The same three reads for a customer caller.
+
+    What a customer route must never be able to leave out is fixed here
+    rather than passed by each route: the venue check (organisation and the
+    caller's venue grants), the organisation on every statement, and the
+    small-venue rule. A route hands over the path's venue, the caller's
+    organisation as the request context resolved it, and the filters."""
+
+    def __init__(self, destinations: DestinationService, venues: VenueCheck) -> None:
+        self.destinations = destinations
+        self.venues = venues
+
+    async def _fixed(
+        self, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> dict[str, Any]:
+        return {
+            "location_id": await self.venues.own_location(location_id, organization_id),
+            "organization_id": organization_id,
+            "min_devices": CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
+        }
+
+    async def search(
+        self,
+        location_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None,
+        **query: Any,
+    ) -> DestinationSearchResponse:
+        fixed = await self._fixed(location_id, organization_id)
+        return await self.destinations.search(
+            **{**query, **fixed, "actor_user_id": actor_user_id}
+        )
+
+    async def export_csv(
+        self,
+        location_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None,
+        **query: Any,
+    ) -> CsvExport:
+        fixed = await self._fixed(location_id, organization_id)
+        return await self.destinations.export_csv(
+            **{**query, **fixed, "actor_user_id": actor_user_id}
+        )
+
+    async def service_destinations(
+        self,
+        location_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None,
+        **query: Any,
+    ) -> ServiceDestinationsResponse:
+        fixed = await self._fixed(location_id, organization_id)
+        return await self.destinations.service_destinations(
+            **{**query, **fixed, "actor_user_id": actor_user_id}
         )
