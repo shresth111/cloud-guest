@@ -52,7 +52,11 @@ from .constants import (
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from .repository import QueueManagementRepository
-from .service import QueueManagementService, SessionWithoutQueue
+from .service import (
+    QueueManagementService,
+    SessionWithoutQueue,
+    venue_cap_from_rules,
+)
 
 logger = get_logger(__name__)
 
@@ -389,6 +393,14 @@ async def _reapply_policy_assignments_async(
         if location_id:
             with contextlib.suppress(ValueError):
                 location_ids.add(uuid.UUID(location_id))
+        # Whether this policy has ever stated a venue total. A venue that
+        # never set one has no parent row on its routers to take away, so
+        # its routers are not read for one -- a publish there costs exactly
+        # the device calls it cost before venue totals existed.
+        ever_capped = any(
+            venue_cap_from_rules(version.rules) is not None
+            for version in await policy_repository.list_versions_for_policy(policy.id)
+        )
         total_reapplied = 0
         total_failed = 0
         total_assigned = 0
@@ -402,6 +414,7 @@ async def _reapply_policy_assignments_async(
                 # One assignment's failed statement is rolled back on its
                 # own instead of aborting the transaction the rest share.
                 unit_of_work=session.begin_nested,
+                clear_venue_cap_when_uncapped=ever_capped,
             )
             total_reapplied += result["reapplied"]
             total_failed += result["failed"]
@@ -419,6 +432,31 @@ async def _reapply_policy_assignments_async(
                 )
                 total_assigned += backfilled["assigned"]
                 total_failed += backfilled["failed"]
+        # A location this policy used to be mapped to and is not any more
+        # still has the policy's parent row on its routers. It is brought
+        # in line with whatever its bandwidth policy is *now* -- another
+        # policy's total, or none.
+        if ever_capped:
+            formerly = {
+                a.scope_id
+                for a in assignments
+                if not a.is_active
+                and a.scope_type == "location"
+                and a.scope_id is not None
+            } - location_ids
+            for location_id in sorted(formerly, key=str):
+                try:
+                    async with session.begin_nested():
+                        await service.sync_venue_cap_for_location(
+                            location_id=location_id,
+                            requesting_organization_id=policy.organization_id,
+                        )
+                except Exception as exc:  # noqa: BLE001 -- per-location isolation
+                    total_failed += 1
+                    logger.warning(
+                        "venue_cap_sync_failed",
+                        extra={"location_id": str(location_id), "error": str(exc)},
+                    )
         await session.commit()
         return {
             "reapplied": total_reapplied,
@@ -596,6 +634,8 @@ async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
         "skipped_address_in_use": 0,
         "retargeted": 0,
         "retarget_failed": 0,
+        "venue_caps_written": 0,
+        "venue_caps_failed": 0,
     }
     if not _queue_backfill_is_on_anywhere(settings):
         return result
@@ -655,6 +695,16 @@ async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
         )
         result["retargeted"] = moved["retargeted"]
         result["retarget_failed"] = moved["failed"]
+        # A venue's total cap that did not reach a router when it was saved
+        # (the router was not answering), or whose parent row has since
+        # gone. Same switch as the two above; one read per router that has
+        # a guest online, and no write where the router already matches.
+        venue = await service.sync_venue_caps_for_live_locations(
+            router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+            unit_of_work=session.begin_nested,
+        )
+        result["venue_caps_written"] = venue["wrote"]
+        result["venue_caps_failed"] = venue["failed"]
         await session.commit()
         return result
 

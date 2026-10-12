@@ -38,8 +38,14 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 
-from .constants import QueueScheduleType, QueueStatus, QueueTargetType
+from .constants import (
+    UNENFORCED_QUEUE_TARGET_TYPES,
+    QueueScheduleType,
+    QueueStatus,
+    QueueTargetType,
+)
 from .dependencies import get_queue_management_service
+from .exceptions import QueueTargetTypeNotEnforcedError
 from .models import QueueAssignment, QueueProfile, QueueSchedule, QueueTemplate
 from .schemas import (
     MessageResponse,
@@ -338,10 +344,17 @@ async def create_queue_assignment(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: QueueManagementService = Depends(get_queue_management_service),
 ):
+    target_type = QueueTargetType(payload.target_type)
+    # Refused at the door rather than in ``create_assignment``: that method
+    # is also how this service builds its own rows, and existing rows of
+    # these types are not what is being withdrawn -- accepting *new* ones
+    # from a screen is. See ``constants.UNENFORCED_QUEUE_TARGET_TYPES``.
+    if target_type in UNENFORCED_QUEUE_TARGET_TYPES:
+        raise QueueTargetTypeNotEnforcedError(target_type.value)
     assignment = await service.create_assignment(
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
-        target_type=QueueTargetType(payload.target_type),
+        target_type=target_type,
         target_id=uuid.UUID(payload.target_id) if payload.target_id else None,
         router_id=uuid.UUID(payload.router_id) if payload.router_id else None,
         location_id=uuid.UUID(payload.location_id) if payload.location_id else None,

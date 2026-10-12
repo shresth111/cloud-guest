@@ -43,7 +43,17 @@ def validate_rules(policy_type: PolicyType, rules: dict[str, Any]) -> dict[str, 
     try:
         validated = schema.model_validate(rules)
     except ValidationError as exc:
-        raise PolicyRulesValidationError(policy_type.value, str(exc)) from exc
+        raise PolicyRulesValidationError(
+            policy_type.value,
+            str(exc),
+            field_errors=[
+                {
+                    "field": ".".join(str(part) for part in error["loc"]),
+                    "message": str(error["msg"]).removeprefix("Value error, "),
+                }
+                for error in exc.errors()
+            ],
+        ) from exc
     return validated.model_dump()
 
 

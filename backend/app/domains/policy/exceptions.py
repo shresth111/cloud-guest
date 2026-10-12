@@ -99,10 +99,21 @@ class PolicyRulesValidationError(PolicyError):
     ``schemas.POLICY_RULE_SCHEMAS`` -- see that registry's own docstring for
     which types have a concrete schema vs. the generic passthrough."""
 
-    def __init__(self, policy_type: str, detail: str) -> None:
+    def __init__(
+        self,
+        policy_type: str,
+        detail: str,
+        *,
+        field_errors: list[dict[str, str]] | None = None,
+    ) -> None:
+        # ``field_errors`` is the same refusal, one entry per offending
+        # field (``{"field": ..., "message": ...}``), so a form can put the
+        # sentence beside the input it is about instead of parsing the
+        # message above. Additive: the message and status are unchanged.
         super().__init__(
             f"Invalid rules payload for policy type '{policy_type}': {detail}",
             status_code=status.HTTP_400_BAD_REQUEST,
+            data={"field_errors": field_errors} if field_errors else None,
         )
 
 
