@@ -28,8 +28,9 @@ SMTP passwords next to it in ``Settings``:
 
 * read from ``Settings.slack_onboarding_webhook_url``
   (``CLOUDGUEST_SLACK_ONBOARDING_WEBHOOK_URL``), which in production comes
-  from the ``cloudguest/prod/slack`` Secrets Manager secret via
-  ``deploy/remote-deploy.sh``'s ``materialise_slack_env``;
+  from the ``cloudguest/prod/mail`` Secrets Manager secret via
+  ``deploy/remote-deploy.sh``'s ``materialise_slack_env`` (that script's
+  ``SLACK_SECRET_ID`` comment explains why it shares the mail secret);
 * never committed, never written to any database column (a Slack outbox
   row's ``recipient`` is the constant label
   ``SLACK_ONBOARDING_RECIPIENT``), and
