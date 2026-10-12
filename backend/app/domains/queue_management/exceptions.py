@@ -16,6 +16,7 @@ from app.common.exceptions import CloudGuestError
 from app.domains.router.device_domain_gate import unsupported_vendor_message
 
 __all__ = [
+    "QueueTargetTypeNotEnforcedError",
     "QueueTargetNotLanAddressError",
     "QueueTargetNotOnRouterError",
     "QueueManagementError",
@@ -252,6 +253,27 @@ class QueueTargetNotOnRouterError(QueueManagementError):
             "device, so there is no address a queue could target yet. It "
             "is assigned once the device is seen on the venue's network.",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class QueueTargetTypeNotEnforcedError(QueueManagementError):
+    """A new speed limit was asked for on a whole organization, location or
+    router.
+
+    Those three target types were saved and never enforced: nothing reads
+    an organization or location row, and a router row was pushed with no
+    target. Accepting the request would show the venue a saved limit that
+    limits nobody, so it is refused -- and the refusal says where the thing
+    they were after actually lives."""
+
+    def __init__(self, target_type: str) -> None:
+        super().__init__(
+            f"A speed limit for a whole {target_type} is not supported on "
+            "this venue's hardware yet, so nothing was saved. To cap the "
+            "total speed all guests share at a venue, set the venue's total "
+            "speed in Guest WiFi Limits.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            data={"target_type": target_type},
         )
 
 

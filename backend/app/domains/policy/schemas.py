@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from .constants import PolicyType, PolicyVersionStatus
 
@@ -44,6 +44,9 @@ __all__ = [
     "DevicePolicyRules",
     "GenericPolicyRules",
     "POLICY_RULE_SCHEMAS",
+    "VENUE_RATE_MIN_KBPS",
+    "VENUE_RATE_MAX_KBPS",
+    "with_venue_rate_keys",
     "PolicyCreateRequest",
     "PolicyVersionCreateRequest",
     "PolicyAssignmentCreateRequest",
@@ -61,6 +64,13 @@ __all__ = [
 # Rule payload schemas -- validated shape of PolicyVersion.rules per
 # PolicyType. See module docstring.
 # ============================================================================
+
+#: Bounds for a venue's total speed cap (``BandwidthPolicyRules
+#: .venue_*_rate_kbps``). 1 Mbps is the least a venue-wide total can be and
+#: still be a venue; 10 Gbps is above any uplink these routers have, and is
+#: there to stop a value typed in the wrong unit, not to be reached.
+VENUE_RATE_MIN_KBPS = 1024
+VENUE_RATE_MAX_KBPS = 10_000_000
 
 
 class SessionPolicyRules(BaseModel):
@@ -162,10 +172,32 @@ class BandwidthPolicyRules(BaseModel):
     touched -- reading as "Edit is broken" even though nothing else about
     it was. All six are optional here (``None``/empty means "not set") so
     a policy created before this change, or directly via the API with only
-    rate fields, still validates."""
+    rate fields, still validates.
+
+    ``venue_download_rate_kbps``/``venue_upload_rate_kbps`` are the one
+    pair here that is *not* per guest: the total every guest at the venue
+    shares, in each direction. ``None`` (or absent -- every version saved
+    before these existed) means the venue has no total cap, and each
+    direction stands alone: a venue may cap downloads and leave uploads
+    open. ``queue_management`` enforces them as one parent ``/queue simple``
+    per router with every guest's own row under it (see
+    ``QueueManagementService.sync_venue_cap_for_location``); they are
+    enforced on routers this platform logs in to and nowhere else.
+
+    A total below what one guest is allowed is refused rather than stored:
+    the venue would have saved "each guest 40 Mbps, everyone together
+    20 Mbps" and the first number would be a promise nothing keeps. A
+    per-guest rate of ``0`` is this codebase's "unlimited" and is not
+    compared."""
 
     download_rate_kbps: int = Field(..., ge=0)
     upload_rate_kbps: int = Field(..., ge=0)
+    venue_download_rate_kbps: int | None = Field(
+        default=None, ge=VENUE_RATE_MIN_KBPS, le=VENUE_RATE_MAX_KBPS
+    )
+    venue_upload_rate_kbps: int | None = Field(
+        default=None, ge=VENUE_RATE_MIN_KBPS, le=VENUE_RATE_MAX_KBPS
+    )
     burst_download_kbps: int | None = Field(default=None, ge=0)
     burst_upload_kbps: int | None = Field(default=None, ge=0)
     burst_threshold_kbps: int | None = Field(default=None, ge=0)
@@ -179,6 +211,63 @@ class BandwidthPolicyRules(BaseModel):
     data_limit: GroupDataLimitRules | None = None
 
     model_config = ConfigDict(extra="forbid")
+
+    # Field validators rather than one model validator, so the error names
+    # the field the venue has to change. The per-guest rates are declared
+    # first and are therefore already in ``info.data`` -- absent from it only
+    # when they failed their own validation, which is reported on its own.
+    @field_validator("venue_download_rate_kbps")
+    @classmethod
+    def _venue_download_covers_one_guest(
+        cls, value: int | None, info: ValidationInfo
+    ) -> int | None:
+        return _venue_rate_covers_one_guest(
+            value, info.data.get("download_rate_kbps"), direction="download"
+        )
+
+    @field_validator("venue_upload_rate_kbps")
+    @classmethod
+    def _venue_upload_covers_one_guest(
+        cls, value: int | None, info: ValidationInfo
+    ) -> int | None:
+        return _venue_rate_covers_one_guest(
+            value, info.data.get("upload_rate_kbps"), direction="upload"
+        )
+
+
+def _venue_rate_covers_one_guest(
+    venue_rate: int | None, per_guest_rate: object, *, direction: str
+) -> int | None:
+    if (
+        venue_rate is not None
+        and isinstance(per_guest_rate, int)
+        and per_guest_rate > 0
+        and venue_rate < per_guest_rate
+    ):
+        raise ValueError(
+            f"the venue's total {direction} speed ({venue_rate} kbps) cannot be "
+            f"lower than the {direction} speed one guest is allowed "
+            f"({per_guest_rate} kbps)"
+        )
+    return venue_rate
+
+
+def with_venue_rate_keys(rules: dict[str, Any]) -> dict[str, Any]:
+    """``rules`` with both venue-total keys present, ``None`` where unset.
+
+    A bandwidth version saved before those keys existed does not carry
+    them, and a reader that asks ``rules.venue_download_rate_kbps`` should
+    get "no cap", not ``undefined``. Applied on the way out only -- the
+    stored row is not rewritten. Recognised by the two per-guest rate keys,
+    which no other policy type's rules carry; anything else is returned
+    untouched."""
+    if "download_rate_kbps" not in rules or "upload_rate_kbps" not in rules:
+        return rules
+    return {
+        **rules,
+        "venue_download_rate_kbps": rules.get("venue_download_rate_kbps"),
+        "venue_upload_rate_kbps": rules.get("venue_upload_rate_kbps"),
+    }
 
 
 class QoSPolicyRules(BaseModel):

@@ -139,6 +139,7 @@ from .contract import (
     SpeedTestResult,
     TracerouteHop,
     TracerouteResult,
+    VenueQueueSyncResult,
     VlanConfig,
     VlanHotspotConfig,
     WanHealth,
@@ -7482,6 +7483,7 @@ class MikroTikAdapter:
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = 8,
+        parent: str | None = None,
     ) -> str:
         fields = {
             "name": name,
@@ -7495,6 +7497,8 @@ class MikroTikAdapter:
             ),
             "priority": str(priority),
         }
+        if parent:
+            fields["parent"] = parent
         return await asyncio.to_thread(
             self._queue_add_sync,
             creds,
@@ -7502,6 +7506,283 @@ class MikroTikAdapter:
             fields,
             "create_simple_queue",
         )
+
+    async def sync_venue_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+        targets: Sequence[str] | None = None,
+        comment: str | None = None,
+    ) -> VenueQueueSyncResult:
+        """One parent ``/queue simple`` holding a venue's total speed, with
+        each listed guest row under it.
+
+        ## Why a parent row
+
+        Every guest already has a row of their own, limiting that guest. A
+        venue's total -- "everyone together gets no more than this" -- is a
+        limit on their sum, and in ``/queue simple`` that is a row whose
+        ``target`` is the guest subnet with the guests' rows as its
+        children (``parent=<name>``). A packet is matched against the
+        top-level rows in list order; it enters the first one whose target
+        it matches, and inside that row it goes to the first matching
+        child. A packet that matches the parent and no child -- a bypassed
+        or trusted device, a guest whose own row has not been written yet
+        -- is still held by the parent's own limit.
+
+        ## Why it has to be first
+
+        Because the first matching top-level row takes the packet. A
+        top-level row for one guest's address that sits *above* the parent
+        (a dynamic hotspot queue made from a RADIUS rate-limit reply is
+        the real case; the hotspot inserts those at the top) takes that
+        guest's traffic out of the total. So the parent is moved to the top
+        whenever it is not there, and the read-back names any top-level row
+        still above it.
+
+        ## What is not established on hardware
+
+        That RouterOS accepts ``parent`` over the API on ``add`` and
+        ``set`` as written here; that it lets a static row be moved above a
+        dynamic one; where it lists a child relative to its parent after
+        ``set parent=``; and that a child whose target is outside the
+        parent's target behaves as a plain mismatch rather than an error.
+        Nothing here assumes any of them: every write is followed by a
+        read of the whole list, and ``in_sync``/``problems`` describe what
+        the device then holds.
+
+        Idempotent. A device that already matches costs one read and no
+        write."""
+        return await asyncio.to_thread(
+            self._sync_venue_simple_queue_sync,
+            creds,
+            name,
+            download_rate_kbps,
+            upload_rate_kbps,
+            tuple(str(i) for i in child_queue_ids if i),
+            None if targets is None else tuple(targets),
+            comment,
+        )
+
+    def _sync_venue_simple_queue_sync(
+        self,
+        creds: DeviceCredentials,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: tuple[str, ...],
+        targets: tuple[str, ...] | None,
+        comment: str | None,
+    ) -> VenueQueueSyncResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if targets is None:
+                    targets = _hotspot_guest_networks(api)
+                wanted_targets = tuple(sorted({t.strip() for t in targets if t.strip()}))
+                if not wanted_targets:
+                    # Nothing is written against a guess. The guests' own
+                    # rows stay exactly as they are.
+                    return VenueQueueSyncResult(
+                        name=name,
+                        in_sync=False,
+                        problems=("guest_subnet_unresolved",),
+                    )
+                max_limit = _max_limit_field(
+                    upload_rate_kbps or 0, download_rate_kbps or 0
+                )["max-limit"]
+                path = api.path(*_SIMPLE_QUEUE_PATH)
+                rows = [dict(row) for row in path]
+                parent = _static_row_named(rows, name)
+
+                created = updated = moved = False
+                reparented = 0
+                if parent is None:
+                    fields = {
+                        "name": name,
+                        "target": ",".join(wanted_targets),
+                        "max-limit": max_limit,
+                    }
+                    if comment:
+                        fields["comment"] = comment
+                    parent_id = str(path.add(**fields))
+                    created = True
+                else:
+                    parent_id = str(parent.get(".id"))
+                    changes: dict[str, str] = {}
+                    if _queue_target_set(parent) != set(wanted_targets):
+                        changes["target"] = ",".join(wanted_targets)
+                    if _rate_pair_bps(parent.get("max-limit")) != _rate_pair_bps(
+                        max_limit
+                    ):
+                        changes["max-limit"] = max_limit
+                    if changes:
+                        path.update(**{".id": parent_id, **changes})
+                        updated = True
+
+                known = {str(row.get(".id")): row for row in rows}
+                for child_id in child_queue_ids:
+                    child = known.get(child_id)
+                    if child is None or child_id == parent_id:
+                        continue
+                    if _safe_str(child.get("parent")) != name:
+                        path.update(**{".id": child_id, "parent": name})
+                        reparented += 1
+
+                if created or updated or reparented:
+                    rows = [dict(row) for row in path]
+                first_id = str(rows[0].get(".id")) if rows else parent_id
+                move_refused = False
+                if first_id != parent_id:
+                    # Its own ``try``: the row and its children are already
+                    # written, and a router that will not reorder them (a
+                    # static row above a dynamic one is the case nobody has
+                    # tried on hardware) must not turn that into "the venue
+                    # cap failed". The read-back below reports where the
+                    # parent actually is.
+                    try:
+                        tuple(
+                            api(
+                                "/queue/simple/move",
+                                numbers=parent_id,
+                                destination=first_id,
+                            )
+                        )
+                        moved = True
+                    except LibRouterosError as exc:
+                        move_refused = True
+                        logger.warning(
+                            "venue_simple_queue_move_refused",
+                            extra={
+                                "host": creds.host,
+                                "queue_name": name,
+                                "error": str(exc),
+                            },
+                        )
+
+                wrote = created or updated or moved or bool(reparented)
+                if wrote:
+                    rows = [dict(row) for row in path]
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"sync_venue_simple_queue: {exc}"
+                ) from exc
+
+            problems = _venue_queue_problems(
+                rows,
+                name=name,
+                parent_id=parent_id,
+                targets=wanted_targets,
+                max_limit=max_limit,
+                child_queue_ids=child_queue_ids,
+            )
+            if move_refused and "top_level_row_above_parent" not in problems:
+                problems = (*problems, "parent_move_refused")
+            if problems:
+                logger.warning(
+                    "venue_simple_queue_not_in_sync",
+                    extra={
+                        "host": creds.host,
+                        "queue_name": name,
+                        "problems": list(problems),
+                    },
+                )
+            return VenueQueueSyncResult(
+                name=name,
+                device_queue_id=parent_id,
+                targets=wanted_targets,
+                created=created,
+                updated=updated,
+                reparented=reparented,
+                moved_to_top=moved,
+                wrote=wrote,
+                in_sync=not problems,
+                problems=problems,
+            )
+        finally:
+            api.close()
+
+    async def clear_venue_simple_queue(
+        self, creds: DeviceCredentials, *, name: str
+    ) -> VenueQueueSyncResult:
+        """Takes a venue's total cap off the device: the rows under the
+        parent named ``name`` go back to the top level first, the parent is
+        removed second, and the list is read back third.
+
+        The order is the point. Removing a parent that still has rows under
+        it is not something this asks RouterOS to decide: if any row still
+        names it after the first step, the parent is left where it is and
+        the result says so. Absent already is success with nothing written.
+        A row with this name that the device made itself (dynamic) is not
+        touched."""
+        return await asyncio.to_thread(self._clear_venue_simple_queue_sync, creds, name)
+
+    def _clear_venue_simple_queue_sync(
+        self, creds: DeviceCredentials, name: str
+    ) -> VenueQueueSyncResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                path = api.path(*_SIMPLE_QUEUE_PATH)
+                rows = [dict(row) for row in path]
+                parent = _static_row_named(rows, name)
+                children = [
+                    row
+                    for row in rows
+                    if _safe_str(row.get("parent")) == name
+                    and not _is_truthy(row.get("dynamic"))
+                ]
+                if parent is None and not children:
+                    return VenueQueueSyncResult(name=name)
+
+                for child in children:
+                    path.update(**{".id": str(child.get(".id")), "parent": "none"})
+                unparented = len(children)
+                if children:
+                    rows = [dict(row) for row in path]
+
+                removed = False
+                still_under = [
+                    row for row in rows if _safe_str(row.get("parent")) == name
+                ]
+                if parent is not None and not still_under:
+                    path.remove(str(parent.get(".id")))
+                    removed = True
+                rows = [dict(row) for row in path]
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"clear_venue_simple_queue: {exc}"
+                ) from exc
+
+            problems: list[str] = []
+            if _static_row_named(rows, name) is not None:
+                problems.append("parent_still_present")
+            if any(_safe_str(row.get("parent")) == name for row in rows):
+                problems.append("rows_still_under_parent")
+            if problems:
+                logger.warning(
+                    "venue_simple_queue_not_cleared",
+                    extra={
+                        "host": creds.host,
+                        "queue_name": name,
+                        "problems": problems,
+                    },
+                )
+            return VenueQueueSyncResult(
+                name=name,
+                device_queue_id=None if removed else _row_id(parent),
+                reparented=unparented,
+                removed=removed,
+                wrote=bool(unparented) or removed,
+                in_sync=not problems,
+                problems=tuple(problems),
+            )
+        finally:
+            api.close()
 
     async def update_simple_queue(
         self,
@@ -8593,6 +8874,144 @@ def _targets_single_hosts(row: Mapping[str, object]) -> bool:
     return True
 
 
+def _row_id(row: Mapping[str, object] | None) -> str | None:
+    return None if row is None else _safe_str(row.get(".id"))
+
+
+def _static_row_named(
+    rows: Sequence[Mapping[str, object]], name: str
+) -> Mapping[str, object] | None:
+    """The row with this name that the platform could have written -- a
+    dynamic row of the same name is the device's own and is not it."""
+    for row in rows:
+        if _safe_str(row.get("name")) == name and not _is_truthy(row.get("dynamic")):
+            return row
+    return None
+
+
+def _queue_target_set(row: Mapping[str, object]) -> set[str]:
+    """A row's targets as written, without the ``/32`` RouterOS adds to a
+    single host -- for comparing a subnet row with the subnets it should
+    hold."""
+    return _simple_queue_targets(row)
+
+
+_RATE_SUFFIX_BPS = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
+
+
+def _rate_bps(value: str) -> int | None:
+    """``40960k``, ``40M`` and ``40960000`` are one rate. RouterOS takes the
+    first form and prints the last, so a row cannot be compared with what
+    was sent to it as text."""
+    text = value.strip().lower()
+    if not text:
+        return None
+    factor = _RATE_SUFFIX_BPS.get(text[-1])
+    digits = text[:-1] if factor else text
+    try:
+        return int(float(digits) * (factor or 1))
+    except ValueError:
+        return None
+
+
+def _rate_pair_bps(value: object) -> tuple[int | None, int | None] | None:
+    """A ``max-limit`` (``upload/download``) as two numbers in bits per
+    second, or ``None`` when it is not two rates."""
+    parts = str(value or "").split("/")
+    if len(parts) != 2:
+        return None
+    return (_rate_bps(parts[0]), _rate_bps(parts[1]))
+
+
+def _hotspot_guest_networks(api) -> tuple[str, ...]:  # noqa: ANN001
+    """The private IPv4 networks of the interface(s) this router's hotspot
+    server runs on -- its guest subnet(s), read from the device rather than
+    assumed.
+
+    A venue's guests are the devices on the hotspot's interface, and what
+    addresses they hold is whatever is configured on that interface: one
+    network on a router set up from a blank reset, two on one set up over
+    its factory defaults (observed live). The tunnel and the WAN are other
+    interfaces and never appear. A disabled server or address, an address
+    the device assigned itself, and anything that is not RFC 1918 are left
+    out. No hotspot package, or no enabled server: empty, and the caller
+    writes nothing."""
+    try:
+        interfaces = {
+            name
+            for row in api.path("ip", "hotspot")
+            if not _is_truthy(row.get("disabled"))
+            and (name := _safe_str(row.get("interface")))
+        }
+    except LibRouterosError:
+        return ()
+    if not interfaces:
+        return ()
+    networks: set[str] = set()
+    for row in api.path("ip", "address"):
+        if _safe_str(row.get("interface")) not in interfaces:
+            continue
+        if _is_truthy(row.get("disabled")) or _is_truthy(row.get("invalid")):
+            continue
+        if _is_truthy(row.get("dynamic")):
+            continue
+        try:
+            network = ipaddress.ip_interface(str(row.get("address") or "")).network
+        except ValueError:
+            continue
+        if network.version != 4 or network.prefixlen >= 31:
+            continue
+        if not any(network.subnet_of(private) for private in _RFC1918_NETWORKS):
+            continue
+        networks.add(str(network))
+    return tuple(sorted(networks))
+
+
+_RFC1918_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _venue_queue_problems(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    name: str,
+    parent_id: str,
+    targets: tuple[str, ...],
+    max_limit: str,
+    child_queue_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """What the list, as just read, says is wrong with a venue's parent row
+    -- empty when it holds what was asked for."""
+    problems: list[str] = []
+    by_id = {str(row.get(".id")): row for row in rows}
+    parent = by_id.get(parent_id)
+    if parent is None:
+        return ("parent_missing",)
+    if _queue_target_set(parent) != set(targets):
+        problems.append("parent_target_differs")
+    if _rate_pair_bps(parent.get("max-limit")) != _rate_pair_bps(max_limit):
+        problems.append("parent_rate_differs")
+    if any(
+        child_id in by_id
+        and child_id != parent_id
+        and _safe_str(by_id[child_id].get("parent")) != name
+        for child_id in child_queue_ids
+    ):
+        problems.append("child_not_under_parent")
+    # Anything at the top level above the parent takes its traffic before
+    # the parent sees it, so that guest is outside the venue's total.
+    for row in rows:
+        if str(row.get(".id")) == parent_id:
+            break
+        if _safe_str(row.get("parent")) in (None, "", "none"):
+            problems.append("top_level_row_above_parent")
+            break
+    return tuple(problems)
+
+
 def _raise_simple_queue_to_top(api, host: str, device_queue_id: str) -> None:  # noqa: ANN001
     """Best effort: make ``device_queue_id`` the first ``/queue simple``
     row, and say so in the log if another row for the same address still
@@ -8620,18 +9039,31 @@ def _raise_simple_queue_to_top(api, host: str, device_queue_id: str) -> None:  #
     try:
         rows = [dict(row) for row in api.path(*_SIMPLE_QUEUE_PATH)]
         ids = [str(row.get(".id")) for row in rows]
-        if device_queue_id not in ids or ids[0] == device_queue_id:
+        if device_queue_id not in ids:
             return
-        if not _targets_single_hosts(rows[ids.index(device_queue_id)]):
+        ours = rows[ids.index(device_queue_id)]
+        # A row under a venue's total cap is not the row that has to be
+        # first: its parent is. Raising the child above the parent would be
+        # at best meaningless and at worst take it out from under the cap,
+        # so the parent is what gets moved, and the child stays put.
+        anchor_id = device_queue_id
+        parent_name = _safe_str(ours.get("parent"))
+        if parent_name and parent_name != "none":
+            parent = _static_row_named(rows, parent_name)
+            if parent is None:
+                return
+            anchor_id = str(parent.get(".id"))
+        elif not _targets_single_hosts(ours):
             return
-        tuple(
-            api(
-                "/queue/simple/move",
-                numbers=device_queue_id,
-                destination=ids[0],
+        if ids[0] != anchor_id:
+            tuple(
+                api(
+                    "/queue/simple/move",
+                    numbers=anchor_id,
+                    destination=ids[0],
+                )
             )
-        )
-        rows = [dict(row) for row in api.path(*_SIMPLE_QUEUE_PATH)]
+            rows = [dict(row) for row in api.path(*_SIMPLE_QUEUE_PATH)]
     except LibRouterosError as exc:
         logger.warning(
             "simple_queue_raise_failed",
@@ -8643,7 +9075,7 @@ def _raise_simple_queue_to_top(api, host: str, device_queue_id: str) -> None:  #
         return
     targets = _simple_queue_targets(ours)
     for row in rows:
-        if str(row.get(".id")) == device_queue_id:
+        if str(row.get(".id")) in (device_queue_id, anchor_id):
             return
         if targets & _simple_queue_targets(row):
             logger.warning(

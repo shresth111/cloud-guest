@@ -1201,6 +1201,34 @@ class QueueDeviceStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class VenueQueueSyncResult:
+    """What ``sync_venue_simple_queue`` / ``clear_venue_simple_queue`` did,
+    and what the device held when they finished.
+
+    ``in_sync`` comes from reading ``/queue simple`` back after the last
+    write, never from the absence of an error: a write that RouterOS
+    accepted and did not act on is exactly the case this exists to report.
+    ``problems`` names each thing the read-back found wrong (or the reason
+    nothing was written), as stable short strings a caller can log.
+
+    ``wrote`` is whether this call changed the device at all -- ``False``
+    on a second run against a device that already matches.
+    """
+
+    name: str
+    device_queue_id: str | None = None
+    targets: tuple[str, ...] = ()
+    created: bool = False
+    updated: bool = False
+    reparented: int = 0
+    moved_to_top: bool = False
+    removed: bool = False
+    wrote: bool = False
+    in_sync: bool = True
+    problems: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceDiscoveryResult:
     """Real device facts a successful ``discover()`` call returns --
     ported from
@@ -1961,6 +1989,7 @@ class DeviceGatewayAdapter(Protocol):
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = _DEFAULT_QUEUE_PRIORITY,
+        parent: str | None = None,
     ) -> str:
         """Creates a real ``/queue simple`` entry. Returns the device-side
         queue id. Ported from
@@ -1968,7 +1997,45 @@ class DeviceGatewayAdapter(Protocol):
 
         The new row is then moved to the top of the list, best effort: the
         first matching row wins, and a dynamic hotspot queue for the same
-        address would otherwise sit above it."""
+        address would otherwise sit above it.
+
+        ``parent`` names an existing simple queue this row is created under
+        (a venue's total cap -- see ``sync_venue_simple_queue``). A row with
+        a parent is not itself moved: its parent is what has to come first."""
+        ...
+
+    async def sync_venue_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+        targets: Sequence[str] | None = None,
+        comment: str | None = None,
+    ) -> VenueQueueSyncResult:
+        """Makes one parent ``/queue simple`` named ``name`` hold a venue's
+        total speed, with ``child_queue_ids`` under it, in one connection.
+
+        ``targets`` are the subnets it covers; ``None`` means "ask the
+        device": the networks of the interface(s) its hotspot server runs
+        on. When none can be found nothing is written and the result says
+        so. A ``None`` rate is unlimited in that direction.
+
+        Creates the row if absent, changes it only where it differs, puts
+        each listed child under it, keeps it first in the list, and reads
+        the list back. Idempotent: a second call writes nothing."""
+        ...
+
+    async def clear_venue_simple_queue(
+        self, creds: DeviceCredentials, *, name: str
+    ) -> VenueQueueSyncResult:
+        """Removes the parent queue named ``name``: every row under it is
+        first returned to the top level (``parent=none``), then the parent
+        is removed, then the list is read back. A parent that still has a
+        row under it is never removed. Idempotent: absent is success, with
+        nothing written."""
         ...
 
     async def update_simple_queue(
@@ -2287,6 +2354,7 @@ __all__ = [
     "TracerouteHop",
     "TracerouteResult",
     "QueueDeviceStatus",
+    "VenueQueueSyncResult",
     "DeviceDiscoveryResult",
     "DeviceHealthResult",
     "DeviceInterfaceCounters",

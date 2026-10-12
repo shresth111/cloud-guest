@@ -650,3 +650,433 @@ async def test_set_simple_queue_target_repoints_the_row_and_keeps_its_rates(
     assert rows[0]["target"] == "10.5.50.253"
     assert rows[0]["max-limit"] == "20480k/20480k"
     assert api.update_calls[-1] == (_SIMPLE, {".id": device_id, "target": "10.5.50.253"})
+
+
+# ---------------------------------------------------------------------------
+# A venue's total speed cap: one parent row, the guests' rows under it.
+#
+# A packet enters the first top-level ``/queue simple`` row whose target it
+# matches and, inside it, the first matching child. So the parent has to be
+# the first row that can match a guest, the guests' rows have to name it as
+# ``parent``, and a guest with no row of their own is still held by the
+# parent because it targets the subnet.
+#
+# What these cannot show: that RouterOS accepts ``parent`` on ``add``/``set``
+# over the API as written, or lets a static row be moved above a dynamic
+# one. The fake does what it is told. Every write is therefore followed by a
+# read of the list, and it is that read-back -- ``in_sync``/``problems`` --
+# these assert for the refusing cases.
+# ---------------------------------------------------------------------------
+
+_VENUE = "cloudguest-venue-72425fa0"
+_HOTSPOT = ("ip", "hotspot")
+_ADDRESS = ("ip", "address")
+
+
+def _guest_row(row_id: str, address: str, parent: str = "none") -> dict:
+    return {
+        ".id": row_id,
+        "name": f"cloudguest-{row_id}",
+        "target": f"{address}/32",
+        "max-limit": "40960000/40960000",
+        "parent": parent,
+    }
+
+
+def _venue_router(*simple_rows: dict, addresses: list[dict] | None = None) -> FakeRouterOSApi:
+    api = FakeRouterOSApi(
+        menus={
+            _SIMPLE: list(simple_rows),
+            _HOTSPOT: [{".id": "*1", "name": "hotspot1", "interface": "bridge"}],
+            _ADDRESS: addresses
+            if addresses is not None
+            else [
+                {".id": "*1", "address": "192.168.1.136/24", "interface": "ether1", "dynamic": "true"},
+                {".id": "*2", "address": "192.168.88.1/24", "interface": "bridge"},
+                {".id": "*3", "address": "10.20.0.46/24", "interface": "wg-cloudguard"},
+            ],
+        },
+        command_handlers={"/queue/simple/move": _move},
+    )
+    counter = iter(f"*V{i}" for i in range(1, 50))
+    api.mint_id = lambda row_count: next(counter)
+    return api
+
+
+async def _sync(adapter, creds, **overrides):
+    kwargs = {
+        "name": _VENUE,
+        "download_rate_kbps": 81920,
+        "upload_rate_kbps": 40960,
+        "child_queue_ids": (),
+        "comment": "venue cap",
+    }
+    kwargs.update(overrides)
+    return await adapter.sync_venue_simple_queue(creds, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_venue_cap_becomes_one_parent_row_over_the_hotspots_own_subnet(
+    patch_connect, mikrotik_creds
+):
+    api = _venue_router(_guest_row("*2", "192.168.88.254"), _guest_row("*4", "192.168.88.249"))
+    patch_connect(api)
+
+    result = await _sync(MikroTikAdapter(), mikrotik_creds, child_queue_ids=("*2", "*4"))
+
+    rows = api._menus[_SIMPLE]
+    parent = rows[0]
+    assert parent["name"] == _VENUE
+    # The hotspot interface's network -- not the WAN's, not the tunnel's.
+    assert parent["target"] == "192.168.88.0/24"
+    assert parent["max-limit"] == "40960k/81920k"  # upload/download
+    assert parent["comment"] == "venue cap"
+    assert {r[".id"]: r["parent"] for r in rows[1:]} == {"*2": _VENUE, "*4": _VENUE}
+    assert result.created and result.reparented == 2 and result.moved_to_top
+    assert result.wrote and result.in_sync and result.problems == ()
+    assert result.targets == ("192.168.88.0/24",)
+    assert api.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_second_sync_reads_once_and_writes_nothing(patch_connect, mikrotik_creds):
+    api = _venue_router(_guest_row("*2", "192.168.88.254"))
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await _sync(adapter, mikrotik_creds, child_queue_ids=("*2",))
+    api.ops.clear()
+    api.command_calls.clear()
+
+    result = await _sync(adapter, mikrotik_creds, child_queue_ids=("*2",))
+
+    assert api.ops == []
+    assert api.command_calls == []
+    assert result.wrote is False and result.in_sync is True
+    assert not (result.created or result.updated or result.reparented)
+
+
+@pytest.mark.asyncio
+async def test_the_rate_routeros_prints_back_is_the_rate_that_was_sent(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS takes ``40960k`` and prints ``40960000``. Compared as text,
+    every run would rewrite a row that is already right."""
+    parent = {
+        ".id": "*9",
+        "name": _VENUE,
+        "target": "192.168.88.0/24",
+        "max-limit": "40960000/81920000",
+        "parent": "none",
+    }
+    api = _venue_router(parent)
+    patch_connect(api)
+
+    result = await _sync(MikroTikAdapter(), mikrotik_creds)
+
+    assert api.ops == []
+    assert result.wrote is False and result.in_sync is True
+
+
+@pytest.mark.asyncio
+async def test_a_changed_cap_is_one_update_of_the_existing_row(patch_connect, mikrotik_creds):
+    api = _venue_router()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    first = await _sync(adapter, mikrotik_creds)
+    api.ops.clear()
+
+    result = await _sync(adapter, mikrotik_creds, download_rate_kbps=51200)
+
+    assert [op[0] for op in api.ops] == ["update"]
+    assert api._menus[_SIMPLE][0]["max-limit"] == "40960k/51200k"
+    assert result.device_queue_id == first.device_queue_id
+    assert result.updated and not result.created and result.in_sync
+
+
+@pytest.mark.asyncio
+async def test_one_direction_can_be_left_open(patch_connect, mikrotik_creds):
+    api = _venue_router()
+    patch_connect(api)
+
+    await _sync(MikroTikAdapter(), mikrotik_creds, upload_rate_kbps=None)
+
+    assert api._menus[_SIMPLE][0]["max-limit"] == "0k/81920k"
+
+
+@pytest.mark.asyncio
+async def test_a_router_set_up_over_its_defaults_gets_both_of_its_guest_networks(
+    patch_connect, mikrotik_creds
+):
+    api = _venue_router(
+        addresses=[
+            {".id": "*1", "address": "192.168.88.1/24", "interface": "bridge"},
+            {".id": "*2", "address": "10.5.50.1/24", "interface": "bridge"},
+            {".id": "*3", "address": "203.0.113.9/24", "interface": "bridge"},
+            {".id": "*4", "address": "172.16.9.1/24", "interface": "bridge", "disabled": "true"},
+        ]
+    )
+    patch_connect(api)
+
+    result = await _sync(MikroTikAdapter(), mikrotik_creds)
+
+    assert result.targets == ("10.5.50.0/24", "192.168.88.0/24")
+    assert api._menus[_SIMPLE][0]["target"] == "10.5.50.0/24,192.168.88.0/24"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "menus",
+    [
+        {_HOTSPOT: []},
+        {_HOTSPOT: [{".id": "*1", "interface": "bridge", "disabled": "true"}]},
+        {_HOTSPOT: [{".id": "*1", "interface": "bridge"}], _ADDRESS: []},
+        {
+            _HOTSPOT: [{".id": "*1", "interface": "bridge"}],
+            _ADDRESS: [{".id": "*1", "address": "203.0.113.9/24", "interface": "bridge"}],
+        },
+    ],
+)
+async def test_a_router_that_reports_no_guest_subnet_gets_nothing_written(
+    patch_connect, mikrotik_creds, menus
+):
+    api = FakeRouterOSApi(menus={_SIMPLE: [_guest_row("*2", "192.168.88.254")], **menus})
+    patch_connect(api)
+
+    result = await _sync(MikroTikAdapter(), mikrotik_creds, child_queue_ids=("*2",))
+
+    assert api.ops == []
+    assert api._menus[_SIMPLE] == [_guest_row("*2", "192.168.88.254")]
+    assert result.in_sync is False
+    assert result.problems == ("guest_subnet_unresolved",)
+    assert result.device_queue_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_router_without_the_hotspot_package_gets_nothing_written(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(missing_menus={_HOTSPOT})
+    patch_connect(api)
+
+    result = await _sync(MikroTikAdapter(), mikrotik_creds)
+
+    assert api.ops == []
+    assert result.problems == ("guest_subnet_unresolved",)
+
+
+@pytest.mark.asyncio
+async def test_a_dynamic_row_left_above_the_parent_is_reported_not_presumed_gone(
+    patch_connect, mikrotik_creds, caplog
+):
+    """The move is accepted and does nothing -- the case a real RouterOS may
+    turn out to be for a static row and a dynamic one."""
+    api = _venue_router(_dynamic_row("*7", "192.168.88.251"))
+    api._command_handlers["/queue/simple/move"] = lambda api, kwargs: []
+    patch_connect(api)
+
+    with caplog.at_level("WARNING"):
+        result = await _sync(MikroTikAdapter(), mikrotik_creds)
+
+    assert [r[".id"] for r in api._menus[_SIMPLE]][0] == "*7"
+    assert result.in_sync is False
+    assert "top_level_row_above_parent" in result.problems
+    (record,) = [r for r in caplog.records if r.msg == "venue_simple_queue_not_in_sync"]
+    assert record.problems == ["top_level_row_above_parent"]
+
+
+@pytest.mark.asyncio
+async def test_a_router_that_refuses_the_move_still_keeps_the_parent_and_its_children(
+    patch_connect, mikrotik_creds, caplog
+):
+    """A refused reorder is not a failed venue cap: the parent is on the
+    device with the guests' rows under it, and the result says it is not
+    first."""
+    from librouteros.exceptions import LibRouterosError
+
+    api = _venue_router(_dynamic_row("*7", "192.168.88.251"), _guest_row("*2", "192.168.88.254"))
+    api._raise_on_command["/queue/simple/move"] = LibRouterosError("cannot move before dynamic")
+    patch_connect(api)
+
+    with caplog.at_level("WARNING"):
+        result = await _sync(MikroTikAdapter(), mikrotik_creds, child_queue_ids=("*2",))
+
+    rows = {r[".id"]: r for r in api._menus[_SIMPLE]}
+    assert result.device_queue_id in rows
+    assert rows["*2"]["parent"] == _VENUE
+    assert result.created and result.reparented == 1 and not result.moved_to_top
+    assert result.in_sync is False
+    assert "top_level_row_above_parent" in result.problems
+    assert any(r.msg == "venue_simple_queue_move_refused" for r in caplog.records)
+    assert api.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_child_the_router_did_not_put_under_the_parent_is_reported(
+    patch_connect, mikrotik_creds
+):
+    api = _venue_router(_guest_row("*2", "192.168.88.254"))
+    api.silently_ignore_updates.add(_SIMPLE)
+    patch_connect(api)
+
+    result = await _sync(MikroTikAdapter(), mikrotik_creds, child_queue_ids=("*2",))
+
+    assert result.in_sync is False
+    assert "child_not_under_parent" in result.problems
+
+
+@pytest.mark.asyncio
+async def test_a_child_id_the_router_no_longer_holds_is_not_an_error(
+    patch_connect, mikrotik_creds
+):
+    api = _venue_router()
+    patch_connect(api)
+
+    result = await _sync(MikroTikAdapter(), mikrotik_creds, child_queue_ids=("*gone",))
+
+    assert result.in_sync is True and result.reparented == 0
+
+
+@pytest.mark.asyncio
+async def test_a_guest_row_created_under_a_parent_names_it_and_is_not_raised_above_it(
+    patch_connect, mikrotik_creds
+):
+    api = _venue_router()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    parent = await _sync(adapter, mikrotik_creds)
+    api.command_calls.clear()
+
+    child_id = await adapter.create_simple_queue(
+        mikrotik_creds,
+        name="cloudguest-q",
+        target="192.168.88.254",
+        download_rate_kbps=40960,
+        upload_rate_kbps=40960,
+        parent=_VENUE,
+    )
+
+    (_, fields) = api.add_calls[-1]
+    assert fields["parent"] == _VENUE
+    # The parent was already first, so nothing is moved -- least of all the
+    # child above it.
+    assert api.command_calls == []
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == [parent.device_queue_id, child_id]
+
+
+@pytest.mark.asyncio
+async def test_a_child_write_puts_its_parent_back_on_top_of_a_dynamic_row(
+    patch_connect, mikrotik_creds
+):
+    """A RADIUS sign-in adds a dynamic row at the top, above the parent. The
+    next write of a guest's row moves the parent -- not the guest's row --
+    back to the top."""
+    api = _venue_router()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    parent = await _sync(adapter, mikrotik_creds)
+    api._menus[_SIMPLE].insert(0, _dynamic_row("*7", "192.168.88.251"))
+    api.command_calls.clear()
+
+    child_id = await adapter.create_simple_queue(
+        mikrotik_creds,
+        name="cloudguest-q",
+        target="192.168.88.254",
+        download_rate_kbps=40960,
+        upload_rate_kbps=40960,
+        parent=_VENUE,
+    )
+
+    assert api.command_calls == [
+        ("/queue/simple/move", {"numbers": parent.device_queue_id, "destination": "*7"})
+    ]
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == [parent.device_queue_id, "*7", child_id]
+
+
+@pytest.mark.asyncio
+async def test_a_guest_row_without_a_parent_carries_no_parent_field(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await _create(MikroTikAdapter(), mikrotik_creds)
+
+    (_, fields) = api.add_calls[-1]
+    assert "parent" not in fields
+
+
+@pytest.mark.asyncio
+async def test_clearing_returns_the_guests_rows_to_the_top_level_then_removes_the_parent(
+    patch_connect, mikrotik_creds
+):
+    api = _venue_router(_guest_row("*2", "192.168.88.254"), _guest_row("*4", "192.168.88.249"))
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await _sync(adapter, mikrotik_creds, child_queue_ids=("*2", "*4"))
+    api.ops.clear()
+
+    result = await adapter.clear_venue_simple_queue(mikrotik_creds, name=_VENUE)
+
+    assert [op[0] for op in api.ops] == ["update", "update", "remove"]
+    assert {r[".id"]: r["parent"] for r in api._menus[_SIMPLE]} == {"*2": "none", "*4": "none"}
+    assert result.removed and result.reparented == 2 and result.in_sync
+    assert api.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_parent_whose_rows_would_not_leave_it_is_left_in_place(
+    patch_connect, mikrotik_creds
+):
+    api = _venue_router(_guest_row("*2", "192.168.88.254"))
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await _sync(adapter, mikrotik_creds, child_queue_ids=("*2",))
+    api.silently_ignore_updates.add(_SIMPLE)
+    api.ops.clear()
+
+    result = await adapter.clear_venue_simple_queue(mikrotik_creds, name=_VENUE)
+
+    assert "remove" not in [op[0] for op in api.ops]
+    assert any(r["name"] == _VENUE for r in api._menus[_SIMPLE])
+    assert result.removed is False and result.in_sync is False
+    assert set(result.problems) == {"parent_still_present", "rows_still_under_parent"}
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_cap_that_is_not_there_writes_nothing(patch_connect, mikrotik_creds):
+    api = _venue_router(_guest_row("*2", "192.168.88.254"))
+    patch_connect(api)
+
+    result = await MikroTikAdapter().clear_venue_simple_queue(mikrotik_creds, name=_VENUE)
+
+    assert api.ops == []
+    assert result.wrote is False and result.in_sync is True and result.removed is False
+
+
+@pytest.mark.asyncio
+async def test_a_venue_cap_write_the_router_refuses_raises(patch_connect, mikrotik_creds):
+    """A RouterOS that will not take the row says so through the adapter's
+    own error, with the connection closed -- not through a result that
+    reads as written."""
+    from librouteros.exceptions import LibRouterosError
+
+    api = _venue_router()
+    plain_path = api.path
+
+    def _path(*segments):
+        found = plain_path(*segments)
+        if segments == _SIMPLE:
+
+            def _add(**fields):
+                raise LibRouterosError("input does not match any value of parent")
+
+            found.add = _add
+        return found
+
+    api.path = _path
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError):
+        await _sync(MikroTikAdapter(), mikrotik_creds)
+    assert api._menus[_SIMPLE] == []
+    assert api.closed is True

@@ -31,6 +31,7 @@ mirroring the identical pattern already used for the ``isp``,
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -42,7 +43,7 @@ from wyfy_device_gateway.mikrotik_adapter import (
 )
 from wyfy_device_gateway.registry import get_adapter
 
-from .constants import DEFAULT_QUEUE_PRIORITY
+from .constants import DEFAULT_QUEUE_PRIORITY, VENUE_QUEUE_COMMENT
 from .exceptions import (
     QueueDeviceConnectionError,
     QueueDeviceOperationError,
@@ -86,6 +87,29 @@ class QueueDeviceStatus:
     queued_bytes: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class VenueQueueState:
+    """What a venue-cap write did and what the device held afterwards --
+    the gateway's ``VenueQueueSyncResult``, in this domain's own type so a
+    caller here never imports the gateway.
+
+    ``in_sync`` is the read-back's verdict, not the absence of an error;
+    ``problems`` says what it found. ``wrote`` is ``False`` when the device
+    already matched."""
+
+    name: str
+    device_queue_id: str | None = None
+    targets: tuple[str, ...] = ()
+    created: bool = False
+    updated: bool = False
+    reparented: int = 0
+    moved_to_top: bool = False
+    removed: bool = False
+    wrote: bool = False
+    in_sync: bool = True
+    problems: tuple[str, ...] = ()
+
+
 class BaseQueueAdapter(Protocol):
     """What a vendor implements to plug real bandwidth/QoS queue
     operations into the Queue Management Engine. A new vendor is exactly:
@@ -108,9 +132,34 @@ class BaseQueueAdapter(Protocol):
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = DEFAULT_QUEUE_PRIORITY,
+        parent: str | None = None,
     ) -> str:
         """Creates a real ``/queue simple`` entry. Returns the device-side
-        queue id."""
+        queue id. ``parent`` names the venue's total-cap row this entry is
+        created under (see ``sync_venue_queue``); callers pass it only when
+        there is one, so an adapter written before it existed keeps
+        working."""
+        ...
+
+    async def sync_venue_queue(
+        self,
+        credentials: QueueCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+    ) -> VenueQueueState:
+        """Makes the device hold one parent queue named ``name`` carrying
+        the venue's total speed over its guest subnet(s), with each listed
+        guest row under it. Idempotent, and read back."""
+        ...
+
+    async def clear_venue_queue(
+        self, credentials: QueueCredentials, *, name: str
+    ) -> VenueQueueState:
+        """Returns every row under the parent named ``name`` to the top
+        level, then removes the parent. Idempotent, and read back."""
         ...
 
     async def update_simple_queue(
@@ -259,6 +308,7 @@ class MikroTikQueueAdapter:
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = DEFAULT_QUEUE_PRIORITY,
+        parent: str | None = None,
     ) -> str:
         creds = self._gateway_credentials(credentials)
         try:
@@ -273,11 +323,56 @@ class MikroTikQueueAdapter:
                 burst_threshold_kbps=burst_threshold_kbps,
                 burst_time_seconds=burst_time_seconds,
                 priority=priority,
+                parent=parent,
             )
         except MikroTikConnectionError as exc:
             raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
         except MikroTikDeviceError as exc:
             raise QueueDeviceOperationError("create_simple_queue", exc.detail) from exc
+
+    async def sync_venue_queue(
+        self,
+        credentials: QueueCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+    ) -> VenueQueueState:
+        """The venue's total cap as one parent ``/queue simple`` over the
+        guest subnet(s) the router itself reports for its hotspot interface
+        -- see the gateway's ``sync_venue_simple_queue``. When the router
+        reports no such subnet nothing is written and ``problems`` carries
+        ``guest_subnet_unresolved``."""
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).sync_venue_simple_queue(
+                creds,
+                name=name,
+                download_rate_kbps=download_rate_kbps,
+                upload_rate_kbps=upload_rate_kbps,
+                child_queue_ids=tuple(child_queue_ids),
+                comment=VENUE_QUEUE_COMMENT,
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("sync_venue_queue", exc.detail) from exc
+        return _venue_queue_state(result)
+
+    async def clear_venue_queue(
+        self, credentials: QueueCredentials, *, name: str
+    ) -> VenueQueueState:
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).clear_venue_simple_queue(
+                creds, name=name
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("clear_venue_queue", exc.detail) from exc
+        return _venue_queue_state(result)
 
     async def update_simple_queue(
         self,
@@ -496,6 +591,22 @@ class MikroTikQueueAdapter:
         )
 
 
+def _venue_queue_state(result: object) -> VenueQueueState:
+    return VenueQueueState(
+        name=result.name,  # type: ignore[attr-defined]
+        device_queue_id=result.device_queue_id,  # type: ignore[attr-defined]
+        targets=tuple(result.targets),  # type: ignore[attr-defined]
+        created=result.created,  # type: ignore[attr-defined]
+        updated=result.updated,  # type: ignore[attr-defined]
+        reparented=result.reparented,  # type: ignore[attr-defined]
+        moved_to_top=result.moved_to_top,  # type: ignore[attr-defined]
+        removed=result.removed,  # type: ignore[attr-defined]
+        wrote=result.wrote,  # type: ignore[attr-defined]
+        in_sync=result.in_sync,  # type: ignore[attr-defined]
+        problems=tuple(result.problems),  # type: ignore[attr-defined]
+    )
+
+
 _QUEUE_ADAPTERS: dict[str, BaseQueueAdapter] = {"mikrotik": MikroTikQueueAdapter()}
 
 
@@ -515,6 +626,7 @@ def list_supported_queue_vendors() -> list[str]:
 __all__ = [
     "QueueCredentials",
     "QueueDeviceStatus",
+    "VenueQueueState",
     "BaseQueueAdapter",
     "MikroTikQueueAdapter",
     "get_queue_adapter",

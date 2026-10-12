@@ -43,6 +43,7 @@ from .schemas import (
     PolicyVersionCreateRequest,
     PolicyVersionResponse,
     ResolvedPolicyResponse,
+    with_venue_rate_keys,
 )
 from .service import PolicyService
 
@@ -89,7 +90,7 @@ def _version_response(version: PolicyVersion) -> PolicyVersionResponse:
         policy_id=str(version.policy_id),
         version_number=version.version_number,
         status=version.status,
-        rules=version.rules,
+        rules=with_venue_rate_keys(version.rules),
         published_at=version.published_at,
         created_at=version.created_at,
     )
@@ -215,7 +216,7 @@ async def resolve_effective_policy(
             policy_type=resolved.policy_type,
             organization_id=resolved.organization_id,
             location_id=resolved.location_id,
-            rules=resolved.rules,
+            rules=with_venue_rate_keys(resolved.rules),
             source=resolved.source,
             user_id=resolved.user_id,
         ).model_dump(),
