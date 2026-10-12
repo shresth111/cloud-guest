@@ -239,7 +239,7 @@ import logging
 import math
 import secrets
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -420,11 +420,13 @@ from .repository import (
 )
 from .validators import (
     DevicePresenceObservation,
+    RouterActivityRead,
     as_utc,
     canonical_mac_key,
     compute_period_start,
     dashboard_series_bucket_starts,
     has_session_reached_time_limit,
+    idle_verdict_is_evidenced,
     is_concurrent_session_limit_reached,
     is_device_limit_reached,
     is_fup_usage_exceeded,
@@ -432,6 +434,7 @@ from .validators import (
     is_session_presence_judgeable,
     is_session_stale,
     is_weak_pin,
+    later_session_activity,
     normalize_guest_display_name,
     normalize_identifier,
     normalize_mac_address,
@@ -606,10 +609,26 @@ class VenueActivityReportingProtocol(Protocol):
     ) -> bool: ...
 
 
+class RouterActivityReadProtocol(Protocol):
+    """What the presence sweep knows about its reads of one router -- see
+    ``validators.RouterActivityRead`` for the two facts and
+    ``validators.idle_verdict_is_evidenced`` for what they decide.
+
+    A Protocol for the reason ``VenueActivityReportingProtocol`` is one:
+    the answer needs the router domain and Redis, neither of which this
+    module should reach for, and the sweep stays testable with a fake.
+    Satisfied by ``tasks._build_router_activity_read_lookup``."""
+
+    async def router_activity_read(
+        self, *, router_id: uuid.UUID
+    ) -> RouterActivityRead: ...
+
+
 async def enforce_session_timeouts(
     repository: GuestRepositoryProtocol,
     terminator: LiveSessionTerminatorProtocol | None = None,
     activity_reporting: VenueActivityReportingProtocol | None = None,
+    activity_reads: RouterActivityReadProtocol | None = None,
 ) -> list[GuestSession]:
     """Guest Session Engine (Phase 1): the actual idle/session-timeout
     sweep, pulled out of ``GuestService.enforce_timeouts`` to module scope
@@ -677,12 +696,36 @@ async def enforce_session_timeouts(
     controller integration (the entire MikroTik/RADIUS fleet) also answers
     ``True``, because for those venues the premise is simply correct: the
     NAS sends Interim-Updates and ``last_activity_at`` moves.
+
+    ## ``activity_reads``: the same question, for one guest
+
+    That last premise holds for a venue and not for every guest in it. A
+    device admitted by an ``ip-binding type=bypassed`` row is never a
+    hotspot session, so the NAS sends nothing for it, and its
+    ``last_activity_at`` moves only when the presence sweep reads the
+    router's host table (``refresh_session_activity_from_router``).
+    Measured 2026-10-12: a cabled laptop was expired as
+    ``inactivity_timeout`` 45 minutes after login with tens of megabytes
+    through its queue, at a venue whose other guest was reporting
+    accounting normally.
+
+    The read is what fixes that guest. ``activity_reads`` is what stops the
+    fix from depending on the read succeeding: for a session with no
+    accounted bytes on a router the presence sweep reads, the idle half
+    applies only if that router's host table has been read since the
+    session crossed its idle cutoff
+    (``validators.idle_verdict_is_evidenced``). A router that could not be
+    read answers nothing about its guests, and silence from the reader is
+    not silence from the guest.
+
+    ``None`` -- the default -- asks nothing, exactly as before.
     """
     now = datetime.now(UTC)
     candidates = await repository.list_timed_out_sessions(now=now)
     observable_by_venue: dict[
         tuple[uuid.UUID | None, uuid.UUID | None], bool
     ] = {}
+    read_by_router: dict[uuid.UUID, RouterActivityRead] = {}
     expired: list[GuestSession] = []
     for session in candidates:
         venue = (session.organization_id, session.location_id)
@@ -708,6 +751,26 @@ async def enforce_session_timeouts(
                 )
                 observable = False
             observable_by_venue[venue] = observable
+        if observable and activity_reads is not None:
+            read = read_by_router.get(session.router_id)
+            if read is None:
+                try:
+                    read = await activity_reads.router_activity_read(
+                        router_id=session.router_id
+                    )
+                except Exception:  # noqa: BLE001 -- same rule as above
+                    # Not knowing whether the router was read is not a
+                    # record that it was.
+                    logger.warning(
+                        "guest_session_router_activity_read_lookup_failed",
+                        extra={"router_id": str(session.router_id)},
+                    )
+                    read = RouterActivityRead(applies=True, read_at=None)
+                read_by_router[session.router_id] = read
+            if not idle_verdict_is_evidenced(session, read):
+                # Per session, so the venue-wide answer is left as it was
+                # for this venue's other guests.
+                observable = False
         if not is_session_stale(
             session, now=now, activity_is_observable=observable
         ):
@@ -1229,6 +1292,61 @@ async def close_sessions_for_nas_restart(
         logger.info("guest_session_closed_nas_restart", extra=_event_extra(event))
         closed.append(updated)
     return closed
+
+
+async def refresh_session_activity_from_router(
+    repository: GuestRepositoryProtocol,
+    *,
+    router_id: uuid.UUID,
+    last_heard: Mapping[str, datetime],
+    now: datetime | None = None,
+) -> list[GuestSession]:
+    """Moves ``last_activity_at`` forward for every ``ACTIVE`` session on
+    ``router_id`` whose device the router has heard from more recently than
+    this platform knows.
+
+    ``last_heard`` is ``validators.last_heard_from_hotspot_hosts`` over the
+    same successful ``/ip/hotspot/host`` read the presence reconcile below
+    uses, so this costs no extra device call. It is the only producer of
+    activity for a guest admitted by a bypass binding, who sends no RADIUS
+    accounting; see ``enforce_session_timeouts``'s ``activity_reads``
+    section for what happened to that guest without it.
+
+    For a session that does report accounting this is a second witness to
+    the same fact and the later timestamp wins
+    (``validators.later_session_activity``) -- it never moves the column
+    back, so it cannot start an idle countdown that accounting had not.
+
+    A device that has gone quiet keeps a growing ``idle-time`` while it is
+    still listed, so its timestamp stops advancing here and the idle rule
+    reaches it on schedule; one that has left is not in ``last_heard`` at
+    all and is the presence reconcile's to close.
+
+    Nothing is written for a session with no device, or whose device is not
+    in ``last_heard``. As with the reconcile, never called on a failed read.
+
+    Returns every session whose timestamp moved."""
+    now = now or datetime.now(UTC)
+    if not last_heard:
+        return []
+    sessions = await repository.list_active_sessions_for_router(router_id)
+    refreshed: list[GuestSession] = []
+    for session in sessions:
+        if session.device_id is None:
+            continue
+        device = await repository.get_device_by_id(session.device_id)
+        if device is None:
+            continue
+        heard_at = last_heard.get(normalize_mac_address(device.mac_address))
+        if heard_at is None:
+            continue
+        observed = later_session_activity(session, heard_at=heard_at, now=now)
+        if observed is None:
+            continue
+        refreshed.append(
+            await repository.update_session(session, {"last_activity_at": observed})
+        )
+    return refreshed
 
 
 async def reconcile_sessions_with_router_presence(

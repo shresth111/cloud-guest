@@ -540,6 +540,23 @@ SESSION_PRESENCE_DISCONNECT_REASON = "device_left_network"
 SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY = "cloudguest:guest:session-presence-sweep:lock"
 SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS = 240
 
+# When the presence sweep last read a router's host table *successfully*,
+# as a Unix timestamp. Written by ``tasks.reconcile_router_session_presence``
+# after every good read and read back by the timeout sweep, which is the
+# only way that sweep can tell "this guest's device has been silent" from
+# "nobody has been able to look" -- see
+# ``validators.idle_verdict_is_evidenced``.
+#
+# The value carries the judgement, not the key's existence: the timeout
+# sweep compares it against the moment the session crossed its own idle
+# cutoff, so a TTL is only garbage collection. A day is far longer than any
+# idle cutoff plus grace a venue can configure, and short enough that a
+# decommissioned router's key does not sit in Redis indefinitely.
+SESSION_PRESENCE_READ_AT_REDIS_KEY = (
+    "cloudguest:guest:session-presence:read-at:{router_id}"
+)
+SESSION_PRESENCE_READ_AT_TTL_SECONDS = 24 * 60 * 60
+
 # ============================================================================
 # Fair Usage Policy (FUP) quota tracking -- Phase 1 BhaiFi-parity.
 # See ``models.GuestQuotaUsage``'s own docstring and ``service.py``'s "FUP
@@ -939,6 +956,8 @@ __all__ = [
     "SESSION_PRESENCE_DISCONNECT_REASON",
     "SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY",
     "SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS",
+    "SESSION_PRESENCE_READ_AT_REDIS_KEY",
+    "SESSION_PRESENCE_READ_AT_TTL_SECONDS",
     "TASK_RUN_FUP_TIME_ACCRUAL_SWEEP",
     "FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_QUOTA_RESET_SWEEP",

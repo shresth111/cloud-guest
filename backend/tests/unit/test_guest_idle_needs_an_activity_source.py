@@ -501,8 +501,11 @@ class TestTheSweepIsWiredTheWayTheAppBuildsIt:
             async def rollback(self):
                 return None
 
-        async def _fake_enforce(repository, terminator=None, activity_reporting=None):
+        async def _fake_enforce(
+            repository, terminator=None, activity_reporting=None, activity_reads=None
+        ):
             seen["activity_reporting"] = activity_reporting
+            seen["activity_reads"] = activity_reads
             return []
 
         monkeypatch.setattr(tasks_module, "SessionLocal", lambda: _Session())
@@ -517,6 +520,11 @@ class TestTheSweepIsWiredTheWayTheAppBuildsIt:
         lookup = seen["activity_reporting"]
         assert lookup is not None, "the sweep no longer asks the venue anything"
         assert callable(getattr(lookup, "venue_reports_guest_activity", None))
+        # The per-guest half: without it a bypass-admitted guest on a router
+        # that cannot be read is expired on the strength of no read at all.
+        reads = seen["activity_reads"]
+        assert reads is not None, "the sweep no longer asks whether the router was read"
+        assert callable(getattr(reads, "router_activity_read", None))
 
 
 class TestMikrotikIsUntouched:

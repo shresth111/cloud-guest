@@ -76,6 +76,8 @@ from .constants import (
     OPEN_HOTSPOT_GATE_MAX_RETRIES,
     OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS,
     SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
+    SESSION_PRESENCE_READ_AT_REDIS_KEY,
+    SESSION_PRESENCE_READ_AT_TTL_SECONDS,
     SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY,
     SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
     TASK_ASSIGN_GUEST_QUEUE,
@@ -101,10 +103,16 @@ from .service import (
     enforce_session_timeouts,
     enforce_whitelist_only_online_guests,
     reconcile_sessions_with_router_presence,
+    refresh_session_activity_from_router,
     run_fup_time_accrual,
     run_quota_reset,
 )
-from .validators import hotspot_is_serving, present_macs_from_hotspot_hosts
+from .validators import (
+    RouterActivityRead,
+    hotspot_is_serving,
+    last_heard_from_hotspot_hosts,
+    present_macs_from_hotspot_hosts,
+)
 
 logger = get_logger(__name__)
 
@@ -145,6 +153,7 @@ async def _run_session_timeout_sweep_async() -> int:
                 repository,
                 _build_session_terminator(session, repository),
                 _build_activity_reporting_lookup(session),
+                _build_router_activity_read_lookup(session),
             )
             await session.commit()
             return len(expired)
@@ -481,6 +490,62 @@ def _build_activity_reporting_lookup(session: AsyncSession):
     )
 
     return build_controller_activity_reporting_lookup(session)
+
+
+def _build_router_activity_read_lookup(session: AsyncSession):
+    """The per-guest half of the session-timeout sweep: has the presence
+    sweep been able to read this router's host table lately?
+
+    Satisfies ``service.RouterActivityReadProtocol``; see
+    ``validators.idle_verdict_is_evidenced`` for what the answer decides.
+
+    ``applies`` is the same test ``_load_presence_target`` applies before
+    it will dial a router -- RouterOS, with an address and stored API
+    credentials -- so the two cannot disagree about which routers are
+    read. A controller-managed or NAS-only row answers ``applies=False``
+    and its sessions are judged exactly as they were.
+
+    ``read_at`` is the stamp ``_record_presence_read`` leaves after each
+    successful read. A Redis that cannot be asked, or a value that is not a
+    number, is "no record of a read", never "read just now": this lookup
+    exists to stop an expiry that rests on a read nobody made, and an
+    unanswerable question must not become that evidence."""
+    from wyfy_device_gateway import DeviceVendor
+
+    from app.database.redis import create_redis_client
+    from app.domains.router.repository import RouterRepository
+
+    class _RouterActivityRead:
+        @staticmethod
+        async def router_activity_read(*, router_id: uuid.UUID) -> RouterActivityRead:
+            router = await RouterRepository(session).get_by_id(router_id)
+            if (
+                router is None
+                or router.vendor != DeviceVendor.MIKROTIK.value
+                or not (router.management_ip_address or router.public_ip_address)
+                or not router.api_username
+                or not router.api_credentials_encrypted
+            ):
+                return RouterActivityRead(applies=False, read_at=None)
+            key = SESSION_PRESENCE_READ_AT_REDIS_KEY.format(router_id=router_id)
+            read_at: datetime | None = None
+            try:
+                redis = create_redis_client()
+                try:
+                    raw = await redis.get(key)
+                finally:
+                    await redis.aclose()
+                if raw is not None:
+                    read_at = datetime.fromtimestamp(float(raw), UTC)
+            except Exception as exc:  # noqa: BLE001 -- see docstring
+                logger.warning(
+                    "guest_session_presence_read_stamp_unavailable",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                read_at = None
+            return RouterActivityRead(applies=True, read_at=read_at)
+
+    return _RouterActivityRead()
 
 
 def _build_session_terminator(session: AsyncSession, repository: GuestRepository):
@@ -1299,15 +1364,44 @@ async def _load_presence_target(router_id: uuid.UUID):  # noqa: ANN202
     return router, creds
 
 
+async def _record_presence_read(router_id: uuid.UUID, read_at: datetime) -> None:
+    """Leaves the stamp the timeout sweep reads through
+    ``_build_router_activity_read_lookup``: this router's host table was
+    read successfully at ``read_at``.
+
+    Best-effort. A stamp that could not be written reads to the timeout
+    sweep as "no record of a read", which only makes it decline to expire a
+    bypass-admitted guest for inactivity -- the safe direction -- so a Redis
+    blip must not fail a reconcile that has already committed."""
+    from app.database.redis import create_redis_client
+
+    try:
+        redis = create_redis_client()
+        try:
+            await redis.set(
+                SESSION_PRESENCE_READ_AT_REDIS_KEY.format(router_id=router_id),
+                str(read_at.timestamp()),
+                ex=SESSION_PRESENCE_READ_AT_TTL_SECONDS,
+            )
+        finally:
+            await redis.aclose()
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "guest_session_presence_read_stamp_failed",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+
+
 async def _reconcile_router_session_presence_async(
     router_id: uuid.UUID,
     *,
     reader_factory=_default_presence_reader_factory,  # noqa: ANN001
     now: datetime | None = None,
 ) -> dict[str, object]:
-    """One router: read its hotspot host table, then close every ``ACTIVE``
-    session whose device is not in it (``service
-    .reconcile_sessions_with_router_presence``).
+    """One router: read its hotspot host table, credit every ``ACTIVE``
+    session whose device it has heard from (``service
+    .refresh_session_activity_from_router``), then close every one whose
+    device is not in it (``service.reconcile_sessions_with_router_presence``).
 
     **Every way this can fail changes nothing.** An unreachable router, a
     section RouterOS refused, no stored credentials, or a router with no
@@ -1342,14 +1436,28 @@ async def _reconcile_router_session_presence_async(
         )
         return {"router_id": str(router_id), "closed": 0, "skipped": "no_hotspot"}
 
+    # Taken as the read returns: ``idle-time`` is a duration, so the moment
+    # it is measured back from is this platform's clock, not the router's.
+    read_at = now or datetime.now(UTC)
+    host_rows = capture.sections.get("hotspot_hosts", [])
     present_macs = present_macs_from_hotspot_hosts(
-        capture.sections.get("hotspot_hosts", []),
+        host_rows, dead_after_seconds=SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS
+    )
+    last_heard = last_heard_from_hotspot_hosts(
+        host_rows,
+        read_at=read_at,
         dead_after_seconds=SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
     )
     async with SessionLocal() as session:
         try:
+            repository = GuestRepository(session)
+            # Before the reconcile, so a device just credited with activity
+            # is inside the reconcile's own grace window.
+            refreshed = await refresh_session_activity_from_router(
+                repository, router_id=router_id, last_heard=last_heard, now=read_at
+            )
             closed = await reconcile_sessions_with_router_presence(
-                GuestRepository(session),
+                repository,
                 router_id=router_id,
                 present_macs=present_macs,
                 now=now,
@@ -1358,7 +1466,13 @@ async def _reconcile_router_session_presence_async(
         except Exception:
             await session.rollback()
             raise
-    return {"router_id": str(router_id), "closed": len(closed), "skipped": None}
+    await _record_presence_read(router_id, read_at)
+    return {
+        "router_id": str(router_id),
+        "closed": len(closed),
+        "refreshed": len(refreshed),
+        "skipped": None,
+    }
 
 
 @celery_app.task(name=TASK_RECONCILE_ROUTER_SESSION_PRESENCE)
