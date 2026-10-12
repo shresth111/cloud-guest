@@ -65,6 +65,7 @@ def _base_fields(**overrides: object) -> dict[str, object]:
 @dataclass
 class FakeDemoRequestRepository:
     requests: dict[uuid.UUID, DemoRequest] = field(default_factory=dict)
+    soft_deleted: list[uuid.UUID] = field(default_factory=list)
 
     async def create(self, **fields: object) -> DemoRequest:
         demo_request = DemoRequest(**_base_fields(**fields))
@@ -80,6 +81,11 @@ class FakeDemoRequestRepository:
         for key, value in data.items():
             setattr(demo_request, key, value)
         demo_request.version += 1
+        return demo_request
+
+    async def soft_delete(self, demo_request: DemoRequest) -> DemoRequest:
+        demo_request.mark_deleted()
+        self.soft_deleted.append(demo_request.id)
         return demo_request
 
     async def list_records(
@@ -192,19 +198,13 @@ class TestDemoRequestUpdateRequestValidation:
 
 class TestComputeLeadPriority:
     def test_both_fields_none_is_unknown(self) -> None:
-        assert (
-            compute_lead_priority(None, None) == DemoRequestLeadPriority.UNKNOWN
-        )
+        assert compute_lead_priority(None, None) == DemoRequestLeadPriority.UNKNOWN
 
     def test_single_location_no_router_info_is_single_site(self) -> None:
-        assert (
-            compute_lead_priority(1, None) == DemoRequestLeadPriority.SINGLE_SITE
-        )
+        assert compute_lead_priority(1, None) == DemoRequestLeadPriority.SINGLE_SITE
 
     def test_zero_locations_treated_as_single_site(self) -> None:
-        assert (
-            compute_lead_priority(0, None) == DemoRequestLeadPriority.SINGLE_SITE
-        )
+        assert compute_lead_priority(0, None) == DemoRequestLeadPriority.SINGLE_SITE
 
     def test_single_location_many_routers_is_multi_router_single_site(self) -> None:
         assert (
@@ -221,37 +221,24 @@ class TestComputeLeadPriority:
         )
 
     def test_location_unknown_single_router_is_single_site(self) -> None:
-        assert (
-            compute_lead_priority(None, 1) == DemoRequestLeadPriority.SINGLE_SITE
-        )
+        assert compute_lead_priority(None, 1) == DemoRequestLeadPriority.SINGLE_SITE
 
     def test_two_locations_is_multi_location(self) -> None:
-        assert (
-            compute_lead_priority(2, None) == DemoRequestLeadPriority.MULTI_LOCATION
-        )
+        assert compute_lead_priority(2, None) == DemoRequestLeadPriority.MULTI_LOCATION
 
     def test_ten_locations_is_still_multi_location(self) -> None:
-        assert (
-            compute_lead_priority(10, None)
-            == DemoRequestLeadPriority.MULTI_LOCATION
-        )
+        assert compute_lead_priority(10, None) == DemoRequestLeadPriority.MULTI_LOCATION
 
     def test_eleven_locations_is_enterprise(self) -> None:
-        assert (
-            compute_lead_priority(11, None) == DemoRequestLeadPriority.ENTERPRISE
-        )
+        assert compute_lead_priority(11, None) == DemoRequestLeadPriority.ENTERPRISE
 
     def test_large_location_count_is_enterprise_regardless_of_routers(self) -> None:
-        assert (
-            compute_lead_priority(50, 2) == DemoRequestLeadPriority.ENTERPRISE
-        )
+        assert compute_lead_priority(50, 2) == DemoRequestLeadPriority.ENTERPRISE
 
     def test_multi_location_takes_priority_over_router_count(self) -> None:
         # location_count alone decides MULTI_LOCATION/ENTERPRISE -- router
         # count is only consulted in the single-site branch.
-        assert (
-            compute_lead_priority(3, 1) == DemoRequestLeadPriority.MULTI_LOCATION
-        )
+        assert compute_lead_priority(3, 1) == DemoRequestLeadPriority.MULTI_LOCATION
 
 
 # ============================================================================
@@ -520,3 +507,181 @@ class TestDemoRequestModel:
         assert demo_request.property_type is None
         assert demo_request.location_count is None
         assert demo_request.router_count is None
+
+
+# ============================================================================
+# Delete (Master console): soft delete, 404s, list exclusion, RBAC pin
+# ============================================================================
+
+
+async def _submit(service: DemoRequestService, **overrides: object) -> DemoRequest:
+    fields: dict[str, object] = {
+        "full_name": "Alice Anderson",
+        "email": "alice@example.com",
+        "phone": None,
+        "company_name": "Lakeside Hotel",
+        "message": None,
+    }
+    fields.update(overrides)
+    return await service.submit_demo_request(**fields)  # type: ignore[arg-type]
+
+
+class _CapturingSession:
+    """Just enough ``AsyncSession`` to drive the real repositories without a
+    database: records every call so a test can assert *what* was issued."""
+
+    def __init__(self) -> None:
+        self.deleted: list[object] = []
+        self.flushed = 0
+        self.refreshed: list[object] = []
+        self.statements: list[object] = []
+
+    async def delete(self, instance: object) -> None:
+        self.deleted.append(instance)
+
+    async def flush(self) -> None:
+        self.flushed += 1
+
+    async def refresh(self, instance: object) -> None:
+        self.refreshed.append(instance)
+
+    async def execute(self, statement: object):
+        self.statements.append(statement)
+
+        class _Result:
+            def scalars(self):
+                class _Scalars:
+                    def first(self):
+                        return None
+
+                return _Scalars()
+
+        return _Result()
+
+
+class TestDeleteDemoRequest:
+    async def test_delete_soft_deletes_and_records_actor(self) -> None:
+        service, repository = _make_service()
+        created = await _submit(service)
+        actor = uuid.uuid4()
+
+        deleted = await service.delete_demo_request(created.id, actor_user_id=actor)
+
+        assert deleted.id == created.id
+        assert deleted.is_deleted is True
+        assert deleted.deleted_at is not None
+        assert deleted.updated_by == actor
+        assert repository.soft_deleted == [created.id]
+        # Still in storage -- flagged, never removed.
+        assert created.id in repository.requests
+
+    async def test_delete_missing_id_raises_not_found(self) -> None:
+        service, repository = _make_service()
+        with pytest.raises(DemoRequestNotFoundError):
+            await service.delete_demo_request(uuid.uuid4(), actor_user_id=None)
+        assert repository.soft_deleted == []
+
+    async def test_delete_already_deleted_raises_not_found(self) -> None:
+        service, repository = _make_service()
+        created = await _submit(service)
+        await service.delete_demo_request(created.id, actor_user_id=None)
+
+        with pytest.raises(DemoRequestNotFoundError):
+            await service.delete_demo_request(created.id, actor_user_id=None)
+        assert repository.soft_deleted == [created.id]
+
+    async def test_get_after_delete_raises_not_found(self) -> None:
+        service, _repository = _make_service()
+        created = await _submit(service)
+        await service.delete_demo_request(created.id, actor_user_id=None)
+
+        with pytest.raises(DemoRequestNotFoundError):
+            await service.get_demo_request(created.id)
+
+    async def test_list_excludes_deleted(self) -> None:
+        service, _repository = _make_service()
+        keep = await _submit(service, email="keep@example.com")
+        drop = await _submit(service, email="drop@example.com")
+        await service.delete_demo_request(drop.id, actor_user_id=None)
+
+        result = await service.list_demo_requests()
+
+        assert [r.id for r in result.items] == [keep.id]
+        assert result.meta.total_items == 1
+
+    def test_real_list_filters_exclude_deleted(self) -> None:
+        from app.domains.demo_request.repository import DemoRequestRepository
+
+        repository = DemoRequestRepository(_CapturingSession())  # type: ignore[arg-type]
+        filters = repository._list_filters(status=None, search=None)
+        assert any("is_deleted" in str(f) for f in filters)
+
+    async def test_real_repository_never_issues_a_row_delete(self) -> None:
+        """``demo_bookings.demo_request_id`` is ON DELETE RESTRICT, so a row
+        DELETE would fail for any lead with a booking. The real repository
+        must only flag the row."""
+        from app.domains.demo_request.repository import DemoRequestRepository
+
+        session = _CapturingSession()
+        repository = DemoRequestRepository(session)  # type: ignore[arg-type]
+        lead = DemoRequest(
+            **_base_fields(
+                full_name="Alice Anderson",
+                email="alice@example.com",
+                company_name="Lakeside Hotel",
+                status=DemoRequestStatus.NEW.value,
+            )
+        )
+
+        await repository.soft_delete(lead)
+
+        assert session.deleted == []
+        assert lead.is_deleted is True
+        assert session.flushed == 1
+
+    async def test_lead_with_a_booking_stays_resolvable_for_that_booking(
+        self,
+    ) -> None:
+        """A lead with a booking can be deleted (soft), and the booking's own
+        lead lookup must not filter on ``is_deleted`` -- otherwise the
+        visitor's cancel/reschedule link and the operator's booking edit
+        would 404 while the slot stays held."""
+        from app.domains.demo_booking.repository import DemoBookingRepository
+
+        session = _CapturingSession()
+        repository = DemoBookingRepository(session)  # type: ignore[arg-type]
+
+        await repository.find_lead_by_id(uuid.uuid4())
+
+        (statement,) = session.statements
+        where_clause = str(statement).split("WHERE", 1)[1]
+        assert "is_deleted" not in where_clause
+
+    def test_delete_route_pins_global_scope_and_delete_permission(self) -> None:
+        from app.domains.demo_request.router import router
+        from app.domains.rbac.enums import ScopeType
+
+        (route,) = [
+            r
+            for r in router.routes
+            if r.path == "/demo-requests/{demo_request_id}" and "DELETE" in r.methods
+        ]
+        closures = [
+            cell.cell_contents
+            for dep in route.dependant.dependencies
+            for cell in (getattr(dep.call, "__closure__", None) or ())
+        ]
+        assert "demo_requests.delete" in closures
+        assert ScopeType.GLOBAL in closures
+
+    def test_seed_grants_delete_exactly_where_manage_is_granted(self) -> None:
+        from app.domains.rbac.enums import PermissionAction, PermissionModule
+        from app.domains.rbac.seed import MODULE_ACTIONS, GrantLevel, expand_grant_level
+
+        actions = MODULE_ACTIONS[PermissionModule.DEMO_REQUESTS]
+        assert PermissionAction.DELETE in actions
+        for level in GrantLevel:
+            expanded = expand_grant_level(level, actions)
+            assert (PermissionAction.DELETE in expanded) == (
+                PermissionAction.MANAGE in expanded
+            )

@@ -1,5 +1,5 @@
 """Demo Request business logic: ``DemoRequestService`` -- create (public,
-unauthenticated)/list/get/update (Master console, RBAC-gated), with no
+unauthenticated)/list/get/update/delete (Master console, RBAC-gated), with no
 tenant scoping at all (see ``models.py``'s own module docstring: a demo
 request belongs to no organization -- there is no ``organization_id`` to
 scope by, unlike every other domain in this codebase)."""
@@ -211,6 +211,39 @@ class DemoRequestService:
             extra={"demo_request_id": str(updated.id)},
         )
         return updated
+
+    # -- delete (Master console) ---------------------------------------------
+
+    async def delete_demo_request(
+        self,
+        demo_request_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+    ) -> DemoRequest:
+        """Soft-deletes one lead: the row is flagged, never removed.
+
+        Soft rather than hard because ``demo_bookings.demo_request_id`` is
+        ``ON DELETE RESTRICT`` -- a row delete would fail for any lead that
+        booked a slot. Missing and already-deleted ids both raise the same
+        ``DemoRequestNotFoundError`` ``get_demo_request`` does.
+
+        Attached bookings are deliberately left alone: a confirmed booking
+        still holds its calendar slot, still shows in the Master console's
+        bookings list, and can still be cancelled/rescheduled by the visitor
+        or the operator (``demo_booking.repository.find_lead_by_id`` resolves
+        a booking's lead regardless of this flag).
+        """
+        demo_request = await self.get_demo_request(demo_request_id)
+        demo_request.updated_by = actor_user_id
+        deleted = await self.repository.soft_delete(demo_request)
+        logger.info(
+            "demo_request_deleted",
+            extra={
+                "demo_request_id": str(deleted.id),
+                "actor_user_id": str(actor_user_id) if actor_user_id else None,
+            },
+        )
+        return deleted
 
 
 __all__ = ["DemoRequestService", "DemoRequestListResult", "NotificationEnqueuer"]
