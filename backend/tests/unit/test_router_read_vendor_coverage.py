@@ -213,9 +213,18 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "address that matches nothing is reported as an unknown exporter, "
         "and no judgement about device health is made from the result."
     ),
+    "app/domains/traffic_flow/service.py::TrafficFlowRepository.fleet_routers": (
+        "The Master fleet status lists every router on purpose, so an "
+        "operator can see which venues cannot be switched on at all. A "
+        "controller-managed row is never described as silent or broken "
+        "hardware: `flow_state` gives any non-MikroTik vendor the explicit "
+        "state `unsupported_vendor` before it looks at data, and the apply "
+        "path refuses such a router with UNSUPPORTED_VENDOR before any "
+        "device call. Nothing is dispatched from this list."
+    ),
     "app/domains/traffic_flow/service.py::TrafficFlowRepository.router_labels": (
         "Name/vendor/location labels for routers that already have flow "
-        "windows or are allowlisted, for the Master overview. Every vendor "
+        "windows or are switched on, for the Master overview. Every vendor "
         "belongs in the answer (a non-MikroTik is shown with its vendor and "
         "is refused by the apply path, never reported as broken hardware); "
         "nothing is written to it."

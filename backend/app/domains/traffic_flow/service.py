@@ -193,9 +193,7 @@ def router_activity_statement(recent_since: datetime) -> Any:
         func.max(window.window_start),
         func.max(window.window_seconds),
         func.count().filter(recent),
-        func.coalesce(
-            func.sum(window.bytes_up + window.bytes_down).filter(recent), 0
-        ),
+        func.coalesce(func.sum(window.bytes_up + window.bytes_down).filter(recent), 0),
     ).group_by(window.router_id)
 
 
@@ -270,9 +268,7 @@ class TrafficFlowRepository:
         )
         if router_id is not None:
             stmt = stmt.where(Router.id == router_id)
-        return [
-            FleetRouter(*row) for row in (await self.session.execute(stmt)).all()
-        ]
+        return [FleetRouter(*row) for row in (await self.session.execute(stmt)).all()]
 
     async def router_activity(
         self, recent_since: datetime
