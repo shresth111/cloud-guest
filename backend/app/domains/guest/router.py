@@ -175,7 +175,12 @@ from .service import (
     GuestService,
     RadiusService,
 )
-from .validators import guest_has_opened_review_link, guest_has_profile
+from .validators import (
+    DevicePresenceObservation,
+    device_online_for_session,
+    guest_has_opened_review_link,
+    guest_has_profile,
+)
 
 guest_router = APIRouter(prefix="/guest", tags=["Guest"])
 admin_router = APIRouter(tags=["Guest Admin"])
@@ -567,14 +572,17 @@ async def _resolve_session_presence(
     one of them has seen it.
 
     ``None`` is "this platform has no observation to make" -- no device on
-    the session, or a router that has never synced one. That is deliberately
-    not the same answer as ``False``, and the schema documents it as such."""
+    the session, a router that has never synced one, or a "gone" verdict
+    written before this session last proved the device was there (the sync
+    is 15 minutes apart; see ``validators.device_online_for_session``). That
+    is deliberately not the same answer as ``False``, and the schema
+    documents it as such."""
     pairs = [
         (session.router_id, macs[str(session.device_id)])
         for session in sessions
         if session.device_id is not None and str(session.device_id) in macs
     ]
-    seen: dict[tuple[uuid.UUID, str], bool] = {}
+    seen: dict[tuple[uuid.UUID, str], DevicePresenceObservation] = {}
     unique_pairs = list(dict.fromkeys(pairs))
     for start in range(0, len(unique_pairs), MAX_BULK_DEVICE_LOOKUP_IDS):
         chunk = unique_pairs[start : start + MAX_BULK_DEVICE_LOOKUP_IDS]
@@ -584,7 +592,9 @@ async def _resolve_session_presence(
     for session in sessions:
         mac = macs.get(str(session.device_id)) if session.device_id else None
         presence[str(session.id)] = (
-            seen.get((session.router_id, mac)) if mac else None
+            device_online_for_session(session, seen.get((session.router_id, mac)))
+            if mac
+            else None
         )
     return presence
 

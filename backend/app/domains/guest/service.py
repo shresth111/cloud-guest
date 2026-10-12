@@ -419,6 +419,7 @@ from .repository import (
     VoucherRedemptionRow,
 )
 from .validators import (
+    DevicePresenceObservation,
     as_utc,
     canonical_mac_key,
     compute_period_start,
@@ -5006,8 +5007,8 @@ class GuestService:
 
     async def list_device_presence(
         self, *, router_mac_pairs: list[tuple[uuid.UUID, str]]
-    ) -> dict[tuple[uuid.UUID, str], bool]:
-        """Whether the venue's network is still seeing each ``(router, MAC)``
+    ) -> dict[tuple[uuid.UUID, str], DevicePresenceObservation]:
+        """What the venue's network last observed of each ``(router, MAC)``
         -- backs ``GuestSessionResponse.device_online``, and through it the
         "Online" indicator.
 

@@ -48,6 +48,7 @@ from app.domains.guest.schemas import (
     GuestSessionResponse,
     VoucherRedemptionResponse,
 )
+from app.domains.guest.validators import DevicePresenceObservation
 from app.middleware.request_context import MaskingContext, masking_context
 
 NOW = datetime(2026, 9, 7, 7, 38, 22, tzinfo=UTC)
@@ -307,7 +308,10 @@ class TestSessionPresenceResolution:
         class _Service:
             async def list_device_presence(self, *, router_mac_pairs):
                 calls.append(list(router_mac_pairs))
-                return {pair: True for pair in router_mac_pairs}
+                return {
+                    pair: DevicePresenceObservation(is_active=True, observed_at=NOW)
+                    for pair in router_mac_pairs
+                }
 
         session = _session()
         result = await _resolve_session_presence(
@@ -337,6 +341,104 @@ class TestSessionPresenceResolution:
         assert sorted(asked) == sorted(
             {(first.router_id, REAL_MAC), (second.router_id, REAL_MAC)}
         )
+
+    async def _presence_for(
+        self, session: _Row, observation: DevicePresenceObservation | None
+    ) -> bool | None:
+        class _Service:
+            async def list_device_presence(self, *, router_mac_pairs):
+                if observation is None:
+                    return {}
+                return {pair: observation for pair in router_mac_pairs}
+
+        result = await _resolve_session_presence(
+            [session], {str(session.device_id): REAL_MAC}, service=_Service()
+        )
+        return result[str(session.id)]
+
+    async def test_a_gone_verdict_older_than_the_login_does_not_hide_the_guest(
+        self,
+    ) -> None:
+        """Seen live: a phone logged in 93 seconds after the 15-minute device
+        sync, carrying yesterday's ``is_active=False`` row. Hotspot-authorized
+        and passing traffic, it was reported as not online until the next
+        sync. A row written before the session started says nothing about
+        it."""
+        session = _session(started_at=NOW, last_activity_at=NOW)
+        stale = DevicePresenceObservation(
+            is_active=False, observed_at=NOW - timedelta(hours=8)
+        )
+
+        assert await self._presence_for(session, stale) is None
+        [payload] = [
+            r.model_dump()
+            for r in _session_responses(
+                [session],
+                {str(session.device_id): REAL_MAC},
+                presence={str(session.id): await self._presence_for(session, stale)},
+            )
+        ]
+        assert payload["is_online"] is True
+        assert payload["device_online"] is None
+
+    async def test_a_gone_verdict_written_after_the_login_still_counts(
+        self,
+    ) -> None:
+        session = _session(
+            started_at=NOW - timedelta(hours=1),
+            last_activity_at=NOW - timedelta(minutes=40),
+        )
+        left = DevicePresenceObservation(
+            is_active=False, observed_at=NOW - timedelta(minutes=5)
+        )
+
+        assert await self._presence_for(session, left) is False
+
+    async def test_activity_after_the_gone_verdict_outranks_it(self) -> None:
+        """Accounting or a portal re-POST after the row was flipped is the
+        device proving it is back; the next sync has simply not run yet."""
+        session = _session(
+            started_at=NOW - timedelta(hours=1),
+            last_activity_at=NOW - timedelta(minutes=1),
+        )
+        flipped_earlier = DevicePresenceObservation(
+            is_active=False, observed_at=NOW - timedelta(minutes=5)
+        )
+
+        assert await self._presence_for(session, flipped_earlier) is None
+
+    async def test_a_gone_verdict_at_the_same_instant_is_not_newer(self) -> None:
+        session = _session(started_at=NOW, last_activity_at=None)
+        same = DevicePresenceObservation(is_active=False, observed_at=NOW)
+
+        assert await self._presence_for(session, same) is None
+
+    async def test_a_present_verdict_is_taken_whatever_its_age(self) -> None:
+        session = _session(started_at=NOW, last_activity_at=NOW)
+        old_but_present = DevicePresenceObservation(
+            is_active=True, observed_at=NOW - timedelta(days=2)
+        )
+
+        assert await self._presence_for(session, old_but_present) is True
+
+    async def test_no_row_is_no_observation(self) -> None:
+        assert await self._presence_for(_session(), None) is None
+
+    async def test_a_gone_verdict_with_no_timestamp_is_not_trusted(self) -> None:
+        undated = DevicePresenceObservation(is_active=False, observed_at=None)
+
+        assert await self._presence_for(_session(), undated) is None
+
+    async def test_naive_timestamps_are_compared_as_utc(self) -> None:
+        """SQLite-backed test runs hand back naive datetimes; the comparison
+        must not raise on a naive/aware mix."""
+        session = _session(
+            started_at=(NOW - timedelta(hours=1)).replace(tzinfo=None),
+            last_activity_at=None,
+        )
+        left = DevicePresenceObservation(is_active=False, observed_at=NOW)
+
+        assert await self._presence_for(session, left) is False
 
     async def test_a_session_with_no_device_asks_about_nothing(self) -> None:
         class _Service:
