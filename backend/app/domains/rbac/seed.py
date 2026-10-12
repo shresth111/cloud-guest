@@ -559,10 +559,20 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     PermissionModule.READINESS: (_A.READ, _A.MANAGE),
     # Channel Partners: CREATE covers the one-shot "onboard + send welcome
     # message" action (no separate draft step, same reasoning QUOTATIONS'
-    # own comment gives), READ covers list/get, MANAGE is the catch-all for
-    # the future deactivate/reactivate action (see models.py's `status`
-    # column comment -- no API surface for it yet).
-    PermissionModule.CHANNEL_PARTNERS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # own comment gives), READ covers list/get, MANAGE covers revoke and
+    # resend-welcome-message, DELETE gates the soft delete
+    # (DELETE /channel-partners/{id}) -- its own action rather than folded
+    # into MANAGE for exactly the reasons QUOTATIONS' comment above gives
+    # (every module with a real delete endpoint gates it on
+    # ``<module>.delete``, and OPERATE excludes DELETE).
+    #
+    # NOTE FOR DEPLOY: same trap as QUOTATIONS' DELETE -- the seed is a
+    # manual entrypoint, so the endpoint 403s for everyone (and the
+    # console's Delete button does not render) until
+    # ``python -m app.domains.rbac.seed`` is re-run. expand_grant_level
+    # folds DELETE into FULL, so Super Admin and Platform Admin (the two
+    # roles holding channel_partners.manage) get it with no role changes.
+    PermissionModule.CHANNEL_PARTNERS: (_A.CREATE, _A.READ, _A.DELETE, _A.MANAGE),
     # Network Integrations: plain CRUD on the integration row plus MANAGE
     # (the platform-console enable/disable, a real admin action distinct
     # from a field edit -- the same reasoning

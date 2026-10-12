@@ -129,6 +129,12 @@ class FakeChannelPartnerRepository:
         partner.version += 1
         return partner
 
+    async def soft_delete_partner(self, partner: ChannelPartner) -> ChannelPartner:
+        # Mirrors BaseModel.mark_deleted via GenericRepository.soft_delete.
+        partner.mark_deleted()
+        partner.version += 1
+        return partner
+
     async def list_partners(
         self,
         *,
@@ -1194,6 +1200,193 @@ class TestRevokePartner:
             await service.revoke_partner(uuid.uuid4(), actor_user_id=uuid.uuid4())
 
 
+class TestDeletePartner:
+    async def _onboarded(self, **service_kwargs: object):
+        service, repository = _make_service(
+            sms_provider=FakeSmsProvider(),
+            email_provider=FakeEmailProvider(),
+            **service_kwargs,
+        )
+        partner = await service.onboard_partner(
+            actor_user_id=uuid.uuid4(), data=_make_request()
+        )
+        return service, repository, partner
+
+    async def test_delete_soft_deletes_and_never_removes_the_row(self) -> None:
+        service, repository, partner = await self._onboarded()
+        actor_id = uuid.uuid4()
+
+        deleted = await service.delete_partner(partner.id, actor_user_id=actor_id)
+
+        # Row still present -- flagged, not removed.
+        assert partner.id in repository.partners
+        row = repository.partners[partner.id]
+        assert row is deleted
+        assert row.is_deleted is True
+        assert row.deleted_at is not None
+        assert row.status == ChannelPartnerStatus.INACTIVE.value
+        assert row.updated_by == actor_id
+
+    async def test_delete_writes_an_audit_log_entry(self) -> None:
+        audit_writer = FakeAuditWriter()
+        service, _repository, partner = await self._onboarded(audit_writer=audit_writer)
+        actor_id = uuid.uuid4()
+
+        await service.delete_partner(partner.id, actor_user_id=actor_id)
+
+        assert len(audit_writer.entries) == 1
+        entry = audit_writer.entries[0]
+        assert entry["action"] == AuditAction.CHANNEL_PARTNER_DELETED.value
+        assert entry["entity_type"] == "channel_partner"
+        assert entry["entity_id"] == partner.id
+        assert entry["actor_user_id"] == actor_id
+        assert entry["organization_id"] is None
+        assert entry["event_metadata"]["previous_status"] == (
+            ChannelPartnerStatus.ACTIVE.value
+        )
+
+    async def test_get_on_deleted_partner_is_not_found(self) -> None:
+        service, _repository, partner = await self._onboarded()
+        await service.delete_partner(partner.id, actor_user_id=uuid.uuid4())
+
+        with pytest.raises(ChannelPartnerNotFoundError) as exc_info:
+            await service.get_partner(partner.id)
+        assert exc_info.value.status_code == 404
+
+    async def test_delete_missing_partner_is_404(self) -> None:
+        service, _repository = _make_service()
+        with pytest.raises(ChannelPartnerNotFoundError) as exc_info:
+            await service.delete_partner(uuid.uuid4(), actor_user_id=uuid.uuid4())
+        assert exc_info.value.status_code == 404
+
+    async def test_delete_already_deleted_partner_is_404_with_no_second_write(
+        self,
+    ) -> None:
+        audit_writer = FakeAuditWriter()
+        service, repository, partner = await self._onboarded(audit_writer=audit_writer)
+        await service.delete_partner(partner.id, actor_user_id=uuid.uuid4())
+        first_deleted_at = repository.partners[partner.id].deleted_at
+        version_after_delete = repository.partners[partner.id].version
+
+        with pytest.raises(ChannelPartnerNotFoundError) as exc_info:
+            await service.delete_partner(partner.id, actor_user_id=uuid.uuid4())
+
+        assert exc_info.value.status_code == 404
+        assert repository.partners[partner.id].deleted_at == first_deleted_at
+        assert repository.partners[partner.id].version == version_after_delete
+        assert len(audit_writer.entries) == 1
+
+    async def test_list_excludes_deleted_partners(self) -> None:
+        service, _repository, kept = await self._onboarded()
+        doomed = await service.onboard_partner(
+            actor_user_id=uuid.uuid4(),
+            data=_make_request(
+                name="Bob Brown", phone="9123456780", gst_number="29ABCDE1234F1Z1"
+            ),
+        )
+
+        await service.delete_partner(doomed.id, actor_user_id=uuid.uuid4())
+
+        result = await service.list_partners()
+        assert [p.id for p in result.items] == [kept.id]
+        assert result.meta.total_items == 1
+        # Status filter must not resurrect it either (delete sets INACTIVE).
+        inactive = await service.list_partners(
+            status=ChannelPartnerStatus.INACTIVE.value
+        )
+        assert inactive.items == []
+
+    def test_real_repository_list_filters_exclude_is_deleted(self) -> None:
+        """The fake above filters ``is_deleted`` by construction -- this
+        pins the *real* repository's WHERE clause so the list test is not
+        merely testing the fake."""
+        from app.domains.channel_partner.repository import ChannelPartnerRepository
+
+        repository = ChannelPartnerRepository(session=None)  # type: ignore[arg-type]
+        for kwargs in (
+            {"status": None, "search": None},
+            {"status": "inactive", "search": "x"},
+        ):
+            compiled = [
+                str(clause.compile(compile_kwargs={"literal_binds": True}))
+                for clause in repository._list_filters(**kwargs)
+            ]
+            assert "channel_partners.is_deleted IS false" in compiled, compiled
+
+    async def test_route_handler_returns_message_response(self) -> None:
+        from types import SimpleNamespace
+
+        from app.domains.channel_partner.router import delete_channel_partner
+
+        service, _repository, partner = await self._onboarded()
+        request = SimpleNamespace(state=SimpleNamespace(request_id="req-1"))
+        user = SimpleNamespace(id=str(uuid.uuid4()))
+
+        body = await delete_channel_partner(
+            request=request,  # type: ignore[arg-type]
+            channel_partner_id=partner.id,
+            user=user,  # type: ignore[arg-type]
+            service=service,
+        )
+
+        assert body == {
+            "success": True,
+            "message": "Channel partner deleted",
+            "data": {"message": "Channel partner deleted", "success": True},
+            "request_id": "req-1",
+        }
+
+
+class TestDeleteRouteAuthorizationScope:
+    def _mounted_delete_route(self):
+        from app.main import create_app
+
+        app = create_app()
+        routes = [
+            route
+            for route in app.routes
+            if getattr(route, "path", "").endswith(
+                "/channel-partners/{channel_partner_id}"
+            )
+            and "DELETE" in getattr(route, "methods", set())
+        ]
+        assert len(routes) == 1, "DELETE /channel-partners/{id} not mounted"
+        return routes[0]
+
+    def test_delete_is_mounted_under_api_v1(self) -> None:
+        route = self._mounted_delete_route()
+        assert route.path == "/api/v1/channel-partners/{channel_partner_id}"
+
+    def test_delete_route_pins_permission_check_to_global_scope(self) -> None:
+        """Unpinned ``RequirePermission`` infers the scope from the
+        caller's own scope headers. A channel partner has no
+        ``organization_id`` to re-check, so the route must pin GLOBAL."""
+        route = self._mounted_delete_route()
+        cells = [
+            cell.cell_contents
+            for dependency in route.dependant.dependencies
+            for cell in (dependency.call.__closure__ or ())
+        ]
+        assert ScopeType.GLOBAL in [c for c in cells if isinstance(c, ScopeType)]
+        assert "channel_partners.delete" in [c for c in cells if isinstance(c, str)]
+
+    async def test_actor_without_delete_permission_gets_403(self) -> None:
+        delete_route = next(
+            route
+            for route in router.routes
+            if "DELETE" in route.methods  # type: ignore[attr-defined]
+        )
+        (permission_key,) = _permission_keys(delete_route)
+        assert permission_key == "channel_partners.delete"
+        validator = AccessValidator(FakeRBACRepository())
+
+        with pytest.raises(PermissionDeniedError) as exc_info:
+            await validator.check(
+                uuid.uuid4(), permission_key, scope_type=ScopeType.GLOBAL
+            )
+        assert exc_info.value.status_code == 403
+
+
 # ============================================================================
 # Router: message composition + RBAC gating
 # ============================================================================
@@ -1372,8 +1565,8 @@ class TestResendMessageComposition:
 
 class TestEveryRouteRequiresPermission:
     def test_every_channel_partner_route_has_a_permission_dependency(self) -> None:
-        # onboard, list, get, resend-welcome-message, revoke.
-        assert len(router.routes) == 5
+        # onboard, list, get, resend-welcome-message, revoke, delete.
+        assert len(router.routes) == 6
         for route in router.routes:
             assert (
                 route.dependencies != []
@@ -1497,14 +1690,34 @@ class TestChannelPartnersRbacSeedData:
             == ScopeType.GLOBAL
         )
 
-    def test_actions_are_create_read_manage(self) -> None:
+    def test_actions_are_create_read_delete_manage(self) -> None:
         from app.domains.rbac.enums import PermissionAction
 
         assert MODULE_ACTIONS[PermissionModule.CHANNEL_PARTNERS] == (
             PermissionAction.CREATE,
             PermissionAction.READ,
+            PermissionAction.DELETE,
             PermissionAction.MANAGE,
         )
+
+    def test_delete_is_granted_to_exactly_the_roles_holding_manage(self) -> None:
+        """``channel_partners.delete`` must reach the same platform roles
+        that already hold ``channel_partners.manage`` (Super Admin,
+        Platform Admin) and no one else -- Platform Support stays
+        read-only."""
+        from app.domains.rbac.enums import PermissionAction
+
+        holders = {
+            action: {
+                role_def.name
+                for role_def in SYSTEM_ROLES
+                if action
+                in role_def.grants().get(PermissionModule.CHANNEL_PARTNERS, ())
+            }
+            for action in (PermissionAction.DELETE, PermissionAction.MANAGE)
+        }
+        assert holders[PermissionAction.DELETE] == holders[PermissionAction.MANAGE]
+        assert holders[PermissionAction.DELETE] == {"Super Admin", "Platform Admin"}
 
     def test_role_grants_mirror_quotations_role_for_role(self) -> None:
         """The exact invariant this feature's RBAC diff is built on: every
@@ -1514,14 +1727,10 @@ class TestChannelPartnersRbacSeedData:
         Compared at the GRANT LEVEL, not as expanded action tuples. It used
         to compare the tuples, which was the same assertion only for as
         long as the two modules happened to declare the same actions. They
-        no longer do: QUOTATIONS gained ``DELETE`` (it has a real
-        ``DELETE /quotations/{id}`` endpoint) and CHANNEL_PARTNERS has no
-        delete endpoint to gate, so a tuple comparison now fails for Super
-        Admin -- reporting a difference in what the two modules *are*
-        rather than in how the roles *treat* them, which is what this test
-        is for. Making the tuples equal again would mean seeding
-        ``channel_partners.delete``, a permission for an endpoint that does
-        not exist.
+        no longer have to: each module's action tuple describes the
+        endpoints *it* exposes, and a tuple comparison would report a
+        difference in what the two modules *are* rather than in how the
+        roles *treat* them, which is what this test is for.
 
         So: the level each role resolves to must match, and each module's
         own grant must be exactly that level expanded over its own actions.
