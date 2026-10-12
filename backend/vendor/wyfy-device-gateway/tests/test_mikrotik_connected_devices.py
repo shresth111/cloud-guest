@@ -30,11 +30,31 @@ from tests.fake_write_transport import FakeRouterOSApi
 _LEASES = ("ip", "dhcp-server", "lease")
 _ARP = ("ip", "arp")
 _WIRELESS = ("interface", "wireless", "registration-table")
+_ROUTES = ("ip", "route")
+_ADDRESSES = ("ip", "address")
+_INTERFACES = ("interface",)
+_DHCP_CLIENTS = ("ip", "dhcp-client")
 
 
-def _api(*, leases=(), arp=(), missing=None) -> FakeRouterOSApi:
+def _api(
+    *,
+    leases=(),
+    arp=(),
+    routes=(),
+    addresses=(),
+    interfaces=(),
+    dhcp_clients=(),
+    missing=None,
+) -> FakeRouterOSApi:
     return FakeRouterOSApi(
-        menus={_LEASES: list(leases), _ARP: list(arp)},
+        menus={
+            _LEASES: list(leases),
+            _ARP: list(arp),
+            _ROUTES: list(routes),
+            _ADDRESSES: list(addresses),
+            _INTERFACES: list(interfaces),
+            _DHCP_CLIENTS: list(dhcp_clients),
+        },
         missing_menus=missing or set(),
     )
 
@@ -61,7 +81,14 @@ async def test_wireless_registration_table_is_never_queried(
         "the wireless registration table must not be queried at all -- "
         "it cannot exist on this fleet's hardware"
     )
-    assert set(api._menus) == {_LEASES, _ARP}
+    assert set(api._menus) == {
+        _LEASES,
+        _ARP,
+        _ROUTES,
+        _ADDRESSES,
+        _INTERFACES,
+        _DHCP_CLIENTS,
+    }
 
 
 @pytest.mark.asyncio
@@ -266,3 +293,131 @@ async def test_lease_row_without_a_status_field_stays_visible(
     devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
 
     assert [d.mac_address for d in devices] == ["AA:BB:CC:DD:EE:07"]
+
+
+# ============================================================================
+# Upstream neighbours are not guests
+# ============================================================================
+
+# A typical venue: DHCP WAN on ether1 behind an ISP router at
+# 192.168.1.1, guest LAN 10.5.50.0/24 on the bridge.
+_VENUE_INTERFACES = [{"name": "ether1"}, {"name": "bridge"}, {"name": "wg-cloudguard"}]
+_VENUE_ADDRESSES = [
+    {"address": "10.5.50.1/24", "interface": "bridge"},
+    {"address": "10.20.0.99/24", "interface": "wg-cloudguard"},
+    {"address": "192.168.1.200/24", "interface": "ether1"},
+]
+_VENUE_ROUTES = [
+    {"dst-address": "0.0.0.0/0", "gateway": "192.168.1.1", "active": "true"},
+]
+_VENUE_DHCP_CLIENTS = [{"interface": "ether1", "gateway": "192.168.1.1"}]
+_VENUE_ARP = [
+    {
+        "mac-address": "02:00:00:00:01:01",
+        "address": "192.168.1.1",
+        "interface": "ether1",
+    },
+    {
+        "mac-address": "02:00:00:00:01:02",
+        "address": "192.168.1.19",
+        "interface": "ether1",
+    },
+    {
+        "mac-address": "02:00:00:00:01:03",
+        "address": "192.168.1.214",
+        "interface": "ether1",
+    },
+    {
+        "mac-address": "02:00:00:00:02:01",
+        "address": "10.5.50.254",
+        "interface": "bridge",
+    },
+    {
+        "mac-address": "02:00:00:00:02:02",
+        "address": "10.5.50.10",
+        "interface": "bridge",
+    },
+]
+
+
+@pytest.mark.asyncio
+async def test_arp_neighbours_on_the_wan_are_not_connected_devices(
+    patch_connect, mikrotik_creds
+):
+    """``/ip/arp`` lists the ISP router and everything else on the upstream
+    LAN. Those are not guests of this venue; reporting them made the
+    dashboard look like devices were online without a login."""
+    api = _api(
+        arp=_VENUE_ARP,
+        routes=_VENUE_ROUTES,
+        addresses=_VENUE_ADDRESSES,
+        interfaces=_VENUE_INTERFACES,
+        dhcp_clients=_VENUE_DHCP_CLIENTS,
+    )
+    patch_connect(api)
+
+    devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
+
+    assert sorted(d.mac_address for d in devices) == [
+        "02:00:00:00:02:01",
+        "02:00:00:00:02:02",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_every_default_route_egress_counts_as_uplink(
+    patch_connect, mikrotik_creds
+):
+    """Failover/load-balance routers carry one default route per WAN; a
+    neighbour on the backup WAN is no more a guest than one on the
+    primary. Static WAN (no dhcp-client) is named from the route itself."""
+    api = _api(
+        arp=[
+            {
+                "mac-address": "AA:00:00:00:00:01",
+                "address": "203.0.113.1",
+                "interface": "ether1",
+            },
+            {
+                "mac-address": "AA:00:00:00:00:02",
+                "address": "198.51.100.1",
+                "interface": "ether2",
+            },
+            {
+                "mac-address": "AA:00:00:00:00:03",
+                "address": "10.5.50.30",
+                "interface": "bridge",
+            },
+        ],
+        routes=[
+            {
+                "dst-address": "0.0.0.0/0",
+                "gateway": "203.0.113.1%ether1",
+                "active": "true",
+            },
+            {"dst-address": "0.0.0.0/0", "gateway": "198.51.100.1", "distance": "2"},
+        ],
+        addresses=[
+            {"address": "203.0.113.2/30", "interface": "ether1"},
+            {"address": "198.51.100.2/30", "interface": "ether2"},
+            {"address": "10.5.50.1/24", "interface": "bridge"},
+        ],
+        interfaces=[{"name": "ether1"}, {"name": "ether2"}, {"name": "bridge"}],
+    )
+    patch_connect(api)
+
+    devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
+
+    assert [d.mac_address for d in devices] == ["AA:00:00:00:00:03"]
+
+
+@pytest.mark.asyncio
+async def test_unreadable_route_menu_keeps_every_arp_row(patch_connect, mikrotik_creds):
+    """If the router will not say which interface is the WAN, hiding rows
+    on a guess could hide real guests. Fall back to the old behaviour."""
+    api = _api(arp=_VENUE_ARP, missing={_ROUTES, _DHCP_CLIENTS})
+    patch_connect(api)
+
+    devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
+
+    assert len(devices) == len(_VENUE_ARP)
