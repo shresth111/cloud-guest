@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .constants import (
@@ -485,6 +486,52 @@ def is_session_presence_judgeable(
     return session.started_at <= cutoff and session.last_activity_at <= cutoff
 
 
+class DevicePresenceObservation(NamedTuple):
+    """One ``connected_devices`` row, as far as "is this guest online" cares:
+    what the DHCP/ARP sync last concluded, and when that row was last
+    written. ``observed_at`` is the row's ``updated_at`` -- the sync flips
+    ``is_active`` to ``False`` without touching ``last_seen_at``, so the
+    row's own last write is the only timestamp on "seen leaving"."""
+
+    is_active: bool
+    observed_at: datetime | None
+
+
+def device_online_for_session(
+    session: GuestSession, observation: DevicePresenceObservation | None
+) -> bool | None:
+    """What a ``connected_devices`` observation says about *this* session's
+    device: ``True`` (seen), ``False`` (seen leaving) or ``None`` (nothing
+    to say).
+
+    The sync that writes the row runs every 15 minutes. A device that left
+    yesterday keeps its ``is_active=False`` row until the first sync after
+    it returns, so for up to a full interval a guest who has just logged in
+    -- hotspot-authorized, queue carrying traffic -- was reported as not
+    online, on the one screen an operator opens to see who is.
+
+    An "absent" verdict is therefore evidence about a session only if it
+    was written after the session last proved the device was there: its
+    start, or its latest activity (RADIUS accounting / a portal re-POST).
+    Older than that, the row predates the login and says nothing about it.
+    A "present" verdict needs no such test -- it can only err toward the
+    session's own state, which is what decides in its absence anyway."""
+    if observation is None:
+        return None
+    if observation.is_active:
+        return True
+    proven_present_at = [
+        as_utc(moment)
+        for moment in (session.started_at, session.last_activity_at)
+        if moment is not None
+    ]
+    if observation.observed_at is None or not proven_present_at:
+        return None
+    if as_utc(observation.observed_at) <= max(proven_present_at):
+        return None
+    return False
+
+
 def is_quota_exceeded(session: GuestSession) -> bool:
     """Whether ``session``'s cumulative ``bytes_uploaded +
     bytes_downloaded`` has reached or exceeded its own ``data_limit_mb`` --
@@ -673,6 +720,8 @@ def is_weak_pin(pin: str) -> bool:
 
 
 __all__ = [
+    "DevicePresenceObservation",
+    "device_online_for_session",
     "guest_has_profile",
     "guest_has_opened_review_link",
     "normalize_mac_address",

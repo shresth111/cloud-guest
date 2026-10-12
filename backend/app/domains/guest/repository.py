@@ -63,6 +63,7 @@ from .models import (
     RadiusNasClient,
     RadiusNasCodeCounter,
 )
+from .validators import DevicePresenceObservation
 
 # ============================================================================
 # Analytics read-models (repository-layer return shapes -- service.py wraps
@@ -281,7 +282,7 @@ class GuestRepositoryProtocol(Protocol):
 
     async def list_device_presence(
         self, *, router_mac_pairs: Sequence[tuple[uuid.UUID, str]]
-    ) -> dict[tuple[uuid.UUID, str], bool]: ...
+    ) -> dict[tuple[uuid.UUID, str], DevicePresenceObservation]: ...
 
     async def list_voucher_redemptions(
         self,
@@ -894,8 +895,8 @@ class GuestRepository:
 
     async def list_device_presence(
         self, *, router_mac_pairs: Sequence[tuple[uuid.UUID, str]]
-    ) -> dict[tuple[uuid.UUID, str], bool]:
-        """Whether the network is still seeing each ``(router, MAC)`` -- backs
+    ) -> dict[tuple[uuid.UUID, str], DevicePresenceObservation]:
+        """What the network last observed of each ``(router, MAC)`` -- backs
         ``GuestSessionResponse.device_online``.
 
         ## Why this reads another domain's table
@@ -917,7 +918,13 @@ class GuestRepository:
         -- the pair, not the MAC alone, because the same phone can be on two
         venues' networks and only one of them has seen it. A pair with no row
         is simply absent from the result, which the caller reads as "this
-        platform has no observation", never as ``False``."""
+        platform has no observation", never as ``False``.
+
+        The row's ``updated_at`` travels with the verdict because the sync
+        that writes it runs every 15 minutes: an ``is_active=False`` left
+        over from before a guest logged in is not an observation of that
+        login. ``validators.device_online_for_session`` is where the two are
+        weighed against a session."""
         if not router_mac_pairs:
             return {}
         router_ids = {router_id for router_id, _ in router_mac_pairs}
@@ -926,6 +933,7 @@ class GuestRepository:
             ConnectedDevice.router_id,
             ConnectedDevice.mac_address,
             ConnectedDevice.is_active,
+            ConnectedDevice.updated_at,
         ).where(
             ConnectedDevice.router_id.in_(router_ids),
             ConnectedDevice.mac_address.in_(mac_addresses),
@@ -933,8 +941,10 @@ class GuestRepository:
         )
         result = await self.session.execute(statement)
         return {
-            (router_id, mac_address): is_active
-            for router_id, mac_address, is_active in result.all()
+            (router_id, mac_address): DevicePresenceObservation(
+                is_active=is_active, observed_at=observed_at
+            )
+            for router_id, mac_address, is_active, observed_at in result.all()
         }
 
     async def list_voucher_redemptions(
