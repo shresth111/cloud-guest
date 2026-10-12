@@ -1,21 +1,36 @@
 [Unit]
 Description=Wyfy NetFlow/IPFIX collector (pmacct nfacctd on the WireGuard tunnel address)
-# NOT DEPLOYED. Needs wg0 up: nfacctd binds 10.20.0.1, which exists only then.
+# Needs wg0 up: nfacctd binds the hub's tunnel address, which exists only then.
 After=wg-quick@wg0.service flow-agent-firewall.service
 Requires=wg-quick@wg0.service
+# The collector must not listen without its firewall rules in place.
+Wants=flow-agent-firewall.service
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/install -d -o pmacct -g pmacct -m 0750 /var/spool/wyfy-flows
+# flow_agent.py reads the spool file names as UTC. Pin the daemon to UTC
+# whatever the host's zone is.
+Environment=TZ=UTC
+# "+" runs this one command as root: the service user cannot create a
+# directory under /var/spool, and without it the unit never starts.
+ExecStartPre=+/usr/bin/install -d -o pmacct -g pmacct -m 0750 /var/spool/wyfy-flows
 ExecStart=/usr/sbin/nfacctd -f /etc/pmacct/wyfy-nfacctd.conf
 Restart=always
 RestartSec=5
 # /var/lib/wyfy-nfacctd, owned by the service user: the IPFIX template cache
 # (nfacctd_templates_file) that lets records decode straight after a restart.
 StateDirectory=wyfy-nfacctd
+StateDirectoryMode=0750
+# The "pmacct" user comes from wyfy-pmacct.sysusers.conf; the Debian package
+# does not create it.
 User=pmacct
 Group=pmacct
 AmbientCapabilities=
+# Backstop for the cache sizing in nfacctd.conf (about 76 MB at start, see
+# the arithmetic there): the hub has 2 GB and no swap and carries RADIUS and
+# WireGuard for every venue. If the collector ever grows past this, it is
+# the collector that is killed and restarted, not the hub that starves.
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target
