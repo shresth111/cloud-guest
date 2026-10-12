@@ -151,6 +151,15 @@ class PlanFeatureKey(StrEnum):
     # (see FEATURE_REQUIRES below).
     GUEST_MARKETING_BYO = "guest_marketing_byo"
 
+    # -- Traffic flow, customer side (the venue page shown as "Traffic
+    # Lens", ``app.domains.traffic_flow`` customer routes). BOOLEAN, off by
+    # default and carried by no seeded plan, so every organization starts
+    # locked and is unlocked per organization from the Master console, the
+    # same way as GUEST_MARKETING. It gates what a CUSTOMER may read; the
+    # Master console's own traffic-flow screens do not depend on it, and it
+    # does not switch collection on for any router.
+    TRAFFIC_FLOW = "traffic_flow"
+
 
 class PlanFeatureType(StrEnum):
     """The value-shape a :class:`~.models.PlanFeature` row carries -- see
@@ -223,6 +232,7 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.ISP_FAILOVER,
         PlanFeatureKey.GUEST_MARKETING,
         PlanFeatureKey.GUEST_MARKETING_BYO,
+        PlanFeatureKey.TRAFFIC_FLOW,
     }
 )
 
@@ -232,7 +242,11 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
 # an override silently diverging from a customer's plan is a billing act,
 # and each add-on that can be sold separately is a product decision.
 ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
-    {PlanFeatureKey.GUEST_MARKETING, PlanFeatureKey.GUEST_MARKETING_BYO}
+    {
+        PlanFeatureKey.GUEST_MARKETING,
+        PlanFeatureKey.GUEST_MARKETING_BYO,
+        PlanFeatureKey.TRAFFIC_FLOW,
+    }
 )
 
 # An add-on that only means anything on top of another one. The entitlement

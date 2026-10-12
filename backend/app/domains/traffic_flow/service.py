@@ -34,21 +34,25 @@ from app.core.logging import get_logger
 from app.domains.guest.models import GuestSession
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
+from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
 from app.domains.router.models import Router
 from app.domains.wireguard.constants import PeerStatus
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
 
 from .constants import (
+    CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
     DEFAULT_LIST_LIMIT,
     DEFAULT_QUERY_WINDOW_SECONDS,
     DEFAULT_TIMELINE_SERIES,
     MAX_LIST_LIMIT,
     MAX_QUERY_WINDOW_DAYS,
     MAX_TIMELINE_SERIES,
+    RETENTION_DAYS,
     SILENT_AFTER_SECONDS,
     STALE_AFTER_SECONDS,
     WINDOW_SECONDS,
     BlockerCode,
+    CustomerCollection,
     FlowState,
     RouterFlowState,
     TrafficFlowSource,
@@ -93,6 +97,7 @@ __all__ = [
     "TrafficFlowDeviceService",
     "TrafficFlowError",
     "TrafficFlowIngestService",
+    "TrafficFlowCustomerService",
     "TrafficFlowOverviewService",
     "TrafficFlowRepository",
     "TrafficFlowStatusService",
@@ -245,9 +250,13 @@ class TrafficFlowRepository:
 
     # -- fleet status -----------------------------------------------------
     async def fleet_routers(
-        self, router_id: uuid.UUID | None = None
+        self,
+        router_id: uuid.UUID | None = None,
+        *,
+        location_id: uuid.UUID | None = None,
     ) -> list[FleetRouter]:
-        """Every live router (or just one), with names and its export row."""
+        """Every live router (or just one, or one venue's), with names and
+        its export row."""
         stmt = (
             select(
                 Router.id,
@@ -273,6 +282,8 @@ class TrafficFlowRepository:
         )
         if router_id is not None:
             stmt = stmt.where(Router.id == router_id)
+        if location_id is not None:
+            stmt = stmt.where(Router.location_id == location_id)
         return [FleetRouter(*row) for row in (await self.session.execute(stmt)).all()]
 
     async def router_activity(
@@ -911,6 +922,7 @@ class TrafficFlowSummaryService:
         until: datetime | None,
         limit: int | None = None,
         series: int | None = None,
+        min_devices_for_destinations: int = 0,
     ) -> dict[str, Any]:
         if router_id is None and location_id is None:
             # A fleet-wide list would merge the same private address at two
@@ -977,7 +989,213 @@ class TrafficFlowSummaryService:
             series=bands,
             data_oldest=oldest,
             data_newest=newest,
+            min_devices_for_destinations=min_devices_for_destinations,
         )
+
+
+# ---------------------------------------------------------------------------
+# customer view (one venue, the caller's own)
+# ---------------------------------------------------------------------------
+
+
+class TrafficFlowLocationNotFoundError(CloudGuestError):
+    """One answer for "no such venue" and "another organization's venue": a
+    customer route must not confirm that somebody else's venue exists."""
+
+    def __init__(self, location_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Location not found: {location_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+            data={"code": "TRAFFIC_FLOW_LOCATION_NOT_FOUND"},
+        )
+
+
+class TrafficFlowCrossLocationError(CloudGuestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "You can only view traffic for your own venues.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "TRAFFIC_FLOW_CROSS_LOCATION"},
+        )
+
+
+class LocationLookup(Protocol):
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> Any: ...
+
+
+#: The device fields a customer gets: the local address (as Connected
+#: Devices shows it), volumes, and a reference to the guest session when
+#: there is exactly one. No name, phone number, MAC or host name -- those
+#: stay behind the screens and permissions that already own them.
+_CUSTOMER_DEVICE_FIELDS = (
+    "router_id",
+    "ip",
+    "bytes_up",
+    "bytes_down",
+    "bytes",
+    "flows",
+    "share_at_least",
+    "match",
+    "guest_session_id",
+)
+
+
+def customer_collection(states: Iterable[str]) -> CustomerCollection:
+    """Fold the venue's per-router states into the three a customer sees."""
+    states = list(states)
+    if FlowState.RECEIVING.value in states:
+        return CustomerCollection.COLLECTING
+    if any(state != FlowState.UNSUPPORTED_VENDOR.value for state in states):
+        return CustomerCollection.NOT_COLLECTING_YET
+    # No router at all, or none that can report traffic.
+    return CustomerCollection.NOT_AVAILABLE
+
+
+class TrafficFlowCustomerService:
+    """Read-only venue view for the customer dashboard.
+
+    Three things make a response safe to hand to a customer, and each is
+    done here rather than left to a route:
+
+    * **Whose venue.** ``organization_id`` is the caller's organization as
+      the request context resolved it -- never a path or body value. The
+      venue is loaded and checked against it, then against the caller's
+      location grants (``caller_location_scope``, injected at construction
+      so no method can forget it). Every read below is then filtered on that
+      *loaded* venue's id.
+    * **What is in it.** Only the summary's own figures, the three-value
+      collection state and two timestamps. No exporter or tunnel address, no
+      verdict, no switch state, no collector health.
+    * **Privacy.** Devices, destinations and services stay three independent
+      lists, a device is an address plus at most a session reference, and
+      destinations are withheld for windows with too few devices.
+    """
+
+    def __init__(
+        self,
+        repository: TrafficFlowRepository,
+        location_lookup: LocationLookup,
+        settings: Settings,
+        *,
+        caller_location_scope: LocationScope = None,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self.repository = repository
+        self.location_lookup = location_lookup
+        self.settings = settings
+        self.caller_location_scope = caller_location_scope
+        self.now = now
+        self._status = TrafficFlowStatusService(repository, settings, now=now)
+        self._summary = TrafficFlowSummaryService(repository, settings, now=now)
+
+    async def _own_location(
+        self, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> uuid.UUID:
+        """The id of the venue, once it is known to be the caller's."""
+        try:
+            location = await self.location_lookup.get_location(
+                location_id, requesting_organization_id=organization_id
+            )
+        except CloudGuestError as exc:
+            raise TrafficFlowLocationNotFoundError(location_id) from exc
+        # Checked again here, on the loaded row, whatever the lookup did:
+        # this comparison is the tenant boundary for everything below.
+        if location is None or location.organization_id != organization_id:
+            raise TrafficFlowLocationNotFoundError(location_id)
+        enforce_entity_location(
+            entity_location_id=location.id,
+            caller_location_scope=self.caller_location_scope,
+            error=TrafficFlowCrossLocationError(),
+        )
+        return location.id
+
+    async def _collection(self, location_id: uuid.UUID) -> dict[str, Any]:
+        now = self.now()
+        routers = await self.repository.fleet_routers(location_id=location_id)
+        activity = await self.repository.router_activity(now - timedelta(hours=1))
+        rows = [
+            status_row(
+                router,
+                activity.get(router.router_id),
+                feature_enabled=bool(self.settings.traffic_flow_enabled),
+                now=now,
+            )
+            for router in routers
+        ]
+        oldest, newest = await self.repository.data_bounds(
+            SummaryScope(location_id=location_id)
+        )
+        return {
+            "location_id": str(location_id),
+            "collection": customer_collection(row["state"] for row in rows).value,
+            "latest_data": _iso(newest + timedelta(seconds=WINDOW_SECONDS))
+            if newest
+            else None,
+            "data_starts": _iso(oldest),
+        }
+
+    async def status(
+        self, location_id: uuid.UUID, *, organization_id: uuid.UUID
+    ) -> dict[str, Any]:
+        own = await self._own_location(location_id, organization_id)
+        return {
+            **await self._collection(own),
+            "window_seconds": WINDOW_SECONDS,
+            "retention_days": RETENTION_DAYS,
+        }
+
+    async def summary(
+        self,
+        location_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int | None = None,
+        series: int | None = None,
+        router_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        own = await self._own_location(location_id, organization_id)
+        # ``location_id=own`` is always part of the filter. A ``router_id``
+        # only narrows within it: a router of another venue, or of another
+        # organization, matches no row.
+        data = await self._summary.summary(
+            router_id=router_id,
+            location_id=own,
+            since=since,
+            until=until,
+            limit=limit,
+            series=series,
+            min_devices_for_destinations=CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
+        )
+        collection = await self._collection(own)
+        data.pop("feature_enabled", None)
+        data["devices"] = {
+            **data["devices"],
+            "items": [
+                {key: item.get(key) for key in _CUSTOMER_DEVICE_FIELDS}
+                for item in data["devices"]["items"]
+            ],
+        }
+        if "min_devices" not in data["destinations"]:
+            # The not-measured shape: nothing was withheld because nothing
+            # was there, but the keys are always present for the customer.
+            data["destinations"] = {
+                "min_devices": CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
+                "windows_withheld": 0,
+                **data["destinations"],
+            }
+        return {
+            "location_id": collection["location_id"],
+            "collection": collection["collection"],
+            "latest_data": collection["latest_data"],
+            **data,
+        }
 
 
 # ---------------------------------------------------------------------------

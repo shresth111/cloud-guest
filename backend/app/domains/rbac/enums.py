@@ -191,6 +191,12 @@ class PermissionModule(StrEnum):
     # fewer GLOBAL roles than usual: the data is guest browsing metadata
     # (DPDP), so Platform Support and Billing Manager are explicitly NONE.
     TRAFFIC_FLOWS = "traffic_flows"
+    # Venue Traffic: the CUSTOMER's read of traffic-flow rollups for their
+    # own venue (app.domains.traffic_flow customer routes). A separate
+    # module from TRAFFIC_FLOWS on purpose: that one is GLOBAL-only and
+    # covers the fleet, exporter addresses and router writes, none of which
+    # a customer may reach. This one is read-only and LOCATION-scoped.
+    VENUE_TRAFFIC = "venue_traffic"
     # Device Logs: syslog (and, later, controller/cloud event feeds) that
     # venue devices send to the platform, viewed in the Master console. A
     # separate module because the lines carry guest identifiers (MAC, IP,
