@@ -13,21 +13,24 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import status
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, literal, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 
 from .constants import (
+    CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
     DEFAULT_QUERY_WINDOW_SECONDS,
     MAX_QUERY_WINDOW_DAYS,
     WINDOW_SECONDS,
 )
+from .destinations import DestinationScope
 from .geo import (
     DEFAULT_GEO_COUNTRIES,
     DEFAULT_GEO_NETWORKS,
@@ -44,6 +47,8 @@ from .models import TrafficFlowCountryBucket, TrafficFlowWindow
 from .service import SummaryScope, TrafficFlowError
 
 __all__ = [
+    "CustomerGeoService",
+    "GeoScope",
     "GeoWindowWriter",
     "TrafficFlowGeoRepository",
     "TrafficFlowGeoService",
@@ -57,6 +62,39 @@ __all__ = [
 GEO_RETENTION_BATCH = 100_000
 
 
+@dataclass(frozen=True, slots=True)
+class GeoScope:
+    """Whose rows a statement may read. ``SummaryScope`` plus the two things
+    a customer route adds: the caller's organisation on every statement, and
+    the small-venue rule for networks."""
+
+    router_id: uuid.UUID | None = None
+    location_id: uuid.UUID | None = None
+    #: The caller's organisation on a customer route; ``None`` for Master.
+    organization_id: uuid.UUID | None = None
+    #: Small-venue rule for networks. 0 (Master) withholds nothing.
+    min_devices: int = 0
+
+    def conditions(self, model: Any) -> list[Any]:
+        out = SummaryScope(self.router_id, self.location_id).conditions(model)
+        if self.organization_id is not None:
+            out.append(model.organization_id == self.organization_id)
+        return out
+
+    def shown(self, model: Any) -> Any | None:
+        """The condition "this bucket's window had enough devices", or
+        ``None`` when no rule applies. It IS the Destinations condition
+        (``DestinationScope.visible``), not a copy: one rule for both, and it
+        fails closed the same way (a bucket whose window row is missing is
+        not shown)."""
+        if self.min_devices <= 0 or self.location_id is None:
+            return None
+        (condition,) = DestinationScope(
+            location_id=self.location_id, min_devices=self.min_devices
+        ).visible(model)
+        return condition
+
+
 def country_bucket_insert_statement(rows: list[dict[str, Any]]) -> Any:
     return (
         pg_insert(TrafficFlowCountryBucket)
@@ -65,7 +103,9 @@ def country_bucket_insert_statement(rows: list[dict[str, Any]]) -> Any:
     )
 
 
-def _in_range(model: Any, scope: SummaryScope, since: datetime, until: datetime) -> Any:
+def _in_range(
+    model: Any, scope: SummaryScope | GeoScope, since: datetime, until: datetime
+) -> Any:
     return (
         model.window_start >= since,
         model.window_start < until,
@@ -74,33 +114,48 @@ def _in_range(model: Any, scope: SummaryScope, since: datetime, until: datetime)
 
 
 def country_rows_statement(
-    scope: SummaryScope, *, since: datetime, until: datetime
+    scope: SummaryScope | GeoScope, *, since: datetime, until: datetime
 ) -> Any:
     """Country buckets in range, summed per (country, network). The scope
-    conditions are the only thing between one venue's rows and another's."""
+    conditions are the only thing between one venue's rows and another's.
+
+    Under the small-venue rule three more columns carry the same sums over
+    only the windows with enough devices: the country total stays whole, the
+    network breakdown is built from these."""
     bucket = TrafficFlowCountryBucket
+    columns = [
+        bucket.country_code,
+        bucket.asn,
+        func.max(bucket.network_name),
+        func.coalesce(func.sum(bucket.bytes_up), 0),
+        func.coalesce(func.sum(bucket.bytes_down), 0),
+        func.coalesce(func.sum(bucket.flows), 0),
+    ]
+    shown = scope.shown(bucket) if isinstance(scope, GeoScope) else None
+    if shown is not None:
+        columns += [
+            func.coalesce(func.sum(bucket.bytes_up).filter(shown), 0),
+            func.coalesce(func.sum(bucket.bytes_down).filter(shown), 0),
+            func.coalesce(func.sum(bucket.flows).filter(shown), 0),
+        ]
     return (
-        select(
-            bucket.country_code,
-            bucket.asn,
-            func.max(bucket.network_name),
-            func.coalesce(func.sum(bucket.bytes_up), 0),
-            func.coalesce(func.sum(bucket.bytes_down), 0),
-            func.coalesce(func.sum(bucket.flows), 0),
-        )
+        select(*columns)
         .where(*_in_range(bucket, scope, since, until))
         .group_by(bucket.country_code, bucket.asn)
     )
 
 
 def windows_looked_up_statement(
-    scope: SummaryScope, *, since: datetime, until: datetime
+    scope: SummaryScope | GeoScope, *, since: datetime, until: datetime
 ) -> Any:
     """How many windows in range were looked up: exactly one "unknown" row is
     written per looked-up window (``geo.py``), so counting those counts
-    windows."""
+    windows. The second column is how many of them the small-venue rule
+    withholds networks for (0 when no rule applies)."""
     bucket = TrafficFlowCountryBucket
-    return select(func.count()).where(
+    shown = scope.shown(bucket) if isinstance(scope, GeoScope) else None
+    withheld = func.count().filter(~shown) if shown is not None else literal(0)
+    return select(func.count(), withheld).where(
         bucket.country_code == UNKNOWN_COUNTRY,
         bucket.asn == UNKNOWN_NETWORK_ASN,
         *_in_range(bucket, scope, since, until),
@@ -131,7 +186,7 @@ class TrafficFlowGeoRepository:
         return int(result.rowcount or 0)
 
     async def window_count(
-        self, scope: SummaryScope, *, since: datetime, until: datetime
+        self, scope: GeoScope, *, since: datetime, until: datetime
     ) -> int:
         stmt = select(func.count()).where(
             *_in_range(TrafficFlowWindow, scope, since, until)
@@ -139,7 +194,7 @@ class TrafficFlowGeoRepository:
         return int((await self.session.execute(stmt)).scalar_one() or 0)
 
     async def data_bounds(
-        self, scope: SummaryScope
+        self, scope: GeoScope
     ) -> tuple[datetime | None, datetime | None]:
         stmt = select(
             func.min(TrafficFlowWindow.window_start),
@@ -149,21 +204,33 @@ class TrafficFlowGeoRepository:
         return oldest, newest
 
     async def windows_looked_up(
-        self, scope: SummaryScope, *, since: datetime, until: datetime
-    ) -> int:
+        self, scope: GeoScope, *, since: datetime, until: datetime
+    ) -> tuple[int, int]:
+        """(windows looked up, of those: windows whose networks are withheld)."""
         stmt = windows_looked_up_statement(scope, since=since, until=until)
-        return int((await self.session.execute(stmt)).scalar_one() or 0)
+        looked_up, withheld = (await self.session.execute(stmt)).one()
+        return int(looked_up or 0), int(withheld or 0)
 
     async def country_rows(
-        self, scope: SummaryScope, *, since: datetime, until: datetime
+        self, scope: GeoScope, *, since: datetime, until: datetime
     ) -> list[GeoCountryRow]:
         stmt = country_rows_statement(scope, since=since, until=until)
-        return [
-            GeoCountryRow(str(country), int(asn), name, int(up), int(down), int(n))
-            for country, asn, name, up, down, n in (
-                await self.session.execute(stmt)
-            ).all()
-        ]
+        out: list[GeoCountryRow] = []
+        for country, asn, name, up, down, n, *shown in (
+            await self.session.execute(stmt)
+        ).all():
+            out.append(
+                GeoCountryRow(
+                    str(country),
+                    int(asn),
+                    name,
+                    int(up),
+                    int(down),
+                    int(n),
+                    *(int(value) for value in shown),
+                )
+            )
+        return out
 
 
 class GeoWindowWriter:
@@ -217,9 +284,14 @@ class TrafficFlowGeoService:
         until: datetime | None,
         limit: int | None = None,
         networks: int | None = None,
+        organization_id: uuid.UUID | None = None,
+        min_devices: int = 0,
     ) -> dict[str, Any]:
         """Same range rules and error codes as ``/summary``: a scope is
-        required, and a range over 7 days is refused, never shortened."""
+        required, and a range over 7 days is refused, never shortened.
+
+        ``organization_id`` and ``min_devices`` are a customer caller's:
+        set by ``CustomerGeoService``, never by a route."""
         if router_id is None and location_id is None:
             raise TrafficFlowError(
                 "Give a router_id or a location_id.",
@@ -254,6 +326,7 @@ class TrafficFlowGeoService:
             "window_seconds": WINDOW_SECONDS,
             "limit": size,
             "networks": per_country,
+            "networks_min_devices": max(0, int(min_devices)),
         }
         if not self.settings.traffic_flow_enabled:
             # Not a query that comes back empty and reads as "no traffic".
@@ -266,13 +339,18 @@ class TrafficFlowGeoService:
                 data_newest=None,
                 **common,
             )
-        scope = SummaryScope(router_id=router_id, location_id=location_id)
+        scope = GeoScope(
+            router_id=router_id,
+            location_id=location_id,
+            organization_id=organization_id,
+            min_devices=max(0, int(min_devices)),
+        )
         oldest, newest = await self.repository.data_bounds(scope)
         windows = await self.repository.window_count(scope, since=since, until=until)
-        looked_up = (
+        looked_up, withheld = (
             await self.repository.windows_looked_up(scope, since=since, until=until)
             if windows
-            else 0
+            else (0, 0)
         )
         rows = (
             await self.repository.country_rows(scope, since=since, until=until)
@@ -286,5 +364,55 @@ class TrafficFlowGeoService:
             rows=rows,
             data_oldest=oldest,
             data_newest=newest,
+            networks_withheld_windows=withheld,
             **common,
         )
+
+
+class VenueCheck(Protocol):
+    async def own_location(
+        self, location_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> uuid.UUID: ...
+
+
+class CustomerGeoService:
+    """The by-country read for a customer caller.
+
+    What a customer route must never be able to leave out is fixed here, as
+    in ``CustomerDestinationService``: the venue check (organisation and the
+    caller's venue grants), the organisation on every statement, and the
+    small-venue rule -- the Destinations threshold, applied to networks.
+    Country totals are always shown: a country is too coarse to be one
+    person's."""
+
+    def __init__(self, geo: TrafficFlowGeoService, venues: VenueCheck) -> None:
+        self.geo = geo
+        self.venues = venues
+
+    async def by_country(
+        self,
+        location_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int | None = None,
+        networks: int | None = None,
+        router_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        own = await self.venues.own_location(location_id, organization_id)
+        # ``location_id=own`` is always part of the filter. A ``router_id``
+        # only narrows within it: a router of another venue matches no row.
+        data = await self.geo.by_country(
+            router_id=router_id,
+            location_id=own,
+            since=since,
+            until=until,
+            limit=limit,
+            networks=networks,
+            organization_id=organization_id,
+            min_devices=CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
+        )
+        # The platform switch is not a customer's to know about.
+        data.pop("feature_enabled", None)
+        return {"location_id": str(own), **data}

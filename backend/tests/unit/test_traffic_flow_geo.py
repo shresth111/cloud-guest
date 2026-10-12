@@ -51,6 +51,8 @@ from app.domains.traffic_flow.geo import (
     is_public_address,
 )
 from app.domains.traffic_flow.geo_service import (
+    CustomerGeoService,
+    GeoScope,
     GeoWindowWriter,
     TrafficFlowGeoService,
     country_bucket_insert_statement,
@@ -646,6 +648,12 @@ class IngestRepo:
     async def insert_service_buckets(self, rows):  # noqa: ANN001
         self.service_rows.extend(rows)
 
+    async def insert_destination_buckets(self, rows):  # noqa: ANN001
+        return None
+
+    async def delete_destination_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
+        return 0
+
     async def get_state(self) -> Any:
         return self.state
 
@@ -1071,6 +1079,7 @@ class ReadRepo:
     def __init__(self) -> None:
         self.windows: dict[uuid.UUID, list[datetime]] = {}
         self.looked_up: dict[uuid.UUID, int] = {}
+        self.withheld: dict[uuid.UUID, int] = {}
         self.rows: dict[uuid.UUID, list[GeoCountryRow]] = {}
         self.calls: list[tuple[str, Any]] = []
 
@@ -1087,7 +1096,10 @@ class ReadRepo:
 
     async def windows_looked_up(self, scope, *, since, until):  # noqa: ANN001
         self.calls.append(("looked_up", scope))
-        return self.looked_up.get(scope.location_id, 0)
+        return (
+            self.looked_up.get(scope.location_id, 0),
+            self.withheld.get(scope.location_id, 0) if scope.min_devices else 0,
+        )
 
     async def country_rows(self, scope, *, since, until):  # noqa: ANN001
         self.calls.append(("rows", scope))
@@ -1153,7 +1165,7 @@ class TestService:
     async def test_scope_reaches_every_repository_call(self, lookup: GeoLookup) -> None:
         repo = _populated()
         await _ask(_service(repo, lookup), router_id=ROUTER_ID)
-        want = SummaryScope(router_id=ROUTER_ID, location_id=LOCATION_ID)
+        want = GeoScope(router_id=ROUTER_ID, location_id=LOCATION_ID)
         assert [c[0] for c in repo.calls] == ["bounds", "windows", "looked_up", "rows"]
         assert repo.calls[0][1] == want and repo.calls[1][1][0] == want
         assert repo.calls[2][1] == want and repo.calls[3][1] == want
@@ -1277,11 +1289,10 @@ class TestAuthorization:
 
         paths = {r.path for r in api_v1_router.routes}
         assert "/platform/traffic-flow/geo" in paths
-        # No customer route yet: it waits for the add-on gate and permission
-        # of the customer Traffic Lens routes (API.md).
-        assert not [
+        # Exactly one other: the customer venue route (TestCustomerGeo).
+        assert [
             p for p in paths if p.endswith("/geo") and not p.startswith("/platform/")
-        ]
+        ] == ["/traffic-flow/locations/{location_id}/geo"]
 
     def test_scope_and_range_are_query_parameters_not_a_body(self) -> None:
         from app.domains.traffic_flow.geo_router import (
@@ -1302,7 +1313,7 @@ class TestAuthorization:
 
 
 # ---------------------------------------------------------------------------
-# migration 0158 (static: no database server)
+# migration 0160 (static: no database server)
 # ---------------------------------------------------------------------------
 
 
@@ -1332,16 +1343,16 @@ def _run(module: Any, monkeypatch: pytest.MonkeyPatch, fn: str) -> list[str]:
 
 
 class TestMigration:
-    FILE = "0158_traffic_flow_country_buckets.py"
+    FILE = "0160_traffic_flow_country_buckets.py"
 
     def test_chain(self) -> None:
         module = _migration(self.FILE)
-        assert module.down_revision == "0157_traffic_flow_services_export"
+        assert module.down_revision == "0159_traffic_flow_dest_buckets"
         assert len(module.revision) <= 40
 
     def test_no_other_revision_claims_the_same_parent(self) -> None:
         """Two heads would stop ``alembic upgrade head`` at deploy. Fails the
-        day another migration lands on 0157 first: re-chain this one."""
+        day another migration lands on 0159 first: re-chain this one."""
         mine = _migration(self.FILE)
         children = [
             path.name
@@ -1478,3 +1489,398 @@ class TestDelivery:
             )
         finally:
             found.close()
+
+
+# ---------------------------------------------------------------------------
+# customer venue route: scoping, add-on, and networks withheld at small venues
+# ---------------------------------------------------------------------------
+
+ORG_B = uuid.UUID("55555555-0000-4000-8000-000000000005")
+SIBLING_LOCATION = uuid.UUID("66666666-0000-4000-8000-000000000006")
+
+
+class Venues:
+    """Stands in for ``LocationService.get_location``: the real one raises
+    for a missing venue and for another organisation's."""
+
+    owner = {LOCATION_ID: ORG_ID, SIBLING_LOCATION: ORG_ID, OTHER_LOCATION: ORG_B}
+
+    async def get_location(self, location_id, *, requesting_organization_id=None):  # noqa: ANN001
+        from app.domains.location.exceptions import (
+            CrossOrganizationLocationAccessError,
+            LocationNotFoundError,
+        )
+
+        if location_id not in self.owner:
+            raise LocationNotFoundError(location_id)
+        if self.owner[location_id] != requesting_organization_id:
+            raise CrossOrganizationLocationAccessError()
+        return SimpleNamespace(id=location_id, organization_id=self.owner[location_id])
+
+
+def _customer(
+    repo: ReadRepo,
+    lookup: GeoLookup,
+    *,
+    confined_to: frozenset[uuid.UUID] | None = None,
+) -> CustomerGeoService:
+    """The customer service as the route builds it: the REAL venue check of
+    the customer venue routes in front of the geo read."""
+    from app.domains.traffic_flow.service import TrafficFlowCustomerService
+
+    venues = TrafficFlowCustomerService(
+        object(),  # type: ignore[arg-type]
+        Venues(),
+        SimpleNamespace(  # type: ignore[arg-type]
+            traffic_flow_enabled=True,
+            traffic_flow_agent_url="",
+            traffic_flow_agent_secret="",
+        ),
+        caller_location_scope=confined_to,
+        now=lambda: NOW,
+    )
+    return CustomerGeoService(_service(repo, lookup), venues)
+
+
+async def _venue(service: CustomerGeoService, venue: uuid.UUID, **kw: Any) -> Any:
+    args: dict[str, Any] = {"organization_id": ORG_ID, "since": None, "until": None}
+    args.update(kw)
+    return await service.by_country(venue, **args)
+
+
+def _shown(
+    country: str, asn: int, down: int, shown_down: int, name: str | None = None
+) -> GeoCountryRow:
+    """A summed row where only ``shown_down`` of ``down`` came from windows
+    with enough devices."""
+    return GeoCountryRow(
+        country, asn, name, 0, down, 1, 0, shown_down, 1 if shown_down else 0
+    )
+
+
+def _dependency_calls(dependant: Any) -> set[Any]:
+    calls = {d.call for d in dependant.dependencies}
+    for d in dependant.dependencies:
+        calls |= _dependency_calls(d)
+    return calls
+
+
+class TestCustomerGeo:
+    async def test_own_venue_gets_the_master_shape_without_the_platform_switch(
+        self, lookup: GeoLookup
+    ) -> None:
+        repo = _populated()
+        out = await _venue(_customer(repo, lookup), LOCATION_ID)
+        assert out["location_id"] == str(LOCATION_ID)
+        assert "feature_enabled" not in out
+        assert out["measured"] and out["geo_measured"]
+        assert out["attribution"] == ATTRIBUTION
+        assert out["networks_min_devices"] == 5
+        assert out["networks_withheld_windows"] == 0
+
+    async def test_every_read_carries_the_venue_the_organisation_and_the_rule(
+        self, lookup: GeoLookup
+    ) -> None:
+        repo = _populated()
+        await _venue(_customer(repo, lookup), LOCATION_ID, router_id=ROUTER_ID)
+        want = GeoScope(
+            router_id=ROUTER_ID,
+            location_id=LOCATION_ID,
+            organization_id=ORG_ID,
+            min_devices=5,
+        )
+        assert [c[0] for c in repo.calls] == ["bounds", "windows", "looked_up", "rows"]
+        assert repo.calls[0][1] == want and repo.calls[1][1][0] == want
+        assert repo.calls[2][1] == want and repo.calls[3][1] == want
+
+    async def test_another_organisations_venue_is_a_404_and_nothing_is_read(
+        self, lookup: GeoLookup
+    ) -> None:
+        from app.domains.traffic_flow.service import TrafficFlowLocationNotFoundError
+
+        repo = _populated()
+        service = _customer(repo, lookup)
+        for venue in (OTHER_LOCATION, uuid.uuid4()):
+            with pytest.raises(TrafficFlowLocationNotFoundError) as caught:
+                await _venue(service, venue)
+            assert caught.value.status_code == 404
+        assert repo.calls == []
+
+    async def test_a_caller_confined_to_one_venue_cannot_read_a_sibling(
+        self, lookup: GeoLookup
+    ) -> None:
+        from app.domains.traffic_flow.service import TrafficFlowCrossLocationError
+
+        repo = _populated()
+        service = _customer(repo, lookup, confined_to=frozenset({LOCATION_ID}))
+        assert (await _venue(service, LOCATION_ID))["measured"] is True
+        repo.calls.clear()
+        with pytest.raises(TrafficFlowCrossLocationError) as caught:
+            await _venue(service, SIBLING_LOCATION)
+        assert caught.value.status_code == 403 and repo.calls == []
+
+    async def test_a_router_of_another_venue_only_narrows_within_the_own_venue(
+        self, lookup: GeoLookup
+    ) -> None:
+        repo = _populated()
+        foreign_router = uuid.uuid4()
+        await _venue(_customer(repo, lookup), LOCATION_ID, router_id=foreign_router)
+        for _name, scope in [(c[0], c[1]) for c in repo.calls if c[0] != "windows"]:
+            assert scope.location_id == LOCATION_ID
+            assert scope.organization_id == ORG_ID
+
+    # -- the small-venue rule: networks only ------------------------------
+
+    def test_networks_come_from_windows_with_enough_devices_only(self) -> None:
+        rows = [
+            _shown("IN", 55836, 600, 400, "Example Mobile Ltd"),
+            _shown("IN", 45609, 100, 0, "Example Broadband Ltd"),  # small windows only
+            _shown("IN", UNKNOWN_NETWORK_ASN, 60, 10),
+            _shown("IN", OTHER_NETWORK_ASN, 40, 40),
+            _shown("US", 15169, 100, 0, "Example Search LLC"),
+            _shown(UNKNOWN_COUNTRY, UNKNOWN_NETWORK_ASN, 100, 30),
+        ]
+        out = _summary(rows, networks_min_devices=5, networks_withheld_windows=4)
+        assert out["networks_min_devices"] == 5
+        assert out["networks_withheld_windows"] == 4
+        india, usa = out["countries"]["items"]
+        # Country totals are whole: never withheld.
+        assert (india["country_code"], india["bytes"], india["share"]) == (
+            "IN",
+            800,
+            0.8,
+        )
+        assert out["totals"]["bytes"] == 1000 and out["unknown"]["bytes"] == 100
+        # Networks: only what the shown windows carried.
+        assert [(n["asn"], n["bytes"]) for n in india["networks"]["items"]] == [
+            (55836, 400)
+        ]
+        assert india["networks"]["unknown_bytes"] == 10
+        assert india["networks"]["other_bytes"] == 40
+        assert india["networks"]["withheld_bytes"] == 350
+        listed = sum(n["bytes"] for n in india["networks"]["items"])
+        assert (
+            listed
+            + india["networks"]["other_bytes"]
+            + india["networks"]["unknown_bytes"]
+            + india["networks"]["withheld_bytes"]
+            == india["bytes"]
+        )
+        # A country seen only in small windows: its total, and no network.
+        assert usa["bytes"] == 100
+        assert usa["networks"] == {
+            "items": [],
+            "other_bytes": 0,
+            "unknown_bytes": 0,
+            "withheld_bytes": 100,
+        }
+        assert "Example Broadband" not in repr(out)
+        assert "Example Search" not in repr(out)
+
+    def test_master_withholds_nothing_and_has_no_rule_fields(self) -> None:
+        out = _summary(ROWS)
+        assert "networks_min_devices" not in out
+        assert "networks_withheld_windows" not in out
+        assert "withheld_bytes" not in out["countries"]["items"][0]["networks"]
+
+    async def test_withheld_windows_reach_the_customer_response(
+        self, lookup: GeoLookup
+    ) -> None:
+        repo = _populated()
+        repo.withheld[LOCATION_ID] = 2
+        repo.rows[LOCATION_ID] = [
+            _shown("IN", 55836, 600, 200, "Example Mobile Ltd"),
+            _shown(UNKNOWN_COUNTRY, UNKNOWN_NETWORK_ASN, 0, 0),
+        ]
+        out = await _venue(_customer(repo, lookup), LOCATION_ID)
+        assert out["networks_withheld_windows"] == 2
+        (india,) = out["countries"]["items"]
+        assert india["bytes"] == 600
+        assert india["networks"]["items"][0]["bytes"] == 200
+        assert india["networks"]["withheld_bytes"] == 400
+        # The Master route, same data: nothing withheld.
+        master = await _ask(_service(repo, lookup))
+        assert "networks_withheld_windows" not in master
+
+    async def test_not_measured_keeps_the_rule_fields_and_withholds_nothing(
+        self, lookup: GeoLookup
+    ) -> None:
+        out = await _venue(
+            _customer(_populated(), lookup),
+            LOCATION_ID,
+            since=NOW - timedelta(days=2),
+            until=NOW - timedelta(days=1),
+        )
+        assert out["measured"] is False and out["totals"] is None
+        assert out["networks_min_devices"] == 5
+        assert out["networks_withheld_windows"] == 0
+
+    def test_the_rule_is_the_destinations_condition_itself(self) -> None:
+        from app.domains.traffic_flow.constants import (
+            CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
+        )
+        from app.domains.traffic_flow.destinations import DestinationScope
+
+        scope = GeoScope(
+            location_id=LOCATION_ID,
+            organization_id=ORG_ID,
+            min_devices=CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS,
+        )
+        mine = _sql(scope.shown(TrafficFlowCountryBucket))
+        (theirs,) = DestinationScope(
+            location_id=LOCATION_ID, min_devices=CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS
+        ).visible(TrafficFlowCountryBucket)
+        assert mine == _sql(theirs)
+        assert "traffic_flow_windows.talker_count >=" in mine and "EXISTS" in mine
+        assert GeoScope(location_id=LOCATION_ID).shown(TrafficFlowCountryBucket) is None
+
+    def test_customer_statements_carry_organisation_venue_and_the_rule(self) -> None:
+        scope = GeoScope(location_id=LOCATION_ID, organization_id=ORG_ID, min_devices=5)
+        rows = _sql(
+            country_rows_statement(scope, since=NOW - timedelta(hours=1), until=NOW)
+        )
+        assert "traffic_flow_country_buckets.organization_id =" in rows
+        assert "traffic_flow_country_buckets.location_id =" in rows
+        assert rows.count("FILTER (WHERE EXISTS") == 3
+        # The rule is a FILTER on the network sums, never a WHERE: a country's
+        # total must not shrink.
+        where = rows[rows.rindex("WHERE") : rows.index("GROUP BY")]
+        assert "talker_count" not in where
+        counted = _sql(
+            windows_looked_up_statement(
+                scope, since=NOW - timedelta(hours=1), until=NOW
+            )
+        )
+        assert "organization_id =" in counted
+        assert "FILTER (WHERE NOT (EXISTS" in counted
+        master = _sql(
+            country_rows_statement(
+                GeoScope(location_id=LOCATION_ID),
+                since=NOW - timedelta(hours=1),
+                until=NOW,
+            )
+        )
+        assert "FILTER" not in master and "organization_id =" not in master
+
+    # -- route, guards, add-on --------------------------------------------
+
+    @staticmethod
+    def _route() -> Any:
+        from app.domains.traffic_flow.geo_customer_router import (
+            traffic_flow_geo_customer_router as router,
+        )
+
+        (route,) = router.routes
+        return route
+
+    def test_read_only_and_only_this_one(self) -> None:
+        route = self._route()
+        assert route.path == "/traffic-flow/locations/{location_id}/geo"
+        assert route.methods == {"GET"}
+
+    def test_it_carries_the_customer_venue_routes_own_guards(self) -> None:
+        """The very same three objects, so the add-on key and the permission
+        cannot drift apart."""
+        from app.domains.billing.constants import PlanFeatureKey
+        from app.domains.rbac.dependencies import RequireOrganization
+        from app.domains.traffic_flow import customer_router
+
+        expected = [g.dependency for g in customer_router._GUARDS]  # noqa: SLF001
+
+        def closure(call: Any) -> list[Any]:
+            return [c.cell_contents for c in (getattr(call, "__closure__", None) or ())]
+
+        assert len(expected) == 3 and expected[0] is RequireOrganization
+        assert PlanFeatureKey.TRAFFIC_FLOW in closure(expected[1])
+        assert "venue_traffic.read" in closure(expected[2])
+        assert ScopeType.LOCATION in closure(expected[2])
+        guards = [d.dependency for d in self._route().dependencies]
+        assert len(guards) == 3
+        for mine, theirs in zip(guards, expected, strict=True):
+            assert mine is theirs
+
+    async def test_add_on_off_is_a_402_naming_the_feature(self) -> None:
+        from decimal import Decimal
+
+        from app.domains.billing.constants import PlanFeatureKey
+        from app.domains.billing.exceptions import FeatureNotEntitledError
+
+        def closure(call: Any) -> list[Any]:
+            return [c.cell_contents for c in (getattr(call, "__closure__", None) or ())]
+
+        (guard,) = [
+            d.dependency
+            for d in self._route().dependencies
+            if PlanFeatureKey.TRAFFIC_FLOW in closure(d.dependency)
+        ]
+
+        class Checker:
+            def __init__(self, *features: str) -> None:
+                self.features = features
+
+            async def get_snapshot(self, organization_id: uuid.UUID) -> Any:
+                return SimpleNamespace(
+                    enabled_features=frozenset(self.features),
+                    limits={"max_locations": Decimal(1)},
+                    has_feature=lambda key: key.value in self.features,
+                )
+
+        with pytest.raises(FeatureNotEntitledError) as caught:
+            await guard(organization_id=ORG_ID, checker=Checker("reports"))
+        assert caught.value.status_code == 402
+        assert caught.value.data == {
+            "error_code": "feature_not_entitled",
+            "feature_key": "traffic_flow",
+        }
+        assert await guard(organization_id=ORG_ID, checker=Checker("traffic_flow"))
+
+    def test_it_resolves_organization_location_and_confinement(self) -> None:
+        from app.domains.rbac.dependencies import (
+            CurrentLocation,
+            CurrentOrganization,
+            RequireOrganization,
+        )
+        from app.domains.rbac.location_scope import CallerLocationScope
+
+        calls = _dependency_calls(self._route().dependant)
+        for needed in (
+            RequireOrganization,
+            CurrentOrganization,
+            CurrentLocation,
+            CallerLocationScope,
+        ):
+            assert needed in calls
+
+    def test_it_takes_no_organisation_and_no_threshold(self) -> None:
+        route = self._route()
+        assert {p.name for p in route.dependant.path_params} == {"location_id"}
+        assert {p.name for p in route.dependant.query_params} == {
+            "router_id",
+            "since",
+            "until",
+            "limit",
+            "networks",
+        }
+        assert route.dependant.body_params == []
+
+    async def test_a_header_naming_another_venue_is_refused(self) -> None:
+        from app.domains.traffic_flow.geo_customer_router import get_venue_traffic_geo
+        from app.domains.traffic_flow.service import TrafficFlowCrossLocationError
+
+        class Never:
+            async def by_country(self, *args: Any, **kwargs: Any) -> Any:
+                raise AssertionError("nothing may be read")
+
+        with pytest.raises(TrafficFlowCrossLocationError):
+            await get_venue_traffic_geo(
+                LOCATION_ID,
+                SimpleNamespace(state=SimpleNamespace(request_id="r")),  # type: ignore[arg-type]
+                since=None,
+                until=None,
+                limit=None,
+                networks=None,
+                router_id=None,
+                organization_id=ORG_ID,
+                header_location_id=SIBLING_LOCATION,
+                service=Never(),  # type: ignore[arg-type]
+            )

@@ -200,9 +200,21 @@ def _merge_devices(windows: Iterable[Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _merge_destinations(windows: Iterable[Any]) -> list[dict[str, Any]]:
+def _merge_destinations(
+    windows: Iterable[Any], *, min_devices: int = 0
+) -> tuple[list[dict[str, Any]], int]:
+    """Merged destinations, and how many windows were withheld.
+
+    A window in which fewer than ``min_devices`` devices were seen
+    contributes nothing: with one or two devices online, "the venue's
+    destinations" are in effect one person's. Used by the customer view;
+    0 (the Master view) withholds nothing."""
     merged: dict[str, dict[str, Any]] = {}
+    withheld = 0
     for window in windows:
+        if int(window.talker_count or 0) < min_devices:
+            withheld += 1
+            continue
         for entry in window.top_destinations or []:
             ip = str(entry.get("ip"))
             item = merged.setdefault(
@@ -212,7 +224,7 @@ def _merge_destinations(windows: Iterable[Any]) -> list[dict[str, Any]]:
             item["bytes_up"] += int(entry.get("bytes_up") or 0)
             item["bytes_down"] += int(entry.get("bytes_down") or 0)
             item["flows"] += int(entry.get("flows") or 0)
-    return sorted(merged.values(), key=lambda d: (-d["bytes"], d["ip"]))
+    return sorted(merged.values(), key=lambda d: (-d["bytes"], d["ip"])), withheld
 
 
 def _lower_bound_list(
@@ -252,6 +264,7 @@ def build_summary(
     series: int,
     data_oldest: datetime | None,
     data_newest: datetime | None,
+    min_devices_for_destinations: int = 0,
 ) -> dict[str, Any]:
     """``windows`` are the stored windows in range (any object with the
     ``TrafficFlowWindow`` attributes); ``service_rows`` the service buckets
@@ -398,6 +411,19 @@ def build_summary(
             }
         )
 
+    destination_items, destinations_withheld = _merge_destinations(
+        windows, min_devices=min_devices_for_destinations
+    )
+    destinations = _lower_bound_list(
+        destination_items, limit=limit, client_bytes=client_bytes
+    )
+    if min_devices_for_destinations > 0:
+        destinations = {
+            "min_devices": min_devices_for_destinations,
+            "windows_withheld": destinations_withheld,
+            **destinations,
+        }
+
     return {
         "feature_enabled": True,
         "measured": True,
@@ -435,7 +461,5 @@ def build_summary(
         "devices": _lower_bound_list(
             _merge_devices(windows), limit=limit, client_bytes=client_bytes
         ),
-        "destinations": _lower_bound_list(
-            _merge_destinations(windows), limit=limit, client_bytes=client_bytes
-        ),
+        "destinations": destinations,
     }

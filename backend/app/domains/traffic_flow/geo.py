@@ -384,6 +384,11 @@ class GeoCountryRow:
     bytes_up: int
     bytes_down: int
     flows: int
+    #: The same three sums over only the windows whose networks may be shown
+    #: (the small-venue rule, customer callers). ``None`` = no rule applied.
+    shown_bytes_up: int | None = None
+    shown_bytes_down: int | None = None
+    shown_flows: int | None = None
 
 
 def _share(part: int, whole: int) -> float:
@@ -420,8 +425,16 @@ def build_geo_summary(
     networks: int,
     data_oldest: datetime | None,
     data_newest: datetime | None,
+    networks_min_devices: int = 0,
+    networks_withheld_windows: int = 0,
 ) -> dict[str, Any]:
-    """Three different empties, kept apart:
+    """``networks_min_devices`` above zero (a customer caller) applies the
+    small-venue rule to **networks only**: a window with fewer devices
+    contributes to its country's total but to no network, and each country
+    says how much that was (``networks.withheld_bytes``). Country totals are
+    never withheld.
+
+    Three different empties, kept apart:
 
     * ``measured: false`` -- no traffic window exists in the range at all;
     * ``measured: true, geo_measured: false`` -- traffic was measured but no
@@ -451,6 +464,12 @@ def build_geo_summary(
         "attribution": dict(ATTRIBUTION),
         "source": dict(source) if source else None,
     }
+    ruled = networks_min_devices > 0
+    if ruled:
+        out["networks_min_devices"] = networks_min_devices
+        out["networks_withheld_windows"] = (
+            networks_withheld_windows if geo_measured else 0
+        )
     if not geo_measured:
         return out
 
@@ -468,15 +487,26 @@ def build_geo_summary(
             target = other
         else:
             country = countries.setdefault(
-                row.country_code, {"sums": [0, 0, 0], "networks": {}}
+                row.country_code, {"sums": [0, 0, 0], "shown": 0, "networks": {}}
             )
             target = country["sums"]
-            network = country["networks"].setdefault(
-                row.asn, {"sums": [0, 0, 0], "name": None}
+            shown = (
+                sums
+                if not ruled
+                else (
+                    int(row.shown_bytes_up or 0),
+                    int(row.shown_bytes_down or 0),
+                    int(row.shown_flows or 0),
+                )
             )
-            for index in range(3):
-                network["sums"][index] += sums[index]
-            network["name"] = network["name"] or row.network_name
+            country["shown"] += shown[0] + shown[1]
+            if any(shown):
+                network = country["networks"].setdefault(
+                    row.asn, {"sums": [0, 0, 0], "name": None}
+                )
+                for index in range(3):
+                    network["sums"][index] += shown[index]
+                network["name"] = network["name"] or row.network_name
         for index in range(3):
             target[index] += sums[index]
     whole = total[0] + total[1]
@@ -507,16 +537,21 @@ def build_geo_summary(
             else 0
         )
         listed = sum(item["bytes"] for item in network_items)
+        network_block: dict[str, Any] = {
+            "items": network_items,
+            # Networks below the list, plus what a window folded.
+            "other_bytes": max(country["shown"] - listed - unknown_bytes, 0),
+            "unknown_bytes": unknown_bytes,
+        }
+        if ruled:
+            # In this country, in windows with too few devices: counted in
+            # the country, attributed to no network.
+            network_block["withheld_bytes"] = max(country_bytes - country["shown"], 0)
         items.append(
             {
                 "country_code": code,
                 **_volume(country["sums"], whole),
-                "networks": {
-                    "items": network_items,
-                    # Networks below the list, plus what a window folded.
-                    "other_bytes": max(country_bytes - listed - unknown_bytes, 0),
-                    "unknown_bytes": unknown_bytes,
-                },
+                "networks": network_block,
             }
         )
     for _code, country in ranked[limit:]:

@@ -80,6 +80,29 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "traffic_flow": (
+        "Three location-bearing models (`TrafficFlowWindow`, "
+        "`TrafficFlowServiceBucket`, and routers via the export row), read "
+        "from two surfaces. The Master routes (`/platform/traffic-flow/...`) "
+        "are pinned to ScopeType.GLOBAL on the GLOBAL-only `traffic_flows` "
+        "module, which no location- or organization-scoped caller holds. The "
+        "customer routes (`/traffic-flow/locations/{location_id}/...`) read "
+        "one venue: `TrafficFlowCustomerService._own_location` loads the "
+        "venue named in the path, compares its organization with the "
+        "caller's (a foreign or missing venue is the same 404), runs "
+        "`enforce_entity_location` against the caller's grants, and every "
+        "read is then filtered on that loaded venue's id -- a `router_id` "
+        "query value only narrows within it. The confinement is taken at "
+        "construction and supplied by `get_traffic_flow_customer_service`. "
+        "The Destinations routes read a fourth model, "
+        "`TrafficFlowDestinationBucket`, the same way: the Master ones are "
+        "GLOBAL-pinned, and the customer ones go through "
+        "`CustomerDestinationService`, which calls that same "
+        "`own_location` check (via the same provider) before any read and "
+        "puts the caller's organization on every statement. "
+        "There is no by-id row route: windows and buckets are never "
+        "addressed individually."
+    ),
     "marketing": (
         "Guest Marketing. Two location-bearing models: MarketingCampaign "
         "(nullable location_id = org-wide) and GuestMarketingConsent "
@@ -338,14 +361,6 @@ EXEMPT: dict[str, str] = {
         "AnalyticsSnapshot is a precomputed aggregate, and every analytics read "
         "route already carries an explicit `scope=ScopeType.ORGANIZATION` plus "
         "`RequireOrganization`, which a narrower grant cannot satisfy."
-    ),
-    "traffic_flow": (
-        "`TrafficFlowWindow` carries a denormalized `location_id`, but every "
-        "route on the domain is Master-only and pinned to ScopeType.GLOBAL "
-        "on the GLOBAL-only `traffic_flows` module (held by Super Admin and "
-        "Platform Admin only). No location- or organization-scoped caller "
-        "can reach any of its rows, so there is no confinement to apply. A "
-        "future venue-owner view must move it to PENDING first."
     ),
 }
 

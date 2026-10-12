@@ -8,11 +8,11 @@ shape and the same bounded 7-day delete as ``traffic_flow_service_buckets``.
 Nothing writes to it unless ``CLOUDGUEST_TRAFFIC_FLOW_ENABLED`` is true AND
 the geo data files are present in the image.
 
-Idempotent (``IF NOT EXISTS`` throughout), like 0156 and 0157. Not a CERT-In
+Idempotent (``IF NOT EXISTS`` throughout), like 0156, 0157 and 0159. Not a CERT-In
 table; safe to prune.
 
-Revision ID: 0158_traffic_flow_country_buckets
-Revises: 0157_traffic_flow_services_export
+Revision ID: 0160_traffic_flow_country_buckets
+Revises: 0159_traffic_flow_dest_buckets
 Create Date: 2026-10-12
 """
 
@@ -20,8 +20,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0158_traffic_flow_country_buckets"
-down_revision = "0157_traffic_flow_services_export"
+revision = "0160_traffic_flow_country_buckets"
+down_revision = "0159_traffic_flow_dest_buckets"
 branch_labels = None
 depends_on = None
 

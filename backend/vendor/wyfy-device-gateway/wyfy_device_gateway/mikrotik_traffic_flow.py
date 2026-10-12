@@ -12,10 +12,20 @@ drift (see ``~/wyfy-ops/netflow/DESIGN.md`` §2).
   that differ, so an unchanged re-apply issues no write at all.
 * ``/ip traffic-flow target`` is a **list with no natural unique key**.
   ``add`` duplicates on every push, and two targets mean every flow is
-  exported, and counted, twice. Our row is found by its ``comment`` marker,
-  updated in place, and any *extra* marked rows are removed. Targets without
-  our marker belong to someone else and are never touched; they are counted
-  and reported so an operator can see a pre-existing export.
+  exported, and counted, twice. Our row is found by its **own values**:
+  a target is ours when its ``dst-address`` and ``port`` equal the caller's
+  ``identity`` (the platform's collector address and port). It is updated
+  in place, and any *extra* rows with the same identity are removed. Every
+  other target belongs to someone else (a venue's own collector) and is
+  never updated or removed; they are counted and reported.
+
+  There is deliberately no ``comment`` marker. ``/ip traffic-flow target``
+  does not have that property: RouterOS 7.21.4 answers "unknown parameter
+  comment" to an ``add`` carrying one (measured on a hEX lite, the first
+  real apply). Nothing in this module ever sends ``comment``.
+
+* Switching export off never switches off somebody else's: when a foreign
+  target remains, ``/ip traffic-flow enabled`` is left as it is.
 
 ## RouterOS v6 is refused, not guessed at
 
@@ -31,8 +41,10 @@ field with the desired rows; ``matches`` is False with a per-field reason
 when anything differs. "No exception" is never treated as success -- see the
 2026-08-18 hotspot-profile rebind failure modelled in the write fake.
 
-Nothing in this module has run against hardware yet; the device plan is H1
-and H7 in DESIGN.md §9.
+Hardware status: reads and the dry run work on RouterOS 7.21.4; no target
+row has existed on a device yet, so how a target row *prints* (in
+particular whether ``dst-address`` carries a ``/32``) is unmeasured.
+Addresses are therefore compared with a host mask stripped.
 """
 
 from __future__ import annotations
@@ -50,6 +62,7 @@ __all__ = [
     "TrafficFlowState",
     "apply_traffic_flow",
     "diff_traffic_flow",
+    "is_our_target",
     "normalize_value",
     "plan_traffic_flow",
     "read_traffic_flow",
@@ -64,6 +77,11 @@ _TARGET_PATH = ("ip", "traffic-flow", "target")
 
 #: Fields whose value is a RouterOS duration ("1m", "00:01:00", "60s").
 _DURATION_FIELDS = frozenset({"active-flow-timeout", "inactive-flow-timeout"})
+
+#: Fields holding one host address. RouterOS may print such a value with a
+#: host mask ("10.20.0.1/32"); both spellings mean the same host.
+_ADDRESS_FIELDS = frozenset({"dst-address", "src-address"})
+_HOST_MASKS = ("/32", "/128")
 
 
 class TrafficFlowRefusal(Exception):  # noqa: N818 -- mirrors FirewallRefusal
@@ -80,13 +98,16 @@ class TrafficFlowConfig:
     """The desired state, as RouterOS field -> value strings.
 
     ``target`` is ``None`` to mean "no export target of ours should exist"
-    (the disable path). ``marker`` is the ``comment`` that identifies our
-    target row."""
+    (the disable path).
+
+    ``identity`` says which target rows are ours: the fields (``dst-address``
+    and ``port``) and the values a row must carry. ``None`` means "we cannot
+    say" -- then no row is ours, and nothing is updated or removed."""
 
     settings: Mapping[str, str]
     ipfix: Mapping[str, str]
     target: Mapping[str, str] | None
-    marker: str
+    identity: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +188,10 @@ def normalize_value(key: str, value: Any) -> str:
         seconds = _duration_seconds(lowered)
         if seconds is not None:
             return f"{seconds}s"
+    if key in _ADDRESS_FIELDS:
+        for mask in _HOST_MASKS:
+            if lowered.endswith(mask):
+                return lowered[: -len(mask)]
     return lowered
 
 
@@ -189,7 +214,20 @@ def _first_row(api: Any, path: tuple[str, ...]) -> dict[str, Any]:
     return {}
 
 
-def read_traffic_flow(api: Any, *, marker: str) -> TrafficFlowState:
+def is_our_target(row: Mapping[str, Any], identity: Mapping[str, str] | None) -> bool:
+    """A target row is ours when every identity field has our value. No
+    identity, or an empty one, matches nothing -- never everything."""
+    if not identity:
+        return False
+    return all(
+        normalize_value(key, row.get(key)) == normalize_value(key, value)
+        for key, value in identity.items()
+    )
+
+
+def read_traffic_flow(
+    api: Any, *, identity: Mapping[str, str] | None
+) -> TrafficFlowState:
     """Read-only. Never writes."""
     resource = _first_row(api, ("system", "resource"))
     version = resource.get("version")
@@ -198,7 +236,7 @@ def read_traffic_flow(api: Any, *, marker: str) -> TrafficFlowState:
     ours: list[dict[str, str]] = []
     foreign = 0
     for row in api.path(*_TARGET_PATH):
-        if str(row.get("comment", "")) == marker:
+        if is_our_target(row, identity):
             normalized = _normalized_row(row)
             normalized[".id"] = str(row.get(".id", ""))
             ours.append(normalized)
@@ -224,6 +262,17 @@ def _changed(current: Mapping[str, str], desired: Mapping[str, str]) -> dict[str
     }
 
 
+def _settings_change(
+    state: TrafficFlowState, config: TrafficFlowConfig
+) -> dict[str, str]:
+    """The ``/ip traffic-flow`` fields to write. On the disable path
+    (``target is None``) with somebody else's target still on the router,
+    nothing: switching export off would switch theirs off too."""
+    if config.target is None and state.foreign_targets > 0:
+        return {}
+    return _changed(state.settings, config.settings)
+
+
 def diff_traffic_flow(
     state: TrafficFlowState, config: TrafficFlowConfig
 ) -> tuple[str, ...]:
@@ -231,7 +280,7 @@ def diff_traffic_flow(
     reasons. Empty means the device already holds exactly the desired
     state."""
     reasons: list[str] = []
-    for key, value in _changed(state.settings, config.settings).items():
+    for key, value in _settings_change(state, config).items():
         reasons.append(
             f"traffic-flow {key}: have {state.settings.get(key)!r}, want {value!r}"
         )
@@ -265,18 +314,17 @@ def plan_traffic_flow(
     """The writes :func:`apply_traffic_flow` would issue, in order, as
     ``(op, path, fields)``. Pure: used for ``dry_run``.
 
-    Order matters for a clean turn-on and turn-off: the target is put in
-    place before export is enabled (no records sent to a stale target), and
-    on disable export is switched off before the target is removed."""
-    ops: list[tuple[str, tuple[str, ...], dict[str, str]]] = []
-    settings_change = _changed(state.settings, config.settings)
-    ipfix_change = _changed(state.ipfix, config.ipfix)
-    disabling = (
-        normalize_value("enabled", config.settings.get("enabled", "yes")) == "no"
-    )
+    Turning on: the target is put in place before export is enabled (no
+    records sent to a stale target). Turning off: our target is removed
+    first, and export is switched off only if no foreign target is left.
 
-    if disabling and settings_change:
-        ops.append(("set", _SETTINGS_PATH, settings_change))
+    ``state.targets`` holds only rows that matched ``config.identity``, so
+    every update and remove below is on a row of ours; a foreign row's
+    ``.id`` never reaches this function. No write carries ``comment``."""
+    ops: list[tuple[str, tuple[str, ...], dict[str, str]]] = []
+    settings_change = _settings_change(state, config)
+    ipfix_change = _changed(state.ipfix, config.ipfix)
+
     if ipfix_change:
         ops.append(("set", _IPFIX_PATH, ipfix_change))
 
@@ -285,9 +333,7 @@ def plan_traffic_flow(
             ops.append(("remove", _TARGET_PATH, {".id": row[".id"]}))
     else:
         if not state.targets:
-            ops.append(
-                ("add", _TARGET_PATH, {**config.target, "comment": config.marker})
-            )
+            ops.append(("add", _TARGET_PATH, dict(config.target)))
         else:
             keep, *extra = state.targets
             change = _changed(keep, config.target)
@@ -296,7 +342,7 @@ def plan_traffic_flow(
             for row in extra:
                 ops.append(("remove", _TARGET_PATH, {".id": row[".id"]}))
 
-    if not disabling and settings_change:
+    if settings_change:
         ops.append(("set", _SETTINGS_PATH, settings_change))
     return ops
 
@@ -314,7 +360,7 @@ def apply_traffic_flow(api: Any, config: TrafficFlowConfig) -> TrafficFlowApplyR
 
     Raises :class:`TrafficFlowRefusal` (nothing written) on a router that is
     not RouterOS 7. An unchanged device gets zero writes."""
-    before = read_traffic_flow(api, marker=config.marker)
+    before = read_traffic_flow(api, identity=config.identity)
     if before.major_version != 7:
         raise TrafficFlowRefusal(
             TRAFFIC_FLOW_V7_REQUIRED,
@@ -333,7 +379,7 @@ def apply_traffic_flow(api: Any, config: TrafficFlowConfig) -> TrafficFlowApplyR
         elif op == "remove":
             menu.remove(fields[".id"])
         writes.append(_describe(op, path, fields))
-    after = read_traffic_flow(api, marker=config.marker)
+    after = read_traffic_flow(api, identity=config.identity)
     mismatches = diff_traffic_flow(after, config)
     return TrafficFlowApplyResult(
         writes=tuple(writes),

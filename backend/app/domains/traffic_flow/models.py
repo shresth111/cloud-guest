@@ -311,3 +311,8 @@ class TrafficFlowCountryBucket(Base):
             "window_start",
         ),
     )
+
+
+# Registered on the shared metadata with the rest of the domain's tables
+# (alembic/env.py imports this module). Defined in its own file.
+from .destination_buckets import TrafficFlowDestinationBucket  # noqa: E402, F401

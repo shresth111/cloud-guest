@@ -4,12 +4,6 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-#: ``comment`` on the one ``/ip traffic-flow target`` row the platform owns.
-#: The device writer finds its row by this, and the renderer's add-guard
-#: keys on it, so it must never change without a migration plan for routers
-#: already carrying the old marker.
-TRAFFIC_FLOW_TARGET_MARKER = "wyfy-traffic-flow"
-
 #: Section header in ``render_network_config`` output.
 TRAFFIC_FLOW_SECTION_HEADER = "# --- Traffic Flow (CloudGuest-managed) ---"
 
@@ -37,6 +31,12 @@ ROUTEROS_CACHE_ENTRIES = "16k"
 #: A router whose newest window ended at least this long ago reads
 #: ``silent`` in the fleet status (PRODUCT.md M1: "nothing for an hour").
 SILENT_AFTER_SECONDS = 3600
+
+#: Customer view only: a 5-minute window in which fewer than this many
+#: devices were seen contributes nothing to the venue's destination list.
+#: With one or two devices online the venue's destinations are in effect
+#: one person's (RESEARCH.md §6.4). The Master view withholds nothing.
+CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS = 5
 
 #: ``GET /summary`` limits.
 MAX_QUERY_WINDOW_DAYS = 7
@@ -175,6 +175,15 @@ class FlowState(StrEnum):
     AWAITING_FIRST_DATA = "awaiting_first_data"
     RECEIVING = "receiving"
     SILENT = "silent"
+
+
+class CustomerCollection(StrEnum):
+    """All a customer is told about how a venue is doing. Deliberately
+    three values: nothing about tunnels, exporters, verdicts or the switch."""
+
+    COLLECTING = "collecting"
+    NOT_COLLECTING_YET = "not_collecting_yet"
+    NOT_AVAILABLE = "not_available"
 
 
 class BlockerCode(StrEnum):

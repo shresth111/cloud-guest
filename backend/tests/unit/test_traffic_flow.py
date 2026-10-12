@@ -37,7 +37,6 @@ from app.domains.traffic_flow.constants import (
     OTHER_SERVICE_PORT,
     ROUTEROS_CACHE_ENTRIES,
     TRAFFIC_FLOW_SECTION_HEADER,
-    TRAFFIC_FLOW_TARGET_MARKER,
     FlowState,
     RouterFlowState,
     TalkerMatch,
@@ -54,8 +53,10 @@ from app.domains.traffic_flow.ingest import (
 from app.domains.traffic_flow.routeros import (
     TrafficFlowTarget,
     desired_config,
+    disabled_config,
     render_removal_lines,
     render_traffic_flow_lines,
+    target_identity,
     traffic_flow_lines_for_router,
 )
 from app.domains.traffic_flow.service import (
@@ -382,38 +383,83 @@ class TestParity:
             plan_traffic_flow,
         )
 
-        from app.domains.traffic_flow.routeros import disabled_config
-
+        identity = target_identity("10.20.0.1", 2055)
         state = TrafficFlowState(
-            routeros_version="7.16.2",
+            routeros_version="7.21.4",
             settings={"enabled": "yes"},
             ipfix={},
-            targets=({".id": "*1", "comment": TRAFFIC_FLOW_TARGET_MARKER},),
+            targets=({".id": "*1", "dst-address": "10.20.0.1", "port": "2055"},),
             foreign_targets=0,
         )
-        plan = plan_traffic_flow(state, disabled_config())
+        plan = plan_traffic_flow(state, disabled_config(identity))
         assert [(op, path) for op, path, _fields in plan] == [
-            ("set", ("ip", "traffic-flow")),
             ("remove", ("ip", "traffic-flow", "target")),
+            ("set", ("ip", "traffic-flow")),
         ]
-        script = render_removal_lines()
+        assert plan[1][2] == {"enabled": "no"}
+        script = render_removal_lines(identity)
         assert script == [
-            "/ip traffic-flow set enabled=no",
             "/ip traffic-flow target remove "
-            f'[find where comment="{TRAFFIC_FLOW_TARGET_MARKER}"]',
+            "[find where dst-address=10.20.0.1 and port=2055]",
+            ":if ([:len [/ip traffic-flow target find]] = 0) do={"
+            "/ip traffic-flow set enabled=no}",
         ]
-        assert plan[0][2] == {"enabled": "no"}
-        text = "\n".join(script)
-        assert text.count("[") == text.count("]") and text.count('"') % 2 == 0
+        for line in script:
+            assert line.count("[") == line.count("]")
+            assert line.count("{") == line.count("}")
+
+    def test_removal_leaves_export_on_for_somebody_elses_target(self) -> None:
+        """Script and writer agree here too: with a foreign target left,
+        neither switches export off."""
+        from wyfy_device_gateway.mikrotik_traffic_flow import (
+            TrafficFlowState,
+            plan_traffic_flow,
+        )
+
+        identity = target_identity("10.20.0.1", 2055)
+        state = TrafficFlowState(
+            routeros_version="7.21.4",
+            settings={"enabled": "yes"},
+            ipfix={},
+            targets=({".id": "*1", "dst-address": "10.20.0.1", "port": "2055"},),
+            foreign_targets=1,
+        )
+        plan = plan_traffic_flow(state, disabled_config(identity))
+        assert [op for op, _path, _fields in plan] == ["remove"]
+        assert (
+            "[:len [/ip traffic-flow target find]] = 0"
+            in (render_removal_lines(identity)[1])
+        )
+
+    def test_removal_without_a_known_identity_removes_nothing(self) -> None:
+        assert render_removal_lines(None) == []
+        assert disabled_config().identity is None
+
+    def test_no_line_and_no_row_carries_a_comment(self) -> None:
+        """``/ip traffic-flow target`` has no ``comment`` property: RouterOS
+        7.21.4 refused the first real apply with "unknown parameter
+        comment"."""
+        config = desired_config(TARGET)
+        assert "comment" not in (config.target or {})
+        assert config.identity == {"dst-address": "10.20.0.1", "port": "2055"}
+        for version in ("7.21.4", None):
+            for line in render_traffic_flow_lines(config, routeros_version=version):
+                if not line.startswith("#"):
+                    assert "comment" not in line, line
+        for line in render_removal_lines(config.identity):
+            assert "comment" not in line
 
     def test_target_add_is_guarded_and_duplicates_are_collapsed(self) -> None:
         lines = render_traffic_flow_lines(
             desired_config(TARGET), routeros_version="7.15"
         )
         add = next(x for x in lines if "target add" in x)
-        assert add.startswith(":if ([:len [/ip traffic-flow target find where comment=")
-        assert f'comment="{TRAFFIC_FLOW_TARGET_MARKER}"' in add
-        assert any("target remove [:pick" in x for x in lines)
+        find = (
+            "[/ip traffic-flow target find where dst-address=10.20.0.1 and port=2055]"
+        )
+        assert add.startswith(f":if ([:len {find}] = 0) do=")
+        assert any(x.startswith(f"/ip traffic-flow target set {find} ") for x in lines)
+        assert any("target remove [:pick" in x and find in x for x in lines)
         # target in place before export is switched on (same order as the writer)
         assert lines.index(add) < next(
             i for i, x in enumerate(lines) if x.startswith("/ip traffic-flow set ")
@@ -427,13 +473,41 @@ class TestParity:
             assert line.count("[") == line.count("]"), line
             assert line.count('"') % 2 == 0, line
 
-    @pytest.mark.parametrize("version", ["6.49.10", None, "garbage"])
-    def test_non_v7_gets_a_comment_not_a_guess(self, version: str | None) -> None:
+    def test_stored_v6_gets_a_comment_not_a_guess(self) -> None:
         lines = render_traffic_flow_lines(
-            desired_config(TARGET), routeros_version=version
+            desired_config(TARGET), routeros_version="6.49.10"
         )
         assert all(x.startswith("#") for x in lines)
-        assert "RouterOS 7 required" in lines[1]
+        assert "RouterOS 7 required (router reports 6.49.10)" in lines[1]
+
+    @pytest.mark.parametrize("version", [None, "", "garbage"])
+    def test_unknown_version_gets_the_script_behind_a_device_side_guard(
+        self, version: str | None
+    ) -> None:
+        """No stored version is not "RouterOS 6". The drawer showed
+        "skipped: router reports no version" for a router on 7.21.4."""
+        config = desired_config(TARGET)
+        known = render_traffic_flow_lines(config, routeros_version="7.21.4")
+        unknown = render_traffic_flow_lines(config, routeros_version=version)
+        assert unknown[0] == TRAFFIC_FLOW_SECTION_HEADER
+        assert unknown[1].startswith("# RouterOS version not recorded")
+        assert not any("skipped" in x for x in unknown)
+        guard = ':if ([:pick [/system resource get version] 0 2] = "7.") do={ '
+        commands = unknown[2:]
+        assert len(commands) == len(known) - 1
+        for guarded, plain in zip(commands, known[1:], strict=True):
+            # Exactly the known-v7 line, inside the guard: nothing else differs.
+            assert guarded == f"{guard}{plain} }}"
+            assert guarded.count("{") == guarded.count("}")
+            assert guarded.count("[") == guarded.count("]")
+            assert guarded.count('"') % 2 == 0
+
+    def test_known_v7_lines_carry_no_version_guard(self) -> None:
+        lines = render_traffic_flow_lines(
+            desired_config(TARGET), routeros_version="7.21.4"
+        )
+        assert not any("/system resource get version" in x for x in lines)
+        assert not any("not recorded" in x for x in lines)
 
     def test_render_network_config_carries_its_own_wrapped_block(self) -> None:
         lines = render_traffic_flow_lines(
@@ -567,12 +641,21 @@ class FakeRepo:
         self.pruned_before: datetime | None = None
         self.service_rows: list[dict[str, Any]] = []
         self.service_pruned_before: datetime | None = None
+        self.destination_rows: list[dict[str, Any]] = []
+        self.destination_pruned_before: datetime | None = None
         self.export: Any = None
         self.saved_exports: list[Any] = []
         self.fleet_vendor = "mikrotik"
 
     async def insert_service_buckets(self, rows):  # noqa: ANN001
         self.service_rows.extend(dict(r) for r in rows)
+
+    async def insert_destination_buckets(self, rows):  # noqa: ANN001
+        self.destination_rows.extend(dict(r) for r in rows)
+
+    async def delete_destination_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
+        self.destination_pruned_before = cutoff
+        return 0
 
     async def delete_service_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
         self.service_pruned_before = cutoff
@@ -888,6 +971,7 @@ class FakeAdapter:
         unreachable: bool = False,
     ) -> None:
         self.applied: list[Any] = []
+        self.read_identities: list[Any] = []
         self.refuse = refuse
         self.mismatches = mismatches
         self.unreachable = unreachable
@@ -899,7 +983,8 @@ class FakeAdapter:
             foreign_targets=0,
         )
 
-    async def read_traffic_flow(self, creds, *, marker):  # noqa: ANN001
+    async def read_traffic_flow(self, creds, *, identity):  # noqa: ANN001
+        self.read_identities.append(identity)
         return self.state
 
     async def apply_traffic_flow(self, creds, config):  # noqa: ANN001
@@ -981,7 +1066,9 @@ class TestDeviceService:
             desired_config(TARGET), routeros_version="7.16.2"
         )
         assert data["paste_script"] == data["lines"]
-        assert data["removal_script"] == render_removal_lines()
+        assert data["removal_script"] == render_removal_lines(
+            target_identity("10.20.0.1", 2055)
+        )
         assert data["desired"] == {
             "target_host": "10.20.0.1",
             "target_port": 2055,
@@ -1030,8 +1117,64 @@ class TestDeviceService:
         data = await service.remove(ROUTER_ID, actor_user_id=None)
         assert data["ok"] is True and data["enabled"] is False
         assert adapter.applied[-1].target is None
+        # Without a tunnel, "ours" is what was recorded when it was applied.
+        assert adapter.applied[-1].identity == {
+            "dst-address": "10.20.0.1",
+            "port": "2055",
+        }
         assert repo.export.enabled is False
         assert data["state"] == FlowState.NOT_CONFIGURED.value
+
+    async def test_remove_with_nothing_known_treats_no_target_as_ours(self) -> None:
+        """No tunnel and no record of an apply: there is no way to say which
+        target is the platform's, so none is -- the writer then removes no
+        row. Never "all of them"."""
+        service, adapter = _device()
+        service.repository.peer = service.repository.server = None
+        await service.remove(ROUTER_ID, actor_user_id=None)
+        assert adapter.applied[-1].target is None
+        assert adapter.applied[-1].identity is None
+        data = await service.preview(ROUTER_ID)
+        assert data["removal_script"] == []
+
+    async def test_apply_and_dry_run_carry_the_identity_and_no_comment(self) -> None:
+        service, adapter = _device()
+        await service.apply(ROUTER_ID, enabled=True, dry_run=True, actor_user_id=None)
+        assert adapter.read_identities == [{"dst-address": "10.20.0.1", "port": "2055"}]
+        data = await service.apply(
+            ROUTER_ID, enabled=True, dry_run=False, actor_user_id=None
+        )
+        config = adapter.applied[-1]
+        assert config.identity == {"dst-address": "10.20.0.1", "port": "2055"}
+        assert "comment" not in config.target and not hasattr(config, "marker")
+        assert data["ok"] is True
+
+    async def test_dry_run_plans_an_add_without_a_comment(self) -> None:
+        service, _ = _device()
+        data = await service.apply(
+            ROUTER_ID, enabled=True, dry_run=True, actor_user_id=None
+        )
+        (add,) = [w for w in data["planned_writes"] if w.startswith("add ")]
+        assert "dst-address=10.20.0.1" in add and "port=2055" in add
+        assert "comment" not in " ".join(data["planned_writes"])
+
+    async def test_preview_for_an_unrecorded_version_is_a_script_not_a_skip(
+        self,
+    ) -> None:
+        service, _ = _device(routers=FakeRouters(routeros_version=None))
+        data = await service.preview(ROUTER_ID)
+        assert data["eligible"] is True and data["blocker_codes"] == []
+        script = "\n".join(data["paste_script"])
+        assert "skipped" not in script
+        assert "version not recorded" in script
+        assert "/ip traffic-flow target add dst-address=10.20.0.1" in script
+        assert data["routeros_version"] is None
+
+    async def test_preview_for_a_stored_v6_is_still_a_skip(self) -> None:
+        service, _ = _device(routers=FakeRouters(routeros_version="6.49.10"))
+        data = await service.preview(ROUTER_ID)
+        assert data["blocker_codes"] == ["ROUTEROS_VERSION"]
+        assert any("skipped" in line for line in data["paste_script"])
 
     async def test_real_apply_records_the_switch_and_the_verdict(self) -> None:
         service, _ = _device()
@@ -1174,9 +1317,20 @@ class TestAuthorization:
 
         paths = {r.path for r in api_v1_router.routes}
         assert "/platform/traffic-flow/overview" in paths
-        assert not any(
-            "traffic-flow" in p and not p.startswith("/platform/") for p in paths
-        )
+        # Outside /platform there are exactly the read-only customer routes
+        # (the venue view's two, the Destinations three and Geo Location's
+        # one, all behind the add-on and venue_traffic.read) and nothing else:
+        # no Master route is reachable without the GLOBAL pin.
+        assert {
+            p for p in paths if "traffic-flow" in p and not p.startswith("/platform/")
+        } == {
+            "/traffic-flow/locations/{location_id}/status",
+            "/traffic-flow/locations/{location_id}/summary",
+            "/traffic-flow/locations/{location_id}/destinations",
+            "/traffic-flow/locations/{location_id}/destinations/export",
+            "/traffic-flow/locations/{location_id}/services/destinations",
+            "/traffic-flow/locations/{location_id}/geo",
+        }
 
     def test_module_is_global_only(self) -> None:
         assert (
