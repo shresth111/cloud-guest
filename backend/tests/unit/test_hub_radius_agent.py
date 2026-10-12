@@ -511,3 +511,167 @@ class TestFailuresAreRecorded:
                 f"{handler.__name__} returns a 500 without recording why -- "
                 "the response body is the caller's only clue and the journal has none"
             )
+
+
+# ---------------------------------------------------------------------------
+# Multi-address NAS (Aruba Instant On egress auto-learn)
+# ---------------------------------------------------------------------------
+
+
+def _restarts(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Re-stub subprocess.run so the test can count restarts."""
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        calls.append(cmd)
+        if cmd[:2] == ["freeradius", "-CX"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Configuration appears to be OK\n", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(radius_agent.subprocess, "run", _fake_run)
+    return calls
+
+
+class TestAdditionalAddresses:
+    IDENT = "cg-aruba-9e6069de"
+    SECRET = "S" * 32
+
+    def _stanzas(self, conf: Path) -> list[tuple[int, int, str | None]]:
+        return [
+            b
+            for b in radius_agent._split_client_blocks(conf.read_text())
+            if b[2] == self.IDENT
+        ]
+
+    def test_old_backend_payload_is_byte_identical_to_before(
+        self, conf: Path
+    ) -> None:
+        """No `additional_addresses` key: one stanza, no `addresses` in the
+        reply -- exactly what every deployed backend gets today."""
+        result = radius_agent.add_client("103.84.202.195", self.IDENT, self.SECRET)
+        assert result == {"status": "ok", "superseded": 0}
+        assert len(self._stanzas(conf)) == 1
+        assert f"client cg-{self.IDENT} {{" in conf.read_text()
+
+    def test_writes_one_stanza_per_address_with_the_same_secret_and_shortname(
+        self, conf: Path
+    ) -> None:
+        result = radius_agent.add_client(
+            "103.84.202.195",
+            self.IDENT,
+            self.SECRET,
+            True,
+            ["111.223.3.241", "8.8.4.4"],
+        )
+        assert result["addresses"] == ["103.84.202.195", "111.223.3.241", "8.8.4.4"]
+        text = conf.read_text()
+        assert len(self._stanzas(conf)) == 3
+        assert text.count(f"shortname = {self.IDENT}") == 3
+        assert text.count(f"secret = {self.SECRET}") == 6  # secret + backend
+        assert text.count("require_message_authenticator = yes") == 3
+        assert f"client cg-{self.IDENT}-111-223-3-241 {{" in text
+        assert "ipaddr = 111.223.3.241/32" in text
+
+    def test_dropping_an_address_revokes_its_stanza(self, conf: Path) -> None:
+        radius_agent.add_client(
+            "103.84.202.195", self.IDENT, self.SECRET, True, ["111.223.3.241"]
+        )
+        result = radius_agent.add_client(
+            "103.84.202.195", self.IDENT, self.SECRET, True, []
+        )
+        assert result["addresses"] == ["103.84.202.195"]
+        assert "111.223.3.241" not in conf.read_text()
+        assert len(self._stanzas(conf)) == 1
+
+    def test_an_old_payload_after_a_new_one_also_collapses_to_one(
+        self, conf: Path
+    ) -> None:
+        """A rotation from a backend that does not know about learned
+        addresses must not leave them behind with the OLD secret."""
+        radius_agent.add_client(
+            "103.84.202.195", self.IDENT, "old-secret-123", True, ["111.223.3.241"]
+        )
+        radius_agent.add_client("103.84.202.195", self.IDENT, self.SECRET)
+        assert "old-secret-123" not in conf.read_text()
+        assert len(self._stanzas(conf)) == 1
+
+    def test_the_same_set_again_does_not_restart(
+        self, conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        radius_agent.add_client(
+            "103.84.202.195", self.IDENT, self.SECRET, True, ["111.223.3.241"]
+        )
+        calls = _restarts(monkeypatch)
+        result = radius_agent.add_client(
+            "103.84.202.195", self.IDENT, self.SECRET, True, ["111.223.3.241"]
+        )
+        assert result.get("unchanged") is True
+        assert calls == []
+
+    def test_a_new_address_restarts_once(
+        self, conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = _restarts(monkeypatch)
+        radius_agent.add_client(
+            "103.84.202.195", self.IDENT, self.SECRET, True, ["111.223.3.241"]
+        )
+        assert [c[:2] for c in calls] == [
+            ["freeradius", "-CX"],
+            ["systemctl", "restart"],
+        ]
+
+    def test_other_nas_stanzas_are_untouched(self, conf: Path) -> None:
+        conf.write_text(conf.read_text() + _stanza("cg-5d3a509e", "10.20.0.28"))
+        radius_agent.add_client(
+            "103.84.202.195", self.IDENT, self.SECRET, True, ["111.223.3.241"]
+        )
+        assert "ipaddr = 10.20.0.28/32" in conf.read_text()
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            ["192.168.1.1"],
+            ["100.64.0.9"],
+            ["127.0.0.1"],
+            ["1.2.3.0/24"],
+            ["not-an-ip"],
+            [42],
+            "111.223.3.241",
+        ],
+    )
+    def test_non_public_or_malformed_additional_addresses_are_refused(
+        self, conf: Path, bad: object
+    ) -> None:
+        before = conf.read_text()
+        with pytest.raises(ValueError):
+            radius_agent.add_client(
+                "103.84.202.195", self.IDENT, self.SECRET, True, bad  # type: ignore[arg-type]
+            )
+        assert conf.read_text() == before
+
+    def test_duplicates_and_the_primary_are_folded(self, conf: Path) -> None:
+        result = radius_agent.add_client(
+            "103.84.202.195",
+            self.IDENT,
+            self.SECRET,
+            True,
+            ["111.223.3.241", "111.223.3.241", "103.84.202.195"],
+        )
+        assert result["addresses"] == ["103.84.202.195", "111.223.3.241"]
+        assert len(self._stanzas(conf)) == 2
+
+    def test_cap(self, conf: Path) -> None:
+        many = [f"8.8.{i}.1" for i in range(radius_agent.MAX_ADDITIONAL_ADDRESSES + 1)]
+        with pytest.raises(ValueError, match="at most"):
+            radius_agent.add_client(
+                "103.84.202.195", self.IDENT, self.SECRET, True, many
+            )
+
+    def test_delete_removes_every_learned_stanza_too(self, conf: Path) -> None:
+        radius_agent.add_client(
+            "103.84.202.195", self.IDENT, self.SECRET, True, ["111.223.3.241"]
+        )
+        assert radius_agent.remove_client(self.IDENT) == {"status": "ok", "removed": 2}
+        assert self.SECRET not in conf.read_text()
