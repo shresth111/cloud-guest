@@ -336,6 +336,14 @@ def _radius_server_address(server: WireGuardServer | None) -> str | None:
     return hub_reserved_ip(server.tunnel_network_cidr)
 
 
+class TrafficFlowExportLookupProtocol(Protocol):
+    """Is flow export switched on for this router
+    (``router_traffic_flow_export``)? Implemented by
+    ``traffic_flow.service.TrafficFlowRepository``."""
+
+    async def export_enabled(self, router_id: uuid.UUID) -> bool: ...
+
+
 class NetworkConfigService:
     """Core Network Configuration Management business logic -- see module
     docstring."""
@@ -358,7 +366,9 @@ class NetworkConfigService:
         agent_credential_issuer: AgentCredentialIssuerProtocol | None = None,
         router_lookup: RouterLookupProtocol | None = None,
         content_filter_lookup: ContentFilterLookupProtocol | None = None,
+        traffic_flow_export_lookup: TrafficFlowExportLookupProtocol | None = None,
     ) -> None:
+        self.traffic_flow_export_lookup = traffic_flow_export_lookup
         self.dhcp_lookup = dhcp_lookup
         self.vlan_lookup = vlan_lookup
         self.port_forwarding_lookup = port_forwarding_lookup
@@ -512,12 +522,21 @@ class NetworkConfigService:
         requesting_organization_id: uuid.UUID | None,
     ) -> list[str] | None:
         """The traffic-flow section, or ``None``. Every gate lives in
-        ``traffic_flow_lines_for_router`` (flag, allowlist, vendor, tunnel);
-        this only supplies the router's vendor and RouterOS version."""
+        ``traffic_flow_lines_for_router`` (flag, per-router switch, vendor,
+        tunnel); this supplies the router's vendor and RouterOS version and
+        whether export is switched on for it. With no lookup wired the
+        answer is "not switched on" -- fail closed."""
         from app.core.config import get_settings
 
         settings = get_settings()
         if not settings.traffic_flow_enabled:
+            return None
+        if self.traffic_flow_export_lookup is None:
+            return None
+        export_enabled = await self.traffic_flow_export_lookup.export_enabled(
+            router_id
+        )
+        if not export_enabled:
             return None
         vendor: str | None = None
         version: str | None = None
@@ -527,7 +546,7 @@ class NetworkConfigService:
             )
             vendor, version = router.vendor, router.routeros_version
         return traffic_flow_lines_for_router(
-            router_id=router_id,
+            export_enabled=export_enabled,
             vendor=vendor,
             routeros_version=version,
             peer=peer,

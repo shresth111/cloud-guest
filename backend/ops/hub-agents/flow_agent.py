@@ -102,6 +102,15 @@ def read_rows(path: str) -> list[dict]:
                     "peer_ip_src": record.get("peer_ip_src"),
                     "ip_src": record.get("ip_src"),
                     "ip_dst": record.get("ip_dst"),
+                    # Present once nfacctd aggregates on proto/ports (see
+                    # ops/netflow/nfacctd.conf). Passed through as printed;
+                    # the app decides which port is the remote one. Absent
+                    # keys stay absent so the app can tell "not measured".
+                    **{
+                        key: record[key]
+                        for key in ("ip_proto", "port_src", "port_dst")
+                        if key in record
+                    },
                     "bytes": record.get("bytes", 0),
                     "packets": record.get("packets", 0),
                     "flows": record.get("flows", 0),

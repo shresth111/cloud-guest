@@ -91,5 +91,7 @@ class TestCreateRevision:
             )
 
 
-#: Columns added by later revisions (none yet).
-LATER_COLUMNS: dict[str, set[str]] = {}
+#: Columns added by later revisions (0157_traffic_flow_services_export).
+LATER_COLUMNS: dict[str, set[str]] = {
+    "traffic_flow_windows": {"bytes_up", "bytes_down", "services_measured"},
+}

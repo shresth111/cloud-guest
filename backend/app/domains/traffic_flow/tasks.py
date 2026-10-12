@@ -6,6 +6,7 @@ Contract with the agent (``ops/hub-agents/flow_agent.py``)::
     X-Agent-Secret: <traffic_flow_agent_secret>
     200 {"windows": [{"window_start": <epoch>, "window_seconds": 300,
                       "rows": [{"peer_ip_src", "ip_src", "ip_dst",
+                                "ip_proto", "port_src", "port_dst",
                                 "bytes", "packets", "flows"}, ...]}, ...],
          "agent_time": <epoch>, "oldest_spooled": <epoch|null>}
 
@@ -35,6 +36,7 @@ from .constants import (
     MAX_WINDOWS_PER_PULL,
     RETENTION_BATCH,
     RETENTION_DAYS,
+    SERVICE_BUCKET_RETENTION_FACTOR,
     TASK_RUN_TRAFFIC_FLOW_PULL_SWEEP,
     WINDOW_SECONDS,
 )
@@ -101,12 +103,17 @@ async def pull_once(
     state.last_pull_ok = True
     state.last_error = None
     state.unknown_exporters = list(unknown)
-    pruned = await repository.delete_windows_before(
-        started - timedelta(days=RETENTION_DAYS), limit=RETENTION_BATCH
+    cutoff = started - timedelta(days=RETENTION_DAYS)
+    pruned = await repository.delete_windows_before(cutoff, limit=RETENTION_BATCH)
+    # Service buckets age out with their windows. There are up to ~50 per
+    # window, hence the larger (still bounded) batch.
+    pruned_services = await repository.delete_service_buckets_before(
+        cutoff, limit=RETENTION_BATCH * SERVICE_BUCKET_RETENTION_FACTOR
     )
     await commit()
     result = {
         "pruned": pruned,
+        "pruned_service_buckets": pruned_services,
         "ok": True,
         "windows": len(windows),
         "written": written,

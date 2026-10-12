@@ -19,6 +19,9 @@ connection record -- Guest Connection Records (``guest_sessions`` /
 cursor and the last pull's outcome, so the Master view can say
 "collector unreachable" or "unknown exporter" instead of showing an empty
 table that looks like "no traffic".
+
+``traffic_flow_service_buckets`` and ``router_traffic_flow_export`` -- see
+their class docstrings.
 """
 
 from __future__ import annotations
@@ -29,8 +32,10 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     SmallInteger,
@@ -41,7 +46,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.database.base import Base, UUIDMixin
+from app.database.base import Base, BaseModel, UUIDMixin
 
 
 class TrafficFlowWindow(UUIDMixin, Base):
@@ -71,6 +76,15 @@ class TrafficFlowWindow(UUIDMixin, Base):
     bytes_total: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     packets_total: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     flows_total: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # Client traffic (one private end, one public end), by direction. Their
+    # sum is what every share, service row and timeline step is a part of.
+    bytes_up: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    bytes_down: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # False when the collector rows carried no protocol/port, so this window
+    # has no service buckets: "not measured", never "no services".
+    services_measured: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     # Both ends private (guest -> router DNS, router -> hub over the tunnel).
     bytes_internal: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     # Both ends public -- should not happen behind NAT; counted, not hidden.
@@ -90,7 +104,8 @@ class TrafficFlowWindow(UUIDMixin, Base):
     top_talkers: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list
     )
-    # [{ip, bytes, flows}] -- top N. Never joined to a talker: see package doc.
+    # [{ip, bytes, bytes_up, bytes_down, flows}] -- top N. Never joined to a
+    # talker: see package doc.
     top_destinations: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list
     )
@@ -127,4 +142,105 @@ class TrafficFlowIngestState(Base):
     # active WireGuard peer -- e.g. a leaked orphan hub peer. Never guessed.
     unknown_exporters: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list
+    )
+
+
+class TrafficFlowServiceBucket(Base):
+    """One row per (router, source, 5-minute window, protocol, remote port):
+    client traffic by *service*, the outside end's port.
+
+    The top ``TOP_SERVICES_STORED`` services of a window get a row each; the
+    rest are folded into one "other" row per protocol (``remote_port =
+    OTHER_SERVICE_PORT``). Because nothing is dropped, a sum over this table
+    is exact -- unlike the per-window top-N talker/destination lists -- and
+    the protocol breakdown is a ``GROUP BY protocol``.
+
+    A row holds no address of any kind: not a device, not a destination. It
+    is the third independent list, not a pairing (package doc).
+
+    Written once per closed window, together with its ``traffic_flow_windows``
+    row and only when that row was new; the unique key plus ON CONFLICT DO
+    NOTHING makes a re-pulled window a no-op. Same 7-day delete as windows.
+    Not day-partitioned: at this size a bounded DELETE is enough, and
+    partitioning would need its own maintenance job (see the PR text)."""
+
+    __tablename__ = "traffic_flow_service_buckets"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("routers.id", ondelete="CASCADE"), nullable=False
+    )
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: IP protocol number (6 TCP, 17 UDP, 1 ICMP, ...).
+    protocol: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    #: The outside end's port; 0 for a protocol without ports;
+    #: ``OTHER_SERVICE_PORT`` for the folded remainder of this protocol.
+    remote_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    bytes_up: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    bytes_down: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    flows: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "router_id",
+            "source",
+            "window_start",
+            "protocol",
+            "remote_port",
+            name="uq_traffic_flow_service_buckets_key",
+        ),
+        Index("ix_traffic_flow_service_buckets_window_start", "window_start"),
+        Index(
+            "ix_traffic_flow_service_buckets_location_window",
+            "location_id",
+            "window_start",
+        ),
+    )
+
+
+class RouterTrafficFlowExport(BaseModel):
+    """The per-router switch: "Wyfy configured flow export on this router",
+    with the last read-back verdict (the ``router_remote_logging`` pattern).
+    Replaces the environment allowlist. Not ``routers.settings``: that JSON
+    is writable by a venue owner through ``PUT /routers/{id}``."""
+
+    __tablename__ = "router_traffic_flow_export"
+
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: True while Wyfy intends the router to export. False after a removal.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    target_host: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    target_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    src_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    export_version: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    #: When Wyfy last wrote the export onto the router.
+    configured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_verdict_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_verdict_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("router_id", name="uq_router_traffic_flow_export_router_id"),
     )

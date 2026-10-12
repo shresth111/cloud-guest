@@ -1,16 +1,8 @@
-import uuid
 from functools import lru_cache
 from pathlib import Path
 
 from email_validator import EmailNotValidError, validate_email
-from pydantic import (
-    Field,
-    PostgresDsn,
-    RedisDsn,
-    SecretStr,
-    ValidationInfo,
-    field_validator,
-)
+from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The default for every Fernet key below. It is base64 of the ASCII string
@@ -397,8 +389,10 @@ class Settings(BaseSettings):
     )
     # ------------------------------------------------------------------
     # Traffic flow (NetFlow v9 / IPFIX) -- app.domains.traffic_flow.
-    # Design: ~/wyfy-ops/netflow/DESIGN.md. Staging-only MVP; every gate
-    # below defaults to OFF/empty so a deploy changes nothing anywhere.
+    # Design: ~/wyfy-ops/netflow/DESIGN.md. Off by default, so a deploy
+    # changes nothing anywhere. Which routers export is NOT a setting: it is
+    # the per-router switch in router_traffic_flow_export, set from the
+    # Master console.
     # ------------------------------------------------------------------
     traffic_flow_enabled: bool = Field(
         default=False,
@@ -409,17 +403,6 @@ class Settings(BaseSettings):
             "renders no traffic-flow section, the Master apply endpoint "
             "refuses, and the pull sweep returns without a network call. "
             "Override via CLOUDGUEST_TRAFFIC_FLOW_ENABLED."
-        ),
-    )
-    traffic_flow_router_ids: str = Field(
-        default="",
-        description=(
-            "Comma-separated router UUIDs allowed to receive the traffic-flow "
-            "config (generator section + Master apply). Empty (the default) "
-            "means no router. An environment setting, not a routers.settings "
-            "key, for the same reason as radius_bandwidth_attribute_router_ids: "
-            "routers.settings is writable by a venue owner. Override via "
-            "CLOUDGUEST_TRAFFIC_FLOW_ROUTER_IDS."
         ),
     )
     traffic_flow_collector_port: int = Field(
@@ -451,37 +434,6 @@ class Settings(BaseSettings):
             "CLOUDGUEST_TRAFFIC_FLOW_AGENT_SECRET."
         ),
     )
-
-    @field_validator("traffic_flow_router_ids")
-    @classmethod
-    def _normalize_traffic_flow_router_ids(
-        cls, value: str, info: ValidationInfo
-    ) -> str:
-        """Lower-cased canonical UUIDs, de-duplicated, order-preserving --
-        naming the offending token on a typo."""
-        ids: list[str] = []
-        for token in (value or "").split(","):
-            candidate = token.strip()
-            if not candidate:
-                continue
-            try:
-                normalized = str(uuid.UUID(candidate))
-            except ValueError as exc:
-                raise ValueError(
-                    f"{info.field_name}: {candidate!r} is not a UUID"
-                ) from exc
-            if normalized not in ids:
-                ids.append(normalized)
-        return ",".join(ids)
-
-    @property
-    def traffic_flow_router_id_set(self) -> frozenset[uuid.UUID]:
-        """``traffic_flow_router_ids`` parsed."""
-        return frozenset(
-            uuid.UUID(token)
-            for token in self.traffic_flow_router_ids.split(",")
-            if token
-        )
 
     # -- Device Logs (syslog) -- see app.domains.device_logs ---------------
     device_logs_enabled: bool = Field(
