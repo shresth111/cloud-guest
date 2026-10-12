@@ -22,11 +22,12 @@ device is dropped. None of that is measured (hardware check H4).
 
 Per router: 288 windows a day x (50 rows + at most ~4 "other" rows, one per
 protocol seen) = at most 15,552 rows a day, and 108,864 rows at the 7-day
-retention. At roughly 330 bytes a row with its three indexes (about 170 heap,
-160 index) that is about 5 MB a day and 36 MB per router at retention; 100
-routers would be about 3.6 GB, which is the point to revisit N or partition.
-N = 100 would double every figure for the long tail of a list whose head is
-what the screen shows.
+retention. That worst case was loaded into a scratch PostgreSQL 17 on
+2026-10-12: 30 MB with its indexes (284 bytes a row), so about 4.3 MB a day
+per router; an unfiltered 7-day search over it (count, totals, sorted page of
+1000) took about 0.2 s on a laptop. 100 routers would be about 3 GB, which
+is the point to revisit N or to partition by day. N = 100 would double every
+figure for the long tail of a list whose head is what the screen shows.
 
 Everything below the cut is folded into one explicit "other" row per
 protocol, so a window's rows add up exactly to its client traffic.

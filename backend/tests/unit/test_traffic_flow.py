@@ -567,6 +567,8 @@ class FakeRepo:
         self.pruned_before: datetime | None = None
         self.service_rows: list[dict[str, Any]] = []
         self.service_pruned_before: datetime | None = None
+        self.destination_rows: list[dict[str, Any]] = []
+        self.destination_pruned_before: datetime | None = None
         self.export: Any = None
         self.saved_exports: list[Any] = []
         self.fleet_vendor = "mikrotik"
@@ -575,9 +577,10 @@ class FakeRepo:
         self.service_rows.extend(dict(r) for r in rows)
 
     async def insert_destination_buckets(self, rows):  # noqa: ANN001
-        self.destination_buckets = [*getattr(self, "destination_buckets", []), *rows]
+        self.destination_rows.extend(dict(r) for r in rows)
 
     async def delete_destination_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
+        self.destination_pruned_before = cutoff
         return 0
 
     async def delete_service_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
