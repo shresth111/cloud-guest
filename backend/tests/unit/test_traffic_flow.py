@@ -641,12 +641,21 @@ class FakeRepo:
         self.pruned_before: datetime | None = None
         self.service_rows: list[dict[str, Any]] = []
         self.service_pruned_before: datetime | None = None
+        self.destination_rows: list[dict[str, Any]] = []
+        self.destination_pruned_before: datetime | None = None
         self.export: Any = None
         self.saved_exports: list[Any] = []
         self.fleet_vendor = "mikrotik"
 
     async def insert_service_buckets(self, rows):  # noqa: ANN001
         self.service_rows.extend(dict(r) for r in rows)
+
+    async def insert_destination_buckets(self, rows):  # noqa: ANN001
+        self.destination_rows.extend(dict(r) for r in rows)
+
+    async def delete_destination_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
+        self.destination_pruned_before = cutoff
+        return 0
 
     async def delete_service_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
         self.service_pruned_before = cutoff
@@ -1307,14 +1316,18 @@ class TestAuthorization:
 
         paths = {r.path for r in api_v1_router.routes}
         assert "/platform/traffic-flow/overview" in paths
-        # Outside /platform there are exactly the two read-only customer
-        # routes (behind the add-on and venue_traffic.read) and nothing else:
-        # no Master route is reachable without the GLOBAL pin.
+        # Outside /platform there are exactly the read-only customer routes
+        # (the venue view's two and the Destinations three, all behind the
+        # add-on and venue_traffic.read) and nothing else: no Master route is
+        # reachable without the GLOBAL pin.
         assert {
             p for p in paths if "traffic-flow" in p and not p.startswith("/platform/")
         } == {
             "/traffic-flow/locations/{location_id}/status",
             "/traffic-flow/locations/{location_id}/summary",
+            "/traffic-flow/locations/{location_id}/destinations",
+            "/traffic-flow/locations/{location_id}/destinations/export",
+            "/traffic-flow/locations/{location_id}/services/destinations",
         }
 
     def test_module_is_global_only(self) -> None:

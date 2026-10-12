@@ -94,6 +94,12 @@ LOCATION_SCOPED: dict[str, str] = {
         "read is then filtered on that loaded venue's id -- a `router_id` "
         "query value only narrows within it. The confinement is taken at "
         "construction and supplied by `get_traffic_flow_customer_service`. "
+        "The Destinations routes read a fourth model, "
+        "`TrafficFlowDestinationBucket`, the same way: the Master ones are "
+        "GLOBAL-pinned, and the customer ones go through "
+        "`CustomerDestinationService`, which calls that same "
+        "`own_location` check (via the same provider) before any read and "
+        "puts the caller's organization on every statement. "
         "There is no by-id row route: windows and buckets are never "
         "addressed individually."
     ),

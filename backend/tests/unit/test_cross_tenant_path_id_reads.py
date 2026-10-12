@@ -526,6 +526,13 @@ _PATH_ID_ROUTES = [
     # behavioural half.
     ("/api/v1/traffic-flow/locations/{location_id}/status", "GET"),
     ("/api/v1/traffic-flow/locations/{location_id}/summary", "GET"),
+    # The same venue's destination records, download and service drill-down:
+    # same guards, and the same venue check before any read
+    # (CustomerDestinationService). Behavioural half:
+    # tests/unit/test_traffic_flow_destinations.py::TestCustomerRoutes.
+    ("/api/v1/traffic-flow/locations/{location_id}/destinations", "GET"),
+    ("/api/v1/traffic-flow/locations/{location_id}/destinations/export", "GET"),
+    ("/api/v1/traffic-flow/locations/{location_id}/services/destinations", "GET"),
 ]
 
 
