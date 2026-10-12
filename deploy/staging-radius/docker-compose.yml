@@ -1,0 +1,40 @@
+# STAGING ONLY -- a self-contained RADIUS "hub" for the staging stack.
+# Deliberately a separate compose project (not part of ~/deploy/docker-compose.yml),
+# so the CD deploy (remote-deploy.sh) neither recreates nor removes it.
+#
+#   install.sh does everything; by hand:
+#   docker compose -p wyfy-staging-radius -f deploy/staging-radius/docker-compose.yml \
+#     --env-file /home/ubuntu/deploy/staging-radius/compose.env up -d --build
+name: wyfy-staging-radius
+services:
+  radius:
+    build:
+      context: ../..
+      dockerfile: deploy/staging-radius/Dockerfile
+    image: wyfy-staging-radius:local
+    # Host networking: FreeRADIUS matches clients by SOURCE address, so it must
+    # see the venue's real public IP (and 127.0.0.1 for the on-box self-test).
+    # The agent binds to AGENT_BIND_ADDR only (the deploy_default bridge
+    # gateway), so it is reachable from the api container and nothing else.
+    network_mode: host
+    env_file:
+      - ${RADIUS_ENV_FILE:-/home/ubuntu/deploy/staging-radius/radius.env}
+    environment:
+      # The STAGING api, published on the box's :8000. Never prod.
+      WYFY_RADIUS_API_URI: ${WYFY_RADIUS_API_URI:-http://127.0.0.1:8000/api/v1}
+    volumes:
+      - radius_state:/var/lib/wyfy-radius
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 $$(cat /run/wyfy-radiusd.pid) && kill -0 $$(cat /run/wyfy-agent.pid)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  radius_state:
