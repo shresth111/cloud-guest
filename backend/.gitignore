@@ -15,3 +15,6 @@ logs/
 
 # DB-IP Lite files fetched by scripts/fetch_geo_data.py (never committed)
 data/geo/
+# Spamhaus DROP files fetched by scripts/fetch_threat_data.py (never
+# committed: their terms grant no right to redistribute)
+data/threat/

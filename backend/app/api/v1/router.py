@@ -116,6 +116,9 @@ from app.domains.traffic_flow.destinations_customer_router import (
 from app.domains.traffic_flow.destinations_router import (
     traffic_flow_destinations_platform_router,
 )
+from app.domains.traffic_flow.findings_customer_router import (
+    traffic_flow_findings_customer_router,
+)
 from app.domains.traffic_flow.geo_customer_router import (
     traffic_flow_geo_customer_router,
 )
@@ -254,6 +257,9 @@ api_v1_router.include_router(traffic_flow_customer_router)
 api_v1_router.include_router(traffic_flow_destinations_customer_router)
 # Geo Location for the same venue page: same three guards, read-only.
 api_v1_router.include_router(traffic_flow_geo_customer_router)
+# Findings for the same venue page: same three guards, read-only, computed
+# on read (no table, no notification).
+api_v1_router.include_router(traffic_flow_findings_customer_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 # Cloudflare Gateway category filtering: the provider-backed half of the same

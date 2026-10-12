@@ -31,6 +31,7 @@ from app.domains.router.models import Router
 from app.domains.router.service import RouterService
 
 from .constants import MAX_LIST_LIMIT, MAX_TIMELINE_SERIES
+from .findings_router import traffic_flow_findings_platform_router
 from .geo_router import traffic_flow_geo_platform_router
 from .service import (
     TrafficFlowDeviceService,
@@ -271,3 +272,6 @@ async def remove_traffic_flow_config(
 
 # Geo Location (``GET /geo``): its own module, same prefix, same GLOBAL pin.
 traffic_flow_platform_router.include_router(traffic_flow_geo_platform_router)
+
+# Findings (``GET /findings``): its own module, same prefix, same GLOBAL pin.
+traffic_flow_platform_router.include_router(traffic_flow_findings_platform_router)
