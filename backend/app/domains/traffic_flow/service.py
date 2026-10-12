@@ -62,6 +62,7 @@ from .destination_buckets import (
     destination_bucket_insert_statement,
     destination_rows,
 )
+from .geo import GeoWindowWriterProtocol
 from .ingest import (
     attribute_talkers,
     reduce_window,
@@ -520,8 +521,16 @@ class WindowIngestSummary:
 
 
 class TrafficFlowIngestService:
-    def __init__(self, repository: TrafficFlowRepository) -> None:
+    def __init__(
+        self,
+        repository: TrafficFlowRepository,
+        *,
+        geo: GeoWindowWriterProtocol | None = None,
+    ) -> None:
         self.repository = repository
+        #: Geo Location (``geo_service.GeoWindowWriter``). ``None`` = no
+        #: country rows are written.
+        self.geo = geo
 
     async def ingest_window(
         self,
@@ -593,6 +602,9 @@ class TrafficFlowIngestService:
                 await self.repository.insert_destination_buckets(
                     [{**identity, **row} for row in destination_rows(reduced)]
                 )
+                if self.geo is not None:
+                    # The full remote-address map, not the stored top N.
+                    await self.geo.write_window(identity, reduced.destinations)
             else:
                 summary.duplicates += 1
         summary.unknown_exporters = tuple(sorted(unknown))

@@ -434,6 +434,18 @@ class Settings(BaseSettings):
             "CLOUDGUEST_TRAFFIC_FLOW_AGENT_SECRET."
         ),
     )
+    traffic_flow_geo_data_dir: str = Field(
+        default="",
+        description=(
+            "Directory holding the DB-IP Lite country and ASN files "
+            "(dbip-country-lite.mmdb, dbip-asn-lite.mmdb) for Traffic Lens "
+            "Geo Location. Empty = <backend>/data/geo, where "
+            "scripts/fetch_geo_data.py puts them at image build. Missing "
+            "files are not an error: ingest writes no country rows and the "
+            "API answers geo_available=false. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_GEO_DATA_DIR."
+        ),
+    )
 
     # -- Device Logs (syslog) -- see app.domains.device_logs ---------------
     device_logs_enabled: bool = Field(

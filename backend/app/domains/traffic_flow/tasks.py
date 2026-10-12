@@ -41,6 +41,7 @@ from .constants import (
     WINDOW_SECONDS,
 )
 from .destination_buckets import DESTINATION_BUCKET_RETENTION_FACTOR
+from .geo import GeoWindowWriterProtocol
 from .service import TrafficFlowIngestService, TrafficFlowRepository
 
 logger = get_logger(__name__)
@@ -60,6 +61,7 @@ async def pull_once(
     fetch_windows: FetchWindows,
     commit: Callable[[], Awaitable[None]],
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    geo: GeoWindowWriterProtocol | None = None,
 ) -> dict[str, Any]:
     if not settings.traffic_flow_enabled:
         return {"skipped": "disabled"}
@@ -84,7 +86,7 @@ async def pull_once(
         logger.warning("traffic_flow_pull_failed", extra={"error": state.last_error})
         return {"ok": False, "error": state.last_error}
 
-    service = TrafficFlowIngestService(repository)
+    service = TrafficFlowIngestService(repository, geo=geo)
     exporter_map = await repository.exporter_router_map() if windows else {}
     written = duplicates = 0
     unknown: tuple[str, ...] = tuple(state.unknown_exporters or ())
@@ -114,11 +116,14 @@ async def pull_once(
     pruned_destinations = await repository.delete_destination_buckets_before(
         cutoff, limit=RETENTION_BATCH * DESTINATION_BUCKET_RETENTION_FACTOR
     )
+    # Country buckets (Geo Location) age out the same way.
+    pruned_countries = await geo.prune(cutoff) if geo is not None else 0
     await commit()
     result = {
         "pruned": pruned,
         "pruned_service_buckets": pruned_services,
         "pruned_destination_buckets": pruned_destinations,
+        "pruned_country_buckets": pruned_countries,
         "ok": True,
         "windows": len(windows),
         "written": written,
@@ -133,6 +138,9 @@ async def _run_async() -> dict[str, Any]:
     import httpx
 
     from app.database.session import SessionLocal
+
+    from .geo import get_geo_lookup
+    from .geo_service import GeoWindowWriter, TrafficFlowGeoRepository
 
     settings = get_settings()
     if not settings.traffic_flow_enabled:
@@ -161,6 +169,10 @@ async def _run_async() -> dict[str, Any]:
             settings=settings,
             fetch_windows=fetch,
             commit=session.commit,
+            geo=GeoWindowWriter(
+                TrafficFlowGeoRepository(session),
+                get_geo_lookup(settings.traffic_flow_geo_data_dir),
+            ),
         )
 
 

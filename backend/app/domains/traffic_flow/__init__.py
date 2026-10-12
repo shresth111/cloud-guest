@@ -13,6 +13,10 @@ Design, sizing, privacy and the hardware plan: ``~/wyfy-ops/netflow/DESIGN.md``.
   per-router top talkers / top destinations / service buckets, plus
   guest-session attribution.
 * ``summary.py`` -- pure assembly of the venue summary from stored rows.
+* ``geo.py`` / ``geo_service.py`` / ``geo_router.py`` -- Geo Location: client
+  traffic by country and network (AS), from DB-IP Lite files that are fetched
+  at image build and may be absent (``geo_available: false``). ``mmdb.py``
+  reads them.
 * ``tasks.py`` -- the pull sweep from the hub's ``flow_agent.py``.
 * ``router.py`` -- Master console only, every route pinned to
   ``ScopeType.GLOBAL`` under the GLOBAL-only ``traffic_flows`` permission.
@@ -28,6 +32,8 @@ Design, sizing, privacy and the hardware plan: ``~/wyfy-ops/netflow/DESIGN.md``.
   to a destination or to a service. The one pairing that is stored is
   venue-level and has no device in it: outside address by service, in
   ``traffic_flow_dest_buckets`` (``destination_buckets.py``).
+  Countries and networks (``geo.py``) are a further independent list with no
+  address in it.
 
 Everything is gated by ``Settings.traffic_flow_enabled`` (default False).
 Which routers export is the per-router switch in

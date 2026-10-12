@@ -1287,6 +1287,7 @@ class TestAuthorization:
             ("/overview", "GET", "traffic_flows.read"),
             ("/status", "GET", "traffic_flows.read"),
             ("/summary", "GET", "traffic_flows.read"),
+            ("/geo", "GET", "traffic_flows.read"),
             ("/routers/{router_id}/config", "GET", "traffic_flows.read"),
             ("/routers/{router_id}/apply", "POST", "traffic_flows.update"),
             ("/routers/{router_id}/remove", "POST", "traffic_flows.update"),
@@ -1303,7 +1304,7 @@ class TestAuthorization:
     def test_no_route_exists_outside_the_pinned_set(self) -> None:
         from app.domains.traffic_flow.router import traffic_flow_platform_router
 
-        assert len(traffic_flow_platform_router.routes) == 6
+        assert len(traffic_flow_platform_router.routes) == 7
         for route in traffic_flow_platform_router.routes:
             (method,) = route.methods
             assert (
@@ -1317,9 +1318,9 @@ class TestAuthorization:
         paths = {r.path for r in api_v1_router.routes}
         assert "/platform/traffic-flow/overview" in paths
         # Outside /platform there are exactly the read-only customer routes
-        # (the venue view's two and the Destinations three, all behind the
-        # add-on and venue_traffic.read) and nothing else: no Master route is
-        # reachable without the GLOBAL pin.
+        # (the venue view's two, the Destinations three and Geo Location's
+        # one, all behind the add-on and venue_traffic.read) and nothing else:
+        # no Master route is reachable without the GLOBAL pin.
         assert {
             p for p in paths if "traffic-flow" in p and not p.startswith("/platform/")
         } == {
@@ -1328,6 +1329,7 @@ class TestAuthorization:
             "/traffic-flow/locations/{location_id}/destinations",
             "/traffic-flow/locations/{location_id}/destinations/export",
             "/traffic-flow/locations/{location_id}/services/destinations",
+            "/traffic-flow/locations/{location_id}/geo",
         }
 
     def test_module_is_global_only(self) -> None:

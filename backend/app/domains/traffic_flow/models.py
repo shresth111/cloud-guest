@@ -246,6 +246,73 @@ class RouterTrafficFlowExport(BaseModel):
     )
 
 
+class TrafficFlowCountryBucket(Base):
+    """One row per (router, source, 5-minute window, country, network):
+    client traffic by where the outside end is, as DB-IP Lite places it.
+
+    The ``traffic_flow_service_buckets`` pattern with (country, network) in
+    place of (protocol, remote port): the window's top countries and top
+    networks get rows, the rest are folded into explicit "other" rows, and
+    traffic with no country is the "unknown" row -- so a sum over this table
+    is exact. The sentinels and the "unknown row is always written" rule are
+    in ``geo.py``.
+
+    A row holds no address of any kind, and nothing here is joined to a
+    device or a service (package doc). Written once per closed window, only
+    when its ``traffic_flow_windows`` row was new and only when the geo data
+    files were loaded; unique key plus ON CONFLICT DO NOTHING. Same 7-day
+    delete as windows."""
+
+    __tablename__ = "traffic_flow_country_buckets"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("routers.id", ondelete="CASCADE"), nullable=False
+    )
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: ISO 3166-1 alpha-2, or ``geo.UNKNOWN_COUNTRY`` / ``geo.OTHER_COUNTRY``.
+    country_code: Mapped[str] = mapped_column(String(8), nullable=False)
+    #: AS number; ``geo.UNKNOWN_NETWORK_ASN`` (0) when not known;
+    #: ``geo.OTHER_NETWORK_ASN`` (-1) for the country's folded remainder.
+    asn: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: The AS organisation's name at ingest time. A network, not an app.
+    network_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    bytes_up: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    bytes_down: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    flows: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "router_id",
+            "source",
+            "window_start",
+            "country_code",
+            "asn",
+            name="uq_traffic_flow_country_buckets_key",
+        ),
+        Index("ix_traffic_flow_country_buckets_window_start", "window_start"),
+        Index(
+            "ix_traffic_flow_country_buckets_location_window",
+            "location_id",
+            "window_start",
+        ),
+    )
+
+
 # Registered on the shared metadata with the rest of the domain's tables
 # (alembic/env.py imports this module). Defined in its own file.
 from .destination_buckets import TrafficFlowDestinationBucket  # noqa: E402, F401

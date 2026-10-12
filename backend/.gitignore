@@ -13,3 +13,5 @@ build/
 *.egg-info/
 logs/
 
+# DB-IP Lite files fetched by scripts/fetch_geo_data.py (never committed)
+data/geo/
