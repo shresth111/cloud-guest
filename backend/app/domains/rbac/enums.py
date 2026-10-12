@@ -186,6 +186,11 @@ class PermissionModule(StrEnum):
     # integration belongs to the customer, and this module gates who may
     # point this platform at it.
     NETWORK_INTEGRATIONS = "network_integrations"
+    # Traffic Flows: NetFlow/IPFIX rollups (top talkers / destinations per
+    # venue) -- see app.domains.traffic_flow. GLOBAL-only, and held by
+    # fewer GLOBAL roles than usual: the data is guest browsing metadata
+    # (DPDP), so Platform Support and Billing Manager are explicitly NONE.
+    TRAFFIC_FLOWS = "traffic_flows"
     # Device Logs: syslog (and, later, controller/cloud event feeds) that
     # venue devices send to the platform, viewed in the Master console. A
     # separate module because the lines carry guest identifiers (MAC, IP,

@@ -99,6 +99,7 @@ from app.domains.router_provisioning import (
 )
 from app.domains.support_tickets import models as support_tickets_models  # noqa: F401
 from app.domains.system_settings import models as system_settings_models  # noqa: F401
+from app.domains.traffic_flow import models as traffic_flow_models  # noqa: F401
 from app.domains.vlan import models as vlan_models  # noqa: F401
 from app.domains.voucher import models as voucher_models  # noqa: F401
 from app.domains.wireguard import models as wireguard_models  # noqa: F401

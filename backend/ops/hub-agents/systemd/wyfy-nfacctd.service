@@ -1,0 +1,18 @@
+[Unit]
+Description=Wyfy NetFlow/IPFIX collector (pmacct nfacctd on the WireGuard tunnel address)
+# NOT DEPLOYED. Needs wg0 up: nfacctd binds 10.20.0.1, which exists only then.
+After=wg-quick@wg0.service flow-agent-firewall.service
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -o pmacct -g pmacct -m 0750 /var/spool/wyfy-flows
+ExecStart=/usr/sbin/nfacctd -f /etc/pmacct/wyfy-nfacctd.conf
+Restart=always
+RestartSec=5
+User=pmacct
+Group=pmacct
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
