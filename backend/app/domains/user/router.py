@@ -25,10 +25,20 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.domains.auth.dependencies import get_role_resolver as get_login_role_resolver
 from app.domains.auth.models import AuthUser, User
+from app.domains.auth.router import (
+    _organization_membership_summaries,
+    _role_assignment_summaries,
+)
+from app.domains.billing.dependencies import get_license_service
+from app.domains.billing.service import LicenseService
+from app.domains.organization.dependencies import get_organization_service
+from app.domains.organization.service import OrganizationService
 from app.domains.otp.constants import OtpChannel, OtpPurpose
 from app.domains.otp.dependencies import get_otp_service
 from app.domains.otp.service import OtpService
+from app.domains.rbac.authorization import RoleResolver
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -378,7 +388,12 @@ async def activate_user(
     )
 
 
-def _impersonation_response(result: ImpersonationResult) -> ImpersonateUserResponse:
+def _impersonation_response(
+    result: ImpersonationResult,
+    *,
+    roles: list | None = None,
+    organizations: list | None = None,
+) -> ImpersonateUserResponse:
     return ImpersonateUserResponse(
         access_token=result.access_token,
         expires_at=result.expires_at,
@@ -388,6 +403,8 @@ def _impersonation_response(result: ImpersonationResult) -> ImpersonateUserRespo
             email=result.target_user.email,
             username=result.target_user.username,
         ),
+        roles=roles or [],
+        organizations=organizations or [],
     )
 
 
@@ -405,6 +422,9 @@ async def impersonate_user(
     payload: ImpersonateUserRequest,
     user: AuthUser = Depends(CurrentUser),
     user_service: UserService = Depends(get_user_service),
+    role_resolver: RoleResolver = Depends(get_login_role_resolver),
+    organization_service: OrganizationService = Depends(get_organization_service),
+    license_service: LicenseService = Depends(get_license_service),
 ):
     """Mint a short-lived (~30 minute) access token identifying ``user_id``
     so a platform operator can view that customer's dashboard exactly as
@@ -424,7 +444,19 @@ async def impersonate_user(
     return build_response(
         success=True,
         message=f"Impersonation session started for '{result.target_user.email}'",
-        data=_impersonation_response(result).model_dump(),
+        # The TARGET's real role assignments and active memberships, built
+        # by the very helpers ``POST /auth/login`` uses -- so the
+        # impersonated session holds exactly what the customer would hold
+        # had they signed in themselves, and nothing of the operator's.
+        data=_impersonation_response(
+            result,
+            roles=await _role_assignment_summaries(
+                role_resolver, result.target_user.id
+            ),
+            organizations=await _organization_membership_summaries(
+                organization_service, license_service, result.target_user.id
+            ),
+        ).model_dump(),
         request_id=_request_id(request),
     )
 

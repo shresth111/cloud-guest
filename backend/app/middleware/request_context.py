@@ -39,6 +39,15 @@ class MaskingContext:
     user_id: str | None = None
     organization_id: str | None = None
     accessed_kinds: list[str] = field(default_factory=list)
+    # Set by ``get_current_user`` when the bearer token carries the
+    # backend-minted ``impersonation`` claim (``UserService
+    # .impersonate_user``): the REAL operator behind this request, as
+    # ``{"actor_user_id", "actor_email", "started_at"}``. Every
+    # ``audit_log_entries`` row written while it is set is stamped with it
+    # (see ``app.domains.rbac.models``' ``before_insert`` listener), so an
+    # action taken while "viewing as" a customer is never attributed to the
+    # customer alone.
+    impersonated_by: dict[str, str] | None = None
 
 
 # A brand-new ``MaskingContext()`` is ``.set()`` fresh by the middleware on
@@ -53,6 +62,13 @@ class MaskingContext:
 masking_context: contextvars.ContextVar[MaskingContext | None] = contextvars.ContextVar(
     "masking_context", default=None
 )
+
+
+def current_impersonator() -> dict[str, str] | None:
+    """The operator behind the current request when it runs on an
+    impersonation token, else ``None``. Outside a request, ``None``."""
+    context = masking_context.get()
+    return context.impersonated_by if context is not None else None
 
 
 def get_masking_context() -> MaskingContext:
