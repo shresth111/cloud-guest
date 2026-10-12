@@ -38,6 +38,12 @@ ROUTEROS_CACHE_ENTRIES = "16k"
 #: ``silent`` in the fleet status (PRODUCT.md M1: "nothing for an hour").
 SILENT_AFTER_SECONDS = 3600
 
+#: Customer view only: a 5-minute window in which fewer than this many
+#: devices were seen contributes nothing to the venue's destination list.
+#: With one or two devices online the venue's destinations are in effect
+#: one person's (RESEARCH.md §6.4). The Master view withholds nothing.
+CUSTOMER_MIN_DEVICES_FOR_DESTINATIONS = 5
+
 #: ``GET /summary`` limits.
 MAX_QUERY_WINDOW_DAYS = 7
 DEFAULT_QUERY_WINDOW_SECONDS = 3600
@@ -175,6 +181,15 @@ class FlowState(StrEnum):
     AWAITING_FIRST_DATA = "awaiting_first_data"
     RECEIVING = "receiving"
     SILENT = "silent"
+
+
+class CustomerCollection(StrEnum):
+    """All a customer is told about how a venue is doing. Deliberately
+    three values: nothing about tunnels, exporters, verdicts or the switch."""
+
+    COLLECTING = "collecting"
+    NOT_COLLECTING_YET = "not_collecting_yet"
+    NOT_AVAILABLE = "not_available"
 
 
 class BlockerCode(StrEnum):
