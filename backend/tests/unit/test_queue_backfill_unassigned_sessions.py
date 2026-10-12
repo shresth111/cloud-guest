@@ -526,6 +526,8 @@ class TestTheSwitch:
             **EMPTY,
             "retargeted": 0,
             "retarget_failed": 0,
+            "venue_caps_written": 0,
+            "venue_caps_failed": 0,
         }
 
 

@@ -287,8 +287,40 @@ BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN = 25
 BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT = 1000
 
 
+# ---------------------------------------------------------------------------
+# A venue's total speed cap (``BandwidthPolicyRules.venue_*_rate_kbps``)
+# ---------------------------------------------------------------------------
+#
+# One parent ``/queue simple`` per router, targeting the guest subnet, with
+# every guest's own per-session row under it. The name carries the first
+# eight characters of the location id, like the per-session rows carry
+# their assignment id: enough to tell two venues' rows apart on a router
+# somebody is reading by hand, and a name this platform can find again
+# without keeping a device id for it.
+VENUE_QUEUE_NAME_PREFIX = "cloudguest-venue-"
+
+# Written on the parent row so a person looking at the router can tell it
+# is the platform's and what it is for.
+VENUE_QUEUE_COMMENT = "cloudguest: venue total speed cap -- managed by the platform"
+
+# Target types the REST API no longer accepts a new assignment for. They
+# were always saved and never enforced: nothing reads an ORGANIZATION or
+# LOCATION row, and a ROUTER row was pushed with an empty ``target``. A
+# venue's total cap is the policy's ``venue_*_rate_kbps`` now, not a row of
+# one of these types. Existing rows are left alone.
+UNENFORCED_QUEUE_TARGET_TYPES: frozenset[QueueTargetType] = frozenset(
+    {
+        QueueTargetType.ORGANIZATION,
+        QueueTargetType.LOCATION,
+        QueueTargetType.ROUTER,
+    }
+)
+
 __all__ = [
     "QueueType",
+    "VENUE_QUEUE_NAME_PREFIX",
+    "VENUE_QUEUE_COMMENT",
+    "UNENFORCED_QUEUE_TARGET_TYPES",
     "MIN_QUEUE_PRIORITY",
     "MAX_QUEUE_PRIORITY",
     "DEFAULT_QUEUE_PRIORITY",

@@ -80,7 +80,10 @@ from app.domains.rbac.location_scope import (
 )
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
-from app.domains.router.vendor_capabilities import is_controller_managed
+from app.domains.router.vendor_capabilities import (
+    is_controller_managed,
+    is_nas_only,
+)
 
 from .constants import (
     APPLICABLE_QUEUE_STATUSES,
@@ -91,12 +94,13 @@ from .constants import (
     RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS,
     REMOVABLE_QUEUE_STATUSES,
     UNLIMITED_RATE_KBPS,
+    VENUE_QUEUE_NAME_PREFIX,
     QueueScheduleType,
     QueueStatus,
     QueueTargetType,
     QueueType,
 )
-from .device_adapters import QueueCredentials, get_queue_adapter
+from .device_adapters import QueueCredentials, VenueQueueState, get_queue_adapter
 from .exceptions import (
     ControllerQueueUnavailableError,
     CrossOrganizationQueueAccessError,
@@ -111,6 +115,7 @@ from .exceptions import (
     QueueTargetNotLanAddressError,
     QueueTargetNotOnRouterError,
     QueueTemplateNotFoundError,
+    UnsupportedQueueVendorError,
 )
 from .models import QueueAssignment, QueueProfile, QueueSchedule, QueueTemplate
 from .repository import QueueManagementRepositoryProtocol
@@ -278,6 +283,47 @@ class QueueReapplySummary:
 
     reapplied: int
     failed: int
+
+
+@dataclass(frozen=True, slots=True)
+class VenueCap:
+    """A venue's total speed: what all of its guests share, per direction.
+    ``None`` on a direction is "no total in that direction". Never both
+    ``None`` -- that is "no cap", and is spelled ``None`` for the whole
+    thing."""
+
+    download_rate_kbps: int | None
+    upload_rate_kbps: int | None
+
+
+def venue_queue_name(location_id: uuid.UUID) -> str:
+    """The name of a location's parent queue on its routers -- see
+    ``constants.VENUE_QUEUE_NAME_PREFIX``."""
+    return f"{VENUE_QUEUE_NAME_PREFIX}{str(location_id)[:8]}"
+
+
+def venue_cap_from_rules(rules: dict[str, Any] | None) -> VenueCap | None:
+    """The venue total a bandwidth policy's ``rules`` carry, or ``None``.
+
+    Read with ``.get`` and not through ``BandwidthPolicyRules``: a version
+    saved before these keys existed does not have them, and a rules
+    payload that fails validation for some unrelated reason must not turn
+    "is there a venue cap" into an exception on the login path. Anything
+    that is not a positive integer is "no cap in that direction"."""
+    if not rules:
+        return None
+
+    def _rate(key: str) -> int | None:
+        value = rules.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        return value
+
+    download = _rate("venue_download_rate_kbps")
+    upload = _rate("venue_upload_rate_kbps")
+    if download is None and upload is None:
+        return None
+    return VenueCap(download_rate_kbps=download, upload_rate_kbps=upload)
 
 
 # ============================================================================
@@ -822,9 +868,54 @@ class QueueManagementService:
         # entirely, which is exactly what returning None here achieves.
         if profile.upload_rate_kbps == 0 and profile.download_rate_kbps == 0:
             return None
+        if await self._venue_cap_holds_this_session(assignment):
+            return None
         return format_mikrotik_rate_limit(
             profile, priority_override=assignment.priority_override
         )
+
+    async def _venue_cap_holds_this_session(self, assignment: QueueAssignment) -> bool:
+        """Whether ``assignment``'s session is at a venue whose total cap
+        this platform enforces on the router -- in which case the RADIUS
+        reply must not carry a rate limit.
+
+        The attribute makes RouterOS create a dynamic ``<hotspot-...>``
+        simple queue for the guest's address, at the top level and at the
+        top of the list. A top-level row above the venue's parent takes
+        that guest's traffic before the parent sees it, so the guest would
+        be limited to their own rate and counted in nobody's total. The
+        guest's own limit does not depend on the attribute: it is the
+        ``cloudguest-...`` row under the parent.
+
+        Whether the attribute was sent has never been a setting. It is sent
+        when an assignment row for the session already exists at the moment
+        the hotspot authorizes -- and the row is written by a worker task
+        that the login only enqueues, so it is a race with the portal's own
+        hotspot sign-in. Observed both ways on one router on consecutive
+        days. Under a venue cap that race is taken out of the picture.
+
+        Never raises, and anything it cannot establish answers ``False``:
+        the reply then carries the limit exactly as it did before."""
+        if assignment.location_id is None or assignment.router_id is None:
+            return False
+        try:
+            router = await self.router_lookup.get_router(
+                assignment.router_id,
+                requesting_organization_id=assignment.organization_id,
+            )
+            if is_controller_managed(router) or is_nas_only(router):
+                return False
+            cap = await self._venue_cap_for_location(
+                organization_id=assignment.organization_id,
+                location_id=assignment.location_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "venue_cap_lookup_failed",
+                extra={"assignment_id": str(assignment.id), "error": str(exc)},
+            )
+            return False
+        return cap is not None
 
     # ========================================================================
     # Queue lifecycle: apply / remove / move / reset / expire
@@ -906,6 +997,18 @@ class QueueManagementService:
 
         priority = assignment.priority_override or profile.priority
         try:
+            # A venue with a total cap: its parent row has to be on this
+            # router before the guest's own row is, and the guest's row is
+            # created under it. An existing row is put under it by the same
+            # call. ``None`` here is every venue without a cap, and the
+            # ``/queue simple`` calls below are then exactly what they were.
+            venue_parent = (
+                await self._ensure_venue_parent(
+                    router, adapter, credentials, assignment
+                )
+                if assignment.target_type == QueueTargetType.SESSION.value
+                else None
+            )
             if assignment.device_queue_id is None:
                 device_queue_id = await adapter.create_simple_queue(
                     credentials,
@@ -918,6 +1021,9 @@ class QueueManagementService:
                     burst_threshold_kbps=profile.burst_threshold_kbps,
                     burst_time_seconds=profile.burst_time_seconds,
                     priority=priority,
+                    # Passed only when there is one, so an adapter that has
+                    # never heard of ``parent`` is called as it always was.
+                    **({"parent": venue_parent} if venue_parent else {}),
                 )
             else:
                 device_queue_id = assignment.device_queue_id
@@ -1603,9 +1709,17 @@ class QueueManagementService:
         requesting_organization_id: uuid.UUID | None,
         actor_user_id: uuid.UUID | None = None,
         unit_of_work: Callable[[], AbstractAsyncContextManager[Any]] | None = None,
+        clear_venue_cap_when_uncapped: bool = False,
     ) -> dict[str, int]:
         """Re-resolve every currently-``ACTIVE`` SESSION queue assignment
         for one location against the location's *current* bandwidth policy.
+
+        The venue's total cap is brought in line first (see
+        ``sync_venue_cap_for_location``). ``clear_venue_cap_when_uncapped``
+        says whether a location whose policy now carries no total should
+        have its routers read for a parent row to take away: the caller
+        passes ``True`` when the policy has ever carried one, so a venue
+        that never set a total costs no device call it did not cost before.
 
         This is the "a venue just raised their speeds" hook -- the
         counterpart to the per-login ``resolve_and_assign_queue`` call in
@@ -1654,6 +1768,25 @@ class QueueManagementService:
         "current transaction is aborted". Rolling back to a savepoint is
         what makes "one failure does not stop the rest" true."""
         await self.repository.acquire_location_reapply_lock(location_id=location_id)
+        # The venue's total first, under the same lock: its parent row is
+        # made (or changed, or taken away) and every guest row already on
+        # the router is put under it (or returned to the top level) before
+        # any guest's own rate is re-resolved below. A failure here is the
+        # venue cap's failure and never the guests' -- it is counted by
+        # ``sync_venue_cap_for_location`` itself and the loop below runs
+        # either way.
+        try:
+            await self._sync_venue_cap_under_lock(
+                location_id=location_id,
+                requesting_organization_id=requesting_organization_id,
+                clear_when_uncapped=clear_venue_cap_when_uncapped,
+                router_allowed=None,
+            )
+        except Exception as exc:  # noqa: BLE001 -- must not stop the re-apply
+            logger.warning(
+                "venue_cap_sync_failed",
+                extra={"location_id": str(location_id), "error": str(exc)},
+            )
         assignments, _ = await self.list_assignments(
             requesting_organization_id=requesting_organization_id,
             location_id=location_id,
@@ -1705,6 +1838,390 @@ class QueueManagementService:
                     extra={"assignment_id": str(assignment.id), "error": str(exc)},
                 )
         return {"reapplied": reapplied, "failed": failed}
+
+    # ========================================================================
+    # A venue's total speed cap
+    # ========================================================================
+
+    async def _venue_cap_for_location(
+        self, *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+    ) -> VenueCap | None:
+        """The total the location's *own* bandwidth policy carries, or
+        ``None``. Resolved without a guest: a guest mapped to a group gets
+        that group's per-guest rate, but a group is not where a venue's
+        total is said, and one guest's group must not change what everybody
+        shares."""
+        if location_id is None:
+            return None
+        resolved = await self.policy_lookup.resolve_effective_policy(
+            policy_type=PolicyType.BANDWIDTH,
+            organization_id=organization_id,
+            location_id=location_id,
+        )
+        return venue_cap_from_rules(resolved.rules)
+
+    async def _ensure_venue_parent(
+        self,
+        router: Router,
+        adapter: Any,
+        credentials: QueueCredentials,
+        assignment: QueueAssignment,
+    ) -> str | None:
+        """The name of the parent row ``assignment``'s guest row belongs
+        under on ``router``, having made sure that row is there -- or
+        ``None`` when the venue has no total cap, or when it has one that
+        could not be put on this router.
+
+        ``None`` for the second reason is deliberate. The guest's own limit
+        is the thing this call is in the middle of applying; a venue cap
+        that cannot be written (the router reports no guest subnet, or
+        refuses the row) is logged and the guest still gets their own rate,
+        exactly as before there was such a thing as a venue cap. Only a
+        router that cannot be reached raises, as the write that follows
+        would have."""
+        if assignment.location_id is None or not hasattr(adapter, "sync_venue_queue"):
+            return None
+        try:
+            cap = await self._venue_cap_for_location(
+                organization_id=assignment.organization_id,
+                location_id=assignment.location_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the guest's own limit goes ahead
+            logger.warning(
+                "venue_cap_lookup_failed",
+                extra={"assignment_id": str(assignment.id), "error": str(exc)},
+            )
+            return None
+        if cap is None:
+            return None
+        name = venue_queue_name(assignment.location_id)
+        try:
+            state = await adapter.sync_venue_queue(
+                credentials,
+                name=name,
+                download_rate_kbps=cap.download_rate_kbps,
+                upload_rate_kbps=cap.upload_rate_kbps,
+                child_queue_ids=(
+                    (assignment.device_queue_id,) if assignment.device_queue_id else ()
+                ),
+            )
+        except QueueDeviceOperationError as exc:
+            logger.warning(
+                "venue_queue_sync_failed",
+                extra={
+                    "router_id": str(router.id),
+                    "location_id": str(assignment.location_id),
+                    "error": str(exc),
+                },
+            )
+            return None
+        self._log_venue_queue_state(router.id, assignment.location_id, state)
+        if state.device_queue_id is None:
+            return None
+        return name
+
+    def _log_venue_queue_state(
+        self, router_id: uuid.UUID, location_id: uuid.UUID, state: VenueQueueState
+    ) -> None:
+        """Says so when the device, read back, does not hold what was
+        written -- or when nothing was written because the router reports
+        no guest subnet. Silent when it matches."""
+        if state.in_sync:
+            return
+        event = (
+            "venue_queue_subnet_unresolved"
+            if "guest_subnet_unresolved" in state.problems
+            else "venue_queue_not_in_sync"
+        )
+        logger.warning(
+            event,
+            extra={
+                "router_id": str(router_id),
+                "location_id": str(location_id),
+                "queue_name": state.name,
+                "problems": list(state.problems),
+            },
+        )
+
+    async def sync_venue_cap_for_location(
+        self,
+        *,
+        location_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        clear_when_uncapped: bool = True,
+        router_allowed: Callable[[uuid.UUID], bool] | None = None,
+    ) -> dict[str, int]:
+        """Bring every router at ``location_id`` in line with the venue's
+        total speed cap, as its bandwidth policy states it now.
+
+        ## What it does
+
+        * **The policy carries a total:** each router gets one parent
+          ``/queue simple`` (``venue_queue_name``) over the guest subnet(s)
+          the router itself reports for its hotspot interface, at the
+          venue's rates, first in the list; and every guest row this
+          platform has on that router for this location is put under it.
+          A device with no row of its own -- bypassed, trusted, or still
+          waiting for the backfill -- is held by the parent because the
+          parent targets the subnet.
+        * **The policy carries none** and ``clear_when_uncapped``: each
+          router's guest rows go back to the top level, then the parent is
+          removed. In that order; a parent with a row still under it is
+          left in place and reported.
+        * **The policy carries none** and not ``clear_when_uncapped``:
+          nothing is contacted at all.
+
+        Only a router this platform logs in to. A venue run from a vendor
+        controller, or one whose access points this platform cannot reach,
+        is skipped: the cap is not enforced there and nothing pretends it
+        is.
+
+        ## What it never does
+
+        It never guesses the subnet (a router that reports none is logged
+        and left alone, guest rows untouched), never decides which of a
+        router's rows are guests' from the router's list (the rows are the
+        ones this platform's own assignments name), and never lets one
+        router stop another: each is tried on its own, a router that does
+        not answer is counted and converges on the next run.
+
+        Idempotent -- a router that already matches costs one read. Takes
+        the per-location re-apply lock first, so it never interleaves with
+        a policy re-apply or a re-target for the same location.
+
+        Returns ``{"routers", "synced", "cleared", "wrote", "failed",
+        "skipped"}``; ``wrote`` counts routers this call changed."""
+        await self.repository.acquire_location_reapply_lock(location_id=location_id)
+        return await self._sync_venue_cap_under_lock(
+            location_id=location_id,
+            requesting_organization_id=requesting_organization_id,
+            clear_when_uncapped=clear_when_uncapped,
+            router_allowed=router_allowed,
+        )
+
+    async def _sync_venue_cap_under_lock(
+        self,
+        *,
+        location_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        clear_when_uncapped: bool,
+        router_allowed: Callable[[uuid.UUID], bool] | None,
+    ) -> dict[str, int]:
+        """``sync_venue_cap_for_location`` for a caller that already holds
+        the location's re-apply lock."""
+        result = {
+            "routers": 0,
+            "synced": 0,
+            "cleared": 0,
+            "wrote": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+        cap = await self._venue_cap_for_location(
+            organization_id=requesting_organization_id, location_id=location_id
+        )
+        if cap is None and not clear_when_uncapped:
+            return result
+
+        assignments, _ = await self.list_assignments(
+            requesting_organization_id=requesting_organization_id,
+            location_id=location_id,
+            status=QueueStatus.ACTIVE,
+            page=1,
+            page_size=1000,
+        )
+        children: dict[uuid.UUID, list[str]] = {}
+        for row in assignments:
+            if (
+                row.target_type == QueueTargetType.SESSION.value
+                and row.router_id is not None
+                and row.device_queue_id
+                and row.device_queue_id != self.CONTROLLER_QUEUE_MARKER
+            ):
+                children.setdefault(row.router_id, []).append(row.device_queue_id)
+
+        routers = await self._routers_at_location(
+            location_id,
+            requesting_organization_id=requesting_organization_id,
+            also=children.keys(),
+        )
+        name = venue_queue_name(location_id)
+        for router in sorted(routers, key=lambda r: str(r.id)):
+            if router_allowed is not None and not router_allowed(router.id):
+                continue
+            result["routers"] += 1
+            if is_controller_managed(router) or is_nas_only(router):
+                result["skipped"] += 1
+                continue
+            try:
+                adapter = self._get_device_adapter(router.vendor)
+                if not hasattr(adapter, "sync_venue_queue"):
+                    result["skipped"] += 1
+                    continue
+                credentials = self._resolve_device_credentials(router)
+            except (UnsupportedQueueVendorError, QueueMissingCredentialsError):
+                result["skipped"] += 1
+                continue
+            try:
+                if cap is not None:
+                    state = await adapter.sync_venue_queue(
+                        credentials,
+                        name=name,
+                        download_rate_kbps=cap.download_rate_kbps,
+                        upload_rate_kbps=cap.upload_rate_kbps,
+                        child_queue_ids=tuple(sorted(children.get(router.id, ()))),
+                    )
+                    result["synced"] += 1
+                else:
+                    state = await adapter.clear_venue_queue(credentials, name=name)
+                    result["cleared"] += 1
+            except QueueDeviceConnectionError as exc:
+                result["failed"] += 1
+                logger.warning(
+                    "venue_queue_router_unreachable",
+                    extra={
+                        "router_id": str(router.id),
+                        "location_id": str(location_id),
+                        "error": str(exc),
+                    },
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 -- per-router isolation
+                result["failed"] += 1
+                logger.warning(
+                    "venue_queue_sync_failed",
+                    extra={
+                        "router_id": str(router.id),
+                        "location_id": str(location_id),
+                        "error": str(exc),
+                    },
+                )
+                continue
+            if state.wrote:
+                result["wrote"] += 1
+                logger.info(
+                    "venue_queue_synced" if cap is not None else "venue_queue_cleared",
+                    extra={
+                        "router_id": str(router.id),
+                        "location_id": str(location_id),
+                        "queue_name": name,
+                        "parent_created": state.created,
+                        "parent_updated": state.updated,
+                        "reparented": state.reparented,
+                        "moved_to_top": state.moved_to_top,
+                        "parent_removed": state.removed,
+                    },
+                )
+            self._log_venue_queue_state(router.id, location_id, state)
+        return result
+
+    async def sync_venue_caps_for_live_locations(
+        self,
+        *,
+        router_allowed: Callable[[uuid.UUID], bool] | None = None,
+        unit_of_work: Callable[[], AbstractAsyncContextManager[Any]] | None = None,
+    ) -> dict[str, int]:
+        """``sync_venue_cap_for_location`` for every location that has a
+        guest row on a router right now -- the periodic half, for the cases
+        a publish cannot cover: a router that did not answer when the venue
+        saved its total, a parent row somebody removed by hand, a guest row
+        that was written while the parent could not be.
+
+        Driven by this platform's own ACTIVE session assignments, so a
+        location nobody is online at is not visited: with no guest row
+        there is nothing to put under a parent, and its routers are brought
+        in line by the next publish or the next sign-in. ``router_allowed``
+        is the backfill's own switch.
+
+        Returns the per-location counts summed, plus ``locations``."""
+        total = {
+            "locations": 0,
+            "routers": 0,
+            "synced": 0,
+            "cleared": 0,
+            "wrote": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+        locations: dict[uuid.UUID, uuid.UUID | None] = {}
+        for row in await self.repository.list_assignments_by_status(
+            status=QueueStatus.ACTIVE.value
+        ):
+            if (
+                row.target_type == QueueTargetType.SESSION.value
+                and row.location_id is not None
+                and row.router_id is not None
+                and not row.is_deleted
+                and (router_allowed is None or router_allowed(row.router_id))
+            ):
+                locations.setdefault(row.location_id, row.organization_id)
+        for location_id in sorted(locations, key=str):
+            total["locations"] += 1
+            try:
+                if unit_of_work is None:
+                    result = await self.sync_venue_cap_for_location(
+                        location_id=location_id,
+                        requesting_organization_id=locations[location_id],
+                        router_allowed=router_allowed,
+                    )
+                else:
+                    async with unit_of_work():
+                        result = await self.sync_venue_cap_for_location(
+                            location_id=location_id,
+                            requesting_organization_id=locations[location_id],
+                            router_allowed=router_allowed,
+                        )
+            except Exception as exc:  # noqa: BLE001 -- per-location isolation
+                total["failed"] += 1
+                logger.warning(
+                    "venue_cap_sync_failed",
+                    extra={"location_id": str(location_id), "error": str(exc)},
+                )
+                continue
+            for key, value in result.items():
+                total[key] += value
+        return total
+
+    async def _routers_at_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        also: Collection[uuid.UUID] = (),
+    ) -> list[Router]:
+        """Every router at the location: the ones the router domain lists
+        for it, and any that one of this platform's guest rows names (which
+        covers a router lookup that cannot list). A router that cannot be
+        loaded is left out, not raised."""
+        found: dict[uuid.UUID, Router] = {}
+        lister = getattr(self.router_lookup, "list_routers", None)
+        if lister is not None:
+            try:
+                listed, _ = await lister(
+                    location_id=location_id,
+                    requesting_organization_id=requesting_organization_id,
+                    page=1,
+                    page_size=100,
+                )
+                found.update({router.id: router for router in listed})
+            except Exception as exc:  # noqa: BLE001 -- fall back to the rows' own routers
+                logger.warning(
+                    "venue_cap_router_listing_failed",
+                    extra={"location_id": str(location_id), "error": str(exc)},
+                )
+        for router_id in also:
+            if router_id in found:
+                continue
+            try:
+                found[router_id] = await self.router_lookup.get_router(
+                    router_id, requesting_organization_id=requesting_organization_id
+                )
+            except Exception as exc:  # noqa: BLE001 -- per-router isolation
+                logger.warning(
+                    "venue_cap_router_lookup_failed",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+        return list(found.values())
 
     async def _reapply_one(
         self, assignment: QueueAssignment, actor_user_id: uuid.UUID | None

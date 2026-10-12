@@ -43,6 +43,7 @@ from .contract import (
     RogueDhcpAlertStatus,
     SpeedTestResult,
     TracerouteResult,
+    VenueQueueSyncResult,
     VlanConfig,
     VlanHotspotConfig,
     WanHealth,
@@ -177,7 +178,26 @@ class _StubAdapter:
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = 8,
+        parent: str | None = None,
     ) -> str:
+        raise self._not_implemented()
+
+    async def sync_venue_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+        targets: Sequence[str] | None = None,
+        comment: str | None = None,
+    ) -> VenueQueueSyncResult:
+        raise self._not_implemented()
+
+    async def clear_venue_simple_queue(
+        self, creds: DeviceCredentials, *, name: str
+    ) -> VenueQueueSyncResult:
         raise self._not_implemented()
 
     async def update_simple_queue(
