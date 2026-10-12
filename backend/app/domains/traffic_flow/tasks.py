@@ -40,6 +40,7 @@ from .constants import (
     TASK_RUN_TRAFFIC_FLOW_PULL_SWEEP,
     WINDOW_SECONDS,
 )
+from .destination_buckets import DESTINATION_BUCKET_RETENTION_FACTOR
 from .service import TrafficFlowIngestService, TrafficFlowRepository
 
 logger = get_logger(__name__)
@@ -110,10 +111,14 @@ async def pull_once(
     pruned_services = await repository.delete_service_buckets_before(
         cutoff, limit=RETENTION_BATCH * SERVICE_BUCKET_RETENTION_FACTOR
     )
+    pruned_destinations = await repository.delete_destination_buckets_before(
+        cutoff, limit=RETENTION_BATCH * DESTINATION_BUCKET_RETENTION_FACTOR
+    )
     await commit()
     result = {
         "pruned": pruned,
         "pruned_service_buckets": pruned_services,
+        "pruned_destination_buckets": pruned_destinations,
         "ok": True,
         "windows": len(windows),
         "written": written,

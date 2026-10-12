@@ -53,6 +53,11 @@ from .constants import (
     RouterFlowState,
     TrafficFlowSource,
 )
+from .destination_buckets import (
+    destination_bucket_delete_statement,
+    destination_bucket_insert_statement,
+    destination_rows,
+)
 from .ingest import (
     attribute_talkers,
     reduce_window,
@@ -342,6 +347,18 @@ class TrafficFlowRepository:
         )
         return int(result.rowcount or 0)
 
+    async def insert_destination_buckets(self, rows: list[dict[str, Any]]) -> None:
+        if rows:
+            await self.session.execute(destination_bucket_insert_statement(rows))
+
+    async def delete_destination_buckets_before(
+        self, cutoff: datetime, *, limit: int
+    ) -> int:
+        result = await self.session.execute(
+            destination_bucket_delete_statement(cutoff, limit=limit)
+        )
+        return int(result.rowcount or 0)
+
     async def exporter_router_map(self) -> dict[str, ExporterRouter]:
         """Tunnel address -> router, for every non-revoked peer. A tunnel
         address is unique per hub; the fleet has one hub."""
@@ -559,6 +576,10 @@ class TrafficFlowIngestService:
                 # key would refuse them too.)
                 await self.repository.insert_service_buckets(
                     [{**identity, **row} for row in service_rows(reduced)]
+                )
+                # Venue-level destinations by service. No talker in them.
+                await self.repository.insert_destination_buckets(
+                    [{**identity, **row} for row in destination_rows(reduced)]
                 )
             else:
                 summary.duplicates += 1

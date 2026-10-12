@@ -574,6 +574,12 @@ class FakeRepo:
     async def insert_service_buckets(self, rows):  # noqa: ANN001
         self.service_rows.extend(dict(r) for r in rows)
 
+    async def insert_destination_buckets(self, rows):  # noqa: ANN001
+        self.destination_buckets = [*getattr(self, "destination_buckets", []), *rows]
+
+    async def delete_destination_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
+        return 0
+
     async def delete_service_buckets_before(self, cutoff, *, limit):  # noqa: ANN001
         self.service_pruned_before = cutoff
         return 0

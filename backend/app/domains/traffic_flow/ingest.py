@@ -27,8 +27,13 @@ and is dropped. A window whose rows carry no protocol/port is
 ``services_measured = False`` and yields no service rows at all -- never a
 partial list that would read as the whole.
 
-Talkers, destinations and services are reduced **independently**. Nothing
-here, and nothing stored, pairs any one of them with another (DESIGN.md §7).
+Talkers, destinations and services are reduced **independently**: nothing
+here, and nothing stored, pairs a talker with a destination or with a
+service (DESIGN.md §7).
+
+The one pairing that exists has no talker in it: ``destination_services``
+keys the *outside* address by its service, for the venue-level destination
+buckets (``destination_buckets.py``). The local end is not part of that key.
 """
 
 from __future__ import annotations
@@ -94,6 +99,11 @@ class ExporterWindow:
     )  # ip -> [bytes, flows, bytes_up, bytes_down]
     # (protocol, remote port) -> [bytes_up, bytes_down, flows]
     services: dict[tuple[int, int], list[int]] = field(default_factory=dict)
+    # (remote address, protocol, remote port) -> [bytes_up, bytes_down, flows].
+    # Venue-level: the local end is deliberately not in the key.
+    destination_services: dict[tuple[str, int, int], list[int]] = field(
+        default_factory=dict
+    )
     rows_with_service: int = 0
     rows_without_service: int = 0
     bytes_total: int = 0
@@ -214,6 +224,9 @@ def reduce_window(rows: Iterable[Mapping[str, Any]]) -> dict[str, ExporterWindow
             service = window.services.setdefault(key, [0, 0, 0])
             service[direction] += nbytes
             service[2] += nflows
+            pair = window.destination_services.setdefault((remote, *key), [0, 0, 0])
+            pair[direction] += nbytes
+            pair[2] += nflows
     return out
 
 

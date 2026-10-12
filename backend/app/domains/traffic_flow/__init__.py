@@ -24,9 +24,10 @@ Design, sizing, privacy and the hardware plan: ``~/wyfy-ops/netflow/DESIGN.md``.
 * **Not the per-guest byte source of truth.** RADIUS accounting is.
 * **Not a legal record.** No raw flow and no NAT translation is stored; see
   DESIGN.md §6 for the archive that would be, and why it needs legal sign-off.
-* **Not a guest browsing history.** Talkers, destinations and services are
-  stored as three independent lists; no stored row links a guest to a
-  destination, a guest to a service, or a service to a destination.
+* **Not a guest browsing history.** No stored row links a guest or a device
+  to a destination or to a service. The one pairing that is stored is
+  venue-level and has no device in it: outside address by service, in
+  ``traffic_flow_dest_buckets`` (``destination_buckets.py``).
 
 Everything is gated by ``Settings.traffic_flow_enabled`` (default False).
 Which routers export is the per-router switch in
