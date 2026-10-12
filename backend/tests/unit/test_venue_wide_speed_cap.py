@@ -86,6 +86,17 @@ from tests.unit.test_queue_release_on_session_end import (
     _profile,
 )
 
+
+@pytest.fixture(autouse=True)
+def _info_logging_on(caplog: pytest.LogCaptureFixture) -> None:
+    """Every test here runs with INFO records actually built, as they are in
+    the worker. Run on its own this module had INFO off, so an ``extra`` key
+    that collides with a ``LogRecord`` attribute (``created``) raised only in
+    the full suite -- and would have raised on every venue-cap write in
+    production."""
+    caplog.set_level("INFO", logger="app.domains.queue_management.service")
+
+
 GUEST_NET = "192.168.88.0/24"
 PER_GUEST = 40960
 TOTAL_DOWN = 81920

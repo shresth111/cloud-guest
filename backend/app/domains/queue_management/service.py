@@ -2105,11 +2105,11 @@ class QueueManagementService:
                         "router_id": str(router.id),
                         "location_id": str(location_id),
                         "queue_name": name,
-                        "created": state.created,
-                        "updated": state.updated,
+                        "parent_created": state.created,
+                        "parent_updated": state.updated,
                         "reparented": state.reparented,
                         "moved_to_top": state.moved_to_top,
-                        "removed": state.removed,
+                        "parent_removed": state.removed,
                     },
                 )
             self._log_venue_queue_state(router.id, location_id, state)
