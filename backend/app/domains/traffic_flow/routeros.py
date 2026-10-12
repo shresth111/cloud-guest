@@ -23,12 +23,17 @@ Values and why (DESIGN.md §2):
   and the NAT archive (DESIGN.md §6) needs them.
 * ``cache-entries`` -- one constant (``ROUTEROS_CACHE_ENTRIES``); RouterOS's
   own default depends on the board, and the smallest value overflows early.
+* the target row carries NO ``comment``: ``/ip traffic-flow target`` has no
+  such property (RouterOS 7.21.4 answers "unknown parameter comment"). Our
+  row is identified by its own ``dst-address`` + ``port`` -- the platform's
+  collector -- in the writer and in every script line below alike.
 * the target's ``src-address`` is the router's tunnel address -- the hub maps
   an exporter to a router by exactly that address.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -36,19 +41,17 @@ from wyfy_device_gateway.mikrotik_traffic_flow import TrafficFlowConfig
 
 from app.domains.wireguard.validators import hub_reserved_ip
 
-from .constants import (
-    ROUTEROS_CACHE_ENTRIES,
-    TRAFFIC_FLOW_SECTION_HEADER,
-    TRAFFIC_FLOW_TARGET_MARKER,
-)
+from .constants import ROUTEROS_CACHE_ENTRIES, TRAFFIC_FLOW_SECTION_HEADER
 
 __all__ = [
     "TrafficFlowTarget",
     "desired_config",
     "disabled_config",
+    "TARGET_IDENTITY_FIELDS",
     "render_removal_lines",
     "render_traffic_flow_lines",
     "routeros_major_version",
+    "target_identity",
     "traffic_flow_lines_for_router",
     "traffic_flow_target_for",
 ]
@@ -80,6 +83,17 @@ class TrafficFlowTarget:
     source_address: str
 
 
+#: The target fields that say "this row is ours".
+TARGET_IDENTITY_FIELDS: tuple[str, ...] = ("dst-address", "port")
+
+
+def target_identity(collector_address: str, collector_port: int) -> dict[str, str]:
+    """Which ``/ip traffic-flow target`` rows are the platform's: the ones
+    exporting to the platform's collector. Any other row is somebody else's
+    (a venue's own collector) and is never updated or removed."""
+    return {"dst-address": str(collector_address), "port": str(int(collector_port))}
+
+
 def desired_config(target: TrafficFlowTarget) -> TrafficFlowConfig:
     """Export ON, to ``target``."""
     return TrafficFlowConfig(
@@ -91,18 +105,20 @@ def desired_config(target: TrafficFlowTarget) -> TrafficFlowConfig:
             "version": "ipfix",
             "src-address": target.source_address,
         },
-        marker=TRAFFIC_FLOW_TARGET_MARKER,
+        identity=target_identity(target.collector_address, target.collector_port),
     )
 
 
-def disabled_config() -> TrafficFlowConfig:
-    """Export OFF and our target removed. IPFIX field toggles are left as
-    they are: they do nothing while export is off."""
+def disabled_config(identity: Mapping[str, str] | None = None) -> TrafficFlowConfig:
+    """Our target removed, and export OFF unless somebody else's target is
+    still there. ``identity`` says which rows are ours; without one nothing
+    is removed. IPFIX field toggles are left as they are: they do nothing
+    while export is off."""
     return TrafficFlowConfig(
         settings={"enabled": "no"},
         ipfix={},
         target=None,
-        marker=TRAFFIC_FLOW_TARGET_MARKER,
+        identity=dict(identity) if identity else None,
     )
 
 
@@ -117,6 +133,25 @@ def _fields(fields: dict[str, str]) -> str:
     return " ".join(f"{key}={value}" for key, value in fields.items())
 
 
+def _find(identity: Mapping[str, str]) -> str:
+    """``find where`` for our target, e.g. ``dst-address=10.20.0.1 and
+    port=2055``. Values are an IP address and a port number built by
+    :func:`target_identity`, never free text.
+
+    ASSUMPTION, unmeasured: that RouterOS prints a target's ``dst-address``
+    as a bare address, so this comparison matches. If a release prints
+    ``10.20.0.1/32`` the find matches nothing and a re-paste would add a
+    second target; the device writer does not depend on this (it compares
+    with the mask stripped) and its read-back would report the duplicate."""
+    return " and ".join(f"{key}={value}" for key, value in identity.items())
+
+
+#: A stored version that is not 7 skips the section. No stored version at
+#: all does NOT: the lines are rendered behind this per-line guard instead,
+#: so on a RouterOS 6 device each one does nothing.
+_V7_GUARD = ':if ([:pick [/system resource get version] 0 2] = "7.") do={{ {line} }}'
+
+
 def render_traffic_flow_lines(
     config: TrafficFlowConfig, *, routeros_version: str | None
 ) -> list[str]:
@@ -124,47 +159,62 @@ def render_traffic_flow_lines(
     one command so ``_idempotent_lines`` can wrap it.
 
     ``target add`` has no unique key and duplicates on every push -- two
-    targets double-count every flow -- so it is guarded by a find on the
-    marker, followed by a ``set`` that converges an existing row and a
-    one-line removal of any extra marked rows. The two singleton ``set``s are
-    idempotent by nature. The target goes in before export is switched on,
-    the same order the device writer uses.
+    targets double-count every flow -- so it is guarded by a find on our
+    target's own ``dst-address`` + ``port``, followed by a ``set`` that
+    converges an existing row and a one-line removal of any extra rows with
+    the same identity. The two singleton ``set``s are idempotent by nature.
+    The target goes in before export is switched on, the same order the
+    device writer uses.
 
-    RouterOS 6 spells the target differently and lacks ``src-address``; a
-    router not positively known to run 7 gets a comment, not a guess."""
+    Three cases by the router's *stored* version:
+
+    * 7.x -- the lines as they are;
+    * not recorded -- the same lines, each behind a "RouterOS 7" check the
+      device evaluates itself, under a one-line note. A missing database
+      value is not a reason to withhold the script;
+    * anything else (6.x) -- a comment only. RouterOS 6 spells the target
+      differently and lacks ``src-address``."""
     major = routeros_major_version(routeros_version)
-    if major != 7:
+    if major is not None and major != 7:
         return [
             TRAFFIC_FLOW_SECTION_HEADER,
             "# traffic-flow skipped: RouterOS 7 required "
-            f"(router reports {routeros_version or 'no version'})",
+            f"(router reports {routeros_version})",
         ]
-    if config.target is None:
+    if config.target is None or not config.identity:
         raise ValueError("render_traffic_flow_lines renders export ON only")
-    marker = config.marker
-    find = f'[/ip traffic-flow target find where comment="{marker}"]'
+    find = f"[/ip traffic-flow target find where {_find(config.identity)}]"
     target = _fields(dict(config.target))
-    return [
-        TRAFFIC_FLOW_SECTION_HEADER,
-        f":if ([:len {find}] = 0) do={{/ip traffic-flow target add {target} "
-        f'comment="{marker}"}}',
+    commands = [
+        f":if ([:len {find}] = 0) do={{/ip traffic-flow target add {target}}}",
         f"/ip traffic-flow target set {find} {target}",
         f":local wyfyTf {find}; :if ([:len $wyfyTf] > 1) do={{"
         "/ip traffic-flow target remove [:pick $wyfyTf 1 [:len $wyfyTf]]}",
         f"/ip traffic-flow ipfix set {_fields(dict(config.ipfix))}",
         f"/ip traffic-flow set {_fields(dict(config.settings))}",
     ]
-
-
-def render_removal_lines() -> list[str]:
-    """RouterOS lines that undo the export, for pasting by hand. Rendered
-    from :func:`disabled_config` -- the description the device writer's
-    removal uses -- and in the writer's order: export off first, then our
-    target, so nothing is sent to a target that is about to go."""
-    config = disabled_config()
+    if major == 7:
+        return [TRAFFIC_FLOW_SECTION_HEADER, *commands]
     return [
-        f"/ip traffic-flow set {_fields(dict(config.settings))}",
-        f'/ip traffic-flow target remove [find where comment="{config.marker}"]',
+        TRAFFIC_FLOW_SECTION_HEADER,
+        "# RouterOS version not recorded for this router: each line below "
+        "runs only on RouterOS 7",
+        *[_V7_GUARD.format(line=line) for line in commands],
+    ]
+
+
+def render_removal_lines(identity: Mapping[str, str] | None) -> list[str]:
+    """RouterOS lines that undo the export, for pasting by hand, in the
+    device writer's order: remove OUR target (found by ``dst-address`` +
+    ``port``, so a venue's own collector is never touched), then switch
+    export off only if no target at all is left. Empty when it is not known
+    which target is ours -- there is then nothing safe to remove."""
+    if not identity:
+        return []
+    return [
+        f"/ip traffic-flow target remove [find where {_find(identity)}]",
+        ":if ([:len [/ip traffic-flow target find]] = 0) do={"
+        "/ip traffic-flow set enabled=no}",
     ]
 
 

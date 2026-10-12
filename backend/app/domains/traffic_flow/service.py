@@ -77,6 +77,7 @@ from .routeros import (
     render_removal_lines,
     render_traffic_flow_lines,
     routeros_major_version,
+    target_identity,
     traffic_flow_target_for,
 )
 from .summary import (
@@ -1183,7 +1184,9 @@ class TrafficFlowCustomerService:
 
 
 class _Adapter(Protocol):
-    async def read_traffic_flow(self, creds: Any, *, marker: str) -> Any: ...
+    async def read_traffic_flow(
+        self, creds: Any, *, identity: Mapping[str, str] | None
+    ) -> Any: ...
 
     async def apply_traffic_flow(self, creds: Any, config: Any) -> Any: ...
 
@@ -1275,6 +1278,21 @@ class TrafficFlowDeviceService:
             )
         return reasons
 
+    async def _our_identity(
+        self, router_id: uuid.UUID, target: TrafficFlowTarget | None
+    ) -> dict[str, str] | None:
+        """Which target rows on this router are the platform's, for a
+        removal: the current collector address and port when the router has
+        a tunnel, otherwise the ones recorded when export was applied.
+        ``None`` when neither is known -- then nothing is treated as ours,
+        and a removal removes no target at all."""
+        if target is not None:
+            return target_identity(target.collector_address, target.collector_port)
+        row = await self.repository.get_export(router_id)
+        if row is not None and row.target_host and row.target_port:
+            return target_identity(row.target_host, int(row.target_port))
+        return None
+
     async def preview(self, router_id: uuid.UUID) -> dict[str, Any]:
         router = await self.router_lookup.get_router(router_id)
         peer, server = await self.repository.peer_and_server(router.id)
@@ -1311,7 +1329,11 @@ class TrafficFlowDeviceService:
             "routeros_version": router.routeros_version,
             "desired": desired,
             "paste_script": list(lines),
-            "removal_script": render_removal_lines() if mikrotik else [],
+            "removal_script": render_removal_lines(
+                await self._our_identity(router.id, target)
+            )
+            if mikrotik
+            else [],
             # Names from before the per-router switch, kept for the page
             # already built on them.
             "collector_address": target.collector_address if target else None,
@@ -1383,7 +1405,11 @@ class TrafficFlowDeviceService:
                 code="TRAFFIC_FLOW_NOT_ELIGIBLE",
                 status_code=status.HTTP_409_CONFLICT,
             )
-        config = desired_config(target) if enabled and target else disabled_config()
+        config = (
+            desired_config(target)
+            if enabled and target
+            else disabled_config(await self._our_identity(router.id, target))
+        )
         secret = self.router_lookup.get_decrypted_api_secret(router)
         host = router.management_ip_address or router.public_ip_address
         if not host or not router.api_username or not secret:
@@ -1396,7 +1422,7 @@ class TrafficFlowDeviceService:
         adapter = self.adapter_factory()
         try:
             if dry_run:
-                state = await adapter.read_traffic_flow(creds, marker=config.marker)
+                state = await adapter.read_traffic_flow(creds, identity=config.identity)
                 plan = plan_traffic_flow(state, config)
                 return {
                     "router_id": str(router.id),

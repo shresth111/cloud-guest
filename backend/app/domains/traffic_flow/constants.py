@@ -4,12 +4,6 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-#: ``comment`` on the one ``/ip traffic-flow target`` row the platform owns.
-#: The device writer finds its row by this, and the renderer's add-guard
-#: keys on it, so it must never change without a migration plan for routers
-#: already carrying the old marker.
-TRAFFIC_FLOW_TARGET_MARKER = "wyfy-traffic-flow"
-
 #: Section header in ``render_network_config`` output.
 TRAFFIC_FLOW_SECTION_HEADER = "# --- Traffic Flow (CloudGuest-managed) ---"
 
