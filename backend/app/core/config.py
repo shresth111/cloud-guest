@@ -484,6 +484,18 @@ class Settings(BaseSettings):
             "CLOUDGUEST_TRAFFIC_FLOW_GEO_DATA_DIR."
         ),
     )
+    traffic_flow_threat_data_dir: str = Field(
+        default="",
+        description=(
+            "Directory holding the Spamhaus DROP files (drop_v4.json, "
+            "drop_v6.json) the Traffic Lens 'known-bad destinations' finding "
+            "matches against. Empty = <backend>/data/threat, where "
+            "scripts/fetch_threat_data.py puts them at image build. Missing, "
+            "unreadable or out-of-date files are not an error: the finding "
+            "answers could_not_check, never clear. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_THREAT_DATA_DIR."
+        ),
+    )
 
     # -- Device Logs (syslog) -- see app.domains.device_logs ---------------
     device_logs_enabled: bool = Field(
