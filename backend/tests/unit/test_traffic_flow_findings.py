@@ -1633,6 +1633,7 @@ _MIGRATIONS = [
     "0157_traffic_flow_services_export.py",
     "0159_traffic_flow_dest_buckets.py",
     "0160_traffic_flow_country_buckets.py",
+    "0161_traffic_flow_bucket_packets.py",
 ]
 _DEVICE_COLUMNS = {
     "ip",
