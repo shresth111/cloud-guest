@@ -215,6 +215,8 @@ class TestIngest:
                 "bytes_up": 100,
                 "bytes_down": 900,
                 "flows": 2,
+                "packets_up": 1,
+                "packets_down": 1,
             },
             {
                 "protocol": 17,
@@ -222,6 +224,8 @@ class TestIngest:
                 "bytes_up": 50,
                 "bytes_down": 0,
                 "flows": 1,
+                "packets_up": 1,
+                "packets_down": 0,
             },
         ]
 
@@ -306,6 +310,97 @@ class TestIngest:
         assert (w.bytes_internal, w.bytes_unclassified) == (70, 30)
         assert (w.bytes_up, w.bytes_down) == (0, 0)
 
+    def test_packets_are_summed_by_direction_including_the_other_rows(self) -> None:
+        def row(
+            remote: str, dport: int, nbytes: int, packets: int, *, down: bool = False
+        ):
+            args = ("192.168.95.10", remote) if not down else (remote, "192.168.95.10")
+            ports = {"sport": 50000, "dport": dport}
+            if down:
+                ports = {"sport": dport, "dport": 50000}
+            out = _row(*args, nbytes, proto="tcp", **ports)
+            out["packets"] = packets
+            return out
+
+        rows = [
+            row("142.250.1.1", 443, 1000, 7),
+            row("142.250.1.1", 443, 9000, 11, down=True),
+            row("142.250.1.2", 443, 500, 3),
+            row("142.250.1.3", 80, 40, 2),
+            row("142.250.1.3", 22, 30, 5, down=True),
+            row("142.250.1.4", 25, 20, 4),
+        ]
+        w = reduce_window(rows)["10.20.0.31"]
+        assert w.packets_measured is True
+        services = service_rows(w, limit=1)
+        assert services[0] == {
+            "protocol": 6,
+            "remote_port": 443,
+            "bytes_up": 1500,
+            "bytes_down": 9000,
+            "flows": 3,
+            "packets_up": 10,
+            "packets_down": 11,
+        }
+        # Everything below the cut is in the "other" row, packets included.
+        (other,) = [r for r in services if r["remote_port"] == OTHER_SERVICE_PORT]
+        assert (other["packets_up"], other["packets_down"]) == (6, 5)
+        # Nothing dropped: the buckets' packets are the rows' packets.
+        assert sum(r["packets_up"] + r["packets_down"] for r in services) == 32
+        assert sum(r["packets"] for r in rows) == 32 == w.packets_total
+
+        from app.domains.traffic_flow.destination_buckets import destination_rows
+
+        destinations = destination_rows(w, limit=2)
+        listed = [r for r in destinations if r["remote_port"] != OTHER_SERVICE_PORT]
+        assert [
+            (r["remote_address"], r["packets_up"], r["packets_down"]) for r in listed
+        ] == [
+            ("142.250.1.1", 7, 11),
+            ("142.250.1.2", 3, 0),
+        ]
+        (other,) = [r for r in destinations if r["remote_port"] == OTHER_SERVICE_PORT]
+        assert (other["packets_up"], other["packets_down"]) == (6, 5)
+        assert sum(r["packets_up"] + r["packets_down"] for r in destinations) == 32
+
+    def test_rows_without_a_packet_count_store_null_not_zero(self) -> None:
+        rows = [
+            _row("192.168.95.10", "142.250.1.1", 100, proto="tcp", sport=5, dport=443),
+            _row("192.168.95.10", "142.250.1.2", 100, proto="tcp", sport=5, dport=443),
+        ]
+        del rows[1]["packets"]  # one row is enough: all or nothing
+        w = reduce_window(rows)["10.20.0.31"]
+        assert w.services_measured is True and w.packets_measured is False
+        for bucket in service_rows(w):
+            assert bucket["packets_up"] is None and bucket["packets_down"] is None
+            assert bucket["bytes_up"] == 200  # bytes are still counted
+
+        from app.domains.traffic_flow.destination_buckets import destination_rows
+
+        for bucket in destination_rows(w):
+            assert bucket["packets_up"] is None and bucket["packets_down"] is None
+
+    @pytest.mark.parametrize("value", [None, "", "n/a", -1, True])
+    def test_an_unreadable_packet_count_is_not_measured(self, value: Any) -> None:
+        row = _row("192.168.95.10", "142.250.1.1", 100, proto="tcp", sport=5, dport=443)
+        row["packets"] = value
+        w = reduce_window([row])["10.20.0.31"]
+        assert w.packets_measured is False
+        assert service_rows(w)[0]["packets_up"] is None
+
+    def test_a_measured_zero_is_zero_not_null(self) -> None:
+        row = _row("192.168.95.10", "142.250.1.1", 100, proto="tcp", sport=5, dport=443)
+        row["packets"] = 0
+        w = reduce_window([row])["10.20.0.31"]
+        assert w.packets_measured is True
+        assert (
+            service_rows(w)[0]["packets_up"],
+            service_rows(w)[0]["packets_down"],
+        ) == (
+            0,
+            0,
+        )
+
     def test_a_service_row_carries_no_address(self) -> None:
         w = reduce_window(
             [_row("192.168.95.10", "142.250.1.1", 100, proto="tcp", sport=5, dport=443)]
@@ -317,6 +412,8 @@ class TestIngest:
             "bytes_up",
             "bytes_down",
             "flows",
+            "packets_up",
+            "packets_down",
         }
         from app.domains.traffic_flow.models import TrafficFlowServiceBucket
 
@@ -797,12 +894,37 @@ class TestIngestAndOverview:
                 "bytes_up": 100,
                 "bytes_down": 900,
                 "flows": 2,
+                "packets_up": 1,
+                "packets_down": 1,
             }
         ]
         # A re-pulled window adds nothing: not a second window, not a second
         # set of service rows.
         await self._ingest(repo, start, rows)
         assert len(repo.inserted) == 1 and len(repo.service_rows) == 1
+
+    async def test_re_ingest_does_not_add_packets_a_second_time(self) -> None:
+        repo = FakeRepo()
+        start = NOW - timedelta(minutes=10)
+        rows = [
+            _row("192.168.95.10", "142.250.1.1", 100, proto="tcp", sport=5, dport=443),
+            _row("142.250.1.1", "192.168.95.10", 900, proto="tcp", sport=443, dport=5),
+        ]
+        rows[0]["packets"], rows[1]["packets"] = 4, 9
+        await self._ingest(repo, start, rows)
+        first_services = [dict(r) for r in repo.service_rows]
+        first_destinations = [dict(r) for r in repo.destination_rows]
+        assert [(r["packets_up"], r["packets_down"]) for r in first_services] == [
+            (4, 9)
+        ]
+        assert [(r["packets_up"], r["packets_down"]) for r in first_destinations] == [
+            (4, 9)
+        ]
+        again = await self._ingest(repo, start, rows)
+        assert again.written == 0 and again.duplicates == 1
+        # Same rows, same counts: a re-pulled window is not added on top.
+        assert repo.service_rows == first_services
+        assert repo.destination_rows == first_destinations
 
     async def test_window_without_ports_stores_no_service_rows(self) -> None:
         repo = FakeRepo()

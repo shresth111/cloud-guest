@@ -830,11 +830,12 @@ class TestSecondMigration:
             start = text.index(f"CREATE TABLE IF NOT EXISTS {model.__tablename__} ")
             body = text[start : text.index("CREATE", start + 10)]
             for column in model.__table__.columns:
+                if column.name in {"packets_up", "packets_down"}:
+                    continue  # added by 0161, see test_traffic_flow_destinations
                 assert f" {column.name} " in body, (model.__tablename__, column.name)
         assert (
             "uq_traffic_flow_service_buckets_key UNIQUE "
-            "(router_id, source, window_start, protocol, remote_port)"
-            in text
+            "(router_id, source, window_start, protocol, remote_port)" in text
         )
         # NOT NULL additions carry a default, or they fail on a table with rows.
         for line in text.splitlines():
