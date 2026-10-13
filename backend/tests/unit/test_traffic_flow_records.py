@@ -72,6 +72,7 @@ USER = uuid.UUID("cccccccc-0000-4000-8000-00000000000c")
 EXPORTER = "10.20.0.31"
 VERSIONS = pathlib.Path("alembic/versions")
 MIGRATION = "0162_traffic_flow_records.py"
+MERGE_MIGRATION = "0163_traffic_flow_record_merge.py"
 
 DEVICE = "192.168.88.24"
 REMOTE = "142.250.193.14"
@@ -165,6 +166,8 @@ class TestReduction:
             "direction": "upload",
             "exporter_address": EXPORTER,
             "exporter_port": None,
+            "records_merged": 1,
+            "ports_merged": False,
         }
 
     def test_todays_collector_rows_leave_times_and_nat_not_recorded(self) -> None:
@@ -288,6 +291,199 @@ class TestReduction:
 
 
 # ---------------------------------------------------------------------------
+# what is merged and what is not stored, each with a count
+# ---------------------------------------------------------------------------
+
+NTP = "162.159.200.1"
+
+
+def _prepared(rows: list[dict[str, Any]], **kw: Any) -> Any:
+    options = {"store_internal": False, "merge_ports": True, **kw}
+    return fr.prepare_records(flow_record_rows(rows, EXPORTER), **options)
+
+
+def _ntp_answers(n: int) -> list[dict[str, Any]]:
+    """What filled the measured window: one- or two-packet answers from one
+    outside address to a different local port each time."""
+    return [
+        flow_row(
+            NTP,
+            DEVICE,
+            76,
+            ip_proto="udp",
+            port_src=123,
+            port_dst=40000 + i,
+            post_nat_ip_src=NTP,
+            post_nat_port_src=123,
+            post_nat_ip_dst=DEVICE,
+            post_nat_port_dst=40000 + i,
+            packets=1,
+            timestamp_start=str(1791883500 + i),
+            timestamp_end=str(1791883500 + i),
+        )
+        for i in range(n)
+    ]
+
+
+class TestPrepare:
+    def test_internal_records_are_not_stored_and_are_counted(self) -> None:
+        rows = [
+            rollup_row(DEVICE, "192.168.88.1", 90, ip_proto="udp", port_dst=53),
+            rollup_row("192.168.88.1", "10.20.0.1", 40, ip_proto="udp", port_dst=2055),
+            rollup_row(DEVICE, REMOTE, 500),
+        ]
+        stored, counts = _prepared(rows)
+        assert [r["dst_address"] for r in stored] == [REMOTE]
+        assert (counts.received, counts.internal, counts.merged) == (3, 2, 0)
+
+    def test_internal_records_are_stored_when_the_setting_asks(self) -> None:
+        rows = [
+            rollup_row(DEVICE, "192.168.88.1", 90, ip_proto="udp", port_dst=53),
+            rollup_row(DEVICE, REMOTE, 500),
+        ]
+        stored, counts = _prepared(rows, store_internal=True)
+        assert len(stored) == 2 and counts.internal == 0
+        assert {r["direction"] for r in stored} == {"internal", "upload"}
+
+    def test_identical_records_collapse_with_sums_and_min_start_max_end(self) -> None:
+        rows = [
+            flow_row(
+                DEVICE,
+                REMOTE,
+                100,
+                timestamp_start="1791883500",
+                timestamp_end="1791883510",
+                flows=1,
+            ),
+            flow_row(
+                DEVICE,
+                REMOTE,
+                250,
+                timestamp_start="1791883400",
+                timestamp_end="1791883405",
+                flows=1,
+            ),
+            flow_row(
+                DEVICE,
+                REMOTE,
+                50,
+                timestamp_start="1791883600",
+                timestamp_end="1791883660",
+                flows=2,
+            ),
+        ]
+        (row,), counts = _prepared(rows, merge_ports=False)
+        assert (row["bytes"], row["packets"], row["flows"]) == (400, 21, 4)
+        assert row["flow_start"] == datetime.fromtimestamp(1791883400, tz=UTC)
+        assert row["flow_end"] == datetime.fromtimestamp(1791883660, tz=UTC)
+        assert (row["records_merged"], row["ports_merged"]) == (3, False)
+        # Identical in every port: the ports and the translation survive.
+        assert (row["src_port"], row["dst_port"]) == (51544, 443)
+        assert (row["nat_src_address"], row["nat_src_port"]) == (WAN, 40001)
+        assert (counts.received, counts.merged, counts.internal) == (3, 2, 0)
+
+    def test_the_measured_noise_collapses_to_one_row_per_outside_address(
+        self,
+    ) -> None:
+        stored, counts = _prepared(_ntp_answers(300))
+        (row,) = stored
+        assert (row["src_address"], row["src_port"], row["dst_address"]) == (
+            NTP,
+            123,
+            DEVICE,
+        )
+        assert (row["bytes"], row["packets"]) == (300 * 76, 300)
+        assert (row["records_merged"], row["ports_merged"]) == (300, True)
+        # The venue-side port differed, so it is not kept; neither is its
+        # translated twin. The outside end's port is.
+        assert row["dst_port"] is None and row["nat_dst_port"] is None
+        assert row["nat_src_port"] == 123
+        assert (counts.received, counts.merged) == (300, 299)
+
+    def test_without_port_merging_those_stay_separate_rows(self) -> None:
+        stored, counts = _prepared(_ntp_answers(300), merge_ports=False)
+        assert len(stored) == 300 and counts.merged == 0
+        assert all(not r["ports_merged"] for r in stored)
+
+    def test_the_outside_address_and_port_are_never_merged_away(self) -> None:
+        rows = [
+            flow_row(DEVICE, REMOTE, 10, port_src=50001, port_dst=443),
+            flow_row(DEVICE, REMOTE, 10, port_src=50002, port_dst=443),
+            flow_row(DEVICE, REMOTE, 10, port_src=50003, port_dst=80),
+            flow_row(DEVICE, "1.1.1.1", 10, port_src=50004, port_dst=443),
+            flow_row(DEVICE, REMOTE, 10, port_src=50005, port_dst=443, ip_proto="udp"),
+            flow_row("192.168.88.25", REMOTE, 10, port_src=50006, port_dst=443),
+        ]
+        stored, counts = _prepared(rows)
+        keys = sorted(
+            (r["src_address"], r["dst_address"], r["protocol"], r["dst_port"])
+            for r in stored
+        )
+        assert keys == sorted(
+            [
+                (DEVICE, REMOTE, 6, 443),
+                (DEVICE, REMOTE, 6, 80),
+                (DEVICE, "1.1.1.1", 6, 443),
+                (DEVICE, REMOTE, 17, 443),
+                ("192.168.88.25", REMOTE, 6, 443),
+            ]
+        )
+        assert counts.merged == 1
+        merged = next(r for r in stored if r["records_merged"] == 2)
+        assert merged["src_port"] is None and merged["ports_merged"] is True
+
+    def test_the_two_directions_are_never_merged_into_each_other(self) -> None:
+        rows = [
+            flow_row(DEVICE, REMOTE, 10, port_src=50001, port_dst=443),
+            flow_row(REMOTE, DEVICE, 900, port_src=443, port_dst=50001),
+        ]
+        stored, counts = _prepared(rows)
+        assert sorted(r["direction"] for r in stored) == ["download", "upload"]
+        assert counts.merged == 0
+
+    def test_a_single_record_keeps_its_port_and_is_not_marked_merged(self) -> None:
+        (row,), _counts = _prepared([flow_row(DEVICE, REMOTE, 10)])
+        assert (row["src_port"], row["records_merged"], row["ports_merged"]) == (
+            51544,
+            1,
+            False,
+        )
+
+    def test_a_translation_the_records_disagree_on_is_not_kept(self) -> None:
+        rows = [
+            flow_row(DEVICE, REMOTE, 10, post_nat_ip_src=WAN),
+            flow_row(DEVICE, REMOTE, 10, post_nat_ip_src="203.0.114.10"),
+        ]
+        (row,), _counts = _prepared(rows)
+        assert row["nat_src_address"] is None and row["nat_src_port"] is None
+        assert row["nat_dst_address"] == REMOTE
+
+    def test_packets_not_recorded_stay_not_recorded_after_a_merge(self) -> None:
+        rows = [
+            rollup_row(DEVICE, REMOTE, 10, packets=None),
+            rollup_row(DEVICE, REMOTE, 10, packets=None),
+        ]
+        (row,), _counts = _prepared(rows)
+        assert row["packets"] is None and row["bytes"] == 20
+        assert row["flow_start"] is None
+
+    def test_every_record_is_accounted_for(self) -> None:
+        rows = [
+            *_ntp_answers(40),
+            *[rollup_row(DEVICE, "192.168.88.1", 5, ip_proto="udp", port_dst=53)] * 25,
+            flow_row(DEVICE, REMOTE, 10),
+            flow_row(DEVICE, REMOTE, 10),
+            flow_row(DEVICE, "1.1.1.1", 10),
+        ]
+        stored, counts = _prepared(rows)
+        assert counts.received == 68
+        assert counts.received == len(stored) + counts.merged + counts.internal
+        assert (len(stored), counts.merged, counts.internal) == (3, 40, 25)
+        assert sum(r["records_merged"] for r in stored) == 68 - 25
+        assert sum(r["bytes"] for r in stored) == 40 * 76 + 30
+
+
+# ---------------------------------------------------------------------------
 # writer: the two switches and the cap
 # ---------------------------------------------------------------------------
 
@@ -296,6 +492,7 @@ class Store:
     def __init__(self) -> None:
         self.records: list[dict[str, Any]] = []
         self.caps: dict[tuple[uuid.UUID, date], dict[str, Any]] = {}
+        self.counts: dict[tuple[uuid.UUID, date], dict[str, int]] = {}
         self.pruned: list[tuple[datetime, int]] = []
 
     async def cap_state(self, router_id: uuid.UUID, day: date) -> CapState:
@@ -303,7 +500,17 @@ class Store:
         return CapState(cap["stored"], cap["capped_at"]) if cap else CapState()
 
     async def record_cap(
-        self, *, router_id, location_id, day, stored, not_stored, capped_at
+        self,
+        *,
+        router_id,
+        location_id,
+        day,
+        stored,
+        not_stored,
+        capped_at,
+        received=0,
+        merged=0,
+        internal=0,
     ) -> None:  # noqa: ANN001
         cap = self.caps.setdefault(
             (router_id, day), {"stored": 0, "not_stored": 0, "capped_at": None}
@@ -311,6 +518,12 @@ class Store:
         cap["stored"] += stored
         cap["not_stored"] += not_stored
         cap["capped_at"] = cap["capped_at"] or capped_at
+        extra = self.counts.setdefault(
+            (router_id, day), {"received": 0, "merged": 0, "internal": 0}
+        )
+        extra["received"] += received
+        extra["merged"] += merged
+        extra["internal"] += internal
 
     async def insert_records(self, rows: list[dict[str, Any]]) -> None:
         self.records.extend(rows)
@@ -408,6 +621,83 @@ class TestWriter:
         assert await writer.write_window(IDENTITY, EXPORTER, _rows(2)) == 0
         assert store.caps[(ROUTER, W1.date())]["capped_at"] == W1
 
+    async def test_the_days_counters_say_what_was_merged_and_left_out(self) -> None:
+        store = Store()
+        rows = [
+            *_ntp_answers(50),
+            *[rollup_row(DEVICE, "192.168.88.1", 5, ip_proto="udp", port_dst=53)] * 20,
+            flow_row(DEVICE, REMOTE, 900),
+        ]
+        assert await _writer(store).write_window(IDENTITY, EXPORTER, rows) == 2
+        assert store.counts[(ROUTER, W1.date())] == {
+            "received": 71,
+            "merged": 49,
+            "internal": 20,
+        }
+        assert store.caps[(ROUTER, W1.date())]["stored"] == 2
+        assert [r["records_merged"] for r in store.records] == [50, 1]
+
+    async def test_the_cap_counts_rows_after_merging(self) -> None:
+        """300 records that merge into one row use one unit of the cap."""
+        store = Store()
+        writer = _writer(store, traffic_flow_record_daily_cap=2)
+        rows = [*_ntp_answers(300), flow_row(DEVICE, REMOTE, 10)]
+        assert await writer.write_window(IDENTITY, EXPORTER, rows) == 2
+        cap = store.caps[(ROUTER, W1.date())]
+        assert (cap["stored"], cap["not_stored"], cap["capped_at"]) == (2, 0, None)
+
+    async def test_internal_records_do_not_use_the_cap_or_trip_it(self) -> None:
+        store = Store()
+        writer = _writer(store, traffic_flow_record_daily_cap=1)
+        rows = [
+            flow_row(DEVICE, REMOTE, 10),
+            *[
+                rollup_row(DEVICE, f"192.168.88.{n}", 5, ip_proto="udp", port_dst=53)
+                for n in range(100, 140)
+            ],
+        ]
+        assert await writer.write_window(IDENTITY, EXPORTER, rows) == 1
+        cap = store.caps[(ROUTER, W1.date())]
+        assert (cap["not_stored"], cap["capped_at"]) == (0, None)
+        assert store.counts[(ROUTER, W1.date())]["internal"] == 40
+
+    async def test_a_window_of_only_internal_records_is_still_counted(self) -> None:
+        store = Store()
+        rows = [rollup_row(DEVICE, "192.168.88.1", 5, ip_proto="udp", port_dst=53)] * 3
+        assert await _writer(store).write_window(IDENTITY, EXPORTER, rows) == 0
+        assert store.records == []
+        assert store.counts[(ROUTER, W1.date())] == {
+            "received": 3,
+            "merged": 0,
+            "internal": 3,
+        }
+
+    async def test_the_settings_switch_both_rules(self) -> None:
+        store = Store()
+        writer = _writer(
+            store,
+            traffic_flow_record_store_internal=True,
+            traffic_flow_record_merge_ports=False,
+        )
+        rows = [
+            *_ntp_answers(5),
+            rollup_row(DEVICE, "192.168.88.1", 5, ip_proto="udp", port_dst=53),
+        ]
+        assert await writer.write_window(IDENTITY, EXPORTER, rows) == 6
+        assert store.counts[(ROUTER, W1.date())] == {
+            "received": 6,
+            "merged": 0,
+            "internal": 0,
+        }
+
+    def test_the_rule_defaults(self) -> None:
+        from app.core.config import Settings
+
+        fields = Settings.model_fields
+        assert fields["traffic_flow_record_store_internal"].default is False
+        assert fields["traffic_flow_record_merge_ports"].default is True
+        assert fields["traffic_flow_record_daily_cap"].default == 100_000
+
     async def test_retention_is_the_one_setting(self) -> None:
         store = Store()
         await _writer(store, traffic_flow_record_retention_days=3).prune(NOW)
@@ -442,7 +732,8 @@ class TestIngestHook:
             rows=[rollup_row(DEVICE, REMOTE, 100)],
             flow_rows=[flow_row(DEVICE, REMOTE, 60), flow_row(DEVICE, REMOTE, 40)],
         )
-        assert [r["bytes"] for r in store.records] == [60, 40]
+        # The agent's two records of one flow are one row, and say so.
+        assert [(r["bytes"], r["records_merged"]) for r in store.records] == [(100, 2)]
         assert all(r["nat_src_address"] == WAN for r in store.records)
         assert repo.inserted[0]["bytes_up"] == 100
 
@@ -503,6 +794,7 @@ class Repo:
         self.rows = rows if rows is not None else [_stored()]
         self.total = len(self.rows) if total is None else total
         self.capped: list[CappedDay] = []
+        self.storage = fr.StorageCounts()
         self.exists = True
         self.calls: list[tuple[str, Any]] = []
 
@@ -521,6 +813,9 @@ class Repo:
 
     async def capped_days(self, scope, *, since, until):  # noqa: ANN001
         return self.capped
+
+    async def storage_counts(self, scope, *, since, until):  # noqa: ANN001
+        return self.storage
 
     async def bounds(self, scope):  # noqa: ANN001
         return W1, W2
@@ -571,6 +866,8 @@ class TestSearch:
             "direction": "upload",
             "exporter": EXPORTER,
             "router_id": str(ROUTER),
+            "records_merged": 1,
+            "ports_merged": False,
         }
         assert out.totals.bytes == 33440 and out.totals.packets == 7
         assert (out.since, out.until) == (HOUR_AGO.isoformat(), NOW.isoformat())
@@ -628,7 +925,7 @@ class TestSearch:
         assert out.incomplete_message.startswith(
             "Records incomplete since 2026-10-13T09:30+00:00"
         )
-        assert "4200 record(s)" in out.incomplete_message
+        assert "4200 row(s)" in out.incomplete_message
         (stretch,) = out.incomplete_stretches
         assert stretch.model_dump() == {
             "router_id": str(ROUTER),
@@ -638,6 +935,70 @@ class TestSearch:
         }
         export = await service.export_csv(actor_user_id=USER, location_id=LOC)
         assert export.incomplete_since == W2.isoformat()
+
+    async def test_the_response_counts_what_was_merged_and_not_stored_by_reason(
+        self,
+    ) -> None:
+        repo = Repo([_stored(records_merged=37, ports_merged=True, dst_port=None)])
+        repo.storage = fr.StorageCounts(
+            received=6500, stored=180, merged=3900, internal=2400, over_cap=20
+        )
+        out = await _service(repo).search(
+            actor_user_id=USER,
+            location_id=LOC,
+            since=datetime(2026, 10, 12, 22, 0, tzinfo=UTC),
+            until=datetime(2026, 10, 13, 9, 0, tzinfo=UTC),
+        )
+        assert out.storage.model_dump() == {
+            "from_day": "2026-10-12",
+            "to_day": "2026-10-13",
+            "records_received": 6500,
+            "rows_stored": 180,
+            "records_merged": 3900,
+            "not_stored": {"internal": 2400, "daily_cap": 20},
+            "internal_records_stored": False,
+            "ports_merged": True,
+        }
+        counted = out.storage
+        assert counted.records_received == (
+            counted.rows_stored
+            + counted.records_merged
+            + counted.not_stored.internal
+            + counted.not_stored.daily_cap
+        )
+        row = out.rows[0]
+        assert (row.records_merged, row.ports_merged, row.dst_port) == (37, True, None)
+        # A port merged away is "several", so it is not "not recorded".
+        assert "dst_port" not in out.fields_not_recorded
+        assert "records_merged" in out.row_meaning
+        assert "not stored" in out.row_meaning
+
+    async def test_a_range_ending_at_midnight_does_not_count_the_next_day(self) -> None:
+        out = await _service().search(
+            actor_user_id=USER,
+            location_id=LOC,
+            since=datetime(2026, 10, 12, 18, 0, tzinfo=UTC),
+            until=datetime(2026, 10, 13, 0, 0, tzinfo=UTC),
+        )
+        assert (out.storage.from_day, out.storage.to_day) == (
+            "2026-10-12",
+            "2026-10-12",
+        )
+
+    async def test_the_rules_in_force_are_reported(self) -> None:
+        out = await _service(
+            traffic_flow_record_store_internal=True,
+            traffic_flow_record_merge_ports=False,
+        ).search(actor_user_id=USER, location_id=LOC)
+        assert out.storage.internal_records_stored is True
+        assert out.storage.ports_merged is False
+
+    async def test_the_csv_carries_the_merge_columns(self) -> None:
+        repo = Repo([_stored(records_merged=37, ports_merged=True, dst_port=None)])
+        export = await _service(repo).export_csv(actor_user_id=USER, location_id=LOC)
+        header, line = (row.split(",") for row in export.text.splitlines())
+        assert header[-2:] == ["records_merged", "ports_merged"]
+        assert line[-2:] == ["37", "True"]
 
     async def test_a_complete_range_says_nothing_about_a_cap(self) -> None:
         out = await _service().search(actor_user_id=USER, location_id=LOC)
@@ -1486,6 +1847,10 @@ class TestMigration:
         for statement in _statements(MIGRATION, "downgrade"):
             assert "IF EXISTS" in statement, statement
         ddl = "\n".join(statements)
+        added = re.findall(
+            r"ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+) ",
+            "\n".join(_statements(MERGE_MIGRATION)),
+        )
         for model in (TrafficFlowRecord, TrafficFlowRecordCap):
             table = model.__table__
             start = ddl.index(f"CREATE TABLE IF NOT EXISTS {table.name} ")
@@ -1495,11 +1860,31 @@ class TestMigration:
                 r"(?:BIGINT|UUID|VARCHAR|TIMESTAMPTZ|INTEGER|INET|SMALLINT|DATE)",
                 body,
             )
-            assert columns == [c.name for c in table.columns], table.name
+            later = [column for name, column in added if name == table.name]
+            # The create revision plus the merge revision is the model.
+            assert columns + later == [c.name for c in table.columns], table.name
             for index in table.indexes:
                 assert f"CREATE INDEX IF NOT EXISTS {index.name} " in ddl, index.name
         for name in re.findall(r"\b(?:pk|fk|uq|ix)_[a-z_]+", ddl):
             assert len(name) <= 63, name
+
+    def test_the_merge_revision_is_additive_idempotent_and_safe_on_rows(self) -> None:
+        statements = _statements(MERGE_MIGRATION)
+        assert len(statements) == 5
+        for statement in statements:
+            assert statement.startswith("ALTER TABLE traffic_flow_record")
+            assert "ADD COLUMN IF NOT EXISTS" in statement
+            # NOT NULL on a table that may have rows needs a default.
+            assert "NOT NULL DEFAULT" in statement, statement
+        assert "records_merged INTEGER NOT NULL DEFAULT 1" in " ".join(statements)
+        for statement in _statements(MERGE_MIGRATION, "downgrade"):
+            assert "DROP COLUMN IF EXISTS" in statement
+        spec = importlib.util.spec_from_file_location("m", VERSIONS / MERGE_MIGRATION)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.down_revision == "0162_traffic_flow_records"
+        assert len(module.revision) <= 32
 
     def test_optional_fields_are_nullable_and_have_no_default(self) -> None:
         """NULL is "not recorded". A default of 0 would turn an unrecorded
@@ -1595,7 +1980,7 @@ class TestOnPostgres:
                 )
             )
             for _ in range(2):  # the second run must be a no-op
-                for statement in _statements(MIGRATION):
+                for statement in _statements(MIGRATION) + _statements(MERGE_MIGRATION):
                     await connection.execute(text(statement))
             await connection.execute(
                 text("INSERT INTO organizations VALUES (:o)"), {"o": ORG}
@@ -1619,6 +2004,54 @@ class TestOnPostgres:
                 _settings(traffic_flow_record_daily_cap=4),
                 enabled_router_ids=enabled,
             )
+            # Yesterday, with room under the cap: the measured mix. 30
+            # answers to changing local ports merge into one row, 5 internal
+            # records are left out, and all of it is counted.
+            yesterday = {**IDENTITY, "window_start": W1 - timedelta(days=1)}
+            roomy = FlowRecordWriter(
+                repository, _settings(), enabled_router_ids=enabled
+            )
+            mixed = [
+                *_ntp_answers(30),
+                *[rollup_row(DEVICE, "192.168.88.1", 5, ip_proto="udp", port_dst=53)]
+                * 5,
+                flow_row(DEVICE, REMOTE, 10),
+            ]
+            assert await roomy.write_window(yesterday, EXPORTER, mixed) == 2
+            await session.flush()
+            day_before = await FlowRecordService(
+                repository, _settings(), audit_writer=Audit(), now=lambda: NOW
+            ).search(
+                actor_user_id=USER,
+                location_id=LOC,
+                since=W1 - timedelta(days=1, minutes=5),
+                until=W1 - timedelta(days=1) + timedelta(minutes=5),
+                sort="bytes",
+            )
+            assert day_before.total == 2
+            merged = day_before.rows[0]
+            assert (merged.src_address, merged.src_port) == (NTP, 123)
+            assert (merged.dst_port, merged.records_merged, merged.ports_merged) == (
+                None,
+                30,
+                True,
+            )
+            assert (merged.bytes, merged.packets) == (30 * 76, 30)
+            assert merged.start == "2026-10-13T09:25:00+00:00"
+            assert merged.end == "2026-10-13T09:25:29+00:00"
+            assert day_before.storage.model_dump() == {
+                "from_day": "2026-10-12",
+                "to_day": "2026-10-12",
+                "records_received": 36,
+                "rows_stored": 2,
+                "records_merged": 29,
+                "not_stored": {"internal": 5, "daily_cap": 0},
+                "internal_records_stored": False,
+                "ports_merged": True,
+            }
+            assert day_before.incomplete is False
+            assert "dst_port" not in day_before.fields_not_recorded
+
             first = [
                 flow_row(DEVICE, REMOTE, 900),
                 flow_row(REMOTE, DEVICE, 5000, port_src=443, port_dst=51544),
@@ -1648,6 +2081,12 @@ class TestOnPostgres:
             )
             assert out.incomplete_stretches[0].since == W2.isoformat()
             assert out.totals.bytes == 900 + 5000 + 40 + 700
+            # Today: 6 received, 4 stored, 2 kept out by the daily limit.
+            assert out.storage.model_dump()["not_stored"] == {
+                "internal": 0,
+                "daily_cap": 2,
+            }
+            assert (out.storage.records_received, out.storage.rows_stored) == (6, 4)
             # Newest first. The three timed records share a start, so the
             # later window leads and the rest keep insertion order (largest
             # first); the record without a start sorts by its window, last.
@@ -1691,7 +2130,7 @@ class TestOnPostgres:
                 is None
             )
 
-            assert await repository.delete_records_before(W2, limit=100) == 3
+            assert await repository.delete_records_before(W2, limit=100) == 5
             assert await count() == 1
             await repository.delete_records_before(NOW + timedelta(days=2), limit=100)
             assert await repository.cap_state(ROUTER, W1.date()) == CapState()
