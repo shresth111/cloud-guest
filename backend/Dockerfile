@@ -32,6 +32,17 @@ RUN if [ "$FETCH_GEO_DATA" = "1" ]; then \
         || echo "WARNING: geo data not fetched; Geo Location will read 'not available'"; \
     fi
 
+# Traffic Lens "known-bad destinations" list: Spamhaus DROP, about 110 kB.
+# Free to use in a product, but its terms grant no right to redistribute, so
+# it is fetched here and never kept in the (public) repository. Best effort
+# on purpose: without the files the finding answers "could not be checked".
+# --build-arg FETCH_THREAT_DATA=0 skips it.
+ARG FETCH_THREAT_DATA=1
+RUN if [ "$FETCH_THREAT_DATA" = "1" ]; then \
+        python scripts/fetch_threat_data.py --dest /app/data/threat \
+        || echo "WARNING: threat list not fetched; known-bad destinations will read 'could not be checked'"; \
+    fi
+
 RUN chmod +x /app/scripts/run_api.sh \
     && mkdir -p /var/log/cloudguest
 

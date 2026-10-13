@@ -1426,7 +1426,7 @@ class TestAuthorization:
     def test_no_route_exists_outside_the_pinned_set(self) -> None:
         from app.domains.traffic_flow.router import traffic_flow_platform_router
 
-        assert len(traffic_flow_platform_router.routes) == 7
+        assert len(traffic_flow_platform_router.routes) == 8
         for route in traffic_flow_platform_router.routes:
             (method,) = route.methods
             assert (
@@ -1440,8 +1440,9 @@ class TestAuthorization:
         paths = {r.path for r in api_v1_router.routes}
         assert "/platform/traffic-flow/overview" in paths
         # Outside /platform there are exactly the read-only customer routes
-        # (the venue view's two, the Destinations three and Geo Location's
-        # one, all behind the add-on and venue_traffic.read) and nothing else:
+        # (the venue view's two, the Destinations three, Geo Location's one
+        # and Findings' one, all behind the add-on and venue_traffic.read)
+        # and nothing else:
         # no Master route is reachable without the GLOBAL pin.
         assert {
             p for p in paths if "traffic-flow" in p and not p.startswith("/platform/")
@@ -1452,6 +1453,7 @@ class TestAuthorization:
             "/traffic-flow/locations/{location_id}/destinations/export",
             "/traffic-flow/locations/{location_id}/services/destinations",
             "/traffic-flow/locations/{location_id}/geo",
+            "/traffic-flow/locations/{location_id}/findings",
         }
 
     def test_module_is_global_only(self) -> None:
