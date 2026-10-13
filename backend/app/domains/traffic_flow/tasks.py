@@ -42,6 +42,7 @@ from .constants import (
 )
 from .destination_buckets import DESTINATION_BUCKET_RETENTION_FACTOR
 from .geo import GeoWindowWriterProtocol
+from .platform_overhead import PlatformEndpoints, platform_endpoints_of
 from .service import (
     FlowRecordWriterProtocol,
     TrafficFlowIngestService,
@@ -67,6 +68,7 @@ async def pull_once(
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     geo: GeoWindowWriterProtocol | None = None,
     flow_records: FlowRecordWriterProtocol | None = None,
+    platform: PlatformEndpoints | None = None,
 ) -> dict[str, Any]:
     if not settings.traffic_flow_enabled:
         return {"skipped": "disabled"}
@@ -91,7 +93,18 @@ async def pull_once(
         logger.warning("traffic_flow_pull_failed", extra={"error": state.last_error})
         return {"ok": False, "error": state.last_error}
 
-    service = TrafficFlowIngestService(repository, geo=geo, flow_records=flow_records)
+    if platform is None:
+        # The hub's tunnel endpoints, once per pull: a router's own traffic
+        # to them is platform overhead, not the venue's traffic.
+        platform = await platform_endpoints_of(repository, settings)
+    if platform.unresolved_hosts:
+        logger.warning(
+            "traffic_flow_platform_endpoint_is_a_hostname",
+            extra={"hosts": list(platform.unresolved_hosts)},
+        )
+    service = TrafficFlowIngestService(
+        repository, geo=geo, flow_records=flow_records, platform=platform
+    )
     exporter_map = await repository.exporter_router_map() if windows else {}
     written = duplicates = 0
     unknown: tuple[str, ...] = tuple(state.unknown_exporters or ())
@@ -177,9 +190,11 @@ async def _run_async() -> dict[str, Any]:
                 )
             return response.json()
 
+        platform = await platform_endpoints_of(TrafficFlowRepository(session), settings)
         return await pull_once(
             repository=TrafficFlowRepository(session),
             settings=settings,
+            platform=platform,
             fetch_windows=fetch,
             commit=session.commit,
             geo=GeoWindowWriter(
@@ -192,6 +207,7 @@ async def _run_async() -> dict[str, Any]:
                 enabled_router_ids=TrafficFlowRepository(
                     session
                 ).enabled_export_router_ids,
+                platform=platform,
             ),
         )
 
