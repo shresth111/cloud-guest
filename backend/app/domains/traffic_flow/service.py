@@ -82,6 +82,7 @@ from .platform_overhead import (
     PLATFORM_OVERHEAD_NOTE,
     PlatformEndpoints,
     load_platform_endpoints,
+    load_platform_server_hosts,
     platform_endpoints_of,
 )
 from .routeros import (
@@ -450,6 +451,11 @@ class TrafficFlowRepository:
     async def platform_endpoints(self, settings: Any) -> PlatformEndpoints:
         """The hub's WireGuard endpoints (``platform_overhead``)."""
         return await load_platform_endpoints(self.session, settings)
+
+    async def platform_server_hosts(self) -> list[str]:
+        """The active hubs' ``endpoint_host`` values, for the sweep to
+        resolve the ones that are names."""
+        return await load_platform_server_hosts(self.session)
 
     async def exporter_router_map(self) -> dict[str, ExporterRouter]:
         """Tunnel address -> router, for every non-revoked peer. A tunnel
@@ -998,12 +1004,31 @@ class TrafficFlowStatusService:
         return {
             "feature_enabled": enabled,
             # Can the routers' own tunnel to the platform be told apart from
-            # venue traffic? Counts and host NAMES only -- no address. A hub
-            # endpoint stored as a hostname is not matched until its
-            # addresses are listed in the platform-addresses setting.
+            # venue traffic? Counts, ages and host NAMES only -- no address.
+            # A hub stored by name is resolved by the sweep; one that has
+            # never resolved is listed in ``unresolved_hosts`` and is not
+            # matched until it does.
             "platform_overhead": {
                 "endpoints_known": len(platform.endpoints),
                 "unresolved_hosts": list(platform.unresolved_hosts),
+                "hosts": [
+                    {
+                        "host": host.host,
+                        "addresses": len(host.addresses),
+                        "resolved_at": _iso(host.resolved_at),
+                        "age_seconds": (
+                            max(0, int((now - host.resolved_at).total_seconds()))
+                            if host.resolved_at
+                            else None
+                        ),
+                        "last_attempt_at": _iso(host.attempted_at),
+                        # Set while lookups are failing; the addresses above
+                        # are then the last good answer.
+                        "last_error": host.last_error,
+                        "never_resolved": not host.addresses,
+                    }
+                    for host in platform.hosts
+                ],
             },
             "generated_at": now.isoformat(),
             "window_seconds": WINDOW_SECONDS,

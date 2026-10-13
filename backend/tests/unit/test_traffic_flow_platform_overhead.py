@@ -1070,7 +1070,7 @@ class TestMigration:
         getattr(module, fn)()
         return statements
 
-    def test_it_is_the_single_head(self) -> None:
+    def test_it_has_one_parent_and_one_child(self) -> None:
         module = self._module()
         assert module.down_revision == "0163_traffic_flow_record_merge"
         versions = list(pathlib.Path("alembic/versions").glob("*.py"))
@@ -1079,11 +1079,13 @@ class TestMigration:
             for p in versions
             if f'down_revision = "{module.down_revision}"' in p.read_text()
         ] == [self.FILE.name]
-        assert not [
+        # The resolved-hostnames revision follows; a second child would be
+        # a second head.
+        assert [
             p.name
             for p in versions
             if f'down_revision = "{module.revision}"' in p.read_text()
-        ]
+        ] == ["0165_traffic_flow_platform_hosts.py"]
 
     def test_columns_are_nullable_with_no_default_and_no_backfill(self) -> None:
         up = self._statements("upgrade")

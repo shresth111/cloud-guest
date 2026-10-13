@@ -477,14 +477,18 @@ class Settings(BaseSettings):
     traffic_flow_platform_addresses: str = Field(
         default="",
         description=(
+            "NORMALLY EMPTY: an override. "
             "Comma-separated IP addresses of the platform's WireGuard hub, in "
             "ADDITION to the wireguard_servers.endpoint_host values. A "
             "router's own traffic to the hub (its management tunnel) is "
             "platform overhead and is kept out of every venue's traffic "
             "figures; it is recognised by address and port, never by port "
-            "alone. Needed only when the endpoint is stored as a hostname "
-            "(it is not resolved) or the hub is reached through another "
-            "address. Empty (the default) uses the table alone. Override via "
+            "alone. A hub stored as a hostname is resolved by the pull sweep "
+            "and kept up to date (Master /status shows the age), so this is "
+            "needed only when the hub is reached through an address its name "
+            "does not resolve to. A value left here does NOT follow a change "
+            "of the hub's address. Empty (the default) uses the table and "
+            "the resolved names. Override via "
             "CLOUDGUEST_TRAFFIC_FLOW_PLATFORM_ADDRESSES."
         ),
     )

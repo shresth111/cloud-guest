@@ -101,4 +101,6 @@ LATER_COLUMNS: dict[str, set[str]] = {
         "bytes_overhead_up",
         "bytes_overhead_down",
     },
+    # 0165_traffic_flow_platform_hosts
+    "traffic_flow_ingest_state": {"platform_hosts"},
 }
