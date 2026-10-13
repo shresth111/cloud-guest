@@ -55,17 +55,50 @@ owner:
 * Unverified on hardware: whether RouterOS sends the NAT elements pmacct
   reads, and whether at a hotspot venue the source is the guest's address.
 
+## What is merged and what is not stored (measured, 2026-10-13)
+
+The hub's first per-flow file, one venue with 5 to 7 devices, 4 minutes of
+one window: 5,183 records, i.e. about 6,500 per 5-minute window and 1.9
+million a day. 3,207 were outside-to-venue UDP answers of one or two packets
+(3,183 from port 123) from 62 outside addresses to 2 venue addresses, each
+to a different local port; 1,949 had both ends inside the venue (949 to the
+router's DNS); 27 were venue-to-outside. Stored as they came, the daily cap
+would be reached about 01:20 every day.
+
+So, per window (``prepare_records``), each rule with a count the reader is
+given:
+
+* **Internal records are not stored** unless
+  ``traffic_flow_record_store_internal``. 38% of the sample, none of it
+  traffic to anywhere.
+* **Records identical in addresses, ports and protocol are merged**: bytes,
+  packets and flows summed, earliest start, latest end.
+* **Records that differ only in the venue-side port are merged too**
+  (``traffic_flow_record_merge_ports``, default on); that port is then NULL
+  and ``ports_merged`` is true. This is the rule that matters: the sample's
+  busiest local port had 4 records, so merging identical records alone
+  would leave most of the 3,207 in place, while by outside address and
+  service they are at most a few per (outside address, venue address).
+  The outside address and port, which say what was reached, are never
+  merged away.
+
+For the sample that is at most about 150 rows from the 3,207, plus at most
+27: under 200 rows a window, under 58,000 a day, about 18 MB a day and 125
+MB at retention for that venue. An estimate from the sample's summary
+counts, not a replay of its rows.
+
 ## Size (the default cap)
 
-RESEARCH.md section 4.1 estimates about 1.3 million raw records a day for a
-50-guest venue; COLLECTOR-FLOW-FIELDS.md puts per-flow rows at 6,000 to
-75,000 per 5-minute window. Neither is measured. A row with every field
-filled and its indexes was measured at 307 bytes on PostgreSQL 17 (500,000
-rows, 146 MB; an address search across them took about 50 ms). The default
-cap of 100,000 rows is therefore about 31 MB per router per day and about
-215 MB per router at the 7-day retention, which is what this table may take
-on the shared server. A busy venue with per-flow rows reaches the cap within
-hours, and says so; raising it is a deliberate, per-environment choice.
+A row with every field filled and its indexes measures 307 bytes on
+PostgreSQL 17 (500,000 rows, 146 MB), unchanged by the two merge columns.
+The cap counts rows as STORED, after merging and without internal records,
+because that is what takes the disk. The default stays 100,000 rows per
+router per UTC day: at most 31 MB a day and 215 MB per router at the 7-day
+retention. Assumed, not measured: the database shares the app server's
+disk, and this table may take about 1 GB of it, i.e. four routers at the
+cap. The sample venue would use a little over half its cap. A venue with
+ten times the devices may still reach it; then storage stops for the day
+and every reader says so, with the count.
 """
 
 from __future__ import annotations
@@ -307,10 +340,117 @@ def flow_record_rows(
                 "direction": _direction(src, dst),
                 "exporter_address": exporter,
                 "exporter_port": _port(_first(row, _EXPORTER_PORT_KEYS)),
+                "records_merged": 1,
+                "ports_merged": False,
             }
         )
     out.sort(key=lambda r: (-r["bytes"], r["src_address"], r["dst_address"]))
     return out
+
+
+@dataclass(frozen=True, slots=True)
+class WindowCounts:
+    """What happened to one window's collector records before storage."""
+
+    #: Records the collector sent for this exporter (with real addresses).
+    received: int = 0
+    #: Left out because both ends are inside the venue.
+    internal: int = 0
+    #: Folded into another row; their bytes, packets and flows are kept.
+    merged: int = 0
+
+
+def _venue_side(direction: str) -> str | None:
+    """Which end's port is the venue's own (ephemeral) one."""
+    if direction == DIRECTION_UP:
+        return "src"
+    if direction == DIRECTION_DOWN:
+        return "dst"
+    return None
+
+
+def _total(values: list[int | None]) -> int | None:
+    present = [v for v in values if v is not None]
+    return sum(present) if present else None
+
+
+def _common(values: list[Any]) -> Any:
+    """The value all merged records share, else ``None``."""
+    first = values[0]
+    return first if all(v == first for v in values) else None
+
+
+def _merge(group: list[dict[str, Any]], side: str | None) -> dict[str, Any]:
+    if len(group) == 1:
+        return group[0]
+    out = dict(group[0])
+    starts = [r["flow_start"] for r in group if r["flow_start"] is not None]
+    ends = [r["flow_end"] for r in group if r["flow_end"] is not None]
+    arrivals = [r["arrived_at"] for r in group if r["arrived_at"] is not None]
+    out["flow_start"] = min(starts) if starts else None
+    out["flow_end"] = max(ends) if ends else None
+    out["arrived_at"] = max(arrivals) if arrivals else None
+    out["bytes"] = sum(r["bytes"] for r in group)
+    out["packets"] = _total([r["packets"] for r in group])
+    out["flows"] = _total([r["flows"] for r in group])
+    out["records_merged"] = len(group)
+    # A translation is kept only when every merged record agrees on it.
+    for name in ("nat_src_address", "nat_dst_address", "exporter_port"):
+        out[name] = _common([r[name] for r in group])
+    for name in ("nat_src_port", "nat_dst_port"):
+        address = name.replace("port", "address")
+        out[name] = _common([r[name] for r in group]) if out[address] else None
+    if side is not None:
+        ports = [r[f"{side}_port"] for r in group]
+        if not all(p == ports[0] for p in ports):
+            out[f"{side}_port"] = None
+            out[f"nat_{side}_port"] = None
+            out["ports_merged"] = True
+    return out
+
+
+def prepare_records(
+    records: list[dict[str, Any]], *, store_internal: bool, merge_ports: bool
+) -> tuple[list[dict[str, Any]], WindowCounts]:
+    """One window's records as they will be stored, largest first, and what
+    was left out or folded on the way. Nothing is dropped without a count.
+
+    * **Internal** records (both ends inside the venue) are left out unless
+      ``store_internal``: they are not traffic to anywhere.
+    * Records with the same addresses, ports and protocol are **merged**:
+      bytes, packets and flows summed, earliest start, latest end.
+    * With ``merge_ports``, records that differ only in the venue-side port
+      (a phone's ephemeral port, different on every connection) are merged
+      too; that port is then ``None`` and ``ports_merged`` is true. The
+      outside end's address and port, which say what was reached, are never
+      merged away. Internal and unclassified records have no venue side and
+      are only merged when identical."""
+    received = len(records)
+    internal = 0
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for record in records:
+        direction = record["direction"]
+        if direction == DIRECTION_INTERNAL and not store_internal:
+            internal += 1
+            continue
+        side = _venue_side(direction) if merge_ports else None
+        key = (
+            direction,
+            record["src_address"],
+            None if side == "src" else record["src_port"],
+            record["dst_address"],
+            None if side == "dst" else record["dst_port"],
+            record["protocol"],
+        )
+        groups.setdefault(key, []).append(record)
+    rows = [
+        _merge(group, _venue_side(group[0]["direction"]) if merge_ports else None)
+        for group in groups.values()
+    ]
+    rows.sort(key=lambda r: (-r["bytes"], r["src_address"], r["dst_address"]))
+    return rows, WindowCounts(
+        received=received, internal=internal, merged=received - internal - len(rows)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +744,26 @@ def capped_days_statement(
     )
 
 
+def storage_counts_statement(
+    scope: FlowRecordScope, *, since: datetime, until: datetime
+) -> Any:
+    """What happened to the collector's records on the UTC days the range
+    touches. Counters are kept per router and day, so a range inside a day
+    is answered with that whole day's figures (the response says so)."""
+    last = (until - timedelta(microseconds=1)).astimezone(UTC).date()
+    return select(
+        func.coalesce(func.sum(_CAP.rows_received), 0),
+        func.coalesce(func.sum(_CAP.rows_stored), 0),
+        func.coalesce(func.sum(_CAP.rows_merged), 0),
+        func.coalesce(func.sum(_CAP.rows_internal), 0),
+        func.coalesce(func.sum(_CAP.rows_not_stored), 0),
+    ).where(
+        _CAP.day >= since.astimezone(UTC).date(),
+        _CAP.day <= last,
+        *scope.conditions(_CAP),
+    )
+
+
 def record_delete_statement(cutoff: datetime, *, limit: int) -> Any:
     ids = (
         select(_RECORD.id).where(_RECORD.window_start < cutoff).limit(limit)
@@ -624,6 +784,15 @@ def cap_delete_statement(cutoff: datetime) -> Any:
 class CapState:
     rows_stored: int = 0
     capped_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StorageCounts:
+    received: int = 0
+    stored: int = 0
+    merged: int = 0
+    internal: int = 0
+    over_cap: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -674,6 +843,9 @@ class FlowRecordRepository:
         stored: int,
         not_stored: int,
         capped_at: datetime | None,
+        received: int = 0,
+        merged: int = 0,
+        internal: int = 0,
     ) -> None:
         """Add to the day's counters. ``capped_at`` is kept from the first
         time it is set: "incomplete since" is when storage first stopped."""
@@ -684,6 +856,9 @@ class FlowRecordRepository:
             rows_stored=stored,
             rows_not_stored=not_stored,
             capped_at=capped_at,
+            rows_received=received,
+            rows_merged=merged,
+            rows_internal=internal,
         )
         statement = statement.on_conflict_do_update(
             constraint="uq_traffic_flow_record_caps_key",
@@ -691,6 +866,9 @@ class FlowRecordRepository:
                 "rows_stored": _CAP.rows_stored + statement.excluded.rows_stored,
                 "rows_not_stored": _CAP.rows_not_stored
                 + statement.excluded.rows_not_stored,
+                "rows_received": _CAP.rows_received + statement.excluded.rows_received,
+                "rows_merged": _CAP.rows_merged + statement.excluded.rows_merged,
+                "rows_internal": _CAP.rows_internal + statement.excluded.rows_internal,
                 "capped_at": func.coalesce(
                     _CAP.capped_at, statement.excluded.capped_at
                 ),
@@ -795,6 +973,16 @@ class FlowRecordRepository:
         ).all()
         return [CappedDay(r[0], r[1], r[2], int(r[3])) for r in rows]
 
+    async def storage_counts(
+        self, scope: FlowRecordScope, *, since: datetime, until: datetime
+    ) -> StorageCounts:
+        row = (
+            await self.session.execute(
+                storage_counts_statement(scope, since=since, until=until)
+            )
+        ).one()
+        return StorageCounts(*(int(value) for value in row))
+
 
 # ---------------------------------------------------------------------------
 # ingest side
@@ -850,11 +1038,22 @@ class FlowRecordWriter:
         router_id: uuid.UUID = identity["router_id"]
         if not await self._export_on(router_id):
             return 0
-        records = flow_record_rows(rows, exporter)
-        if not records:
+        received = flow_record_rows(rows, exporter)
+        if not received:
             return 0
+        records, counts = prepare_records(
+            received,
+            store_internal=bool(
+                getattr(self.settings, "traffic_flow_record_store_internal", False)
+            ),
+            merge_ports=bool(
+                getattr(self.settings, "traffic_flow_record_merge_ports", True)
+            ),
+        )
         window_start: datetime = identity["window_start"]
         day = window_start.astimezone(UTC).date()
+        # The cap counts rows as STORED (after merging, without internal
+        # records): it guards the disk, and that is what takes the disk.
         cap = max(0, int(self.settings.traffic_flow_record_daily_cap))
         state = await self.store.cap_state(router_id, day)
         room = 0 if state.capped_at is not None else max(0, cap - state.rows_stored)
@@ -870,6 +1069,9 @@ class FlowRecordWriter:
             stored=len(kept),
             not_stored=cut,
             capped_at=window_start if cut else None,
+            received=counts.received,
+            merged=counts.merged,
+            internal=counts.internal,
         )
         if cut and state.capped_at is None:
             logger.warning(
@@ -932,6 +1134,11 @@ class FlowRecordOut(_Model):
     #: "address:port" of the exporter, or the address alone.
     exporter: str
     router_id: str
+    #: How many collector records this row stands for. 1 = one record.
+    records_merged: int
+    #: True: the merged records differed in the venue-side port, which is
+    #: therefore null in this row. Show "several", not "not recorded".
+    ports_merged: bool
 
 
 class IncompleteStretch(_Model):
@@ -946,6 +1153,35 @@ class IncompleteStretch(_Model):
 class RecordTotalsOut(_Model):
     bytes: int
     packets: int
+
+
+class NotStoredOut(_Model):
+    #: Both ends inside the venue (a device asking the router's DNS, router
+    #: chatter). Left out by rule, not lost by accident.
+    internal: int
+    #: Rows the daily limit kept out (see ``incomplete``).
+    daily_cap: int
+
+
+class StorageOut(_Model):
+    """What happened to the collector's records before the table: counts
+    for the UTC days the range touches (counters are kept per day), so the
+    screen can say how many were merged and how many were not stored, and
+    why. ``records_received == rows_stored + records_merged +
+    not_stored.internal + not_stored.daily_cap``."""
+
+    #: First and last UTC day counted.
+    from_day: str
+    to_day: str
+    records_received: int
+    rows_stored: int
+    #: Records folded into another row. Their bytes, packets and flows are
+    #: in that row; nothing of them is lost but the separate line.
+    records_merged: int
+    not_stored: NotStoredOut
+    #: The rules in force NOW (settings); earlier days may have differed.
+    internal_records_stored: bool
+    ports_merged: bool
 
 
 class FiltersOut(_Model):
@@ -981,6 +1217,7 @@ class FlowRecordSearchResponse(_Model):
     fields_not_recorded: list[str]
     #: What one row is. Fixed text, so no screen has to guess.
     row_meaning: str
+    storage: StorageOut
     filters: FiltersOut
     sort: str
     order: str
@@ -999,14 +1236,19 @@ RESPONSE_MODELS: tuple[type[BaseModel], ...] = (
     IncompleteStretch,
     RecordTotalsOut,
     FiltersOut,
+    NotStoredOut,
+    StorageOut,
 )
 
 ROW_MEANING = (
-    "One row is one flow record as the router exported it, in one direction. "
-    "A long flow is exported again every minute, and the two directions of "
-    "a conversation are separate rows; rows are not paired or stitched. "
-    "A row without a start is a 5-minute total for that source, destination, "
-    "ports and protocol."
+    "One row is the flow records the router exported in one 5-minute window "
+    "for one source address, destination address, protocol and outside "
+    "port, in one direction, added together. records_merged says how many "
+    "records that is. Where they came from different ports on the venue "
+    "side, that port is not kept (ports_merged). The two directions of a "
+    "conversation are separate rows and are not paired. Records between two "
+    "addresses inside the venue are not stored unless the platform is set "
+    "to keep them; storage says how many were left out and why."
 )
 
 #: Fields that may be "not recorded", in table order.
@@ -1044,6 +1286,8 @@ CSV_COLUMNS = (
     "direction",
     "exporter",
     "router_id",
+    "records_merged",
+    "ports_merged",
 )
 
 
@@ -1107,6 +1351,8 @@ def _record_out(row: Any) -> FlowRecordOut:
         direction=row.direction,
         exporter=exporter,
         router_id=str(row.router_id),
+        records_merged=int(getattr(row, "records_merged", 1) or 1),
+        ports_merged=bool(getattr(row, "ports_merged", False)),
     )
 
 
@@ -1115,11 +1361,17 @@ def _not_recorded(rows: list[Any]) -> list[str]:
     if not rows:
         return []
     column = {"start": "flow_start", "end": "flow_end"}
-    return [
-        name
-        for name in OPTIONAL_FIELDS
-        if all(getattr(row, column.get(name, name)) is None for row in rows)
-    ]
+
+    def absent(row: Any, name: str) -> bool:
+        if getattr(row, column.get(name, name)) is not None:
+            return False
+        # A port merged away is "several", which is not "not recorded".
+        merged_port = name in {"src_port", "dst_port"} and getattr(
+            row, "ports_merged", False
+        )
+        return not merged_port
+
+    return [name for name in OPTIONAL_FIELDS if all(absent(row, name) for row in rows)]
 
 
 def records_csv(rows: list[Any], columns: tuple[str, ...] = CSV_COLUMNS) -> str:
@@ -1145,7 +1397,7 @@ def incomplete_message(stretches: list[CappedDay]) -> str | None:
     lost = sum(s.rows_not_stored for s in stretches)
     return (
         f"Records incomplete since {first.isoformat(timespec='minutes')}: the "
-        f"daily limit on stored flow records was reached and {lost} record(s) "
+        f"daily limit on stored flow records was reached and {lost} row(s) "
         "in this range were not stored. Totals for the period are in the "
         "venue view, which is not affected."
     )
@@ -1324,6 +1576,7 @@ class FlowRecordService:
         rows: list[Any] = []
         totals = RecordTotals()
         capped: list[CappedDay] = []
+        counts = StorageCounts()
         oldest: datetime | None = None
         newest: datetime | None = None
         query_ms = 0
@@ -1343,6 +1596,7 @@ class FlowRecordService:
             )
             query_ms = int((time.perf_counter() - started) * 1000)
             capped = await self.repository.capped_days(request.scope, **where)
+            counts = await self.repository.storage_counts(request.scope, **where)
             oldest, newest = await self.repository.bounds(request.scope)
         await self._audit(
             request,
@@ -1376,6 +1630,25 @@ class FlowRecordService:
             ],
             fields_not_recorded=_not_recorded(rows),
             row_meaning=ROW_MEANING,
+            storage=StorageOut(
+                from_day=request.since.astimezone(UTC).date().isoformat(),
+                to_day=(request.until - timedelta(microseconds=1))
+                .astimezone(UTC)
+                .date()
+                .isoformat(),
+                records_received=counts.received,
+                rows_stored=counts.stored,
+                records_merged=counts.merged,
+                not_stored=NotStoredOut(
+                    internal=counts.internal, daily_cap=counts.over_cap
+                ),
+                internal_records_stored=bool(
+                    getattr(self.settings, "traffic_flow_record_store_internal", False)
+                ),
+                ports_merged=bool(
+                    getattr(self.settings, "traffic_flow_record_merge_ports", True)
+                ),
+            ),
             filters=FiltersOut(**request.filters.as_dict()),
             sort=request.sort,
             order=request.order,

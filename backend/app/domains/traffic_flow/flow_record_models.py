@@ -11,6 +11,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Date,
     DateTime,
     ForeignKey,
@@ -88,6 +89,15 @@ class TrafficFlowRecord(Base):
     exporter_address: Mapped[str] = mapped_column(String(45), nullable=False)
     #: The exporter's own source port. NULL = not recorded.
     exporter_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: How many collector records this row stands for (1 = not merged).
+    records_merged: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    #: True when the merged records differed in the venue-side port, which
+    #: is then NULL here. That NULL is "several", not "not recorded".
+    ports_merged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     __table_args__ = (
         Index("ix_traffic_flow_records_window_start", "window_start"),
@@ -119,6 +129,19 @@ class TrafficFlowRecordCap(Base):
         DateTime(timezone=True), nullable=True
     )
     rows_not_stored: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    #: Collector records received for the day, before any rule below.
+    rows_received: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    #: Records folded into another row of the same window (not lost: their
+    #: bytes, packets and flows are in that row).
+    rows_merged: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    #: Records not stored because both ends were inside the venue.
+    rows_internal: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
 
     __table_args__ = (
         UniqueConstraint("router_id", "day", name="uq_traffic_flow_record_caps_key"),

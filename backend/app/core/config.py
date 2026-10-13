@@ -466,10 +466,36 @@ class Settings(BaseSettings):
             "Flow records stored per router per UTC day. When a router "
             "reaches it, flow records stop for that router until the next "
             "day (rollups continue), the moment is stored, and every flow "
-            "search says 'records incomplete since ...'. About 307 bytes a "
-            "row with indexes (measured), so the default is about 31 MB per "
-            "router per day and 215 MB at 7 days. 0 stores nothing. Override via "
+            "search says 'records incomplete since ...'. Counts rows as "
+            "STORED, i.e. after merging and after internal records are left "
+            "out. About 307 bytes a row with indexes (measured), so the "
+            "default is at most 31 MB per router per day and 215 MB at 7 days. "
+            "0 stores nothing. Override via "
             "CLOUDGUEST_TRAFFIC_FLOW_RECORD_DAILY_CAP."
+        ),
+    )
+    traffic_flow_record_store_internal: bool = Field(
+        default=False,
+        description=(
+            "Also store flow records whose two ends are both inside the venue "
+            "(a device asking the router's own DNS, router chatter). False "
+            "(the default): they are counted and reported as not stored. "
+            "Measured on one small venue they were 38% of all records, none "
+            "of them traffic to the outside. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_STORE_INTERNAL."
+        ),
+    )
+    traffic_flow_record_merge_ports: bool = Field(
+        default=True,
+        description=(
+            "Within one 5-minute window, merge flow records that differ only "
+            "in the venue-side (ephemeral) port into one row with summed "
+            "bytes, packets and flows; that port is then not kept. Records "
+            "identical in every address and port are always merged. False: "
+            "only identical ones are. Measured on one small venue, 3,183 of "
+            "5,183 records in a window were one- or two-packet answers from "
+            "62 outside addresses to ever-changing local ports. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_MERGE_PORTS."
         ),
     )
     traffic_flow_geo_data_dir: str = Field(
