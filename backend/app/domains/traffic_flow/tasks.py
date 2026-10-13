@@ -42,7 +42,12 @@ from .constants import (
 )
 from .destination_buckets import DESTINATION_BUCKET_RETENTION_FACTOR
 from .geo import GeoWindowWriterProtocol
-from .platform_overhead import PlatformEndpoints, platform_endpoints_of
+from .platform_overhead import (
+    PlatformEndpoints,
+    platform_endpoints_of,
+    refresh_platform_hosts,
+    resolve_host,
+)
 from .service import (
     FlowRecordWriterProtocol,
     TrafficFlowIngestService,
@@ -69,6 +74,7 @@ async def pull_once(
     geo: GeoWindowWriterProtocol | None = None,
     flow_records: FlowRecordWriterProtocol | None = None,
     platform: PlatformEndpoints | None = None,
+    resolver: Callable[[str], Awaitable[Any]] = resolve_host,
 ) -> dict[str, Any]:
     if not settings.traffic_flow_enabled:
         return {"skipped": "disabled"}
@@ -95,11 +101,14 @@ async def pull_once(
 
     if platform is None:
         # The hub's tunnel endpoints, once per pull: a router's own traffic
-        # to them is platform overhead, not the venue's traffic.
+        # to them is platform overhead, not the venue's traffic. A hub
+        # stored by name is looked up here first, when its stored answer is
+        # due -- bounded in time, and a failure changes nothing.
+        await refresh_platform_hosts(repository, now=started, resolver=resolver)
         platform = await platform_endpoints_of(repository, settings)
     if platform.unresolved_hosts:
         logger.warning(
-            "traffic_flow_platform_endpoint_is_a_hostname",
+            "traffic_flow_platform_hostname_never_resolved",
             extra={"hosts": list(platform.unresolved_hosts)},
         )
     service = TrafficFlowIngestService(
@@ -190,6 +199,11 @@ async def _run_async() -> dict[str, Any]:
                 )
             return response.json()
 
+        # Resolve hub hostnames that are due, then read the endpoints: the
+        # same values go to the rollups and to the flow-record writer.
+        await refresh_platform_hosts(
+            TrafficFlowRepository(session), now=datetime.now(UTC)
+        )
         platform = await platform_endpoints_of(TrafficFlowRepository(session), settings)
         return await pull_once(
             repository=TrafficFlowRepository(session),

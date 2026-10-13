@@ -151,6 +151,13 @@ class TrafficFlowIngestState(Base):
     unknown_exporters: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list
     )
+    # Hub hostnames as the sweep last resolved them
+    # (``platform_overhead.refreshed_hosts``): {host: {"addresses": [...],
+    # "resolved_at", "attempted_at", "last_error"}}. Written by the sweep,
+    # read by every process, so no request ever does a DNS lookup.
+    platform_hosts: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
 
 
 class TrafficFlowServiceBucket(Base):

@@ -1646,6 +1646,9 @@ _MIGRATIONS = [
     # platform, kept out of client traffic). Not findings'; findings read
     # the corrected figures.
     "0164_traffic_flow_window_overhead.py",
+    # Resolved hub hostnames on the ingest-state row, for the same overhead
+    # classification. Not findings'.
+    "0165_traffic_flow_platform_hosts.py",
 ]
 #: The flow-records feature keeps adding its own migrations (0162, 0163, ...).
 #: They are not findings', and listing each one here broke the deploy when

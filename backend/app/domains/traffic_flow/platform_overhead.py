@@ -26,9 +26,11 @@ a port-only guess, and no address is written in this repository.
 
 ## What it misses, on purpose or not
 
-* A hub endpoint stored as a **hostname**. It is not resolved here (no DNS
-  lookup on the ingest or read path); list its addresses in the setting.
-  ``unresolved_hosts`` names such hosts so the Master status can say so.
+* A hub endpoint stored as a **hostname** that has never resolved. Names
+  are resolved by the pull sweep (see "Hostnames" below), never on a
+  request or per row; until the first answer the tunnel shape is not
+  matched for that hub, and ``unresolved_hosts`` names it so the Master
+  status can say so.
 * A hub reached through an address the app does not know (a NAT in front of
   the hub, a changed address not yet in the table).
 * Collector rows without protocol and ports (the first collector config):
@@ -37,6 +39,19 @@ a port-only guess, and no address is written in this repository.
   are the router's traffic but not to the platform. They stay client
   traffic and can still lead a quiet venue's list.
 
+## Hostnames
+
+``endpoint_host`` is often a name. The pull sweep resolves each active
+hub's name (A and AAAA) at most once per ``PLATFORM_HOST_TTL_SECONDS`` and
+stores the answer on the ingest-state row, where every process reads it:
+the sweep's own ingest and the API's reads alike. So there is no lookup per
+request and none per row, and a read never waits on DNS.
+
+A failed lookup keeps the last good answer -- for as long as it keeps
+failing -- and records the error and the time beside it. An answer is only
+ever replaced by another answer. ``Settings.traffic_flow_platform_addresses``
+is added on top as an override; it is normally empty.
+
 A venue's own WireGuard to somewhere else -- same protocol, very often the
 same port -- is NOT matched: the address differs. That is why the port
 alone is never enough.
@@ -44,16 +59,30 @@ alone is never enough.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
-from collections.abc import Iterable, Mapping
+import socket
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
+
+#: A stored answer older than this is looked up again by the next sweep.
+PLATFORM_HOST_TTL_SECONDS = 600
+#: One lookup may take this long; then it counts as failed and the sweep
+#: goes on with what it had.
+PLATFORM_HOST_LOOKUP_TIMEOUT_SECONDS = 3.0
 
 __all__ = [
     "NO_PLATFORM_ENDPOINTS",
     "PLATFORM_OVERHEAD_NOTE",
     "PlatformEndpoints",
+    "PLATFORM_HOST_TTL_SECONDS",
+    "HostResolution",
     "load_platform_endpoints",
+    "refresh_platform_hosts",
+    "refreshed_hosts",
+    "resolve_host",
     "platform_endpoints_from",
     "platform_endpoints_of",
 ]
@@ -94,13 +123,180 @@ def _port(value: Any) -> int | None:
 
 
 @dataclass(frozen=True, slots=True)
+class HostResolution:
+    """What the sweep last learned about one hub hostname."""
+
+    host: str
+    addresses: tuple[str, ...] = ()
+    #: When ``addresses`` were answered. ``None``: never resolved.
+    resolved_at: datetime | None = None
+    #: The last attempt, successful or not.
+    attempted_at: datetime | None = None
+    #: Why the last attempt failed; ``None`` after a success.
+    last_error: str | None = None
+
+
+def _instant(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def host_resolutions(stored: Any) -> dict[str, HostResolution]:
+    """The ingest-state row's ``platform_hosts`` JSON as records. Anything
+    malformed reads as "nothing held", never as an address."""
+    out: dict[str, HostResolution] = {}
+    if not isinstance(stored, Mapping):
+        return out
+    for host, entry in stored.items():
+        if not isinstance(entry, Mapping):
+            continue
+        addresses = tuple(
+            dict.fromkeys(
+                canonical
+                for canonical in map(_canonical, entry.get("addresses") or [])
+                if canonical is not None
+            )
+        )
+        out[str(host)] = HostResolution(
+            host=str(host),
+            addresses=addresses,
+            resolved_at=_instant(entry.get("resolved_at")) if addresses else None,
+            attempted_at=_instant(entry.get("attempted_at")),
+            last_error=str(entry["last_error"]) if entry.get("last_error") else None,
+        )
+    return out
+
+
+def _stored(resolution: HostResolution) -> dict[str, Any]:
+    return {
+        "addresses": list(resolution.addresses),
+        "resolved_at": resolution.resolved_at.isoformat()
+        if resolution.resolved_at
+        else None,
+        "attempted_at": resolution.attempted_at.isoformat()
+        if resolution.attempted_at
+        else None,
+        "last_error": resolution.last_error,
+    }
+
+
+async def resolve_host(host: str) -> list[str]:
+    """A and AAAA for ``host``, through the system resolver, off the event
+    loop and bounded in time. Raises on failure or timeout."""
+    loop = asyncio.get_running_loop()
+    infos = await asyncio.wait_for(
+        loop.getaddrinfo(host, None, type=socket.SOCK_DGRAM),
+        timeout=PLATFORM_HOST_LOOKUP_TIMEOUT_SECONDS,
+    )
+    return [str(info[4][0]) for info in infos]
+
+
+async def refreshed_hosts(
+    stored: Any,
+    hosts: Iterable[str],
+    *,
+    now: datetime,
+    resolver: Callable[[str], Awaitable[Iterable[str]]] = resolve_host,
+    ttl_seconds: int = PLATFORM_HOST_TTL_SECONDS,
+) -> dict[str, Any]:
+    """``stored`` brought up to date for ``hosts`` (the names of the active
+    hubs), as the JSON to store.
+
+    * A host answered less than ``ttl_seconds`` ago is not looked up.
+    * A lookup that fails, times out or returns no usable address keeps the
+      addresses already held and records the error.
+    * A host no longer among ``hosts`` is dropped.
+    Never raises: whatever the resolver does, the sweep goes on."""
+    held = host_resolutions(stored)
+    out: dict[str, Any] = {}
+    for host in dict.fromkeys(str(h).strip() for h in hosts):
+        if not host or _canonical(host) is not None:
+            continue  # an address needs no lookup
+        current = held.get(host, HostResolution(host=host))
+        fresh = (
+            current.attempted_at is not None
+            and (now - current.attempted_at).total_seconds() < ttl_seconds
+        )
+        if fresh:
+            out[host] = _stored(current)
+            continue
+        try:
+            answered = tuple(
+                dict.fromkeys(
+                    canonical
+                    for canonical in map(_canonical, await resolver(host))
+                    if canonical is not None
+                )
+            )
+            error = None if answered else "no address in the answer"
+        except Exception as exc:  # noqa: BLE001 -- recorded; the sweep must go on
+            answered = ()
+            error = f"{type(exc).__name__}: {exc}"[:200].rstrip(": ")
+        if answered:
+            current = HostResolution(
+                host=host,
+                addresses=tuple(sorted(answered)),
+                resolved_at=now,
+                attempted_at=now,
+            )
+        else:
+            # Keep the last good answer; say that this attempt failed.
+            current = HostResolution(
+                host=host,
+                addresses=current.addresses,
+                resolved_at=current.resolved_at,
+                attempted_at=now,
+                last_error=error,
+            )
+        out[host] = _stored(current)
+    return out
+
+
+async def refresh_platform_hosts(
+    repository: Any,
+    *,
+    now: datetime,
+    resolver: Callable[[str], Awaitable[Iterable[str]]] = resolve_host,
+) -> bool:
+    """Run by the pull sweep, before it reads the endpoints. Looks up what
+    is due and stores it on the ingest-state row (the caller's commit saves
+    it). Returns whether anything changed. A repository that cannot list the
+    hubs, or any failure at all, changes nothing."""
+    list_hosts = getattr(repository, "platform_server_hosts", None)
+    get_state = getattr(repository, "get_state", None)
+    if list_hosts is None or get_state is None:
+        return False
+    try:
+        hosts = await list_hosts()
+        state = await get_state()
+        before = getattr(state, "platform_hosts", None) or {}
+        after = await refreshed_hosts(before, hosts, now=now, resolver=resolver)
+    except Exception:  # noqa: BLE001 -- DNS must never stop an ingest
+        return False
+    if after == before:
+        return False
+    # A new object, so the JSON column is seen as changed.
+    state.platform_hosts = after
+    return True
+
+
+@dataclass(frozen=True, slots=True)
 class PlatformEndpoints:
     """The hub's WireGuard endpoints as (canonical address, UDP port)."""
 
     endpoints: frozenset[tuple[str, int]] = frozenset()
-    #: Endpoint hosts that are names, not addresses: not matched (see the
-    #: module docstring), reported instead of silently ignored.
+    #: Endpoint hosts that are names and have NEVER resolved: not matched
+    #: (see the module docstring), reported instead of silently ignored.
     unresolved_hosts: tuple[str, ...] = ()
+    #: What is held for every hub that is a name, resolved or not.
+    hosts: tuple[HostResolution, ...] = ()
 
     def __bool__(self) -> bool:
         return bool(self.endpoints)
@@ -184,13 +380,18 @@ NO_PLATFORM_ENDPOINTS = PlatformEndpoints()
 
 
 def platform_endpoints_from(
-    servers: Iterable[tuple[Any, Any]], extra_addresses: Iterable[str] = ()
+    servers: Iterable[tuple[Any, Any]],
+    extra_addresses: Iterable[str] = (),
+    resolved: Any = None,
 ) -> PlatformEndpoints:
     """``servers``: (endpoint_host, endpoint_port) of every hub.
-    ``extra_addresses``: further addresses of the same hubs (a hostname's
-    addresses, a NAT's), each paired with every known endpoint port."""
+    ``resolved``: the stored lookups (``platform_hosts``) for hubs that are
+    names. ``extra_addresses``: the override setting -- further addresses of
+    the same hubs, each paired with every known endpoint port."""
+    held = host_resolutions(resolved)
     endpoints: set[tuple[str, int]] = set()
     unresolved: list[str] = []
+    named: dict[str, HostResolution] = {}
     ports: set[int] = set()
     for host, port in servers:
         number = _port(port)
@@ -198,36 +399,54 @@ def platform_endpoints_from(
             continue
         ports.add(number)
         canonical = _canonical(host)
-        if canonical is None:
-            text = str(host or "").strip()
-            if text and text not in unresolved:
-                unresolved.append(text)
+        if canonical is not None:
+            endpoints.add((canonical, number))
             continue
-        endpoints.add((canonical, number))
+        text = str(host or "").strip()
+        if not text:
+            continue
+        resolution = held.get(text, HostResolution(host=text))
+        named[text] = resolution
+        for address in resolution.addresses:
+            endpoints.add((address, number))
+        if not resolution.addresses and text not in unresolved:
+            unresolved.append(text)
     for address in extra_addresses:
         canonical = _canonical(address)
         if canonical is None:
             continue
         for number in ports:
             endpoints.add((canonical, number))
-    return PlatformEndpoints(frozenset(endpoints), tuple(unresolved))
+    return PlatformEndpoints(
+        frozenset(endpoints), tuple(unresolved), tuple(named.values())
+    )
 
 
-async def load_platform_endpoints(session: Any, settings: Any) -> PlatformEndpoints:
-    """The hub endpoints from ``wireguard_servers`` (the values rendered into
-    every router's peer configuration) plus
-    ``Settings.traffic_flow_platform_addresses``."""
+def _active_servers_statement() -> Any:
     from sqlalchemy import select
 
     from app.domains.wireguard.models import WireGuardServer
 
-    rows = (
-        await session.execute(
-            select(WireGuardServer.endpoint_host, WireGuardServer.endpoint_port).where(
-                WireGuardServer.is_deleted.is_(False)
-            )
-        )
-    ).all()
+    return select(WireGuardServer.endpoint_host, WireGuardServer.endpoint_port).where(
+        WireGuardServer.is_deleted.is_(False), WireGuardServer.is_active.is_(True)
+    )
+
+
+async def load_platform_server_hosts(session: Any) -> list[str]:
+    """``endpoint_host`` of every active hub (names and addresses alike)."""
+    rows = (await session.execute(_active_servers_statement())).all()
+    return [str(host) for host, _port_number in rows if host]
+
+
+async def load_platform_endpoints(session: Any, settings: Any) -> PlatformEndpoints:
+    """The active hubs' endpoints from ``wireguard_servers`` (the values
+    rendered into every router's peer configuration), with names replaced by
+    what the sweep last resolved them to, plus the override setting. Two
+    reads of the database; no DNS."""
+    from .models import TrafficFlowIngestState
+
+    rows = (await session.execute(_active_servers_statement())).all()
+    state = await session.get(TrafficFlowIngestState, 1)
     extra = [
         part.strip()
         for part in str(
@@ -235,7 +454,11 @@ async def load_platform_endpoints(session: Any, settings: Any) -> PlatformEndpoi
         ).split(",")
         if part.strip()
     ]
-    return platform_endpoints_from([(host, port) for host, port in rows], extra)
+    return platform_endpoints_from(
+        [(host, port) for host, port in rows],
+        extra,
+        getattr(state, "platform_hosts", None),
+    )
 
 
 async def platform_endpoints_of(repository: Any, settings: Any) -> PlatformEndpoints:
