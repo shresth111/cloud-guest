@@ -93,5 +93,12 @@ class TestCreateRevision:
 
 #: Columns added by later revisions (0157_traffic_flow_services_export).
 LATER_COLUMNS: dict[str, set[str]] = {
-    "traffic_flow_windows": {"bytes_up", "bytes_down", "services_measured"},
+    "traffic_flow_windows": {
+        "bytes_up",
+        "bytes_down",
+        "services_measured",
+        # 0164_traffic_flow_window_overhead
+        "bytes_overhead_up",
+        "bytes_overhead_down",
+    },
 }

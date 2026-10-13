@@ -332,8 +332,13 @@ def build_summary(
         in_service[1] += int(row.bytes_down)
         in_service[2] += int(row.flows)
     if overhead_by_service:
+        corrected = [_less_overhead(row, overhead_by_service) for row in service_rows]
+        # A service that was ONLY the tunnel is not a service of the venue:
+        # drop the emptied row rather than list it with zeros.
         service_rows = [
-            _less_overhead(row, overhead_by_service) for row in service_rows
+            row
+            for row, original in zip(corrected, service_rows, strict=True)
+            if row is original or row.bytes_up or row.bytes_down
         ]
 
     # -- windows: totals and per-step coverage ------------------------------
@@ -501,6 +506,29 @@ def build_summary(
             **destinations,
         }
 
+    # Devices. A window stored before overhead was classified lists the
+    # router itself as a "device" carrying the tunnel, and nothing stored
+    # says which entry that is. When such overhead was found in the range,
+    # only the classified windows feed the list (the figures stay lower
+    # bounds, which they already were), and the response says how many
+    # windows were left out of it.
+    history_found = any(up or down for up, down in overhead_by_step.values())
+    device_windows = (
+        [
+            w
+            for w in windows
+            if getattr(w, "bytes_overhead_up", None) is not None
+            or getattr(w, "bytes_overhead_down", None) is not None
+        ]
+        if history_found
+        else list(windows)
+    )
+    devices = _lower_bound_list(
+        _merge_devices(device_windows), limit=limit, client_bytes=client_bytes
+    )
+    if history_found:
+        devices["windows_not_listed"] = len(windows) - len(device_windows)
+
     return {
         "feature_enabled": True,
         "measured": True,
@@ -545,8 +573,6 @@ def build_summary(
             "steps": timeline_steps,
         },
         "list_accuracy": _list_accuracy(),
-        "devices": _lower_bound_list(
-            _merge_devices(windows), limit=limit, client_bytes=client_bytes
-        ),
+        "devices": devices,
         "destinations": destinations,
     }

@@ -1235,7 +1235,12 @@ class DestinationService:
                 router_id=router_id,
                 organization_id=organization_id,
                 min_devices=max(0, int(min_devices)),
-                platform=await platform_endpoints_of(self.repository, self.settings),
+                # Nothing is read while the feature is off, this included.
+                platform=(
+                    await platform_endpoints_of(self.repository, self.settings)
+                    if getattr(self.settings, "traffic_flow_enabled", False)
+                    else NO_PLATFORM_ENDPOINTS
+                ),
             ),
             since=start,
             until=end,

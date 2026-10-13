@@ -1528,7 +1528,7 @@ class FlowRecordService:
             organization_id=organization_id,
             platform=(
                 await platform_endpoints_of(self.repository, self.settings)
-                if organization_id is not None
+                if organization_id is not None and self._reading
                 else NO_PLATFORM_ENDPOINTS
             ),
         )

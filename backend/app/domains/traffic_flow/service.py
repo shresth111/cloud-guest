@@ -994,8 +994,17 @@ class TrafficFlowStatusService:
         routers = await self.repository.fleet_routers()
         activity = await self.repository.router_activity(now - timedelta(hours=1))
         state = await self.repository.get_state()
+        platform = await platform_endpoints_of(self.repository, self.settings)
         return {
             "feature_enabled": enabled,
+            # Can the routers' own tunnel to the platform be told apart from
+            # venue traffic? Counts and host NAMES only -- no address. A hub
+            # endpoint stored as a hostname is not matched until its
+            # addresses are listed in the platform-addresses setting.
+            "platform_overhead": {
+                "endpoints_known": len(platform.endpoints),
+                "unresolved_hosts": list(platform.unresolved_hosts),
+            },
             "generated_at": now.isoformat(),
             "window_seconds": WINDOW_SECONDS,
             "silent_after_seconds": SILENT_AFTER_SECONDS,
