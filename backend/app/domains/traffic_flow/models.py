@@ -193,6 +193,11 @@ class TrafficFlowServiceBucket(Base):
     bytes_up: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     bytes_down: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     flows: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    #: Packets by direction. NULL = not measured: a row written before
+    #: packets were recorded (revision 0161), or a window whose collector
+    #: rows carried no packet count. Never read NULL as 0.
+    packets_up: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    packets_down: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(

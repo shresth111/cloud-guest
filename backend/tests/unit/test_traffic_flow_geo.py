@@ -1360,11 +1360,13 @@ class TestMigration:
             if f'down_revision = "{mine.down_revision}"' in path.read_text()
         ]
         assert children == [self.FILE]
-        assert not [
+        # One revision follows this one (packets on the buckets). A second
+        # child would be a second head.
+        assert [
             path.name
             for path in VERSIONS.glob("*.py")
             if f'down_revision = "{mine.revision}"' in path.read_text()
-        ]
+        ] == ["0161_traffic_flow_bucket_packets.py"]
 
     def test_every_statement_is_a_no_op_when_already_applied(
         self, monkeypatch: pytest.MonkeyPatch
