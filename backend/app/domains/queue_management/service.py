@@ -941,27 +941,49 @@ class QueueManagementService:
         # entirely, which is exactly what returning None here achieves.
         if profile.upload_rate_kbps == 0 and profile.download_rate_kbps == 0:
             return None
-        if self._own_queue_is_on_the_router(assignment):
-            return None
         if await self._venue_cap_holds_this_session(assignment):
             return None
+        # Any of the session's live rows, not only the newest: a changed
+        # limit whose write failed can leave a newer row that never reached
+        # the router beside the older one that is still shaping the guest.
+        for row in await self.repository.list_assignments_for_target(
+            target_type=QueueTargetType.SESSION.value, target_id=session_id
+        ):
+            if await self._own_queue_is_on_the_router(row):
+                return None
         return format_mikrotik_rate_limit(
             profile, priority_override=assignment.priority_override
         )
 
-    def _own_queue_is_on_the_router(self, assignment: QueueAssignment) -> bool:
+    async def _own_queue_is_on_the_router(self, assignment: QueueAssignment) -> bool:
         """Whether this platform's own ``/queue simple`` row for
         ``assignment`` is, by its own record, on the router: ACTIVE, with
-        the id the router gave the row when it was written.
+        the id the router gave the row when it was written, on a router
+        this platform logs in to.
 
-        A controller-managed assignment carries a marker instead of an id
-        and is not this: the controller ignores the attribute either way,
-        and what is sent there is left exactly as it was."""
-        return (
-            assignment.status == QueueStatus.ACTIVE.value
-            and bool(assignment.device_queue_id)
-            and assignment.device_queue_id != self.CONTROLLER_QUEUE_MARKER
-        )
+        A venue run from a controller is not this -- the controller ignores
+        the attribute either way, and what is sent there is left exactly as
+        it was. Never raises; a router that cannot be looked up answers
+        ``False`` and the reply carries the limit as it did before."""
+        if (
+            assignment.status != QueueStatus.ACTIVE.value
+            or not assignment.device_queue_id
+            or assignment.device_queue_id == self.CONTROLLER_QUEUE_MARKER
+            or assignment.router_id is None
+        ):
+            return False
+        try:
+            router = await self.router_lookup.get_router(
+                assignment.router_id,
+                requesting_organization_id=assignment.organization_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "radius_rate_router_lookup_failed",
+                extra={"assignment_id": str(assignment.id), "error": str(exc)},
+            )
+            return False
+        return not (is_controller_managed(router) or is_nas_only(router))
 
     async def _policy_rate_limit_reply(
         self,
@@ -1866,19 +1888,37 @@ class QueueManagementService:
             target_type=target_type.value, target_id=target_id
         )
 
+        # A row an earlier attempt left PENDING has never reached the
+        # router, and the row that *is* shaping this guest is one of the
+        # "other" rows below. Retiring those first and then finding the
+        # PENDING one already right -- same rate, same address -- returned
+        # it unapplied: the guest's only row removed and nothing written in
+        # its place. So with a PENDING row the order is the other way
+        # round: write it, and only then retire what it replaces. A write
+        # that fails raises with the old row still on the router.
+        apply_before_retiring = (
+            existing is not None
+            and auto_apply
+            and existing.status == QueueStatus.PENDING.value
+        )
+
+        async def _retire(keep_id: uuid.UUID | None) -> None:
+            await self._retire_superseded_assignments(
+                keep_id=keep_id,
+                target_type=target_type,
+                target_id=target_id,
+                router_id=router_id,
+                device_target=device_target,
+                actor_user_id=actor_user_id,
+                requesting_organization_id=requesting_organization_id,
+            )
+
         # Retire every *other* live row competing for this same device-side
         # target before anything is applied. A competing row is not merely
         # untidy -- it silently overrides the rate resolved above. See
         # `_retire_superseded_assignments`.
-        await self._retire_superseded_assignments(
-            keep_id=existing.id if existing is not None else None,
-            target_type=target_type,
-            target_id=target_id,
-            router_id=router_id,
-            device_target=device_target,
-            actor_user_id=actor_user_id,
-            requesting_organization_id=requesting_organization_id,
-        )
+        if not apply_before_retiring:
+            await _retire(existing.id if existing is not None else None)
 
         if existing is None:
             new_assignment = await self.create_assignment(
@@ -1910,9 +1950,16 @@ class QueueManagementService:
             existing.queue_profile_id == profile.id
             and existing.device_target == device_target
         ):
+            if apply_before_retiring:
+                existing = await self.apply_queue(
+                    existing.id,
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                )
+                await _retire(existing.id)
             return existing
 
-        return await self.move_queue(
+        moved = await self.move_queue(
             existing.id,
             actor_user_id=actor_user_id,
             requesting_organization_id=requesting_organization_id,
@@ -1920,6 +1967,9 @@ class QueueManagementService:
             new_device_target=device_target,
             auto_apply=auto_apply,
         )
+        if apply_before_retiring:
+            await _retire(moved.id)
+        return moved
 
     async def reapply_active_sessions_for_location(
         self,

@@ -1033,14 +1033,24 @@ class TestTheRadiusReply:
 
         assert await h.service.get_rate_limit_reply_for_session(session_id) is None
 
-    async def test_it_is_sent_as_before_where_there_is_no_total(self) -> None:
+    async def test_it_is_sent_where_there_is_no_total_and_no_row_on_the_router(
+        self,
+    ) -> None:
+        """Without a total the attribute is the guest's limit only while
+        this platform's own row is not on the router -- here, a row whose
+        write has not happened. With the row there, nothing is sent
+        (``test_bandwidth_after_rule_change``)."""
         h, device, router = _venue()
-        h.policy_lookup.rules_by_scope[(router.organization_id, router.location_id)] = {
-            "download_rate_kbps": PER_GUEST,
-            "upload_rate_kbps": PER_GUEST,
-        }
+        profile = await _profile(h, PER_GUEST)
         session_id = uuid.uuid4()
-        await _sign_in(h, router, address="192.168.88.254", session_id=session_id)
+        _seed_assignment(
+            h,
+            router=router,
+            target_id=session_id,
+            device_target="192.168.88.254",
+            queue_profile_id=profile.id,
+            status=QueueStatus.PENDING.value,
+        )
 
         reply = await h.service.get_rate_limit_reply_for_session(session_id)
 
@@ -1072,7 +1082,14 @@ class TestTheRadiusReply:
             "upload_rate_kbps": PER_GUEST,
         }
         session_id = uuid.uuid4()
-        await _sign_in(h, router, address="192.168.88.254", session_id=session_id)
+        _seed_assignment(
+            h,
+            router=router,
+            target_id=session_id,
+            device_target="192.168.88.254",
+            queue_profile_id=(await _profile(h, PER_GUEST)).id,
+            status=QueueStatus.PENDING.value,
+        )
 
         async def _boom(**kwargs):
             raise RuntimeError("policy lookup down")
