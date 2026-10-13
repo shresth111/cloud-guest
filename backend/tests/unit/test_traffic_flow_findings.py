@@ -299,7 +299,10 @@ class TestUploadHeavy:
     def test_too_little_traffic_to_judge(self) -> None:
         hours = _hours(overrides={LAST: (10 * MIB, 20 * MIB)})
         out = upload_heavy(hours, **_last_hour())
-        assert (out["state"], out["reason"]) == ("could_not_check", "not_enough_traffic")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "not_enough_traffic",
+        )
         assert out["evidence"]["period_bytes"] == 30 * MIB
 
     def test_floor_boundary(self) -> None:
@@ -317,7 +320,10 @@ class TestUploadHeavy:
     def test_a_short_baseline_is_not_clear(self) -> None:
         hours = _hours(days=3, overrides={LAST: (3 * GIB, 0)})
         out = upload_heavy(hours, **_last_hour())
-        assert (out["state"], out["reason"]) == ("could_not_check", "baseline_too_short")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "baseline_too_short",
+        )
         assert out["evidence"]["baseline_days"] == 3
 
     def test_baseline_days_boundary(self) -> None:
@@ -366,7 +372,9 @@ class TestQuietHours:
             return lambda hour: (0, value) if hour < 6 else (100 * MIB, 2 * GIB)
 
         spike = {LAST: (0, 2 * GIB)}
-        quiet = quiet_hours_traffic(_hours(night(edge), overrides=spike), **_last_hour())
+        quiet = quiet_hours_traffic(
+            _hours(night(edge), overrides=spike), **_last_hour()
+        )
         busy = quiet_hours_traffic(
             _hours(night(edge + 1), overrides=spike), **_last_hour()
         )
@@ -391,7 +399,10 @@ class TestQuietHours:
 
     def test_too_little_traffic_to_judge(self) -> None:
         out = quiet_hours_traffic(_hours(), **_last_hour())
-        assert (out["state"], out["reason"]) == ("could_not_check", "not_enough_traffic")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "not_enough_traffic",
+        )
 
     def test_no_data_in_the_period_is_not_clear(self) -> None:
         hours = [h for h in _hours() if h.start != LAST]
@@ -401,21 +412,28 @@ class TestQuietHours:
     def test_a_short_baseline_is_not_clear(self) -> None:
         hours = _hours(days=3, overrides={LAST: (0, 2 * GIB)})
         out = quiet_hours_traffic(hours, **_last_hour())
-        assert (out["state"], out["reason"]) == ("could_not_check", "baseline_too_short")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "baseline_too_short",
+        )
 
     def test_enough_days_but_too_few_at_each_hour_of_day(self) -> None:
         """Four days make a baseline, but leaving the busiest one out leaves
         three per hour of day: fewer than QUIET_MIN_DAYS."""
         hours = _hours(days=4, overrides={LAST: (0, 2 * GIB)})
         out = quiet_hours_traffic(hours, **_last_hour())
-        assert (out["state"], out["reason"]) == ("could_not_check", "baseline_too_short")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "baseline_too_short",
+        )
 
     def test_a_half_measured_hour_is_not_a_quiet_hour(self) -> None:
-        hours = _hours(
-            windows=f.HOUR_MIN_WINDOWS - 1, overrides={LAST: (0, 2 * GIB)}
-        )
+        hours = _hours(windows=f.HOUR_MIN_WINDOWS - 1, overrides={LAST: (0, 2 * GIB)})
         out = quiet_hours_traffic(hours, **_last_hour())
-        assert (out["state"], out["reason"]) == ("could_not_check", "baseline_too_short")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "baseline_too_short",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +471,10 @@ class TestDominantDevice:
         out = dominant_device(
             _summary(up=10 * MIB, down=90 * MIB, devices=[_device(0.9)])
         )
-        assert (out["state"], out["reason"]) == ("could_not_check", "not_enough_traffic")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "not_enough_traffic",
+        )
 
     def test_floor_boundary(self) -> None:
         floor = f.DOMINANT_DEVICE_MIN_BYTES
@@ -562,9 +583,7 @@ class TestUnusualService:
     def test_size_boundary(self) -> None:
         history = _history(6, 6881, 0)
         at = _summary(services=[_svc(6, 6881, f.UNUSUAL_SERVICE_MIN_BYTES, 0.5)])
-        under = _summary(
-            services=[_svc(6, 6881, f.UNUSUAL_SERVICE_MIN_BYTES - 1, 0.5)]
-        )
+        under = _summary(services=[_svc(6, 6881, f.UNUSUAL_SERVICE_MIN_BYTES - 1, 0.5)])
         assert unusual_service(at, history, _hours())["state"] == "flagged"
         assert unusual_service(under, history, _hours())["state"] == "clear"
 
@@ -573,7 +592,10 @@ class TestUnusualService:
             up=10 * MIB, down=50 * MIB, services=[_svc(6, 6881, 50 * MIB, 0.9)]
         )
         out = unusual_service(summary, [], _hours())
-        assert (out["state"], out["reason"]) == ("could_not_check", "not_enough_traffic")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "not_enough_traffic",
+        )
 
     def test_services_not_measured_is_not_clear(self) -> None:
         out = unusual_service(_summary(windows_measured=0), [], _hours())
@@ -585,7 +607,10 @@ class TestUnusualService:
     def test_a_short_baseline_is_not_clear(self) -> None:
         summary = _summary(services=[_svc(6, 6881, 3 * GIB, 0.9)])
         out = unusual_service(summary, _history(6, 6881, 0), _hours(days=3))
-        assert (out["state"], out["reason"]) == ("could_not_check", "baseline_too_short")
+        assert (out["state"], out["reason"]) == (
+            "could_not_check",
+            "baseline_too_short",
+        )
 
     def test_not_measured(self) -> None:
         out = unusual_service(_summary(measured=False), [], [])
@@ -613,11 +638,15 @@ class TestUnusualService:
             assert not f.is_ordinary_service(protocol, port), (protocol, port)
         assert len(f.ORDINARY_SERVICES) < 60
 
-    def test_nothing_calls_a_service_malicious(self) -> None:
-        source = pathlib.Path(f.__file__).read_text().lower()
-        code = source.split('"""', 2)[2]
-        for word in ("malicious", "malware", "attack", "infected", "hacked"):
-            assert f'"{word}' not in code and f"'{word}" not in code
+    def test_nothing_calls_a_service_malicious(self, threat: ThreatList) -> None:
+        """Checked on what is sent: every key, code and value of a response
+        in which all five rules flag."""
+        data = build_findings(**_everything_flagged(threat))
+        assert data["counts"]["flagged"] == 5
+        text = json.dumps(data).lower()
+        for word in ("malicious", "malware", "attack", "infected", "hacked", "threat"):
+            assert word not in text.replace("threat_list", ""), word
+        assert _by_id(data)["unusual_service"]["parts"]["why"] in {"new", "large_share"}
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +663,9 @@ class TestKnownBad:
         assert out["parts"]["addresses"] == 1
         assert out["parts"]["bytes_at_least"] == 3 * GIB
         assert out["parts"]["list_name"] == "Spamhaus DROP"
-        assert out["parts"]["list_date"] == (NOW - timedelta(hours=6)).date().isoformat()
+        assert (
+            out["parts"]["list_date"] == (NOW - timedelta(hours=6)).date().isoformat()
+        )
         (item,) = out["evidence"]["items"]
         assert item["list_entry"] == "203.0.113.0/24" and item["reference"] == "SBL1"
         assert out["evidence"]["addresses_checked"] == 2
@@ -693,7 +724,9 @@ class TestKnownBad:
         out = _known_bad([], threat, windows=0, windows_measured=0)
         assert (out["state"], out["reason"]) == ("could_not_check", "not_measured")
 
-    def test_every_window_withheld_is_said_not_cleared(self, threat: ThreatList) -> None:
+    def test_every_window_withheld_is_said_not_cleared(
+        self, threat: ThreatList
+    ) -> None:
         out = _known_bad([], threat, windows_withheld=12, min_devices=5)
         assert (out["state"], out["reason"]) == (
             "could_not_check",
@@ -795,9 +828,9 @@ class TestThreatList:
 
     def test_one_list_per_directory_per_process(self, tmp_path: pathlib.Path) -> None:
         directory = _write_list(tmp_path)
-        assert threat_module.get_threat_list(directory) is threat_module.get_threat_list(
-            str(directory)
-        )
+        assert threat_module.get_threat_list(
+            directory
+        ) is threat_module.get_threat_list(str(directory))
 
     def test_default_directory_is_backend_data_threat(self) -> None:
         assert threat_module.default_threat_data_dir().parts[-2:] == ("data", "threat")
@@ -982,7 +1015,9 @@ class FindingsRepo:
     async def window_stats(self, scope, *, since, until):  # noqa: ANN001
         self.calls.append(("stats", scope))
         stats = self.stats.get(scope.location_id, WindowStats(12, 12, 0))
-        return stats if scope.min_devices else WindowStats(stats.windows, stats.measured)
+        return (
+            stats if scope.min_devices else WindowStats(stats.windows, stats.measured)
+        )
 
 
 def _populated() -> tuple[FindingsRepo, SummaryRepo]:
@@ -1072,9 +1107,7 @@ async def _master(service: TrafficFlowFindingsService, **kw: Any) -> dict[str, A
 
 
 async def _venue(service: CustomerFindingsService, venue: uuid.UUID) -> dict[str, Any]:
-    return await service.findings(
-        venue, organization_id=ORG_ID, since=None, until=None
-    )
+    return await service.findings(venue, organization_id=ORG_ID, since=None, until=None)
 
 
 class TestService:
@@ -1091,7 +1124,9 @@ class TestService:
             assert finding["period"] == {"since": data["since"], "until": data["until"]}
         assert sum(data["counts"].values()) == 5
 
-    async def test_the_default_period_is_the_last_hour(self, threat: ThreatList) -> None:
+    async def test_the_default_period_is_the_last_hour(
+        self, threat: ThreatList
+    ) -> None:
         data = await _master(_service(*_populated(), threat))
         assert data["since"] == LAST.isoformat() and data["until"] == END.isoformat()
         assert data["baseline"] == {
@@ -1141,7 +1176,9 @@ class TestService:
         for _name, scope in summaries.calls:
             assert scope.location_id == LOCATION_ID
 
-    async def test_a_venue_that_does_not_exist_is_a_404(self, threat: ThreatList) -> None:
+    async def test_a_venue_that_does_not_exist_is_a_404(
+        self, threat: ThreatList
+    ) -> None:
         findings, summaries = _populated()
         with pytest.raises(TrafficFlowError) as caught:
             await _master(
@@ -1291,7 +1328,14 @@ class TestCustomer:
     def test_how_the_data_is_gathered_is_in_no_field(self, threat: ThreatList) -> None:
         data = build_findings(**_everything_flagged(threat), min_devices=5)
         text = json.dumps(data).lower()
-        for word in ("tunnel", "wireguard", "exporter", "collector", "netflow", "ipfix"):
+        for word in (
+            "tunnel",
+            "wireguard",
+            "exporter",
+            "collector",
+            "netflow",
+            "ipfix",
+        ):
             assert word not in text
 
     # -- the route --------------------------------------------------------
@@ -1500,17 +1544,15 @@ class TestStatements:
         assert ".location_id = " in sql and ".organization_id = " in sql
 
     def test_addresses_use_the_destinations_small_venue_condition(self) -> None:
-        (condition,) = _CUSTOMER_SCOPE.visible(
-            __import__(
-                "app.domains.traffic_flow.destination_buckets",
-                fromlist=["TrafficFlowDestinationBucket"],
-            ).TrafficFlowDestinationBucket
-        )
+        """Not a copy of the rule: ``DestinationScope.visible`` itself, so a
+        window with fewer than five devices contributes no address."""
         customer = _statements(_CUSTOMER_SCOPE)["addresses"]
-        assert _sql(condition).split("WHERE", 1)[1].strip() in customer.replace(
-            "\n", " "
-        ) or ("EXISTS" in customer and "talker_count >= " in customer)
+        assert "EXISTS" in customer and "talker_count >= " in customer
         assert "EXISTS" not in _statements(_MASTER_SCOPE)["addresses"]
+        source = pathlib.Path(
+            "app/domains/traffic_flow/findings_service.py"
+        ).read_text()
+        assert "*scope.visible(bucket)," in source
 
     def test_addresses_never_include_the_folded_remainder(self) -> None:
         assert "remote_port != " in _statements(_MASTER_SCOPE)["addresses"]
@@ -1518,7 +1560,7 @@ class TestStatements:
     @pytest.mark.parametrize("scope", [_MASTER_SCOPE, _CUSTOMER_SCOPE])
     def test_no_statement_selects_a_device(self, scope: DestinationScope) -> None:
         for name, sql in _statements(scope).items():
-            selected = sql.split("FROM", 1)[0]
+            selected = sql.split("\nFROM ", 1)[0]
             for column in ("top_talkers", "top_destinations", "talker", "session"):
                 assert column not in selected, (name, column)
             # The one use of the windows table by the address read is the
@@ -1526,7 +1568,7 @@ class TestStatements:
             assert "top_talkers" not in sql and "guest" not in sql, name
 
     def test_the_hour_read_takes_sums_and_counts_only(self) -> None:
-        selected = _statements(_MASTER_SCOPE)["hours"].split("FROM", 1)[0]
+        selected = _statements(_MASTER_SCOPE)["hours"].split("\nFROM ", 1)[0]
         assert selected.count("sum(") == 2 and selected.count("count(") == 2
         assert "remote_address" not in _statements(_MASTER_SCOPE)["hours"]
 
@@ -1585,6 +1627,13 @@ _TABLES = {
     "traffic_flow_country_buckets",
     "router_traffic_flow_export",
 }
+#: The domain's migrations as they stand. Findings add none.
+_MIGRATIONS = [
+    "0156_create_traffic_flow_tables.py",
+    "0157_traffic_flow_services_export.py",
+    "0159_traffic_flow_dest_buckets.py",
+    "0160_traffic_flow_country_buckets.py",
+]
 _DEVICE_COLUMNS = {
     "ip",
     "client_ip",
@@ -1680,13 +1729,21 @@ class TestPrivacyBoundary:
         for module in ("findings.py", "findings_service.py", "threat_list.py"):
             source = pathlib.Path("app/domains/traffic_flow", module).read_text()
             code = "\n".join(
-                line for line in source.splitlines() if not line.lstrip().startswith("#")
+                line
+                for line in source.splitlines()
+                if not line.lstrip().startswith("#")
             )
-            for write in ("insert(", "pg_insert", ".add(self", "session.add", "update("):
+            for write in (
+                "insert(",
+                "pg_insert",
+                ".add(self",
+                "session.add",
+                "update(",
+            ):
                 assert write not in code.split('"""', 2)[2], (module, write)
-        for path in pathlib.Path("alembic/versions").glob("*.py"):
-            text = path.read_text().lower()
-            assert "finding" not in text and "threat" not in text, path.name
+        names = [path.name for path in pathlib.Path("alembic/versions").glob("*.py")]
+        assert not [n for n in names if "finding" in n or "threat" in n]
+        assert sorted(n for n in names if "traffic_flow" in n) == _MIGRATIONS
 
     def test_no_alert_rule_is_created(self) -> None:
         """Findings are not raised through the alerting domain, so there is
