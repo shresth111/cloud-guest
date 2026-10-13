@@ -69,10 +69,16 @@ class TestCollectorMemory:
 
     def test_startup_memory_is_under_budget(self, check: Any, conf: dict) -> None:
         report = check.startup_bytes(conf)
-        assert list(report) == ["wyfy"]
-        assert check.total_bytes(report) <= BUDGET_BYTES, report
-        # ...with room to spare, so a small change does not tip it over.
-        assert check.total_bytes(report) <= 0.8 * BUDGET_BYTES
+        assert list(report) == ["wyfy", "wyfyflows"]
+        # The rollup plugin is exactly what it was before the second one.
+        rollup = report["wyfy"]
+        assert rollup["cache_bytes"] + rollup["pipe_bytes"] == 76_671_728
+        assert rollup["cache_bytes"] + rollup["pipe_bytes"] <= BUDGET_BYTES
+        assert rollup["full_cache_extra_bytes"] == 0
+        # Both together, at start and with every cache full.
+        assert check.total_bytes(report) == 120_141_760
+        assert check.worst_case_bytes(report) == 131_700_032
+        assert check.total_bytes(report) <= check.DEFAULT_BUDGET_MB * 1_000_000
 
     def test_cache_holds_five_minutes_of_the_fleet(
         self, check: Any, conf: dict

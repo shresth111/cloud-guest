@@ -872,6 +872,7 @@ class TestHubArtifacts:
 
     def test_collector_aggregates_on_protocol_and_both_ports(self) -> None:
         fields = [f.strip() for f in self._conf()["aggregate[wyfy]"].split(",")]
+        # The rollup's KEYS are unchanged; "flows" is a counter, not a key.
         assert fields == [
             "peer_src_ip",
             "src_host",
@@ -879,6 +880,7 @@ class TestHubArtifacts:
             "proto",
             "src_port",
             "dst_port",
+            "flows",
         ]
 
     def test_templates_survive_a_restart(self) -> None:
