@@ -8672,7 +8672,7 @@ class RadiusService:
             rate_limit=(
                 None
                 if is_nas_only(router)
-                else await self._resolve_rate_limit_reply(session.id)
+                else await self._resolve_rate_limit_reply(session.id, session=session)
             ),
         )
 
@@ -8730,15 +8730,36 @@ class RadiusService:
             return candidate
         return None
 
-    async def _resolve_rate_limit_reply(self, session_id: uuid.UUID) -> str | None:
+    async def _resolve_rate_limit_reply(
+        self, session_id: uuid.UUID, *, session: GuestSession | None = None
+    ) -> str | None:
         """Best-effort, additive ``Mikrotik-Rate-Limit`` resolution -- see
         ``QueueRateLimitLookupProtocol``'s own docstring. A no-op when no
         ``queue_lookup`` hook was wired (the default); never raises, since
         a queue-lookup failure must never turn an otherwise-valid
-        authorize into a reject."""
+        authorize into a reject.
+
+        A hook that can also answer for a session with no queue assignment
+        (``rate_limit_reply_for_authorize``) is told whose session this is,
+        so a guest whose queue never reached the router is still given a
+        speed -- see ``QueueManagementService.rate_limit_reply_for_authorize``
+        for when the attribute is and is not sent. A hook without it is
+        asked exactly as before."""
         if self.queue_lookup is None:
             return None
         try:
+            for_authorize = getattr(
+                self.queue_lookup, "rate_limit_reply_for_authorize", None
+            )
+            if for_authorize is not None and session is not None:
+                return await for_authorize(
+                    session_id,
+                    organization_id=session.organization_id,
+                    location_id=session.location_id,
+                    router_id=session.router_id,
+                    guest_id=session.guest_id,
+                    session_started_at=session.started_at,
+                )
             return await self.queue_lookup.get_rate_limit_reply_for_session(session_id)
         except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
             logger.warning(

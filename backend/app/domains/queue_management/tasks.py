@@ -46,6 +46,7 @@ from app.domains.router.service import RouterService
 
 from .constants import (
     BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+    REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS,
     TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES,
     TASK_REAPPLY_POLICY_ASSIGNMENTS,
     TASK_RELEASE_ENDED_SESSION_QUEUES,
@@ -485,17 +486,36 @@ def reapply_policy_assignments(
         result = run_celery_task(
             _reapply_policy_assignments_async(policy_id, version_id, location_id)
         )
-        logger.info(
-            "queue_management_task_reapply_policy_assignments_completed",
-            extra=result,
-        )
-        return result
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "queue_management_task_reapply_policy_assignments_failed",
             extra={"policy_id": policy_id, "error": str(exc)},
         )
-        raise self.retry(exc=exc, countdown=30) from exc
+        raise self.retry(
+            exc=exc, countdown=REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS
+        ) from exc
+    logger.info(
+        "queue_management_task_reapply_policy_assignments_completed",
+        extra=result,
+    )
+    # A guest whose write failed is still at the speed they had -- the new
+    # row is written before the old one is touched -- and nothing else
+    # comes back for them: every later re-apply is somebody saving a policy
+    # again. So a run that left work undone runs again, while it has
+    # retries left. What already succeeded costs the repeat no device call.
+    if reapply_should_run_again(
+        result, retries=self.request.retries, max_retries=self.max_retries
+    ):
+        raise self.retry(countdown=REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS)
+    return result
+
+
+def reapply_should_run_again(
+    result: dict[str, int], *, retries: int, max_retries: int | None
+) -> bool:
+    """Whether a policy re-apply that finished should be run once more: it
+    left at least one guest's write failed, and the task has a retry left."""
+    return bool(result.get("failed")) and retries < (max_retries or 0)
 
 
 async def _sweep_schedule_transitions_async() -> dict[str, int]:

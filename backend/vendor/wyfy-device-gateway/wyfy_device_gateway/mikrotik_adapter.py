@@ -69,6 +69,7 @@ on top if/when it migrates this call site (e.g. via ``creds.extra``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import logging
@@ -7468,6 +7469,8 @@ class MikroTikAdapter:
         path_segments: tuple[str, ...],
         fields: dict[str, str],
         operation: str,
+        supersede_name_prefix: str | None = None,
+        keep_queue_ids: tuple[str, ...] = (),
     ) -> str:
         api = self._connect_api(creds)
         try:
@@ -7477,6 +7480,26 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
             if path_segments == _SIMPLE_QUEUE_PATH:
                 _raise_simple_queue_to_top(api, creds.host, str(device_queue_id))
+                if supersede_name_prefix:
+                    try:
+                        _remove_superseded_simple_queues(
+                            api,
+                            creds.host,
+                            str(device_queue_id),
+                            supersede_name_prefix,
+                            keep_queue_ids,
+                        )
+                    except LibRouterosError as exc:
+                        # A row for this address that could not be taken
+                        # away may be the one that governs. The caller is
+                        # told the write failed, and the row just added is
+                        # taken back so the device is as it was found --
+                        # the caller will not record an id for it.
+                        with contextlib.suppress(LibRouterosError):
+                            api.path(*path_segments).remove(str(device_queue_id))
+                        raise MikroTikDeviceError(
+                            creds.host, f"{operation}: superseded row: {exc}"
+                        ) from exc
             return device_queue_id
         finally:
             api.close()
@@ -7529,7 +7552,19 @@ class MikroTikAdapter:
         burst_time_seconds: int | None = None,
         priority: int = 8,
         parent: str | None = None,
+        supersede_name_prefix: str | None = None,
+        keep_queue_ids: Sequence[str] = (),
     ) -> str:
+        """Adds a ``/queue simple`` row and moves it to the top of the list
+        (see ``_raise_simple_queue_to_top``).
+
+        ``supersede_name_prefix`` makes the new row the *only* row of its
+        kind for its address: once it is on the device, every other static
+        row named ``<prefix><uuid>`` whose target is exactly the same
+        single host is removed, in the same connection. See
+        ``_remove_superseded_simple_queues`` for why the order of the list
+        is not enough. ``keep_queue_ids`` are rows to leave alone whatever
+        they target."""
         fields = {
             "name": name,
             "target": target,
@@ -7550,6 +7585,8 @@ class MikroTikAdapter:
             ("queue", "simple"),
             fields,
             "create_simple_queue",
+            supersede_name_prefix,
+            tuple(str(i) for i in keep_queue_ids if i),
         )
 
     async def sync_venue_simple_queue(
@@ -9133,6 +9170,88 @@ def _raise_simple_queue_to_top(api, host: str, device_queue_id: str) -> None:  #
                 },
             )
             return
+
+
+def _is_prefixed_uuid_name(name: str | None, prefix: str) -> bool:
+    """Whether ``name`` is ``<prefix><uuid>`` and nothing else -- the shape
+    of a per-guest row's name. ``<prefix>venue-...`` and ``<prefix>qos-...``
+    share the prefix and are other things."""
+    if not name or not name.startswith(prefix):
+        return False
+    try:
+        uuid.UUID(name[len(prefix) :])
+    except ValueError:
+        return False
+    return True
+
+
+def _remove_superseded_simple_queues(  # noqa: ANN001
+    api,
+    host: str,
+    device_queue_id: str,
+    name_prefix: str,
+    keep_queue_ids: tuple[str, ...] = (),
+) -> int:
+    """Remove every other static ``/queue simple`` row named
+    ``<name_prefix><uuid>`` that targets exactly the single host
+    ``device_queue_id`` targets; returns how many went.
+
+    RouterOS applies the first matching simple queue in list order, so two
+    rows for one address are one limit and one row that does nothing --
+    and which is which is decided by the list, not by which is newer. The
+    caller's own bookkeeping removes the row a new one replaces, but as a
+    separate step, on a separate connection, after the new row is written:
+    when that step fails, or its record is rolled back, the old row stays.
+    Where the old row is an unlimited one (``max-limit=0/0``, what "no
+    limit" is written as) and it sits above the new one, the guest runs at
+    full speed under a limit the venue has just set. Observed on hardware
+    as several rows per address with a ``0/0`` row on top.
+
+    Moving the new row to the top covers that only while the move works
+    and nothing is added above it later. Taking the other rows away covers
+    it whatever the order is.
+
+    What is never touched: the row itself; a dynamic row (the device's
+    own -- the hotspot's ``<hotspot-...>`` rows are these, and cannot be
+    removed anyway); a row with any other name; a row whose target is not
+    exactly this one host, which is what keeps a venue's parent row and
+    every other guest's row out of it; and ``keep_queue_ids``.
+
+    A row that has already gone is not an error. Anything else the device
+    refuses is raised to the caller."""
+    path = api.path(*_SIMPLE_QUEUE_PATH)
+    rows = [dict(row) for row in path]
+    ours = next((r for r in rows if str(r.get(".id")) == device_queue_id), None)
+    if ours is None or not _targets_single_hosts(ours):
+        return 0
+    targets = _simple_queue_targets(ours)
+    removed: list[str] = []
+    for row in rows:
+        row_id = str(row.get(".id"))
+        if row_id == device_queue_id or row_id in keep_queue_ids:
+            continue
+        if _is_truthy(row.get("dynamic")):
+            continue
+        if not _is_prefixed_uuid_name(_safe_str(row.get("name")), name_prefix):
+            continue
+        if _simple_queue_targets(row) != targets:
+            continue
+        try:
+            path.remove(row_id)
+        except LibRouterosError as exc:
+            if "no such item" not in str(exc).lower():
+                raise
+        removed.append(_safe_str(row.get("name")) or row_id)
+    if removed:
+        logger.info(
+            "simple_queue_superseded_rows_removed",
+            extra={
+                "host": host,
+                "device_queue_id": device_queue_id,
+                "removed_rows": removed,
+            },
+        )
+    return len(removed)
 
 
 def _max_limit_field(upload_rate_kbps: int, download_rate_kbps: int) -> dict[str, str]:

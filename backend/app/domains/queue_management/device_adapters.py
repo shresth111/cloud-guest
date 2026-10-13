@@ -133,12 +133,18 @@ class BaseQueueAdapter(Protocol):
         burst_time_seconds: int | None = None,
         priority: int = DEFAULT_QUEUE_PRIORITY,
         parent: str | None = None,
+        supersede_name_prefix: str | None = None,
+        keep_queue_ids: Sequence[str] = (),
     ) -> str:
         """Creates a real ``/queue simple`` entry. Returns the device-side
         queue id. ``parent`` names the venue's total-cap row this entry is
         created under (see ``sync_venue_queue``); callers pass it only when
         there is one, so an adapter written before it existed keeps
-        working."""
+        working. ``supersede_name_prefix`` makes the new entry the only one
+        of that name prefix for its address: every other such entry for
+        exactly the same single host is removed once the new one is on the
+        device, except ``keep_queue_ids``. Passed only for a guest
+        session's own entry."""
         ...
 
     async def sync_venue_queue(
@@ -309,6 +315,8 @@ class MikroTikQueueAdapter:
         burst_time_seconds: int | None = None,
         priority: int = DEFAULT_QUEUE_PRIORITY,
         parent: str | None = None,
+        supersede_name_prefix: str | None = None,
+        keep_queue_ids: Sequence[str] = (),
     ) -> str:
         creds = self._gateway_credentials(credentials)
         try:
@@ -324,6 +332,8 @@ class MikroTikQueueAdapter:
                 burst_time_seconds=burst_time_seconds,
                 priority=priority,
                 parent=parent,
+                supersede_name_prefix=supersede_name_prefix,
+                keep_queue_ids=tuple(keep_queue_ids),
             )
         except MikroTikConnectionError as exc:
             raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
