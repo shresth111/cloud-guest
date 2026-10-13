@@ -16,12 +16,12 @@ false) and the router's own export switch is on.
 
 Idempotent (``IF NOT EXISTS`` throughout), like its neighbours.
 
-Numbered 0162 because a sibling branch has 0161 (bucket packets). Both were
-cut from 0160: whichever merges second must repoint its ``down_revision``
-at the other, or the graph has two heads.
+Chained on 0161 (bucket packets), the head of ``main`` when this was
+opened. If another revision lands on 0161 first, repoint this one, or the
+graph has two heads.
 
 Revision ID: 0162_traffic_flow_records
-Revises: 0160_traffic_flow_country_buckets
+Revises: 0161_traffic_flow_bucket_packets
 Create Date: 2026-10-13
 """
 
@@ -30,7 +30,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "0162_traffic_flow_records"
-down_revision = "0160_traffic_flow_country_buckets"
+down_revision = "0161_traffic_flow_bucket_packets"
 branch_labels = None
 depends_on = None
 
