@@ -3056,13 +3056,13 @@ class TestPacketsMigration:
             if f'down_revision = "{module.down_revision}"' in path.read_text()
         ]
         assert siblings == [PACKETS_MIGRATION]
-        # Fails the day another revision chains on this one's parent or on
-        # this one: re-check the head before merging.
-        assert not [
+        # One revision follows this one (flow records). A second child
+        # would be a second head.
+        assert [
             path.name
             for path in VERSIONS.glob("*.py")
             if f'down_revision = "{module.revision}"' in path.read_text()
-        ]
+        ] == ["0162_traffic_flow_records.py"]
 
     def test_columns_are_added_nullable_with_no_default_and_no_backfill(self) -> None:
         statements = _statements(PACKETS_MIGRATION)

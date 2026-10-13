@@ -1627,6 +1627,14 @@ _TABLES = {
     "traffic_flow_country_buckets",
     "router_traffic_flow_export",
 }
+#: The flow-records feature's own tables. They DO hold a device beside a
+#: destination, by a separate owner decision, behind their own switch and
+#: add-on; findings neither read nor write them, so the pairing check below
+#: covers ``_TABLES`` only.
+_FLOW_RECORD_TABLES = {
+    "traffic_flow_records",
+    "traffic_flow_record_caps",
+}
 #: The domain's migrations as they stand. Findings add none.
 _MIGRATIONS = [
     "0156_create_traffic_flow_tables.py",
@@ -1634,6 +1642,7 @@ _MIGRATIONS = [
     "0159_traffic_flow_dest_buckets.py",
     "0160_traffic_flow_country_buckets.py",
     "0161_traffic_flow_bucket_packets.py",
+    "0162_traffic_flow_records.py",
 ]
 _DEVICE_COLUMNS = {
     "ip",
@@ -1705,7 +1714,7 @@ class TestPrivacyBoundary:
             for name in Base.metadata.tables
             if "traffic_flow" in name or "finding" in name or "threat" in name
         }
-        assert tables == _TABLES
+        assert tables == _TABLES | _FLOW_RECORD_TABLES
 
     def test_no_table_holds_a_device_beside_a_destination(self) -> None:
         import app.domains.traffic_flow.models  # noqa: F401

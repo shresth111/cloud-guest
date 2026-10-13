@@ -1452,6 +1452,9 @@ class TestAuthorization:
             "/traffic-flow/locations/{location_id}/destinations",
             "/traffic-flow/locations/{location_id}/destinations/export",
             "/traffic-flow/locations/{location_id}/services/destinations",
+            # Flow records, behind the SECOND add-on (traffic_flow_records).
+            "/traffic-flow/locations/{location_id}/flows",
+            "/traffic-flow/locations/{location_id}/flows/export",
             "/traffic-flow/locations/{location_id}/geo",
             "/traffic-flow/locations/{location_id}/findings",
         }

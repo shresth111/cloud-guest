@@ -159,6 +159,15 @@ class PlanFeatureKey(StrEnum):
     # Master console's own traffic-flow screens do not depend on it, and it
     # does not switch collection on for any router.
     TRAFFIC_FLOW = "traffic_flow"
+    # -- Traffic flow records, customer side: the per-flow table (source and
+    # destination address and port, NAT, bytes) for the customer's own venue.
+    # A SECOND add-on on top of TRAFFIC_FLOW (see FEATURE_REQUIRES), because
+    # a row puts a device beside the address it reached and the aggregates
+    # do not. BOOLEAN, off by default, carried by no seeded plan, unlocked
+    # per organization from the Master console and never implied by
+    # TRAFFIC_FLOW. It does not switch record storage on: that is the
+    # platform's CLOUDGUEST_TRAFFIC_FLOW_RECORDS_ENABLED.
+    TRAFFIC_FLOW_RECORDS = "traffic_flow_records"
 
 
 class PlanFeatureType(StrEnum):
@@ -233,6 +242,7 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.GUEST_MARKETING,
         PlanFeatureKey.GUEST_MARKETING_BYO,
         PlanFeatureKey.TRAFFIC_FLOW,
+        PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
     }
 )
 
@@ -246,6 +256,7 @@ ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.GUEST_MARKETING,
         PlanFeatureKey.GUEST_MARKETING_BYO,
         PlanFeatureKey.TRAFFIC_FLOW,
+        PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
     }
 )
 
@@ -255,6 +266,8 @@ ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
 # is off while Guest Marketing itself is locked.
 FEATURE_REQUIRES: dict[PlanFeatureKey, PlanFeatureKey] = {
     PlanFeatureKey.GUEST_MARKETING_BYO: PlanFeatureKey.GUEST_MARKETING,
+    # Flow records are a view inside the Traffic Lens page.
+    PlanFeatureKey.TRAFFIC_FLOW_RECORDS: PlanFeatureKey.TRAFFIC_FLOW,
 }
 TIER_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset({PlanFeatureKey.SUPPORT_LEVEL})
 

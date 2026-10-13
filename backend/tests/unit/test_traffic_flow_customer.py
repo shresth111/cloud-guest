@@ -595,7 +595,12 @@ class TestEntitlement:
         key = PlanFeatureKey.TRAFFIC_FLOW
         assert key.value == "traffic_flow"
         assert key in ADDON_FEATURE_KEYS and key in BOOLEAN_FEATURE_KEYS
-        assert key not in FEATURE_REQUIRES and key not in FEATURE_REQUIRES.values()
+        # It needs nothing itself; the flow-records add-on is the one key
+        # that needs it.
+        assert key not in FEATURE_REQUIRES
+        assert [k for k, v in FEATURE_REQUIRES.items() if v is key] == [
+            PlanFeatureKey.TRAFFIC_FLOW_RECORDS
+        ]
 
     async def test_it_is_off_by_default_and_named_for_the_panel(self) -> None:
         from app.domains.feature_entitlement.service import (

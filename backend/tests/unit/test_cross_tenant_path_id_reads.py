@@ -533,6 +533,11 @@ _PATH_ID_ROUTES = [
     ("/api/v1/traffic-flow/locations/{location_id}/destinations", "GET"),
     ("/api/v1/traffic-flow/locations/{location_id}/destinations/export", "GET"),
     ("/api/v1/traffic-flow/locations/{location_id}/services/destinations", "GET"),
+    # Flow records for the same venue (second add-on). Same venue check
+    # before any read (CustomerFlowRecordService). Behavioural half:
+    # tests/unit/test_traffic_flow_records.py::TestCustomer.
+    ("/api/v1/traffic-flow/locations/{location_id}/flows", "GET"),
+    ("/api/v1/traffic-flow/locations/{location_id}/flows/export", "GET"),
     # The same venue's traffic by country and network: same guards, same
     # venue check before any read (CustomerGeoService). Behavioural half:
     # tests/unit/test_traffic_flow_geo.py::TestCustomerGeo.
