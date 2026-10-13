@@ -60,7 +60,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database.base import Base
 
 from .constants import OTHER_SERVICE_PORT
-from .ingest import ExporterWindow
+from .ingest import ExporterWindow, packets_pair
 
 __all__ = [
     "DESTINATION_BUCKET_RETENTION_FACTOR",
@@ -130,6 +130,11 @@ class TrafficFlowDestinationBucket(Base):
     bytes_up: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     bytes_down: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     flows: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    #: Packets by direction. NULL = not measured: a row written before
+    #: packets were recorded (revision 0161), or a window whose collector
+    #: rows carried no packet count. Never read NULL as 0.
+    packets_up: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    packets_down: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -169,36 +174,57 @@ def destination_rows(
     if not window.services_measured:
         return []
     merged: dict[tuple[str, int, int], list[int]] = {}
+    merged_packets: dict[tuple[str, int, int], list[int]] = {}
     for (address, protocol, port), totals in window.destination_services.items():
-        entry = merged.setdefault((_canonical(address), protocol, port), [0, 0, 0])
+        key = (_canonical(address), protocol, port)
+        entry = merged.setdefault(key, [0, 0, 0])
         for index in range(3):
             entry[index] += totals[index]
+        packets = window.destination_service_packets.get(
+            (address, protocol, port), [0, 0]
+        )
+        entry_packets = merged_packets.setdefault(key, [0, 0])
+        entry_packets[0] += packets[0]
+        entry_packets[1] += packets[1]
     ranked = sorted(merged.items(), key=lambda kv: (-(kv[1][0] + kv[1][1]), kv[0]))
-    rows: list[dict[str, Any]] = [
-        {
+
+    def _row(
+        address: str, protocol: int, port: int, totals: list[int], packets: list[int]
+    ) -> dict[str, Any]:
+        packets_up, packets_down = packets_pair(window, packets)
+        return {
             "remote_address": address,
             "protocol": protocol,
             "remote_port": port,
             "bytes_up": totals[0],
             "bytes_down": totals[1],
             "flows": totals[2],
+            "packets_up": packets_up,
+            "packets_down": packets_down,
         }
+
+    rows: list[dict[str, Any]] = [
+        _row(address, protocol, port, totals, merged_packets[(address, protocol, port)])
         for (address, protocol, port), totals in ranked[:limit]
     ]
     folded: dict[int, list[int]] = {}
-    for (_address, protocol, _port), totals in ranked[limit:]:
+    folded_packets: dict[int, list[int]] = {}
+    for key, totals in ranked[limit:]:
+        protocol = key[1]
         rest = folded.setdefault(protocol, [0, 0, 0])
         for index in range(3):
             rest[index] += totals[index]
+        rest_packets = folded_packets.setdefault(protocol, [0, 0])
+        rest_packets[0] += merged_packets[key][0]
+        rest_packets[1] += merged_packets[key][1]
     rows.extend(
-        {
-            "remote_address": OTHER_DESTINATION_ADDRESS,
-            "protocol": protocol,
-            "remote_port": OTHER_SERVICE_PORT,
-            "bytes_up": totals[0],
-            "bytes_down": totals[1],
-            "flows": totals[2],
-        }
+        _row(
+            OTHER_DESTINATION_ADDRESS,
+            protocol,
+            OTHER_SERVICE_PORT,
+            totals,
+            folded_packets[protocol],
+        )
         for protocol, totals in sorted(folded.items())
     )
     return rows
