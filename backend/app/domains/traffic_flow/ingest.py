@@ -57,6 +57,7 @@ __all__ = [
     "TalkerTotals",
     "attribute_talkers",
     "is_local_address",
+    "packets_pair",
     "parse_protocol",
     "reduce_window",
     "service_rows",
@@ -104,8 +105,17 @@ class ExporterWindow:
     destination_services: dict[tuple[str, int, int], list[int]] = field(
         default_factory=dict
     )
+    # Packets, alongside the two maps above and under the same keys:
+    # -> [packets_up, packets_down]. Separate maps so the byte/flow triples
+    # keep their shape.
+    service_packets: dict[tuple[int, int], list[int]] = field(default_factory=dict)
+    destination_service_packets: dict[tuple[str, int, int], list[int]] = field(
+        default_factory=dict
+    )
     rows_with_service: int = 0
     rows_without_service: int = 0
+    # Client-traffic service rows whose ``packets`` was absent or unreadable.
+    service_rows_without_packets: int = 0
     bytes_total: int = 0
     bytes_up: int = 0
     bytes_down: int = 0
@@ -116,12 +126,43 @@ class ExporterWindow:
     rows_rejected: int = 0
 
     @property
+    def packets_measured(self) -> bool:
+        """Every client-traffic service row of the window carried a packet
+        count. All or nothing, like ``services_measured``: a bucket summed
+        from some rows with packets and some without would be a number that
+        looks complete and is not."""
+        return self.services_measured and self.service_rows_without_packets == 0
+
+    @property
     def services_measured(self) -> bool:
         """Every row of the window carried a protocol (and ports where the
         protocol has them). All or nothing: one row without them means the
         collector is not aggregating on them, and a partial service list
         would be presented as complete."""
         return self.rows_with_service > 0 and self.rows_without_service == 0
+
+
+def _count(value: Any) -> int | None:
+    """A non-negative counter, or ``None`` when the collector row does not
+    carry one. Unlike :func:`_int` this keeps "absent" apart from 0."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def packets_pair(
+    window: ExporterWindow, packets: list[int] | None
+) -> tuple[int | None, int | None]:
+    """(packets_up, packets_down) to store for one bucket, or (None, None)
+    when the window's packets were not fully measured -- stored as NULL so
+    "not measured" never reads as zero packets."""
+    if not window.packets_measured or packets is None:
+        return None, None
+    return packets[0], packets[1]
 
 
 def parse_protocol(value: Any) -> int | None:
@@ -227,6 +268,14 @@ def reduce_window(rows: Iterable[Mapping[str, Any]]) -> dict[str, ExporterWindow
             pair = window.destination_services.setdefault((remote, *key), [0, 0, 0])
             pair[direction] += nbytes
             pair[2] += nflows
+            npackets = _count(row.get("packets"))
+            if npackets is None:
+                window.service_rows_without_packets += 1
+            else:
+                window.service_packets.setdefault(key, [0, 0])[direction] += npackets
+                window.destination_service_packets.setdefault((remote, *key), [0, 0])[
+                    direction
+                ] += npackets
     return out
 
 
@@ -302,36 +351,46 @@ def service_rows(
     protocol with ``remote_port = OTHER_SERVICE_PORT``.
 
     Nothing is dropped, so the rows sum to the window's client traffic
-    (``bytes_up + bytes_down``) and to its protocol breakdown. Empty when the
-    window is not ``services_measured``."""
+    (``bytes_up + bytes_down``) and to its protocol breakdown, and their
+    packets to the window's client packets. Empty when the window is not
+    ``services_measured``. ``packets_up`` / ``packets_down`` are ``None`` on
+    every row when the window's packets were not measured."""
     if not window.services_measured:
         return []
     ranked = sorted(
         window.services.items(), key=lambda kv: (-(kv[1][0] + kv[1][1]), kv[0])
     )
-    rows = [
-        {
+
+    def _row(protocol: int, port: int, totals: list[int], packets: list[int]) -> dict:
+        packets_up, packets_down = packets_pair(window, packets)
+        return {
             "protocol": protocol,
             "remote_port": port,
             "bytes_up": totals[0],
             "bytes_down": totals[1],
             "flows": totals[2],
+            "packets_up": packets_up,
+            "packets_down": packets_down,
         }
+
+    rows = [
+        _row(
+            protocol, port, totals, window.service_packets.get((protocol, port), [0, 0])
+        )
         for (protocol, port), totals in ranked[:limit]
     ]
     folded: dict[int, list[int]] = {}
-    for (protocol, _port_number), totals in ranked[limit:]:
+    folded_packets: dict[int, list[int]] = {}
+    for (protocol, port), totals in ranked[limit:]:
         rest = folded.setdefault(protocol, [0, 0, 0])
         for index in range(3):
             rest[index] += totals[index]
+        packets = window.service_packets.get((protocol, port), [0, 0])
+        rest_packets = folded_packets.setdefault(protocol, [0, 0])
+        rest_packets[0] += packets[0]
+        rest_packets[1] += packets[1]
     rows.extend(
-        {
-            "protocol": protocol,
-            "remote_port": OTHER_SERVICE_PORT,
-            "bytes_up": totals[0],
-            "bytes_down": totals[1],
-            "flows": totals[2],
-        }
+        _row(protocol, OTHER_SERVICE_PORT, totals, folded_packets[protocol])
         for protocol, totals in sorted(folded.items())
     )
     return rows

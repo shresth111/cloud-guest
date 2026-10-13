@@ -96,6 +96,8 @@ EXPORTER = "10.20.0.31"
 SOURCE = "mikrotik_ipfix"
 VERSIONS = pathlib.Path("alembic/versions")
 MIGRATION = "0159_traffic_flow_dest_buckets.py"
+PACKETS_MIGRATION = "0161_traffic_flow_bucket_packets.py"
+PACKET_COLUMNS = ("packets_up", "packets_down")
 
 # The venue's devices. They exist in the collector rows the tests feed in,
 # and must appear in nothing that comes out.
@@ -131,9 +133,12 @@ def flow(
     *,
     up: int = 0,
     down: int = 0,
+    packets: int | None = 1,
 ) -> list[dict[str, Any]]:
     """Collector rows for one device talking to one outside service: one row
-    per direction that carried bytes, as nfacctd emits them."""
+    per direction that carried bytes, as nfacctd emits them. ``packets`` is
+    the count on each row; ``None`` leaves the key out, which is how a
+    bucket ends up stored without a packet count."""
     rows: list[dict[str, Any]] = []
     if up:
         rows.append(
@@ -145,7 +150,7 @@ def flow(
                 "port_src": 50000,
                 "port_dst": port,
                 "bytes": up,
-                "packets": 1,
+                **({} if packets is None else {"packets": packets}),
                 "flows": 1,
             }
         )
@@ -159,7 +164,7 @@ def flow(
                 "port_src": port,
                 "port_dst": 50000,
                 "bytes": down,
-                "packets": 1,
+                **({} if packets is None else {"packets": packets}),
                 "flows": 1,
             }
         )
@@ -201,6 +206,14 @@ def _w3() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # backends
 # ---------------------------------------------------------------------------
+
+
+def _psum(values: list[int | None]) -> int | None:
+    """The statements' rule for packets: ``None`` as soon as one of the rows
+    added together has no packet count; 0 for no rows at all."""
+    if any(value is None for value in values):
+        return None
+    return sum(values)  # type: ignore[arg-type]
 
 
 def _address_key(address: str) -> tuple[int, int]:
@@ -310,13 +323,32 @@ class MemoryRepository:
                 r["protocol"],
                 r["remote_port"],
             )
-            sums = grouped.setdefault(key, [0, 0, 0])
+            sums = grouped.setdefault(key, [0, 0, 0, [], []])
             sums[0] += r["bytes_up"]
             sums[1] += r["bytes_down"]
             sums[2] += r["flows"]
+            sums[3].append(r.get("packets_up"))
+            sums[4].append(r.get("packets_down"))
         out = [
-            RecordRow(start, 300, address, protocol, port, up, down, flows)
-            for (start, address, protocol, port), (up, down, flows) in grouped.items()
+            RecordRow(
+                start,
+                300,
+                address,
+                protocol,
+                port,
+                up,
+                down,
+                flows,
+                _psum(pu),
+                _psum(pd),
+            )
+            for (start, address, protocol, port), (
+                up,
+                down,
+                flows,
+                pu,
+                pd,
+            ) in grouped.items()
         ]
         if filters.direction == "up":
             out = [r for r in out if r.bytes_up > 0]
@@ -346,6 +378,7 @@ class MemoryRepository:
             "bytes_up": lambda r: r.bytes_up,
             "bytes_down": lambda r: r.bytes_down,
             "flows": lambda r: r.flows,
+            "packets": lambda r: (r.packets_up or 0) + (r.packets_down or 0),
         }[sort]
         # Stable sorts, least significant key first: the statement's order.
         rows.sort(
@@ -354,6 +387,9 @@ class MemoryRepository:
         rows.sort(key=lambda r: r.bytes_up + r.bytes_down, reverse=True)
         rows.sort(key=lambda r: r.window_start, reverse=True)
         rows.sort(key=primary, reverse=order == "desc")
+        if sort == "packets":
+            # NULLS LAST in either order: not measured is not "fewest".
+            rows.sort(key=lambda r: r.packets_up is None or r.packets_down is None)
         return rows[:limit]
 
     async def search_totals(
@@ -370,6 +406,8 @@ class MemoryRepository:
             sum(r.bytes_up for r in rows),
             sum(r.bytes_down for r in rows),
             sum(r.flows for r in rows),
+            _psum([r.packets_up for r in rows]),
+            _psum([r.packets_down for r in rows]),
         )
 
     async def unlisted(
@@ -393,6 +431,8 @@ class MemoryRepository:
             sum(r["bytes_up"] for r in rows),
             sum(r["bytes_down"] for r in rows),
             sum(r["flows"] for r in rows),
+            _psum([r.get("packets_up") for r in rows]),
+            _psum([r.get("packets_down") for r in rows]),
         )
 
     async def service_total(
@@ -423,6 +463,8 @@ class MemoryRepository:
             sum(r["bytes_down"] for r in own),
             sum(r["flows"] for r in own),
             len(with_other - with_service),
+            _psum([r.get("packets_up") for r in own]),
+            _psum([r.get("packets_down") for r in own]),
         )
 
     def _addresses(
@@ -439,11 +481,16 @@ class MemoryRepository:
         ):
             if r["protocol"] != protocol or r["remote_port"] != port:
                 continue
-            sums = merged.setdefault(r["remote_address"], [0, 0, 0])
+            sums = merged.setdefault(r["remote_address"], [0, 0, 0, [], []])
             sums[0] += r["bytes_up"]
             sums[1] += r["bytes_down"]
             sums[2] += r["flows"]
-        rows = [AddressRow(a, *sums) for a, sums in merged.items()]
+            sums[3].append(r.get("packets_up"))
+            sums[4].append(r.get("packets_down"))
+        rows = [
+            AddressRow(a, up, down, flows, _psum(pu), _psum(pd))
+            for a, (up, down, flows, pu, pd) in merged.items()
+        ]
         rows.sort(key=lambda r: _address_key(r.remote_address))
         rows.sort(key=lambda r: r.bytes_up + r.bytes_down, reverse=True)
         return rows
@@ -475,6 +522,8 @@ class MemoryRepository:
             sum(r.bytes_up for r in rows),
             sum(r.bytes_down for r in rows),
             sum(r.flows for r in rows),
+            _psum([r.packets_up for r in rows]),
+            _psum([r.packets_down for r in rows]),
         )
 
 
@@ -598,12 +647,14 @@ class PostgresBackend:
             "0156_create_traffic_flow_tables.py",
             "0157_traffic_flow_services_export.py",
             MIGRATION,
+            PACKETS_MIGRATION,
         ):
             for statement in _statements(filename):
                 await connection.execute(text(statement))
-        # A second run of the new revision must be a no-op.
-        for statement in _statements(MIGRATION):
-            await connection.execute(text(statement))
+        # A second run of the new revisions must be a no-op.
+        for filename in (MIGRATION, PACKETS_MIGRATION):
+            for statement in _statements(filename):
+                await connection.execute(text(statement))
 
     def repository(self) -> Any:
         return DestinationRepository(self.session)
@@ -769,6 +820,8 @@ class TestBuckets:
             "bytes_up": 150,
             "bytes_down": 1500,
             "flows": 4,
+            "packets_up": 2,
+            "packets_down": 2,
         }
 
     def test_everything_below_the_cut_is_an_explicit_other_row_per_protocol(
@@ -986,6 +1039,9 @@ class TestSearch:
             "bytes_down": 9000,
             "bytes": 9000,
             "flows": 1,
+            "packets_up": 0,
+            "packets_down": 1,
+            "packets": 1,
         }
 
     async def test_two_devices_to_one_service_are_one_venue_record(
@@ -1416,9 +1472,11 @@ class TestCsv:
                 "bytes_up",
                 "bytes_down",
                 "flows",
+                "packets_up",
+                "packets_down",
             )
         )
-        assert len(lines) == 11 and all(len(line) == 10 for line in lines)
+        assert len(lines) == 11 and all(len(line) == 12 for line in lines)
         assert lines[1] == [
             W3.isoformat(),
             NOW.isoformat(),
@@ -1429,6 +1487,8 @@ class TestCsv:
             "https",
             "0",
             "9000",
+            "1",
+            "0",
             "1",
         ]
         assert (export.total, export.rows, export.truncated) == (10, 10, False)
@@ -1497,6 +1557,9 @@ class TestServiceDrillDown:
             "bytes_down": 12800,
             "bytes": 13155,
             "flows": 9,
+            "packets_up": 4,
+            "packets_down": 5,
+            "packets": 9,
             "exact": True,
         }
         assert [(i.address, i.bytes, i.share) for i in out.items] == [
@@ -1651,7 +1714,7 @@ class TestScoping:
         )
         assert (
             await repository.service_total(crossed, **where, protocol=6, port=443)
-        ) == ServiceTotal()
+        ) == ServiceTotal(packets_up=0, packets_down=0)  # no rows: 0, like bytes
         # The owner does read it.
         own = DestinationScope(location_id=LOC_B, organization_id=ORG_B)
         assert (
@@ -2573,6 +2636,8 @@ class TestNoDeviceAnywhere:
             "bytes_up",
             "bytes_down",
             "flows",
+            "packets_up",
+            "packets_down",
         ]
         assert [name for name in columns if _offending(name)] == []
         # ...and no foreign key to anything that has one.
@@ -2680,7 +2745,9 @@ class TestMigration:
             r"(?:BIGINT|UUID|VARCHAR|TIMESTAMPTZ|INTEGER|INET|SMALLINT)",
             body,
         )
-        assert columns == [c.name for c in table.columns]
+        added_later = [c.name for c in table.columns if c.name in PACKET_COLUMNS]
+        assert columns + added_later == [c.name for c in table.columns]
+        assert added_later == list(PACKET_COLUMNS)
         assert (
             "uq_traffic_flow_dest_buckets_key UNIQUE (router_id, source, "
             "window_start, remote_address, protocol, remote_port)" in body
@@ -2692,3 +2759,334 @@ class TestMigration:
         # different name on the next run.
         for name in re.findall(r"\b(?:pk|fk|uq|ix)_[a-z_]+", ddl):
             assert len(name) <= 63, name
+
+
+# ---------------------------------------------------------------------------
+# packets (revision 0161)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_packets(backend: Any) -> None:
+    """Venue A: W1 written the old way (no packet count on any row, which is
+    what a row from before revision 0161 holds: NULL), W2 and W3 with
+    packets."""
+    await backend.add_venue(LOC_A, ORG_A)
+    await backend.add_window(
+        router_id=ROUTER_A,
+        location_id=LOC_A,
+        organization_id=ORG_A,
+        start=W1,
+        rows=[
+            *flow(C1, GOOGLE, 6, 443, up=100, down=1000, packets=None),
+            *flow(C2, DNS, 17, 53, up=10, down=20, packets=None),
+        ],
+    )
+    await backend.add_window(
+        router_id=ROUTER_A,
+        location_id=LOC_A,
+        organization_id=ORG_A,
+        start=W2,
+        rows=[
+            *flow(C1, GOOGLE, 6, 443, up=200, down=2000, packets=7),
+            *flow(C2, GOOGLE, 6, 443, down=500, packets=3),
+            *flow(C3, ONE, 6, 443, up=5, packets=2),
+        ],
+    )
+    await backend.add_window(
+        router_id=ROUTER_A,
+        location_id=LOC_A,
+        organization_id=ORG_A,
+        start=W3,
+        rows=[*flow(C1, GOOGLE, 6, 443, down=9000, packets=40)],
+    )
+
+
+def _packets_of(record: Any) -> tuple[Any, Any, Any]:
+    return record.packets_up, record.packets_down, record.packets
+
+
+class TestPackets:
+    async def test_search_records_carry_packets_by_direction(self, backend) -> None:
+        await _seed_packets(backend)
+        out = await _service(backend).search(
+            location_id=LOC_A, actor_user_id=USER, since=W2, until=NOW
+        )
+        by_key = {(r.window_start, r.address): r for r in out.rows}
+        # Two devices to one address and service: one record, packets added.
+        assert _packets_of(by_key[(W2.isoformat(), GOOGLE)]) == (7, 10, 17)
+        assert _packets_of(by_key[(W2.isoformat(), ONE)]) == (2, 0, 2)
+        assert _packets_of(by_key[(W3.isoformat(), GOOGLE)]) == (0, 40, 40)
+        assert out.totals is not None
+        assert _packets_of(out.totals) == (9, 50, 59)
+        # Nothing below any window's cut, and that is a measured zero.
+        assert out.unlisted is not None and _packets_of(out.unlisted) == (0, 0, 0)
+
+    async def test_rows_from_before_the_migration_are_null_not_zero(
+        self, backend
+    ) -> None:
+        await _seed_packets(backend)
+        out = await _service(backend).search(
+            location_id=LOC_A, actor_user_id=USER, since=W1, until=W2
+        )
+        assert out.total == 2 and out.totals is not None
+        for record in out.rows:
+            assert _packets_of(record) == (None, None, None)
+            assert record.bytes > 0 and record.flows > 0  # the rest is intact
+        assert _packets_of(out.totals) == (None, None, None)
+        dumped = out.model_dump(mode="json")
+        assert dumped["rows"][0]["packets"] is None
+        assert dumped["rows"][0]["packets_up"] is None
+
+    async def test_a_total_over_measured_and_unmeasured_rows_is_null(
+        self, backend
+    ) -> None:
+        """Adding up a range where some records have no packet count would
+        give a number that looks complete. The rows still say which is
+        which."""
+        await _seed_packets(backend)
+        out = await _service(backend).search(location_id=LOC_A, actor_user_id=USER)
+        assert out.total == 5 and out.totals is not None
+        assert _packets_of(out.totals) == (None, None, None)
+        assert out.totals.bytes == 1130 + 2705 + 9000
+        measured = [r for r in out.rows if r.packets is not None]
+        assert len(measured) == 3 and sum(r.packets for r in measured) == 59
+
+    async def test_unlisted_packets_are_the_other_rows(self, backend) -> None:
+        await backend.add_venue(LOC_A, ORG_A)
+        await backend.add_window(
+            router_id=ROUTER_A,
+            location_id=LOC_A,
+            organization_id=ORG_A,
+            start=W2,
+            rows=[
+                *flow(C1, GOOGLE, 6, 443, up=200, down=2000, packets=7),
+                *flow(C2, ONE, 6, 443, up=5, packets=2),
+                *flow(C3, DNS, 17, 53, up=1, down=2, packets=4),
+            ],
+            top_n=1,
+        )
+        out = await _service(backend).search(location_id=LOC_A, actor_user_id=USER)
+        assert out.totals is not None and out.unlisted is not None
+        assert _packets_of(out.totals) == (7, 7, 14)
+        assert _packets_of(out.unlisted) == (6, 4, 10)
+        # Listed + unlisted = every packet the collector reported: 24.
+        assert out.totals.packets + out.unlisted.packets == 24
+
+    async def test_sorting_by_packets_puts_unmeasured_records_last(
+        self, backend
+    ) -> None:
+        await _seed_packets(backend)
+        service = _service(backend)
+        for order, measured in (("desc", [40, 17, 2]), ("asc", [2, 17, 40])):
+            out = await service.search(
+                location_id=LOC_A, actor_user_id=USER, sort="packets", order=order
+            )
+            assert [r.packets for r in out.rows] == [*measured, None, None]
+            assert out.sort == "packets"
+
+    async def test_csv_has_the_two_columns_and_an_empty_cell_for_null(
+        self, backend
+    ) -> None:
+        await _seed_packets(backend)
+        export = await _service(backend).export_csv(
+            location_id=LOC_A, actor_user_id=USER, sort="time", order="asc"
+        )
+        lines = list(csv.DictReader(io.StringIO(export.text)))
+        assert list(lines[0])[-2:] == ["packets_up", "packets_down"]
+        old = [line for line in lines if line["window_start"] == W1.isoformat()]
+        new = [line for line in lines if line["window_start"] != W1.isoformat()]
+        assert len(old) == 2 and len(new) == 3
+        for line in old:
+            assert (line["packets_up"], line["packets_down"]) == ("", "")
+            assert line["flows"] != ""
+        assert {
+            (n["remote_address"], n["packets_up"], n["packets_down"]) for n in new
+        } == {
+            (GOOGLE, "7", "10"),
+            (ONE, "2", "0"),
+            (GOOGLE, "0", "40"),
+        }
+        assert "None" not in export.text
+
+    async def test_service_drill_down_carries_packets(self, backend) -> None:
+        await _seed_packets(backend)
+        out = await _service(backend).service_destinations(
+            location_id=LOC_A,
+            actor_user_id=USER,
+            protocol=6,
+            port=443,
+            since=W2,
+            until=NOW,
+        )
+        assert out.service is not None
+        assert _packets_of(out.service) == (9, 50, 59)
+        assert {i.address: _packets_of(i) for i in out.items} == {
+            GOOGLE: (7, 50, 57),
+            ONE: (2, 0, 2),
+        }
+
+    async def test_service_drill_down_over_old_rows_is_null(self, backend) -> None:
+        await _seed_packets(backend)
+        out = await _service(backend).service_destinations(
+            location_id=LOC_A, actor_user_id=USER, protocol=6, port=443
+        )
+        assert out.service is not None
+        # The range includes W1, stored without packets.
+        assert _packets_of(out.service) == (None, None, None)
+        assert out.service.bytes == 1100 + 2705 + 9000
+        by_address = {i.address: i for i in out.items}
+        assert _packets_of(by_address[GOOGLE]) == (None, None, None)
+        assert _packets_of(by_address[ONE]) == (2, 0, 2)  # only in W2
+
+    async def test_the_customer_routes_return_the_same_fields(self, backend) -> None:
+        await _seed_packets(backend)
+        # Six devices, so the small-venue rule withholds nothing in W2.
+        await backend.add_window(
+            router_id=ROUTER_B,
+            location_id=LOC_A,
+            organization_id=ORG_A,
+            start=W2,
+            rows=[
+                row
+                for d in DEVICES
+                for row in flow(d, ELSEWHERE, 6, 443, down=111, packets=1)
+            ],
+        )
+        service = _customer(backend)
+        out = await service.search(
+            LOC_A, organization_id=ORG_A, actor_user_id=USER, since=W2, until=W3
+        )
+        by_address = {r.address: r for r in out.rows}
+        assert _packets_of(by_address[ELSEWHERE]) == (0, len(DEVICES), len(DEVICES))
+        export = await service.export_csv(
+            LOC_A, organization_id=ORG_A, actor_user_id=USER, since=W2, until=W3
+        )
+        assert export.text.splitlines()[0].endswith(",flows,packets_up,packets_down")
+        drill = await service.service_destinations(
+            LOC_A,
+            organization_id=ORG_A,
+            actor_user_id=USER,
+            protocol=6,
+            port=443,
+            since=W2,
+            until=W3,
+        )
+        assert drill.service is not None and drill.service.packets is not None
+
+    def test_response_models_declare_packets_as_nullable(self) -> None:
+        for model in (
+            dest.DestinationRecord,
+            dest.ByteTotals,
+            dest.ServiceOut,
+            dest.ServiceDestinationItem,
+        ):
+            for name in ("packets_up", "packets_down", "packets"):
+                field = model.model_fields[name]
+                assert field.annotation == (int | None), (model, name)
+                # Required, so a response can never simply leave it out.
+                assert field.is_required(), (model, name)
+
+    def test_statements_never_turn_a_missing_count_into_zero(self) -> None:
+        scope = DestinationScope(
+            location_id=LOC_A, router_id=None, organization_id=ORG_A, min_devices=0
+        )
+        filters = parse_filters(address=None, protocol=None, port=None, direction=None)
+        where = {"since": HOUR_AGO, "until": NOW}
+        page = _sql(
+            dest.search_page_statement(
+                scope, filters, **where, sort="packets", order="desc", limit=10
+            )
+        )
+        # NULL unless every grouped row has a count: count(col) = count(*).
+        assert "count(traffic_flow_dest_buckets.packets_up) = count(*)" in page
+        assert "count(traffic_flow_dest_buckets.packets_down) = count(*)" in page
+        assert "NULLS LAST" in page
+        for sql in (
+            page,
+            _sql(dest.search_totals_statement(scope, filters, **where)),
+            _sql(dest.unlisted_statement(scope, **where, protocol=None)),
+            _sql(dest.service_total_statement(scope, **where, protocol=6, port=443)),
+            _sql(
+                dest.service_destinations_statement(
+                    scope, **where, protocol=6, port=443, limit=10
+                )
+            ),
+            _sql(
+                dest.service_destination_totals_statement(
+                    scope, **where, protocol=6, port=443
+                )
+            ),
+        ):
+            assert "packets_up" in sql and "packets_down" in sql
+            # Never a bare coalesce(sum(packets), 0): always inside a CASE.
+            assert not re.search(r"(?<!THEN )coalesce\(sum\([a-z_.]*packets", sql), sql
+
+    def test_insert_is_still_idempotent_on_the_same_key(self) -> None:
+        row = {
+            "router_id": ROUTER_A,
+            "organization_id": ORG_A,
+            "location_id": LOC_A,
+            "source": SOURCE,
+            "window_start": W1,
+            "window_seconds": 300,
+            "remote_address": GOOGLE,
+            "protocol": 6,
+            "remote_port": 443,
+            "bytes_up": 1,
+            "bytes_down": 2,
+            "flows": 1,
+            "packets_up": 3,
+            "packets_down": None,
+        }
+        sql = _sql(destination_bucket_insert_statement([row]))
+        assert "packets_up" in sql and "packets_down" in sql
+        assert "ON CONFLICT ON CONSTRAINT uq_traffic_flow_dest_buckets_key" in sql
+        assert "DO NOTHING" in sql
+
+
+class TestPacketsMigration:
+    def test_it_is_the_single_head_after_the_country_buckets(self) -> None:
+        module = _migration(PACKETS_MIGRATION)
+        assert module.revision == "0161_traffic_flow_bucket_packets"
+        assert module.down_revision == "0160_traffic_flow_country_buckets"
+        assert len(module.revision) <= 40
+        siblings = [
+            path.name
+            for path in VERSIONS.glob("*.py")
+            if f'down_revision = "{module.down_revision}"' in path.read_text()
+        ]
+        assert siblings == [PACKETS_MIGRATION]
+        # Fails the day another revision chains on this one's parent or on
+        # this one: re-check the head before merging.
+        assert not [
+            path.name
+            for path in VERSIONS.glob("*.py")
+            if f'down_revision = "{module.revision}"' in path.read_text()
+        ]
+
+    def test_columns_are_added_nullable_with_no_default_and_no_backfill(self) -> None:
+        statements = _statements(PACKETS_MIGRATION)
+        assert sorted(statements) == sorted(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} BIGINT NULL"
+            for table in ("traffic_flow_dest_buckets", "traffic_flow_service_buckets")
+            for column in PACKET_COLUMNS
+        )
+        text_ = " ".join(statements).upper()
+        # Existing rows must stay NULL: "not measured" is not zero packets.
+        assert "DEFAULT" not in text_ and "NOT NULL" not in text_
+        assert "UPDATE" not in text_
+
+    def test_it_is_a_no_op_when_already_applied_and_downgrade_is_guarded(self) -> None:
+        for statement in _statements(PACKETS_MIGRATION):
+            assert "IF NOT EXISTS" in statement
+        down = _statements(PACKETS_MIGRATION, "downgrade")
+        assert len(down) == 4 and all("DROP COLUMN IF EXISTS" in s for s in down)
+
+    def test_both_bucket_models_declare_the_columns_as_nullable(self) -> None:
+        from app.domains.traffic_flow.models import TrafficFlowServiceBucket
+
+        for model in (TrafficFlowDestinationBucket, TrafficFlowServiceBucket):
+            for name in PACKET_COLUMNS:
+                column = model.__table__.columns[name]
+                assert column.nullable is True, (model.__tablename__, name)
+                assert column.default is None and column.server_default is None

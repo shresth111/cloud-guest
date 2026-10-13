@@ -45,7 +45,7 @@ from typing import Any, Protocol
 
 from fastapi import status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import and_, cast, exists, func, literal, not_, select
+from sqlalchemy import and_, case, cast, exists, func, literal, not_, select
 from sqlalchemy.dialects.postgresql import CIDR
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -116,6 +116,7 @@ SORT_KEYS = (
     "bytes_up",
     "bytes_down",
     "flows",
+    "packets",
 )
 ORDERS = ("desc", "asc")
 
@@ -130,6 +131,8 @@ CSV_COLUMNS = (
     "bytes_up",
     "bytes_down",
     "flows",
+    "packets_up",
+    "packets_down",
 )
 
 
@@ -307,6 +310,20 @@ def _in_range(model: Any, since: datetime, until: datetime) -> list[Any]:
     return [model.window_start >= since, model.window_start < until]
 
 
+def _packets(column: Any) -> Any:
+    """Packets over the grouped rows, or NULL if ANY of them has none.
+
+    A plain ``SUM`` skips NULLs, so a record added up from one row with a
+    packet count and one without would come back as a number that looks
+    complete. Rows written before packets were recorded hold NULL, and that
+    means "not measured", not zero. With no rows at all the answer is 0,
+    like the byte sums beside it."""
+    return case(
+        (func.count(column) == func.count(), func.coalesce(func.sum(column), 0)),
+        else_=None,
+    )
+
+
 def matching_records(
     scope: DestinationScope,
     filters: DestinationFilters,
@@ -343,6 +360,8 @@ def matching_records(
             bytes_up.label("bytes_up"),
             bytes_down.label("bytes_down"),
             func.sum(_BUCKET.flows).label("flows"),
+            _packets(_BUCKET.packets_up).label("packets_up"),
+            _packets(_BUCKET.packets_down).label("packets_down"),
         )
         .where(*conditions)
         .group_by(
@@ -381,8 +400,13 @@ def search_page_statement(
         "bytes_up": c.bytes_up,
         "bytes_down": c.bytes_down,
         "flows": c.flows,
+        "packets": c.packets_up + c.packets_down,
     }[sort]
     primary = column.asc() if order == "asc" else column.desc()
+    if sort == "packets":
+        # Records with no packet count go last in either order: "not
+        # measured" is neither the smallest nor the largest.
+        primary = primary.nulls_last()
     # A total order, so the same search returns the same page every time.
     return (
         select(records)
@@ -412,6 +436,8 @@ def search_totals_statement(
         func.coalesce(func.sum(c.bytes_up), 0),
         func.coalesce(func.sum(c.bytes_down), 0),
         func.coalesce(func.sum(c.flows), 0),
+        _packets(c.packets_up),
+        _packets(c.packets_down),
     ).select_from(records)
 
 
@@ -435,6 +461,8 @@ def unlisted_statement(
         func.coalesce(func.sum(_BUCKET.bytes_up), 0),
         func.coalesce(func.sum(_BUCKET.bytes_down), 0),
         func.coalesce(func.sum(_BUCKET.flows), 0),
+        _packets(_BUCKET.packets_up),
+        _packets(_BUCKET.packets_down),
     ).where(*conditions)
 
 
@@ -485,6 +513,12 @@ def service_total_statement(
                 "down"
             ),
             func.coalesce(func.sum(bucket.flows).filter(is_service), 0).label("flows"),
+            func.sum(bucket.packets_up).filter(is_service).label("packets_up"),
+            func.sum(bucket.packets_down).filter(is_service).label("packets_down"),
+            # The service's own rows that carry no packet count.
+            func.count()
+            .filter(and_(is_service, bucket.packets_up.is_(None)))
+            .label("unmeasured"),
             func.bool_or(is_service).label("has_service"),
             func.bool_or(bucket.remote_port == OTHER_SERVICE_PORT).label("has_other"),
         )
@@ -504,6 +538,21 @@ def service_total_statement(
         func.coalesce(func.sum(c.down), 0),
         func.coalesce(func.sum(c.flows), 0),
         func.count().filter(and_(c.has_other, not_(c.has_service))),
+        # NULL as soon as one of the service's rows has no packet count.
+        case(
+            (
+                func.coalesce(func.sum(c.unmeasured), 0) == 0,
+                func.coalesce(func.sum(c.packets_up), 0),
+            ),
+            else_=None,
+        ),
+        case(
+            (
+                func.coalesce(func.sum(c.unmeasured), 0) == 0,
+                func.coalesce(func.sum(c.packets_down), 0),
+            ),
+            else_=None,
+        ),
     ).select_from(per_window)
 
 
@@ -521,6 +570,8 @@ def _service_destinations(
             func.sum(_BUCKET.bytes_up).label("bytes_up"),
             func.sum(_BUCKET.bytes_down).label("bytes_down"),
             func.sum(_BUCKET.flows).label("flows"),
+            _packets(_BUCKET.packets_up).label("packets_up"),
+            _packets(_BUCKET.packets_down).label("packets_down"),
         )
         .where(
             *_in_range(_BUCKET, since, until),
@@ -571,12 +622,23 @@ def service_destination_totals_statement(
         func.coalesce(func.sum(c.bytes_up), 0),
         func.coalesce(func.sum(c.bytes_down), 0),
         func.coalesce(func.sum(c.flows), 0),
+        _packets(c.packets_up),
+        _packets(c.packets_down),
     ).select_from(listed)
 
 
 # ---------------------------------------------------------------------------
 # repository
 # ---------------------------------------------------------------------------
+
+
+def _optional(value: Any) -> int | None:
+    """A nullable counter from the database: NULL stays ``None``."""
+    return None if value is None else int(value)
+
+
+def _packets_total(up: int | None, down: int | None) -> int | None:
+    return None if up is None or down is None else up + down
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,6 +651,9 @@ class RecordRow:
     bytes_up: int
     bytes_down: int
     flows: int
+    #: ``None`` = not measured (never 0).
+    packets_up: int | None = None
+    packets_down: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,6 +662,9 @@ class Totals:
     bytes_up: int = 0
     bytes_down: int = 0
     flows: int = 0
+    #: ``None`` = at least one row summed here has no packet count.
+    packets_up: int | None = None
+    packets_down: int | None = None
 
     @property
     def bytes(self) -> int:
@@ -617,6 +685,8 @@ class ServiceTotal:
     flows: int = 0
     #: Windows in which the service may sit in the "other" service row.
     windows_maybe_folded: int = 0
+    packets_up: int | None = None
+    packets_down: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,6 +695,8 @@ class AddressRow:
     bytes_up: int
     bytes_down: int
     flows: int
+    packets_up: int | None = None
+    packets_down: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +767,8 @@ class DestinationRepository:
                 bytes_up=int(row.bytes_up),
                 bytes_down=int(row.bytes_down),
                 flows=int(row.flows),
+                packets_up=_optional(row.packets_up),
+                packets_down=_optional(row.packets_down),
             )
             for row in (await self.session.execute(statement)).all()
         ]
@@ -712,7 +786,14 @@ class DestinationRepository:
                 search_totals_statement(scope, filters, since=since, until=until)
             )
         ).one()
-        return Totals(int(row[0]), int(row[1]), int(row[2]), int(row[3]))
+        return Totals(
+            int(row[0]),
+            int(row[1]),
+            int(row[2]),
+            int(row[3]),
+            _optional(row[4]),
+            _optional(row[5]),
+        )
 
     async def unlisted(
         self,
@@ -727,7 +808,14 @@ class DestinationRepository:
                 unlisted_statement(scope, since=since, until=until, protocol=protocol)
             )
         ).one()
-        return Totals(0, int(row[0]), int(row[1]), int(row[2]))
+        return Totals(
+            0,
+            int(row[0]),
+            int(row[1]),
+            int(row[2]),
+            _optional(row[3]),
+            _optional(row[4]),
+        )
 
     async def service_total(
         self,
@@ -745,7 +833,14 @@ class DestinationRepository:
                 )
             )
         ).one()
-        return ServiceTotal(int(row[0]), int(row[1]), int(row[2]), int(row[3]))
+        return ServiceTotal(
+            int(row[0]),
+            int(row[1]),
+            int(row[2]),
+            int(row[3]),
+            _optional(row[4]),
+            _optional(row[5]),
+        )
 
     async def service_destinations(
         self,
@@ -766,6 +861,8 @@ class DestinationRepository:
                 bytes_up=int(row.bytes_up),
                 bytes_down=int(row.bytes_down),
                 flows=int(row.flows),
+                packets_up=_optional(row.packets_up),
+                packets_down=_optional(row.packets_down),
             )
             for row in (await self.session.execute(statement)).all()
         ]
@@ -786,7 +883,14 @@ class DestinationRepository:
                 )
             )
         ).one()
-        return Totals(int(row[0]), int(row[1]), int(row[2]), int(row[3]))
+        return Totals(
+            int(row[0]),
+            int(row[1]),
+            int(row[2]),
+            int(row[3]),
+            _optional(row[4]),
+            _optional(row[5]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +907,11 @@ class ByteTotals(_Model):
     bytes_down: int
     bytes: int
     flows: int
+    #: ``null`` = not measured for at least part of what is summed here
+    #: (rows stored before packets were recorded). Never 0 for that.
+    packets_up: int | None
+    packets_down: int | None
+    packets: int | None
 
 
 class FiltersOut(_Model):
@@ -827,6 +936,10 @@ class DestinationRecord(_Model):
     bytes_down: int
     bytes: int
     flows: int
+    #: ``null`` = not measured for this record. Never 0 for that.
+    packets_up: int | None
+    packets_down: int | None
+    packets: int | None
 
 
 class _RangeModel(_Model):
@@ -877,6 +990,9 @@ class ServiceDestinationItem(_Model):
     bytes_down: int
     bytes: int
     flows: int
+    packets_up: int | None
+    packets_down: int | None
+    packets: int | None
     share: float
 
 
@@ -934,6 +1050,9 @@ def _byte_totals(totals: Totals) -> ByteTotals:
         bytes_down=totals.bytes_down,
         bytes=totals.bytes,
         flows=totals.flows,
+        packets_up=totals.packets_up,
+        packets_down=totals.packets_down,
+        packets=_packets_total(totals.packets_up, totals.packets_down),
     )
 
 
@@ -952,6 +1071,9 @@ def _record(row: RecordRow) -> DestinationRecord:
         bytes_down=row.bytes_down,
         bytes=row.bytes_up + row.bytes_down,
         flows=row.flows,
+        packets_up=row.packets_up,
+        packets_down=row.packets_down,
+        packets=_packets_total(row.packets_up, row.packets_down),
     )
 
 
@@ -975,6 +1097,9 @@ def records_csv(rows: list[RecordRow]) -> str:
                 row.bytes_up,
                 row.bytes_down,
                 row.flows,
+                # An empty cell, not 0, when packets were not measured.
+                "" if row.packets_up is None else row.packets_up,
+                "" if row.packets_down is None else row.packets_down,
             )
         )
     return buffer.getvalue()
@@ -1322,11 +1447,13 @@ class DestinationService:
             )
             exact = own.windows_maybe_folded == 0
             up, down, flows = own.bytes_up, own.bytes_down, own.flows
+            packets_up, packets_down = own.packets_up, own.packets_down
             if listed.bytes > up + down:
                 # Only possible when the service was folded into "other" in
                 # the service buckets while one of its destinations was
                 # still listed here. Both are lower bounds; use the larger.
                 up, down, flows = listed.bytes_up, listed.bytes_down, listed.flows
+                packets_up, packets_down = listed.packets_up, listed.packets_down
                 exact = False
             whole = up + down
             unlisted_bytes = max(0, whole - listed.bytes)
@@ -1339,6 +1466,9 @@ class DestinationService:
                 bytes_down=down,
                 bytes=whole,
                 flows=flows,
+                packets_up=packets_up,
+                packets_down=packets_down,
+                packets=_packets_total(packets_up, packets_down),
                 exact=exact,
             )
             items = [
@@ -1348,6 +1478,9 @@ class DestinationService:
                     bytes_down=row.bytes_down,
                     bytes=row.bytes_up + row.bytes_down,
                     flows=row.flows,
+                    packets_up=row.packets_up,
+                    packets_down=row.packets_down,
+                    packets=_packets_total(row.packets_up, row.packets_down),
                     share=_share(row.bytes_up + row.bytes_down, whole),
                 )
                 for row in rows
