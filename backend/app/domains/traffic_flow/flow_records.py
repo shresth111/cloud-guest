@@ -120,6 +120,7 @@ from sqlalchemy import (
     delete,
     func,
     literal,
+    not_,
     or_,
     select,
 )
@@ -139,6 +140,12 @@ from .constants import (
 )
 from .flow_record_models import TrafficFlowRecord, TrafficFlowRecordCap
 from .ingest import is_local_address, parse_protocol
+from .platform_overhead import (
+    NO_PLATFORM_ENDPOINTS,
+    PlatformEndpoints,
+    load_platform_endpoints,
+    platform_endpoints_of,
+)
 from .service import TrafficFlowError
 from .summary import protocol_name, service_name
 
@@ -186,6 +193,10 @@ DIRECTION_UP = "upload"
 DIRECTION_DOWN = "download"
 DIRECTION_INTERNAL = "internal"
 DIRECTION_UNCLASSIFIED = "unclassified"
+#: The router's own tunnel to the platform (``platform_overhead``). Stored,
+#: so the Master table can show it with this marker; never returned to a
+#: customer.
+DIRECTION_PLATFORM = "platform"
 
 SORT_KEYS = (
     "start",
@@ -298,7 +309,9 @@ def _direction(src: str, dst: str) -> str:
 
 
 def flow_record_rows(
-    rows: Iterable[Mapping[str, Any]], exporter: str
+    rows: Iterable[Mapping[str, Any]],
+    exporter: str,
+    platform: PlatformEndpoints = NO_PLATFORM_ENDPOINTS,
 ) -> list[dict[str, Any]]:
     """One record per collector row of ``exporter``, largest first.
 
@@ -315,6 +328,11 @@ def flow_record_rows(
             continue
         nat_src = _address(_first(row, _NAT_SRC_KEYS))
         nat_dst = _address(_first(row, _NAT_DST_KEYS))
+        direction = _direction(src, dst)
+        if direction != DIRECTION_INTERNAL and platform.row_direction(row):
+            # The router's tunnel to the hub. (What rides INSIDE the tunnel
+            # has two private ends and stays "internal", left out as before.)
+            direction = DIRECTION_PLATFORM
         out.append(
             {
                 "flow_start": _instant(_first(row, _START_KEYS)),
@@ -337,7 +355,7 @@ def flow_record_rows(
                 "bytes": _count(row.get("bytes")) or 0,
                 "packets": _count(row.get("packets")),
                 "flows": _count(row.get("flows")),
-                "direction": _direction(src, dst),
+                "direction": direction,
                 "exporter_address": exporter,
                 "exporter_port": _port(_first(row, _EXPORTER_PORT_KEYS)),
                 "records_merged": 1,
@@ -609,6 +627,9 @@ class FlowRecordScope:
     #: Put on every statement over a table that carries it, whatever the
     #: venue check already established.
     organization_id: uuid.UUID | None = None
+    #: The hub's tunnel endpoints, for hiding rows stored before they were
+    #: marked. Only consulted for a customer scope.
+    platform: PlatformEndpoints = NO_PLATFORM_ENDPOINTS
 
     def conditions(self, model: Any) -> list[Any]:
         out: list[Any] = []
@@ -618,6 +639,14 @@ class FlowRecordScope:
             out.append(model.router_id == self.router_id)
         if self.organization_id is not None and hasattr(model, "organization_id"):
             out.append(model.organization_id == self.organization_id)
+        if self.organization_id is not None and hasattr(model, "direction"):
+            # A customer never sees the router's tunnel to the platform:
+            # neither the rows marked at ingest, nor older rows that match
+            # the hub's endpoint now.
+            out.append(model.direction != DIRECTION_PLATFORM)
+            hidden = self.platform.record_condition(model)
+            if hidden is not None:
+                out.append(not_(hidden))
         return out
 
 
@@ -824,6 +853,9 @@ class FlowRecordRepository:
         self.session = session
 
     # -- write side -------------------------------------------------------
+    async def platform_endpoints(self, settings: Any) -> PlatformEndpoints:
+        return await load_platform_endpoints(self.session, settings)
+
     async def cap_state(self, router_id: uuid.UUID, day: date) -> CapState:
         row = (
             await self.session.execute(
@@ -1014,9 +1046,13 @@ class FlowRecordWriter:
         settings: Settings,
         *,
         enabled_router_ids: Callable[[], Any],
+        platform: PlatformEndpoints = NO_PLATFORM_ENDPOINTS,
     ) -> None:
         self.store = store
         self.settings = settings
+        #: The hub's tunnel endpoints: records to or from them are stored
+        #: with ``direction = "platform"``.
+        self.platform = platform
         self._enabled_router_ids = enabled_router_ids
         self._enabled: set[uuid.UUID] | None = None
 
@@ -1038,7 +1074,7 @@ class FlowRecordWriter:
         router_id: uuid.UUID = identity["router_id"]
         if not await self._export_on(router_id):
             return 0
-        received = flow_record_rows(rows, exporter)
+        received = flow_record_rows(rows, exporter, self.platform)
         if not received:
             return 0
         records, counts = prepare_records(
@@ -1490,6 +1526,11 @@ class FlowRecordService:
             location_id=location_id,
             router_id=router_id,
             organization_id=organization_id,
+            platform=(
+                await platform_endpoints_of(self.repository, self.settings)
+                if organization_id is not None and self._reading
+                else NO_PLATFORM_ENDPOINTS
+            ),
         )
         if organization_id is None:
             target = await self.repository.target(scope)

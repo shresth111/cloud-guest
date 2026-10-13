@@ -58,6 +58,7 @@ from .constants import (
     TrafficFlowSource,
 )
 from .destination_buckets import (
+    TrafficFlowDestinationBucket,
     destination_bucket_delete_statement,
     destination_bucket_insert_statement,
     destination_rows,
@@ -75,6 +76,13 @@ from .models import (
     TrafficFlowIngestState,
     TrafficFlowServiceBucket,
     TrafficFlowWindow,
+)
+from .platform_overhead import (
+    NO_PLATFORM_ENDPOINTS,
+    PLATFORM_OVERHEAD_NOTE,
+    PlatformEndpoints,
+    load_platform_endpoints,
+    platform_endpoints_of,
 )
 from .routeros import (
     TrafficFlowTarget,
@@ -192,6 +200,50 @@ def service_step_statement(
             bucket.window_start >= since,
             bucket.window_start < until,
             *scope.conditions(bucket),
+        )
+        .group_by(step, bucket.protocol, bucket.remote_port)
+    )
+
+
+def history_overhead_statement(
+    scope: Any,
+    platform: PlatformEndpoints,
+    *,
+    since: datetime,
+    until: datetime,
+    step_seconds: int,
+) -> Any | None:
+    """Destination-bucket rows that are the router's tunnel to the hub,
+    summed per (step, protocol, port). ``None`` when no hub endpoint is
+    known.
+
+    Overhead is no longer written to the buckets, so every row this finds
+    belongs to a window stored before it was classified -- and is exactly
+    what that window's client totals and its service bucket still contain.
+    ``scope`` is anything with ``conditions(model)``. The small-venue rule is
+    deliberately not applied: this is subtracted, not shown."""
+    bucket = TrafficFlowDestinationBucket
+    is_overhead = platform.bucket_condition(bucket)
+    if is_overhead is None:
+        return None
+    step = func.to_timestamp(
+        func.floor(func.extract("epoch", bucket.window_start) / step_seconds)
+        * step_seconds
+    ).label("step_start")
+    return (
+        select(
+            step,
+            bucket.protocol,
+            bucket.remote_port,
+            func.coalesce(func.sum(bucket.bytes_up), 0),
+            func.coalesce(func.sum(bucket.bytes_down), 0),
+            func.coalesce(func.sum(bucket.flows), 0),
+        )
+        .where(
+            bucket.window_start >= since,
+            bucket.window_start < until,
+            *scope.conditions(bucket),
+            is_overhead,
         )
         .group_by(step, bucket.protocol, bucket.remote_port)
     )
@@ -341,6 +393,29 @@ class TrafficFlowRepository:
             ).all()
         ]
 
+    async def history_overhead_steps(
+        self,
+        scope: SummaryScope,
+        platform: PlatformEndpoints,
+        *,
+        since: datetime,
+        until: datetime,
+        step_seconds: int,
+    ) -> list[ServiceStepRow]:
+        """Platform overhead still held in the destination buckets, per
+        timeline step (see ``history_overhead_statement``)."""
+        stmt = history_overhead_statement(
+            scope, platform, since=since, until=until, step_seconds=step_seconds
+        )
+        if stmt is None:
+            return []
+        return [
+            ServiceStepRow(step, int(protocol), int(port), int(up), int(down), int(n))
+            for step, protocol, port, up, down, n in (
+                await self.session.execute(stmt)
+            ).all()
+        ]
+
     async def insert_service_buckets(self, rows: list[dict[str, Any]]) -> None:
         if rows:
             await self.session.execute(service_bucket_insert_statement(rows))
@@ -371,6 +446,10 @@ class TrafficFlowRepository:
             destination_bucket_delete_statement(cutoff, limit=limit)
         )
         return int(result.rowcount or 0)
+
+    async def platform_endpoints(self, settings: Any) -> PlatformEndpoints:
+        """The hub's WireGuard endpoints (``platform_overhead``)."""
+        return await load_platform_endpoints(self.session, settings)
 
     async def exporter_router_map(self) -> dict[str, ExporterRouter]:
         """Tunnel address -> router, for every non-revoked peer. A tunnel
@@ -541,8 +620,13 @@ class TrafficFlowIngestService:
         *,
         geo: GeoWindowWriterProtocol | None = None,
         flow_records: FlowRecordWriterProtocol | None = None,
+        platform: PlatformEndpoints = NO_PLATFORM_ENDPOINTS,
     ) -> None:
         self.repository = repository
+        #: The hub's tunnel endpoints. A router's traffic to them, and
+        #: anything with the router's own tunnel address as an end, is
+        #: platform overhead: counted on the window, in nothing else.
+        self.platform = platform
         #: Geo Location (``geo_service.GeoWindowWriter``). ``None`` = no
         #: country rows are written.
         self.geo = geo
@@ -570,7 +654,7 @@ class TrafficFlowIngestService:
         window_end = window_start + timedelta(seconds=window_seconds)
         summary = WindowIngestSummary(window_start=window_start)
         unknown: list[str] = []
-        for exporter, reduced in reduce_window(rows).items():
+        for exporter, reduced in reduce_window(rows, self.platform).items():
             summary.exporters += 1
             summary.rows_rejected += reduced.rows_rejected
             router = exporter_map.get(exporter)
@@ -606,6 +690,10 @@ class TrafficFlowIngestService:
                     "flows_total": reduced.flows_total,
                     "bytes_internal": reduced.bytes_internal,
                     "bytes_unclassified": reduced.bytes_unclassified,
+                    # Classified, so a number even when it is 0 (NULL is
+                    # for windows stored before overhead was classified).
+                    "bytes_overhead_up": reduced.overhead_bytes_up,
+                    "bytes_overhead_down": reduced.overhead_bytes_down,
                     "bytes_other_talkers": other_talkers,
                     "bytes_other_destinations": other_destinations,
                     "talker_count": len(reduced.talkers),
@@ -906,8 +994,17 @@ class TrafficFlowStatusService:
         routers = await self.repository.fleet_routers()
         activity = await self.repository.router_activity(now - timedelta(hours=1))
         state = await self.repository.get_state()
+        platform = await platform_endpoints_of(self.repository, self.settings)
         return {
             "feature_enabled": enabled,
+            # Can the routers' own tunnel to the platform be told apart from
+            # venue traffic? Counts and host NAMES only -- no address. A hub
+            # endpoint stored as a hostname is not matched until its
+            # addresses are listed in the platform-addresses setting.
+            "platform_overhead": {
+                "endpoints_known": len(platform.endpoints),
+                "unresolved_hosts": list(platform.unresolved_hosts),
+            },
             "generated_at": now.isoformat(),
             "window_seconds": WINDOW_SECONDS,
             "silent_after_seconds": SILENT_AFTER_SECONDS,
@@ -1013,6 +1110,14 @@ class TrafficFlowSummaryService:
         windows = await self.repository.windows_in_range(
             scope, since=since, until=until
         )
+        platform = await platform_endpoints_of(self.repository, self.settings)
+        history_overhead = (
+            await self.repository.history_overhead_steps(
+                scope, platform, since=since, until=until, step_seconds=step_seconds
+            )
+            if windows and platform
+            else []
+        )
         rows = (
             await self.repository.service_steps(
                 scope, since=since, until=until, step_seconds=step_seconds
@@ -1032,6 +1137,8 @@ class TrafficFlowSummaryService:
             data_oldest=oldest,
             data_newest=newest,
             min_devices_for_destinations=min_devices_for_destinations,
+            history_overhead=history_overhead,
+            hidden_addresses=platform.addresses,
         )
 
 
@@ -1224,6 +1331,10 @@ class TrafficFlowCustomerService:
         )
         collection = await self._collection(own)
         data.pop("feature_enabled", None)
+        # A customer is told THAT the router's own traffic to the platform
+        # is left out, in one sentence -- never how much, and nothing that
+        # names what it is.
+        data["platform_overhead"] = {"excluded": True, "note": PLATFORM_OVERHEAD_NOTE}
         data["devices"] = {
             **data["devices"],
             "items": [

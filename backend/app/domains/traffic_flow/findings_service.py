@@ -68,6 +68,11 @@ from .findings import (
     unusual_service_candidates,
 )
 from .models import TrafficFlowServiceBucket, TrafficFlowWindow
+from .platform_overhead import (
+    PlatformEndpoints,
+    load_platform_endpoints,
+    platform_endpoints_of,
+)
 from .service import TrafficFlowError, TrafficFlowSummaryService
 from .threat_list import ThreatList
 
@@ -166,9 +171,38 @@ def address_rows_statement(
             *_in_range(bucket, since, until),
             *scope.conditions(bucket),
             *scope.visible(bucket),
+            # Never the router's own tunnel to the platform's hub.
+            *scope.venue_traffic(bucket),
             bucket.remote_port != OTHER_SERVICE_PORT,
         )
         .group_by(bucket.remote_address)
+    )
+
+
+def platform_overhead_statement(
+    scope: DestinationScope, *, since: datetime, until: datetime, seconds: int
+) -> Any | None:
+    """The router's tunnel to the platform's hub still held in the
+    destination buckets, per ``seconds`` (an hour or a day), protocol and
+    port. Only windows stored before overhead was classified at ingest have
+    such rows; their window totals and service buckets still include it, so
+    the rules below take it off before judging the venue. ``None`` when no
+    hub endpoint is known. Reads byte sums only."""
+    bucket = TrafficFlowDestinationBucket
+    hidden = scope.platform.bucket_condition(bucket)
+    if hidden is None:
+        return None
+    step = _floor(bucket.window_start, seconds).label("step_start")
+    return (
+        select(
+            step,
+            bucket.protocol,
+            bucket.remote_port,
+            func.coalesce(func.sum(bucket.bytes_up), 0),
+            func.coalesce(func.sum(bucket.bytes_down), 0),
+        )
+        .where(*_in_range(bucket, since, until), *scope.conditions(bucket), hidden)
+        .group_by(step, bucket.protocol, bucket.remote_port)
     )
 
 
@@ -176,6 +210,24 @@ class FindingsRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self._destinations = DestinationRepository(session)
+
+    async def platform_endpoints(self, settings: Any) -> PlatformEndpoints:
+        return await load_platform_endpoints(self.session, settings)
+
+    async def _platform_overhead(
+        self, scope: DestinationScope, *, since: datetime, until: datetime, seconds: int
+    ) -> list[tuple[datetime, int, int, int, int]]:
+        statement = platform_overhead_statement(
+            scope, since=since, until=until, seconds=seconds
+        )
+        if statement is None:
+            return []
+        return [
+            (step, int(protocol), int(port), int(up), int(down))
+            for step, protocol, port, up, down in (
+                await self.session.execute(statement)
+            ).all()
+        ]
 
     async def venue_exists(self, location_id: uuid.UUID) -> bool:
         return await self._destinations.venue(location_id) is not None
@@ -188,8 +240,21 @@ class FindingsRepository:
                 hour_rows_statement(scope, since=since, until=until)
             )
         ).all()
+        taken: dict[datetime, list[int]] = {}
+        for step, _protocol, _port, up, down in await self._platform_overhead(
+            scope, since=since, until=until, seconds=_HOUR
+        ):
+            in_hour = taken.setdefault(step, [0, 0])
+            in_hour[0] += up
+            in_hour[1] += down
         return [
-            HourRow(start, int(up), int(down), int(windows), int(measured))
+            HourRow(
+                start,
+                max(0, int(up) - taken.get(start, [0, 0])[0]),
+                max(0, int(down) - taken.get(start, [0, 0])[1]),
+                int(windows),
+                int(measured),
+            )
             for start, up, down, windows, measured in rows
         ]
 
@@ -208,8 +273,23 @@ class FindingsRepository:
                 service_history_statement(scope, services, since=since, until=until)
             )
         ).all()
+        taken_by_day: dict[tuple[date, int, int], int] = {}
+        for step, protocol, port, up, down in await self._platform_overhead(
+            scope, since=since, until=until, seconds=_DAY
+        ):
+            key = (_as_day(step), protocol, port)
+            taken_by_day[key] = taken_by_day.get(key, 0) + up + down
         return [
-            ServiceDay(_as_day(day), int(protocol), int(port), int(nbytes))
+            ServiceDay(
+                _as_day(day),
+                int(protocol),
+                int(port),
+                max(
+                    0,
+                    int(nbytes)
+                    - taken_by_day.get((_as_day(day), int(protocol), int(port)), 0),
+                ),
+            )
             for day, protocol, port, nbytes in rows
         ]
 
@@ -345,6 +425,7 @@ class TrafficFlowFindingsService:
             location_id=location_id,
             organization_id=organization_id,
             min_devices=rule,
+            platform=await platform_endpoints_of(self.repository, self.settings),
         )
         hours = await self.repository.hour_rows(scope, since=baseline_since, until=end)
         candidates = [

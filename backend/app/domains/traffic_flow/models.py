@@ -85,7 +85,15 @@ class TrafficFlowWindow(UUIDMixin, Base):
     services_measured: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
-    # Both ends private (guest -> router DNS, router -> hub over the tunnel).
+    # Platform overhead: the router's own traffic to the platform (its
+    # management tunnel and what rides inside it), by direction, router ->
+    # platform being "up". In ``bytes_total``; in no other column, list or
+    # bucket of this window. NULL = this window was stored before overhead
+    # was classified, so its overhead (if any) is still inside the client
+    # and internal figures -- "not classified", not zero.
+    bytes_overhead_up: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    bytes_overhead_down: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Both ends private (guest -> router DNS).
     bytes_internal: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     # Both ends public -- should not happen behind NAT; counted, not hidden.
     bytes_unclassified: Mapped[int] = mapped_column(

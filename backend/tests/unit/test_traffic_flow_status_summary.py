@@ -850,6 +850,11 @@ class TestSecondMigration:
                 _migration("0156_create_traffic_flow_tables.py"), monkeypatch, "upgrade"
             )
             + _run(_migration(self.FILE), monkeypatch, "upgrade")
+            + _run(
+                _migration("0164_traffic_flow_window_overhead.py"),
+                monkeypatch,
+                "upgrade",
+            )
         )
         for column in TrafficFlowWindow.__table__.columns:
             assert f" {column.name} " in created, column.name

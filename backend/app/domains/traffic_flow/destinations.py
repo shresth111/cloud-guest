@@ -34,6 +34,7 @@ rows are exact.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
 import ipaddress
 import time
@@ -68,6 +69,12 @@ from .destination_buckets import (
     TrafficFlowDestinationBucket,
 )
 from .models import TrafficFlowServiceBucket, TrafficFlowWindow
+from .platform_overhead import (
+    NO_PLATFORM_ENDPOINTS,
+    PlatformEndpoints,
+    load_platform_endpoints,
+    platform_endpoints_of,
+)
 from .service import TrafficFlowError
 from .summary import protocol_name, service_name
 
@@ -272,6 +279,12 @@ class DestinationScope:
     organization_id: uuid.UUID | None = None
     #: Small-venue rule. 0 (Master) withholds nothing.
     min_devices: int = 0
+    #: The hub's tunnel endpoints. Bucket rows to them are the router's own
+    #: traffic to the platform, not a destination of the venue: they are
+    #: left out of every read, Master's included (Master sees the amount as
+    #: ``platform_overhead`` in the venue summary). Such rows exist only in
+    #: windows stored before overhead was classified at ingest.
+    platform: PlatformEndpoints = NO_PLATFORM_ENDPOINTS
 
     def conditions(self, model: Any) -> list[Any]:
         out: list[Any] = [model.location_id == self.location_id]
@@ -280,6 +293,12 @@ class DestinationScope:
         if self.organization_id is not None:
             out.append(model.organization_id == self.organization_id)
         return out
+
+    def venue_traffic(self, model: Any) -> list[Any]:
+        """Bucket rows of ``model`` (it has ``remote_address``, ``protocol``
+        and ``remote_port``) that are NOT the router's tunnel to the hub."""
+        hidden = self.platform.bucket_condition(model)
+        return [] if hidden is None else [not_(hidden)]
 
     def visible(self, model: Any) -> list[Any]:
         """Rows of ``model`` (a per-window bucket table) whose window had
@@ -338,6 +357,7 @@ def matching_records(
         *_in_range(_BUCKET, since, until),
         *scope.conditions(_BUCKET),
         *scope.visible(_BUCKET),
+        *scope.venue_traffic(_BUCKET),
         _BUCKET.remote_port != OTHER_SERVICE_PORT,
     ]
     if filters.address is not None:
@@ -453,6 +473,7 @@ def unlisted_statement(
         *_in_range(_BUCKET, since, until),
         *scope.conditions(_BUCKET),
         *scope.visible(_BUCKET),
+        *scope.venue_traffic(_BUCKET),
         _BUCKET.remote_port == OTHER_SERVICE_PORT,
     ]
     if protocol is not None:
@@ -556,6 +577,35 @@ def service_total_statement(
     ).select_from(per_window)
 
 
+def platform_overhead_total_statement(
+    scope: DestinationScope,
+    *,
+    since: datetime,
+    until: datetime,
+    protocol: int,
+    port: int,
+) -> Any | None:
+    """What of one service is the router's tunnel to the hub, from the
+    destination buckets. The service buckets of windows stored before
+    overhead was classified still include it (a service bucket has no
+    address to tell it apart by), so the drill-down takes this off the
+    service's total. ``None`` when no hub endpoint is known."""
+    hidden = scope.platform.bucket_condition(_BUCKET)
+    if hidden is None:
+        return None
+    return select(
+        func.coalesce(func.sum(_BUCKET.bytes_up), 0),
+        func.coalesce(func.sum(_BUCKET.bytes_down), 0),
+        func.coalesce(func.sum(_BUCKET.flows), 0),
+    ).where(
+        *_in_range(_BUCKET, since, until),
+        *scope.conditions(_BUCKET),
+        _BUCKET.protocol == protocol,
+        _BUCKET.remote_port == port,
+        hidden,
+    )
+
+
 def _service_destinations(
     scope: DestinationScope,
     *,
@@ -577,6 +627,7 @@ def _service_destinations(
             *_in_range(_BUCKET, since, until),
             *scope.conditions(_BUCKET),
             *scope.visible(_BUCKET),
+            *scope.venue_traffic(_BUCKET),
             _BUCKET.protocol == protocol,
             _BUCKET.remote_port == port,
         )
@@ -708,6 +759,28 @@ class Venue:
 class DestinationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+
+    async def platform_endpoints(self, settings: Any) -> PlatformEndpoints:
+        return await load_platform_endpoints(self.session, settings)
+
+    async def platform_overhead_total(
+        self,
+        scope: DestinationScope,
+        *,
+        since: datetime,
+        until: datetime,
+        protocol: int,
+        port: int,
+    ) -> tuple[int, int, int]:
+        """(bytes up, bytes down, flows) of this service that are the
+        router's tunnel to the hub and still sit in the buckets."""
+        statement = platform_overhead_total_statement(
+            scope, since=since, until=until, protocol=protocol, port=port
+        )
+        if statement is None:
+            return 0, 0, 0
+        row = (await self.session.execute(statement)).one()
+        return int(row[0]), int(row[1]), int(row[2])
 
     async def venue(self, location_id: uuid.UUID) -> Venue | None:
         row = (
@@ -1162,6 +1235,12 @@ class DestinationService:
                 router_id=router_id,
                 organization_id=organization_id,
                 min_devices=max(0, int(min_devices)),
+                # Nothing is read while the feature is off, this included.
+                platform=(
+                    await platform_endpoints_of(self.repository, self.settings)
+                    if getattr(self.settings, "traffic_flow_enabled", False)
+                    else NO_PLATFORM_ENDPOINTS
+                ),
             ),
             since=start,
             until=end,
@@ -1439,6 +1518,18 @@ class DestinationService:
                 "port": chosen.port,
             }
             own = await self.repository.service_total(request.scope, **where)
+            if request.scope.platform:
+                # Windows stored before overhead was classified: take the
+                # router's tunnel to the hub off this service's total.
+                taken = await self.repository.platform_overhead_total(
+                    request.scope, **where
+                )
+                own = dataclasses.replace(
+                    own,
+                    bytes_up=max(0, own.bytes_up - taken[0]),
+                    bytes_down=max(0, own.bytes_down - taken[1]),
+                    flows=max(0, own.flows - taken[2]),
+                )
             listed = await self.repository.service_destination_totals(
                 request.scope, **where
             )

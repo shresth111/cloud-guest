@@ -51,6 +51,7 @@ from .constants import (
     TOP_SERVICES_STORED,
     TalkerMatch,
 )
+from .platform_overhead import NO_PLATFORM_ENDPOINTS, PlatformEndpoints
 
 __all__ = [
     "ExporterWindow",
@@ -124,6 +125,12 @@ class ExporterWindow:
     bytes_internal: int = 0
     bytes_unclassified: int = 0
     rows_rejected: int = 0
+    # Platform overhead (``platform_overhead``): the router's own traffic to
+    # the platform. Counted here and in ``bytes_total``; in nothing else --
+    # not client traffic, not internal, not a talker, destination or service.
+    overhead_bytes_up: int = 0
+    overhead_bytes_down: int = 0
+    overhead_rows: int = 0
 
     @property
     def packets_measured(self) -> bool:
@@ -212,7 +219,10 @@ def _int(value: Any) -> int:
     return max(number, 0)
 
 
-def reduce_window(rows: Iterable[Mapping[str, Any]]) -> dict[str, ExporterWindow]:
+def reduce_window(
+    rows: Iterable[Mapping[str, Any]],
+    platform: PlatformEndpoints = NO_PLATFORM_ENDPOINTS,
+) -> dict[str, ExporterWindow]:
     """Group one window's rows by exporter and split them as described in
     the module docstring. A row whose addresses do not parse is counted in
     ``rows_rejected`` and contributes nothing else."""
@@ -241,6 +251,16 @@ def reduce_window(rows: Iterable[Mapping[str, Any]]) -> dict[str, ExporterWindow
         window.bytes_total += nbytes
         window.packets_total += _int(row.get("packets"))
         window.flows_total += nflows
+        overhead = platform.row_direction(row)
+        if overhead is not None:
+            # The router talking to the platform. Before every other class:
+            # it is neither the venue's client traffic nor venue-internal.
+            window.overhead_rows += 1
+            if overhead == "up":
+                window.overhead_bytes_up += nbytes
+            else:
+                window.overhead_bytes_down += nbytes
+            continue
         if src_local and dst_local:
             window.bytes_internal += nbytes
             continue

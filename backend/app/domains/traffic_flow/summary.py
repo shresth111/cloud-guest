@@ -35,6 +35,7 @@ from .constants import (
     TIMELINE_STEPS,
     TOP_N_STORED,
 )
+from .platform_overhead import PLATFORM_OVERHEAD_NOTE
 
 __all__ = [
     "ServiceStepRow",
@@ -138,6 +139,7 @@ def empty_summary(
         "windows": 0,
         "data_oldest": _iso(data_oldest),
         "data_newest": _iso(data_newest),
+        "platform_overhead": None,
         "totals": None,
         "services_measured": False,
         "services": {
@@ -200,8 +202,29 @@ def _merge_devices(windows: Iterable[Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _less_overhead(
+    row: ServiceStepRow, overhead: Mapping[tuple[datetime, int, int], list[int]]
+) -> ServiceStepRow:
+    """``row`` without the platform overhead recorded for its step and
+    service. Never below zero."""
+    taken = overhead.get((row.step_start, row.protocol, row.remote_port))
+    if taken is None:
+        return row
+    return ServiceStepRow(
+        step_start=row.step_start,
+        protocol=row.protocol,
+        remote_port=row.remote_port,
+        bytes_up=max(0, int(row.bytes_up) - taken[0]),
+        bytes_down=max(0, int(row.bytes_down) - taken[1]),
+        flows=max(0, int(row.flows) - taken[2]),
+    )
+
+
 def _merge_destinations(
-    windows: Iterable[Any], *, min_devices: int = 0
+    windows: Iterable[Any],
+    *,
+    min_devices: int = 0,
+    hidden: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], int]:
     """Merged destinations, and how many windows were withheld.
 
@@ -217,6 +240,10 @@ def _merge_destinations(
             continue
         for entry in window.top_destinations or []:
             ip = str(entry.get("ip"))
+            if ip in hidden:
+                # The platform's hub, in a window stored before overhead
+                # was classified: not a destination of the venue.
+                continue
             item = merged.setdefault(
                 ip, {"ip": ip, "bytes_up": 0, "bytes_down": 0, "bytes": 0, "flows": 0}
             )
@@ -265,10 +292,21 @@ def build_summary(
     data_oldest: datetime | None,
     data_newest: datetime | None,
     min_devices_for_destinations: int = 0,
+    history_overhead: Sequence[ServiceStepRow] = (),
+    hidden_addresses: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """``windows`` are the stored windows in range (any object with the
     ``TrafficFlowWindow`` attributes); ``service_rows`` the service buckets
-    of the same range already summed per timeline step."""
+    of the same range already summed per timeline step.
+
+    ``history_overhead``: platform overhead found in the destination
+    buckets, per step. Such rows only exist in windows stored before
+    overhead was classified at ingest (it is no longer written there), so
+    they are exactly what those windows' client figures still contain. They
+    are taken out of the totals, the timeline and their service, and
+    reported under ``platform_overhead`` instead. ``hidden_addresses``: the
+    hub's addresses, dropped from the stored destination lists of those same
+    windows."""
     if not windows:
         return empty_summary(
             feature_enabled=True,
@@ -279,6 +317,29 @@ def build_summary(
             data_oldest=data_oldest,
             data_newest=data_newest,
         )
+
+    # -- platform overhead still inside pre-classification windows ----------
+    overhead_by_step: dict[datetime, list[int]] = {}
+    overhead_by_service: dict[tuple[datetime, int, int], list[int]] = {}
+    for row in history_overhead:
+        in_step = overhead_by_step.setdefault(row.step_start, [0, 0])
+        in_step[0] += int(row.bytes_up)
+        in_step[1] += int(row.bytes_down)
+        in_service = overhead_by_service.setdefault(
+            (row.step_start, row.protocol, row.remote_port), [0, 0, 0]
+        )
+        in_service[0] += int(row.bytes_up)
+        in_service[1] += int(row.bytes_down)
+        in_service[2] += int(row.flows)
+    if overhead_by_service:
+        corrected = [_less_overhead(row, overhead_by_service) for row in service_rows]
+        # A service that was ONLY the tunnel is not a service of the venue:
+        # drop the emptied row rather than list it with zeros.
+        service_rows = [
+            row
+            for row, original in zip(corrected, service_rows, strict=True)
+            if row is original or row.bytes_up or row.bytes_down
+        ]
 
     # -- windows: totals and per-step coverage ------------------------------
     steps: dict[datetime, dict[str, Any]] = {}
@@ -293,9 +354,17 @@ def build_summary(
         "flows": 0,
     }
     windows_measured = 0
+    overhead = {"bytes_up": 0, "bytes_down": 0}
+    windows_classified = 0
     for window in windows:
         up = int(window.bytes_up or 0)
         down = int(window.bytes_down or 0)
+        classified_up = getattr(window, "bytes_overhead_up", None)
+        classified_down = getattr(window, "bytes_overhead_down", None)
+        if classified_up is not None or classified_down is not None:
+            windows_classified += 1
+            overhead["bytes_up"] += int(classified_up or 0)
+            overhead["bytes_down"] += int(classified_down or 0)
         totals["bytes_up"] += up
         totals["bytes_down"] += down
         totals["bytes_internal"] += int(window.bytes_internal or 0)
@@ -319,6 +388,19 @@ def build_summary(
         step["bytes_down"] += down
         step["starts"].add(start)
         step["measured"] = step["measured"] and measured
+    for step_start, (history_up, history_down) in overhead_by_step.items():
+        step = steps.get(step_start)
+        if step is None:
+            continue
+        # Never below zero: a step cannot give back more than it holds.
+        taken_up = min(history_up, step["bytes_up"])
+        taken_down = min(history_down, step["bytes_down"])
+        step["bytes_up"] -= taken_up
+        step["bytes_down"] -= taken_down
+        totals["bytes_up"] -= taken_up
+        totals["bytes_down"] -= taken_down
+        overhead["bytes_up"] += taken_up
+        overhead["bytes_down"] += taken_down
     covered_seconds = sum(seconds_by_start.values())
     client_bytes = totals["bytes_up"] + totals["bytes_down"]
 
@@ -412,7 +494,7 @@ def build_summary(
         )
 
     destination_items, destinations_withheld = _merge_destinations(
-        windows, min_devices=min_devices_for_destinations
+        windows, min_devices=min_devices_for_destinations, hidden=hidden_addresses
     )
     destinations = _lower_bound_list(
         destination_items, limit=limit, client_bytes=client_bytes
@@ -424,6 +506,29 @@ def build_summary(
             **destinations,
         }
 
+    # Devices. A window stored before overhead was classified lists the
+    # router itself as a "device" carrying the tunnel, and nothing stored
+    # says which entry that is. When such overhead was found in the range,
+    # only the classified windows feed the list (the figures stay lower
+    # bounds, which they already were), and the response says how many
+    # windows were left out of it.
+    history_found = any(up or down for up, down in overhead_by_step.values())
+    device_windows = (
+        [
+            w
+            for w in windows
+            if getattr(w, "bytes_overhead_up", None) is not None
+            or getattr(w, "bytes_overhead_down", None) is not None
+        ]
+        if history_found
+        else list(windows)
+    )
+    devices = _lower_bound_list(
+        _merge_devices(device_windows), limit=limit, client_bytes=client_bytes
+    )
+    if history_found:
+        devices["windows_not_listed"] = len(windows) - len(device_windows)
+
     return {
         "feature_enabled": True,
         "measured": True,
@@ -434,6 +539,16 @@ def build_summary(
         "windows": len(windows),
         "data_oldest": _iso(data_oldest),
         "data_newest": _iso(data_newest),
+        "platform_overhead": {
+            "bytes_up": overhead["bytes_up"],
+            "bytes_down": overhead["bytes_down"],
+            "bytes": overhead["bytes_up"] + overhead["bytes_down"],
+            # Windows whose overhead was set aside at ingest. The rest were
+            # corrected here from their destination buckets, which catches
+            # the tunnel itself but not what rode inside it.
+            "windows_classified": windows_classified,
+            "note": PLATFORM_OVERHEAD_NOTE,
+        },
         "totals": {
             **totals,
             "covered_seconds": covered_seconds,
@@ -458,8 +573,6 @@ def build_summary(
             "steps": timeline_steps,
         },
         "list_accuracy": _list_accuracy(),
-        "devices": _lower_bound_list(
-            _merge_devices(windows), limit=limit, client_bytes=client_bytes
-        ),
+        "devices": devices,
         "destinations": destinations,
     }

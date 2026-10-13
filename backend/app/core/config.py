@@ -474,6 +474,20 @@ class Settings(BaseSettings):
             "CLOUDGUEST_TRAFFIC_FLOW_RECORD_DAILY_CAP."
         ),
     )
+    traffic_flow_platform_addresses: str = Field(
+        default="",
+        description=(
+            "Comma-separated IP addresses of the platform's WireGuard hub, in "
+            "ADDITION to the wireguard_servers.endpoint_host values. A "
+            "router's own traffic to the hub (its management tunnel) is "
+            "platform overhead and is kept out of every venue's traffic "
+            "figures; it is recognised by address and port, never by port "
+            "alone. Needed only when the endpoint is stored as a hostname "
+            "(it is not resolved) or the hub is reached through another "
+            "address. Empty (the default) uses the table alone. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_PLATFORM_ADDRESSES."
+        ),
+    )
     traffic_flow_record_store_internal: bool = Field(
         default=False,
         description=(

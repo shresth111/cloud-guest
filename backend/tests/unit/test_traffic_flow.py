@@ -147,7 +147,7 @@ class TestIngest:
         w = reduce_window(
             [
                 _row("192.168.95.10", "192.168.95.1", 50),  # guest -> router DNS
-                _row("10.20.0.31", "10.20.0.1", 70),  # export over the tunnel
+                _row("192.168.95.10", "192.168.95.20", 70),  # two LAN devices
                 _row("8.8.8.8", "1.1.1.1", 5),  # should not happen behind NAT
             ]
         )["10.20.0.31"]
