@@ -225,6 +225,14 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "into three states, where a venue with only controller-managed "
         "equipment reads `not_available`, never \"not collecting\"."
     ),
+    "app/domains/traffic_flow/flow_records.py::FlowRecordRepository.target": (
+        "Master flow-record search by router: reads one router's venue and "
+        "organization so the audit row can name them, and so a router id "
+        "that does not exist is a 404. Any vendor's row answers that "
+        "question; no judgement about the device is made from it, and a "
+        "router that never exported simply has no records. The customer "
+        "path never calls it with a router id."
+    ),
     "app/domains/traffic_flow/service.py::TrafficFlowRepository.router_labels": (
         "Name/vendor/location labels for routers that already have flow "
         "windows or are switched on, for the Master overview. Every vendor "

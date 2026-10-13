@@ -42,7 +42,11 @@ from .constants import (
 )
 from .destination_buckets import DESTINATION_BUCKET_RETENTION_FACTOR
 from .geo import GeoWindowWriterProtocol
-from .service import TrafficFlowIngestService, TrafficFlowRepository
+from .service import (
+    FlowRecordWriterProtocol,
+    TrafficFlowIngestService,
+    TrafficFlowRepository,
+)
 
 logger = get_logger(__name__)
 
@@ -62,6 +66,7 @@ async def pull_once(
     commit: Callable[[], Awaitable[None]],
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     geo: GeoWindowWriterProtocol | None = None,
+    flow_records: FlowRecordWriterProtocol | None = None,
 ) -> dict[str, Any]:
     if not settings.traffic_flow_enabled:
         return {"skipped": "disabled"}
@@ -86,7 +91,7 @@ async def pull_once(
         logger.warning("traffic_flow_pull_failed", extra={"error": state.last_error})
         return {"ok": False, "error": state.last_error}
 
-    service = TrafficFlowIngestService(repository, geo=geo)
+    service = TrafficFlowIngestService(repository, geo=geo, flow_records=flow_records)
     exporter_map = await repository.exporter_router_map() if windows else {}
     written = duplicates = 0
     unknown: tuple[str, ...] = tuple(state.unknown_exporters or ())
@@ -97,6 +102,8 @@ async def pull_once(
             window_seconds=int(window.get("window_seconds") or WINDOW_SECONDS),
             rows=window.get("rows") or [],
             exporter_map=exporter_map,
+            # Present only when the agent serves per-flow rows.
+            flow_rows=window.get("flow_rows"),
         )
         written += summary.written
         duplicates += summary.duplicates
@@ -118,12 +125,17 @@ async def pull_once(
     )
     # Country buckets (Geo Location) age out the same way.
     pruned_countries = await geo.prune(cutoff) if geo is not None else 0
+    # Flow records have their own retention setting; the writer applies it.
+    pruned_records = (
+        await flow_records.prune(started) if flow_records is not None else 0
+    )
     await commit()
     result = {
         "pruned": pruned,
         "pruned_service_buckets": pruned_services,
         "pruned_destination_buckets": pruned_destinations,
         "pruned_country_buckets": pruned_countries,
+        "pruned_flow_records": pruned_records,
         "ok": True,
         "windows": len(windows),
         "written": written,
@@ -139,6 +151,7 @@ async def _run_async() -> dict[str, Any]:
 
     from app.database.session import SessionLocal
 
+    from .flow_records import FlowRecordRepository, FlowRecordWriter
     from .geo import get_geo_lookup
     from .geo_service import GeoWindowWriter, TrafficFlowGeoRepository
 
@@ -172,6 +185,13 @@ async def _run_async() -> dict[str, Any]:
             geo=GeoWindowWriter(
                 TrafficFlowGeoRepository(session),
                 get_geo_lookup(settings.traffic_flow_geo_data_dir),
+            ),
+            flow_records=FlowRecordWriter(
+                FlowRecordRepository(session),
+                settings,
+                enabled_router_ids=TrafficFlowRepository(
+                    session
+                ).enabled_export_router_ids,
             ),
         )
 

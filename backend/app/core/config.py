@@ -434,6 +434,44 @@ class Settings(BaseSettings):
             "CLOUDGUEST_TRAFFIC_FLOW_AGENT_SECRET."
         ),
     )
+    traffic_flow_records_enabled: bool = Field(
+        default=False,
+        description=(
+            "Second switch, on top of traffic_flow_enabled: store per-flow "
+            "records (source and destination address and port, protocol, NAT "
+            "translation, bytes, packets) for routers whose export is on, "
+            "for the Master console's flow table. False (the default): no "
+            "flow record is written anywhere; the aggregate tables are not "
+            "affected. A row puts a device beside the address it reached, so "
+            "this is an owner decision per environment and needs the legal "
+            "review in the flow-visibility research notes before a real "
+            "venue. Override via CLOUDGUEST_TRAFFIC_FLOW_RECORDS_ENABLED."
+        ),
+    )
+    traffic_flow_record_retention_days: int = Field(
+        default=7,
+        ge=1,
+        le=7,
+        description=(
+            "Days a flow record is kept before the pull sweep deletes it, "
+            "and the oldest a flow search may reach. Operations data: never "
+            "to be described as a CERT-In or legal log. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_RETENTION_DAYS."
+        ),
+    )
+    traffic_flow_record_daily_cap: int = Field(
+        default=100_000,
+        ge=0,
+        description=(
+            "Flow records stored per router per UTC day. When a router "
+            "reaches it, flow records stop for that router until the next "
+            "day (rollups continue), the moment is stored, and every flow "
+            "search says 'records incomplete since ...'. About 307 bytes a "
+            "row with indexes (measured), so the default is about 31 MB per "
+            "router per day and 215 MB at 7 days. 0 stores nothing. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_DAILY_CAP."
+        ),
+    )
     traffic_flow_geo_data_dir: str = Field(
         default="",
         description=(

@@ -520,17 +520,36 @@ class WindowIngestSummary:
     rows_rejected: int = 0
 
 
+class FlowRecordWriterProtocol(Protocol):
+    """``flow_records.FlowRecordWriter``: the Master flow table's ingest
+    side. Declared here because that module imports this one."""
+
+    async def write_window(
+        self,
+        identity: Mapping[str, Any],
+        exporter: str,
+        rows: Iterable[Mapping[str, Any]],
+    ) -> int: ...
+
+    async def prune(self, now: datetime) -> int: ...
+
+
 class TrafficFlowIngestService:
     def __init__(
         self,
         repository: TrafficFlowRepository,
         *,
         geo: GeoWindowWriterProtocol | None = None,
+        flow_records: FlowRecordWriterProtocol | None = None,
     ) -> None:
         self.repository = repository
         #: Geo Location (``geo_service.GeoWindowWriter``). ``None`` = no
         #: country rows are written.
         self.geo = geo
+        #: Per-flow records for the Master flow table. ``None`` = none are
+        #: written. The writer itself also refuses unless its own switch and
+        #: the router's export switch are on.
+        self.flow_records = flow_records
 
     async def ingest_window(
         self,
@@ -539,7 +558,13 @@ class TrafficFlowIngestService:
         window_seconds: int,
         rows: Iterable[Mapping[str, Any]],
         exporter_map: Mapping[str, ExporterRouter] | None = None,
+        flow_rows: Iterable[Mapping[str, Any]] | None = None,
     ) -> WindowIngestSummary:
+        """``flow_rows``: the agent's per-flow rows for this window, when it
+        sends them. Used only for flow records; every rollup comes from
+        ``rows``."""
+        rows = list(rows)
+        record_rows = list(flow_rows) if flow_rows is not None else rows
         if exporter_map is None:
             exporter_map = await self.repository.exporter_router_map()
         window_end = window_start + timedelta(seconds=window_seconds)
@@ -605,6 +630,10 @@ class TrafficFlowIngestService:
                 if self.geo is not None:
                     # The full remote-address map, not the stored top N.
                     await self.geo.write_window(identity, reduced.destinations)
+                if self.flow_records is not None:
+                    await self.flow_records.write_window(
+                        identity, exporter, record_rows
+                    )
             else:
                 summary.duplicates += 1
         summary.unknown_exporters = tuple(sorted(unknown))

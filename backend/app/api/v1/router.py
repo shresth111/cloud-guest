@@ -116,6 +116,12 @@ from app.domains.traffic_flow.destinations_customer_router import (
 from app.domains.traffic_flow.destinations_router import (
     traffic_flow_destinations_platform_router,
 )
+from app.domains.traffic_flow.flow_records_customer_router import (
+    traffic_flow_records_customer_router,
+)
+from app.domains.traffic_flow.flow_records_router import (
+    traffic_flow_records_platform_router,
+)
 from app.domains.traffic_flow.geo_customer_router import (
     traffic_flow_geo_customer_router,
 )
@@ -245,6 +251,12 @@ api_v1_router.include_router(network_integration_instant_on_customer_router)
 api_v1_router.include_router(network_integration_instant_on_platform_router)
 api_v1_router.include_router(traffic_flow_platform_router)
 api_v1_router.include_router(traffic_flow_destinations_platform_router)
+# The Master flow table (per-flow records). GLOBAL-pinned, audited.
+api_v1_router.include_router(traffic_flow_records_platform_router)
+# The same table for a customer's OWN venue, behind the second add-on
+# (traffic_flow_records, off for every customer until Master unlocks it)
+# and venue_traffic.read. Read-only, audited.
+api_v1_router.include_router(traffic_flow_records_customer_router)
 # Traffic flow, customer side: one venue, read-only, behind the per-customer
 # TRAFFIC_FLOW add-on (RequireFeature) and venue_traffic.read. Not on
 # _PAID_WRITES: it has no writes.
