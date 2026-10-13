@@ -91,6 +91,8 @@ from .constants import (
     BACKFILL_UNASSIGNED_SESSION_QUEUES_MIN_AGE_SECONDS,
     BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT,
     DEFAULT_QUEUE_PRIORITY,
+    GUEST_QUEUE_NAME_PREFIX,
+    RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS,
     RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS,
     REMOVABLE_QUEUE_STATUSES,
     UNLIMITED_RATE_KBPS,
@@ -846,21 +848,86 @@ class QueueManagementService:
     async def get_rate_limit_reply_for_session(
         self, session_id: uuid.UUID
     ) -> str | None:
-        """The single method ``app.domains.guest.service.RadiusService
-        .authorize``'s optional ``queue_lookup`` hook needs -- returns a
-        real RouterOS ``Mikrotik-Rate-Limit`` RADIUS reply-attribute
-        string for this session's own current queue assignment (whatever
-        its device-push status -- a guest's *entitled* rate is a RADIUS
-        concern independent of whether that rate has actually finished
-        being pushed to the device yet), or ``None`` if the session has no
-        queue assignment at all. Never raises -- an absent/unresolvable
-        assignment is a normal, common case (e.g. no bandwidth policy
-        configured for this session's scope), not an error."""
+        """The ``Mikrotik-Rate-Limit`` RADIUS reply for a session, from its
+        queue assignment alone -- ``rate_limit_reply_for_authorize`` with
+        nothing known about the session beyond its id, so a session with no
+        assignment gets no attribute. Never raises."""
+        return await self.rate_limit_reply_for_authorize(session_id)
+
+    async def rate_limit_reply_for_authorize(
+        self,
+        session_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
+        router_id: uuid.UUID | None = None,
+        guest_id: uuid.UUID | None = None,
+        session_started_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> str | None:
+        """What ``RadiusService.authorize`` puts in ``Mikrotik-Rate-Limit``
+        for this session: a RouterOS rate string, or ``None`` for "send no
+        such attribute".
+
+        ## The attribute is the fallback, not a second limit
+
+        RouterOS turns the attribute into a dynamic ``<hotspot-...>`` simple
+        queue for the guest's address when the guest logs in to the hotspot,
+        and that queue keeps the rate it was made with until the hotspot
+        session is made again. This platform cannot change it: a dynamic
+        row is read-only over the API, and a CoA from here has never
+        reached a router (see ``guest.device_adapters``).
+
+        It used to be sent whenever the session had an assignment -- that
+        is, exactly when this platform's own ``cloudguest-...`` row was on
+        the router too. The guest then had two rows for one address.
+        Simple queues are first-match and the hotspot inserts its row
+        first, so the dynamic one governed and the platform's row counted a
+        few kilobytes. A bandwidth rule changed afterwards rewrote the
+        platform's row and reached nobody who had signed in through RADIUS,
+        while a guest admitted without a hotspot login (a trusted device, a
+        bypass binding) has no dynamic row and changed at once. Two guests
+        at one venue, two speeds, and which one a returning guest got
+        depended on whether their return made a new RADIUS login. And the
+        fallback it looked like was not one: a session whose queue write
+        failed has no assignment row at all, so it was sent nothing.
+
+        So the attribute is now sent only where it is the guest's *only*
+        limit:
+
+        * **The platform's row is on the router** (the assignment is ACTIVE
+          and holds a device queue id): nothing is sent. One row per guest,
+          whichever way they were admitted; a rule change rewrites it and a
+          later hotspot login does not bring a second one.
+        * **There is an assignment but its row is not on the router**
+          (PENDING after a failed write, DISABLED, SUSPENDED): the
+          assignment's rate is sent, as before.
+        * **There is no assignment** and the caller says whose session it
+          is: the rate the bandwidth policy gives this guest *now* is sent
+          -- but only once the session is older than
+          ``RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS``. A login's own
+          queue write is still in flight when the hotspot authorizes a
+          moment later; sending the attribute then would bring back the
+          second row for every guest whose authorize won that race.
+        * A venue total in force, an unlimited rate, a venue run from a
+          controller or one this platform has no API to: nothing, as
+          before.
+
+        Never raises; anything it cannot establish in the no-assignment
+        case answers ``None``, which is what that case always answered."""
         assignment = await self.repository.get_active_assignment_for_target(
             target_type=QueueTargetType.SESSION.value, target_id=session_id
         )
         if assignment is None or assignment.queue_profile_id is None:
-            return None
+            return await self._policy_rate_limit_reply(
+                session_id,
+                organization_id=organization_id,
+                location_id=location_id,
+                router_id=router_id,
+                guest_id=guest_id,
+                session_started_at=session_started_at,
+                now=now,
+            )
         profile = await self.repository.get_profile_by_id(assignment.queue_profile_id)
         if profile is None:
             return None
@@ -876,9 +943,112 @@ class QueueManagementService:
             return None
         if await self._venue_cap_holds_this_session(assignment):
             return None
+        # Any of the session's live rows, not only the newest: a changed
+        # limit whose write failed can leave a newer row that never reached
+        # the router beside the older one that is still shaping the guest.
+        for row in await self.repository.list_assignments_for_target(
+            target_type=QueueTargetType.SESSION.value, target_id=session_id
+        ):
+            if await self._own_queue_is_on_the_router(row):
+                return None
         return format_mikrotik_rate_limit(
             profile, priority_override=assignment.priority_override
         )
+
+    async def _own_queue_is_on_the_router(self, assignment: QueueAssignment) -> bool:
+        """Whether this platform's own ``/queue simple`` row for
+        ``assignment`` is, by its own record, on the router: ACTIVE, with
+        the id the router gave the row when it was written, on a router
+        this platform logs in to.
+
+        A venue run from a controller is not this -- the controller ignores
+        the attribute either way, and what is sent there is left exactly as
+        it was. Never raises; a router that cannot be looked up answers
+        ``False`` and the reply carries the limit as it did before."""
+        if (
+            assignment.status != QueueStatus.ACTIVE.value
+            or not assignment.device_queue_id
+            or assignment.device_queue_id == self.CONTROLLER_QUEUE_MARKER
+            or assignment.router_id is None
+        ):
+            return False
+        try:
+            router = await self.router_lookup.get_router(
+                assignment.router_id,
+                requesting_organization_id=assignment.organization_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "radius_rate_router_lookup_failed",
+                extra={"assignment_id": str(assignment.id), "error": str(exc)},
+            )
+            return False
+        return not (is_controller_managed(router) or is_nas_only(router))
+
+    async def _policy_rate_limit_reply(
+        self,
+        session_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        router_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None,
+        session_started_at: datetime | None,
+        now: datetime | None,
+    ) -> str | None:
+        """The rate for a session that has no assignment at all, straight
+        from the bandwidth policy -- see ``rate_limit_reply_for_authorize``.
+
+        This is the session whose queue never reached the router: the
+        login's write failed and rolled back, or the router had no entry
+        for the device yet. Until now it was sent nothing and ran unlimited
+        for as long as the hotspot kept it.
+
+        ``None`` unless the caller named the session's location, router and
+        start, and the session is old enough that no login write can still
+        be on its way."""
+        if location_id is None or router_id is None or session_started_at is None:
+            return None
+        age = ((now or datetime.now(UTC)) - session_started_at).total_seconds()
+        if age < RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS:
+            return None
+        try:
+            router = await self.router_lookup.get_router(
+                router_id, requesting_organization_id=organization_id
+            )
+            if is_controller_managed(router) or is_nas_only(router):
+                return None
+            # A top-level row for one guest above the venue's parent takes
+            # that guest out of the total, whoever made it.
+            if (
+                await self._venue_cap_for_location(
+                    organization_id=organization_id, location_id=location_id
+                )
+                is not None
+            ):
+                return None
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.BANDWIDTH,
+                organization_id=organization_id,
+                location_id=location_id,
+                guest_id=guest_id,
+            )
+            if not resolved.rules:
+                return None
+            rules = BandwidthPolicyRules.model_validate(resolved.rules)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "radius_rate_fallback_lookup_failed",
+                extra={"session_id": str(session_id), "error": str(exc)},
+            )
+            return None
+        if rules.upload_rate_kbps == 0 and rules.download_rate_kbps == 0:
+            return None
+        logger.info(
+            "radius_rate_fallback_sent",
+            extra={"session_id": str(session_id), "router_id": str(router_id)},
+        )
+        return f"{rules.upload_rate_kbps}k/{rules.download_rate_kbps}k"
 
     async def _venue_cap_holds_this_session(self, assignment: QueueAssignment) -> bool:
         """Whether ``assignment``'s session is at a venue whose total cap
@@ -1018,7 +1188,7 @@ class QueueManagementService:
             if assignment.device_queue_id is None:
                 device_queue_id = await adapter.create_simple_queue(
                     credentials,
-                    name=f"cloudguest-{assignment.id}",
+                    name=f"{GUEST_QUEUE_NAME_PREFIX}{assignment.id}",
                     target=assignment.device_target or "",
                     download_rate_kbps=profile.download_rate_kbps,
                     upload_rate_kbps=profile.upload_rate_kbps,
@@ -1030,6 +1200,13 @@ class QueueManagementService:
                     # Passed only when there is one, so an adapter that has
                     # never heard of ``parent`` is called as it always was.
                     **({"parent": venue_parent} if venue_parent else {}),
+                    # A guest session's row replaces whatever row this
+                    # platform already has on the device for that address.
+                    **(
+                        await self._superseded_rows_on_device(assignment)
+                        if assignment.target_type == QueueTargetType.SESSION.value
+                        else {}
+                    ),
                 )
             else:
                 device_queue_id = assignment.device_queue_id
@@ -1145,6 +1322,64 @@ class QueueManagementService:
             description=f"Queue assignment {updated.id} removed from device",
         )
         return updated
+
+    async def _superseded_rows_on_device(
+        self, assignment: QueueAssignment
+    ) -> dict[str, object]:
+        """What ``create_simple_queue`` is told so that a guest session's
+        new row ends up the only per-guest row for its address on the
+        router.
+
+        ## Why the device is asked to do it, in the same connection
+
+        A changed limit is a new row (``move_queue``): the new one is
+        written, and only then is the old one removed -- a second device
+        call, whose record shares a transaction with everything else. When
+        that removal fails, or the transaction is rolled back after the new
+        row was written, the router keeps both and this platform's record
+        names one of them. Simple queues are first-match. "No limit" is
+        itself a row (``max-limit=0/0``), so the sequence *limit -> no limit
+        -> limit* is exactly where a leftover row is an unlimited one, and
+        a guest under it runs at full speed with the new limit showing as
+        applied. Raising the new row to the top hides that only when the
+        move works; it is best effort and says so.
+
+        So the write that adds the row also takes away every other
+        ``cloudguest-<id>`` row for exactly that address. The removal
+        ``move_queue`` then asks for finds the row gone, which
+        ``remove_queue`` already treats as done.
+
+        ## What is kept
+
+        A row belonging to a live assignment of another kind for the same
+        address -- an operator's own device or guest assignment. A sign-in
+        is not the place to revoke that (see
+        ``_retire_superseded_assignments``).
+
+        Never raises: a lookup that fails keeps nothing extra, and the
+        device write goes ahead."""
+        keep: list[str] = []
+        try:
+            if assignment.router_id is not None and assignment.device_target:
+                for row in await self.repository.list_assignments_for_device_target(
+                    router_id=assignment.router_id,
+                    device_target=assignment.device_target,
+                ):
+                    if (
+                        row.target_type != QueueTargetType.SESSION.value
+                        and row.device_queue_id
+                        and row.device_queue_id != self.CONTROLLER_QUEUE_MARKER
+                    ):
+                        keep.append(row.device_queue_id)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "queue_superseded_rows_lookup_failed",
+                extra={"assignment_id": str(assignment.id), "error": str(exc)},
+            )
+        return {
+            "supersede_name_prefix": GUEST_QUEUE_NAME_PREFIX,
+            "keep_queue_ids": tuple(sorted(keep)),
+        }
 
     #: The ``device_queue_id`` written for a controller-managed assignment.
     #: A marker rather than an id, because there is no object on the
@@ -1653,19 +1888,37 @@ class QueueManagementService:
             target_type=target_type.value, target_id=target_id
         )
 
+        # A row an earlier attempt left PENDING has never reached the
+        # router, and the row that *is* shaping this guest is one of the
+        # "other" rows below. Retiring those first and then finding the
+        # PENDING one already right -- same rate, same address -- returned
+        # it unapplied: the guest's only row removed and nothing written in
+        # its place. So with a PENDING row the order is the other way
+        # round: write it, and only then retire what it replaces. A write
+        # that fails raises with the old row still on the router.
+        apply_before_retiring = (
+            existing is not None
+            and auto_apply
+            and existing.status == QueueStatus.PENDING.value
+        )
+
+        async def _retire(keep_id: uuid.UUID | None) -> None:
+            await self._retire_superseded_assignments(
+                keep_id=keep_id,
+                target_type=target_type,
+                target_id=target_id,
+                router_id=router_id,
+                device_target=device_target,
+                actor_user_id=actor_user_id,
+                requesting_organization_id=requesting_organization_id,
+            )
+
         # Retire every *other* live row competing for this same device-side
         # target before anything is applied. A competing row is not merely
         # untidy -- it silently overrides the rate resolved above. See
         # `_retire_superseded_assignments`.
-        await self._retire_superseded_assignments(
-            keep_id=existing.id if existing is not None else None,
-            target_type=target_type,
-            target_id=target_id,
-            router_id=router_id,
-            device_target=device_target,
-            actor_user_id=actor_user_id,
-            requesting_organization_id=requesting_organization_id,
-        )
+        if not apply_before_retiring:
+            await _retire(existing.id if existing is not None else None)
 
         if existing is None:
             new_assignment = await self.create_assignment(
@@ -1697,9 +1950,16 @@ class QueueManagementService:
             existing.queue_profile_id == profile.id
             and existing.device_target == device_target
         ):
+            if apply_before_retiring:
+                existing = await self.apply_queue(
+                    existing.id,
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                )
+                await _retire(existing.id)
             return existing
 
-        return await self.move_queue(
+        moved = await self.move_queue(
             existing.id,
             actor_user_id=actor_user_id,
             requesting_organization_id=requesting_organization_id,
@@ -1707,6 +1967,9 @@ class QueueManagementService:
             new_device_target=device_target,
             auto_apply=auto_apply,
         )
+        if apply_before_retiring:
+            await _retire(moved.id)
+        return moved
 
     async def reapply_active_sessions_for_location(
         self,
@@ -1836,9 +2099,17 @@ class QueueManagementService:
             guest_ids = await guest_lookup({a.target_id for a in candidates})
         reapplied = 0
         failed = 0
+        # A router that did not answer is not asked again in this run: each
+        # try costs a whole connection timeout, and a venue that is offline
+        # has every one of its guests waiting behind it. Its rows are
+        # counted as failed, which is what makes the task come back.
+        unreachable_routers: set[uuid.UUID] = set()
         for assignment in candidates:
             current = await self.repository.get_assignment_by_id(assignment.id)
             if current is None or current.status != QueueStatus.ACTIVE.value:
+                continue
+            if assignment.router_id in unreachable_routers:
+                failed += 1
                 continue
             guest_id = guest_ids.get(assignment.target_id)
             try:
@@ -1848,6 +2119,17 @@ class QueueManagementService:
                     async with unit_of_work():
                         await self._reapply_one(assignment, actor_user_id, guest_id)
                 reapplied += 1
+            except QueueDeviceConnectionError as exc:
+                failed += 1
+                unreachable_routers.add(assignment.router_id)
+                logger.warning(
+                    "queue_reapply_router_unreachable",
+                    extra={
+                        "assignment_id": str(assignment.id),
+                        "router_id": str(assignment.router_id),
+                        "error": str(exc),
+                    },
+                )
             except Exception as exc:  # noqa: BLE001 -- per-assignment isolation, see docstring
                 failed += 1
                 logger.warning(

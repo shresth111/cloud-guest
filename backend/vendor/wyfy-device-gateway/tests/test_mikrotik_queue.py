@@ -1080,3 +1080,217 @@ async def test_a_venue_cap_write_the_router_refuses_raises(patch_connect, mikrot
         await _sync(MikroTikAdapter(), mikrotik_creds)
     assert api._menus[_SIMPLE] == []
     assert api.closed is True
+
+
+# ---------------------------------------------------------------------------
+# A guest's new row is the only row of its kind for that address.
+#
+# A changed limit is a new row, and the row it replaces is removed by the
+# caller in a second call. "No limit" is a row too (``max-limit=0/0``). When
+# that second call fails -- or its record is rolled back -- both stay, and
+# RouterOS takes the first that matches: limit -> no limit -> limit left a
+# guest unlimited under a limit the venue had just set. Moving the new row
+# to the top hides it only where the move works, so the write that adds the
+# row also takes the others away.
+# ---------------------------------------------------------------------------
+
+_GUEST = "192.168.88.251"
+_PREFIX = "cloudguest-"
+_OLD_ROW = "cloudguest-11111111-1111-4111-8111-111111111111"
+_NEW_ROW = "cloudguest-22222222-2222-4222-8222-222222222222"
+
+
+def _static_row(row_id: str, name: str, target: str, limit: str = "0/0", **more) -> dict:
+    return {".id": row_id, "name": name, "target": target, "max-limit": limit, **more}
+
+
+def _governing(api, address: str) -> dict | None:
+    """The first row whose target is this address: what RouterOS applies."""
+    for row in api._menus[_SIMPLE]:
+        if address in {t.strip().removesuffix("/32") for t in row["target"].split(",")}:
+            return row
+    return None
+
+
+async def _create_guest_row(adapter, creds, **kwargs):
+    return await adapter.create_simple_queue(
+        creds,
+        name=_NEW_ROW,
+        target=_GUEST,
+        download_rate_kbps=81920,
+        upload_rate_kbps=81920,
+        supersede_name_prefix=_PREFIX,
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unlimited_row_left_above_does_not_outlive_the_new_limit(
+    patch_connect, mikrotik_creds
+):
+    """Limit -> no limit -> limit, on a router that will not reorder rows:
+    the ``0/0`` row is first, the new one is added below it."""
+    from librouteros.exceptions import LibRouterosError
+
+    api = FakeRouterOSApi(
+        menus={_SIMPLE: [_static_row("*5", _OLD_ROW, f"{_GUEST}/32")]},
+        raise_on_command={"/queue/simple/move": LibRouterosError("cannot move")},
+    )
+    api.mint_id = lambda row_count: "*A"
+    patch_connect(api)
+
+    device_id = await _create_guest_row(MikroTikAdapter(), mikrotik_creds)
+
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == [device_id]
+    assert _governing(api, _GUEST)["max-limit"] == "81920k/81920k"
+    # Added first, removed second: never a moment with no row.
+    writes = [op[0] for op in api.ops if op[0] in ("add", "remove")]
+    assert writes == ["add", "remove"]
+    assert api.remove_calls == [(_SIMPLE, ("*5",))]
+
+
+@pytest.mark.asyncio
+async def test_only_this_addresss_own_guest_rows_are_taken_away(
+    patch_connect, mikrotik_creds
+):
+    untouched = [
+        _dynamic_row("*7", _GUEST),
+        _static_row("*8", "cloudguest-33333333-3333-4333-8333-333333333333", "192.168.88.9"),
+        _static_row("*9", "cloudguest-venue-0a1b2c3d", "192.168.88.0/24", "0/81920000"),
+        _static_row("*10", "cloudguest-qos-44444444-4444-4444-8444-444444444444", _GUEST),
+        _static_row("*11", "front-desk", f"{_GUEST}/32"),
+        _static_row("*12", "cloudguest-55555555-5555-4555-8555-555555555555", _GUEST),
+        _static_row(
+            "*13",
+            "cloudguest-66666666-6666-4666-8666-666666666666",
+            f"{_GUEST}/32,192.168.88.9/32",
+        ),
+    ]
+    api = FakeRouterOSApi(
+        menus={_SIMPLE: [*untouched, _static_row("*5", _OLD_ROW, f"{_GUEST}/32")]},
+        command_handlers={"/queue/simple/move": _move},
+    )
+    api.mint_id = lambda row_count: "*A"
+    patch_connect(api)
+
+    await _create_guest_row(MikroTikAdapter(), mikrotik_creds, keep_queue_ids=("*12",))
+
+    assert api.remove_calls == [(_SIMPLE, ("*5",))]
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == [
+        "*A",
+        *[r[".id"] for r in untouched],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_row_created_without_the_prefix_removes_nothing(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(
+        menus={_SIMPLE: [_static_row("*5", _OLD_ROW, f"{_GUEST}/32")]},
+        command_handlers={"/queue/simple/move": _move},
+    )
+    api.mint_id = lambda row_count: "*A"
+    patch_connect(api)
+
+    await _create(MikroTikAdapter(), mikrotik_creds, address=_GUEST)
+
+    assert api.remove_calls == []
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == ["*A", "*5"]
+
+
+@pytest.mark.asyncio
+async def test_writing_the_same_guest_row_again_finds_nothing_to_remove(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(command_handlers={"/queue/simple/move": _move})
+    patch_connect(api)
+
+    await _create_guest_row(MikroTikAdapter(), mikrotik_creds)
+
+    assert api.remove_calls == []
+    assert len(api._menus[_SIMPLE]) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_old_row_the_router_will_not_remove_fails_the_write_and_undoes_it(
+    patch_connect, mikrotik_creds, monkeypatch
+):
+    """The row that could not be taken away may be the one that governs, so
+    the caller is not told the new limit is in place -- and is not left
+    with a row it holds no id for."""
+    from librouteros.exceptions import LibRouterosError
+
+    from tests.fake_write_transport import FakePath
+
+    api = FakeRouterOSApi(
+        menus={_SIMPLE: [_static_row("*5", _OLD_ROW, f"{_GUEST}/32")]},
+        command_handlers={"/queue/simple/move": _move},
+    )
+    api.mint_id = lambda row_count: "*A"
+    patch_connect(api)
+    plain_remove = FakePath.remove
+
+    def _remove(self, *ids):
+        if ids == ("*5",):
+            raise LibRouterosError("failure: busy")
+        plain_remove(self, *ids)
+
+    monkeypatch.setattr(FakePath, "remove", _remove)
+
+    with pytest.raises(MikroTikDeviceError):
+        await _create_guest_row(MikroTikAdapter(), mikrotik_creds)
+
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == ["*5"]
+    assert api.closed is True
+
+
+@pytest.mark.asyncio
+async def test_an_old_row_that_has_already_gone_is_not_a_failure(
+    patch_connect, mikrotik_creds, monkeypatch
+):
+    from librouteros.exceptions import LibRouterosError
+
+    from tests.fake_write_transport import FakePath
+
+    api = FakeRouterOSApi(
+        menus={_SIMPLE: [_static_row("*5", _OLD_ROW, f"{_GUEST}/32")]},
+        command_handlers={"/queue/simple/move": _move},
+    )
+    api.mint_id = lambda row_count: "*A"
+    patch_connect(api)
+
+    def _remove(self, *ids):
+        self._rows[:] = [row for row in self._rows if row.get(".id") not in ids]
+        raise LibRouterosError("no such item")
+
+    monkeypatch.setattr(FakePath, "remove", _remove)
+
+    device_id = await _create_guest_row(MikroTikAdapter(), mikrotik_creds)
+
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == [device_id]
+
+
+@pytest.mark.asyncio
+async def test_a_guest_row_under_a_venue_parent_replaces_its_sibling_not_the_parent(
+    patch_connect, mikrotik_creds
+):
+    parent = _static_row("*P", "cloudguest-venue-0a1b2c3d", "192.168.88.0/24", "0/163840000")
+    api = FakeRouterOSApi(
+        menus={
+            _SIMPLE: [
+                parent,
+                _static_row("*5", _OLD_ROW, f"{_GUEST}/32", parent="cloudguest-venue-0a1b2c3d"),
+            ]
+        },
+        command_handlers={"/queue/simple/move": _move},
+    )
+    api.mint_id = lambda row_count: "*A"
+    patch_connect(api)
+
+    await _create_guest_row(
+        MikroTikAdapter(), mikrotik_creds, parent="cloudguest-venue-0a1b2c3d"
+    )
+
+    assert [r[".id"] for r in api._menus[_SIMPLE]] == ["*P", "*A"]
+    assert api.command_calls == []

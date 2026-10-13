@@ -287,6 +287,30 @@ BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN = 25
 BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT = 1000
 
 
+# The name of every per-assignment ``/queue simple`` row is this followed by
+# the assignment's id. It is also how a guest session's new row finds the
+# rows it replaces on the device (``device_adapters.BaseQueueAdapter
+# .create_simple_queue``'s ``supersede_name_prefix``).
+GUEST_QUEUE_NAME_PREFIX = "cloudguest-"
+
+# A session with no queue assignment is sent its speed in the RADIUS reply
+# instead (``QueueManagementService.rate_limit_reply_for_authorize``), but
+# not while it is younger than this. The hotspot authorizes a second or two
+# after the sign-in that enqueued the session's queue write, and that write
+# -- three tries thirty seconds apart, each able to spend a whole connection
+# timeout -- may still be on its way. Answering with a rate then gives the
+# guest a dynamic hotspot queue *and*, moments later, this platform's own:
+# two rows for one address, which is the fault this fallback must not bring
+# back.
+RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS = 150.0
+
+# After a policy re-apply in which some guest's write failed, the task runs
+# again this many seconds later (up to its own ``max_retries``). A re-apply
+# is idempotent -- a guest already at the published rate costs no device
+# call -- so the repeat only does the work that was left.
+REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS = 30
+
+
 # ---------------------------------------------------------------------------
 # A venue's total speed cap (``BandwidthPolicyRules.venue_*_rate_kbps``)
 # ---------------------------------------------------------------------------
@@ -319,6 +343,9 @@ UNENFORCED_QUEUE_TARGET_TYPES: frozenset[QueueTargetType] = frozenset(
 __all__ = [
     "QueueType",
     "VENUE_QUEUE_NAME_PREFIX",
+    "GUEST_QUEUE_NAME_PREFIX",
+    "RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS",
+    "REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS",
     "VENUE_QUEUE_COMMENT",
     "UNENFORCED_QUEUE_TARGET_TYPES",
     "MIN_QUEUE_PRIORITY",
