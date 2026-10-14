@@ -38,6 +38,40 @@ class DemoRequestListResult:
     meta: PaginationMeta
 
 
+class SalesWebhookPublisherProtocol(Protocol):
+    """The narrow surface of ``app.domains.notification.sales_webhook
+    .SalesWebhookPublisher`` this module needs. ``publish`` never raises
+    and is a no-op when the webhook is off."""
+
+    async def publish(self, event: str, data: dict[str, object]) -> None: ...
+
+
+def lead_webhook_payload(demo_request: DemoRequest) -> dict[str, object]:
+    """The lead as the sales-automation webhook carries it. Shared with
+    ``app.domains.demo_booking.service`` so both events describe a lead in
+    the same shape. Excludes ``internal_notes`` (sales' own scratch pad)."""
+    from .schemas import compute_lead_priority
+
+    return {
+        "id": str(demo_request.id),
+        "full_name": demo_request.full_name,
+        "email": demo_request.email,
+        "phone": demo_request.phone,
+        "company_name": demo_request.company_name,
+        "message": demo_request.message,
+        "property_type": demo_request.property_type,
+        "location_count": demo_request.location_count,
+        "router_count": demo_request.router_count,
+        "lead_priority": compute_lead_priority(
+            demo_request.location_count, demo_request.router_count
+        ).value,
+        "status": demo_request.status,
+        "submitted_at": (
+            demo_request.created_at.isoformat() if demo_request.created_at else None
+        ),
+    }
+
+
 class DemoRequestService:
     def __init__(
         self,
@@ -45,6 +79,7 @@ class DemoRequestService:
         *,
         notification_service: NotificationEnqueuer | None = None,
         notify_email: str = "",
+        sales_webhook: SalesWebhookPublisherProtocol | None = None,
     ) -> None:
         self.repository = repository
         # Both default to inert (None/"") so every existing unit test that
@@ -54,6 +89,8 @@ class DemoRequestService:
         # reason.
         self.notification_service = notification_service
         self.notify_email = notify_email
+        # None (the default) and a disabled publisher are both no-ops.
+        self.sales_webhook = sales_webhook
 
     # -- create (public) ---------------------------------------------------
 
@@ -93,6 +130,10 @@ class DemoRequestService:
             extra={"demo_request_id": str(demo_request.id)},
         )
         await self._notify_team(demo_request)
+        if self.sales_webhook is not None:
+            await self.sales_webhook.publish(
+                "demo_request.created", {"lead": lead_webhook_payload(demo_request)}
+            )
         return demo_request
 
     async def _notify_team(self, demo_request: DemoRequest) -> None:
@@ -213,4 +254,10 @@ class DemoRequestService:
         return updated
 
 
-__all__ = ["DemoRequestService", "DemoRequestListResult", "NotificationEnqueuer"]
+__all__ = [
+    "DemoRequestListResult",
+    "DemoRequestService",
+    "NotificationEnqueuer",
+    "SalesWebhookPublisherProtocol",
+    "lead_webhook_payload",
+]

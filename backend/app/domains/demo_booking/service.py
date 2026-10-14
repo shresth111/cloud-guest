@@ -92,6 +92,10 @@ from app.core.email_layout import (
 from app.database.utils.pagination import PaginationMeta
 from app.domains.demo_request.constants import DemoRequestStatus
 from app.domains.demo_request.models import DemoRequest
+from app.domains.demo_request.service import (
+    SalesWebhookPublisherProtocol,
+    lead_webhook_payload,
+)
 
 from .availability import BookingWindow, DayAvailability, iterate_dates
 from .constants import (
@@ -248,6 +252,7 @@ class DemoBookingService:
         alternatives_limit: int = 5,
         slot_id_secret: str = "demo-booking-slot-id-secret-placeholder",
         clock: Callable[[], datetime] | None = None,
+        sales_webhook: SalesWebhookPublisherProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.lead_repository = lead_repository
@@ -273,6 +278,9 @@ class DemoBookingService:
         # Injected so tests can pin "now" without patching a module-level
         # clock -- every time-dependent guard in this domain reads it.
         self._clock = clock or (lambda: datetime.now(UTC))
+        # The sales-automation webhook. None (the default) and a disabled
+        # publisher are both no-ops; publish never raises.
+        self.sales_webhook = sales_webhook
 
     def now(self) -> datetime:
         return self._clock()
@@ -400,6 +408,7 @@ class DemoBookingService:
                 "team_notification_delivery_id": team_delivery_id,
             },
         )
+        await self._publish("demo_booking.created", booking, lead)
 
         # Commit BEFORE building the response. Everything the visitor is
         # about to be told is now durable; nothing is claimed that a later
@@ -446,6 +455,7 @@ class DemoBookingService:
         await self.repository.update_booking(
             booking, {"team_notification_delivery_id": delivery_id}
         )
+        await self._publish("demo_booking.cancelled", booking, lead)
         await self.repository.commit()
         logger.info("demo_booking_cancelled", extra={"booking_id": str(booking.id)})
         return BookingResult(
@@ -516,6 +526,7 @@ class DemoBookingService:
                 "team_notification_delivery_id": team_delivery_id,
             },
         )
+        await self._publish("demo_booking.rescheduled", booking, lead)
         await self.repository.commit()
         logger.info(
             "demo_booking_rescheduled",
@@ -576,6 +587,7 @@ class DemoBookingService:
         if update.get("status") == DemoBookingStatus.CANCELLED.value:
             update["cancelled_at"] = self.now()
         await self.repository.update_booking(booking, update)
+        await self._publish("demo_booking.updated", booking, lead)
         await self.repository.commit()
         logger.info(
             "demo_booking_admin_updated",
@@ -592,6 +604,29 @@ class DemoBookingService:
     # ======================================================================
     # Guards
     # ======================================================================
+
+    async def _publish(
+        self, event: str, booking: DemoBooking, lead: DemoRequest
+    ) -> None:
+        """Queue a sales-automation webhook event in the same transaction as
+        the change it describes. Never carries the manage token."""
+        if self.sales_webhook is None:
+            return
+        await self.sales_webhook.publish(
+            event,
+            {
+                "booking": {
+                    "id": str(booking.id),
+                    "demo_request_id": str(booking.demo_request_id),
+                    "starts_at": booking.starts_at.astimezone(UTC).isoformat(),
+                    "ends_at": booking.ends_at.astimezone(UTC).isoformat(),
+                    "status": booking.status,
+                    "booked_timezone": booking.booked_timezone,
+                    "cancellation_reason": booking.cancellation_reason,
+                },
+                "lead": lead_webhook_payload(lead),
+            },
+        )
 
     def _require_bookable(self, starts_at: datetime, now: datetime) -> None:
         """Raise ``SlotNotBookableError`` unless ``starts_at`` is a slot

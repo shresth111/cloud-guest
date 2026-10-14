@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from email_validator import EmailNotValidError, validate_email
 from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator
@@ -2240,6 +2241,58 @@ class Settings(BaseSettings):
             "sweep worker open indefinitely."
         ),
     )
+    # -- Sales-automation webhook (app.domains.notification.sales_webhook) --
+    #
+    # Demo-request / demo-booking lifecycle events POSTed to the sales
+    # team's workflow automation. OFF by default; inert unless all three of
+    # enabled/url/secret are set. URL and secret are credentials: never
+    # committed, never written to the database, never logged.
+    sales_webhook_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the sales-automation webhook. False (the "
+            "default) writes no outbox rows and changes nothing."
+        ),
+    )
+    sales_webhook_url: str = Field(
+        default="",
+        description=(
+            "Endpoint demo_request.created / demo_booking.* events are "
+            "POSTed to. https:// required (http:// is accepted for "
+            "localhost/127.0.0.1 only, for local testing). Set via "
+            "CLOUDGUEST_SALES_WEBHOOK_URL -- never commit it."
+        ),
+    )
+    sales_webhook_secret: str = Field(
+        default="",
+        description=(
+            "Shared secret sent in the X-Wyfy-Webhook-Secret header on every "
+            "sales-automation webhook POST. Set via "
+            "CLOUDGUEST_SALES_WEBHOOK_SECRET -- never commit it."
+        ),
+    )
+    sales_webhook_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+        description="Per-request timeout for one sales-automation webhook POST.",
+    )
+
+    @field_validator("sales_webhook_url")
+    @classmethod
+    def _validate_sales_webhook_url(cls, value: str) -> str:
+        url = (value or "").strip()
+        if not url or url.startswith("https://"):
+            return url
+        if url.startswith("http://"):
+            host = urlsplit(url).hostname or ""
+            if host in {"localhost", "127.0.0.1", "::1"}:
+                return url
+        raise ValueError(
+            "sales_webhook_url must start with https:// "
+            "(http:// is allowed for localhost only)"
+        )
+
     # -- Cloudflare Gateway DNS filtering (app.domains.dns_filtering) ------
     #
     # One platform-owned Cloudflare account; this platform is the operator

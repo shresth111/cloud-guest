@@ -24,6 +24,11 @@ from .onboarding_slack import (
     resolve_master_console_base_url,
 )
 from .repository import NotificationRepository, NotificationRepositoryProtocol
+from .sales_webhook import (
+    SalesWebhookPublisher,
+    get_configured_sales_webhook_sender,
+    is_sales_webhook_configured,
+)
 from .service import NotificationService
 from .slack import get_configured_slack_sender
 
@@ -58,6 +63,7 @@ def get_notification_service(
         # `get_onboarding_slack_notifier` below is disabled by the same
         # condition.
         slack_sender=get_configured_slack_sender(settings),
+        sales_webhook_sender=get_configured_sales_webhook_sender(settings),
         max_attempts=settings.notification_max_delivery_attempts,
         retry_backoff_seconds=settings.notification_retry_backoff_seconds,
     )
@@ -87,8 +93,23 @@ def get_onboarding_slack_notifier(
     )
 
 
+def get_sales_webhook_publisher(
+    notification_service: NotificationService = Depends(get_notification_service),
+    settings: Settings = Depends(get_settings),
+) -> SalesWebhookPublisher:
+    """The demo domains' handle on the sales-automation webhook, sharing the
+    request's ``NotificationService`` (and so its session): an event row
+    commits with the lead/booking it describes. ``enabled`` is decided
+    here, from configuration, exactly as ``get_onboarding_slack_notifier``
+    does -- callers never test for it."""
+    return SalesWebhookPublisher(
+        notification_service, enabled=is_sales_webhook_configured(settings)
+    )
+
+
 __all__ = [
     "get_notification_repository",
+    "get_sales_webhook_publisher",
     "get_notification_service",
     "get_onboarding_slack_notifier",
 ]
