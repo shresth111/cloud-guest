@@ -48,6 +48,7 @@ from .onboarding_slack import (
     resolve_master_console_base_url,
 )
 from .repository import NotificationRepository
+from .sales_webhook import get_configured_sales_webhook_sender
 from .service import NotificationService
 from .slack import get_configured_slack_sender
 
@@ -73,6 +74,7 @@ async def _run_notification_dispatch_sweep_async() -> dict[str, int]:
             ),
             sms_provider=get_configured_sms_provider(settings),
             slack_sender=get_configured_slack_sender(settings),
+            sales_webhook_sender=get_configured_sales_webhook_sender(settings),
             max_attempts=settings.notification_max_delivery_attempts,
             retry_backoff_seconds=settings.notification_retry_backoff_seconds,
         )

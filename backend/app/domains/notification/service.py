@@ -92,6 +92,10 @@ from .exceptions import (
 )
 from .models import NotificationDelivery, NotificationTemplate
 from .repository import NotificationRepositoryProtocol
+from .sales_webhook import (
+    SalesWebhookSenderProtocol,
+    UnconfiguredSalesWebhookSender,
+)
 from .slack import SlackSenderProtocol, UnconfiguredSlackSender
 from .validators import validate_recipient
 
@@ -123,6 +127,7 @@ class NotificationService:
         ) = None,
         sms_provider: SmsProviderProtocol | None = None,
         slack_sender: SlackSenderProtocol | None = None,
+        sales_webhook_sender: SalesWebhookSenderProtocol | None = None,
         max_attempts: int = 5,
         retry_backoff_seconds: int = 300,
     ) -> None:
@@ -154,6 +159,11 @@ class NotificationService:
         # at all when there is no webhook. See `slack.py`.
         self.slack_sender: SlackSenderProtocol = (
             slack_sender or UnconfiguredSlackSender()
+        )
+        # Same reasoning as `slack_sender` directly above: no logging
+        # fallback that would mark rows SENT. See `sales_webhook.py`.
+        self.sales_webhook_sender: SalesWebhookSenderProtocol = (
+            sales_webhook_sender or UnconfiguredSalesWebhookSender()
         )
         self.max_attempts = max_attempts
         self.retry_backoff_seconds = retry_backoff_seconds
@@ -412,6 +422,10 @@ class NotificationService:
                 # it from Settings. It is deliberately NOT passed here, so
                 # no webhook URL is ever read from a database row.
                 await self.slack_sender.send(delivery.body)
+            elif delivery.channel == NotificationChannelType.WEBHOOK.value:
+                # Same rule as SLACK: the URL and secret live on the
+                # sender (from Settings), never on the row.
+                await self.sales_webhook_sender.send(delivery.body)
             else:
                 await self.sms_provider.send(delivery.recipient, delivery.body)
         except Exception as exc:  # noqa: BLE001 -- a real provider failure must

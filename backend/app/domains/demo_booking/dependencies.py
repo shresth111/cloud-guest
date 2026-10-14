@@ -28,7 +28,11 @@ from app.database.session import get_db_session
 from app.domains.demo_request.repository import (
     DemoRequestRepository,
 )
-from app.domains.notification.dependencies import get_notification_service
+from app.domains.notification.dependencies import (
+    get_notification_service,
+    get_sales_webhook_publisher,
+)
+from app.domains.notification.sales_webhook import SalesWebhookPublisher
 from app.domains.notification.service import NotificationService
 
 from .availability import BookingWindow
@@ -70,6 +74,7 @@ def get_demo_booking_service(
     notification_service: NotificationService = Depends(get_notification_service),
     redis: Redis = Depends(get_redis_client),
     settings: Settings = Depends(get_settings),
+    sales_webhook: SalesWebhookPublisher = Depends(get_sales_webhook_publisher),
 ) -> DemoBookingService:
     return DemoBookingService(
         repository,
@@ -92,6 +97,7 @@ def get_demo_booking_service(
         # holding a stale one gets a clean "reload the calendar" (422
         # INVALID_SLOT_ID) rather than a booking against an old schedule.
         slot_id_secret=settings.jwt_secret_key,
+        sales_webhook=sales_webhook,
     )
 
 
