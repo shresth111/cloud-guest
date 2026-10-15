@@ -214,9 +214,11 @@ class CaptivePortalConfigCreateRequest(BaseModel):
         max_length=REVIEW_URL_MAX_LENGTH,
         description=(
             "The venue's Google review link, copied from Business Profile "
-            "-> Read reviews -> Get more reviews. Stored **verbatim** -- "
-            "never synthesised from a place id, never normalised, never "
-            "rewritten. Validated on write to be `https` on a Google "
+            "-> Read reviews -> Get more reviews. A pasted link is stored "
+            "**verbatim** -- never normalised, never rewritten. A bare "
+            "Google Place ID (no scheme, dot or slash) is accepted too and "
+            "stored as `https://search.google.com/local/writereview"
+            "?placeid=<id>`. Validated on write to be `https` on a Google "
             "host; the path is deliberately not checked, and the link is "
             "not fetched. Null renders no card at all -- not a disabled "
             "one. (The QR code Google offers alongside this link can only "

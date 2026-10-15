@@ -114,6 +114,7 @@ from .validators import (
     validate_feedback_dwell_minutes,
     validate_guest_font_choice,
     validate_hex_color,
+    normalize_review_url,
     validate_review_url,
     validate_single_content_source,
     validate_splash_text_length,
@@ -824,6 +825,9 @@ class CaptivePortalService:
         validate_splash_text_length("splash_headline", splash_headline)
         validate_splash_text_length("splash_welcome_message", splash_welcome_message)
         validate_content_mode(content_mode)
+        # A bare Place ID becomes a writereview link before it is checked,
+        # so what is validated is exactly what is stored.
+        review_url = normalize_review_url(review_url)
         validate_review_url(review_url)
         validate_feedback_dwell_minutes(feedback_dwell_minutes)
         # Sanitize here, not at the schema layer and not on read. The value
@@ -1134,7 +1138,11 @@ class CaptivePortalService:
         # can predate this column, so there is no legacy value to protect.
         if "review_url" in update_data:
             submitted = update_data["review_url"]
-            validate_review_url(None if submitted is None else str(submitted))
+            normalized = normalize_review_url(
+                None if submitted is None else str(submitted)
+            )
+            validate_review_url(normalized)
+            update_data["review_url"] = normalized
         # Same present-key-only rule, for the same reason: a PUT that never
         # mentions the dwell must not reject a save over a value somebody
         # stored earlier.

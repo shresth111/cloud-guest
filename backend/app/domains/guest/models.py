@@ -485,6 +485,21 @@ class GuestSession(BaseModel):
     disconnect_enforced: Mapped[bool | None] = mapped_column(
         Boolean, nullable=True, default=None
     )
+    # The "Rate us on Google" page (``/portal/review``), per session and so
+    # per location. ``guests.review_link_opened_at`` is per organization,
+    # which is wrong for a chain: a guest who reviewed branch A was never
+    # asked at branch B. ``GuestService.review_prompt_due`` reads these two
+    # columns for "asked at this location recently" and "ever tapped here",
+    # and ``GET /captive-portal/review-stats`` counts them.
+    #
+    # Like the guest-level column, ``review_link_opened_at`` records that a
+    # link was *opened*, never that a review was written.
+    review_prompt_shown_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    review_link_opened_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_guest_sessions_guest_id", "guest_id"),
@@ -495,6 +510,15 @@ class GuestSession(BaseModel):
         Index("ix_guest_sessions_voucher_id", "voucher_id"),
         Index("ix_guest_sessions_status", "status"),
         Index("ix_guest_sessions_started_at", "started_at"),
+        Index(
+            "ix_guest_sessions_review_activity",
+            "location_id",
+            "guest_id",
+            postgresql_where=text(
+                "review_prompt_shown_at IS NOT NULL "
+                "OR review_link_opened_at IS NOT NULL"
+            ),
+        ),
     )
 
     def __repr__(self) -> str:
