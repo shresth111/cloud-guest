@@ -28,6 +28,13 @@ get wrong -- done as one idempotent operation:
   each other's portal for their own. A foreign portal is written in exactly
   one case: ``take_over_ssid_portal``, and then only its ``ssidList`` loses
   our SSID; every other field is sent back as the controller returned it.
+  When our SSID is the *only* thing that portal applies to, the controller
+  refuses to keep it bound to nothing (-34319, measured), so take-over
+  deletes that portal instead -- it could no longer reach anybody anyway.
+* **``portalCustomize`` is required on every portal write** (measured on
+  5.15.24.19, 2026-10-16, against the "unverified" note below): ``addPortal``
+  gets five defaults, and a ``modifyPortal`` sends back what
+  ``getPortalCustomization`` returned, filling only required fields it lacked.
 * **Pre-Authentication Access is merge-only.** The PATCH is full-config (the
   spec says "the full configuration parameters should be passed in"), so the
   body is the controller's own GET result with our entry appended. Every
@@ -153,6 +160,7 @@ from .types import coerce_bool, coerce_int, coerce_str, extract_page
 
 PORTALS_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/portals"
 PORTAL_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/portal/{portal_id}"
+PORTAL_CUSTOMIZATION_PATH = PORTAL_PATH + "/customization"
 ADD_PORTAL_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/portal"
 ACCESS_CONTROL_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/setting/access-control"
 OPERATORS_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/hotspot/operators"
@@ -168,6 +176,7 @@ AUTH_TYPE_EXTERNAL_PORTAL = 4
 #: path, and the query string lives in the path (see the backend's
 #: ``validators.ExternalPortalUrl``).
 HOST_TYPE_URL = 2
+HOST_TYPE_IP = 1
 #: ``PreAuthAccessPolicyOpenApiVO.type``: "2: URL, and parameter [url] is
 #: needed". A URL entry permits the address the name resolves to, not the
 #: name (measured, ``HARDWARE-FINDINGS.md``).
@@ -202,6 +211,23 @@ _PRESET_AUTH_TIMEOUTS: dict[int, tuple[int, int]] = {
 #: Used only when a portal detail carries no timeout at all ("Display when
 #: enabled, otherwise no display") and a PATCH still requires one.
 _FALLBACK_AUTH_TIMEOUT: dict[str, int] = {"customTimeout": 1, "customTimeoutUnit": 2}
+
+#: The five fields ``PortalCustomizeOpenApiVO`` marks required. MEASURED on
+#: 5.15.24.19 (2026-10-16): ``addPortal`` and ``modifyPortal`` both refuse a
+#: body without ``portalCustomize`` (-1001 "Parameter [portalCustomize]
+#: should not be null"), and accept exactly these five. ``getPortalDetail``
+#: never returns ``portalCustomize``; ``getPortalCustomization`` does, but a
+#: portal created by an older firmware can lack ``defaultLanguage`` and
+#: ``copyrightEnable`` there -- so these also fill the gaps of what is read.
+#: ``defaultLanguage`` 1 is en_US. None of it is shown by an External Portal
+#: Server portal, whose page is ours.
+_DEFAULT_PORTAL_CUSTOMIZE: dict[str, Any] = {
+    "defaultLanguage": 1,
+    "copyrightEnable": False,
+    "logoDisplay": True,
+    "termsOfServiceEnable": False,
+    "welcomeEnable": False,
+}
 
 #: The ``PortalSetting`` fields that ``PortalDetailResOpenApiVO`` also
 #: returns -- i.e. everything that CAN be echoed back. ``socialLogin`` and
@@ -370,6 +396,42 @@ def _fill_required_portal_fields(body: dict[str, Any]) -> list[str]:
         if body.get(key) is None:
             body[key] = default
             filled.append(key)
+    # ``ExternalServerPortalSetting`` requires ``hostType``, which
+    # ``getPortalDetail`` omits (MEASURED on 5.15.24.19; the bare -1001 "must
+    # not be null" it causes names no field). The address it carries says
+    # which one it is.
+    external = body.get("externalPortal")
+    if isinstance(external, dict) and external.get("hostType") is None:
+        external["hostType"] = (
+            HOST_TYPE_IP
+            if external.get("serverIp") and not external.get("serverUrl")
+            else HOST_TYPE_URL
+        )
+        filled.append("externalPortal.hostType")
+    return filled
+
+
+def apply_portal_customization(
+    body: dict[str, Any], customization: dict[str, Any] | None
+) -> list[str]:
+    """Put a ``getPortalCustomization`` result on a ``PortalSetting`` body.
+
+    ``portalCustomize`` (and ``pageType``/``importedPortalPage`` when read)
+    go back as the controller returned them, so the portal's local page is
+    unchanged; only required fields the read lacked are filled. Returns those
+    names, prefixed ``portalCustomize.``."""
+    customization = customization if isinstance(customization, dict) else {}
+    current = customization.get("portalCustomize")
+    customize = copy.deepcopy(current) if isinstance(current, dict) else {}
+    filled: list[str] = []
+    for key, default in _DEFAULT_PORTAL_CUSTOMIZE.items():
+        if customize.get(key) is None:
+            customize[key] = default
+            filled.append(f"portalCustomize.{key}")
+    body["portalCustomize"] = customize
+    for key in ("pageType", "importedPortalPage"):
+        if customization.get(key) is not None:
+            body[key] = copy.deepcopy(customization[key])
     return filled
 
 
@@ -399,6 +461,7 @@ def new_portal_body(spec: PortalSetupSpec, ssid_id: str) -> dict[str, Any]:
         "httpsRedirectEnable": False,
         "landingPage": LANDING_PAGE_ORIGINAL_URL,
         "externalPortal": _external_portal(spec),
+        "portalCustomize": copy.deepcopy(_DEFAULT_PORTAL_CUSTOMIZE),
     }
 
 
@@ -417,7 +480,10 @@ def portal_drift(
         drift.append("authType")
     external = detail.get("externalPortal")
     external = external if isinstance(external, dict) else {}
-    if coerce_int(external.get("hostType")) != HOST_TYPE_URL:
+    # ``getPortalDetail`` omits ``hostType`` (measured), so absent is not
+    # drift; only a value that says IP is.
+    host_type = coerce_int(external.get("hostType"))
+    if host_type is not None and host_type != HOST_TYPE_URL:
         drift.append("externalPortal.hostType")
     if coerce_str(external.get("serverUrlScheme")) != spec.portal_url_scheme:
         drift.append("externalPortal.serverUrlScheme")
@@ -429,7 +495,10 @@ def portal_drift(
 
 
 def updated_portal_body(
-    detail: dict[str, Any], spec: PortalSetupSpec, ssid_id: str
+    detail: dict[str, Any],
+    spec: PortalSetupSpec,
+    ssid_id: str,
+    customization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """``modifyPortal`` body for OUR portal: what it has, with our settings
     laid over it. Other SSIDs a venue bound to it are kept."""
@@ -445,11 +514,14 @@ def updated_portal_body(
         ssids.append(ssid_id)
     body["ssidList"] = ssids
     _fill_required_portal_fields(body)
+    apply_portal_customization(body, customization)
     return body
 
 
 def released_portal_body(
-    detail: dict[str, Any], ssid_id: str
+    detail: dict[str, Any],
+    ssid_id: str,
+    customization: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """``modifyPortal`` body for a FOREIGN portal on take-over: exactly what
     the controller returned, minus our SSID. Returns ``(body, filled)``."""
@@ -458,7 +530,17 @@ def released_portal_body(
     )
     body["ssidList"] = [s for s in _str_list(body.get("ssidList")) if s != ssid_id]
     filled = _fill_required_portal_fields(body)
+    filled += apply_portal_customization(body, customization)
     return body, filled
+
+
+def release_leaves_portal_unbound(detail: dict[str, Any], ssid_id: str) -> bool:
+    """True when ``ssid_id`` is everything the portal applies to. Releasing it
+    would leave a portal bound to nothing, which the controller refuses
+    (MEASURED on 5.15.24.19: -34319 "Select at least one SSID or LAN for the
+    portal to take effect on."), so take-over deletes such a portal instead."""
+    remaining = [s for s in _str_list(detail.get("ssidList")) if s != ssid_id]
+    return not remaining and not _str_list(detail.get("networkList"))
 
 
 def merged_access_control(
@@ -582,6 +664,18 @@ async def _portal_detail(
     return envelope.result if isinstance(envelope.result, dict) else {}
 
 
+async def _portal_customization(
+    client: OmadaHttpClient, omadac_id: str, site_id: str, portal_id: str
+) -> dict[str, Any]:
+    envelope = await client.request(
+        "GET",
+        PORTAL_CUSTOMIZATION_PATH.format(
+            omadac_id=omadac_id, site_id=site_id, portal_id=portal_id
+        ),
+    )
+    return envelope.result if isinstance(envelope.result, dict) else {}
+
+
 async def _list_portals(
     client: OmadaHttpClient, omadac_id: str, site_id: str
 ) -> list[dict[str, Any]]:
@@ -696,7 +790,8 @@ async def configure_external_portal(
                     "changed. Unbind the SSID from that portal on the "
                     "controller, or run again with take-over, which removes "
                     "only this SSID from that portal and changes nothing else "
-                    "on it."
+                    "on it -- or deletes the portal, if this SSID is all it "
+                    "applies to."
                 ),
                 portal_id=coerce_str(first.get("id")),
                 portal_name=_safe_name(first.get("name")),
@@ -723,7 +818,49 @@ async def configure_external_portal(
     for summary in foreign:
         portal_id = str(summary["id"])
         portal_name = _safe_name(summary.get("name"))
-        body, filled = released_portal_body(details.get(portal_id, {}), ssid_id)
+        detail = details.get(portal_id, {})
+
+        if release_leaves_portal_unbound(detail, ssid_id):
+
+            async def _delete(portal_id: str = portal_id) -> None:
+                await client.request(
+                    "DELETE",
+                    PORTAL_PATH.format(portal_id=portal_id, **paths),
+                    retry_on_transport_error=False,
+                )
+
+            actions.append(
+                _Action(
+                    step=STEP_SSID_TAKEOVER,
+                    outcome=PortalSetupOutcome.UPDATED,
+                    plan_message=(
+                        f"Would delete portal '{portal_name}': SSID "
+                        f"'{ssid_label}' is the only network it applies to, and "
+                        "the controller does not keep a portal bound to nothing."
+                    ),
+                    done_message=(
+                        f"Deleted portal '{portal_name}': SSID '{ssid_label}' "
+                        "was the only network it applied to."
+                    ),
+                    failure_prefix=(
+                        f"Could not delete portal '{portal_name}' to free SSID "
+                        f"'{ssid_label}'."
+                    ),
+                    write=_delete,
+                    details={
+                        "portal_id": portal_id,
+                        "portal_name": portal_name,
+                        "deleted_portal": True,
+                    },
+                )
+            )
+            continue
+
+        body, filled = released_portal_body(
+            detail,
+            ssid_id,
+            await _portal_customization(client, omadac_id, site_id, portal_id),
+        )
 
         async def _release(portal_id: str = portal_id, body: dict = body) -> None:
             await client.request(
@@ -831,7 +968,12 @@ async def configure_external_portal(
                 )
             )
         else:
-            body = updated_portal_body(detail, spec, ssid_id)
+            body = updated_portal_body(
+                detail,
+                spec,
+                ssid_id,
+                await _portal_customization(client, omadac_id, site_id, portal_id),
+            )
 
             async def _update_portal(body: dict = body) -> None:
                 await client.request(
@@ -1167,17 +1309,20 @@ __all__ = [
     "ACCESS_CONTROL_PATH",
     "ADD_PORTAL_PATH",
     "AUTH_TYPE_EXTERNAL_PORTAL",
+    "HOST_TYPE_IP",
     "HOST_TYPE_URL",
     "OPERATORS_PATH",
     "OPERATOR_PATH",
     "OPERATOR_ROLE_ADMINISTRATOR",
     "PORTALS_PATH",
+    "PORTAL_CUSTOMIZATION_PATH",
     "PORTAL_PATH",
     "PRE_AUTH_POLICY_TYPE_URL",
     "STEP_HOTSPOT_OPERATOR",
     "STEP_PORTAL",
     "STEP_PRE_AUTH_ACCESS",
     "STEP_SSID_TAKEOVER",
+    "apply_portal_customization",
     "auth_timeout_setting",
     "configure_external_portal",
     "host_of",
@@ -1185,6 +1330,7 @@ __all__ = [
     "new_portal_body",
     "portal_drift",
     "portal_setting_from_detail",
+    "release_leaves_portal_unbound",
     "released_portal_body",
     "resolve_ssid",
     "updated_portal_body",
