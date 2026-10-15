@@ -568,3 +568,18 @@ class TestRepositoryQueries:
 
         sig = inspect.signature(get_review_stats)
         assert sig.parameters["location_id"].default is not None
+
+
+class TestMigration:
+    def test_0166_is_the_single_head(self) -> None:
+        import pathlib
+
+        versions = list(pathlib.Path("alembic/versions").glob("*.py"))
+        name = "0166_add_review_prompt_columns_to_guest_sessions"
+        text = pathlib.Path(f"alembic/versions/{name}.py").read_text()
+        assert f'revision = "{name}"' in text
+        assert 'down_revision = "0165_traffic_flow_platform_hosts"' in text
+        children = [
+            p.name for p in versions if f'down_revision = "{name}"' in p.read_text()
+        ]
+        assert not children

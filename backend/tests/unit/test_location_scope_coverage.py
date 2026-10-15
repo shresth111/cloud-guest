@@ -665,6 +665,14 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "with a session id they do not own is mark someone else's review card as "
         "already tapped, which suppresses a nudge and grants no access."
     ),
+    ("POST", "/api/v1/guest/review-prompt-shown"): (
+        "A guest on their own connected session, as `/portal/review` renders -- the "
+        "same shape as `/guest/review-link-opened` above, unauthenticated for the "
+        "same reason. It stamps one timestamp on the session the caller already "
+        "holds and reads nothing: the worst a caller can do with a session id they "
+        "do not own is start that guest's 30-day cooldown early, which suppresses "
+        "a review page and grants no access."
+    ),
     ("POST", "/api/v1/guest/set-password"): (
         "A guest acting on their own session, before or during login. They hold no "
         "roles, so there is no confinement to derive; the anonymous-tolerant "
