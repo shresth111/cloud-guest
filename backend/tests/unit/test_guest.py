@@ -1115,6 +1115,40 @@ class FakeGuestRepository:
         self._release_guest_lock(session.guest_id)
         return session
 
+    async def has_blocking_review_activity(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        location_id: uuid.UUID,
+        shown_since: datetime,
+    ) -> bool:
+        for s in self.sessions.values():
+            if s.guest_id != guest_id or s.location_id != location_id:
+                continue
+            if getattr(s, "is_deleted", False):
+                continue
+            if s.review_link_opened_at is not None:
+                return True
+            shown = s.review_prompt_shown_at
+            if shown is not None and shown >= shown_since:
+                return True
+        return False
+
+    async def count_review_activity(
+        self, *, location_id: uuid.UUID, since: datetime
+    ) -> tuple[int, int]:
+        rows = [
+            s
+            for s in self.sessions.values()
+            if s.location_id == location_id and not getattr(s, "is_deleted", False)
+        ]
+        def _in_window(stamp: datetime | None) -> bool:
+            return stamp is not None and stamp >= since
+
+        shown = sum(1 for s in rows if _in_window(s.review_prompt_shown_at))
+        opened = sum(1 for s in rows if _in_window(s.review_link_opened_at))
+        return shown, opened
+
     async def list_sessions(
         self,
         *,
