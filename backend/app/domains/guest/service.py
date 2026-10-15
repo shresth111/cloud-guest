@@ -253,11 +253,17 @@ from app.domains.auth.password import (
     PasswordStrengthError,
     PasswordVerificationError,
 )
+from app.domains.captive_portal.constants import REVIEW_PROMPT_COOLDOWN
 from app.domains.captive_portal.exceptions import (
     CaptivePortalConfigNotConfiguredError,
+    InvalidReviewUrlError,
 )
 from app.domains.captive_portal.service import ResolvedPortalConfig
-from app.domains.captive_portal.validators import compute_terms_version, is_open_now
+from app.domains.captive_portal.validators import (
+    compute_terms_version,
+    is_open_now,
+    validate_review_url,
+)
 from app.domains.guest_access.exceptions import (
     GuestAccessDeniedError,
     WhitelistOnlyAccessDeniedError,
@@ -373,6 +379,7 @@ from .exceptions import (
     GuestProfileFieldNotCollectedError,
     GuestProfileUpdateNotAuthorizedError,
     GuestReviewLinkOpenedNotAuthorizedError,
+    GuestReviewPromptNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     GuestTeamSharedQuotaExceededError,
@@ -4788,14 +4795,18 @@ class GuestService:
         true -- so the portal can call it fire-and-forget without
         sequencing it against the navigation.
 
+        It stamps two places: ``guests.review_link_opened_at`` (per
+        organization, kept for older portals that still read
+        ``has_opened_review_link``) and the session's own
+        ``review_link_opened_at`` (per location, which is what
+        ``review_prompt_due`` and the dashboard count read).
+
         ⚠ **This is not a review counter.** It records that a link was
         opened. Google exposes nothing that would let this platform learn
-        whether a review was written, and it cannot see iOS at all: iPhone
-        and iPad guests are sent to ``captive.apple.com/hotspot-detect
-        .html`` after login rather than to ``/portal/session``, so they
-        never reach the card. Any aggregate over this column counts
-        Android and desktop guests who tapped a link. See
-        ``models.Guest.review_link_opened_at``.
+        whether a review was written. It is also blind to any guest who
+        never reaches the review page, which includes most guests signing
+        in from a phone's captive pop-up: the OS closes the pop-up as soon
+        as the network validates. See ``models.Guest.review_link_opened_at``.
         """
         guest = await self._require_guest(guest_id)
         session = await self.repository.get_session_by_id(session_id)
@@ -4813,14 +4824,117 @@ class GuestService:
         if not eligible:
             raise GuestReviewLinkOpenedNotAuthorizedError()
 
+        now = datetime.now(UTC)
+        await self.repository.update_session(session, {"review_link_opened_at": now})
         updated = await self.repository.update_guest(
-            guest, {"review_link_opened_at": datetime.now(UTC)}
+            guest, {"review_link_opened_at": now}
         )
         logger.info(
             "guest_review_link_opened",
             extra={"event_guest_id": str(updated.id)},
         )
         return updated
+
+    async def record_review_prompt_shown(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> GuestSession:
+        """Records that ``/portal/review`` was shown in this session, which
+        starts the ``REVIEW_PROMPT_COOLDOWN`` for this guest at this
+        location. Idempotent: a repeat call moves the stamp, and the page is
+        no longer due either way.
+
+        Authorised exactly like ``record_review_link_opened``: a live
+        session that belongs to the named guest, and nothing more."""
+        guest = await self._require_guest(guest_id)
+        session = await self.repository.get_session_by_id(session_id)
+        if (
+            session is None
+            or session.guest_id != guest.id
+            or session.status != GuestSessionStatus.ACTIVE.value
+        ):
+            raise GuestReviewPromptNotAuthorizedError()
+        updated = await self.repository.update_session(
+            session, {"review_prompt_shown_at": datetime.now(UTC)}
+        )
+        logger.info(
+            "guest_review_prompt_shown",
+            extra={
+                "event_guest_id": str(guest.id),
+                "event_session_id": str(session.id),
+            },
+        )
+        return updated
+
+    async def review_prompt_due(self, guest: Guest, session: GuestSession) -> bool:
+        """Whether this guest should see the "Rate us on Google" page now,
+        in this session. The portal uses this bit as its only source of
+        truth; it never decides on its own.
+
+        True only when all of these hold:
+
+        * the location's resolved config has the review page switched on
+          and holds a link that passes ``validate_review_url``;
+        * the guest never opened a review link under the old
+          per-organization record (``guests.review_link_opened_at``) --
+          read conservatively, as "never ask again";
+        * at this location, the guest never opened the link, and was not
+          shown the page within ``REVIEW_PROMPT_COOLDOWN``.
+
+        A session that already showed the page is not due again, so a
+        reload of ``/portal/review`` continues instead of asking twice.
+
+        Never raises. This rides on login and session responses, and a
+        review ask must not be able to fail a guest's login.
+        """
+        try:
+            if guest.review_link_opened_at is not None:
+                return False
+            if session.review_prompt_shown_at is not None:
+                return False
+            try:
+                resolved = await self.captive_portal_service.resolve_portal_config(
+                    organization_id=session.organization_id,
+                    location_id=session.location_id,
+                )
+            except CaptivePortalConfigNotConfiguredError:
+                return False
+            config = resolved.config
+            if not getattr(config, "review_card_enabled", False):
+                return False
+            url = getattr(config, "review_url", None)
+            if not url or not str(url).strip():
+                return False
+            try:
+                validate_review_url(str(url))
+            except InvalidReviewUrlError:
+                return False
+            blocked = await self.repository.has_blocking_review_activity(
+                guest_id=guest.id,
+                location_id=session.location_id,
+                shown_since=datetime.now(UTC) - REVIEW_PROMPT_COOLDOWN,
+            )
+            return not blocked
+        except Exception:  # noqa: BLE001 -- a review ask never fails a login
+            logger.warning(
+                "guest_review_prompt_due_failed",
+                exc_info=True,
+                extra={"event_session_id": str(getattr(session, "id", ""))},
+            )
+            return False
+
+    @staticmethod
+    def review_shown_this_session(session: GuestSession) -> bool:
+        """The review page was shown in this session. ``/portal/session``
+        reads it to keep the star-feedback card out of the same visit: a
+        review ask and a rating prompt never share a visit."""
+        shown = session.review_prompt_shown_at
+        if shown is None:
+            return False
+        started = session.started_at
+        return started is None or shown >= started
 
     async def disconnect_own_session(
         self,

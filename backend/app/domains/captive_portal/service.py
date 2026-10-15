@@ -105,6 +105,7 @@ from .models import CaptivePortalConfig
 from .repository import CaptivePortalRepositoryProtocol
 from .validators import (
     SPLASH_TEXT_MAX_LENGTHS,
+    normalize_review_url,
     validate_background_focal_point,
     validate_background_overlay_strength,
     validate_business_hours_schedule,
@@ -114,7 +115,6 @@ from .validators import (
     validate_feedback_dwell_minutes,
     validate_guest_font_choice,
     validate_hex_color,
-    normalize_review_url,
     validate_review_url,
     validate_single_content_source,
     validate_splash_text_length,

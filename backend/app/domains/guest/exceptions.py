@@ -67,6 +67,7 @@ __all__ = [
     "GuestPinLockedError",
     "GuestProfileFieldNotCollectedError",
     "GuestReviewLinkOpenedNotAuthorizedError",
+    "GuestReviewPromptNotAuthorizedError",
 ]
 
 
@@ -779,6 +780,20 @@ class GuestReviewLinkOpenedNotAuthorizedError(GuestError):
     and a guest who taps the card late in a long session, neither of whom
     is doing anything wrong.
     """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "A live session for this guest is required",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestReviewPromptNotAuthorizedError(GuestError):
+    """``POST /guest/review-prompt-shown`` was called without a live
+    session belonging to the named guest. The same deliberately light
+    check as ``GuestReviewLinkOpenedNotAuthorizedError``, for the same
+    reasons: it guards a timestamp that stores nothing about the guest and
+    grants nothing."""
 
     def __init__(self) -> None:
         super().__init__(

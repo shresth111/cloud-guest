@@ -41,6 +41,7 @@ __all__ = [
     "CaptivePortalConfigResponse",
     "CaptivePortalConfigListResponse",
     "ResolvedCaptivePortalConfigResponse",
+    "ReviewStatsResponse",
 ]
 
 
@@ -675,3 +676,14 @@ class ResolvedCaptivePortalConfigResponse(CaptivePortalConfigResponse):
             "same None semantics as background_luminance."
         ),
     )
+
+
+class ReviewStatsResponse(BaseModel):
+    """``GET /captive-portal/review-stats``: one location's review-page
+    numbers. ``opened`` is link opens, never reviews."""
+
+    location_id: str
+    days: int
+    shown: int
+    opened: int
+    since: datetime

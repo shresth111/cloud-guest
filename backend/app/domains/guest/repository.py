@@ -302,6 +302,18 @@ class GuestRepositoryProtocol(Protocol):
         self, session: GuestSession, data: dict[str, object]
     ) -> GuestSession: ...
 
+    async def has_blocking_review_activity(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        location_id: uuid.UUID,
+        shown_since: datetime,
+    ) -> bool: ...
+
+    async def count_review_activity(
+        self, *, location_id: uuid.UUID, since: datetime
+    ) -> tuple[int, int]: ...
+
     async def list_sessions(
         self,
         *,
@@ -1057,6 +1069,51 @@ class GuestRepository:
         self, session: GuestSession, data: dict[str, object]
     ) -> GuestSession:
         return await self.sessions.update(session, data)
+
+    async def has_blocking_review_activity(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        location_id: uuid.UUID,
+        shown_since: datetime,
+    ) -> bool:
+        """Whether this guest, at this location, ever opened the review
+        link or was shown the review page at or after ``shown_since``.
+        Either one means "do not ask again yet". Served by the partial
+        index ``ix_guest_sessions_review_activity``."""
+        statement = select(
+            exists().where(
+                GuestSession.guest_id == guest_id,
+                GuestSession.location_id == location_id,
+                GuestSession.is_deleted.is_(False),
+                or_(
+                    GuestSession.review_link_opened_at.is_not(None),
+                    GuestSession.review_prompt_shown_at >= shown_since,
+                ),
+            )
+        )
+        return bool((await self.session.execute(statement)).scalar_one())
+
+    async def count_review_activity(
+        self, *, location_id: uuid.UUID, since: datetime
+    ) -> tuple[int, int]:
+        """``(shown, opened)``: sessions at one location whose review page
+        was shown, and whose review link was opened, at or after ``since``.
+        Always filtered by a single ``location_id`` -- there is no
+        all-locations form of this query on purpose."""
+        statement = select(
+            func.count().filter(GuestSession.review_prompt_shown_at >= since),
+            func.count().filter(GuestSession.review_link_opened_at >= since),
+        ).where(
+            GuestSession.location_id == location_id,
+            GuestSession.is_deleted.is_(False),
+            or_(
+                GuestSession.review_prompt_shown_at >= since,
+                GuestSession.review_link_opened_at >= since,
+            ),
+        )
+        shown, opened = (await self.session.execute(statement)).one()
+        return int(shown or 0), int(opened or 0)
 
     async def list_sessions(
         self,
