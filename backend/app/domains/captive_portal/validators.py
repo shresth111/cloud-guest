@@ -11,7 +11,7 @@ import hashlib
 import re
 import uuid
 from datetime import datetime, time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Imported, never copied. This is the name the hotspot's own ``dns-name``
@@ -31,7 +31,9 @@ from .constants import (
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
     MIN_FEEDBACK_DWELL_MINUTES,
+    REVIEW_PLACE_ID_PATTERN,
     REVIEW_URL_ALLOWED_HOST_SUFFIXES,
+    REVIEW_URL_PLACE_ID_TEMPLATE,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     GuestFontChoice,
@@ -225,6 +227,30 @@ def validate_feedback_dwell_minutes(value: object) -> None:
     )
     if not in_range:
         raise InvalidFeedbackDwellMinutesError(value)
+
+
+def normalize_review_url(value: str | None) -> str | None:
+    """What gets stored for a pasted review link: a bare Google Place ID
+    becomes ``constants.REVIEW_URL_PLACE_ID_TEMPLATE``, and anything else
+    comes back as given, for ``validate_review_url`` to judge.
+
+    Only a value that matches ``REVIEW_PLACE_ID_PATTERN`` is rewritten. It
+    has no scheme, dot or slash, so it can never be a link, and the
+    rewrite cannot change what a pasted link points at. The id is
+    percent-encoded anyway, so the stored URL never depends on the pattern
+    staying as narrow as it is today.
+
+    ``None`` stays ``None``. Blank stays blank, and the caller treats it as
+    "clear the link", as before.
+    """
+    if value is None:
+        return None
+    candidate = value.strip()
+    if REVIEW_PLACE_ID_PATTERN.fullmatch(candidate):
+        return REVIEW_URL_PLACE_ID_TEMPLATE.format(
+            place_id=quote(candidate, safe="")
+        )
+    return value
 
 
 def validate_review_url(value: str | None) -> None:
@@ -598,6 +624,7 @@ def is_open_now(
 __all__ = [
     "validate_hex_color",
     "validate_single_content_source",
+    "normalize_review_url",
     "validate_review_url",
     "validate_feedback_dwell_minutes",
     "compute_terms_version",

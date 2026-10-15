@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from fastapi import (
     APIRouter,
@@ -44,10 +45,12 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
 from app.core.storage import ObjectStorageError, get_object_storage
+from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
 from app.domains.billing.dependencies import get_entitlement_checker
@@ -59,14 +62,22 @@ from app.domains.branding.service import (
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
     PUBLIC_LOGO_PATH_TEMPLATE,
 )
+from app.domains.guest.repository import GuestRepository
+from app.domains.location.models import Location
 from app.domains.rbac.dependencies import (
+    CurrentLocation,
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_captive_portal_service
-from .exceptions import InvalidContentImageError
+from .exceptions import (
+    InvalidContentImageError,
+    ReviewStatsCrossLocationError,
+    ReviewStatsLocationNotFoundError,
+)
 from .models import CaptivePortalConfig
 from .schemas import (
     CaptivePortalConfigCreateRequest,
@@ -74,6 +85,7 @@ from .schemas import (
     CaptivePortalConfigResponse,
     CaptivePortalConfigUpdateRequest,
     ResolvedCaptivePortalConfigResponse,
+    ReviewStatsResponse,
 )
 from .service import CaptivePortalService
 from .validators import is_open_now
@@ -614,6 +626,64 @@ async def get_captive_portal_content_image_public(
 # ============================================================================
 # Guest-facing resolution -- no RBAC, see module docstring
 # ============================================================================
+
+
+@router.get(
+    "/captive-portal/review-stats",
+    response_model=ApiResponse[ReviewStatsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("captive_portal.read", scope=ScopeType.LOCATION))
+    ],
+)
+async def get_review_stats(
+    request: Request,
+    location_id: uuid.UUID = Query(...),
+    days: int = Query(default=30, ge=1, le=365),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    header_location_id: uuid.UUID | None = Depends(CurrentLocation),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """How many guests at one location were shown the "Rate us on Google"
+    page, and how many opened the review link, over the last ``days``.
+
+    ``opened`` counts link opens, never reviews: Google tells this platform
+    nothing about whether a review was written.
+
+    Scoping: the permission check is explicitly LOCATION-scoped and runs
+    against the ``location_id`` query parameter (or the ``X-Location-Id``
+    header, which must then name the same location). The location is
+    loaded and its organization compared with the caller's; a mismatch is
+    the same 404 as a missing location. A Global Super Admin (no
+    organization) may read any location, but only ever one at a time --
+    there is no all-locations form of this query.
+    """
+    if header_location_id is not None and header_location_id != location_id:
+        raise ReviewStatsCrossLocationError()
+    location = await db.get(Location, location_id)
+    if location is None or location.is_deleted:
+        raise ReviewStatsLocationNotFoundError()
+    if (
+        requesting_organization_id is not None
+        and location.organization_id != requesting_organization_id
+    ):
+        raise ReviewStatsLocationNotFoundError()
+    since = datetime.now(UTC) - timedelta(days=days)
+    shown, opened = await GuestRepository(db).count_review_activity(
+        location_id=location.id, since=since
+    )
+    return build_response(
+        success=True,
+        message="OK",
+        data=ReviewStatsResponse(
+            location_id=str(location.id),
+            days=days,
+            shown=shown,
+            opened=opened,
+            since=since,
+        ).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
 
 
 @router.get(

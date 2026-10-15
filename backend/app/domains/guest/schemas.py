@@ -53,6 +53,8 @@ __all__ = [
     "GuestUpdateProfileRequest",
     "GuestReviewLinkOpenedRequest",
     "GuestReviewLinkOpenedResponse",
+    "GuestReviewPromptShownRequest",
+    "GuestReviewPromptShownResponse",
     "GuestUpdateProfileResponse",
     "GuestConsentRequest",
     "GuestBlockRequest",
@@ -313,6 +315,20 @@ class GuestReviewLinkOpenedResponse(BaseModel):
     # `has_profile`: the caller should never have to re-derive the rule
     # that decides whether the card is finished with.
     has_opened_review_link: bool
+
+
+class GuestReviewPromptShownRequest(BaseModel):
+    """``/portal/review`` was shown to this guest in this session. Two ids
+    and nothing else, like ``GuestReviewLinkOpenedRequest``."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+
+
+class GuestReviewPromptShownResponse(BaseModel):
+    # Always false after a successful call: the page has now been shown
+    # in this session. Echoed so the portal never re-derives the rule.
+    review_prompt_due: bool
 
 
 class GuestDisconnectRequest(BaseModel):
@@ -646,6 +662,16 @@ class GuestLoginResponse(BaseModel):
     # See ``models.Guest.review_link_opened_at`` for why the difference
     # matters and why this can never be counted as reviews.
     has_opened_review_link: bool
+    # The "Rate us on Google" page (``/portal/review``) should be shown now.
+    # Computed server-side by ``GuestService.review_prompt_due``: the venue
+    # switched it on with a valid link, and this guest has neither opened
+    # the link at this location nor been shown the page there within the
+    # cooldown. The portal's single source of truth for the page; it
+    # supersedes ``has_opened_review_link``, which stays for older portals.
+    review_prompt_due: bool = False
+    # The review page was shown in this session. ``/portal/session`` keeps
+    # the star-feedback card out of any visit where this is true.
+    review_shown_this_session: bool = False
     # Guest Marketing (contract §5.8): non-null only when the venue's portal
     # has the opt-in turned on, the organization is entitled to the
     # add-on, and this guest has no consent row yet. The portal renders an

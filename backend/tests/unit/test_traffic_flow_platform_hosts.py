@@ -467,11 +467,13 @@ class TestMigration:
             for p in versions
             if f'down_revision = "{module.down_revision}"' in p.read_text()
         ] == [self.FILE.name]
-        assert not [
+        # One revision follows this one (the review-prompt session columns).
+        # A second child would be a second head.
+        assert [
             p.name
             for p in versions
             if f'down_revision = "{module.revision}"' in p.read_text()
-        ]
+        ] == ["0166_add_review_prompt_columns_to_guest_sessions.py"]
         # Recognised by name in the findings test, or the deploy check fails.
         findings = pathlib.Path("tests/unit/test_traffic_flow_findings.py").read_text()
         assert self.FILE.name in findings

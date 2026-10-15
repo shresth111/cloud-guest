@@ -17,6 +17,7 @@ per-environment tuning.
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 from enum import StrEnum
 
 
@@ -343,6 +344,24 @@ REVIEW_URL_ALLOWED_HOST_SUFFIXES = (
     # than a line in a validator.
 )
 
+# A bare Google Place ID pasted into the review-link field instead of a
+# link. No scheme, no dot, no slash: only the characters Place IDs are
+# made of. Such a value is turned into
+# ``REVIEW_URL_PLACE_ID_TEMPLATE`` server-side, before
+# ``validate_review_url`` checks it. A pasted link is still stored verbatim.
+REVIEW_PLACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,255}$")
+REVIEW_URL_PLACE_ID_TEMPLATE = (
+    "https://search.google.com/local/writereview?placeid={place_id}"
+)
+
+# How long after a guest is shown the "Rate us on Google" page at a
+# location before it may be shown to them there again. A product
+# constant, not a venue setting: a page before the internet on every
+# login would nag a daily regular, and an unusual volume of review asks
+# is flagged against the venue's own Business Profile. A guest who opened
+# the link at a location is never asked there again, whatever this says.
+REVIEW_PROMPT_COOLDOWN = timedelta(days=30)
+
 # Bounds on ``captive_portal_configs.feedback_dwell_minutes`` -- how long a
 # guest must have been connected before the private star-feedback card is
 # allowed to appear.
@@ -412,6 +431,9 @@ __all__ = [
     "POST_LOGIN_HTML_MAX_BYTES",
     "REVIEW_URL_MAX_LENGTH",
     "REVIEW_URL_ALLOWED_HOST_SUFFIXES",
+    "REVIEW_PLACE_ID_PATTERN",
+    "REVIEW_URL_PLACE_ID_TEMPLATE",
+    "REVIEW_PROMPT_COOLDOWN",
     "MIN_FEEDBACK_DWELL_MINUTES",
     "MAX_FEEDBACK_DWELL_MINUTES",
     "DEFAULT_FEEDBACK_DWELL_MINUTES",

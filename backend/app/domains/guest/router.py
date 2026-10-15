@@ -129,6 +129,8 @@ from .schemas import (
     GuestResponse,
     GuestReviewLinkOpenedRequest,
     GuestReviewLinkOpenedResponse,
+    GuestReviewPromptShownRequest,
+    GuestReviewPromptShownResponse,
     GuestSessionListResponse,
     GuestSessionResponse,
     GuestSetPasswordRequest,
@@ -731,13 +733,21 @@ def _login_history_response(entry: GuestLoginHistory) -> GuestLoginHistoryRespon
 
 
 async def _login_payload(
-    result: GuestLoginResult, marketing_offer: MarketingConsentOfferResolver
+    result: GuestLoginResult,
+    marketing_offer: MarketingConsentOfferResolver,
+    service: GuestService,
 ) -> dict:
     """The login response plus ``marketing_consent_offer`` (Guest Marketing
-    contract §5.8). The resolver never raises: marketing can never fail a
-    guest login."""
+    contract §5.8) and the review-page bits. Neither resolver raises:
+    marketing and the review ask can never fail a guest login."""
     response = _login_response(result)
     response.marketing_consent_offer = await marketing_offer.offer_for(result)
+    response.review_prompt_due = await service.review_prompt_due(
+        result.guest, result.session
+    )
+    response.review_shown_this_session = service.review_shown_this_session(
+        result.session
+    )
     return response.model_dump()
 
 
@@ -799,7 +809,7 @@ async def guest_login_via_otp(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=(await _login_payload(result, marketing_offer)),
+        data=(await _login_payload(result, marketing_offer, service)),
         request_id=_request_id(request),
     )
 
@@ -835,7 +845,7 @@ async def guest_login_via_voucher(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=(await _login_payload(result, marketing_offer)),
+        data=(await _login_payload(result, marketing_offer, service)),
         request_id=_request_id(request),
     )
 
@@ -871,7 +881,7 @@ async def guest_login_via_password(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=(await _login_payload(result, marketing_offer)),
+        data=(await _login_payload(result, marketing_offer, service)),
         request_id=_request_id(request),
     )
 
@@ -907,7 +917,7 @@ async def guest_login_via_pin(
     return build_response(
         success=True,
         message="Guest logged in",
-        data=(await _login_payload(result, marketing_offer)),
+        data=(await _login_payload(result, marketing_offer, service)),
         request_id=_request_id(request),
     )
 
@@ -937,7 +947,9 @@ async def guest_active_session(
     return build_response(
         success=True,
         message="Active session found" if result else "No active session",
-        data=(await _login_payload(result, marketing_offer)) if result else None,
+        data=(
+            (await _login_payload(result, marketing_offer, service)) if result else None
+        ),
         request_id=_request_id(request),
     )
 
@@ -1153,6 +1165,33 @@ async def guest_review_link_opened(
             guest_id=str(guest.id),
             has_opened_review_link=guest_has_opened_review_link(guest),
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/review-prompt-shown",
+    response_model=ApiResponse[GuestReviewPromptShownResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_review_prompt_shown(
+    request: Request,
+    payload: GuestReviewPromptShownRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    """Guest-facing, unauthenticated (same posture as
+    ``/review-link-opened``): ``/portal/review`` was shown to this guest.
+    Starts the per-location cooldown -- see
+    ``GuestService.record_review_prompt_shown``. Called fire-and-forget by
+    the portal; it changes nothing about the guest's connection."""
+    await service.record_review_prompt_shown(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+    )
+    return build_response(
+        success=True,
+        message="Recorded",
+        data=GuestReviewPromptShownResponse(review_prompt_due=False).model_dump(),
         request_id=_request_id(request),
     )
 
