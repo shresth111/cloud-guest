@@ -35,6 +35,7 @@ from app.domains.network_integration.usage_tasks import (
     _USAGE_CURSOR_KEY,
     _canonical_mac,
     apply_controller_usage,
+    controller_client_ip_updates,
     sync_omada_session_usage,
 )
 
@@ -53,6 +54,7 @@ class FakeSession:
     bytes_uploaded: int
     bytes_downloaded: int
     started_at: datetime = _T0
+    ip_address: str | None = None
 
 
 @dataclass
@@ -140,6 +142,7 @@ class FakeGuestRepository:
         self._sessions_by_router = sessions_by_router
         self._devices = devices
         self.device_org_args: list[uuid.UUID | None] = []
+        self.session_updates: list[tuple[uuid.UUID, dict[str, object]]] = []
 
     async def list_active_sessions_for_router(
         self, router_id: uuid.UUID
@@ -152,6 +155,14 @@ class FakeGuestRepository:
         self.device_org_args.append(organization_id)
         wanted = set(device_ids)
         return [d for d in self._devices if d.id in wanted]
+
+    async def update_session(
+        self, session: FakeSession, data: dict[str, object]
+    ) -> FakeSession:
+        self.session_updates.append((session.id, dict(data)))
+        for key, value in data.items():
+            setattr(session, key, value)
+        return session
 
 
 def _client(mac: str, up: int | None, down: int | None) -> ProviderClient:
@@ -617,3 +628,126 @@ class TestTheSweepsGuestServiceActuallyConstructs:
         # The repository the service holds is the terminator's device lookup,
         # which is what makes a MAC resolvable when the cap fires.
         assert service.session_end_hook.device_lookup is service.repository
+
+
+# --------------------------------------------------------------------------
+# The guest's LAN address, from the controller's client list
+# --------------------------------------------------------------------------
+
+VENUE_PUBLIC_IP = "103.84.202.219"
+
+
+def _client_at(mac: str, ip: str | None) -> ProviderClient:
+    return ProviderClient(mac=mac, ip_address=ip)
+
+
+class TestControllerClientIpUpdates:
+    def test_the_lan_address_replaces_the_venues_public_nat_address(self) -> None:
+        """2026-10-16, Infinity Cafe: every guest's row said 103.84.202.219
+        (the office NAT) while the controller listed 192.168.1.123."""
+        device_id, session_id = uuid.uuid4(), uuid.uuid4()
+        session = _session(session_id, device_id)
+        session.ip_address = VENUE_PUBLIC_IP
+
+        updates = controller_client_ip_updates(
+            clients=[_client_at("86-25-FE-F0-D7-D9", "192.168.1.123")],
+            active_sessions=[session],
+            devices_by_id={
+                device_id: FakeDevice(id=device_id, mac_address="86:25:FE:F0:D7:D9")
+            },
+        )
+
+        assert updates == {session_id: "192.168.1.123"}
+
+    def test_an_unchanged_address_is_not_rewritten(self) -> None:
+        device_id, session_id = uuid.uuid4(), uuid.uuid4()
+        session = _session(session_id, device_id)
+        session.ip_address = "192.168.1.123"
+
+        assert (
+            controller_client_ip_updates(
+                clients=[_client_at("86-25-FE-F0-D7-D9", "192.168.1.123")],
+                active_sessions=[session],
+                devices_by_id={
+                    device_id: FakeDevice(id=device_id, mac_address="86-25-FE-F0-D7-D9")
+                },
+            )
+            == {}
+        )
+
+    def test_a_missing_or_garbage_address_never_blanks_the_row(self) -> None:
+        device_id, session_id = uuid.uuid4(), uuid.uuid4()
+        session = _session(session_id, device_id)
+        session.ip_address = VENUE_PUBLIC_IP
+        devices = {device_id: FakeDevice(id=device_id, mac_address="AA-BB-CC-DD-EE-FF")}
+
+        for ip in (None, "", "not-an-ip"):
+            assert (
+                controller_client_ip_updates(
+                    clients=[_client_at("AA-BB-CC-DD-EE-FF", ip)],
+                    active_sessions=[session],
+                    devices_by_id=devices,
+                )
+                == {}
+            ), ip
+
+    def test_an_unmatched_client_changes_nothing(self) -> None:
+        device_id = uuid.uuid4()
+        session = _session(uuid.uuid4(), device_id)
+        assert (
+            controller_client_ip_updates(
+                clients=[_client_at("11-22-33-44-55-66", "192.168.1.9")],
+                active_sessions=[session],
+                devices_by_id={
+                    device_id: FakeDevice(id=device_id, mac_address="AA-BB-CC-DD-EE-FF")
+                },
+            )
+            == {}
+        )
+
+
+class TestSyncWritesTheLanAddress:
+    async def test_the_sweep_stores_the_lan_address_once(self) -> None:
+        router_id, device_id, session_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        integration = SimpleNamespace(
+            id=uuid.uuid4(), organization_id=uuid.uuid4(), router_id=router_id
+        )
+        session = _session(session_id, device_id)
+        session.ip_address = VENUE_PUBLIC_IP
+        guest_repo = FakeGuestRepository(
+            sessions_by_router={router_id: [session]},
+            devices=[FakeDevice(id=device_id, mac_address="D8-9C-67-A6-5E-2B")],
+        )
+        client = ProviderClient(
+            mac="D8-9C-67-A6-5E-2B",
+            ip_address="192.168.1.106",
+            traffic_up_bytes=10,
+            traffic_down_bytes=20,
+        )
+        service = FakeNiService(
+            integrations=[integration],
+            clients_by_integration={integration.id: [client]},
+        )
+        redis = FakeRedis()
+
+        first = await sync_omada_session_usage(
+            ni_service=service,
+            guest_repository=guest_repo,
+            guest_service=RecordingUsageRecorder(),
+            redis=redis,
+            limit=50,
+        )
+        second = await sync_omada_session_usage(
+            ni_service=service,
+            guest_repository=guest_repo,
+            guest_service=RecordingUsageRecorder(),
+            redis=redis,
+            limit=50,
+        )
+
+        assert first.session_ips_updated == 1
+        assert second.session_ips_updated == 0
+        assert guest_repo.session_updates == [
+            (session_id, {"ip_address": "192.168.1.106"})
+        ]
+        assert session.ip_address == "192.168.1.106"
