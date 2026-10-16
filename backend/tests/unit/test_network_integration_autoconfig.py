@@ -236,6 +236,9 @@ class MockController:
                 "authTimeout": {"authTimeout": 0, **body["authTimeout"]},
             }
             return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
+        if path.startswith(f"{SITE}/portal/") and path.endswith("/customization"):
+            # ``getPortalCustomization``: what a modifyPortal must send back.
+            return _ok({"pageType": 1, "portalCustomize": {"logoDisplay": True}})
         if path.startswith(f"{SITE}/portal/"):
             portal_id = path.rsplit("/", 1)[1]
             if method == "GET":
