@@ -57,6 +57,7 @@ from wyfy_device_gateway.omada.portal_setup import (
     host_of,
     merged_access_control,
     portal_setting_from_detail,
+    released_portal_body,
     resolve_ssid,
 )
 from wyfy_device_gateway.omada.types import OmadaEnvelope
@@ -65,6 +66,7 @@ SITE_ID = "6aa3913c3ee1605f71ac35a1"
 SSID_ID = "6aa39c6f3ee1605f71ac3622"
 OTHER_SSID_ID = "6aa39c6f3ee1605f71ac3699"
 ROUTER_ID = "9d7c1f5e-1c55-4e8b-9f61-2a9c1a0c7e11"
+STALE_ROUTER_ID = "f0c8fd65-7886-43ed-ba70-c93a7372bbe9"
 INTEGRATION_ID = "3f0e2b1c-8a5d-4d7e-9b2a-1c0d9e8f7a6b"
 PORTAL_HOST = "auth.wyfyguest.com"
 PORTAL_URL = (
@@ -177,6 +179,26 @@ def voucher_portal_detail(portal_id: str, ssids: list[str]) -> dict[str, Any]:
     }
 
 
+def legacy_portal_customization() -> dict[str, Any]:
+    """``getPortalCustomization`` for a portal made by an older firmware, as
+    the EC2 controller answered it 2026-10-16: a customised page, and no
+    ``defaultLanguage`` or ``copyrightEnable`` although a write requires
+    both."""
+    return {
+        "pageType": 1,
+        "portalCustomize": {
+            "background": 2,
+            "logoPosition": 2,
+            "logoDisplay": True,
+            "buttonColor": "#00A870",
+            "buttonText": "Log In",
+            "welcomeEnable": False,
+            "termsOfServiceEnable": False,
+            "redirectionCountDownEnable": True,
+        },
+    }
+
+
 def access_control(
     *, enabled: bool = False, policies: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
@@ -215,6 +237,8 @@ class PortalController(FakeOmadaController):
             {"ssidId": OTHER_SSID_ID, "name": "Staff", "band": 3, "security": 3},
         ]
         self.portals: dict[str, dict[str, Any]] = {}
+        #: ``getPortalCustomization`` results, keyed like ``portals``.
+        self.customizations: dict[str, dict[str, Any]] = {}
         self.access_control: dict[str, Any] = access_control()
         self.operators: dict[str, dict[str, Any]] = {}
         #: ``(method, path_suffix) -> (errorCode, msg)`` to refuse a write.
@@ -237,6 +261,75 @@ class PortalController(FakeOmadaController):
     def _new_id(self) -> str:
         self._next_id += 1
         return f"6aa3a0{self._next_id:018x}"
+
+    def _refuse_portal_write(self, body: Any, operation: str) -> httpx.Response | None:
+        """What 5.15.24.19 refuses on ``addPortal``/``modifyPortal``, each
+        MEASURED on the EC2 controller 2026-10-16."""
+        for required in (
+            "authTimeout",
+            "authType",
+            "enable",
+            "httpsRedirectEnable",
+            "landingPage",
+            "name",
+        ):
+            assert required in body, f"{operation} body lacks required {required}"
+        external = body.get("externalPortal")
+        if isinstance(external, dict) and external.get("hostType") is None:
+            return httpx.Response(
+                200, json=envelope(error_code=-1001, msg="must not be null\n")
+            )
+        if body.get("portalCustomize") is None:
+            return httpx.Response(
+                200,
+                json=envelope(
+                    error_code=-1001,
+                    msg="Parameter [portalCustomize] should not be null.",
+                ),
+            )
+        missing = [
+            key
+            for key in (
+                "welcomeEnable",
+                "defaultLanguage",
+                "termsOfServiceEnable",
+                "logoDisplay",
+                "copyrightEnable",
+            )
+            if body["portalCustomize"].get(key) is None
+        ]
+        if missing:
+            return httpx.Response(
+                200,
+                json=envelope(
+                    error_code=-1001,
+                    msg="".join(
+                        f"portalCustomize parameter [{key}] should not be null\n"
+                        for key in missing
+                    ),
+                ),
+            )
+        if not body.get("ssidList") and not body.get("networkList"):
+            return httpx.Response(
+                200,
+                json=envelope(
+                    error_code=-34319,
+                    msg="Select at least one SSID or LAN for the portal to take "
+                    "effect on.",
+                ),
+            )
+        return None
+
+    def _store_portal(self, portal_id: str, body: dict[str, Any]) -> None:
+        stored = copy.deepcopy(body)
+        stored["id"] = portal_id
+        # The response side re-spells the timeout (AuthTimeOpenApiVO).
+        stored["authTimeout"] = {"authTimeout": 0, **body["authTimeout"]}
+        self.customizations[portal_id] = {
+            "pageType": stored.pop("pageType", 1),
+            "portalCustomize": stored.pop("portalCustomize"),
+        }
+        self.portals[portal_id] = stored
 
     # -- operator login ---------------------------------------------------
 
@@ -281,40 +374,40 @@ class PortalController(FakeOmadaController):
                 200, json=envelope([portal_summary(p) for p in self.portals.values()])
             )
         if path == f"{site}/portal" and method == "POST":
-            for required in (
-                "authTimeout",
-                "authType",
-                "enable",
-                "httpsRedirectEnable",
-                "landingPage",
-                "name",
-            ):
-                assert required in body, f"addPortal body lacks required {required}"
+            refused = self._refuse_portal_write(body, "addPortal")
+            if refused is not None:
+                return refused
             portal_id = self._new_id()
-            detail = copy.deepcopy(body)
-            detail["id"] = portal_id
-            # The response side re-spells the timeout (AuthTimeOpenApiVO).
-            detail["authTimeout"] = {"authTimeout": 0, **body["authTimeout"]}
-            self.portals[portal_id] = detail
+            self._store_portal(portal_id, body)
             return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
+        if path.startswith(f"{site}/portal/") and path.endswith("/customization"):
+            portal_id = path.rsplit("/", 2)[1]
+            return httpx.Response(
+                200,
+                json=envelope(
+                    self.customizations.get(portal_id, legacy_portal_customization())
+                ),
+            )
         if path.startswith(f"{site}/portal/"):
             portal_id = path.rsplit("/", 1)[1]
             if method == "GET":
-                return httpx.Response(200, json=envelope(self.portals[portal_id]))
+                # ``PortalDetailResOpenApiVO`` as 5.15.24.19 really answers it:
+                # no ``hostType`` on ``externalPortal``, no ``portalCustomize``.
+                detail = copy.deepcopy(self.portals[portal_id])
+                detail.pop("portalCustomize", None)
+                detail.pop("pageType", None)
+                if isinstance(detail.get("externalPortal"), dict):
+                    detail["externalPortal"].pop("hostType", None)
+                return httpx.Response(200, json=envelope(detail))
             if method == "PATCH":
-                for required in (
-                    "authTimeout",
-                    "authType",
-                    "enable",
-                    "httpsRedirectEnable",
-                    "landingPage",
-                    "name",
-                ):
-                    assert required in body, f"modifyPortal body lacks {required}"
-                updated = copy.deepcopy(body)
-                updated["id"] = portal_id
-                updated["authTimeout"] = {"authTimeout": 0, **body["authTimeout"]}
-                self.portals[portal_id] = updated
+                refused = self._refuse_portal_write(body, "modifyPortal")
+                if refused is not None:
+                    return refused
+                self._store_portal(portal_id, body)
+                return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
+            if method == "DELETE":
+                del self.portals[portal_id]
+                self.customizations.pop(portal_id, None)
                 return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
         if path == f"{site}/setting/access-control":
             if method == "GET":
@@ -558,11 +651,125 @@ async def test_take_over_removes_only_the_ssid_from_the_foreign_portal():
     assert foreign_writes == [
         ("PATCH", f"/openapi/v1/{OMADAC_ID}/sites/{SITE_ID}/portal/p-venue")
     ]
+    # Its local page went back as read; only the required fields the read
+    # lacked were filled, and the report says which.
+    legacy = legacy_portal_customization()["portalCustomize"]
+    assert {k: sent["portalCustomize"][k] for k in legacy} == legacy
+    assert sent["portalCustomize"]["defaultLanguage"] == 1
+    assert sent["portalCustomize"]["copyrightEnable"] is False
+    assert sent["pageType"] == 1
+    assert set(steps["ssid_takeover"].details["required_fields_defaulted"]) == {
+        "portalCustomize.defaultLanguage",
+        "portalCustomize.copyrightEnable",
+    }
+
+
+async def test_take_over_deletes_a_portal_whose_only_ssid_is_ours():
+    """The 2026-10-16 EC2 case: the stale portal's sole binding was the guest
+    SSID. Releasing it is refused (-34319), so the portal is deleted and ours
+    is created in its place."""
+    controller = PortalController()
+    controller.portals["p-stale"] = external_portal_detail(
+        "p-stale",
+        name="WyfyGuest Portal",
+        server_url=PORTAL_URL.replace(ROUTER_ID, STALE_ROUTER_ID),
+        authType=2,
+    )
+
+    report = await _adapter(controller).configure_external_portal(
+        _creds(), make_spec(take_over_ssid_portal=True)
+    )
+
+    steps = _by_step(report)
+    assert steps["ssid_takeover"].outcome is PortalSetupOutcome.UPDATED
+    assert steps["ssid_takeover"].details["deleted_portal"] is True
+    message = steps["ssid_takeover"].message
+    assert message.startswith("Deleted portal 'WyfyGuest Portal'")
+    assert steps["portal"].outcome is PortalSetupOutcome.CREATED
+    assert "p-stale" not in controller.portals
+    assert controller.portals[report.portal_id]["ssidList"] == [SSID_ID]
+    assert ("DELETE", f"/openapi/v1/{OMADAC_ID}/sites/{SITE_ID}/portal/p-stale") in (
+        controller.writes()
+    )
+    assert not any(
+        method == "PATCH" and path.endswith("/portal/p-stale")
+        for method, path in controller.writes()
+    )
+
+
+async def test_a_take_over_dry_run_says_it_would_delete_and_deletes_nothing():
+    controller = PortalController()
+    controller.portals["p-venue"] = voucher_portal_detail("p-venue", [SSID_ID])
+    controller.portals["p-venue"]["networkList"] = []
+
+    report = await _adapter(controller).configure_external_portal(
+        _creds(), make_spec(take_over_ssid_portal=True, dry_run=True)
+    )
+
+    step = _by_step(report)["ssid_takeover"]
+    assert step.message.startswith("Would delete portal 'Front Desk Vouchers'")
+    assert controller.writes() == []
+    assert "p-venue" in controller.portals
+
+
+async def test_a_portal_that_also_covers_a_lan_is_released_not_deleted():
+    controller = PortalController()
+    # voucher_portal_detail binds net-9 too, so the portal keeps a target.
+    controller.portals["p-venue"] = voucher_portal_detail("p-venue", [SSID_ID])
+
+    report = await _adapter(controller).configure_external_portal(
+        _creds(), make_spec(take_over_ssid_portal=True)
+    )
+
+    assert "deleted_portal" not in _by_step(report)["ssid_takeover"].details
+    assert controller.portals["p-venue"]["ssidList"] == []
+    assert controller.portals["p-venue"]["networkList"] == ["net-9"]
+
+
+async def test_a_new_portal_carries_the_required_customization():
+    controller = PortalController()
+
+    await _adapter(controller).configure_external_portal(_creds(), make_spec())
+
+    body = controller.body_for(f"/sites/{SITE_ID}/portal")
+    assert body["portalCustomize"] == {
+        "defaultLanguage": 1,
+        "copyrightEnable": False,
+        "logoDisplay": True,
+        "termsOfServiceEnable": False,
+        "welcomeEnable": False,
+    }
+
+
+async def test_patching_our_portal_restores_the_host_type_the_detail_omits():
+    controller = PortalController()
+    controller.portals["p-ours"] = external_portal_detail(
+        "p-ours", server_url=f"{PORTAL_HOST}/old?routerId={ROUTER_ID}"
+    )
+
+    report = await _adapter(controller).configure_external_portal(_creds(), make_spec())
+
+    assert _by_step(report)["portal"].outcome is PortalSetupOutcome.UPDATED
+    sent = controller.body_for("/portal/p-ours")
+    assert sent["externalPortal"]["hostType"] == 2
+    assert sent["portalCustomize"]["defaultLanguage"] == 1
+
+
+def test_a_released_foreign_external_portal_gets_its_host_type_back():
+    detail = external_portal_detail("p", ssids=[SSID_ID, OTHER_SSID_ID])
+    detail["externalPortal"].pop("hostType")
+
+    body, filled = released_portal_body(detail, SSID_ID, legacy_portal_customization())
+
+    assert body["externalPortal"]["hostType"] == 2
+    assert "externalPortal.hostType" in filled
 
 
 async def test_if_the_release_fails_our_portal_is_not_attempted():
     controller = PortalController()
-    controller.portals["p-venue"] = voucher_portal_detail("p-venue", [SSID_ID])
+    controller.portals["p-venue"] = voucher_portal_detail(
+        "p-venue", [SSID_ID, OTHER_SSID_ID]
+    )
     controller.refuse[("PATCH", "/portal/p-venue")] = (
         -1001,
         "Invalid request parameters.",
