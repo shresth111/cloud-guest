@@ -44,6 +44,7 @@ from wyfy_device_gateway.controller_contract import (
     ControllerSsid,
     PortalSetupOutcome,
     PortalSetupSpec,
+    RadiusPortalSpec,
 )
 from wyfy_device_gateway.omada.adapter import OmadaControllerAdapter
 from wyfy_device_gateway.omada.client import OmadaHttpClient
@@ -239,6 +240,8 @@ class PortalController(FakeOmadaController):
         self.portals: dict[str, dict[str, Any]] = {}
         #: ``getPortalCustomization`` results, keyed like ``portals``.
         self.customizations: dict[str, dict[str, Any]] = {}
+        #: ``RadiusProfileOpenApiVO`` rows, keyed by ``radiusProfileId``.
+        self.radius_profiles: dict[str, dict[str, Any]] = {}
         self.access_control: dict[str, Any] = access_control()
         self.operators: dict[str, dict[str, Any]] = {}
         #: ``(method, path_suffix) -> (errorCode, msg)`` to refuse a write.
@@ -309,6 +312,29 @@ class PortalController(FakeOmadaController):
                     ),
                 ),
             )
+        if body.get("authType") == 2:
+            radius = body.get("externalRadius")
+            missing_radius = [
+                key
+                for key in ("authMode", "nasId", "portalCustom", "radiusProfileId")
+                if not isinstance(radius, dict) or radius.get(key) is None
+            ]
+            if missing_radius:
+                return httpx.Response(
+                    200,
+                    json=envelope(
+                        error_code=-1001,
+                        msg="".join(
+                            f"externalRadius parameter [{key}] should not be null\n"
+                            for key in missing_radius
+                        ),
+                    ),
+                )
+            if radius["radiusProfileId"] not in self.radius_profiles:
+                return httpx.Response(
+                    200,
+                    json=envelope(error_code=-33800, msg="RADIUS profile not exist."),
+                )
         if not body.get("ssidList") and not body.get("networkList"):
             return httpx.Response(
                 200,
@@ -409,6 +435,32 @@ class PortalController(FakeOmadaController):
                 del self.portals[portal_id]
                 self.customizations.pop(portal_id, None)
                 return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
+        if path == f"{site}/profiles/radius":
+            if method == "GET":
+                return httpx.Response(
+                    200, json=envelope(list(self.radius_profiles.values()))
+                )
+            if method == "POST":
+                for required in (
+                    "authServer",
+                    "name",
+                    "radiusAccountingEnable",
+                    "wirelessVlanAssignment",
+                ):
+                    assert required in body, f"createRadiusProfile lacks {required}"
+                profile_id = self._new_id()
+                self.radius_profiles[profile_id] = {
+                    "radiusProfileId": profile_id,
+                    **copy.deepcopy(body),
+                }
+                return httpx.Response(200, json=envelope({"id": profile_id}))
+        if path.startswith(f"{site}/profiles/radius/") and method == "PATCH":
+            profile_id = path.rsplit("/", 1)[1]
+            self.radius_profiles[profile_id] = {
+                "radiusProfileId": profile_id,
+                **copy.deepcopy(body),
+            }
+            return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
         if path == f"{site}/setting/access-control":
             if method == "GET":
                 return httpx.Response(200, json=envelope(self.access_control))
@@ -1068,3 +1120,167 @@ def test_the_projection_drops_only_read_only_fields():
 )
 def test_host_of(value, expected):
     assert host_of(value) == expected
+
+
+# ============================================================================
+# The RADIUS contract
+# ============================================================================
+
+HUB_IP = "13.201.253.36"
+RADIUS_SECRET = "6DvG-gmCCmcAEfvqTRiUBXPO76xygRZadVz8x7nIXqo"  # noqa: S105
+RADIUS_PROFILE_NAME = "Wyfy Guest RADIUS (3f0e2b1c)"
+NAS_ID = "cg-omada-3f0e2b1c"
+RADIUS_PORTAL_URL = f"{PORTAL_URL}&portalMode=radius"
+
+
+def radius_spec(**overrides: Any) -> RadiusPortalSpec:
+    fields: dict[str, Any] = {
+        "server_ip": HUB_IP,
+        "server_port": 1812,
+        "profile_name": RADIUS_PROFILE_NAME,
+        "nas_id": NAS_ID,
+        "portal_url_scheme": "https",
+        "portal_url": RADIUS_PORTAL_URL,
+        "shared_secret": RADIUS_SECRET,
+    }
+    fields.update(overrides)
+    return RadiusPortalSpec(**fields)
+
+
+async def test_radius_contract_creates_the_profile_then_a_radius_portal():
+    controller = PortalController()
+
+    report = await _adapter(controller).configure_external_portal(
+        _creds(), make_spec(radius=radius_spec())
+    )
+
+    steps = _by_step(report)
+    assert [s.step for s in report.steps] == [
+        "radius_profile",
+        "portal",
+        "pre_auth_access",
+        "hotspot_operator",
+    ]
+    assert steps["radius_profile"].outcome is PortalSetupOutcome.CREATED
+    assert steps["portal"].outcome is PortalSetupOutcome.CREATED
+
+    ((profile_id, profile),) = controller.radius_profiles.items()
+    assert profile["name"] == RADIUS_PROFILE_NAME
+    assert profile["authServer"] == [
+        {"radiusServerIp": HUB_IP, "radiusPort": 1812, "radiusPwd": RADIUS_SECRET}
+    ]
+    assert profile["radiusAccountingEnable"] is False
+
+    body = controller.body_for(f"/sites/{SITE_ID}/portal")
+    assert body["authType"] == 2
+    assert "externalPortal" not in body
+    assert body["externalRadius"] == {
+        "radiusProfileId": profile_id,
+        "authMode": 1,
+        "nasId": NAS_ID,
+        "portalCustom": 2,
+        "externalUrlScheme": "https",
+        "externalUrl": RADIUS_PORTAL_URL,
+        "disconnectReq": False,
+    }
+    assert body["ssidList"] == [SSID_ID]
+
+
+async def test_radius_contract_second_run_changes_nothing():
+    controller = PortalController()
+    adapter = _adapter(controller)
+    await adapter.configure_external_portal(_creds(), make_spec(radius=radius_spec()))
+    writes_after_first = len(controller.writes())
+
+    report = await adapter.configure_external_portal(
+        _creds(with_operator=True),
+        make_spec(
+            radius=radius_spec(), guest_ssid_id=SSID_ID, new_operator_password=None
+        ),
+    )
+
+    assert {s.outcome for s in report.steps} == {PortalSetupOutcome.UNCHANGED}
+    assert len(controller.writes()) == writes_after_first
+
+
+async def test_radius_contract_moves_our_external_portal_onto_radius():
+    """The live Infinity Cafe history: Configure controller first made an
+    External Portal Server portal, then the venue moved contracts."""
+    controller = PortalController()
+    await _adapter(controller).configure_external_portal(_creds(), make_spec())
+    (portal_id,) = controller.portals
+
+    report = await _adapter(controller).configure_external_portal(
+        _creds(with_operator=True),
+        make_spec(
+            radius=radius_spec(), guest_ssid_id=SSID_ID, new_operator_password=None
+        ),
+    )
+
+    steps = _by_step(report)
+    assert steps["radius_profile"].outcome is PortalSetupOutcome.CREATED
+    assert steps["portal"].outcome is PortalSetupOutcome.UPDATED
+    assert "authType" in steps["portal"].details["drift"]
+    # Patched in place -- recognised by the routerId in its URL, not recreated.
+    assert list(controller.portals) == [portal_id]
+    assert controller.portals[portal_id]["authType"] == 2
+    assert controller.portals[portal_id]["externalRadius"]["nasId"] == NAS_ID
+
+
+async def test_a_rotated_secret_repairs_the_profile_and_never_reports_it():
+    controller = PortalController()
+    adapter = _adapter(controller)
+    await adapter.configure_external_portal(
+        _creds(), make_spec(radius=radius_spec(shared_secret="old-secret-123"))
+    )
+
+    report = await adapter.configure_external_portal(
+        _creds(with_operator=True),
+        make_spec(
+            radius=radius_spec(), guest_ssid_id=SSID_ID, new_operator_password=None
+        ),
+    )
+
+    step = _by_step(report)["radius_profile"]
+    assert step.outcome is PortalSetupOutcome.UPDATED
+    assert step.details["drift"] == ["authServer.radiusPwd"]
+    (profile,) = controller.radius_profiles.values()
+    assert profile["authServer"][0]["radiusPwd"] == RADIUS_SECRET
+    # The portal already points at that same profile, so it is left alone.
+    assert _by_step(report)["portal"].outcome is PortalSetupOutcome.UNCHANGED
+    rendered = repr(report) + "".join(s.message for s in report.steps)
+    assert RADIUS_SECRET not in rendered
+    assert "old-secret-123" not in rendered
+    assert RADIUS_SECRET not in repr(radius_spec())
+
+
+async def test_a_refused_profile_leaves_the_portal_untouched():
+    controller = PortalController()
+    controller.refuse[("POST", "/profiles/radius")] = (-1001, "Invalid parameters.")
+
+    report = await _adapter(controller).configure_external_portal(
+        _creds(), make_spec(radius=radius_spec())
+    )
+
+    steps = _by_step(report)
+    assert steps["radius_profile"].outcome is PortalSetupOutcome.FAILED
+    assert steps["portal"].outcome is PortalSetupOutcome.SKIPPED
+    assert "RADIUS profile" in steps["portal"].message
+    assert controller.portals == {}
+
+
+async def test_a_radius_dry_run_writes_nothing():
+    controller = PortalController()
+
+    report = await _adapter(controller).configure_external_portal(
+        _creds(),
+        make_spec(radius=radius_spec(), dry_run=True, new_operator_password=None),
+    )
+
+    assert controller.writes() == []
+    steps = _by_step(report)
+    assert steps["radius_profile"].message.startswith(
+        f"Would create RADIUS profile '{RADIUS_PROFILE_NAME}'"
+    )
+    assert "External RADIUS Server" in steps["portal"].message
+    assert RADIUS_SECRET not in steps["radius_profile"].message

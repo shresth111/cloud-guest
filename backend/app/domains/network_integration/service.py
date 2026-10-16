@@ -92,6 +92,7 @@ from redis.asyncio import Redis
 from app.common.exceptions import CloudGuestError
 from app.core.config import Settings, get_settings
 from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
+from app.domains.router.crypto import decrypt_secret
 
 from .constants import (
     AUDIT_ENTITY_TYPE,
@@ -99,11 +100,13 @@ from .constants import (
     CONTROLLER_SETUP_OPERATOR_PREFIX,
     CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH,
     CONTROLLER_SETUP_PORTAL_NAME_PREFIX,
+    CONTROLLER_SETUP_RADIUS_PROFILE_PREFIX,
     DEFAULT_CONTROLLER_TLS_MODE,
     DEFAULT_PORTAL_AUTH_MODE,
     DEFAULT_SYNC_INTERVAL_SECONDS,
     FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER,
     GUEST_OPERATOR_CREDENTIAL_FIELDS,
+    HUB_RADIUS_AUTH_PORT,
     MIN_SYNC_INTERVAL_SECONDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
     PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS,
@@ -185,6 +188,7 @@ from .providers.base import (
     ProviderDevice,
     ProviderPortalContext,
     ProviderRadiusPortalContext,
+    ProviderRadiusPortalSetup,
     ProviderSite,
     ProviderSsid,
     ProviderTlsObservation,
@@ -334,6 +338,20 @@ class GuestSessionLookupProtocol(Protocol):
     # session it proved it holds. Satisfied as-is by
     # `GuestRepository.get_guest_by_id`.
     async def get_guest_by_id(self, guest_id: uuid.UUID) -> Any: ...
+
+
+class RadiusNasLookupProtocol(Protocol):
+    """How this domain finds the NAS client a RADIUS-contract controller was
+    registered as -- for its shared secret, which "Configure controller"
+    writes into the controller's RADIUS profile.
+
+    One line, satisfied as-is by
+    ``app.domains.guest.repository.GuestRepository``, for the same reasons
+    ``GuestSessionLookupProtocol`` is: no service graph, and no direction
+    from the guest domain back into this one.
+    """
+
+    async def get_nas_client_by_router(self, router_id: uuid.UUID) -> Any: ...
 
 
 class GuestSessionTerminatorProtocol(Protocol):
@@ -871,6 +889,7 @@ class NetworkIntegrationService:
         audit_writer: AuditLogWriter | None = None,
         guest_session_lookup: GuestSessionLookupProtocol | None = None,
         guest_session_terminator: GuestSessionTerminatorProtocol | None = None,
+        radius_nas_lookup: RadiusNasLookupProtocol | None = None,
         fleet_device_provisioner: FleetDeviceProvisionerProtocol | None = None,
         guest_name_gate: GuestNameGateProtocol | None = None,
         provider_resolver=get_network_provider,
@@ -887,6 +906,9 @@ class NetworkIntegrationService:
         # degradation -- ``disconnect_guest`` refuses rather than
         # reporting a guest session ended that it never ended.
         self.guest_session_terminator = guest_session_terminator
+        # Optional for the same reason; only "Configure controller" on the
+        # RADIUS contract reads it, and that path refuses without it.
+        self.radius_nas_lookup = radius_nas_lookup
         # Optional, and its absence is an error rather than a degradation:
         # only the Master onboarding path uses it, and that path refuses
         # outright when it is missing. See
@@ -3435,7 +3457,71 @@ class NetworkIntegrationService:
             gaps.append(ControllerSetupGap.FLEET_DEVICE_MISSING)
         if not integration.guest_ssid_id and not integration.guest_ssid_name:
             gaps.append(ControllerSetupGap.GUEST_SSID_MISSING)
+        if (
+            integration.portal_mode == PortalAuthMode.RADIUS.value
+            and not self.settings.hub_radius_public_address.strip()
+        ):
+            gaps.append(ControllerSetupGap.HUB_RADIUS_ADDRESS_MISSING)
         return gaps
+
+    async def _controller_setup_radius(
+        self, integration: NetworkIntegration, *, dry_run: bool
+    ) -> ProviderRadiusPortalSetup | None:
+        """The RADIUS half of the setup request, or ``None`` off that contract.
+
+        Everything comes from this platform's own records: the hub address
+        from settings, the NAS identifier and secret from the NAS client the
+        controller was registered as (``Register controller with RADIUS``).
+        The secret is the one the hub already holds, so the controller and
+        the hub agree by construction -- nobody types it. A controller that
+        was never registered is refused here, before the controller is
+        contacted, rather than given a profile with no secret behind it.
+        """
+        if integration.portal_mode != PortalAuthMode.RADIUS.value:
+            return None
+        nas_client = None
+        if self.radius_nas_lookup is not None and integration.router_id is not None:
+            nas_client = await self.radius_nas_lookup.get_nas_client_by_router(
+                integration.router_id
+            )
+        if nas_client is None:
+            error = ControllerSetupPreconditionsError(
+                [ControllerSetupGap.RADIUS_NAS_NOT_REGISTERED]
+            )
+            await self._record_setup_event(
+                integration,
+                dry_run=dry_run,
+                ok=False,
+                message=error.message,
+                error_code=error.code.value,
+                context={
+                    "missing": [ControllerSetupGap.RADIUS_NAS_NOT_REGISTERED.value]
+                },
+            )
+            raise error
+        radius_url = build_external_portal_url(
+            organization_id=integration.organization_id,
+            location_id=integration.location_id,
+            router_id=integration.router_id,
+            provider=integration.provider,
+            portal_mode=PortalAuthMode.RADIUS.value,
+        )
+        if radius_url is None:  # pragma: no cover - excluded by the gaps
+            raise ControllerSetupPreconditionsError(
+                [ControllerSetupGap.FLEET_DEVICE_MISSING]
+            )
+        return ProviderRadiusPortalSetup(
+            server_ip=self.settings.hub_radius_public_address.strip(),
+            server_port=HUB_RADIUS_AUTH_PORT,
+            profile_name=(
+                f"{CONTROLLER_SETUP_RADIUS_PROFILE_PREFIX} "
+                f"({integration.id.hex[:8]})"
+            ),
+            nas_id=str(nas_client.nas_identifier),
+            portal_url_scheme=radius_url.scheme,
+            portal_url_host_and_query=radius_url.host_and_query,
+            shared_secret=decrypt_secret(nas_client.shared_secret_encrypted),
+        )
 
     async def _refuse_shared_controller_site(
         self, integration: NetworkIntegration
@@ -3626,6 +3712,7 @@ class NetworkIntegrationService:
                 [ControllerSetupGap.FLEET_DEVICE_MISSING]
             )
         pre_auth_host = portal_url.host_and_query.split("/", 1)[0]
+        radius = await self._controller_setup_radius(integration, dry_run=dry_run)
         _, location_name = (
             await self.repository.resolve_display_names([integration])
         ).get(integration.id, (None, None))
@@ -3680,6 +3767,7 @@ class NetworkIntegrationService:
             new_operator_password=new_password,
             take_over_ssid_portal=take_over_ssid_portal,
             dry_run=dry_run,
+            radius=radius,
         )
         config = self._connection_config(integration, credentials)
         try:
