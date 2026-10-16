@@ -48,6 +48,7 @@ from app.domains.network_integration.constants import (
     IntegrationEventStatus,
     IntegrationEventType,
     NetworkIntegrationAuditAction,
+    PortalAuthMode,
 )
 from app.domains.network_integration.crypto import decrypt_credentials
 from app.domains.network_integration.exceptions import (
@@ -66,6 +67,7 @@ from app.domains.network_integration.providers.omada import OmadaProvider
 from app.domains.network_integration.schemas import ControllerConfigureRequest
 from app.domains.network_integration.service import NetworkIntegrationService
 from app.domains.network_integration.validators import build_external_portal_url
+from app.domains.router.crypto import encrypt_secret
 from tests.unit.test_network_integration import (
     FakeAuditWriter,
     FakeRepository,
@@ -140,6 +142,7 @@ class MockController:
             "freeAuthClientPolicies": [],
         }
         self.operators: dict[str, dict[str, Any]] = {}
+        self.radius_profiles: dict[str, dict[str, Any]] = {}
         self.refuse: dict[tuple[str, str], int] = {}
         self._next = 0
 
@@ -249,6 +252,22 @@ class MockController:
                 "authTimeout": {"authTimeout": 0, **body["authTimeout"]},
             }
             return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
+        if path == f"{SITE}/profiles/radius":
+            if method == "POST":
+                profile_id = self._id()
+                self.radius_profiles[profile_id] = {
+                    "radiusProfileId": profile_id,
+                    **copy.deepcopy(body),
+                }
+                return _ok({"id": profile_id})
+            return _ok(list(self.radius_profiles.values()))
+        if path.startswith(f"{SITE}/profiles/radius/") and method == "PATCH":
+            profile_id = path.rsplit("/", 1)[1]
+            self.radius_profiles[profile_id] = {
+                "radiusProfileId": profile_id,
+                **copy.deepcopy(body),
+            }
+            return httpx.Response(200, json={"errorCode": 0, "msg": "Success."})
         if path == f"{SITE}/setting/access-control":
             if method == "PATCH":
                 self.access_control = copy.deepcopy(body)
@@ -336,6 +355,7 @@ def _service(
     audit: FakeAuditWriter | None = None,
     *,
     settings: Settings | None = None,
+    radius_nas_lookup: Any = None,
 ) -> NetworkIntegrationService:
     return NetworkIntegrationService(
         repo,
@@ -344,6 +364,7 @@ def _service(
         url_resolver=_resolves_public,
         redis=None,
         settings=settings,
+        radius_nas_lookup=radius_nas_lookup,
     )
 
 
@@ -946,3 +967,103 @@ async def test_the_customer_route_hands_the_callers_organization_to_the_service(
             "take_over_ssid_portal": True,
         }
     ]
+
+
+# ============================================================================
+# The RADIUS contract
+# ============================================================================
+
+HUB_ADDRESS = "13.201.253.36"
+NAS_SECRET = "6DvG-gmCCmcAEfvqTRiUBXPO76xygRZadVz8x7nIXqo"  # noqa: S105
+
+
+@dataclass
+class FakeNasLookup:
+    """``RadiusNasLookupProtocol``: the NAS client a controller was registered
+    as, keyed by fleet device -- what ``GuestRepository`` answers."""
+
+    rows: dict[uuid.UUID, Any] = field(default_factory=dict)
+
+    def register(self, router_id: uuid.UUID, nas_identifier: str) -> None:
+        self.rows[router_id] = SimpleNamespace(
+            nas_identifier=nas_identifier,
+            shared_secret_encrypted=encrypt_secret(NAS_SECRET),
+        )
+
+    async def get_nas_client_by_router(self, router_id: uuid.UUID) -> Any:
+        return self.rows.get(router_id)
+
+
+def _radius_service(repo, lookup, *, hub_address: str = HUB_ADDRESS):
+    return _service(
+        repo,
+        settings=Settings(hub_radius_public_address=hub_address),
+        radius_nas_lookup=lookup,
+    )
+
+
+async def test_radius_contract_writes_profile_and_radius_portal(controller) -> None:
+    repo = ScopedRepository()
+    row = repo.add(_row(uuid.uuid4(), portal_mode=PortalAuthMode.RADIUS.value))
+    lookup = FakeNasLookup()
+    lookup.register(row.router_id, "cg-omada-3329280d")
+
+    outcome = await _configure(_radius_service(repo, lookup), row)
+
+    assert outcome.ok
+    assert _outcomes(outcome)["radius_profile"] == "created"
+    assert _outcomes(outcome)["portal"] == "created"
+    ((profile_id, profile),) = controller.radius_profiles.items()
+    assert profile["name"] == f"Wyfy Guest RADIUS ({row.id.hex[:8]})"
+    assert profile["authServer"] == [
+        {"radiusServerIp": HUB_ADDRESS, "radiusPort": 1812, "radiusPwd": NAS_SECRET}
+    ]
+    (portal,) = controller.portals.values()
+    assert portal["authType"] == 2
+    radius = portal["externalRadius"]
+    assert radius["radiusProfileId"] == profile_id
+    assert radius["nasId"] == "cg-omada-3329280d"
+    assert radius["authMode"] == 1
+    assert radius["portalCustom"] == 2
+    assert radius["externalUrl"].endswith("&portalMode=radius")
+    assert f"routerId={row.router_id}" in radius["externalUrl"]
+    # The secret goes to the controller and nowhere else.
+    assert NAS_SECRET not in json.dumps(repo.events, default=str)
+    assert NAS_SECRET not in repr(outcome)
+
+
+async def test_radius_contract_refuses_an_unregistered_controller(controller) -> None:
+    repo = ScopedRepository()
+    row = repo.add(_row(uuid.uuid4(), portal_mode=PortalAuthMode.RADIUS.value))
+
+    with pytest.raises(ControllerSetupPreconditionsError) as exc:
+        await _configure(_radius_service(repo, FakeNasLookup()), row)
+
+    assert exc.value.data["missing"] == ["radius_nas_not_registered"]
+    assert "Register controller with RADIUS" in exc.value.message
+    assert controller.writes() == []
+
+
+async def test_radius_contract_needs_the_hub_address(controller) -> None:
+    repo = ScopedRepository()
+    row = repo.add(_row(uuid.uuid4(), portal_mode=PortalAuthMode.RADIUS.value))
+    lookup = FakeNasLookup()
+    lookup.register(row.router_id, "cg-omada-x")
+
+    with pytest.raises(ControllerSetupPreconditionsError) as exc:
+        await _configure(_radius_service(repo, lookup, hub_address=""), row)
+
+    assert exc.value.data["missing"] == ["hub_radius_address_missing"]
+    assert controller.requests == []
+
+
+async def test_external_portal_contract_never_touches_radius(controller) -> None:
+    repo = ScopedRepository()
+    row = repo.add(_row(uuid.uuid4()))
+
+    outcome = await _configure(_radius_service(repo, FakeNasLookup()), row)
+
+    assert "radius_profile" not in _outcomes(outcome)
+    assert controller.radius_profiles == {}
+    (portal,) = controller.portals.values()
+    assert portal["authType"] == 4

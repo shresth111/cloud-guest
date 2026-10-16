@@ -76,6 +76,7 @@ from .service import (
     GuestSessionLookupProtocol,
     GuestSessionTerminatorProtocol,
     NetworkIntegrationService,
+    RadiusNasLookupProtocol,
 )
 
 __all__ = [
@@ -85,6 +86,7 @@ __all__ = [
     "get_instant_on_read_service",
     "get_network_integration_repository",
     "get_network_integration_service",
+    "get_radius_nas_lookup",
 ]
 
 
@@ -106,6 +108,15 @@ def get_guest_session_lookup(
     else, so this costs no service graph and pulls no other domain's
     dependencies into this one's.
     """
+    return GuestRepository(db)
+
+
+def get_radius_nas_lookup(
+    db: AsyncSession = Depends(get_db_session),
+) -> RadiusNasLookupProtocol:
+    """The real ``GuestRepository`` again, for ``RadiusNasLookupProtocol`` --
+    the RADIUS contract's "Configure controller" reads the controller's NAS
+    client from it. Same reasoning as ``get_guest_session_lookup``."""
     return GuestRepository(db)
 
 
@@ -180,12 +191,14 @@ def get_network_integration_service(
         get_fleet_device_provisioner
     ),
     guest_service: GuestService = Depends(get_guest_service),
+    radius_nas_lookup: RadiusNasLookupProtocol = Depends(get_radius_nas_lookup),
 ) -> NetworkIntegrationService:
     return NetworkIntegrationService(
         repository,
         audit_writer=audit_repository,
         guest_session_lookup=guest_session_lookup,
         guest_session_terminator=guest_session_terminator,
+        radius_nas_lookup=radius_nas_lookup,
         fleet_device_provisioner=fleet_device_provisioner,
         # Name required at sign-in -- see ``GuestNameGateProtocol``.
         guest_name_gate=guest_service,
