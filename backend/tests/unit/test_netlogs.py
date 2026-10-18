@@ -169,7 +169,9 @@ class TestClassifier:
         ) == expected
 
     def test_tag_prefix_left_in_old_messages_is_skipped(self) -> None:
-        c = classify("Office wyfy-8a199617: dhcp1 assigned 10.0.0.9 for AA:BB:CC:DD:EE:FF")
+        c = classify(
+            "Office wyfy-8a199617: dhcp1 assigned 10.0.0.9 for AA:BB:CC:DD:EE:FF"
+        )
         assert c.category == "dhcp" and c.dst_ip == "10.0.0.9"
 
     def test_a_topic_list_naming_something_else_never_becomes_dhcp(self) -> None:
@@ -281,7 +283,9 @@ def _matches(r: Row, f: CustomerFilters) -> bool:
         return False
     if f.severities and r.severity not in f.severities:
         return False
-    if f.max_severity is not None and (r.severity is None or r.severity > f.max_severity):
+    if f.max_severity is not None and (
+        r.severity is None or r.severity > f.max_severity
+    ):
         return False
     if f.categories:
         cat = r.category or "other"
@@ -914,7 +918,9 @@ class TestPartitionMaintenance:
         assert summary["dropped"] == ["device_log_events_p202409"]
         assert summary["created"] == []
         delete_at = next(
-            i for i, s in enumerate(session.sql) if "DELETE FROM guest_device_events" in s
+            i
+            for i, s in enumerate(session.sql)
+            if "DELETE FROM guest_device_events" in s
         )
         drop_at = next(i for i, s in enumerate(session.sql) if "DROP TABLE" in s)
         assert delete_at < drop_at
@@ -1249,7 +1255,7 @@ class TestGuestWiring:
 
         fx = make_fixture()
         fx.guest_service.login_event_recorder = Recorder()
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017
             await fx.guest_service.login_via_otp(
                 identifier="+15553334444",
                 code="BAD",
