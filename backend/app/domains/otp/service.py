@@ -265,6 +265,23 @@ class WhatsAppProviderProtocol(Protocol):
     async def send(self, phone_number: str, *, code: str, message: str) -> None: ...
 
 
+class OrgOtpDispatcherProtocol(Protocol):
+    """``app.domains.guest_messaging.service.OrgOtpDispatcher``: sends a guest
+    login code through the venue's own provider when it has a verified one.
+    Returns False (never raises) when the platform provider must send."""
+
+    async def try_send(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        channel: str,
+        phone: str,
+        code: str,
+        message: str,
+    ) -> bool: ...
+
+
 class LoggingSmsProvider:
     """Honest interim SMS provider -- logs the would-be-sent message
     instead of calling a real carrier/gateway API. See module docstring.
@@ -978,6 +995,42 @@ class TwilioWhatsAppProvider:
             response.raise_for_status()
 
 
+class MetaCloudWhatsAppProvider:
+    """The platform's own WhatsApp number on the direct Meta Cloud API
+    (``Settings.whatsapp_delivery_provider == 'meta'``): an AUTHENTICATION
+    template with a copy-code button, the code as body ``{{1}}`` and as the
+    button parameter. The request is built by the same adapter venues use
+    for their own numbers (``app.domains.guest_messaging.adapters
+    .MetaCloudOtpAdapter``), so the two cannot drift. Raises on any
+    non-success, like every other platform provider here."""
+
+    def __init__(
+        self,
+        *,
+        phone_number_id: str,
+        waba_id: str,
+        access_token: str,
+        template_name: str,
+        template_language: str = "en",
+    ) -> None:
+        self._config = {
+            "phone_number_id": phone_number_id,
+            "waba_id": waba_id,
+            "access_token": access_token,
+            "template_name": template_name,
+            "template_language": template_language,
+        }
+
+    async def send(self, phone_number: str, *, code: str, message: str) -> None:
+        from app.domains.guest_messaging.adapters import MetaCloudOtpAdapter
+        from app.domains.guest_messaging.registry import AdapterContext, OtpMessage
+        from app.domains.guest_messaging.service import normalize_phone
+
+        adapter = MetaCloudOtpAdapter(self._config, AdapterContext())
+        phone = normalize_phone(phone_number) or phone_number
+        await adapter.send_otp(OtpMessage(phone, code, message))
+
+
 class ExotelSmsProvider:
     """Real ``SmsProviderProtocol`` implementation: a plain
     ``httpx.AsyncClient`` POST to Exotel's documented SMS API
@@ -1300,6 +1353,23 @@ def get_configured_whatsapp_provider(settings: Settings) -> WhatsAppProviderProt
     docstring for why WhatsApp is the same Twilio account, just a
     different sender/message shape."""
     provider = settings.whatsapp_delivery_provider.lower()
+    if provider == "meta":
+        if (
+            not settings.whatsapp_meta_phone_number_id
+            or not settings.whatsapp_meta_access_token
+            or not settings.whatsapp_meta_template_name
+        ):
+            raise WhatsAppProviderNotConfiguredError(
+                "whatsapp_delivery_provider='meta' but whatsapp_meta_phone_number_id/"
+                "whatsapp_meta_access_token/whatsapp_meta_template_name is empty."
+            )
+        return MetaCloudWhatsAppProvider(
+            phone_number_id=settings.whatsapp_meta_phone_number_id,
+            waba_id=settings.whatsapp_meta_waba_id,
+            access_token=settings.whatsapp_meta_access_token,
+            template_name=settings.whatsapp_meta_template_name,
+            template_language=settings.whatsapp_meta_template_language or "en",
+        )
     if provider == "twilio":
         if (
             not settings.twilio_account_sid
@@ -1390,6 +1460,7 @@ class OtpService:
         max_requests_per_window: int = 5,
         request_window_minutes: int = 60,
         sms_message_template: str = "",
+        org_dispatcher: OrgOtpDispatcherProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.redis = redis
@@ -1407,6 +1478,12 @@ class OtpService:
         self.max_requests_per_window = max_requests_per_window
         self.request_window_minutes = request_window_minutes
         self.sms_message_template = sms_message_template
+        # A venue's own WhatsApp/SMS account for guest login codes
+        # (app.domains.guest_messaging). Tried first for GUEST_LOGIN codes;
+        # it never raises, and on any failure the platform provider below
+        # sends the same code -- a guest's login never waits on a venue's
+        # vendor.
+        self.org_dispatcher = org_dispatcher
 
     # ========================================================================
     # Request
@@ -1498,10 +1575,18 @@ class OtpService:
             # template; the data-masking code keeps its purpose-specific
             # copy (that flow is an authenticated dashboard control, not
             # the DLT-gated guest sign-in).
+            if await self._send_through_venue(
+                otp_request, code, channel, purpose, message
+            ):
+                return
             if self.sms_message_template and purpose == OtpPurpose.GUEST_LOGIN:
                 message = self.sms_message_template.replace("{#num#}", code)
             await self.sms_provider.send(otp_request.identifier, message)
         elif channel == OtpChannel.WHATSAPP:
+            if await self._send_through_venue(
+                otp_request, code, channel, purpose, message
+            ):
+                return
             await self.whatsapp_provider.send(
                 otp_request.identifier, code=code, message=message
             )
@@ -1512,6 +1597,32 @@ class OtpService:
             await self.email_provider.send(
                 otp_request.identifier, subject, email_html
             )
+
+    async def _send_through_venue(
+        self,
+        otp_request: OtpRequest,
+        code: str,
+        channel: OtpChannel,
+        purpose: OtpPurpose,
+        message: str,
+    ) -> bool:
+        """True when the venue's own provider accepted the code. Only guest
+        login codes for a named venue go this way; account codes (data
+        masking) always use the platform's own sender."""
+        if self.org_dispatcher is None or purpose != OtpPurpose.GUEST_LOGIN:
+            return False
+        try:
+            return await self.org_dispatcher.try_send(
+                organization_id=otp_request.organization_id,
+                location_id=otp_request.location_id,
+                channel=channel.value,
+                phone=otp_request.identifier,
+                code=code,
+                message=message,
+            )
+        except Exception:  # noqa: BLE001 - belt and braces: never fail a login
+            logger.warning("otp_venue_provider_dispatch_failed", exc_info=True)
+            return False
 
     # ========================================================================
     # Verify
@@ -1648,6 +1759,8 @@ __all__ = [
     "warn_email_identity_fallback",
     "get_configured_sms_provider",
     "get_configured_whatsapp_provider",
+    "MetaCloudWhatsAppProvider",
+    "OrgOtpDispatcherProtocol",
     "AuditLogWriter",
     "OtpRateLimiter",
     "generate_numeric_code",

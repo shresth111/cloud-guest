@@ -51,6 +51,10 @@ from app.domains.guest.router import nas_platform_router as guest_nas_platform_r
 from app.domains.guest.router import nas_router as guest_nas_router
 from app.domains.guest.router import radius_router as guest_radius_router
 from app.domains.guest_access.router import router as guest_access_router
+from app.domains.guest_messaging.router import (
+    platform_router as guest_messaging_platform_router,
+)
+from app.domains.guest_messaging.router import router as guest_messaging_router
 from app.domains.guest_teams.router import admin_router as guest_teams_admin_router
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
 from app.domains.hotspot.router import router as hotspot_router
@@ -303,6 +307,11 @@ api_v1_router.include_router(marketing_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(marketing_providers_router, dependencies=_PAID_WRITES)
 # Master read-only own-provider view; pinned GLOBAL, platform surface.
 api_v1_router.include_router(marketing_platform_providers_router)
+# Guest login messaging (own WhatsApp/SMS for login codes). The venue's routes
+# are licence-gated for writes; the Master routes are GLOBAL-pinned platform
+# surface, so not on _PAID_WRITES (the Wyfy team acts for the venue).
+api_v1_router.include_router(guest_messaging_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(guest_messaging_platform_router)
 # Master price book (spec §13.7); GLOBAL-pinned platform surface.
 api_v1_router.include_router(marketing_platform_pricing_router)
 # Marketing credits (§13): the customer balance/ledger routes live in the
