@@ -1004,6 +1004,14 @@ class AuditAction(StrEnum):
     MARKETING_PROVIDER_ENABLED = "marketing_provider_enabled"
     MARKETING_PROVIDER_TRIPPED = "marketing_provider_tripped"
     MARKETING_PROVIDER_TEMPLATES_SYNCED = "marketing_provider_templates_synced"
+    # Guest login messaging, bring-your-own (``app.domains.guest_messaging``).
+    # ``..._FALLBACK`` is written (throttled) when a login code failed on the
+    # venue's own account and went out through the platform default.
+    GUEST_LOGIN_PROVIDER_UPDATED = "guest_login_provider_updated"
+    GUEST_LOGIN_PROVIDER_DELETED = "guest_login_provider_deleted"
+    GUEST_LOGIN_PROVIDER_VERIFIED = "guest_login_provider_verified"
+    GUEST_LOGIN_PROVIDER_VERIFY_FAILED = "guest_login_provider_verify_failed"
+    GUEST_LOGIN_PROVIDER_FALLBACK = "guest_login_provider_fallback"
 
     # DNS Management domain events -- written through this same table by
     # ``app.domains.dns.service.DnsService`` via the same narrow

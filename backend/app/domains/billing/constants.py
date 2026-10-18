@@ -168,6 +168,14 @@ class PlanFeatureKey(StrEnum):
     # TRAFFIC_FLOW. It does not switch record storage on: that is the
     # platform's CLOUDGUEST_TRAFFIC_FLOW_RECORDS_ENABLED.
     TRAFFIC_FLOW_RECORDS = "traffic_flow_records"
+    # -- Guest login messaging, bring-your-own (``app.domains.guest_messaging``):
+    # the venue's own WhatsApp/SMS account sends its guests' login codes
+    # instead of Wyfy's. BOOLEAN, off by default and carried by no seeded
+    # plan; unlocked per organization from the Master console. With it off
+    # (the default) every login code goes through the platform's own
+    # providers, exactly as before. Independent of GUEST_MARKETING_BYO: login
+    # codes and campaigns are separate sending paths with separate accounts.
+    GUEST_LOGIN_BYO = "guest_login_byo"
 
 
 class PlanFeatureType(StrEnum):
@@ -243,6 +251,7 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.GUEST_MARKETING_BYO,
         PlanFeatureKey.TRAFFIC_FLOW,
         PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
+        PlanFeatureKey.GUEST_LOGIN_BYO,
     }
 )
 
@@ -257,6 +266,7 @@ ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.GUEST_MARKETING_BYO,
         PlanFeatureKey.TRAFFIC_FLOW,
         PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
+        PlanFeatureKey.GUEST_LOGIN_BYO,
     }
 )
 

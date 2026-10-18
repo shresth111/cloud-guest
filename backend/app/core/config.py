@@ -1991,7 +1991,8 @@ class Settings(BaseSettings):
         description=(
             "Which concrete WhatsAppProviderProtocol implementation "
             "app.domains.otp.service.get_configured_whatsapp_provider "
-            "selects: 'logging' (default, no real send), or 'twilio'."
+            "selects: 'logging' (default, no real send), 'twilio', or "
+            "'meta' (direct WhatsApp Cloud API, whatsapp_meta_* below)."
         ),
     )
     # Deliberately no separate whatsapp_twilio_account_sid/auth_token --
@@ -2030,6 +2031,39 @@ class Settings(BaseSettings):
             "{{1}}'. Only needs changing if the approved template numbers "
             "its variables differently."
         ),
+    )
+    # whatsapp_delivery_provider='meta': the platform's own WhatsApp number
+    # on the direct Meta Cloud API (no BSP in between). Sends an
+    # AUTHENTICATION-category template with a copy-code button, the shape
+    # app.domains.guest_messaging.adapters.MetaCloudOtpAdapter builds.
+    whatsapp_meta_phone_number_id: str = Field(
+        default="",
+        description=(
+            "Graph API phone number id (digits) of Wyfy Guest's own OTP "
+            "WhatsApp number, from WhatsApp Manager > API Setup."
+        ),
+    )
+    whatsapp_meta_waba_id: str = Field(
+        default="",
+        description="WhatsApp Business Account id (digits) that owns that number.",
+    )
+    whatsapp_meta_access_token: str = Field(
+        default="",
+        description=(
+            "A System User access token with whatsapp_business_messaging on "
+            "that WABA. Secret."
+        ),
+    )
+    whatsapp_meta_template_name: str = Field(
+        default="",
+        description=(
+            "Name of the APPROVED authentication template (copy-code button) "
+            "in that WABA, e.g. 'wyfy_login_code'."
+        ),
+    )
+    whatsapp_meta_template_language: str = Field(
+        default="en",
+        description="Language code the template was approved in, e.g. 'en' or 'en_US'.",
     )
 
     s3_endpoint_url: str = Field(
