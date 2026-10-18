@@ -22,10 +22,15 @@ from fastapi import Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.device_logs.server_events import (
+    PortalLoginEventRecorder,
+    RadiusEventRecorder,
+)
 from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.enforcement import LiveSessionTerminator
 from app.domains.guest_access.service import GuestAccessService
@@ -227,6 +232,8 @@ def get_guest_service(
         team_quota_hook=team_quota_resolver,
         redis=redis,
         caller_location_scope=caller_location_scope,
+        # NetLogs: portal sign-in failures, on a session of their own.
+        login_event_recorder=PortalLoginEventRecorder(get_settings()),
     )
 
 
@@ -249,6 +256,7 @@ def get_radius_service(
         get_queue_management_service
     ),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
+    db: AsyncSession = Depends(get_db_session),
 ) -> RadiusService:
     """Queue Management Engine addition: wires ``QueueManagementService`` in
     as ``RadiusService``'s optional ``queue_lookup`` hook -- the one
@@ -265,6 +273,9 @@ def get_radius_service(
         audit_writer=audit_repository,
         queue_lookup=queue_management_service,
         caller_location_scope=caller_location_scope,
+        # NetLogs: one row per Authorize verdict, in this request's own
+        # transaction (SAVEPOINT; never fails the verdict).
+        radius_event_recorder=RadiusEventRecorder(db, get_settings()),
     )
 
 

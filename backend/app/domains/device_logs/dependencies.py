@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.database.session import get_db_session
 
-from .repository import DeviceLogsRepository
+from .customer_service import NetLogsCustomerService
+from .repository import CustomerLogsRepository, DeviceLogsRepository
 from .service import DeviceLogsService
 from .session_events import GuestDeviceEventsReader
 
@@ -21,3 +22,9 @@ def get_guest_device_events_reader(
     db: AsyncSession = Depends(get_db_session),
 ) -> GuestDeviceEventsReader:
     return GuestDeviceEventsReader(DeviceLogsRepository(db))
+
+
+def get_netlogs_customer_service(
+    db: AsyncSession = Depends(get_db_session),
+) -> NetLogsCustomerService:
+    return NetLogsCustomerService(CustomerLogsRepository(db), get_settings())

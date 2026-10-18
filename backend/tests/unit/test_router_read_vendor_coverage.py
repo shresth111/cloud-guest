@@ -262,6 +262,19 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "Outer join for the router name on stored log lines. Names only; "
         "the set of rows is decided by device_log_events, not by routers."
     ),
+    "app/domains/device_logs/repository.py::CustomerLogsRepository.list_events": (
+        "Outer join for the router name on the customer NetLogs list. Names "
+        "only; the rows are decided by device_log_events, scoped to one org."
+    ),
+    "app/domains/device_logs/repository.py::CustomerLogsRepository.top_routers": (
+        "Name join for the busiest routers in one org's NetLogs summary. "
+        "Counts come from device_log_events; every vendor's name may appear "
+        "and nothing about device health is judged or written."
+    ),
+    "app/domains/device_logs/repository.py::CustomerLogsRepository.router_owner": (
+        "Ownership check (org, location) of a router_id a customer filtered "
+        "on, so another tenant's router is refused. Vendor-neutral by design."
+    ),
     # -- security -----------------------------------------------------------
     "app/domains/security/repository.py::SecurityRepository.fleet_counts": (
         "Narrowing happened upstream and this method cannot undo it: every "

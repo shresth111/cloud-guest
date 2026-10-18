@@ -30,6 +30,7 @@ from app.domains.customer_provisioning.router import (
 from app.domains.dashboard.router import router as dashboard_router
 from app.domains.demo_booking.router import router as demo_booking_router
 from app.domains.demo_request.router import router as demo_request_router
+from app.domains.device_logs.customer_router import netlogs_customer_router
 from app.domains.device_logs.router import (
     device_logs_ingest_router,
     device_logs_platform_router,
@@ -340,3 +341,4 @@ api_v1_router.include_router(channel_partner_router)
 # Platform surface, so not on _PAID_WRITES.
 api_v1_router.include_router(device_logs_platform_router)
 api_v1_router.include_router(device_logs_ingest_router)
+api_v1_router.include_router(netlogs_customer_router)
