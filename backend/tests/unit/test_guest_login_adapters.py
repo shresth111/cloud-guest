@@ -71,7 +71,9 @@ class Recorder:
         self.requests.append(request)
         if self.text is not None:
             return httpx.Response(self.status, text=self.text)
-        return httpx.Response(self.status, json=self.body if self.body is not None else {})
+        return httpx.Response(
+            self.status, json=self.body if self.body is not None else {}
+        )
 
     @property
     def last(self) -> httpx.Request:
@@ -203,7 +205,9 @@ class TestConfig:
         with pytest.raises(ConfigError) as caught:
             normalize_config(spec, base)
         assert "message_template" in caught.value.fields
-        ok = normalize_config(spec, {**base, "message_template": "{#var#} is your code"})
+        ok = normalize_config(
+            spec, {**base, "message_template": "{#var#} is your code"}
+        )
         assert render_sms(ok["message_template"], CODE) == f"{CODE} is your code"
 
     def test_scrub_removes_configured_values(self) -> None:
@@ -315,10 +319,14 @@ class TestCustomHttpSuccess:
             MESSAGE
         )
         with pytest.raises(ProviderSendError) as caught:
-            await _adapter("sms", "custom_http", config, Recorder(401)).send_otp(MESSAGE)
+            await _adapter("sms", "custom_http", config, Recorder(401)).send_otp(
+                MESSAGE
+            )
         assert caught.value.auth is True
         with pytest.raises(ProviderSendError) as caught:
-            await _adapter("sms", "custom_http", config, Recorder(500)).send_otp(MESSAGE)
+            await _adapter("sms", "custom_http", config, Recorder(500)).send_otp(
+                MESSAGE
+            )
         assert caught.value.code == "provider_rejected"
 
     async def test_a_redirect_is_never_followed(self) -> None:
@@ -742,7 +750,11 @@ async def test_msg91() -> None:
     adapter = _adapter(
         "sms",
         "msg91",
-        {"auth_key": "msg91-auth-0000001", "flow_id": "64f0abc123", "sender_id": "CAFEWF"},
+        {
+            "auth_key": "msg91-auth-0000001",
+            "flow_id": "64f0abc123",
+            "sender_id": "CAFEWF",
+        },
         recorder,
     )
     assert (await adapter.send_otp(MESSAGE)).message_id == "5762846b4f8d285d378b4567"
@@ -822,7 +834,10 @@ async def test_kaleyra() -> None:
         recorder,
     )
     assert (await adapter.send_otp(MESSAGE)).message_id == "kl-1"
-    assert str(recorder.last.url) == f"https://{KALEYRA_DOMAINS['in']}/v1/HXIN1234/messages"
+    assert (
+        str(recorder.last.url)
+        == f"https://{KALEYRA_DOMAINS['in']}/v1/HXIN1234/messages"
+    )
     assert recorder.last.headers["api-key"] == "kaleyra-key-000001"
     form = _form(recorder.last)
     assert form["type"] == "OTP" and form["to"] == PHONE
@@ -849,7 +864,11 @@ async def test_fast2sms() -> None:
     adapter = _adapter(
         "sms",
         "fast2sms",
-        {"api_key": "f2s-key-0000000001", "sender_id": "FSTSMS", "message_id": "111111"},
+        {
+            "api_key": "f2s-key-0000000001",
+            "sender_id": "FSTSMS",
+            "message_id": "111111",
+        },
         recorder,
     )
     assert (await adapter.send_otp(MESSAGE)).message_id == "lwdtp7cjyqxvfe9"

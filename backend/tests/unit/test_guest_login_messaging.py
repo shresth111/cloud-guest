@@ -195,7 +195,11 @@ class Vendor:
         out = []
         for r in self.requests:
             if r.method == "POST" and "graph.facebook.com" in str(r.url):
-                out.append(json.loads(r.content)["template"]["components"][0]["parameters"][0]["text"])  # noqa: E501
+                out.append(
+                    json.loads(r.content)["template"]["components"][0]["parameters"][0][
+                        "text"
+                    ]
+                )  # noqa: E501
         return out
 
 
@@ -216,19 +220,24 @@ def _world(*, allowed: set[uuid.UUID] | None = None):
         audit_writer=audit,
         byo_entitlement_check=entitled,
         adapter_context=AdapterContext(
-            transport=httpx.MockTransport(vendor), resolver=lambda h, p: ["93.184.216.34"]
+            transport=httpx.MockTransport(vendor),
+            resolver=lambda h, p: ["93.184.216.34"],
         ),
         now=lambda: NOW,
         code_factory=lambda: "246810",
     )
-    return SimpleNamespace(repo=repo, redis=redis, audit=audit, vendor=vendor, service=service)
+    return SimpleNamespace(
+        repo=repo, redis=redis, audit=audit, vendor=vendor, service=service
+    )
 
 
 VENUE = Actor(VENUE_ADMIN, via_platform=False)
 MASTER = Actor(WYFY_STAFF, via_platform=True)
 
 
-async def _connect_and_verify(w, org=ORG_A, actor=VENUE, channel="whatsapp", config=META):  # noqa: ANN001, E501
+async def _connect_and_verify(
+    w, org=ORG_A, actor=VENUE, channel="whatsapp", config=META
+):  # noqa: ANN001, E501
     provider_type = "meta_cloud" if channel == "whatsapp" else "ping4sms"
     await w.service.put_provider(
         org, channel, actor, provider_type=provider_type, config=config, enabled=None
@@ -255,7 +264,12 @@ class TestResolution:
     async def test_unverified_row_is_not_used(self) -> None:
         w = _world()
         await w.service.put_provider(
-            ORG_A, "whatsapp", VENUE, provider_type="meta_cloud", config=META, enabled=None
+            ORG_A,
+            "whatsapp",
+            VENUE,
+            provider_type="meta_cloud",
+            config=META,
+            enabled=None,
         )
         assert (
             await w.service.resolve_sender(
@@ -478,7 +492,12 @@ class TestSecretMasking:
     async def test_no_view_contains_the_secret_or_ciphertext(self) -> None:
         w = _world()
         view, created = await w.service.put_provider(
-            ORG_A, "whatsapp", VENUE, provider_type="meta_cloud", config=META, enabled=None
+            ORG_A,
+            "whatsapp",
+            VENUE,
+            provider_type="meta_cloud",
+            config=META,
+            enabled=None,
         )
         assert created
         row = w.repo.rows[(ORG_A, "whatsapp")]
@@ -519,7 +538,12 @@ class TestSecretMasking:
         w = _world()
         with pytest.raises(ProviderConfigInvalidError):
             await w.service.put_provider(
-                ORG_A, "whatsapp", VENUE, provider_type="meta_cloud", config=META, enabled=True
+                ORG_A,
+                "whatsapp",
+                VENUE,
+                provider_type="meta_cloud",
+                config=META,
+                enabled=True,
             )
 
 
@@ -532,7 +556,12 @@ class TestVerify:
     async def test_wrong_code_then_right_code(self) -> None:
         w = _world()
         await w.service.put_provider(
-            ORG_A, "whatsapp", VENUE, provider_type="meta_cloud", config=META, enabled=None
+            ORG_A,
+            "whatsapp",
+            VENUE,
+            provider_type="meta_cloud",
+            config=META,
+            enabled=None,
         )
         started = await w.service.start_verification(
             ORG_A, "whatsapp", VENUE, to="+91 98765 43210"
@@ -540,8 +569,12 @@ class TestVerify:
         assert started["sent_to"].endswith("3210") and "98765" not in started["sent_to"]
         assert json.loads(w.vendor.requests[-1].content)["to"] == "919876543210"
         with pytest.raises(VerificationCodeInvalidError):
-            await w.service.confirm_verification(ORG_A, "whatsapp", VENUE, code="111111")
-        view = await w.service.confirm_verification(ORG_A, "whatsapp", VENUE, code="246810")
+            await w.service.confirm_verification(
+                ORG_A, "whatsapp", VENUE, code="111111"
+            )
+        view = await w.service.confirm_verification(
+            ORG_A, "whatsapp", VENUE, code="246810"
+        )
         assert view["status"] == "verified" and view["enabled"] is True
         assert view["effective"] is True
         assert view["set_up_by"] == "venue"
@@ -549,7 +582,12 @@ class TestVerify:
     async def test_changing_settings_after_sending_voids_the_code(self) -> None:
         w = _world()
         await w.service.put_provider(
-            ORG_A, "whatsapp", VENUE, provider_type="meta_cloud", config=META, enabled=None
+            ORG_A,
+            "whatsapp",
+            VENUE,
+            provider_type="meta_cloud",
+            config=META,
+            enabled=None,
         )
         await w.service.start_verification(ORG_A, "whatsapp", VENUE, to="+919876543210")
         await w.service.put_provider(
@@ -561,12 +599,19 @@ class TestVerify:
             enabled=None,
         )
         with pytest.raises(VerificationNotStartedError):
-            await w.service.confirm_verification(ORG_A, "whatsapp", VENUE, code="246810")
+            await w.service.confirm_verification(
+                ORG_A, "whatsapp", VENUE, code="246810"
+            )
 
     async def test_vendor_refusal_marks_failed_and_scrubs_the_error(self) -> None:
         w = _world()
         await w.service.put_provider(
-            ORG_A, "whatsapp", VENUE, provider_type="meta_cloud", config=META, enabled=None
+            ORG_A,
+            "whatsapp",
+            VENUE,
+            provider_type="meta_cloud",
+            config=META,
+            enabled=None,
         )
         w.vendor.fail = 400
         with pytest.raises(ProviderSendFailedError) as caught:
@@ -580,7 +625,12 @@ class TestVerify:
         w = _world(allowed=set())
         with pytest.raises(ByoNotAllowedError):
             await w.service.put_provider(
-                ORG_A, "whatsapp", VENUE, provider_type="meta_cloud", config=META, enabled=None
+                ORG_A,
+                "whatsapp",
+                VENUE,
+                provider_type="meta_cloud",
+                config=META,
+                enabled=None,
             )
 
 
@@ -596,10 +646,15 @@ class TestMaster:
         assert view["configured_by_platform"] is True
         assert view["set_up_by"] == "wyfy_team"
         assert view["updated_by"]["name"] == "Staff Member"
-        venue_view = (await w.service.overview(ORG_A, for_platform=False))["channels"][0]
+        venue_view = (await w.service.overview(ORG_A, for_platform=False))["channels"][
+            0
+        ]
         assert venue_view["own"]["set_up_by"] == "wyfy_team"
         # The venue sees the team, never the staff member.
-        assert venue_view["own"]["updated_by"] == {"id": None, "name": "Wyfy Guest team"}
+        assert venue_view["own"]["updated_by"] == {
+            "id": None,
+            "name": "Wyfy Guest team",
+        }
         audits = [e for e in w.audit.entries if e["organization_id"] == ORG_A]
         assert audits and all(e["actor_user_id"] == WYFY_STAFF for e in audits)
         assert all(e["event_metadata"]["via"] == "master_console" for e in audits)
@@ -682,10 +737,14 @@ class TestRouteTenancy:
         assert len(venue) == 5
         for route in venue:
             assert "{organization_id}" not in route.path
-            assert "organization_id" not in [p.name for p in route.dependant.path_params]
+            assert "organization_id" not in [
+                p.name for p in route.dependant.path_params
+            ]
             calls = [d.call for d in route.dependant.dependencies]
             assert RequireOrganization in calls, route.path
-            assert _closure_values(route, ScopeType) == [ScopeType.ORGANIZATION], route.path
+            assert _closure_values(route, ScopeType) == [
+                ScopeType.ORGANIZATION
+            ], route.path
 
     def test_master_routes_take_the_org_from_the_path_and_pin_global(self) -> None:
         master = [r for r in _routes() if r.path.startswith("/api/v1/platform")]
@@ -765,7 +824,9 @@ class _HttpWorld:
         )
         app.dependency_overrides[get_access_validator] = _Validator
         app.dependency_overrides[RequireOrganization] = lambda: ORG_A
-        app.dependency_overrides[get_login_messaging_service] = lambda: self.world.service
+        app.dependency_overrides[get_login_messaging_service] = (
+            lambda: self.world.service
+        )
         self.app = app
 
     async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -803,7 +864,11 @@ class TestHttpCrossTenant:
         base = f"/api/v1/platform/organizations/{ORG_B}/guest-messaging/providers"
         for method, path, body in (
             ("GET", base, None),
-            ("PUT", f"{base}/whatsapp", {"provider_type": "meta_cloud", "config": META}),
+            (
+                "PUT",
+                f"{base}/whatsapp",
+                {"provider_type": "meta_cloud", "config": META},
+            ),
             ("DELETE", f"{base}/whatsapp", None),
             ("POST", f"{base}/whatsapp/verify", {"to": "+919876543210"}),
         ):
@@ -836,7 +901,9 @@ class TestHttpCrossTenant:
 
         own = GrantScope(scope_type=ScopeType.ORGANIZATION, organization_id=ORG_A)
         http = _HttpWorld(
-            _grants(("marketing_providers.manage", own), ("marketing_providers.read", own))
+            _grants(
+                ("marketing_providers.manage", own), ("marketing_providers.read", own)
+            )
         )
         response = await http.request(
             "PUT",
