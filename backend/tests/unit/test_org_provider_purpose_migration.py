@@ -68,7 +68,9 @@ class TestOffline:
     def test_chains_on_mains_head(self) -> None:
         module = _load(FILE)
         assert module.revision == "0167_org_provider_purpose"
-        assert module.down_revision == "0166_add_review_prompt_columns_to_guest_sessions"
+        assert module.down_revision == (
+            "0166_add_review_prompt_columns_to_guest_sessions"
+        )
         assert len(module.revision) <= 32
 
     def test_is_the_only_head(self) -> None:
@@ -100,9 +102,8 @@ class TestOffline:
         )  # fmt: skip
         assert purpose.nullable is False
         assert purpose.server_default.arg == "marketing"
-        assert ("drop_index", ("uq_omp_org_channel",), {"table_name": module.TABLE}) in [
-            (n, a, k) for n, a, k in op.calls
-        ]
+        drop = ("drop_index", ("uq_omp_org_channel",), {"table_name": module.TABLE})
+        assert drop in op.calls
         created = [a for n, a, k in op.calls if n == "create_index"]
         assert created == [
             ("uq_omp_org_purpose_channel", module.TABLE, ["organization_id", "purpose", "channel"])  # noqa: E501
@@ -111,7 +112,11 @@ class TestOffline:
             i for i in OrgMarketingProvider.__table__.indexes
             if i.name == "uq_omp_org_purpose_channel"
         )  # fmt: skip
-        assert [c.name for c in index.columns] == ["organization_id", "purpose", "channel"]
+        assert [c.name for c in index.columns] == [
+            "organization_id",
+            "purpose",
+            "channel",
+        ]
 
     def test_downgrade_reverses_and_refuses_with_otp_rows(self, monkeypatch) -> None:
         module = _load(FILE)
@@ -138,9 +143,10 @@ _PG_URL = os.environ.get("CLOUDGUEST_TEST_POSTGRES_URL")
 @pytest.mark.skipif(not _PG_URL, reason="CLOUDGUEST_TEST_POSTGRES_URL not set")
 def test_upgrade_and_downgrade_on_postgres() -> None:
     import sqlalchemy as sa
+    from sqlalchemy.exc import IntegrityError
+
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
-    from sqlalchemy.exc import IntegrityError
 
     sync_url = _PG_URL.replace("+asyncpg", "+psycopg2") if _PG_URL else ""
     try:
@@ -184,10 +190,9 @@ def test_upgrade_and_downgrade_on_postgres() -> None:
             assert purpose == "marketing"  # backfilled
             otp = sa.text(insert.text.format(cols=", purpose", vals=", 'otp'"))
             conn.execute(otp, {"o": org})  # same channel, other purpose: allowed
-        with pytest.raises(IntegrityError):
-            with engine.begin() as conn:
-                conn.execute(sa.text(f"SET search_path TO {schema}"))
-                conn.execute(otp, {"o": org})
+        with pytest.raises(IntegrityError), engine.begin() as conn:
+            conn.execute(sa.text(f"SET search_path TO {schema}"))
+            conn.execute(otp, {"o": org})
         with engine.begin() as conn:
             conn.execute(sa.text(f"SET search_path TO {schema}"))
             m0167.op = Operations(MigrationContext.configure(conn))
