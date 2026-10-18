@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import csv
 import io
+import ipaddress
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
@@ -92,6 +94,42 @@ def _csv_safe(value: Any) -> str:
     return text
 
 
+# Platform plumbing never reaches a customer (owner rule: no WireGuard/tunnel
+# internals on the customer dashboard). Router tunnel addresses (10.20.0.0/24)
+# and the platform's VPC (172.31.0.0/16) are replaced, and so are WireGuard
+# interface names, wherever they appear in a log row.
+_INTERNAL_NETS = (
+    ipaddress.ip_network("10.20.0.0/24"),
+    ipaddress.ip_network("172.31.0.0/16"),
+)
+_IPV4_IN_TEXT = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_WG_IN_TEXT = re.compile(r"\b(?:wg[\w-]*|wireguard[\w-]*)\b", re.IGNORECASE)
+INTERNAL_PLACEHOLDER = "[platform]"
+
+
+def _is_internal(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _INTERNAL_NETS)
+
+
+def redact_internal(text: str | None) -> str | None:
+    """Hide tunnel/VPC addresses and WireGuard interface names in free text."""
+    if not text:
+        return text
+    text = _IPV4_IN_TEXT.sub(
+        lambda m: INTERNAL_PLACEHOLDER if _is_internal(m.group(0)) else m.group(0),
+        text,
+    )
+    return _WG_IN_TEXT.sub(INTERNAL_PLACEHOLDER, text)
+
+
+def _ip_for_customer(ip: str | None) -> str | None:
+    return INTERNAL_PLACEHOLDER if ip and _is_internal(ip) else ip
+
+
 def event_view(row: dict[str, Any]) -> dict[str, Any]:
     e = row["event"]
     category = e.category or LogCategory.OTHER.value
@@ -103,12 +141,12 @@ def event_view(row: dict[str, Any]) -> dict[str, Any]:
         "location_name": row.get("location_name"),
         "router_id": _id(e.router_id),
         "router_name": row.get("router_name"),
-        "hostname": e.hostname,
+        "hostname": redact_internal(e.hostname),
         "source": e.source,
         "category": category,
         "protocol": e.protocol,
-        "src_ip": e.src_ip,
-        "dst_ip": e.dst_ip,
+        "src_ip": _ip_for_customer(e.src_ip),
+        "dst_ip": _ip_for_customer(e.dst_ip),
         "status": e.status,
         "device_mac": e.device_mac,
         "severity": e.severity,
@@ -116,7 +154,7 @@ def event_view(row: dict[str, Any]) -> dict[str, Any]:
         if e.severity is not None
         else None,
         "summary": summary_for(category, e.status),
-        "message": e.message,
+        "message": redact_internal(e.message),
     }
 
 

@@ -1361,3 +1361,41 @@ class TestRealPostgres:
                 await session.rollback()
         finally:
             await engine.dispose()
+
+
+class TestCustomerRedaction:
+    def test_tunnel_and_vpc_addresses_and_wg_names_are_hidden(self) -> None:
+        from app.domains.device_logs.customer_service import (
+            INTERNAL_PLACEHOLDER,
+            redact_internal,
+        )
+
+        out = redact_internal(
+            "input: in:wg0 out:(unknown 0), proto UDP, "
+            "10.20.0.31:514->172.31.38.118:5514, guest 192.168.88.10"
+        )
+        assert "10.20.0.31" not in out
+        assert "172.31.38.118" not in out
+        assert "wg0" not in out
+        assert INTERNAL_PLACEHOLDER in out
+        assert "192.168.88.10" in out
+
+    def test_event_view_redacts_ips_hostname_and_message(self) -> None:
+        from types import SimpleNamespace
+
+        from app.domains.device_logs.customer_service import (
+            INTERNAL_PLACEHOLDER,
+            event_view,
+        )
+
+        e = SimpleNamespace(
+            id=1, received_at=None, device_time=None, location_id=None,
+            router_id=None, hostname="wg-hub", source="syslog", category="firewall",
+            protocol="UDP", src_ip="10.20.0.5", dst_ip="8.8.8.8", status="blocked",
+            device_mac=None, severity=6, message="drop from 10.20.0.5 via wg0",
+        )
+        v = event_view({"event": e})
+        assert v["src_ip"] == INTERNAL_PLACEHOLDER
+        assert v["dst_ip"] == "8.8.8.8"
+        assert "wg" not in (v["hostname"] or "").lower()
+        assert "10.20.0.5" not in v["message"] and "wg0" not in v["message"]
