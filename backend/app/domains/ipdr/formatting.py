@@ -17,9 +17,14 @@ from typing import Any
 
 from .constants import (
     ALLOCATION_DYNAMIC,
+    DEVICE_USER,
     IST,
+    SOURCE_SESSION,
     TRANSLATION_NONE,
     UNKNOWN_USER,
+    USER_CLASS_DEVICE,
+    USER_CLASS_GUEST,
+    USER_CLASS_UNKNOWN,
 )
 
 _PROTOCOLS = {1: "ICMP", 6: "TCP", 17: "UDP", 58: "ICMPv6"}
@@ -141,16 +146,51 @@ def _port(value: Any) -> str:
     return "" if value is None else str(int(value))
 
 
+def user_class(record: dict[str, Any]) -> str:
+    """``guest`` / ``device`` / ``unknown``. Day files built before the
+    field existed have only ``user_known``."""
+    if record.get("user_class"):
+        return str(record["user_class"])
+    return USER_CLASS_GUEST if record.get("user_known") else USER_CLASS_UNKNOWN
+
+
+def _user_id(record: dict[str, Any]) -> str:
+    if record.get("user_known"):
+        return record.get("user_id") or UNKNOWN_USER
+    return DEVICE_USER if user_class(record) == USER_CLASS_DEVICE else UNKNOWN_USER
+
+
+def _alloc_source(record: dict[str, Any]) -> str | None:
+    """Where columns 15-17 came from. Old day files: the session, if any."""
+    if record.get("alloc_source"):
+        return str(record["alloc_source"])
+    if record.get("user_known") and record.get("alloc_start"):
+        return SOURCE_SESSION
+    return None
+
+
+def _mac_source(record: dict[str, Any]) -> str | None:
+    if record.get("mac_source"):
+        return str(record["mac_source"])
+    if record.get("mac") and record.get("user_known"):
+        return SOURCE_SESSION
+    return None
+
+
 def csv_cells(record: dict[str, Any], *, provenance: bool = False) -> list[str]:
-    """The 18 standard IPDR cells, unmasked, in ``IPDR_COLUMNS`` order."""
+    """The 18 standard IPDR cells, unmasked, in ``IPDR_COLUMNS`` order.
+    Allocation start/end and online time come from the session, or without
+    one from the router's DHCP log; ``IP Allocation Source`` (provenance)
+    says which."""
     known = bool(record.get("user_known"))
+    allocated = _alloc_source(record) is not None
     cells = [
         ist_minute(record.get("ts")),
         record.get("name") or "",
         record.get("phone") or "",
         record.get("alt_phone") or "",
         record.get("email") or "",
-        record.get("user_id") or UNKNOWN_USER,
+        _user_id(record),
         record.get("src_ip") or "",
         _port(record.get("src_port")),
         record.get("nat_ip") or "",
@@ -159,15 +199,18 @@ def csv_cells(record: dict[str, Any], *, provenance: bool = False) -> list[str]:
         record.get("dst_ip") or "",
         _port(record.get("dst_port")),
         protocol_label(record.get("protocol")),
-        ist_minute(record.get("alloc_start")) if known else "",
-        ist_minute(record.get("alloc_end")) if known else "",
-        online_time(record.get("online_seconds")) if known else "",
+        ist_minute(record.get("alloc_start")) if allocated else "",
+        ist_minute(record.get("alloc_end")) if allocated else "",
+        online_time(record.get("online_seconds")) if allocated else "",
         record.get("mac") or "",
     ]
     if provenance:
         cells += [
             record.get("nat_source") or TRANSLATION_NONE,
             "matched" if known else "no session",
+            _mac_source(record) or "",
+            _alloc_source(record) or "",
+            record.get("device_kind") or user_class(record),
         ]
     return [csv_safe(c) for c in cells]
 
@@ -183,7 +226,7 @@ def list_item(record: dict[str, Any]) -> dict[str, Any]:
         "contact_no": mask_phone(record.get("phone")),
         "alternate_contact_no": mask_phone(record.get("alt_phone")),
         "email": mask_email(record.get("email")),
-        "user_id": (mask_identifier(record.get("user_id")) if known else UNKNOWN_USER),
+        "user_id": (mask_identifier(record.get("user_id")) if known else cells[5]),
         "source_ip": cells[6],
         "source_port": cells[7],
         "translated_ip": cells[8],
@@ -202,5 +245,10 @@ def list_item(record: dict[str, Any]) -> dict[str, Any]:
         "translated_source": record.get("nat_source") or TRANSLATION_NONE,
         "ts_source": record.get("ts_source"),
         "user_known": known,
+        "user_class": user_class(record),
+        "device_kind": record.get("device_kind"),
+        "mac_source": _mac_source(record),
+        "allocation_source": _alloc_source(record),
         "ports_merged": bool(record.get("ports_merged")),
+        "nat_event_only": bool(record.get("nat_event_only")),
     }

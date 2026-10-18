@@ -14,15 +14,32 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domains.connected_devices.models import ConnectedDevice
+from app.domains.device_logs.guest_events import GuestEventKind
+from app.domains.device_logs.models import GuestDeviceEvent
+from app.domains.dhcp.models import DhcpPool
 from app.domains.guest.models import Guest, GuestDevice, GuestSession
 from app.domains.location.models import Location
+from app.domains.mac_authorization.constants import MacAuthorizationType
+from app.domains.mac_authorization.models import MacAuthorizationEntry
+from app.domains.monitored_hardware.models import MonitoredHardware
 from app.domains.router.models import Router
 from app.domains.traffic_flow.flow_record_models import (
     TrafficFlowRecord,
     TrafficFlowRecordCap,
 )
 
-from .join import DOWNLOAD, UPLOAD, FlowInput, SessionInput
+from .constants import LEASE_LOOKAHEAD, LEASE_LOOKBACK
+from .formatting import normalize_ip, normalize_mac
+from .join import (
+    DOWNLOAD,
+    UPLOAD,
+    FlowInput,
+    Infrastructure,
+    InventorySighting,
+    LeaseEvent,
+    SessionInput,
+)
 from .models import IpdrDayFile, IpdrDaySubject
 
 #: A window that starts this much before the day can still hold a flow whose
@@ -56,6 +73,10 @@ def _day_file(row: Any) -> DayFileRow:
         row_count=row.row_count,
         records_incomplete=row.records_incomplete,
     )
+
+
+def _macs(values: Iterable[str | None]) -> frozenset[str]:
+    return frozenset(m for m in (normalize_mac(v) for v in values) if m)
 
 
 class IpdrRepository:
@@ -130,6 +151,7 @@ class IpdrRepository:
             r.bytes,
             r.packets,
             r.ports_merged,
+            r.nat_event,
         ).where(
             r.location_id == location_id,
             r.window_start >= start - _WINDOW_SLACK,
@@ -155,6 +177,7 @@ class IpdrRepository:
                 bytes=row.bytes or 0,
                 packets=row.packets,
                 ports_merged=bool(row.ports_merged),
+                nat_event=row.nat_event,
             )
             for row in (await self.session.execute(statement)).all()
         ]
@@ -225,6 +248,114 @@ class IpdrRepository:
             select(Router.id, Router.public_ip_address).where(Router.id.in_(ids))
         )
         return {row[0]: row[1] for row in rows.all()}
+
+    async def lease_events(
+        self, router_ids: Iterable[uuid.UUID], start: datetime, end: datetime
+    ) -> list[LeaseEvent]:
+        """The routers' DHCP assign/release lines around ``[start, end)``,
+        for the MAC and allocation of an address that has no session."""
+        ids = list(router_ids)
+        if not ids:
+            return []
+        e = GuestDeviceEvent
+        kinds = (GuestEventKind.IP_ASSIGNED.value, GuestEventKind.IP_RELEASED.value)
+        statement = select(
+            e.router_id, e.ip_address, e.mac_address, e.kind, e.occurred_at
+        ).where(
+            e.router_id.in_(ids),
+            e.kind.in_(kinds),
+            e.occurred_at >= start - LEASE_LOOKBACK,
+            e.occurred_at < end + LEASE_LOOKAHEAD,
+        )
+        return [
+            LeaseEvent(
+                router_id=row.router_id,
+                ip_address=row.ip_address,
+                mac_address=row.mac_address,
+                assigned=row.kind == GuestEventKind.IP_ASSIGNED.value,
+                at=row.occurred_at,
+            )
+            for row in (await self.session.execute(statement)).all()
+        ]
+
+    async def inventory_sightings(
+        self, router_ids: Iterable[uuid.UUID]
+    ) -> list[InventorySighting]:
+        """The device inventory's current address per MAC on these routers
+        (a snapshot: used only while its sighting covers the instant)."""
+        ids = list(router_ids)
+        if not ids:
+            return []
+        d = ConnectedDevice
+        statement = select(
+            d.router_id,
+            d.ip_address,
+            d.mac_address,
+            d.connected_at,
+            d.last_seen_at,
+            d.is_active,
+        ).where(
+            d.router_id.in_(ids),
+            d.ip_address.is_not(None),
+            d.is_deleted.is_(False),
+        )
+        return [
+            InventorySighting(
+                router_id=row.router_id,
+                ip_address=row.ip_address,
+                mac_address=row.mac_address,
+                since=row.connected_at,
+                until=None if row.is_active else row.last_seen_at,
+            )
+            for row in (await self.session.execute(statement)).all()
+        ]
+
+    async def infrastructure(
+        self,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        router_ids: Iterable[uuid.UUID],
+    ) -> Infrastructure:
+        """What marks an address as not a guest's: the routers' own LAN
+        addresses, the location's monitored hardware, and authorised-MAC
+        bypass entries of the organisation (org-wide or this location)."""
+        ids = list(router_ids)
+        gateways: dict[uuid.UUID, set[str]] = {}
+        if ids:
+            rows = await self.session.execute(
+                select(DhcpPool.router_id, DhcpPool.gateway_ip_address).where(
+                    DhcpPool.router_id.in_(ids),
+                    DhcpPool.gateway_ip_address.is_not(None),
+                    DhcpPool.is_deleted.is_(False),
+                )
+            )
+            for router_id, address in rows.all():
+                ip = normalize_ip(address)
+                if ip is not None:
+                    gateways.setdefault(router_id, set()).add(ip)
+        monitored = await self.session.execute(
+            select(MonitoredHardware.mac_address).where(
+                MonitoredHardware.location_id == location_id,
+                MonitoredHardware.is_deleted.is_(False),
+            )
+        )
+        m = MacAuthorizationEntry
+        authorized = await self.session.execute(
+            select(m.mac_address).where(
+                m.organization_id == organization_id,
+                or_(m.location_id.is_(None), m.location_id == location_id),
+                # Permanent only: a temporary entry is often a guest's own
+                # device let through for a while, not infrastructure.
+                m.authorization_type == MacAuthorizationType.PERMANENT.value,
+                m.is_enabled.is_(True),
+                m.is_deleted.is_(False),
+            )
+        )
+        return Infrastructure(
+            router_addresses={k: frozenset(v) for k, v in gateways.items()},
+            monitored_macs=_macs(monitored.scalars().all()),
+            authorized_macs=_macs(authorized.scalars().all()),
+        )
 
     async def records_incomplete(
         self, location_id: uuid.UUID, start: datetime, end: datetime

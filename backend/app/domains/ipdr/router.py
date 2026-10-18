@@ -124,6 +124,7 @@ def _query(
     mac: str | None = Query(default=None, max_length=32),
     ip: str | None = Query(default=None, max_length=64),
     dst_ip: str | None = Query(default=None, max_length=64),
+    guests_only: bool = Query(default=False),
 ) -> dict[str, Any]:
     return {
         "since": since,
@@ -135,6 +136,7 @@ def _query(
         "mac": mac,
         "ip": ip,
         "dst_ip": dst_ip,
+        "guests_only": guests_only,
     }
 
 
@@ -246,8 +248,10 @@ async def export_csv(
     """The IPDR in the standard 18 columns (CERT-In IPDR format minus
     Address), unmasked, newest first, at most 1,000,000 rows (a final
     ``# truncated`` line says when the cap was hit). ``include_provenance``
-    appends "Translated Address Source" and "User Match". Audited before
-    the first byte."""
+    appends "Translated Address Source", "User Match", "MAC Source", "IP
+    Allocation Source" and "Device Class". ``guests_only`` keeps only rows
+    matched to a guest session (default: every row). Audited before the
+    first byte."""
     filters = await service.build_filters(organization_id=organization_id, **query)
     actor = uuid.UUID(str(user.id))
     await write_audit(

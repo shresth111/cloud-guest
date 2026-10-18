@@ -58,6 +58,10 @@ from app.domains.ipdr.formatting import (
 )
 from app.domains.ipdr.join import (
     FlowInput,
+    Infrastructure,
+    InventorySighting,
+    LeaseEvent,
+    LeaseIndex,
     SessionInput,
     build_records,
     fold_connections,
@@ -98,6 +102,7 @@ def flow(
     nat_port: int | None = None,
     timed: bool = True,
     nbytes: int = 100,
+    nat_event: int | None = None,
 ) -> FlowInput:
     window = at.replace(minute=at.minute - at.minute % 5, second=0)
     return FlowInput(
@@ -113,8 +118,9 @@ def flow(
         protocol=proto,
         nat_src_address=nat,
         nat_src_port=nat_port,
-        bytes=nbytes,
-        packets=1,
+        bytes=0 if nat_event is not None else nbytes,
+        packets=0 if nat_event is not None else 1,
+        nat_event=nat_event,
     )
 
 
@@ -243,6 +249,9 @@ class TestCsvRow:
         assert csv_cells(record, provenance=True)[18:] == [
             TRANSLATION_DERIVED,
             "matched",
+            "session",
+            "session",
+            "guest",
         ]
 
     def test_list_item_masks_phone_and_email_only(self) -> None:
@@ -404,6 +413,238 @@ class TestTranslation:
         }
 
 
+class TestNatEvents:
+    """IPFIX NAT events (template 1025 on the fleet) next to traffic records."""
+
+    def _event(self, at, kind, *, nat_port=40001, **kw):
+        return flow(at, nat="203.0.113.99", nat_port=nat_port, nat_event=kind, **kw)
+
+    def test_create_and_delete_bracket_the_traffic_into_one_row(self) -> None:
+        at = ist(2026, 10, 17, 10)
+        flows = [
+            self._event(at, 4),
+            flow(at + timedelta(seconds=1), end=at + timedelta(seconds=30)),
+            # 90 s after the last packet: beyond the stitch gap, but the
+            # delete still closes this conntrack entry.
+            self._event(at + timedelta(seconds=120), 5),
+        ]
+        (record,) = build(flows, [])
+        assert record["ts"] == at.isoformat(timespec="microseconds")
+        assert record["ts_end"] == (at + timedelta(seconds=120)).isoformat(
+            timespec="microseconds"
+        )
+        assert (record["nat_ip"], record["nat_port"]) == ("203.0.113.99", 40001)
+        assert record["nat_source"] == TRANSLATION_NAT_EVENT
+        assert record["bytes"] == 100 and record["nat_event_only"] is False
+
+    def test_event_beats_a_traffic_records_own_post_nat(self) -> None:
+        at = ist(2026, 10, 17, 10)
+        flows = [
+            flow(at, nat="203.0.113.50", nat_port=1111),
+            self._event(at + timedelta(seconds=2), 0),
+        ]
+        (record,) = build(flows, [])
+        assert (record["nat_ip"], record["nat_port"]) == ("203.0.113.99", 40001)
+
+    def test_untyped_events_alternate_create_and_delete(self) -> None:
+        at = ist(2026, 10, 17, 10)
+        flows = [
+            self._event(at, 0),
+            self._event(at + timedelta(minutes=2), 0),
+            self._event(at + timedelta(minutes=5), 0, nat_port=40002),
+        ]
+        records = sorted(build(flows, []), key=lambda r: r["ts"])
+        assert len(records) == 2
+        assert records[0]["ts_end"] == (at + timedelta(minutes=2)).isoformat(
+            timespec="microseconds"
+        )
+        assert records[1]["nat_port"] == 40002
+
+    def test_events_without_traffic_are_still_a_row(self) -> None:
+        """FastTrack bypasses traffic-flow, not conntrack: the IPDR keeps it."""
+        at = ist(2026, 10, 17, 10)
+        (record,) = build([self._event(at, 4)], [])
+        assert record["nat_event_only"] is True
+        assert record["src_port"] == 51515 and record["nat_port"] == 40001
+        assert list_item(record)["nat_event_only"] is True
+
+    def test_a_dst_nat_event_is_not_a_guest_connection(self) -> None:
+        at = ist(2026, 10, 17, 10)
+        event = self._event(
+            at, 4, src="198.51.100.7", dst="192.168.88.24", direction="download"
+        )
+        assert fold_connections([event]) == []
+
+
+MAC_A = "02:00:00:00:00:a1"
+MAC_B = "02:00:00:00:00:b2"
+
+
+def lease(at, *, mac=MAC_A, assigned=True, ip="192.168.88.24", router=R_A):
+    return LeaseEvent(
+        router_id=router, ip_address=ip, mac_address=mac, assigned=assigned, at=at
+    )
+
+
+class TestNoSessionFallbacks:
+    def test_dhcp_lease_fills_mac_and_allocation(self) -> None:
+        leases = LeaseIndex(
+            [
+                lease(ist(2026, 10, 17, 9)),
+                lease(ist(2026, 10, 17, 11), assigned=False),
+            ]
+        )
+        (record,) = build([flow(ist(2026, 10, 17, 10))], [], leases=leases)
+        cells = dict(zip(IPDR_COLUMNS, csv_cells(record), strict=True))
+        assert cells["User ID for Internet Access"] == UNKNOWN_USER
+        assert cells["Source MAC Address/IMEI/Device ID"] == "02:00:00:00:00:A1"
+        assert cells["IST Start Time & Date of IP Allocation"] == "17-10-2026 09:00"
+        assert cells["IST End Time & Date of IP Allocation"] == "17-10-2026 11:00"
+        assert cells["Total Online Time"] == "2h 0m 0s"
+        assert csv_cells(record, provenance=True)[18:] == [
+            TRANSLATION_DERIVED,
+            "no session",
+            "dhcp",
+            "dhcp",
+            "unknown",
+        ]
+
+    def test_a_lease_handed_to_another_mac_ends_the_first(self) -> None:
+        leases = LeaseIndex(
+            [lease(ist(2026, 10, 17, 9)), lease(ist(2026, 10, 17, 12), mac=MAC_B)]
+        )
+        early, late = sorted(
+            build(
+                [flow(ist(2026, 10, 17, 10)), flow(ist(2026, 10, 17, 13))],
+                [],
+                leases=leases,
+            ),
+            key=lambda r: r["ts"],
+        )
+        assert early["mac"] == "02:00:00:00:00:A1"
+        assert early["alloc_end"] == ist(2026, 10, 17, 12).isoformat(
+            timespec="microseconds"
+        )
+        assert late["mac"] == "02:00:00:00:00:B2" and late["alloc_end"] is None
+
+    def test_released_address_has_no_lease(self) -> None:
+        leases = LeaseIndex(
+            [
+                lease(ist(2026, 10, 17, 9)),
+                lease(ist(2026, 10, 17, 9, 30), assigned=False),
+            ]
+        )
+        (record,) = build([flow(ist(2026, 10, 17, 10))], [], leases=leases)
+        assert record["mac"] is None and record["alloc_start"] is None
+
+    def test_session_mac_wins_and_a_missing_one_falls_back(self) -> None:
+        leases = LeaseIndex([lease(ist(2026, 10, 17, 8))])
+        with_mac = session(ist(2026, 10, 17, 9), None)
+        (record,) = build([flow(ist(2026, 10, 17, 10))], [with_mac], leases=leases)
+        assert record["mac"] == "02:00:00:00:00:11"
+        assert record["mac_source"] == "session"
+        no_mac = session(ist(2026, 10, 17, 9), None, mac=None)
+        (record,) = build([flow(ist(2026, 10, 17, 10))], [no_mac], leases=leases)
+        assert (record["mac"], record["mac_source"]) == ("02:00:00:00:00:A1", "dhcp")
+        # The allocation stays the session's.
+        assert record["alloc_source"] == "session"
+
+    def test_inventory_gives_the_mac_only_while_its_sighting_covers(self) -> None:
+        sighting = InventorySighting(
+            router_id=R_A,
+            ip_address="192.168.88.24",
+            mac_address=MAC_B,
+            since=ist(2026, 10, 17, 9),
+            until=ist(2026, 10, 17, 11),
+        )
+        leases = LeaseIndex([], [sighting])
+        inside, outside = sorted(
+            build(
+                [flow(ist(2026, 10, 17, 10)), flow(ist(2026, 10, 17, 12))],
+                [],
+                leases=leases,
+            ),
+            key=lambda r: r["ts"],
+        )
+        assert (inside["mac"], inside["mac_source"]) == (
+            "02:00:00:00:00:B2",
+            "inventory",
+        )
+        assert inside["alloc_start"] is None and inside["alloc_source"] is None
+        assert outside["mac"] is None
+
+
+class TestDevices:
+    def test_router_address_is_a_device(self) -> None:
+        infra = Infrastructure(router_addresses={R_A: frozenset({"192.168.88.1"})})
+        (record,) = build(
+            [flow(ist(2026, 10, 17, 10), src="192.168.88.1")],
+            [],
+            infrastructure=infra,
+        )
+        assert record["user_id"] == "device" and record["device_kind"] == "router"
+        cells = dict(zip(IPDR_COLUMNS, csv_cells(record), strict=True))
+        assert cells["User ID for Internet Access"] == "device"
+        item = list_item(record)
+        assert (item["user_id"], item["user_class"]) == ("device", "device")
+
+    def test_monitored_hardware_and_bypass_macs_are_devices(self) -> None:
+        infra = Infrastructure(
+            router_addresses={},
+            monitored_macs=frozenset({"02:00:00:00:00:A1"}),
+            authorized_macs=frozenset({"02:00:00:00:00:B2"}),
+        )
+        leases = LeaseIndex(
+            [
+                lease(ist(2026, 10, 17, 9)),
+                lease(ist(2026, 10, 17, 9), mac=MAC_B, ip="192.168.88.25"),
+            ]
+        )
+        records = build(
+            [
+                flow(ist(2026, 10, 17, 10)),
+                flow(ist(2026, 10, 17, 10), src="192.168.88.25"),
+                flow(ist(2026, 10, 17, 10), src="192.168.88.26"),
+            ],
+            [],
+            leases=leases,
+            infrastructure=infra,
+        )
+        kinds = {r["src_ip"]: (r["user_id"], r["device_kind"]) for r in records}
+        assert kinds == {
+            "192.168.88.24": ("device", "monitored_hardware"),
+            "192.168.88.25": ("device", "authorized_mac"),
+            "192.168.88.26": ("unknown", None),
+        }
+
+    def test_a_session_always_wins_over_infrastructure(self) -> None:
+        infra = Infrastructure(router_addresses={R_A: frozenset({"192.168.88.24"})})
+        (record,) = build(
+            [flow(ist(2026, 10, 17, 10))],
+            [session(ist(2026, 10, 17, 9), None)],
+            infrastructure=infra,
+        )
+        assert record["user_class"] == "guest" and record["device_kind"] is None
+
+    def test_old_day_files_without_the_new_fields_still_render(self) -> None:
+        old = {
+            k: v
+            for k, v in _known_record(user_known=False).items()
+            if k
+            not in (
+                "user_class",
+                "device_kind",
+                "mac_source",
+                "alloc_source",
+                "nat_event_only",
+            )
+        }
+        old.update(alloc_start=None, alloc_end=None, online_seconds=None, mac=None)
+        item = list_item(old)
+        assert item["user_class"] == "unknown" and item["user_id"] == "unknown"
+        assert item["allocation_source"] is None
+
+
 # -- fakes ---------------------------------------------------------------------
 
 
@@ -416,6 +657,8 @@ class FakeRepo:
         self.files: dict[tuple[uuid.UUID, date], DayFileRow] = {}
         self.subjects: dict[int, set[tuple[str, str]]] = {}
         self.calls: list[str] = []
+        self.lease_rows: list[LeaseEvent] = []
+        self.infra = Infrastructure(router_addresses={})
 
     async def location_organization(self, location_id):
         return self.locations.get(location_id)
@@ -449,6 +692,16 @@ class FakeRepo:
 
     async def router_public_ips(self, router_ids):
         return {r: PUBLIC.get(r) for r in router_ids}
+
+    async def lease_events(self, router_ids, start, end):
+        ids = set(router_ids)
+        return [e for e in self.lease_rows if e.router_id in ids]
+
+    async def inventory_sightings(self, router_ids):
+        return []
+
+    async def infrastructure(self, location_id, organization_id, router_ids):
+        return self.infra
 
     async def records_incomplete(self, location_id, start, end):
         return False
@@ -707,6 +960,25 @@ class TestFiltersAndPaging:
             _, page = await _page(service, since=since, until=NOW, limit=200, **kw)
             assert len(page["items"]) == count, kw
 
+    async def test_guests_only_hides_device_and_unknown_rows(self, tmp_path) -> None:
+        repo, builder, service = _env(tmp_path)
+        _seed(repo)
+        repo.flow_rows[LOC_A].append(
+            flow(ist(2026, 10, 17, 13), src="192.168.88.1", proto=17, dport=123)
+        )
+        repo.infra = Infrastructure(router_addresses={R_A: frozenset({"192.168.88.1"})})
+        await builder.run_closed_days()
+        since = ist(2026, 10, 17)
+        _, every = await _page(service, since=since, until=NOW, limit=200)
+        f, guests = await _page(
+            service, since=since, until=NOW, limit=200, guests_only=True
+        )
+        assert len(every["items"]) == len(guests["items"]) + 1
+        assert {i["user_class"] for i in guests["items"]} == {"guest"}
+        (device,) = [i for i in every["items"] if i["user_class"] != "guest"]
+        assert (device["user_id"], device["device_kind"]) == ("device", "router")
+        assert f.audit_view()["guests_only"] is True
+
     async def test_a_missing_day_says_so(self, tmp_path) -> None:
         _, _, service = _env(tmp_path)
         _, page = await _page(
@@ -893,11 +1165,19 @@ class TestMigration:
         ]
         assert children == ["0169_create_ipdr_tables.py"]
 
-    def test_0169_is_the_head(self) -> None:
+    def test_0170_is_the_only_child_of_0169(self) -> None:
         children = [
             p.name
             for p in VERSIONS.glob("*.py")
             if 'down_revision = "0169_create_ipdr_tables"' in p.read_text()
+        ]
+        assert children == ["0170_traffic_flow_record_ipdr_ports.py"]
+
+    def test_0170_is_the_head(self) -> None:
+        children = [
+            p.name
+            for p in VERSIONS.glob("*.py")
+            if 'down_revision = "0170_traffic_flow_record_ipdr_ports"' in p.read_text()
         ]
         assert not children
 

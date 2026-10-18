@@ -73,6 +73,7 @@ EXPORTER = "10.20.0.31"
 VERSIONS = pathlib.Path("alembic/versions")
 MIGRATION = "0162_traffic_flow_records.py"
 MERGE_MIGRATION = "0163_traffic_flow_record_merge.py"
+IPDR_PORTS_MIGRATION = "0170_traffic_flow_record_ipdr_ports.py"
 
 DEVICE = "192.168.88.24"
 REMOTE = "142.250.193.14"
@@ -168,6 +169,7 @@ class TestReduction:
             "exporter_port": None,
             "records_merged": 1,
             "ports_merged": False,
+            "nat_event": None,
         }
 
     def test_todays_collector_rows_leave_times_and_nat_not_recorded(self) -> None:
@@ -542,6 +544,125 @@ def _writer(store: Store, *, export_on: bool = True, **settings: Any) -> Any:
 
 def _rows(n: int) -> list[dict[str, Any]]:
     return [rollup_row(DEVICE, f"142.250.1.{i + 1}", 1000 - i) for i in range(n)]
+
+
+def _nat_event(sport: int, *, kind: int | None = 4, **over: Any) -> dict[str, Any]:
+    """A template-1025 row as pmacct prints it: no counters, start = the
+    observation time, the conntrack translation in post_nat_*."""
+    row = flow_row(
+        DEVICE,
+        REMOTE,
+        0,
+        port_src=sport,
+        post_nat_port_src=60000 + sport % 1000,
+        packets=0,
+        flows=1,
+        timestamp_end="0",
+        **over,
+    )
+    if kind is not None:
+        row["nat_event"] = kind
+    return row
+
+
+class TestIpdrPortsAndNatEvents:
+    def test_nat_event_rows_are_recognised_typed_or_not(self) -> None:
+        records = flow_record_rows(
+            [
+                _nat_event(50001),
+                _nat_event(50002, kind=None),
+                flow_row(DEVICE, REMOTE, 10, nat_event=0),
+            ],
+            EXPORTER,
+        )
+        events = {r["src_port"]: r["nat_event"] for r in records}
+        assert events == {50001: 4, 50002: 0, 51544: None}
+
+    def test_events_never_merge_into_traffic_records(self) -> None:
+        rows = [flow_row(DEVICE, REMOTE, 10), _nat_event(51544)]
+        stored, counts = _prepared(rows, merge_ports=False)
+        assert sorted(r["nat_event"] is None for r in stored) == [False, True]
+        assert counts.merged == 0
+        event = next(r for r in stored if r["nat_event"] is not None)
+        assert (event["nat_src_address"], event["nat_src_port"]) == (WAN, 60544)
+
+    def test_kept_ports_except_ntp(self) -> None:
+        rows = [
+            flow_row(DEVICE, REMOTE, 10, port_src=50001),
+            flow_row(DEVICE, REMOTE, 10, port_src=50002),
+            *_ntp_answers(300),
+        ]
+        stored, counts = _prepared(
+            rows, merge_ports=False, summarised_ports=fr.SUMMARISED_REMOTE_PORTS
+        )
+        tcp = sorted(r["src_port"] for r in stored if r["protocol"] == 6)
+        assert tcp == [50001, 50002]
+        (ntp,) = [r for r in stored if r["protocol"] == 17]
+        assert (ntp["records_merged"], ntp["ports_merged"]) == (300, True)
+        assert counts.merged == 299
+
+    async def test_writer_keeps_ports_only_for_ipdr_routers(self) -> None:
+        rows = [
+            flow_row(DEVICE, REMOTE, 10, port_src=50001),
+            flow_row(DEVICE, REMOTE, 10, port_src=50002),
+        ]
+
+        async def enabled() -> set[uuid.UUID]:
+            return {ROUTER}
+
+        async def ipdr() -> set[uuid.UUID]:
+            return {ROUTER}
+
+        async def none() -> set[uuid.UUID]:
+            return set()
+
+        for keep, expected in ((ipdr, 2), (none, 1)):
+            store = Store()
+            writer = FlowRecordWriter(
+                store,
+                _settings(traffic_flow_record_merge_ports=True),
+                enabled_router_ids=enabled,
+                ipdr_port_router_ids=keep,
+            )
+            assert await writer.write_window(IDENTITY, EXPORTER, rows) == expected
+
+
+class TestIpdrPortsSwitch:
+    async def test_switch_needs_an_export_row_and_is_audited(self) -> None:
+        from app.domains.traffic_flow.models import RouterTrafficFlowExport
+        from app.domains.traffic_flow.service import TrafficFlowError, set_ipdr_ports
+
+        audits: list[dict[str, Any]] = []
+
+        class Audit:
+            async def create_audit_log_entry(self, **kw: Any) -> None:
+                audits.append(kw)
+
+        class Repo:
+            def __init__(self, row: Any) -> None:
+                self.row, self.saved = row, 0
+
+            async def get_export(self, router_id: uuid.UUID) -> Any:
+                return self.row
+
+            async def save_export(self, row: Any) -> Any:
+                self.saved += 1
+                return row
+
+        with pytest.raises(TrafficFlowError) as missing:
+            await set_ipdr_ports(
+                Repo(None), Audit(), ROUTER, enabled=True, actor_user_id=USER
+            )
+        assert missing.value.status_code == 409 and not audits
+        row = RouterTrafficFlowExport(router_id=ROUTER, enabled=True)
+        row.ipdr_ports = False
+        repo = Repo(row)
+        data = await set_ipdr_ports(
+            repo, Audit(), ROUTER, enabled=True, actor_user_id=USER
+        )
+        assert data == {"router_id": str(ROUTER), "ipdr_ports": True, "was": False}
+        assert row.ipdr_ports is True and repo.saved == 1
+        assert audits[0]["action"] == "traffic_flow_ipdr_ports_set"
 
 
 class TestWriter:
@@ -1849,7 +1970,7 @@ class TestMigration:
         ddl = "\n".join(statements)
         added = re.findall(
             r"ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+) ",
-            "\n".join(_statements(MERGE_MIGRATION)),
+            "\n".join(_statements(MERGE_MIGRATION) + _statements(IPDR_PORTS_MIGRATION)),
         )
         for model in (TrafficFlowRecord, TrafficFlowRecordCap):
             table = model.__table__
@@ -1861,7 +1982,7 @@ class TestMigration:
                 body,
             )
             later = [column for name, column in added if name == table.name]
-            # The create revision plus the merge revision is the model.
+            # The create revision plus the later ones is the model.
             assert columns + later == [c.name for c in table.columns], table.name
             for index in table.indexes:
                 assert f"CREATE INDEX IF NOT EXISTS {index.name} " in ddl, index.name

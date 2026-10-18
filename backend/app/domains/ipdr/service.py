@@ -100,6 +100,9 @@ class IpdrFilters:
     mac: str | None = None
     ip: str | None = None
     dst_ip: str | None = None
+    #: Only rows matched to a guest session (the table's default view);
+    #: False keeps ``device`` and ``unknown`` rows too (the export default).
+    guests_only: bool = False
     cursor: IpdrCursor | None = None
     #: (location, day) pairs whose day file contains every subject asked
     #: for; ``None`` = no subject filter.
@@ -117,10 +120,13 @@ class IpdrFilters:
             "mac": self.mac,
             "ip": self.ip,
             "dst_ip": self.dst_ip,
+            "guests_only": self.guests_only,
         }
 
 
 def record_matches(record: dict[str, Any], f: IpdrFilters) -> bool:
+    if f.guests_only and not record.get("user_known"):
+        return False
     if f.router_id is not None and record.get("router_id") != str(f.router_id):
         return False
     if f.phone is not None and phone_key(record.get("phone")) != f.phone:
@@ -206,6 +212,7 @@ class IpdrService:
         mac: str | None = None,
         ip: str | None = None,
         dst_ip: str | None = None,
+        guests_only: bool = False,
         cursor: str | None = None,
     ) -> IpdrFilters:
         now = _aware(self._clock())
@@ -236,6 +243,7 @@ class IpdrService:
             mac=_parsed(mac, normalize_mac, "mac"),
             ip=_parsed(ip, normalize_ip, "ip"),
             dst_ip=_parsed(dst_ip, normalize_ip, "dst_ip"),
+            guests_only=bool(guests_only),
             cursor=decode_cursor(cursor) if cursor else None,
         )
         return await self._with_subject_days(filters)

@@ -222,6 +222,9 @@ async def _run_async() -> dict[str, Any]:
                     session
                 ).enabled_export_router_ids,
                 platform=platform,
+                ipdr_port_router_ids=TrafficFlowRepository(
+                    session
+                ).ipdr_port_router_ids,
             ),
         )
 

@@ -260,6 +260,12 @@ class RouterTrafficFlowExport(BaseModel):
     )
     last_verdict_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     last_verdict_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Master switch, off by default: this router's flow records keep the
+    #: venue-side port (NTP aside) so its IPDR has Source Port and Translated
+    #: Port. Multiplies stored rows; the daily cap still applies.
+    ipdr_ports: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     __table_args__ = (
         UniqueConstraint("router_id", name="uq_router_traffic_flow_export_router_id"),

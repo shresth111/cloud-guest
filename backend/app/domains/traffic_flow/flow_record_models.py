@@ -98,6 +98,10 @@ class TrafficFlowRecord(Base):
     ports_merged: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    #: NULL = a traffic record. Otherwise an IPFIX NAT event (conntrack
+    #: create/delete): the IANA natEvent value, 0 when the hub did not send
+    #: the type. Bytes and packets are 0; ``nat_src_*`` is the translation.
+    nat_event: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
 
     __table_args__ = (
         Index("ix_traffic_flow_records_window_start", "window_start"),
