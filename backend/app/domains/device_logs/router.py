@@ -11,7 +11,8 @@ reason.
 ``device_logs_platform_router`` -- ``/platform/device-logs/...``. Master
 console only: every route pins ``ScopeType.GLOBAL`` (never inferred from
 the caller's headers -- the scope-inference trap), ``device_logs.read`` for
-reads and ``device_logs.manage`` for the two routes that write to a router.
+reads and ``device_logs.manage`` for the routes that write to a router
+(remote logging apply/remove, and the firewall-logging toggle).
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from .dependencies import get_device_logs_service
 from .schemas import (
     DeviceLogPage,
     DeviceLogsOverview,
+    FirewallLoggingRequest,
+    FirewallLoggingState,
     IngestRequest,
     IngestResult,
     RouterLoggingDetail,
@@ -214,3 +217,57 @@ async def remove_router_device_logging(
         data=RouterLoggingDetail.model_validate(data).model_dump(mode="json"),
         request_id=_request_id(request),
     )
+
+
+@device_logs_platform_router.get(
+    "/routers/{router_id}/firewall-logging",
+    response_model=ApiResponse[FirewallLoggingState],
+    dependencies=[Depends(_READ)],
+)
+async def router_firewall_logging(
+    router_id: uuid.UUID,
+    request: Request,
+    service: DeviceLogsService = Depends(get_device_logs_service),
+) -> dict[str, Any]:
+    """Master: is firewall logging (rate-limited ``WYFY-FW`` log rows above
+    Wyfy's own forward drops) on for this router -- the stored intent, the
+    last read-back, and a live read of the router. Writes nothing."""
+    data = await service.firewall_logging_state(router_id)
+    return build_response(
+        success=True,
+        message="Router firewall logging",
+        data=FirewallLoggingState.model_validate(data).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@device_logs_platform_router.put(
+    "/routers/{router_id}/firewall-logging",
+    response_model=ApiResponse[FirewallLoggingState],
+    dependencies=[Depends(_MANAGE)],
+)
+async def set_router_firewall_logging(
+    router_id: uuid.UUID,
+    payload: FirewallLoggingRequest,
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    service: DeviceLogsService = Depends(get_device_logs_service),
+) -> dict[str, Any]:
+    """Master: turn firewall logging on or off for this router, write it
+    (under the router's firewall lock) and read it back. Turning it on is
+    409 while the platform switch is off or remote logging is not applied;
+    turning it off always removes the rows."""
+    data = await service.set_firewall_logging(
+        router_id, enabled=payload.enabled, actor_user_id=uuid.UUID(str(user.id))
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Firewall logging turned on"
+            if payload.enabled
+            else "Firewall logging turned off"
+        ),
+        data=FirewallLoggingState.model_validate(data).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+

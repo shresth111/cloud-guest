@@ -20,7 +20,8 @@ Hotspot        ``<user> (<ip>): logged in`` / ``logged out[: <reason>]`` /
                ``login failed: <reason>``
 Firewall       ``[<prefix> ]<chain>: in:<if> out:<if>, [connection-state:..
                ] [src-mac <mac>, ]proto TCP (SYN), <src>:<port>-><dst>:<port>
-               [, NAT ...], len <n>`` (ICMP has no ports)
+               [, NAT ...], len <n>`` (ICMP has no ports). Prefix ``WYFY-FW``
+               is Wyfy's own log row above one of its drops: ``blocked``.
 Wireless       ``<mac>@<iface>[:] connected[, ...]`` / ``disconnected[, ...]``
                (``wifi`` package and legacy ``wireless``)
 System         ``user <name> logged in|out from <ip> via <svc>`` and
@@ -71,6 +72,11 @@ _FIREWALL_PROTO = re.compile(
 )
 _FIREWALL_SRC_MAC = re.compile(rf"src-mac (?P<mac>{_MAC})")
 _BLOCK_WORDS = re.compile(r"drop|block|deny|denied|reject", re.IGNORECASE)
+#: The prefix on Wyfy's own rate-limited log rows (gateway
+#: ``mikrotik_firewall_logging.LOG_PREFIX``). Each sits directly above a
+#: Wyfy drop/reject with the same matchers, so a line carrying it is a
+#: packet that rule dropped -- "blocked" without needing a block word.
+WYFY_FIREWALL_LOG_PREFIX = "WYFY-FW"
 _ALLOW_WORDS = re.compile(r"accept|allow|permit", re.IGNORECASE)
 
 _WIRELESS = re.compile(
@@ -122,9 +128,10 @@ def _firewall(body: str) -> Classification | None:
     proto = _FIREWALL_PROTO.search(body)
     if head is None or proto is None:
         return None
-    words = f"{head.group('prefix') or ''} {head.group('chain')}"
+    prefix = (head.group("prefix") or "").strip()
+    words = f"{prefix} {head.group('chain')}"
     status: str | None = None
-    if _BLOCK_WORDS.search(words):
+    if prefix == WYFY_FIREWALL_LOG_PREFIX or _BLOCK_WORDS.search(words):
         status = LogStatus.BLOCKED.value
     elif _ALLOW_WORDS.search(words):
         status = LogStatus.ALLOWED.value

@@ -10,6 +10,14 @@ Honesty rules this module keeps:
   more than one, is stored unattributed; the ``wyfy-`` tag never attributes
   on its own.
 * A write is only "verified" when the read-back from the device matched.
+
+Firewall logging (``WYFY-FW``) rides on remote logging: rate-limited log rows
+above Wyfy's own forward drops (gateway ``mikrotik_firewall_logging``). The
+per-router intent lives on ``router_remote_logging``; the rows are on the
+router only while that intent, remote logging and the platform switch are all
+on. Every write of them holds the router's forward-chain lock, and they are
+re-converged after every other write of that chain (``after_firewall_write``)
+so they always sit directly above the drop they describe.
 """
 
 from __future__ import annotations
@@ -22,12 +30,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from app.common.router_firewall_lock import router_firewall_lock
 from app.core.config import Settings
 from app.domains.router.crypto import decrypt_secret
 
 from .classifier import classification_columns
 from .constants import (
     DEFAULT_PAGE_SIZE,
+    FIREWALL_LOG_MAX_LINES_PER_MINUTE,
+    FIREWALL_LOG_PER_RULE_LIMIT,
     MAX_PAGE_SIZE,
     MAX_QUERY_WINDOW_DAYS,
     ROUTEROS_ACTION_NAME,
@@ -44,6 +55,9 @@ from .exceptions import (
     DeviceLogsDisabledError,
     DeviceLogsRouterBlockedError,
     DeviceLogsRouterNotFoundError,
+    FirewallLoggingBusyError,
+    FirewallLoggingNeedsRemoteLoggingError,
+    FirewallLoggingSwitchedOffError,
 )
 from .guest_events import guest_event_row
 from .models import RouterRemoteLogging
@@ -137,6 +151,73 @@ class GatewayRemoteLoggingWriter:
         return WriteVerdict(ok=readback.ok, detail=readback.detail)
 
 
+@dataclass(frozen=True)
+class FirewallLoggingVerdict:
+    """The gateway's ``FirewallLoggingResult``, as plain values."""
+
+    enabled: bool
+    ok: bool
+    band_state: str
+    targets: int
+    companions: int
+    skipped: tuple[str, ...]
+    detail: str
+
+
+class FirewallLoggingWriter(Protocol):
+    async def sync(
+        self, creds: WriterCredentials, *, enabled: bool
+    ) -> FirewallLoggingVerdict: ...
+
+    async def read(self, creds: WriterCredentials) -> FirewallLoggingVerdict: ...
+
+
+class GatewayFirewallLoggingWriter:
+    """The real writer: ``wyfy_device_gateway.mikrotik_firewall_logging``
+    over 8728, imported lazily like :class:`GatewayRemoteLoggingWriter`."""
+
+    def __init__(self) -> None:
+        from wyfy_device_gateway.mikrotik_firewall_logging import (
+            MikroTikFirewallLogging,
+        )
+
+        self._client = MikroTikFirewallLogging()
+
+    @staticmethod
+    def _verdict(result: Any) -> FirewallLoggingVerdict:
+        return FirewallLoggingVerdict(
+            enabled=bool(result.enabled),
+            ok=bool(result.ok),
+            band_state=str(result.band_state),
+            targets=int(result.targets),
+            companions=int(result.companions),
+            skipped=tuple(f"{comment}: {reason}" for comment, reason in result.skipped),
+            detail=str(result.detail),
+        )
+
+    async def sync(
+        self, creds: WriterCredentials, *, enabled: bool
+    ) -> FirewallLoggingVerdict:
+        from wyfy_device_gateway.mikrotik_adapter import MikroTikDeviceError
+
+        try:
+            result = await self._client.sync(
+                GatewayRemoteLoggingWriter._creds(creds), enabled=enabled
+            )
+        except MikroTikDeviceError as exc:
+            raise DeviceWriteFailed(str(exc)) from exc
+        return self._verdict(result)
+
+    async def read(self, creds: WriterCredentials) -> FirewallLoggingVerdict:
+        from wyfy_device_gateway.mikrotik_adapter import MikroTikDeviceError
+
+        try:
+            result = await self._client.read(GatewayRemoteLoggingWriter._creds(creds))
+        except MikroTikDeviceError as exc:
+            raise DeviceWriteFailed(str(exc)) from exc
+        return self._verdict(result)
+
+
 # -- helpers -----------------------------------------------------------------
 
 
@@ -199,11 +280,17 @@ class DeviceLogsService:
         settings: Settings,
         *,
         writer: RemoteLoggingWriter | None = None,
+        firewall_writer: FirewallLoggingWriter | None = None,
+        redis: Any | None = None,
         clock: Any = None,
     ) -> None:
         self.repository = repository
         self.settings = settings
         self._writer = writer
+        self._firewall_writer = firewall_writer
+        # Backs the router's forward-chain lock (app.common.router_firewall_
+        # lock) around firewall-logging writes. None (unit tests) takes none.
+        self._redis = redis
         self._clock = clock or (lambda: datetime.now(UTC))
 
     @property
@@ -627,6 +714,7 @@ class DeviceLogsService:
         row.verify_detail = verdict.detail
         row.updated_by = actor_user_id
         await self.repository.save_config(row)
+        await self._resync_best_effort(row, ctx["creds"])
         logger.info(
             "device_logs_remote_logging_applied",
             extra={
@@ -661,6 +749,9 @@ class DeviceLogsService:
             row.verify_detail = verdict.detail
             row.updated_by = actor_user_id
             await self.repository.save_config(row)
+            # Remote logging is gone, so the rows would log into nothing:
+            # off on the device, intent kept for the next apply.
+            await self._resync_best_effort(row, ctx["creds"])
         logger.info(
             "device_logs_remote_logging_removed",
             extra={
@@ -671,3 +762,215 @@ class DeviceLogsService:
             },
         )
         return await self.router_detail(router_id)
+
+    # -- firewall logging (WYFY-FW) ------------------------------------
+    @property
+    def firewall_logging_platform_enabled(self) -> bool:
+        return self.enabled and bool(
+            getattr(self.settings, "device_logs_firewall_logging_enabled", False)
+        )
+
+    def _firewall_logging_active(self, row: RouterRemoteLogging | None) -> bool:
+        """The rows belong on the router: the per-router intent, remote
+        logging (their only way out) and the platform switch, all on."""
+        return bool(
+            row is not None
+            and row.enabled
+            and row.firewall_logging_enabled
+            and self.firewall_logging_platform_enabled
+        )
+
+    def _require_firewall_writer(self) -> FirewallLoggingWriter:
+        if self._firewall_writer is None:
+            self._firewall_writer = GatewayFirewallLoggingWriter()
+        return self._firewall_writer
+
+    def _firewall_lock(self, router_id: uuid.UUID):  # noqa: ANN202
+        return router_firewall_lock(
+            self._redis,
+            router_id,
+            busy_error=lambda: FirewallLoggingBusyError(router_id),
+        )
+
+    async def _sync_firewall_logging(
+        self,
+        row: RouterRemoteLogging | None,
+        creds: WriterCredentials,
+        *,
+        enabled: bool,
+        router_id: uuid.UUID,
+    ) -> FirewallLoggingVerdict:
+        """One converge of the router's companion rows, recorded on ``row``.
+        The caller holds the forward-chain lock."""
+        verdict = await self._require_firewall_writer().sync(creds, enabled=enabled)
+        if row is not None:
+            row.firewall_logging_verified_at = self._now()
+            row.firewall_logging_verified_ok = verdict.ok
+            row.firewall_logging_detail = verdict.detail
+            await self.repository.save_config(row)
+        logger.info(
+            "device_logs_firewall_logging_synced",
+            extra={
+                "router_id": str(router_id),
+                "fw_enabled": enabled,
+                "fw_ok": verdict.ok,
+                "fw_targets": verdict.targets,
+                "fw_companions": verdict.companions,
+                "fw_detail": verdict.detail,
+            },
+        )
+        return verdict
+
+    async def _resync_best_effort(
+        self, row: RouterRemoteLogging, creds: WriterCredentials | None
+    ) -> None:
+        """Re-converge after a remote-logging apply/remove. Never fails the
+        remote-logging write it follows; a miss is recorded on the row."""
+        if not row.firewall_logging_enabled or creds is None:
+            return
+        try:
+            async with self._firewall_lock(row.router_id):
+                await self._sync_firewall_logging(
+                    row,
+                    creds,
+                    enabled=self._firewall_logging_active(row),
+                    router_id=row.router_id,
+                )
+        except (FirewallLoggingBusyError, DeviceWriteFailed) as exc:
+            row.firewall_logging_verified_ok = False
+            row.firewall_logging_detail = f"not synced: {exc}"
+            await self.repository.save_config(row)
+            logger.warning(
+                "device_logs_firewall_logging_sync_skipped",
+                extra={"router_id": str(row.router_id), "reason": str(exc)},
+            )
+
+    async def after_firewall_write(self, router_id: uuid.UUID) -> None:
+        """Hook for every other writer of the router's ``chain=forward``
+        (``FirewallService``), called while it still holds the lock. A
+        router that never had firewall logging turned on costs one DB read
+        and no device call. Never raises: the write it follows already
+        happened, and its own result is what the caller reports."""
+        try:
+            row = await self.repository.get_config(router_id)
+            if row is None or not row.firewall_logging_enabled:
+                return
+            ctx = await self._context(router_id)
+            if ctx["creds"] is None:
+                return
+            await self._sync_firewall_logging(
+                row,
+                ctx["creds"],
+                enabled=self._firewall_logging_active(row),
+                router_id=router_id,
+            )
+        except Exception:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                "device_logs_firewall_logging_hook_failed",
+                extra={"router_id": str(router_id)},
+                exc_info=True,
+            )
+
+    def _firewall_state(
+        self,
+        router_id: uuid.UUID,
+        row: RouterRemoteLogging | None,
+        *,
+        device: FirewallLoggingVerdict | None,
+        device_error: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "router_id": str(router_id),
+            "platform_enabled": self.firewall_logging_platform_enabled,
+            "router_enabled": bool(row and row.firewall_logging_enabled),
+            "remote_logging_enabled": bool(row and row.enabled),
+            "active": self._firewall_logging_active(row),
+            "verified_at": row.firewall_logging_verified_at if row else None,
+            "verified_ok": row.firewall_logging_verified_ok if row else None,
+            "verify_detail": row.firewall_logging_detail if row else None,
+            "device": (
+                {
+                    "enabled": device.enabled,
+                    "ok": device.ok,
+                    "band_state": device.band_state,
+                    "targets": device.targets,
+                    "companions": device.companions,
+                    "skipped": list(device.skipped),
+                    "detail": device.detail,
+                }
+                if device is not None
+                else None
+            ),
+            "device_error": device_error,
+            "max_lines_per_minute": FIREWALL_LOG_MAX_LINES_PER_MINUTE,
+            "per_rule_limit": FIREWALL_LOG_PER_RULE_LIMIT,
+        }
+
+    async def firewall_logging_state(self, router_id: uuid.UUID) -> dict[str, Any]:
+        """Stored intent and last verdict, plus a live read of the router
+        when it can be reached. Writes nothing, takes no lock."""
+        ctx = await self._context(router_id)
+        row = await self.repository.get_config(router_id)
+        device: FirewallLoggingVerdict | None = None
+        device_error: str | None = None
+        if ctx["creds"] is None:
+            device_error = ctx["blocker_detail"]
+        if ctx["creds"] is not None and ctx["blocker"] != "NOT_MIKROTIK":
+            try:
+                device = await self._require_firewall_writer().read(ctx["creds"])
+            except DeviceWriteFailed as exc:
+                device_error = str(exc)
+        return self._firewall_state(
+            router_id, row, device=device, device_error=device_error
+        )
+
+    async def set_firewall_logging(
+        self, router_id: uuid.UUID, *, enabled: bool, actor_user_id: uuid.UUID
+    ) -> dict[str, Any]:
+        """Master toggle. On: needs the feature, the platform switch and
+        remote logging already applied. Off: always allowed, and always
+        removes from the device (idempotent). Both under the router's
+        forward-chain lock, both read back."""
+        ctx = await self._context(router_id)
+        row = await self.repository.get_config(router_id)
+        if enabled:
+            if not self.enabled:
+                raise DeviceLogsDisabledError()
+            if not self.firewall_logging_platform_enabled:
+                raise FirewallLoggingSwitchedOffError()
+            if ctx["blocker"] is not None:
+                raise DeviceLogsRouterBlockedError(
+                    router_id, ctx["blocker"], ctx["blocker_detail"]
+                )
+            if row is None or not row.enabled:
+                raise FirewallLoggingNeedsRemoteLoggingError(router_id)
+        elif ctx["creds"] is None or ctx["blocker"] == "NOT_MIKROTIK":
+            raise DeviceLogsRouterBlockedError(
+                router_id,
+                ctx["blocker"] or "NO_API_CREDENTIALS",
+                ctx["blocker_detail"] or "",
+            )
+        if row is not None:
+            row.firewall_logging_enabled = enabled
+            row.updated_by = actor_user_id
+        try:
+            async with self._firewall_lock(router_id):
+                verdict = await self._sync_firewall_logging(
+                    row,
+                    ctx["creds"],
+                    enabled=enabled and self._firewall_logging_active(row),
+                    router_id=router_id,
+                )
+        except DeviceWriteFailed as exc:
+            raise DeviceLogsDeviceError(router_id, str(exc)) from exc
+        logger.info(
+            "device_logs_firewall_logging_set",
+            extra={
+                "router_id": str(router_id),
+                "fw_enabled": enabled,
+                "fw_ok": verdict.ok,
+                "actor_user_id": str(actor_user_id),
+            },
+        )
+        return self._firewall_state(router_id, row, device=verdict, device_error=None)
+
