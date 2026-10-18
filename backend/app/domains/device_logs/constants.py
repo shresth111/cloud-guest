@@ -36,7 +36,31 @@ DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
 
 #: Viewer windows the UI offers; the API accepts any range up to this.
+#: Master viewer only -- it reads across every tenant.
 MAX_QUERY_WINDOW_DAYS = 31
+
+#: Customer NetLogs: one organization, so the full two-year retention is
+#: queryable (monthly partitions keep a narrow range cheap).
+CUSTOMER_MAX_QUERY_WINDOW_DAYS = 730
+
+#: Most rows one CSV export streams. An export that would exceed it is cut
+#: and says so in its last line -- never silently truncated.
+CUSTOMER_EXPORT_MAX_ROWS = 100_000
+
+#: Rows per round trip while streaming an export.
+CUSTOMER_EXPORT_CHUNK = 2_000
+
+#: Routers listed in the summary's "top routers".
+SUMMARY_TOP_ROUTERS = 10
+
+#: Partition naming: ``device_log_events_pYYYYMM`` and the catch-all.
+PARTITION_PREFIX = "device_log_events_p"
+DEFAULT_PARTITION = "device_log_events_default"
+
+#: Celery task name for the nightly partition maintenance.
+TASK_DEVICE_LOGS_PARTITION_MAINTENANCE = (
+    "app.domains.device_logs.tasks.run_partition_maintenance"
+)
 
 #: A configured router that has sent nothing for this long reads "silent".
 SILENT_AFTER_MINUTES = 60
@@ -64,6 +88,10 @@ class Attribution(StrEnum):
     #: No (or more than one) tunnel address matched. Never attributed from
     #: the tag alone -- it is plain text anyone can write.
     UNATTRIBUTED = "unattributed"
+    #: Written by the platform itself (RADIUS decision, portal sign-in
+    #: failure); the tenant comes from the authenticated NAS's router or the
+    #: login's own venue, not from a source IP.
+    SERVER = "server"
 
 
 class ReceivingState(StrEnum):
@@ -75,6 +103,46 @@ class ReceivingState(StrEnum):
     AWAITING_FIRST_MESSAGE = "awaiting_first_message"
     RECEIVING = "receiving"
     SILENT = "silent"
+
+
+class LogCategory(StrEnum):
+    """What a line is about. Wire contract with the customer NetLogs page.
+    NULL in the table means "stored before classification existed and not
+    backfilled yet" -- the API reports it as ``other``."""
+
+    DHCP = "dhcp"
+    HOTSPOT_AUTH = "hotspot_auth"
+    RADIUS = "radius"
+    FIREWALL = "firewall"
+    #: Reserved: DNS query logging is deliberately NOT collected (volume and
+    #: guest privacy). Kept in the vocabulary so the column's value set is
+    #: stable if that decision changes.
+    DNS = "dns"
+    SYSTEM = "system"
+    WIRELESS = "wireless"
+    OTHER = "other"
+
+
+class LogStatus(StrEnum):
+    """Outcome of the event, where the line states one. NULL otherwise --
+    never a guessed ``success``."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+    ACCEPT = "accept"
+    REJECT = "reject"
+    BLOCKED = "blocked"
+    ALLOWED = "allowed"
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    RELEASED = "released"
+
+
+#: Where a row came from. ``syslog`` is the router; the other two are
+#: written by the platform itself (``LogSource`` extension).
+SERVER_SOURCE_RADIUS = "radius_server"
+SERVER_SOURCE_PORTAL = "captive_portal"
+SERVER_VENDOR = "wyfy"
 
 
 SEVERITY_NAMES: dict[int, str] = {

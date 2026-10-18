@@ -242,7 +242,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from redis.asyncio import Redis
 
@@ -293,6 +293,12 @@ from app.domains.router.crypto import (
 )
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
+
+if TYPE_CHECKING:
+    from app.domains.device_logs.server_events import (
+        PortalLoginRecorder,
+        RadiusDecisionRecorder,
+    )
 from app.domains.router.vendor_capabilities import (
     is_controller_managed,
     is_nas_only,
@@ -2870,9 +2876,13 @@ class GuestService:
         team_quota_hook: TeamQuotaLookupProtocol | None = None,
         redis: Redis | None = None,
         caller_location_scope: LocationScope = None,
+        login_event_recorder: PortalLoginRecorder | None = None,
     ) -> None:
         self.repository = repository
         self.otp_service = otp_service
+        # NetLogs mirror of portal sign-in failures. Optional and
+        # best-effort: see app.domains.device_logs.server_events.
+        self.login_event_recorder = login_event_recorder
         self.voucher_service = voucher_service
         self.captive_portal_service = captive_portal_service
         self.router_lookup = router_lookup
@@ -7752,6 +7762,21 @@ class GuestService:
             reason=reason,
         )
         logger.warning("guest_login_failed", extra=_event_extra(event))
+        if self.login_event_recorder is not None:
+            # Own session and commit (the caller re-raises, which rolls this
+            # request back); never raises. No identifier is passed on.
+            try:
+                await self.login_event_recorder.record_login_failure(
+                    organization_id=organization_id,
+                    location_id=location_id,
+                    auth_method=auth_method.value,
+                    reason=reason,
+                    ip_address=ip_address,
+                )
+            except Exception as exc:  # noqa: BLE001 -- never break sign-in
+                logger.warning(
+                    "guest_login_failure_netlog_failed", extra={"error": str(exc)}
+                )
 
     def _confined_location_filter(
         self, location_id: uuid.UUID | None
@@ -7912,9 +7937,13 @@ class RadiusService:
         audit_writer: AuditLogWriter | None = None,
         queue_lookup: QueueRateLimitLookupProtocol | None = None,
         caller_location_scope: LocationScope = None,
+        radius_event_recorder: RadiusDecisionRecorder | None = None,
     ) -> None:
         self.repository = repository
         self.guest_service = guest_service
+        # NetLogs: one device_log_events row per Authorize decision.
+        # Optional and best-effort -- see ``_record_radius_decision``.
+        self.radius_event_recorder = radius_event_recorder
         self.router_lookup = router_lookup
         self.location_lookup = location_lookup
         self.nas_code_counter_repository = nas_code_counter_repository
@@ -8609,6 +8638,7 @@ class RadiusService:
         )
 
         session = await self._find_active_session_for_identifier(router, username)
+        reject_reason = "No active guest session for this login"
 
         if session is None and calling_station_id:
             try:
@@ -8627,8 +8657,12 @@ class RadiusService:
                         location_id=router.location_id,
                         router_id=router.id,
                     )
-                except CloudGuestError:
+                except CloudGuestError as exc:
                     session = None
+                    reject_reason = (
+                        "No active guest session; MAC auto-connect refused "
+                        f"({type(exc).__name__})"
+                    )
                 else:
                     session = result.session
 
@@ -8698,6 +8732,7 @@ class RadiusService:
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
             session = None
+            reject_reason = "Session time limit reached"
         # A BLOCKLIST rule written after this session was admitted. The
         # device-side removal in ``guest_access.enforcement`` can fail (a
         # router that refuses the stored API credentials, an unreachable
@@ -8712,6 +8747,7 @@ class RadiusService:
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
             session = None
+            reject_reason = "Guest is blocked"
         # Name required at sign-in: an OTP session whose guest has not yet
         # given the name this venue requires is not an authorization. This
         # is the hop the hotspot login POST lands on, so without it the
@@ -8726,6 +8762,7 @@ class RadiusService:
                 extra={**decision_extra, "event_session_id": str(session.id)},
             )
             session = None
+            reject_reason = "Guest name required before access"
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -8734,6 +8771,13 @@ class RadiusService:
                     "event_authorized": False,
                     "event_session_id": None,
                 },
+            )
+            await self._record_radius_decision(
+                router=router,
+                nas_client=nas_client,
+                accepted=False,
+                reason=reject_reason,
+                calling_station_id=calling_station_id,
             )
             return RadiusAuthorizeResult(
                 authorized=False,
@@ -8748,6 +8792,13 @@ class RadiusService:
                 "event_authorized": True,
                 "event_session_id": str(session.id),
             },
+        )
+        await self._record_radius_decision(
+            router=router,
+            nas_client=nas_client,
+            accepted=True,
+            reason=None,
+            calling_station_id=calling_station_id,
         )
         return RadiusAuthorizeResult(
             authorized=True,
@@ -8789,6 +8840,33 @@ class RadiusService:
                 else await self._resolve_rate_limit_reply(session.id, session=session)
             ),
         )
+
+    async def _record_radius_decision(
+        self,
+        *,
+        router: Router,
+        nas_client: RadiusNasClient,
+        accepted: bool,
+        reason: str | None,
+        calling_station_id: str | None,
+    ) -> None:
+        """One NetLogs row for this Authorize verdict. Never allowed to
+        change, delay meaningfully or fail the verdict: the recorder inserts
+        inside a SAVEPOINT and swallows its own errors, and this catches
+        anything that still escapes. The guest identifier is not passed."""
+        if self.radius_event_recorder is None:
+            return
+        try:
+            await self.radius_event_recorder.record_decision(
+                router=router,
+                nas_identifier=nas_client.nas_identifier,
+                nas_ip=getattr(nas_client, "ip_address", None),
+                accepted=accepted,
+                reason=reason,
+                calling_station_id=calling_station_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring
+            logger.warning("radius_authorize_netlog_failed", extra={"error": str(exc)})
 
     @staticmethod
     def _remaining_session_seconds(session: GuestSession) -> int | None:

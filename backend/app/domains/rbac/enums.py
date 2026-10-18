@@ -204,6 +204,13 @@ class PermissionModule(StrEnum):
     # different grant from who may configure a router. GLOBAL-only for now;
     # see app.domains.device_logs.
     DEVICE_LOGS = "device_logs"
+    # NetLogs: the customer's own organization's device log lines (router
+    # syslog + RADIUS decisions + portal sign-in failures), read-only and
+    # LOCATION-scoped. Separate from DEVICE_LOGS for the same reason
+    # VENUE_TRAFFIC is separate from TRAFFIC_FLOWS: that key is the Master
+    # viewer's, GLOBAL-only, and must never become assignable to a customer
+    # role. See app.domains.device_logs.customer_router.
+    NETWORK_LOGS = "network_logs"
 
 
 class OverrideEffect(StrEnum):

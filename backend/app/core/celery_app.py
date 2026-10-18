@@ -131,6 +131,9 @@ from app.domains.connected_devices.constants import (
     TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
     TASK_SYNC_SINGLE_ROUTER_DEVICES,
 )
+from app.domains.device_logs.constants import (
+    TASK_DEVICE_LOGS_PARTITION_MAINTENANCE,
+)
 from app.domains.dhcp.constants import (
     ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
     TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER,
@@ -279,6 +282,7 @@ celery_app = Celery(
         "app.domains.billing.tasks",
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
+        "app.domains.device_logs.tasks",
         "app.domains.dhcp.tasks",
         "app.domains.dns_filtering.tasks",
         "app.domains.guest.tasks",
@@ -918,6 +922,16 @@ celery_app.conf.update(
         "network-diagnostics-run-retention-sweep": {
             "task": TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
             "schedule": DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
+        },
+        # Device Logs: monthly partitions of device_log_events -- create
+        # the coming months ahead, drop the ones past
+        # Settings.device_logs_retention_months (24). Nightly at a fixed
+        # quiet hour (02:20 UTC = 07:50 IST) rather than an interval, so a
+        # redeploy never runs it mid-day. Pure DB, default queue. See
+        # app.domains.device_logs.partitions.
+        "device-logs-partition-maintenance": {
+            "task": TASK_DEVICE_LOGS_PARTITION_MAINTENANCE,
+            "schedule": crontab(hour=2, minute=20),
         },
         # Network integrations: poll each enabled third-party controller
         # (TP-Link Omada today) for its sites/devices/clients. The

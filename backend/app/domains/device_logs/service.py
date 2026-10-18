@@ -25,6 +25,7 @@ from typing import Any, Protocol
 from app.core.config import Settings
 from app.domains.router.crypto import decrypt_secret
 
+from .classifier import classification_columns
 from .constants import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
@@ -253,6 +254,7 @@ class DeviceLogsService:
                     "message": parsed.message,
                     "attribution": attribution.value,
                     "claimed_tag": parsed.tag,
+                    **classification_columns(parsed.message, topics=parsed.topics),
                 }
             )
         ids = await self.repository.insert_events(rows)
@@ -297,6 +299,31 @@ class DeviceLogsService:
                 is not None
             ]
             inserted += await self.repository.insert_guest_events(guest_rows)
+
+    async def backfill_classification(self, *, batch_size: int = 1000) -> int:
+        """Fill the structured columns (``classifier``) on lines stored before
+        they existed. Idempotent: only rows with ``category IS NULL`` are
+        read, and every row read gets a category (``other`` at worst), so a
+        re-run finds nothing. Returns rows updated."""
+        updated = 0
+        after_id = 0
+        while True:
+            lines = await self.repository.lines_without_category(
+                after_id=after_id, limit=batch_size
+            )
+            if not lines:
+                return updated
+            after_id = lines[-1].id
+            updated += await self.repository.set_classification(
+                [
+                    {
+                        "id": line.id,
+                        "received_at": line.received_at,
+                        **classification_columns(line.message, topics=line.topics),
+                    }
+                    for line in lines
+                ]
+            )
 
     # -- viewer --------------------------------------------------------
     async def list_events(
@@ -384,6 +411,12 @@ class DeviceLogsService:
             "message": e.message,
             "attribution": e.attribution,
             "claimed_tag": e.claimed_tag,
+            "category": e.category,
+            "protocol": e.protocol,
+            "src_ip": e.src_ip,
+            "dst_ip": e.dst_ip,
+            "status": e.status,
+            "device_mac": e.device_mac,
         }
 
     # -- status --------------------------------------------------------

@@ -601,6 +601,11 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # ``python -m app.domains.rbac.seed`` or every caller, Super Admin
     # included, gets a 403 on /platform/device-logs.
     PermissionModule.DEVICE_LOGS: (_A.READ, _A.MANAGE),
+    # NetLogs (customer): READ only -- the list, summary and CSV export.
+    # Nothing a customer does here writes anything.
+    # NOTE FOR DEPLOY: new key -- re-run ``python -m app.domains.rbac.seed``
+    # or every customer gets a 403 on /device-logs.
+    PermissionModule.NETWORK_LOGS: (_A.READ,),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -669,6 +674,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.TRAFFIC_FLOWS: "Traffic Flows",
     PermissionModule.VENUE_TRAFFIC: "Venue Traffic",
     PermissionModule.DEVICE_LOGS: "Device Logs",
+    PermissionModule.NETWORK_LOGS: "Network Logs",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -844,6 +850,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # and carry guest identifiers. Same GLOBAL-only shape (and the same
     # explicit NONE on every non-GLOBAL role) as NETWORK_INTEGRATIONS.
     PermissionModule.DEVICE_LOGS: ScopeType.GLOBAL,
+    # One venue's device log lines, read by that venue's people. LOCATION is
+    # the narrowest scope so a site-level role can hold it for its own site.
+    PermissionModule.NETWORK_LOGS: ScopeType.LOCATION,
 }
 
 
@@ -1221,6 +1230,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.FULL,
@@ -1309,6 +1320,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             # The posture surface itself.
@@ -1376,6 +1389,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.OPERATE,
@@ -1470,6 +1485,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             _M.LOCATIONS: _L.OPERATE,

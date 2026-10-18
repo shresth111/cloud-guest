@@ -585,6 +585,29 @@ class Settings(BaseSettings):
             "CLOUDGUEST_DEVICE_LOGS_REMOTE_PORT."
         ),
     )
+    device_logs_retention_months: int = Field(
+        default=24,
+        ge=1,
+        le=120,
+        description=(
+            "How many whole months of device_log_events (one monthly "
+            "partition each) the nightly partition-maintenance task keeps. "
+            "A partition whose entire range is older than this many months "
+            "before the current month is dropped. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_RETENTION_MONTHS."
+        ),
+    )
+    device_logs_partitions_ahead: int = Field(
+        default=3,
+        ge=1,
+        le=24,
+        description=(
+            "How many future monthly partitions of device_log_events the "
+            "maintenance task keeps created ahead of time, so ingest never "
+            "lands in the DEFAULT partition while beat is healthy. Override "
+            "via CLOUDGUEST_DEVICE_LOGS_PARTITIONS_AHEAD."
+        ),
+    )
     # ------------------------------------------------------------------
     # WHAT THE DEPLOYED HUB AGENT CAN ACTUALLY DO.
     #

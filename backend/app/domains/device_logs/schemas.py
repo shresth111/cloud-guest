@@ -56,6 +56,12 @@ class DeviceLogEventView(BaseModel):
     message: str
     attribution: str
     claimed_tag: str | None
+    category: str | None = None
+    protocol: str | None = None
+    src_ip: str | None = None
+    dst_ip: str | None = None
+    status: str | None = None
+    device_mac: str | None = None
 
 
 class DeviceLogPage(BaseModel):
@@ -143,3 +149,94 @@ class SessionDeviceEvents(BaseModel):
     #: Events that matched this session but also another one, so are not
     #: shown (never guessed).
     ambiguous_count: int
+
+
+# -- customer NetLogs (``/device-logs``) -------------------------------------
+# Wire contract with the customer dashboard. Deliberately no ``source_ip``
+# (the router's tunnel address), ``claimed_tag`` or ``attribution``: tunnel
+# internals are Master-only.
+
+
+class NetLogEventView(BaseModel):
+    id: int
+    #: When the platform received the line (the time every filter uses).
+    received_at: datetime
+    #: The router's own clock, best-effort; None for platform-written rows.
+    device_time: datetime | None
+    location_id: str | None
+    location_name: str | None
+    router_id: str | None
+    router_name: str | None
+    #: The router's identity as it sent it (or the NAS identifier).
+    hostname: str | None
+    #: ``syslog`` (the router) | ``radius_server`` | ``captive_portal``.
+    source: str
+    #: ``LogCategory``: dhcp, hotspot_auth, radius, firewall, dns, system,
+    #: wireless, other. Never null (unclassified reads ``other``).
+    category: str
+    protocol: str | None
+    src_ip: str | None
+    dst_ip: str | None
+    #: ``LogStatus``: success, failure, accept, reject, blocked, allowed,
+    #: connected, disconnected, released -- or None when the line states no
+    #: outcome.
+    status: str | None
+    device_mac: str | None
+    severity: int | None
+    severity_name: str | None
+    #: Short headline ("IP assigned", "Traffic denied"), or None: show
+    #: ``message``.
+    summary: str | None
+    message: str
+
+
+class NetLogPage(BaseModel):
+    feature_enabled: bool
+    items: list[NetLogEventView]
+    #: Pass back as ``cursor`` for the next (older) page; None = last page.
+    next_cursor: str | None
+    #: The effective window after defaults and the 730-day clamp.
+    since: datetime
+    until: datetime
+
+
+class NetLogTotals(BaseModel):
+    events: int
+    #: severity emergency..error (0-3)
+    errors: int
+    #: severity warning (4)
+    warnings: int
+
+
+class NetLogDay(BaseModel):
+    #: Local date (``timezone``), ``YYYY-MM-DD``.
+    day: str
+    total: int
+    errors: int
+    warnings: int
+    by_category: dict[str, int]
+
+
+class NetLogTopRouter(BaseModel):
+    router_id: str | None
+    router_name: str | None
+    location_id: str | None
+    location_name: str | None
+    total: int
+    errors: int
+    warnings: int
+
+
+class NetLogSummary(BaseModel):
+    feature_enabled: bool
+    since: datetime
+    until: datetime
+    timezone: str
+    totals: NetLogTotals
+    #: Only days with at least one event, ascending.
+    by_day: list[NetLogDay]
+    #: Every category key, zero-filled.
+    by_category: dict[str, int]
+    #: Every severity name plus ``unknown`` (no PRI), zero-filled.
+    by_severity: dict[str, int]
+    top_routers: list[NetLogTopRouter]

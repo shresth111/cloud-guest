@@ -74,3 +74,57 @@ class DeviceLogsBadCursorError(DeviceLogsError):
         super().__init__(
             "Invalid cursor.", status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
         )
+
+
+# -- customer NetLogs ---------------------------------------------------------
+
+
+class NetLogsLocationNotFoundError(DeviceLogsError):
+    """Unknown location *or* another organization's -- one answer for both,
+    so the endpoint cannot be used to probe other tenants' ids."""
+
+    code = "NETLOGS_LOCATION_NOT_FOUND"
+
+    def __init__(self, location_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Location {location_id} not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            location_id=str(location_id),
+        )
+
+
+class NetLogsRouterNotFoundError(DeviceLogsError):
+    code = "NETLOGS_ROUTER_NOT_FOUND"
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router {router_id} not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            router_id=str(router_id),
+        )
+
+
+class NetLogsLocationForbiddenError(DeviceLogsError):
+    """In the caller's organization, but not a location they hold
+    ``network_logs.read`` on."""
+
+    code = "NETLOGS_LOCATION_FORBIDDEN"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "You do not have access to logs for this location.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class NetLogsBadFilterError(DeviceLogsError):
+    code = "NETLOGS_BAD_FILTER"
+
+    def __init__(self, field: str, value: str, allowed: list[str]) -> None:
+        super().__init__(
+            f"Unknown {field} {value!r}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            field=field,
+            value=value,
+            allowed=allowed,
+        )
