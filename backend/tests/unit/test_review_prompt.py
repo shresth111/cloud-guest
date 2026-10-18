@@ -571,7 +571,10 @@ class TestRepositoryQueries:
 
 
 class TestMigration:
-    def test_0166_is_the_single_head(self) -> None:
+    def test_0166_is_on_the_single_line_of_history(self) -> None:
+        """0166 chains on 0165 and nothing branches off it: at most one
+        revision builds on it (0167 does, today). The repo-wide single-head
+        rule is CI's own check."""
         import pathlib
 
         versions = list(pathlib.Path("alembic/versions").glob("*.py"))
@@ -582,4 +585,4 @@ class TestMigration:
         children = [
             p.name for p in versions if f'down_revision = "{name}"' in p.read_text()
         ]
-        assert not children
+        assert len(children) <= 1, children
