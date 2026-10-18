@@ -61,6 +61,7 @@ from app.domains.guest import models as guest_models  # noqa: F401
 from app.domains.guest_access import models as guest_access_models  # noqa: F401
 from app.domains.guest_teams import models as guest_teams_models  # noqa: F401
 from app.domains.hotspot import models as hotspot_models  # noqa: F401
+from app.domains.ipdr import models as ipdr_models  # noqa: F401
 from app.domains.isp import models as isp_models  # noqa: F401
 from app.domains.isp_routing import models as isp_routing_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401

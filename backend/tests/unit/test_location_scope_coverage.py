@@ -307,6 +307,16 @@ LOCATION_SCOPED: dict[str, str] = {
 PENDING: dict[str, str] = {}
 
 EXEMPT: dict[str, str] = {
+    "ipdr": (
+        "IPDR. `ipdr_day_files.location_id` says which venue an archived day "
+        "belongs to. Both routes pin `ipdr.read` / `ipdr.export` to "
+        "ScopeType.ORGANIZATION, a module whose narrowest scope is "
+        "ORGANIZATION and which every LOCATION role holds at NONE, so a "
+        "location-confined caller cannot reach them. There is no by-id route; "
+        "`location_id`/`router_id` are query filters validated against the "
+        "caller's organization (404 otherwise). If a location-level grant is "
+        "ever allowed, it moves to PENDING."
+    ),
     "device_logs": (
         "Device Logs. `device_log_events.location_id` is attribution "
         "(which venue a syslog line came from), and every read route is "

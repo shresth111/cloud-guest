@@ -89,6 +89,7 @@ from .routeros import (
     TrafficFlowTarget,
     desired_config,
     disabled_config,
+    nat_events_on,
     render_removal_lines,
     render_traffic_flow_lines,
     routeros_major_version,
@@ -1506,7 +1507,9 @@ class TrafficFlowDeviceService:
         lines: list[str] = []
         desired: dict[str, Any] | None = None
         if target is not None and mikrotik:
-            config = desired_config(target)
+            config = desired_config(
+                target, nat_events=nat_events_on(self.settings)
+            )
             lines = render_traffic_flow_lines(
                 config, routeros_version=router.routeros_version
             )
@@ -1611,7 +1614,7 @@ class TrafficFlowDeviceService:
                 status_code=status.HTTP_409_CONFLICT,
             )
         config = (
-            desired_config(target)
+            desired_config(target, nat_events=nat_events_on(self.settings))
             if enabled and target
             else disabled_config(await self._our_identity(router.id, target))
         )

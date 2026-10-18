@@ -606,6 +606,10 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # NOTE FOR DEPLOY: new key -- re-run ``python -m app.domains.rbac.seed``
     # or every customer gets a 403 on /device-logs.
     PermissionModule.NETWORK_LOGS: (_A.READ,),
+    # IPDR: READ (masked Connections table) and EXPORT (unmasked CSV).
+    # NOTE FOR DEPLOY: new keys -- re-run ``python -m app.domains.rbac.seed``
+    # or every customer gets a 403 on /ipdr.
+    PermissionModule.IPDR: (_A.READ, _A.EXPORT),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -675,6 +679,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.VENUE_TRAFFIC: "Venue Traffic",
     PermissionModule.DEVICE_LOGS: "Device Logs",
     PermissionModule.NETWORK_LOGS: "Network Logs",
+    PermissionModule.IPDR: "IPDR (CERT-In format)",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -853,6 +858,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # One venue's device log lines, read by that venue's people. LOCATION is
     # the narrowest scope so a site-level role can hold it for its own site.
     PermissionModule.NETWORK_LOGS: ScopeType.LOCATION,
+    # Law-enforcement data about every guest of the organization: never a
+    # site-level grant. ORGANIZATION is the narrowest scope.
+    PermissionModule.IPDR: ScopeType.ORGANIZATION,
 }
 
 
@@ -999,6 +1007,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # here the same way SYSTEM_SETTINGS/WHITE_LABEL above are
             # deliberately lowered off this role's own FULL default.
             _M.DEVICE_CONSOLE: _L.NONE,
+            # IPDR (guest identity beside every address reached) is the
+            # venue owner's, requested per case; platform staff do not get it
+            # by role. Super Admin keeps it for support under owner control.
+            _M.IPDR: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1027,6 +1039,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.TRAFFIC_FLOWS: _L.NONE,
             # Venue traffic is for the venue owner only (see organization-owner).
             _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1093,6 +1107,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.TRAFFIC_FLOWS: _L.NONE,
             # Venue traffic is for the venue owner only (see organization-owner).
             _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1130,6 +1146,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.TRAFFIC_FLOWS: _L.NONE,
             # Venue traffic is for the venue owner only (see organization-owner).
             _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1590,6 +1608,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.TRAFFIC_FLOWS: _L.NONE,
             # Venue traffic is for the venue owner only (see organization-owner).
             _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),
@@ -1628,6 +1648,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.TRAFFIC_FLOWS: _L.NONE,
             # Venue traffic is for the venue owner only (see organization-owner).
             _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
             _M.DEVICE_LOGS: _L.NONE,
         },
     ),

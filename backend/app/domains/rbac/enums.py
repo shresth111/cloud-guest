@@ -211,6 +211,11 @@ class PermissionModule(StrEnum):
     # viewer's, GLOBAL-only, and must never become assignable to a customer
     # role. See app.domains.device_logs.customer_router.
     NETWORK_LOGS = "network_logs"
+    # IPDR: per-connection records (who held which address, talking to
+    # what) in the CERT-In IPDR column format -- PII for law-enforcement
+    # requests. READ = the masked on-screen table, EXPORT = the unmasked
+    # CSV. ORGANIZATION-scoped, Owner/Admin only. See app.domains.ipdr.
+    IPDR = "ipdr"
 
 
 class OverrideEffect(StrEnum):

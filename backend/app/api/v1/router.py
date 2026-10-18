@@ -56,6 +56,7 @@ from app.domains.guest_teams.router import admin_router as guest_teams_admin_rou
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
 from app.domains.hotspot.router import router as hotspot_router
 from app.domains.hub_reconciliation.router import router as hub_reconciliation_router
+from app.domains.ipdr.router import ipdr_router
 from app.domains.isp.router import router as isp_router
 from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.live_sessions.router import router as live_sessions_router
@@ -342,3 +343,4 @@ api_v1_router.include_router(channel_partner_router)
 api_v1_router.include_router(device_logs_platform_router)
 api_v1_router.include_router(device_logs_ingest_router)
 api_v1_router.include_router(netlogs_customer_router)
+api_v1_router.include_router(ipdr_router)

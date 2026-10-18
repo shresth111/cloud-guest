@@ -517,6 +517,64 @@ class Settings(BaseSettings):
             "CLOUDGUEST_TRAFFIC_FLOW_RECORD_MERGE_PORTS."
         ),
     )
+    traffic_flow_ipfix_nat_events: bool = Field(
+        default=False,
+        description=(
+            "Also export IPFIX NAT events (nat-events=yes plus nat-dst-*, "
+            "template 260) from routers whose traffic-flow export is on, for "
+            "the IPDR's Translated IP/Port. False (the default): the IPFIX "
+            "field set is unchanged. Unmeasured on the RouterOS 7 fleet: "
+            "turn on for a lab router first (~/wyfy-ops/ipdr/NAT-RESEARCH.md "
+            "section 6). Changing it re-templates every exporter. Override "
+            "via CLOUDGUEST_TRAFFIC_FLOW_IPFIX_NAT_EVENTS."
+        ),
+    )
+    ipdr_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run the nightly IPDR builder (closed IST days within flow-record "
+            "retention -> one archived day file per location). The IPDR list "
+            "and export read whatever exists either way. Override via "
+            "CLOUDGUEST_IPDR_ENABLED."
+        ),
+    )
+    ipdr_archive_bucket: str = Field(
+        default="",
+        description=(
+            "S3 bucket for IPDR day files (the 2-year Object-Locked netlogs "
+            "archive). Empty: day files go to ipdr_local_dir. Credentials are "
+            "the instance role's (boto3 default chain), never the MinIO keys. "
+            "Override via CLOUDGUEST_IPDR_ARCHIVE_BUCKET."
+        ),
+    )
+    ipdr_archive_region: str = Field(
+        default="ap-south-1",
+        description="Region of ipdr_archive_bucket. CLOUDGUEST_IPDR_ARCHIVE_REGION.",
+    )
+    ipdr_archive_prefix: str = Field(
+        default="ipdr/",
+        description=(
+            "Key prefix of IPDR day files; the IAM policy and the lifecycle "
+            "rule are written for ipdr/. CLOUDGUEST_IPDR_ARCHIVE_PREFIX."
+        ),
+    )
+    ipdr_local_dir: str = Field(
+        default="var/ipdr",
+        description=(
+            "Directory for IPDR day files when ipdr_archive_bucket is empty "
+            "(dev/staging). CLOUDGUEST_IPDR_LOCAL_DIR."
+        ),
+    )
+    ipdr_session_grace_seconds: int = Field(
+        default=120,
+        ge=0,
+        le=3600,
+        description=(
+            "A flow up to this long after a guest session's end still belongs "
+            "to that session (accounting lag). "
+            "CLOUDGUEST_IPDR_SESSION_GRACE_SECONDS."
+        ),
+    )
     traffic_flow_geo_data_dir: str = Field(
         default="",
         description=(
