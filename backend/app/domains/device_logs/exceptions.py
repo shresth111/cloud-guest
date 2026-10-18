@@ -67,6 +67,49 @@ class DeviceLogsDeviceError(DeviceLogsError):
         )
 
 
+class FirewallLoggingSwitchedOffError(DeviceLogsError):
+    """The platform switch for firewall logging is off; nothing can be
+    turned on (turning off always works)."""
+
+    code = "FIREWALL_LOGGING_DISABLED"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Firewall logging is switched off on this platform "
+            "(CLOUDGUEST_DEVICE_LOGS_FIREWALL_LOGGING_ENABLED).",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class FirewallLoggingNeedsRemoteLoggingError(DeviceLogsError):
+    """Firewall lines only reach NetLogs through Wyfy's remote logging, so
+    it must be applied (and not removed) first."""
+
+    code = "FIREWALL_LOGGING_NEEDS_REMOTE_LOGGING"
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            "Apply remote logging to this router first: firewall lines are "
+            "sent through it.",
+            status_code=status.HTTP_409_CONFLICT,
+            router_id=str(router_id),
+        )
+
+
+class FirewallLoggingBusyError(DeviceLogsError):
+    """Another writer holds the router's forward-chain lock."""
+
+    code = "FIREWALL_PUSH_IN_PROGRESS"
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            "Another firewall change is being written to this router; try "
+            "again in a few seconds.",
+            status_code=status.HTTP_409_CONFLICT,
+            router_id=str(router_id),
+        )
+
+
 class DeviceLogsBadCursorError(DeviceLogsError):
     code = "DEVICE_LOGS_BAD_CURSOR"
 

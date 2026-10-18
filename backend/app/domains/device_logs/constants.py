@@ -172,3 +172,14 @@ GUEST_EVENT_IP_SKEW_MINUTES = 2
 
 #: Most events returned for one session.
 MAX_SESSION_DEVICE_EVENTS = 200
+
+
+# -- firewall logging (WYFY-FW) ----------------------------------------------
+#: Mirrors of the gateway's ``mikrotik_firewall_logging`` constants, kept here
+#: so this package stays importable without librouteros; a unit test pins
+#: them equal. Per companion row, and the most companions per router.
+FIREWALL_LOG_PER_RULE_LIMIT = "2/1s,5:packet"
+FIREWALL_LOG_MAX_COMPANIONS = 10
+#: The hard ceiling those two give: 2 lines/s x 10 rows, per minute. The
+#: collector's per-router throttle is 3000/min (deploy/device-logs/vector.yaml).
+FIREWALL_LOG_MAX_LINES_PER_MINUTE = 2 * 60 * FIREWALL_LOG_MAX_COMPANIONS

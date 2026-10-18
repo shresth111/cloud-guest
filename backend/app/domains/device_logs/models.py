@@ -21,7 +21,8 @@ No guest-session column on purpose -- the link is computed at read time
 can become ambiguous when a later session appears.
 
 ``router_remote_logging`` -- the one place "Wyfy configured remote logging
-on this router" lives, with the last read-back verdict. Not
+on this router" lives, with the last read-back verdict -- and whether a
+Master turned firewall logging on for it, with that read-back too. Not
 ``routers.settings``: that JSON is writable by a venue owner through
 ``PUT /routers/{id}``.
 """
@@ -211,6 +212,21 @@ class RouterRemoteLogging(BaseModel):
     )
     verified_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     verify_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: A Master turned firewall logging on for this router (rate-limited
+    #: ``WYFY-FW`` log rows above Wyfy's own forward drops). Intent only:
+    #: the rows exist on the device when this is true AND remote logging is
+    #: enabled AND the platform switch
+    #: ``device_logs_firewall_logging_enabled`` is on.
+    firewall_logging_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    firewall_logging_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    firewall_logging_verified_ok: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True
+    )
+    firewall_logging_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("router_id", name="uq_router_remote_logging_router_id"),

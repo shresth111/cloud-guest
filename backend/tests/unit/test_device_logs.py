@@ -628,7 +628,7 @@ def _closure(call) -> set[str]:
 class TestPlatformRoutesArePinnedGlobal:
     def test_every_platform_route_requires_device_logs_at_global(self) -> None:
         routes = dl_router.device_logs_platform_router.routes
-        assert len(routes) == 5
+        assert len(routes) == 7
         for route in routes:
             deps = [d.dependency for d in route.dependencies]
             assert len(deps) == 1, route.path
@@ -637,6 +637,7 @@ class TestPlatformRoutesArePinnedGlobal:
             wanted = (
                 "device_logs.manage"
                 if route.path.endswith(("/apply", "/remove"))
+                or route.methods != {"GET"}
                 else "device_logs.read"
             )
             assert wanted in closure, route.path

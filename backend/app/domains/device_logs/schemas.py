@@ -116,6 +116,49 @@ class RouterLoggingDetail(BaseModel):
     state: str
 
 
+class FirewallLoggingDevice(BaseModel):
+    """A live read of the router: the ``WYFY-FW`` rows it holds now."""
+
+    #: Companion rows are on the router.
+    enabled: bool
+    #: They are exactly what a sync would leave (or there are none).
+    ok: bool
+    #: ``ready`` / ``missing`` / ``invalid`` -- the forward-chain band.
+    band_state: str
+    #: Wyfy drop rows that get a companion.
+    targets: int
+    companions: int
+    #: ``"<target comment>: <reason>"`` for drops left without one.
+    skipped: list[str]
+    detail: str
+
+
+class FirewallLoggingState(BaseModel):
+    router_id: str
+    #: Platform switch (``device_logs_firewall_logging_enabled``) AND
+    #: ``device_logs_enabled``.
+    platform_enabled: bool
+    #: A Master turned it on for this router.
+    router_enabled: bool
+    #: Remote logging is applied on this router (lines have somewhere to go).
+    remote_logging_enabled: bool
+    #: All three: the rows should be on the router.
+    active: bool
+    verified_at: datetime | None
+    verified_ok: bool | None
+    verify_detail: str | None
+    #: None when the router could not be read (``device_error`` says why).
+    device: FirewallLoggingDevice | None
+    device_error: str | None
+    #: Hard ceiling and per-rule limit, for the console to show.
+    max_lines_per_minute: int
+    per_rule_limit: str
+
+
+class FirewallLoggingRequest(BaseModel):
+    enabled: bool
+
+
 class SessionDeviceEventView(BaseModel):
     """One router event linked to one guest session. No raw line, no host
     name, no user name: kind, time, IP and MAC only."""

@@ -585,6 +585,18 @@ class Settings(BaseSettings):
             "CLOUDGUEST_DEVICE_LOGS_REMOTE_PORT."
         ),
     )
+    device_logs_firewall_logging_enabled: bool = Field(
+        default=False,
+        description=(
+            "Platform switch for firewall logging into NetLogs: rate-limited "
+            "action=log rows (log-prefix WYFY-FW) directly above Wyfy's own "
+            "forward-chain drop rows, on routers a Master turned it on for. "
+            "Needs device_logs_enabled too. False (the default) means no "
+            "router gets those rows, and a router that has them loses them "
+            "on its next firewall or remote-logging write. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_FIREWALL_LOGGING_ENABLED."
+        ),
+    )
     device_logs_retention_months: int = Field(
         default=24,
         ge=1,
