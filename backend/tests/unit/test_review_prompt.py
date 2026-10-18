@@ -571,7 +571,7 @@ class TestRepositoryQueries:
 
 
 class TestMigration:
-    def test_0166_is_the_single_head(self) -> None:
+    def test_0166_chains_into_0167_only(self) -> None:
         import pathlib
 
         versions = list(pathlib.Path("alembic/versions").glob("*.py"))
@@ -582,4 +582,5 @@ class TestMigration:
         children = [
             p.name for p in versions if f'down_revision = "{name}"' in p.read_text()
         ]
-        assert not children
+        # 0167 (device_log_events partitions, NetLogs) builds on this one.
+        assert children == ["0167_partition_device_log_events.py"]

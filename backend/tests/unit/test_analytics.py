@@ -990,6 +990,11 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # CONNECTED indefinitely. See
         # app.domains.network_integration.tasks's own module docstring.
         "network-integration-sync-sweep",
+        # Device Logs: creates the coming months' device_log_events
+        # partitions and drops those past the retention period (24 months).
+        # Without it, ingest falls into the DEFAULT partition and nothing
+        # ever expires. See app.domains.device_logs.partitions.
+        "device-logs-partition-maintenance",
         # Back-fills guest data-usage bytes for Omada External-Portal venues
         # from the controller's Open API, on a fixed 5-minute cadence,
         # feeding the same GuestService.record_usage sink RADIUS accounting
