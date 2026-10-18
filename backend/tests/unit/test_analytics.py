@@ -995,6 +995,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # Without it, ingest falls into the DEFAULT partition and nothing
         # ever expires. See app.domains.device_logs.partitions.
         "device-logs-partition-maintenance",
+        # IPDR: archives every closed IST day still inside flow-record
+        # retention as one gzip NDJSON object per location (no-op unless
+        # Settings.ipdr_enabled). See app.domains.ipdr.tasks.
+        "ipdr-daily-build",
         # Back-fills guest data-usage bytes for Omada External-Portal venues
         # from the controller's Open API, on a fixed 5-minute cadence,
         # feeding the same GuestService.record_usage sink RADIUS accounting

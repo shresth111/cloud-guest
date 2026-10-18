@@ -275,6 +275,15 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "Ownership check (org, location) of a router_id a customer filtered "
         "on, so another tenant's router is refused. Vendor-neutral by design."
     ),
+    "app/domains/ipdr/repository.py::IpdrRepository.router_owner": (
+        "Ownership check (org, location) of a router_id a customer filtered "
+        "the IPDR on, so another tenant's router is refused. Vendor-neutral."
+    ),
+    "app/domains/ipdr/repository.py::IpdrRepository.router_public_ips": (
+        "The public address of routers that already exported flow records, "
+        "for the IPDR's derived Translated IP. Rows are decided by "
+        "traffic_flow_records; nothing is polled, pushed or judged."
+    ),
     # -- security -----------------------------------------------------------
     "app/domains/security/repository.py::SecurityRepository.fleet_counts": (
         "Narrowing happened upstream and this method cannot undo it: every "

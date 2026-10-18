@@ -46,6 +46,7 @@ from .constants import ROUTEROS_CACHE_ENTRIES, TRAFFIC_FLOW_SECTION_HEADER
 __all__ = [
     "TrafficFlowTarget",
     "desired_config",
+    "nat_events_on",
     "disabled_config",
     "TARGET_IDENTITY_FIELDS",
     "render_removal_lines",
@@ -68,6 +69,15 @@ _SETTINGS: dict[str, str] = {
 _IPFIX: dict[str, str] = {
     "nat-src-address": "yes",
     "nat-src-port": "yes",
+}
+#: IPFIX NAT event export (template 260) for the IPDR's Translated IP/Port.
+#: Gated by ``traffic_flow_ipfix_nat_events`` (default false) and applied
+#: nowhere until measured on a lab router (~/wyfy-ops/ipdr/NAT-RESEARCH.md
+#: section 6). Turning it on re-templates every exporter.
+_IPFIX_NAT_EVENTS: dict[str, str] = {
+    "nat-dst-address": "yes",
+    "nat-dst-port": "yes",
+    "nat-events": "yes",
 }
 
 
@@ -94,11 +104,17 @@ def target_identity(collector_address: str, collector_port: int) -> dict[str, st
     return {"dst-address": str(collector_address), "port": str(int(collector_port))}
 
 
-def desired_config(target: TrafficFlowTarget) -> TrafficFlowConfig:
-    """Export ON, to ``target``."""
+def desired_config(
+    target: TrafficFlowTarget, *, nat_events: bool = False
+) -> TrafficFlowConfig:
+    """Export ON, to ``target``. ``nat_events`` adds IPFIX NAT event export
+    (off unless ``traffic_flow_ipfix_nat_events``)."""
+    ipfix = dict(_IPFIX)
+    if nat_events:
+        ipfix.update(_IPFIX_NAT_EVENTS)
     return TrafficFlowConfig(
         settings=dict(_SETTINGS),
-        ipfix=dict(_IPFIX),
+        ipfix=ipfix,
         target={
             "dst-address": target.collector_address,
             "port": str(target.collector_port),
@@ -264,5 +280,11 @@ def traffic_flow_lines_for_router(
     if target is None:
         return None
     return render_traffic_flow_lines(
-        desired_config(target), routeros_version=routeros_version
+        desired_config(target, nat_events=nat_events_on(settings)),
+        routeros_version=routeros_version,
     )
+
+
+def nat_events_on(settings: Any) -> bool:
+    """The one reading of the gate, for the generator and the writer."""
+    return bool(getattr(settings, "traffic_flow_ipfix_nat_events", False))

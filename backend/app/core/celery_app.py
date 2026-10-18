@@ -172,6 +172,7 @@ from app.domains.hub_reconciliation.constants import (
     HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_HUB_RECONCILIATION_SWEEP,
 )
+from app.domains.ipdr.constants import BEAT_IPDR_DAILY_BUILD, TASK_IPDR_DAILY_BUILD
 from app.domains.isp.constants import (
     ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
@@ -283,6 +284,7 @@ celery_app = Celery(
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
         "app.domains.device_logs.tasks",
+        "app.domains.ipdr.tasks",
         "app.domains.dhcp.tasks",
         "app.domains.dns_filtering.tasks",
         "app.domains.guest.tasks",
@@ -932,6 +934,14 @@ celery_app.conf.update(
         "device-logs-partition-maintenance": {
             "task": TASK_DEVICE_LOGS_PARTITION_MAINTENANCE,
             "schedule": crontab(hour=2, minute=20),
+        },
+        # IPDR: archive every closed IST day still inside flow-record
+        # retention (7 days) as one gzip NDJSON object per location, plus
+        # its Postgres index row. 19:40 UTC = 01:10 IST, after the IST day
+        # closes. No-op unless Settings.ipdr_enabled. See app.domains.ipdr.
+        BEAT_IPDR_DAILY_BUILD: {
+            "task": TASK_IPDR_DAILY_BUILD,
+            "schedule": crontab(hour=19, minute=40),
         },
         # Network integrations: poll each enabled third-party controller
         # (TP-Link Omada today) for its sites/devices/clients. The
