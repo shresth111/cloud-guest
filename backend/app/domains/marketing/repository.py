@@ -947,6 +947,9 @@ class MarketingRepository:
         result = await self.session.execute(
             select(OrgMarketingProvider).where(
                 OrgMarketingProvider.organization_id == organization_id,
+                # Campaign accounts only: guest login-code accounts share the
+                # table (purpose='otp') and must never send a campaign.
+                OrgMarketingProvider.purpose == "marketing",
                 OrgMarketingProvider.is_deleted.is_(False),
             )
         )
@@ -966,6 +969,7 @@ class MarketingRepository:
             select(OrgMarketingProvider).where(
                 OrgMarketingProvider.id == provider_id,
                 OrgMarketingProvider.organization_id == organization_id,
+                OrgMarketingProvider.purpose == "marketing",
             )
         )
         return result.scalar_one_or_none()
@@ -997,6 +1001,7 @@ class MarketingRepository:
             update(OrgMarketingProvider)
             .where(
                 OrgMarketingProvider.id == provider_id,
+                OrgMarketingProvider.purpose == "marketing",
                 OrgMarketingProvider.status == "verified",
             )
             .values(
