@@ -189,6 +189,27 @@ END $$;
 """
 
 
+def _rename_primary_key(table: str, new_name: str) -> str:
+    """Rename the table's primary key to ``new_name`` whatever it is called
+    now. Looked up, not hard-coded: migrations name it ``pk_device_log_events``
+    (the metadata naming convention), not Postgres' default
+    ``device_log_events_pkey`` -- the hard-coded default failed the
+    2026-10-18 prod deploy, which rolled back."""
+    return f"""
+DO $$
+DECLARE
+    pk text;
+BEGIN
+    SELECT conname INTO pk FROM pg_constraint
+    WHERE conrelid = '{table}'::regclass AND contype = 'p';
+    IF pk IS NOT NULL AND pk <> '{new_name}' THEN
+        EXECUTE format('ALTER TABLE {table} RENAME CONSTRAINT %I TO %I',
+                       pk, '{new_name}');
+    END IF;
+END $$;
+"""
+
+
 def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '15s'")
     op.execute("LOCK TABLE device_log_events IN ACCESS EXCLUSIVE MODE")
@@ -196,8 +217,7 @@ def upgrade() -> None:
 
     op.execute("ALTER TABLE device_log_events RENAME TO device_log_events_legacy")
     op.execute(
-        "ALTER TABLE device_log_events_legacy "
-        "RENAME CONSTRAINT device_log_events_pkey TO device_log_events_legacy_pkey"
+        _rename_primary_key("device_log_events_legacy", "device_log_events_legacy_pkey")
     )
     op.execute(_rename_identity_sequence("device_log_events_legacy"))
     for name in _OLD_INDEXES:
@@ -244,8 +264,7 @@ def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS ix_device_log_events_message_trgm")
     op.execute("ALTER TABLE device_log_events RENAME TO device_log_events_parted")
     op.execute(
-        "ALTER TABLE device_log_events_parted "
-        "RENAME CONSTRAINT device_log_events_pkey TO device_log_events_parted_pkey"
+        _rename_primary_key("device_log_events_parted", "device_log_events_parted_pkey")
     )
     op.execute(_rename_identity_sequence("device_log_events_parted"))
     for name, _ in _NEW_INDEXES:
