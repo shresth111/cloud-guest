@@ -49,7 +49,7 @@ import dataclasses
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
@@ -61,11 +61,17 @@ from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
 from .constants import (
+    MONITORED_DEVICE_EVENT_RETENTION_DAYS,
+    MONITORED_DEVICE_LINK_FLAP_THRESHOLD_24H,
+    MONITORED_HARDWARE_DOWN_AFTER_FAILURES,
     MONITORED_HARDWARE_LIVENESS_PING_COUNT,
     ConnectionType,
 )
 from .device_adapters import (
     DeviceCredentials,
+    LanBridgeHost,
+    LanPort,
+    LanSnapshot,
     get_connected_device_adapter,
 )
 from .events import (
@@ -84,7 +90,8 @@ from .exceptions import (
     CrossOrganizationConnectedDeviceAccessError,
     UnsupportedConnectedDeviceVendorError,
 )
-from .models import ConnectedDevice
+from .health import HealthReason, HealthState, Observation, Verdict, coarse, judge
+from .models import ConnectedDevice, MonitoredDeviceHealth
 from .repository import ConnectedDeviceRepositoryProtocol
 from .validators import vendor_from_mac
 
@@ -215,6 +222,9 @@ class MonitoredHardwareLivenessSummary:
     devices_up: int
     devices_down: int
     skipped: int
+    #: Of ``devices_up``, how many are ``degraded`` (a missed probe still
+    #: inside the debounce, or a flapping port).
+    devices_degraded: int = 0
 
 
 # ============================================================================
@@ -766,12 +776,205 @@ def _resolve_liveness_credentials(
     )
 
 
+class _LanView:
+    """Lookups over one router's ``LanSnapshot``; every answer is ``None``
+    when the snapshot could not be read, so the sweep degrades to the
+    plain ICMP/ARP behaviour."""
+
+    def __init__(self, snapshot: LanSnapshot | None) -> None:
+        self.snapshot = snapshot
+        self._ports: dict[str, LanPort] = (
+            {p.name: p for p in snapshot.ports} if snapshot else {}
+        )
+        self._hosts: dict[str, LanBridgeHost] = (
+            {h.mac_address: h for h in snapshot.hosts if not h.local}
+            if snapshot
+            else {}
+        )
+
+    def host_for(self, mac: str) -> LanBridgeHost | None:
+        return self._hosts.get(mac)
+
+    def port(self, name: str | None) -> LanPort | None:
+        return self._ports.get(name) if name else None
+
+    def is_port(self, name: str | None) -> bool:
+        """A physical/bridge-member port, not the bridge itself."""
+        port = self.port(name)
+        return port is not None and port.type != "bridge"
+
+    def clients_on(self, port_name: str | None, own_mac: str) -> int | None:
+        if self.snapshot is None or not port_name:
+            return None
+        return sum(
+            1
+            for h in self.snapshot.hosts
+            if h.on_interface == port_name and not h.local and h.mac_address != own_mac
+        )
+
+    def arp_interface(
+        self, stored: str | None, host: LanBridgeHost | None
+    ) -> str | None:
+        """The L3 interface an ARP ping must go out on. A stored bridge
+        *port* maps to its bridge; a NULL one falls back to the bridge the
+        MAC was learned on, then to the router's only bridge."""
+        bridge_of = self.snapshot.bridge_of_port if self.snapshot else {}
+        if stored:
+            return bridge_of.get(stored, stored)
+        if host is not None and host.bridge:
+            return host.bridge
+        bridges = [p.name for p in self._ports.values() if p.type == "bridge"]
+        return bridges[0] if len(bridges) == 1 else None
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+def _rate_bps(
+    new: int | None, old: int | None, elapsed: float | None
+) -> int | None:
+    """Bits/s between two counter readings. A counter that went backwards
+    (router reboot) is a gap, never a spike."""
+    if new is None or old is None or not elapsed or elapsed <= 0 or new < old:
+        return None
+    return int((new - old) * 8 / elapsed)
+
+
+async def _record_health(
+    repository: ConnectedDeviceRepositoryProtocol,
+    *,
+    device: ConnectedDevice,
+    previous: MonitoredDeviceHealth | None,
+    lan: _LanView,
+    port_name: str | None,
+    port: LanPort | None,
+    observation: Observation,
+    rtt_ms: float | None,
+    ip_change: tuple[str, str] | None,
+    down_after: int,
+    now: datetime,
+) -> Verdict:
+    """Judges one device, writes its health row, its events and the
+    ``ConnectedDevice`` liveness columns. Returns the verdict."""
+    scope = {
+        "connected_device_id": device.id,
+        "organization_id": device.organization_id,
+        "location_id": device.location_id,
+    }
+    same_port = previous is not None and previous.port_name == port_name
+    new_flaps = 0
+    if (
+        same_port
+        and port is not None
+        and port.link_downs is not None
+        and previous.port_link_downs is not None
+        and port.link_downs > previous.port_link_downs
+    ):
+        new_flaps = port.link_downs - previous.port_link_downs
+        await repository.add_device_event(
+            **scope, kind="link_down", count=new_flaps, detail=port_name,
+            occurred_at=now,
+        )
+    if ip_change is not None:
+        await repository.add_device_event(
+            **scope, kind="ip_changed",
+            detail=f"{ip_change[0]} -> {ip_change[1]}", occurred_at=now,
+        )
+    observation = dataclasses.replace(
+        observation, link_flaps_24h=observation.link_flaps_24h + new_flaps
+    )
+    if previous is not None:
+        previous_state = HealthState(previous.state)
+        previous_failures = previous.consecutive_failures
+    else:
+        previous_state = HealthState.UP if device.is_active else HealthState.DOWN
+        previous_failures = 0
+    verdict = judge(
+        previous_state=previous_state,
+        previous_failures=previous_failures,
+        observation=observation,
+        down_after=down_after,
+        flap_threshold=MONITORED_DEVICE_LINK_FLAP_THRESHOLD_24H,
+    )
+    changed = previous is None or previous.state != verdict.state.value
+    if changed or (
+        verdict.state == HealthState.DOWN and previous.reason != verdict.reason.value
+    ):
+        await repository.add_device_event(
+            **scope, kind="state",
+            from_state=previous.state if previous else None,
+            to_state=verdict.state.value, reason=verdict.reason.value,
+            occurred_at=now,
+        )
+    if previous is None or coarse(previous.state) != coarse(verdict.state):
+        since = now
+    else:
+        since = previous.since
+    elapsed = (
+        (now - previous.port_counters_at).total_seconds()
+        if same_port and previous.port_counters_at
+        else None
+    )
+    fields: dict[str, object] = {
+        **scope,
+        "state": verdict.state.value,
+        "reason": verdict.reason.value,
+        "since": since,
+        "state_changed_at": now if changed else previous.state_changed_at,
+        "consecutive_failures": verdict.consecutive_failures,
+        "last_probe_at": now,
+        "last_ok_at": now if observation.alive else (
+            previous.last_ok_at if previous else None
+        ),
+        "last_rtt_ms": rtt_ms if observation.alive else None,
+        "probe_method": observation.method.value if observation.method else None,
+        "port_name": port_name,
+        "port_running": port.running if port else None,
+        "port_link_downs": port.link_downs if port else None,
+        "port_last_link_down_at": _parse_iso(port.last_link_down_at) if port else None,
+        "port_last_link_up_at": _parse_iso(port.last_link_up_at) if port else None,
+        "port_rx_bytes": port.rx_bytes if port else None,
+        "port_tx_bytes": port.tx_bytes if port else None,
+        "port_counters_at": now if port else None,
+        "rx_bps": _rate_bps(
+            port.rx_bytes if port else None,
+            previous.port_rx_bytes if same_port else None,
+            elapsed,
+        ),
+        "tx_bps": _rate_bps(
+            port.tx_bytes if port else None,
+            previous.port_tx_bytes if same_port else None,
+            elapsed,
+        ),
+        "clients_behind": lan.clients_on(port_name, device.mac_address.upper()),
+    }
+    await repository.save_health(previous, fields)
+
+    if observation.alive:
+        was_inactive = not device.is_active
+        await repository.update_device(
+            device,
+            {
+                "is_active": True,
+                "connected_at": now if was_inactive else device.connected_at,
+                "last_seen_at": now,
+            },
+        )
+    elif not verdict.is_active:
+        await repository.update_device(device, {"is_active": False})
+    # else: a missed probe inside the debounce -- leave the row as it was,
+    # last_seen_at included (it means "last confirmed alive").
+    return verdict
+
+
 async def run_monitored_hardware_liveness_sweep(
     repository: ConnectedDeviceRepositoryProtocol,
     router_lookup: RouterLookupProtocol,
     *,
     device_adapter_resolver=get_connected_device_adapter,
     ping_count: int = MONITORED_HARDWARE_LIVENESS_PING_COUNT,
+    down_after_failures: int = MONITORED_HARDWARE_DOWN_AFTER_FAILURES,
 ) -> MonitoredHardwareLivenessSummary:
     """The fast, ping-driven liveness sweep that ``tasks
     .run_monitored_hardware_liveness_sweep`` (Celery Beat) drives -- pulled
@@ -839,7 +1042,19 @@ async def run_monitored_hardware_liveness_sweep(
     sweep period instead of showing the ping verdict. Discovery still
     owns those rows' metadata (IP/hostname/interface/guest association);
     only the three liveness columns moved here.
+
+    ## Health: debounce, reason, port facts, history (2026-10-19)
+
+    Every probed device also gets a ``MonitoredDeviceHealth`` row and, on
+    change, ``MonitoredDeviceEvent`` rows -- see ``health.judge`` for the
+    state machine. ``is_active`` now follows the *debounced* verdict: one
+    missed probe reads ``degraded`` and leaves ``is_active`` alone; DOWN
+    needs ``down_after_failures`` misses in a row, or a port with no link
+    (immediate). The port facts come from ONE ``read_lan_snapshot`` per
+    router per sweep, never per device, and a device whose port is
+    link-down skips the lease read and the ARP ping entirely.
     """
+    now = datetime.now(UTC)
     targets = await repository.list_monitored_targets()
     by_router: dict[uuid.UUID, list[ConnectedDevice]] = {}
     for device, _hardware in targets:
@@ -849,6 +1064,7 @@ async def run_monitored_hardware_liveness_sweep(
     routers_failed = 0
     devices_up = 0
     devices_down = 0
+    devices_degraded = 0
     skipped = 0
 
     for router_id, devices in by_router.items():
@@ -868,6 +1084,23 @@ async def run_monitored_hardware_liveness_sweep(
             )
             continue
         try:
+            # ONE extra connection per router per sweep (never per device):
+            # port link state + MAC-to-port table. A read failure degrades
+            # to exactly the pre-snapshot behaviour; a connection failure
+            # is the router being down, handled below like a ping's.
+            try:
+                lan = _LanView(await adapter.read_lan_snapshot(credentials))
+            except ConnectedDeviceOperationError as exc:
+                logger.info(
+                    "connected_device_liveness_lan_snapshot_failed",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                lan = _LanView(None)
+            device_ids = [d.id for d in devices]
+            healths = await repository.get_health_for_devices(device_ids)
+            flaps = await repository.count_link_flaps_since(
+                device_ids, now - timedelta(hours=24)
+            )
             # MAC -> the IP the router holds for it right now, read at most
             # once per router and only when a ping has already failed.
             current_ips: dict[str, str | None] | None = None
@@ -875,10 +1108,30 @@ async def run_monitored_hardware_liveness_sweep(
                 if not device.ip_address:
                     skipped += 1
                     continue
+                previous = healths.get(device.id)
+                mac = device.mac_address.upper()
+                host = lan.host_for(mac)
+                port_name = (
+                    host.on_interface
+                    if host is not None and lan.is_port(host.on_interface)
+                    else (previous.port_name if previous else None)
+                )
+                port = lan.port(port_name)
+                port_down = port is not None and (port.disabled or not port.running)
+
                 result = await adapter.ping(
                     credentials, target=device.ip_address, count=ping_count
                 )
-                if result.received == 0:
+                alive = result.received > 0
+                method = HealthReason.ICMP if alive else None
+                rtt = result.avg_rtt_ms if alive else None
+                arp_attempted = False
+                on_lan: bool | None = None
+                ip_change: tuple[str, str] | None = None
+                # A dead link cannot answer anything: skip the lease/ARP
+                # read and the ARP ping, which is where a down device used
+                # to cost up to four connections every 30s.
+                if not alive and not port_down:
                     # The stored IP is only as fresh as the last discovery
                     # sync (15 min), and an AP that rebooted onto a new DHCP
                     # address kept being pinged at its old one -- DOWN on
@@ -889,47 +1142,74 @@ async def run_monitored_hardware_liveness_sweep(
                             found.mac_address.upper(): found.ip_address
                             for found in await adapter.discover_devices(credentials)
                         }
-                    fresh_ip = current_ips.get(device.mac_address.upper())
+                    on_lan = host is not None or mac in current_ips
+                    fresh_ip = current_ips.get(mac)
                     target_ip = device.ip_address
                     if fresh_ip and fresh_ip != device.ip_address:
+                        ip_change = (device.ip_address, fresh_ip)
                         await repository.update_device(device, {"ip_address": fresh_ip})
                         target_ip = fresh_ip
                         result = await adapter.ping(
                             credentials, target=fresh_ip, count=ping_count
                         )
-                    alive = result.received > 0
-                    if not alive and device.interface:
+                        alive = result.received > 0
+                        method = HealthReason.ICMP if alive else None
+                        rtt = result.avg_rtt_ms if alive else None
+                    arp_interface = lan.arp_interface(device.interface, host)
+                    if not alive and arp_interface:
                         # ICMP silence is not death. A TP-Link TL-WR845N
                         # used as a venue AP drops ping on its WAN port by
                         # default, so it read DOWN for two days while
                         # serving guests -- yet answered ARP ping 3/3 from
                         # the same router (an unused IP: 0/3). ARP has to
                         # be answered by anything on the LAN, and the reply
-                        # must come from this device's own MAC.
+                        # must come from this device's own MAC. The
+                        # interface must be the bridge, not a bridge port:
+                        # ``arp_interface`` maps one to the other, and
+                        # falls back to the MAC's bridge when the stored
+                        # interface is NULL (a lease-only sighting).
+                        arp_attempted = True
                         arp = await adapter.arp_ping(
                             credentials,
                             target=target_ip,
-                            interface=device.interface,
+                            interface=arp_interface,
                             count=ping_count,
                         )
-                        alive = device.mac_address.upper() in arp.replied_macs
-                else:
-                    alive = True
-                if alive:
-                    was_inactive = not device.is_active
-                    await repository.update_device(
-                        device,
-                        {
-                            "is_active": True,
-                            "connected_at": datetime.now(UTC)
-                            if was_inactive
-                            else device.connected_at,
-                            "last_seen_at": datetime.now(UTC),
-                        },
-                    )
+                        alive = mac in arp.replied_macs
+                        if alive:
+                            method = HealthReason.ARP
+                            rtt = arp.avg_rtt_ms
+                if alive and port_down and host is None:
+                    # It answered though the port we remembered it on is
+                    # down: it moved. Forget the old port.
+                    port_name, port = None, None
+
+                verdict = await _record_health(
+                    repository,
+                    device=device,
+                    previous=previous,
+                    lan=lan,
+                    port_name=port_name,
+                    port=port,
+                    observation=Observation(
+                        alive=alive,
+                        method=method,
+                        arp_attempted=arp_attempted,
+                        on_lan=on_lan,
+                        port_running=port.running if port else None,
+                        port_disabled=bool(port and port.disabled),
+                        link_flaps_24h=flaps.get(device.id, 0),
+                    ),
+                    rtt_ms=rtt,
+                    ip_change=ip_change,
+                    down_after=down_after_failures,
+                    now=now,
+                )
+                if verdict.is_active:
                     devices_up += 1
+                    if verdict.state == HealthState.DEGRADED:
+                        devices_degraded += 1
                 else:
-                    await repository.update_device(device, {"is_active": False})
                     devices_down += 1
             routers_probed += 1
         except (
@@ -946,12 +1226,18 @@ async def run_monitored_hardware_liveness_sweep(
             )
             continue
 
+    if targets:
+        await repository.prune_device_events(
+            now - timedelta(days=MONITORED_DEVICE_EVENT_RETENTION_DAYS)
+        )
+
     return MonitoredHardwareLivenessSummary(
         routers_probed=routers_probed,
         routers_failed=routers_failed,
         devices_up=devices_up,
         devices_down=devices_down,
         skipped=skipped,
+        devices_degraded=devices_degraded,
     )
 
 

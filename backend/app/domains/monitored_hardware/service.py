@@ -14,9 +14,13 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+from app.domains.connected_devices.models import (
+    MonitoredDeviceEvent,
+    MonitoredDeviceHealth,
+)
 from app.domains.location.models import Location
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
@@ -107,6 +111,17 @@ class HardwareWithStatus:
     #: agent-managed meaning without being rewritten.
     status_source: StatusSource = StatusSource.MEASURED
     status_reason: StatusReason = StatusReason.LIVENESS_PROBE
+    #: The liveness sweep's health row (state/reason/since/port facts), or
+    #: ``None`` before the first sweep that probed it. Read only here.
+    health: MonitoredDeviceHealth | None = None
+    #: That row's transitions in the last 24h, oldest first.
+    events: tuple[MonitoredDeviceEvent, ...] = ()
+    #: Other locations *in this organization* holding the same MAC.
+    duplicate_locations: tuple[str, ...] = ()
+    #: Whether another organization registered this MAC too. Only ever set
+    #: on a row this location has never observed -- the case where it is
+    #: the explanation -- and never says which organization.
+    registered_elsewhere: bool = False
 
 
 class MonitoredHardwareService:
@@ -281,7 +296,12 @@ class MonitoredHardwareService:
             venue_is_probeable = not vendors or any(
                 is_agent_managed(vendor) for vendor in vendors.values()
             )
+            same_org, other_org = await self.repository.registrations_elsewhere(
+                device.organization_id, device.location_id, device.mac_address
+            )
             return HardwareWithStatus(
+                duplicate_locations=tuple(same_org),
+                registered_elsewhere=other_org,
                 device=device,
                 status=HardwareStatus.UNKNOWN,
                 last_seen_at=None,
@@ -328,7 +348,16 @@ class MonitoredHardwareService:
         else:
             is_active = connected.is_active
         status = HardwareStatus.UP if is_active else HardwareStatus.DOWN
+        health, events = await self.repository.get_health_view(
+            connected.id, events_since=datetime.now(UTC) - timedelta(hours=24)
+        )
+        same_org, _other_org = await self.repository.registrations_elsewhere(
+            device.organization_id, device.location_id, device.mac_address
+        )
         return HardwareWithStatus(
+            health=health,
+            events=tuple(events),
+            duplicate_locations=tuple(same_org),
             device=device,
             status=status,
             last_seen_at=connected.last_seen_at,

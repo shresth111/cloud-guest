@@ -18,6 +18,7 @@ first-match-wins routing resolves the literal path first, mirroring
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
@@ -33,6 +34,8 @@ from app.domains.rbac.dependencies import (
 from .dependencies import get_monitored_hardware_service
 from .schemas import (
     MessageResponse,
+    MonitoredHardwareHealth,
+    MonitoredHardwareHealthEvent,
     MonitoredHardwareListResponse,
     MonitoredHardwareRegisterRequest,
     MonitoredHardwareResponse,
@@ -57,6 +60,52 @@ def _pagination_fields(meta: PaginationMeta) -> dict[str, int | bool]:
     }
 
 
+#: A health row whose last probe is older than this is not a current
+#: reading: the sweep runs every 30s, so five minutes means it stalled or
+#: the router stopped answering. Reported as such, never as the old state.
+_HEALTH_STALE_AFTER = timedelta(minutes=5)
+
+
+def _health_response(item: HardwareWithStatus) -> MonitoredHardwareHealth | None:
+    health = item.health
+    if health is None:
+        return None
+    state, reason = health.state, health.reason
+    if datetime.now(UTC) - health.last_probe_at > _HEALTH_STALE_AFTER:
+        state, reason = "unknown", "not_checked_recently"
+    flaps = sum(e.count or 0 for e in item.events if e.kind == "link_down")
+    return MonitoredHardwareHealth(
+        state=state,
+        reason=reason,
+        since=health.since,
+        checked_at=health.last_probe_at,
+        consecutive_failures=health.consecutive_failures,
+        last_ok_at=health.last_ok_at,
+        last_rtt_ms=health.last_rtt_ms,
+        probe_method=health.probe_method,
+        port_name=health.port_name,
+        port_running=health.port_running,
+        port_last_link_down_at=health.port_last_link_down_at,
+        port_last_link_up_at=health.port_last_link_up_at,
+        link_flaps_24h=flaps,
+        clients_behind=health.clients_behind,
+        rx_bps=health.rx_bps,
+        tx_bps=health.tx_bps,
+        events_24h=[
+            MonitoredHardwareHealthEvent(
+                at=e.occurred_at,
+                kind=e.kind,
+                from_state=e.from_state,
+                to_state=e.to_state,
+                reason=e.reason,
+                count=e.count,
+                detail=e.detail,
+            )
+            for e in item.events
+        ],
+    )
+
+
 def _device_response(item: HardwareWithStatus) -> MonitoredHardwareResponse:
     device = item.device
     return MonitoredHardwareResponse(
@@ -73,6 +122,9 @@ def _device_response(item: HardwareWithStatus) -> MonitoredHardwareResponse:
         connected_at=item.connected_at,
         status_source=item.status_source.value,
         status_reason=item.status_reason.value,
+        health=_health_response(item),
+        duplicate_locations=list(item.duplicate_locations),
+        registered_elsewhere=item.registered_elsewhere,
         created_at=device.created_at,
     )
 

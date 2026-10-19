@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import select
@@ -35,7 +36,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
-from app.domains.connected_devices.models import ConnectedDevice
+from app.domains.connected_devices.models import (
+    ConnectedDevice,
+    MonitoredDeviceEvent,
+    MonitoredDeviceHealth,
+)
+from app.domains.location.models import Location
 from app.domains.router.models import Router
 
 from .models import MonitoredHardware
@@ -72,6 +78,14 @@ class MonitoredHardwareRepositoryProtocol(Protocol):
     async def router_vendors_for_locations(
         self, location_ids: Iterable[uuid.UUID]
     ) -> dict[uuid.UUID, dict[uuid.UUID, str]]: ...
+
+    async def get_health_view(
+        self, connected_device_id: uuid.UUID, *, events_since: datetime
+    ) -> tuple[MonitoredDeviceHealth | None, list[MonitoredDeviceEvent]]: ...
+
+    async def registrations_elsewhere(
+        self, organization_id: uuid.UUID, location_id: uuid.UUID, mac_address: str
+    ) -> tuple[list[str], bool]: ...
 
 
 class MonitoredHardwareRepository:
@@ -160,6 +174,54 @@ class MonitoredHardwareRepository:
         for location_id, router_id, vendor in result.all():
             vendors.setdefault(location_id, {})[router_id] = vendor
         return vendors
+
+    async def get_health_view(
+        self, connected_device_id: uuid.UUID, *, events_since: datetime
+    ) -> tuple[MonitoredDeviceHealth | None, list[MonitoredDeviceEvent]]:
+        """The sweep-written health row and its recent transitions, read
+        only -- ``connected_devices``' liveness sweep is the only writer.
+        Capped at 200 events: a timeline, not an export."""
+        health = (
+            await self.session.execute(
+                select(MonitoredDeviceHealth).where(
+                    MonitoredDeviceHealth.connected_device_id == connected_device_id
+                )
+            )
+        ).scalar_one_or_none()
+        events = (
+            await self.session.execute(
+                select(MonitoredDeviceEvent)
+                .where(
+                    MonitoredDeviceEvent.connected_device_id == connected_device_id,
+                    MonitoredDeviceEvent.occurred_at >= events_since,
+                )
+                .order_by(MonitoredDeviceEvent.occurred_at)
+                .limit(200)
+            )
+        ).scalars().all()
+        return health, list(events)
+
+    async def registrations_elsewhere(
+        self, organization_id: uuid.UUID, location_id: uuid.UUID, mac_address: str
+    ) -> tuple[list[str], bool]:
+        """Other non-deleted registrations of this MAC: the *names* of other
+        locations in the same organization, and only *whether* one exists in
+        any other organization -- never which, so nothing about another
+        tenant is disclosed beyond that bit."""
+        rows = (
+            await self.session.execute(
+                select(MonitoredHardware.organization_id, Location.name)
+                .join(Location, Location.id == MonitoredHardware.location_id)
+                .where(
+                    MonitoredHardware.mac_address == mac_address,
+                    MonitoredHardware.location_id != location_id,
+                    MonitoredHardware.is_deleted.is_(False),
+                )
+            )
+        ).all()
+        same_org = sorted({name for org, name in rows if org == organization_id})
+        other_org = any(org != organization_id for org, _name in rows)
+        return same_org, other_org
 
 
 __all__ = ["MonitoredHardwareRepositoryProtocol", "MonitoredHardwareRepository"]

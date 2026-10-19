@@ -166,7 +166,10 @@ async def test_arp_ping_sends_arp_mode_on_the_given_interface(
         )
     ]
     assert result == ArpPingResult(
-        sent=2, received=2, replied_macs=frozenset({"A8:29:48:A9:36:3A"})
+        sent=2,
+        received=2,
+        replied_macs=frozenset({"A8:29:48:A9:36:3A"}),
+        avg_rtt_ms=pytest.approx(0.471),
     )
     assert api.closed is True
 

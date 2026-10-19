@@ -1160,6 +1160,54 @@ class ArpPingResult:
     sent: int
     received: int
     replied_macs: frozenset[str]
+    #: ``avg-rtt`` of the answered probes, milliseconds; ``None`` when
+    #: nothing answered. Defaulted so existing constructions are unchanged.
+    avg_rtt_ms: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanPort:
+    """One ``/interface`` row, the link facts a monitored device's health
+    is read from. ``last_link_*_at`` are ISO-8601 UTC strings converted
+    from the router's local clock (see ``LanSnapshot``), ``None`` when the
+    router has never recorded that event since boot."""
+
+    name: str
+    type: str | None
+    running: bool
+    disabled: bool
+    link_downs: int | None
+    last_link_down_at: str | None
+    last_link_up_at: str | None
+    rx_bytes: int | None
+    tx_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class LanBridgeHost:
+    """One ``/interface/bridge/host`` row: which port a MAC was learned on.
+    ``local`` rows are the bridge's own interfaces, not devices."""
+
+    mac_address: str
+    on_interface: str | None
+    bridge: str | None
+    local: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LanSnapshot:
+    """Everything the monitored-hardware health sweep needs from a router's
+    LAN side, read in one API connection (see ``MikroTikAdapter
+    .read_lan_snapshot``). ``bridge_of_port`` maps a bridge member port to
+    its bridge -- the L3 interface an ARP ping must be sent on.
+    ``clock_offset_seconds`` is router-local minus UTC, ``None`` when the
+    clock could not be read (link times are then left ``None`` rather than
+    guessed)."""
+
+    ports: tuple[LanPort, ...]
+    hosts: tuple[LanBridgeHost, ...]
+    bridge_of_port: Mapping[str, str]
+    clock_offset_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2350,6 +2398,9 @@ __all__ = [
     "ProvisionResult",
     "SpeedTestResult",
     "ArpPingResult",
+    "LanBridgeHost",
+    "LanPort",
+    "LanSnapshot",
     "PingResult",
     "TracerouteHop",
     "TracerouteResult",

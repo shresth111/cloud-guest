@@ -158,6 +158,31 @@ class FakeMonitoredHardwareRepository:
     # all" is the case that must keep behaving exactly as it did before
     # `status_source` existed.
     routers: list[Router] = field(default_factory=list)
+    # connected_device_id -> (health row, events); the liveness sweep's
+    # output, which this domain only reads.
+    health_views: dict[uuid.UUID, tuple[object, list]] = field(default_factory=dict)
+    location_names: dict[uuid.UUID, str] = field(default_factory=dict)
+
+    async def get_health_view(self, connected_device_id, *, events_since):
+        health, events = self.health_views.get(connected_device_id, (None, []))
+        return health, [e for e in events if e.occurred_at >= events_since]
+
+    async def registrations_elsewhere(self, organization_id, location_id, mac):
+        others = [
+            d
+            for d in self.devices.values()
+            if d.mac_address == mac
+            and d.location_id != location_id
+            and not d.is_deleted
+        ]
+        same = sorted(
+            {
+                self.location_names.get(d.location_id, str(d.location_id))
+                for d in others
+                if d.organization_id == organization_id
+            }
+        )
+        return same, any(d.organization_id != organization_id for d in others)
 
     async def create_device(self, **fields: object) -> MonitoredHardware:
         device = MonitoredHardware(**_base_fields(**fields))
@@ -829,3 +854,125 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# Health (written by the liveness sweep, read here)
+# ============================================================================
+
+
+class TestMonitoredHardwareHealthRead:
+    async def test_health_and_24h_events_ride_along(self) -> None:
+        from app.domains.connected_devices.models import (
+            MonitoredDeviceEvent,
+            MonitoredDeviceHealth,
+        )
+        from app.domains.monitored_hardware.router import _device_response
+
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:41")
+        connected = _make_connected_device(
+            organization_id=location.organization_id,
+            location_id=location.id,
+            mac_address=device.mac_address,
+            is_active=False,
+            last_seen_at=_now(),
+        )
+        h.repository.connected_devices.append(connected)
+        now = _now()
+        health = MonitoredDeviceHealth(
+            connected_device_id=connected.id, state="down", reason="port_link_down",
+            since=now - timedelta(hours=3), state_changed_at=now - timedelta(hours=3),
+            consecutive_failures=360, last_probe_at=now, last_ok_at=None,
+            last_rtt_ms=None, probe_method=None, port_name="ether3",
+            port_running=False, port_last_link_down_at=now - timedelta(hours=3),
+            port_last_link_up_at=None, rx_bps=None, tx_bps=None, clients_behind=0,
+        )
+        events = [
+            MonitoredDeviceEvent(
+                kind="link_down", count=2, detail="ether3",
+                occurred_at=now - timedelta(hours=5),
+            ),
+            MonitoredDeviceEvent(
+                kind="link_down", count=9, detail="ether3",
+                occurred_at=now - timedelta(days=2),
+            ),
+        ]
+        h.repository.health_views[connected.id] = (health, events)
+
+        body = _device_response(await h.service.with_status(device))
+
+        assert body.health is not None
+        assert (body.health.state, body.health.reason) == ("down", "port_link_down")
+        assert body.health.port_name == "ether3"
+        assert body.health.link_flaps_24h == 2  # the 2-day-old one is out
+        assert len(body.health.events_24h) == 1
+
+    async def test_a_stalled_sweep_is_not_reported_as_the_old_state(self) -> None:
+        from app.domains.connected_devices.models import MonitoredDeviceHealth
+        from app.domains.monitored_hardware.router import _device_response
+
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:42")
+        connected = _make_connected_device(
+            organization_id=location.organization_id,
+            location_id=location.id,
+            mac_address=device.mac_address,
+            is_active=True,
+            last_seen_at=_now(),
+        )
+        h.repository.connected_devices.append(connected)
+        old = _now() - timedelta(minutes=20)
+        h.repository.health_views[connected.id] = (
+            MonitoredDeviceHealth(
+                connected_device_id=connected.id, state="up", reason="icmp",
+                since=old, state_changed_at=old, consecutive_failures=0,
+                last_probe_at=old,
+            ),
+            [],
+        )
+
+        body = _device_response(await h.service.with_status(device))
+
+        assert (body.health.state, body.health.reason) == (
+            "unknown", "not_checked_recently",
+        )
+
+    async def test_duplicate_mac_is_named_in_org_and_only_flagged_across_orgs(
+        self,
+    ) -> None:
+        h = make_harness()
+        here = h.location_lookup.add(_make_location())
+        sibling = h.location_lookup.add(
+            _make_location(organization_id=here.organization_id)
+        )
+        foreign = h.location_lookup.add(_make_location())
+        h.repository.location_names[sibling.id] = "Head Office"
+        h.repository.location_names[foreign.id] = "Someone Else's Lobby"
+        mac = "A8:29:48:A9:36:3A"
+        # Legacy same-org duplicate (registration refuses new ones) and a
+        # registration in another organization.
+        await h.repository.create_device(
+            organization_id=here.organization_id, location_id=sibling.id,
+            router_id=None, name="AP", mac_address=mac,
+            device_type="Access Point", floor=None,
+        )
+        await h.repository.create_device(
+            organization_id=foreign.organization_id, location_id=foreign.id,
+            router_id=None, name="AP", mac_address=mac,
+            device_type="Access Point", floor=None,
+        )
+        device = await h.repository.create_device(
+            organization_id=here.organization_id, location_id=here.id,
+            router_id=None, name="AP", mac_address=mac,
+            device_type="Access Point", floor=None,
+        )
+
+        item = await h.service.with_status(device)
+
+        assert item.status == HardwareStatus.UNKNOWN
+        assert item.duplicate_locations == ("Head Office",)
+        assert item.registered_elsewhere is True
+
