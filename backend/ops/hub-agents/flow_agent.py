@@ -109,6 +109,8 @@ FLOW_ROW_KEYS = (
     "post_nat_ip_dst",
     "post_nat_port_src",
     "post_nat_port_dst",
+    # IPFIX NAT event type (0 on a traffic record); see nfacctd.conf.
+    "nat_event",
     "timestamp_start",
     "timestamp_end",
     "timestamp_arrival",

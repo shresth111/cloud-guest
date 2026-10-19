@@ -34,7 +34,7 @@ from .constants import (
     TRANSLATION_DERIVED,
 )
 from .formatting import normalize_ip, normalize_mac, phone_key
-from .join import build_records
+from .join import LeaseIndex, build_records
 from .repository import IpdrRepository
 from .translation import ExactOrRouterPublicIp
 
@@ -122,6 +122,13 @@ class IpdrBuilder:
         routers = sorted({f.router_id for f in flows}, key=str)
         sessions = await self.repository.sessions(routers, start, end, grace=self.grace)
         public = await self.repository.router_public_ips(routers)
+        leases = LeaseIndex(
+            await self.repository.lease_events(routers, start, end),
+            await self.repository.inventory_sightings(routers),
+        )
+        infrastructure = await self.repository.infrastructure(
+            location_id, organization_id, routers
+        )
         return build_records(
             flows,
             sessions,
@@ -131,6 +138,8 @@ class IpdrBuilder:
             grace=self.grace,
             start=start,
             end=end,
+            leases=leases,
+            infrastructure=infrastructure,
         )
 
     async def build_day(

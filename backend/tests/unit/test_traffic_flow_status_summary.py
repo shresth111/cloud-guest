@@ -832,6 +832,8 @@ class TestSecondMigration:
             for column in model.__table__.columns:
                 if column.name in {"packets_up", "packets_down"}:
                     continue  # added by 0161, see test_traffic_flow_destinations
+                if column.name == "ipdr_ports":
+                    continue  # added by 0170_traffic_flow_record_ipdr_ports
                 assert f" {column.name} " in body, (model.__tablename__, column.name)
         assert (
             "uq_traffic_flow_service_buckets_key UNIQUE "

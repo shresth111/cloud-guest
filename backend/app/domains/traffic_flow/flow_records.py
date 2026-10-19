@@ -87,6 +87,28 @@ For the sample that is at most about 150 rows from the 3,207, plus at most
 MB at retention for that venue. An estimate from the sample's summary
 counts, not a replay of its rows.
 
+## IPDR routers keep their ports (``router_traffic_flow_export.ipdr_ports``)
+
+An IPDR row needs the guest's own source port. For a router whose export
+row has ``ipdr_ports`` on (a Master-console switch, off by default), the
+venue-side port is **not** merged away, whatever
+``traffic_flow_record_merge_ports`` says. One exception keeps the measured
+noise bounded: UDP whose outside end is port 123 (NTP, 3,183 of the
+sample's 5,183 records) is still port-merged, per venue host and outside
+server, and flagged ``ports_merged`` like before. The per-router daily cap
+still applies and still says so.
+
+## NAT events (IPFIX ``nat-events=yes``)
+
+RouterOS sends conntrack NAT events as a template of their own (on the
+fleet: elements 4, 7, 8, 11, 12, 225-228, 230 natEvent and 323
+observationTimeMilliseconds, no byte or packet counter). pmacct prints them
+as rows with ``bytes`` and ``packets`` 0, its start time the observation
+time, and -- only when the hub's aggregate carries ``nat_event`` -- the
+event type. They are stored as rows with ``nat_event`` set (the IANA
+natEvent value, 0 when the hub did not send the type) and never merged
+with a traffic record. NULL ``nat_event`` = a traffic record.
+
 ## Size (the default cap)
 
 A row with every field filled and its indexes measures 307 bytes on
@@ -226,6 +248,15 @@ _START_KEYS = ("timestamp_start",)
 _END_KEYS = ("timestamp_end",)
 _ARRIVAL_KEYS = ("timestamp_arrival",)
 _EXPORTER_PORT_KEYS = ("peer_port_src", "peer_src_port")
+_NAT_EVENT_KEYS = ("nat_event",)
+
+#: ``nat_event`` of a NAT-event row whose type the hub did not send (its
+#: aggregate has no ``nat_event``): known to be an event, type unknown.
+NAT_EVENT_UNTYPED = 0
+#: UDP to or from these outside ports is port-merged even on a router that
+#: keeps ports for the IPDR: NTP, the measured bulk of the noise.
+SUMMARISED_REMOTE_PORTS = frozenset({123})
+_UDP = 17
 
 #: pmacct prints these when a field is in the aggregate but the exporter
 #: sent nothing for it. They mean "not recorded", not an address.
@@ -296,6 +327,21 @@ def _instant(value: Any) -> datetime | None:
     return parsed if parsed.timestamp() > 0 else None
 
 
+def nat_event_of(row: Mapping[str, Any]) -> int | None:
+    """The natEvent value of a NAT-event row, else ``None`` (a traffic
+    record). A row with the hub's ``nat_event`` key above 0 is an event of
+    that type. Without the key (the hub's aggregate does not carry it), a row
+    whose ``packets`` AND ``bytes`` are both an explicit 0 is an event of
+    unknown type: no traffic record has zero packets, and pmacct prints the
+    counters of a counter-less NAT-event template as 0."""
+    typed = _count(_first(row, _NAT_EVENT_KEYS))
+    if typed:
+        return typed
+    if _count(row.get("packets")) == 0 and _count(row.get("bytes")) == 0:
+        return NAT_EVENT_UNTYPED
+    return None
+
+
 def _direction(src: str, dst: str) -> str:
     src_local = bool(is_local_address(src))
     dst_local = bool(is_local_address(dst))
@@ -360,6 +406,7 @@ def flow_record_rows(
                 "exporter_port": _port(_first(row, _EXPORTER_PORT_KEYS)),
                 "records_merged": 1,
                 "ports_merged": False,
+                "nat_event": nat_event_of(row),
             }
         )
     out.sort(key=lambda r: (-r["bytes"], r["src_address"], r["dst_address"]))
@@ -418,6 +465,11 @@ def _merge(group: list[dict[str, Any]], side: str | None) -> dict[str, Any]:
     for name in ("nat_src_port", "nat_dst_port"):
         address = name.replace("port", "address")
         out[name] = _common([r[name] for r in group]) if out[address] else None
+    if out.get("nat_event") is not None:
+        # Events only merge with events; a create and its delete in one
+        # window become one row spanning both, type then unknown.
+        typed = _common([r.get("nat_event") for r in group])
+        out["nat_event"] = NAT_EVENT_UNTYPED if typed is None else typed
     if side is not None:
         ports = [r[f"{side}_port"] for r in group]
         if not all(p == ports[0] for p in ports):
@@ -427,8 +479,33 @@ def _merge(group: list[dict[str, Any]], side: str | None) -> dict[str, Any]:
     return out
 
 
+def _remote_port(record: dict[str, Any], side: str | None) -> int | None:
+    """The outside end's port: the one that is not the venue side."""
+    if side == "src":
+        return record["dst_port"]
+    if side == "dst":
+        return record["src_port"]
+    return None
+
+
+def _merges_ports(
+    record: dict[str, Any], merge_ports: bool, summarised: frozenset[int]
+) -> str | None:
+    """Which side's port this record may lose to a merge, if any."""
+    side = _venue_side(record["direction"])
+    if side is None or merge_ports:
+        return side
+    if record["protocol"] == _UDP and _remote_port(record, side) in summarised:
+        return side
+    return None
+
+
 def prepare_records(
-    records: list[dict[str, Any]], *, store_internal: bool, merge_ports: bool
+    records: list[dict[str, Any]],
+    *,
+    store_internal: bool,
+    merge_ports: bool,
+    summarised_ports: frozenset[int] = frozenset(),
 ) -> tuple[list[dict[str, Any]], WindowCounts]:
     """One window's records as they will be stored, largest first, and what
     was left out or folded on the way. Nothing is dropped without a count.
@@ -442,7 +519,11 @@ def prepare_records(
       too; that port is then ``None`` and ``ports_merged`` is true. The
       outside end's address and port, which say what was reached, are never
       merged away. Internal and unclassified records have no venue side and
-      are only merged when identical."""
+      are only merged when identical.
+    * Without ``merge_ports`` (a router kept for the IPDR), UDP records whose
+      outside port is in ``summarised_ports`` (NTP) are still port-merged,
+      and flagged ``ports_merged`` the same way.
+    * NAT-event rows (``nat_event`` not None) only merge with each other."""
     received = len(records)
     internal = 0
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
@@ -451,7 +532,7 @@ def prepare_records(
         if direction == DIRECTION_INTERNAL and not store_internal:
             internal += 1
             continue
-        side = _venue_side(direction) if merge_ports else None
+        side = _merges_ports(record, merge_ports, summarised_ports)
         key = (
             direction,
             record["src_address"],
@@ -459,12 +540,11 @@ def prepare_records(
             record["dst_address"],
             None if side == "dst" else record["dst_port"],
             record["protocol"],
+            record.get("nat_event") is not None,
+            side,
         )
         groups.setdefault(key, []).append(record)
-    rows = [
-        _merge(group, _venue_side(group[0]["direction"]) if merge_ports else None)
-        for group in groups.values()
-    ]
+    rows = [_merge(group, key[-1]) for key, group in groups.items()]
     rows.sort(key=lambda r: (-r["bytes"], r["src_address"], r["dst_address"]))
     return rows, WindowCounts(
         received=received, internal=internal, merged=received - internal - len(rows)
@@ -1047,6 +1127,7 @@ class FlowRecordWriter:
         *,
         enabled_router_ids: Callable[[], Any],
         platform: PlatformEndpoints = NO_PLATFORM_ENDPOINTS,
+        ipdr_port_router_ids: Callable[[], Any] | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -1055,11 +1136,22 @@ class FlowRecordWriter:
         self.platform = platform
         self._enabled_router_ids = enabled_router_ids
         self._enabled: set[uuid.UUID] | None = None
+        #: Routers whose export row has ``ipdr_ports`` on: venue-side ports
+        #: are kept (NTP aside) whatever ``traffic_flow_record_merge_ports``.
+        self._ipdr_port_router_ids = ipdr_port_router_ids
+        self._keep_ports: set[uuid.UUID] | None = None
 
     async def _export_on(self, router_id: uuid.UUID) -> bool:
         if self._enabled is None:
             self._enabled = set(await self._enabled_router_ids())
         return router_id in self._enabled
+
+    async def keeps_ports(self, router_id: uuid.UUID) -> bool:
+        if self._ipdr_port_router_ids is None:
+            return False
+        if self._keep_ports is None:
+            self._keep_ports = set(await self._ipdr_port_router_ids())
+        return router_id in self._keep_ports
 
     async def write_window(
         self,
@@ -1077,14 +1169,15 @@ class FlowRecordWriter:
         received = flow_record_rows(rows, exporter, self.platform)
         if not received:
             return 0
+        keep_ports = await self.keeps_ports(router_id)
         records, counts = prepare_records(
             received,
             store_internal=bool(
                 getattr(self.settings, "traffic_flow_record_store_internal", False)
             ),
-            merge_ports=bool(
-                getattr(self.settings, "traffic_flow_record_merge_ports", True)
-            ),
+            merge_ports=not keep_ports
+            and bool(getattr(self.settings, "traffic_flow_record_merge_ports", True)),
+            summarised_ports=SUMMARISED_REMOTE_PORTS if keep_ports else frozenset(),
         )
         window_start: datetime = identity["window_start"]
         day = window_start.astimezone(UTC).date()

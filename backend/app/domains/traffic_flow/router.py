@@ -39,6 +39,7 @@ from .service import (
     TrafficFlowRepository,
     TrafficFlowStatusService,
     TrafficFlowSummaryService,
+    set_ipdr_ports,
 )
 
 __all__ = ["traffic_flow_platform_router"]
@@ -265,6 +266,48 @@ async def remove_traffic_flow_config(
     return build_response(
         success=True,
         message="Traffic flow removed",
+        data=data,
+        request_id=_request_id(request),
+    )
+
+
+class TrafficFlowIpdrPortsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: True = keep the venue-side port in this router's flow records.
+    enabled: bool
+
+
+@traffic_flow_platform_router.post(
+    "/routers/{router_id}/ipdr-ports",
+    response_model=ApiResponse[dict[str, Any]],
+    dependencies=[Depends(_UPDATE)],
+)
+async def set_traffic_flow_ipdr_ports(
+    router_id: uuid.UUID,
+    payload: TrafficFlowIpdrPortsRequest,
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    session: AsyncSession = Depends(get_db_session),
+    audit: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> dict[str, Any]:
+    """Master: the IPDR switch for one router. On: its flow records keep the
+    guest's source port (UDP/123 still summarised), so the IPDR has Source
+    Port and Translated Port; stored rows grow and the daily cap applies.
+    Nothing is written to the router. Audited."""
+    repository = TrafficFlowRepository(session)
+    fleet = await repository.fleet_routers(router_id)
+    data = await set_ipdr_ports(
+        repository,
+        audit,
+        router_id,
+        enabled=payload.enabled,
+        actor_user_id=uuid.UUID(str(user.id)),
+        organization_id=fleet[0].organization_id if fleet else None,
+    )
+    return build_response(
+        success=True,
+        message="Traffic flow IPDR ports",
         data=data,
         request_id=_request_id(request),
     )

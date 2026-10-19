@@ -35,10 +35,48 @@ IPDR_COLUMNS: tuple[str, ...] = (
 )
 #: Appended after the 18 standard columns only on request
 #: (``include_provenance=true``), so the standard file stays standard.
-PROVENANCE_COLUMNS: tuple[str, ...] = ("Translated Address Source", "User Match")
+PROVENANCE_COLUMNS: tuple[str, ...] = (
+    "Translated Address Source",
+    "User Match",
+    "MAC Source",
+    "IP Allocation Source",
+    "Device Class",
+)
 
 #: The value of "User ID for Internet Access" when no session matched.
 UNKNOWN_USER = "unknown"
+#: ... and when no session matched but the address is known infrastructure
+#: (the router itself, registered monitored hardware, an authorised-MAC
+#: bypass device): not a guest, and not "unknown" either.
+DEVICE_USER = "device"
+
+# -- who a row belongs to (table view only, never one of the 18 columns) -----
+USER_CLASS_GUEST = "guest"
+USER_CLASS_DEVICE = "device"
+USER_CLASS_UNKNOWN = "unknown"
+#: Why a row is ``device``.
+DEVICE_KIND_ROUTER = "router"
+DEVICE_KIND_MONITORED = "monitored_hardware"
+DEVICE_KIND_AUTHORIZED = "authorized_mac"
+
+# -- MAC / allocation provenance ----------------------------------------------
+#: The guest session's own device.
+SOURCE_SESSION = "session"
+#: The router's DHCP server log (``guest_device_events`` ip_assigned /
+#: ip_released for that address on that router at that time).
+SOURCE_DHCP = "dhcp"
+#: The device inventory (``connected_devices``: the router's lease/ARP
+#: table as last synced), only while the sighting covers the instant.
+SOURCE_INVENTORY = "inventory"
+#: How far back a DHCP assignment may be to still hold the address, and how
+#: far past the day a release is looked for.
+LEASE_LOOKBACK = timedelta(days=2)
+LEASE_LOOKAHEAD = timedelta(hours=6)
+
+# -- connection provenance ------------------------------------------------------
+#: IANA natEvent values (RFC 8158) RouterOS may send. 0 = type not sent.
+NAT_EVENT_CREATE = frozenset({1, 4})
+NAT_EVENT_DELETE = frozenset({2, 5})
 #: Guests get their address from the venue's DHCP.
 ALLOCATION_DYNAMIC = "Dynamic"
 

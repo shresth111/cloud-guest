@@ -304,6 +304,15 @@ class TrafficFlowRepository:
         )
         return set((await self.session.execute(stmt)).scalars().all())
 
+    async def ipdr_port_router_ids(self) -> set[uuid.UUID]:
+        """Routers whose flow records keep the venue-side port (IPDR)."""
+        stmt = select(RouterTrafficFlowExport.router_id).where(
+            RouterTrafficFlowExport.enabled.is_(True),
+            RouterTrafficFlowExport.ipdr_ports.is_(True),
+            RouterTrafficFlowExport.is_deleted.is_(False),
+        )
+        return set((await self.session.execute(stmt)).scalars().all())
+
     # -- fleet status -----------------------------------------------------
     async def fleet_routers(
         self,
@@ -1711,3 +1720,39 @@ class TrafficFlowDeviceService:
             "before": _state_dict(result.before),
             "after": _state_dict(result.after),
         }
+
+
+async def set_ipdr_ports(
+    repository: TrafficFlowRepository,
+    audit_writer: AuditWriter,
+    router_id: uuid.UUID,
+    *,
+    enabled: bool,
+    actor_user_id: uuid.UUID,
+    organization_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Master: keep (or stop keeping) this router's venue-side ports in its
+    flow records, for the IPDR. Needs the router's export row (export applied
+    once). Changes nothing on the router; takes effect from the next pull."""
+    row = await repository.get_export(router_id)
+    if row is None:
+        raise TrafficFlowError(
+            "This router has no traffic-flow export row; apply the export first.",
+            code="TRAFFIC_FLOW_NOT_CONFIGURED",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+    before = bool(row.ipdr_ports)
+    row.ipdr_ports = enabled
+    await repository.save_export(row)
+    await audit_writer.create_audit_log_entry(
+        actor_user_id=actor_user_id,
+        action="traffic_flow_ipdr_ports_set",
+        entity_type="router",
+        entity_id=router_id,
+        description=(
+            f"Traffic flow IPDR ports {'on' if enabled else 'off'} for router "
+            f"{router_id} (was {'on' if before else 'off'})"
+        ),
+        organization_id=organization_id,
+    )
+    return {"router_id": str(router_id), "ipdr_ports": enabled, "was": before}
