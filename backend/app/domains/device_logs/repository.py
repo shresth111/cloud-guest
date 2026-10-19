@@ -515,6 +515,9 @@ def customer_conditions(f: CustomerFilters) -> list[Any]:
     conditions: list[Any] = [
         DeviceLogEvent.organization_id == f.organization_id,
         DeviceLogEvent.organization_id.is_not(None),
+        # Rows stored before ingest refused the owner of a mismatched tag
+        # still carry the tunnel IP's owner; never show them to a tenant.
+        DeviceLogEvent.attribution != Attribution.TAG_MISMATCH.value,
         DeviceLogEvent.received_at >= f.since,
         DeviceLogEvent.received_at <= f.until,
     ]

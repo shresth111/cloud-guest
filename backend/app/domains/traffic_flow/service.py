@@ -140,6 +140,28 @@ class ExporterRouter:
     location_id: uuid.UUID | None
 
 
+def exporter_map_from_rows(
+    rows: Iterable[tuple[Any, uuid.UUID, uuid.UUID | None, uuid.UUID | None]],
+) -> dict[str, ExporterRouter]:
+    """``(tunnel_ip, router_id, org_id, location_id)`` rows -> exporter map,
+    refusing any address that more than one router holds."""
+    owners: dict[str, dict[uuid.UUID, ExporterRouter]] = {}
+    for ip, rid, org, loc in rows:
+        owners.setdefault(str(ip), {})[rid] = ExporterRouter(
+            router_id=rid, organization_id=org, location_id=loc
+        )
+    out: dict[str, ExporterRouter] = {}
+    for ip, by_router in owners.items():
+        if len(by_router) == 1:
+            out[ip] = next(iter(by_router.values()))
+        else:
+            logger.warning(
+                "traffic_flow_ambiguous_exporter",
+                extra={"exporter": ip, "router_count": len(by_router)},
+            )
+    return out
+
+
 @dataclass(frozen=True, slots=True)
 class FleetRouter:
     """One router as the fleet status lists it, with its export row."""
@@ -468,8 +490,13 @@ class TrafficFlowRepository:
         return await load_platform_server_hosts(self.session)
 
     async def exporter_router_map(self) -> dict[str, ExporterRouter]:
-        """Tunnel address -> router, for every non-revoked peer. A tunnel
-        address is unique per hub; the fleet has one hub."""
+        """Tunnel address -> router, for every live, non-revoked peer. A
+        tunnel address is unique per hub, not globally.
+
+        An address held by more than one live router is left out (so its
+        windows land in ``unknown_exporters``): picking one of them would
+        file one venue's traffic -- and its IPDR joins -- under another
+        tenant."""
         stmt = (
             select(
                 WireGuardPeer.tunnel_ip_address,
@@ -479,13 +506,11 @@ class TrafficFlowRepository:
             )
             .join(Router, Router.id == WireGuardPeer.router_id)
             .where(WireGuardPeer.status != PeerStatus.REVOKED.value)
+            .where(WireGuardPeer.is_deleted.is_(False))
             .where(Router.is_deleted.is_(False))
         )
         rows = (await self.session.execute(stmt)).all()
-        return {
-            str(ip): ExporterRouter(router_id=rid, organization_id=org, location_id=loc)
-            for ip, rid, org, loc in rows
-        }
+        return exporter_map_from_rows(rows)
 
     async def sessions_by_ip(
         self,

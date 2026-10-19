@@ -337,15 +337,22 @@ class TestIngest:
         assert row["attribution"] == Attribution.TUNNEL_IP
 
     @pytest.mark.asyncio
-    async def test_tag_naming_another_router_flags_mismatch_but_keeps_ip_owner(
+    async def test_tag_naming_another_router_flags_mismatch_and_refuses_owner(
         self,
     ) -> None:
+        # The tunnel IP was re-allocated to another tenant's router while
+        # the old device (tag 8a199617) still sends: the line must not land
+        # in the new owner's NetLogs.
         repo = FakeRepo()
-        other = uuid.uuid4()
-        repo.owners["10.20.0.31"] = [PeerOwner(other, ORG_ID, LOC_ID)]
-        await _service(repo).ingest([_event()])
-        assert repo.inserted[0]["attribution"] == Attribution.TAG_MISMATCH
-        assert repo.inserted[0]["router_id"] == other
+        other_router, other_org, other_loc = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        repo.owners["10.20.0.31"] = [PeerOwner(other_router, other_org, other_loc)]
+        result = await _service(repo).ingest([_event()])
+        row = repo.inserted[0]
+        assert row["attribution"] == Attribution.TAG_MISMATCH
+        assert row["router_id"] is None
+        assert row["organization_id"] is None and row["location_id"] is None
+        assert row["claimed_tag"] == "8a199617"
+        assert result["tag_mismatch"] == 1 and result["attributed"] == 0
 
     @pytest.mark.asyncio
     async def test_unknown_ip_is_unattributed_even_with_a_valid_tag(self) -> None:

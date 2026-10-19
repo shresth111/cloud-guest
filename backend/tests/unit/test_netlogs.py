@@ -271,6 +271,8 @@ def _matches(r: Row, f: CustomerFilters) -> bool:
     """Mirror of ``customer_conditions``."""
     if r.organization_id is None or r.organization_id != f.organization_id:
         return False
+    if r.attribution == "tag_mismatch":
+        return False
     if not (f.since <= r.received_at <= f.until):
         return False
     if f.allowed_location_ids is not None and r.location_id not in (
@@ -697,6 +699,12 @@ class TestSqlConditions:
         sql = self._sql(CustomerFilters(organization_id=ORG_A, since=NOW, until=NOW))
         assert f"device_log_events.organization_id = '{ORG_A}'" in sql
         assert "device_log_events.organization_id IS NOT NULL" in sql
+
+    def test_tag_mismatch_rows_are_never_shown_to_a_tenant(self) -> None:
+        # A legacy row stamped with the tunnel IP's owner while its tag named
+        # another router must not reach that owner's NetLogs.
+        sql = self._sql(CustomerFilters(organization_id=ORG_A, since=NOW, until=NOW))
+        assert "device_log_events.attribution != 'tag_mismatch'" in sql
 
     def test_confinement_is_an_in_list_and_empty_matches_nothing(self) -> None:
         sql = self._sql(
