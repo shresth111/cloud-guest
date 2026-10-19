@@ -319,8 +319,14 @@ class DeviceLogsService:
                 attribution = Attribution.UNATTRIBUTED
                 counts["unattributed"] += 1
             elif parsed.tag is not None and parsed.tag != router_tag(owner.router_id):
+                # The line names another router: the tunnel IP was most
+                # likely re-allocated while the old device still sends.
+                # Keeping the IP's current owner would show one venue's
+                # lines in another tenant's NetLogs, so refuse the owner
+                # and keep the flag (and claimed_tag) for the operators.
                 attribution = Attribution.TAG_MISMATCH
                 counts["tag_mismatch"] += 1
+                owner = None
             else:
                 attribution = Attribution.TUNNEL_IP
                 counts["attributed"] += 1
