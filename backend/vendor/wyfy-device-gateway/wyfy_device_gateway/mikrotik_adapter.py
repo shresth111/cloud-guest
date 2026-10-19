@@ -78,6 +78,7 @@ import shlex
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 
 import asyncssh
 import librouteros
@@ -129,6 +130,9 @@ from .contract import (
     NatRuleConfig,
     NetworkSnapshot,
     ArpPingResult,
+    LanBridgeHost,
+    LanPort,
+    LanSnapshot,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
@@ -2866,13 +2870,73 @@ class MikroTikAdapter:
                 ) from exc
         finally:
             api.close()
-        sent, received, _loss, _rtt = _parse_ping_rows(rows, requested_count=count)
+        sent, received, _loss, rtt = _parse_ping_rows(rows, requested_count=count)
         # A timed-out row carries the target IP in ``host``, not a MAC;
         # normalize_mac_address drops it.
         replied_macs = frozenset(
             mac for row in rows if (mac := normalize_mac_address(row.get("host")))
         )
-        return ArpPingResult(sent=sent, received=received, replied_macs=replied_macs)
+        return ArpPingResult(
+            sent=sent,
+            received=received,
+            replied_macs=replied_macs,
+            avg_rtt_ms=rtt if received else None,
+        )
+
+    async def read_lan_snapshot(self, creds: DeviceCredentials) -> LanSnapshot:
+        """Port link state, MAC-to-port table and the router clock, in ONE
+        API connection -- the monitored-hardware health sweep reads this
+        once per router per sweep, never per device.
+
+        Four reads, all small and all read-only:
+
+        * ``/interface`` (``.proplist`` trimmed): ``running``, ``link-downs``,
+          ``last-link-down-time``/``last-link-up-time``, byte counters. Tells
+          "cable pulled / device powered off" apart from "device ignores
+          ping", which ICMP and ARP cannot.
+        * ``/interface/bridge/host`` (``.proplist`` trimmed): the port each
+          MAC was learned on, and how many other MACs share that port.
+        * ``/interface/bridge/port``: port -> bridge, so an ARP ping can be
+          sent on the bridge even when the stored interface is a port.
+        * ``/system/clock``: RouterOS reports link times in local time; the
+          offset converts them to UTC. Unreadable clock -> times ``None``.
+
+        Measured on a hEX lite (RouterOS 7.21.4) 2026-10-19: 0.06 s, 0.04 s
+        and well under 0.1 s for the rest.
+        """
+        return await asyncio.to_thread(self._read_lan_snapshot_sync, creds)
+
+    def _read_lan_snapshot_sync(self, creds: DeviceCredentials) -> LanSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                interfaces = list(
+                    api("/interface/print", **{".proplist": _LAN_PORT_PROPLIST})
+                )
+                hosts = list(
+                    api(
+                        "/interface/bridge/host/print",
+                        **{".proplist": _LAN_HOST_PROPLIST},
+                    )
+                )
+                members = list(
+                    api(
+                        "/interface/bridge/port/print",
+                        **{".proplist": "interface,bridge"},
+                    )
+                )
+            except (LibRouterosError, OSError) as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"lan snapshot failed: {_describe_exception(exc)}"
+                ) from exc
+            try:
+                clock_rows = list(api("/system/clock/print"))
+            except (LibRouterosError, OSError):
+                clock_rows = []
+        finally:
+            self._safe_close(api)
+        offset = _router_clock_offset_seconds(clock_rows, time.time())
+        return _build_lan_snapshot(interfaces, hosts, members, offset)
 
     async def traceroute(
         self,
@@ -8872,6 +8936,116 @@ def _build_default_routes(
             )
         )
     return routes
+
+
+_LAN_PORT_PROPLIST = (
+    "name,type,running,disabled,link-downs,last-link-down-time,"
+    "last-link-up-time,rx-byte,tx-byte"
+)
+_LAN_HOST_PROPLIST = "mac-address,on-interface,bridge,local"
+_ROUTEROS_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+
+def _parse_routeros_local_datetime(value: object) -> datetime | None:
+    """A RouterOS local timestamp as a naive datetime. 7.10+ prints
+    ``2026-10-19 07:09:20``; older releases ``oct/19/2026 07:09:20``."""
+    text = _safe_str(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+    match = re.fullmatch(r"([a-z]{3})/(\d{2})/(\d{4}) (\d{2}):(\d{2}):(\d{2})", text)
+    if not match or match.group(1).lower() not in _ROUTEROS_MONTHS:
+        return None
+    mon, day, year, hh, mm, ss = match.groups()
+    try:
+        return datetime(
+            int(year), _ROUTEROS_MONTHS[mon.lower()], int(day),
+            int(hh), int(mm), int(ss),
+        )
+    except ValueError:
+        return None
+
+
+def _router_clock_offset_seconds(
+    clock_rows: Sequence[Mapping[str, object]], now_epoch: float
+) -> float | None:
+    """Router local time minus UTC, in seconds, from ``/system/clock``.
+    Derived from the router's own ``date``+``time`` rather than its
+    ``gmt-offset`` so a router whose clock is simply wrong (no NTP) still
+    converts its own link timestamps consistently."""
+    if not clock_rows:
+        return None
+    row = clock_rows[0]
+    local = _parse_routeros_local_datetime(f"{row.get('date')} {row.get('time')}")
+    if local is None:
+        return None
+    utc_now = datetime.fromtimestamp(now_epoch, tz=UTC).replace(tzinfo=None)
+    return round((local - utc_now).total_seconds())
+
+
+def _router_local_to_utc_iso(value: object, offset: float | None) -> str | None:
+    local = _parse_routeros_local_datetime(value)
+    if local is None or offset is None:
+        return None
+    return (local - timedelta(seconds=offset)).replace(tzinfo=UTC).isoformat()
+
+
+def _build_lan_snapshot(
+    interfaces: Sequence[Mapping[str, object]],
+    hosts: Sequence[Mapping[str, object]],
+    members: Sequence[Mapping[str, object]],
+    offset: float | None,
+) -> LanSnapshot:
+    ports = tuple(
+        LanPort(
+            name=str(row["name"]),
+            type=_safe_str(row.get("type")),
+            running=_is_truthy(row.get("running")),
+            disabled=_is_truthy(row.get("disabled")),
+            link_downs=_safe_int(row.get("link-downs")),
+            last_link_down_at=_router_local_to_utc_iso(
+                row.get("last-link-down-time"), offset
+            ),
+            last_link_up_at=_router_local_to_utc_iso(
+                row.get("last-link-up-time"), offset
+            ),
+            rx_bytes=_safe_int(row.get("rx-byte")),
+            tx_bytes=_safe_int(row.get("tx-byte")),
+        )
+        for row in interfaces
+        if row.get("name")
+    )
+    bridge_hosts = tuple(
+        LanBridgeHost(
+            mac_address=mac,
+            on_interface=_safe_str(row.get("on-interface")),
+            bridge=_safe_str(row.get("bridge")),
+            local=_is_truthy(row.get("local")),
+        )
+        for row in hosts
+        if (mac := normalize_mac_address(row.get("mac-address")))
+    )
+    bridge_of_port = {
+        str(row["interface"]): str(row["bridge"])
+        for row in members
+        if row.get("interface") and row.get("bridge")
+    }
+    return LanSnapshot(
+        ports=ports,
+        hosts=bridge_hosts,
+        bridge_of_port=bridge_of_port,
+        clock_offset_seconds=offset,
+    )
 
 
 def _parse_ping_rows(

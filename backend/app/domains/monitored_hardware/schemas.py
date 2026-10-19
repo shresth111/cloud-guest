@@ -13,6 +13,8 @@ from app.domains.auth.schemas import MessageResponse
 
 __all__ = [
     "MessageResponse",
+    "MonitoredHardwareHealth",
+    "MonitoredHardwareHealthEvent",
     "MonitoredHardwareRegisterRequest",
     "MonitoredHardwareResponse",
     "MonitoredHardwareListResponse",
@@ -26,6 +28,49 @@ class MonitoredHardwareRegisterRequest(BaseModel):
     mac_address: str
     device_type: str
     floor: str | None = None
+
+
+class MonitoredHardwareHealthEvent(BaseModel):
+    at: datetime
+    # "state" | "link_down" | "ip_changed"
+    kind: str
+    from_state: str | None
+    to_state: str | None
+    reason: str | None
+    count: int | None
+    detail: str | None
+
+
+class MonitoredHardwareHealth(BaseModel):
+    """What the liveness sweep last concluded, with its evidence. Codes,
+    never prose -- the console owns the words (``@/lib/device-health``).
+
+    ``since`` is when this platform saw the device come up (or go down):
+    an observation, NOT the device's uptime, which nothing behind a router
+    reports. A reboot between two sweeps shows as a port link flap."""
+
+    # "up" | "degraded" | "down" | "unknown"
+    state: str
+    # connected_devices.health.HealthReason, or "not_checked_recently"
+    reason: str
+    since: datetime
+    checked_at: datetime
+    consecutive_failures: int
+    last_ok_at: datetime | None
+    last_rtt_ms: float | None
+    # "icmp" | "arp"
+    probe_method: str | None
+    port_name: str | None
+    port_running: bool | None
+    port_last_link_down_at: datetime | None
+    port_last_link_up_at: datetime | None
+    link_flaps_24h: int
+    # Other MACs learned on the same router port (an AP's clients).
+    clients_behind: int | None
+    # Port rates, bits/s: rx = from the device, tx = to the device.
+    rx_bps: int | None
+    tx_bps: int | None
+    events_24h: list[MonitoredHardwareHealthEvent]
 
 
 class MonitoredHardwareResponse(BaseModel):
@@ -60,6 +105,14 @@ class MonitoredHardwareResponse(BaseModel):
     # `@/lib/device-liveness`); a sentence composed here would be a second
     # copy of them, free to drift.
     status_reason: str
+    # Null until the liveness sweep has probed this device once.
+    health: MonitoredHardwareHealth | None = None
+    # Other locations in this organization registered with the same MAC.
+    # Only the location whose router sees the MAC can report its status.
+    duplicate_locations: list[str] = []
+    # True when another organization registered this MAC, sent only for a
+    # row this location has never observed. Never says which.
+    registered_elsewhere: bool = False
     created_at: datetime
 
 

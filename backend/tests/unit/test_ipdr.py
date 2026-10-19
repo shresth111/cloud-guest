@@ -1173,13 +1173,14 @@ class TestMigration:
         ]
         assert children == ["0170_traffic_flow_record_ipdr_ports.py"]
 
-    def test_0170_is_the_head(self) -> None:
+    def test_0170_chains_into_0171_only(self) -> None:
         children = [
             p.name
             for p in VERSIONS.glob("*.py")
             if 'down_revision = "0170_traffic_flow_record_ipdr_ports"' in p.read_text()
         ]
-        assert not children
+        # 0171 (monitored device health) builds on this one.
+        assert children == ["0171_create_monitored_device_health.py"]
 
     def test_tables_are_registered(self) -> None:
         import app.domains.ipdr.models  # noqa: F401
