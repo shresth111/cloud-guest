@@ -33,6 +33,8 @@ class DemoRequestRepositoryProtocol(Protocol):
         self, demo_request: DemoRequest, data: dict[str, object]
     ) -> DemoRequest: ...
 
+    async def soft_delete(self, demo_request: DemoRequest) -> DemoRequest: ...
+
     async def list_records(
         self,
         *,
@@ -62,6 +64,15 @@ class DemoRequestRepository:
         self, demo_request: DemoRequest, data: dict[str, object]
     ) -> DemoRequest:
         return await self.demo_requests.update(demo_request, data)
+
+    async def soft_delete(self, demo_request: DemoRequest) -> DemoRequest:
+        """Flags the row ``is_deleted``/``deleted_at`` -- never a row
+        removal. ``demo_bookings.demo_request_id`` references this table with
+        ``ON DELETE RESTRICT``, so a hard delete would fail for any lead that
+        ever booked a slot. Both read paths already exclude flagged rows
+        (``get_by_id`` via ``GenericRepository``'s default, ``_list_filters``
+        below explicitly)."""
+        return await self.demo_requests.soft_delete(demo_request)
 
     def _list_filters(
         self,

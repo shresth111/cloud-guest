@@ -276,10 +276,16 @@ class DemoBookingRepository:
     async def find_lead_by_id(self, lead_id: uuid.UUID) -> DemoRequest | None:
         """The lead a booking belongs to. Read through this domain's own
         session rather than reaching into ``DemoRequestRepository`` for a
-        plain by-id read -- one query, no extra composition."""
-        statement = select(DemoRequest).where(
-            DemoRequest.id == lead_id, DemoRequest.is_deleted.is_(False)
-        )
+        plain by-id read -- one query, no extra composition.
+
+        Deliberately *not* filtered on ``DemoRequest.is_deleted``: an
+        operator can soft-delete a lead from the Master console
+        (``DELETE /demo-requests/{id}``) while it still has a booking, and
+        that booking must stay manageable -- the visitor's cancel/reschedule
+        link and the operator's booking edit both resolve the lead through
+        here, and a filtered read would 404 them while the slot stays held.
+        The FK is NOT NULL + ON DELETE RESTRICT, so the row always exists."""
+        statement = select(DemoRequest).where(DemoRequest.id == lead_id)
         result = await self.session.execute(statement)
         return result.scalars().first()
 

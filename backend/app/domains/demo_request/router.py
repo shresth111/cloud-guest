@@ -15,7 +15,8 @@ genuinely public endpoint in this codebase already gets) plus Pydantic
 input validation (``EmailStr``, length bounds -- see ``schemas.py``).
 
 ``GET /demo-requests``/``GET /demo-requests/{id}``/``PATCH
-/demo-requests/{id}`` are the Master console's internal view -- gated by
+/demo-requests/{id}``/``DELETE /demo-requests/{id}`` are the Master
+console's internal view -- gated by
 RBAC's existing ``RequirePermission`` dependency against the
 ``demo_requests.*`` permission keys
 (``app.domains.rbac.seed.MODULE_ACTIONS[PermissionModule.DEMO_REQUESTS]``),
@@ -34,7 +35,9 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.auth.schemas import MessageResponse
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_demo_request_service
 from .models import DemoRequest
@@ -195,6 +198,38 @@ async def update_demo_request(
         success=True,
         message="Demo request updated",
         data=_demo_request_response(demo_request).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.delete(
+    "/{demo_request_id}",
+    response_model=ApiResponse[MessageResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("demo_requests.delete", scope=ScopeType.GLOBAL))
+    ],
+)
+async def delete_demo_request(
+    request: Request,
+    demo_request_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: DemoRequestService = Depends(get_demo_request_service),
+):
+    """Soft-deletes one demo request (see
+    ``service.DemoRequestService.delete_demo_request``).
+
+    ``scope=ScopeType.GLOBAL`` is pinned explicitly for the same reason
+    ``app.domains.quotation.router.delete_quotation`` documents: a demo
+    request has no ``organization_id``, so the permission check is the whole
+    authorization, and without the pin ``RequirePermission`` would infer the
+    check level from whatever scope headers the caller chose to send.
+    """
+    await service.delete_demo_request(demo_request_id, actor_user_id=uuid.UUID(user.id))
+    return build_response(
+        success=True,
+        message="Demo request deleted",
+        data=MessageResponse(message="Demo request deleted").model_dump(),
         request_id=_request_id(request),
     )
 

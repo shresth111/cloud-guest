@@ -333,9 +333,18 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # the public, unauthenticated "Book a Demo" form (see
     # app.domains.demo_request.router's own module docstring), which is
     # deliberately never RBAC-gated. The Master console only ever READs
-    # the submitted queue and MANAGEs (updates status/internal notes on)
-    # an existing row -- no UPDATE/DELETE/CREATE beyond that.
-    PermissionModule.DEMO_REQUESTS: (_A.READ, _A.MANAGE),
+    # the submitted queue, MANAGEs (updates status/internal notes on) an
+    # existing row, and DELETEs (soft-deletes) one -- no UPDATE/CREATE.
+    #
+    # DELETE is its own action for the reason QUOTATIONS' entry below
+    # gives: expand_grant_level folds DELETE into FULL only, i.e. exactly
+    # the roles that already hold demo_requests.manage, so no role table
+    # changes are needed. NOTE FOR DEPLOY: seeding is manual
+    # (``python -m app.domains.rbac.seed``) -- shipping DELETE
+    # /demo-requests/{id} without re-running it 403s every caller and the
+    # console's Delete button (gated on ``demo_requests.delete``) never
+    # renders.
+    PermissionModule.DEMO_REQUESTS: (_A.READ, _A.MANAGE, _A.DELETE),
     # ISP Management: full CRUD on isp_links plus EXECUTE for the manual
     # health-check/failover/failback triggers -- mirrors
     # PermissionModule.BANDWIDTH's own identical CRUD+EXECUTE+MANAGE shape
