@@ -73,12 +73,15 @@ async def get_current_user(
     api_key_service: ApiKeyService = Depends(get_api_key_service),
 ) -> AuthUser:
     x_api_key = request.headers.get(_API_KEY_HEADER)
+    impersonated_by: dict[str, str] | None = None
     if x_api_key:
         user = await _resolve_user_from_api_key(
             x_api_key, request=request, repository=repository, service=api_key_service
         )
     elif credentials is not None:
-        user = await _resolve_user_from_jwt(credentials, repository=repository)
+        user, impersonated_by = await _resolve_user_from_jwt(
+            credentials, repository=repository
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -94,6 +97,11 @@ async def get_current_user(
     masking_ctx = get_masking_context()
     masking_ctx.masking_enabled = auth_user.data_masking_enabled
     masking_ctx.user_id = auth_user.id
+    # The request's identity is the impersonated customer (that is the whole
+    # point: their permissions, their memberships, nothing of the operator's).
+    # The operator is carried alongside, never instead, so audit rows written
+    # by this request can still name who was really at the keyboard.
+    masking_ctx.impersonated_by = impersonated_by
     return auth_user
 
 
@@ -101,7 +109,7 @@ async def _resolve_user_from_jwt(
     credentials: HTTPAuthorizationCredentials,
     *,
     repository: AuthRepositoryProtocol,
-) -> User:
+) -> tuple[User, dict[str, str] | None]:
     try:
         payload = JWTManager.validate_token(
             credentials.credentials, expected_type="access"
@@ -130,7 +138,22 @@ async def _resolve_user_from_jwt(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session has been terminated",
             )
-    return user
+    return user, _impersonation_actor(payload)
+
+
+def _impersonation_actor(payload: dict) -> dict[str, str] | None:
+    """The ``impersonation`` claim ``UserService.impersonate_user`` signs into
+    the token, reduced to string fields -- or ``None`` for a normal login.
+    The token's signature was already verified, so the claim is the
+    backend's own statement, not client input."""
+    claim = payload.get("impersonation")
+    if not isinstance(claim, dict) or not claim.get("actor_user_id"):
+        return None
+    return {
+        key: str(claim[key])
+        for key in ("actor_user_id", "actor_email", "started_at")
+        if claim.get(key) is not None
+    }
 
 
 async def _resolve_user_from_api_key(
