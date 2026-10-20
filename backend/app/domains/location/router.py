@@ -68,6 +68,7 @@ from .provisioning_schemas import (
 )
 from .provisioning_service import (
     FeatureOverride,
+    InstantOnSiteInput,
     LocationInput,
     LocationProvisioningService,
     NewOrganizationInput,
@@ -597,6 +598,20 @@ def _provision_input(payload: ProvisionLocationRequest) -> ProvisionLocationInpu
             if payload.router is not None
             else None
         ),
+        # An Aruba Instant On venue (the wizard's third device option): one
+        # NAS-only fleet row, created in this transaction -- see
+        # provisioning_service's "Provisioning an Aruba Instant On venue".
+        instant_on_site=(
+            InstantOnSiteInput(
+                name=payload.instant_on_site.name,
+                serial_number=payload.instant_on_site.serial_number,
+                mac_address=payload.instant_on_site.mac_address,
+                instant_on_site_id=payload.instant_on_site.instant_on_site_id,
+                instant_on_site_name=payload.instant_on_site.instant_on_site_name,
+            )
+            if payload.instant_on_site is not None
+            else None
+        ),
         plan_id=uuid.UUID(payload.plan_id),
         existing_organization_id=(
             uuid.UUID(payload.existing_organization_id)
@@ -769,6 +784,8 @@ async def provision_location(
         router_id=str(result.router_id) if result.router_id is not None else None,
         router_name=result.router_name,
         tunnel_ip_address=result.tunnel_ip_address,
+        router_vendor=result.router_vendor,
+        instant_on_site_id=result.instant_on_site_id,
         owner_user_id=str(result.owner_user_id),
         owner_name=result.owner_name,
         owner_username=result.owner_username,
