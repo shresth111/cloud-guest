@@ -420,13 +420,20 @@ class HubTunnelAllocation:
     of the hub's own parameters to write a device config without a second
     round trip.
 
-    ``peer_private_key`` is ``None`` whenever ``reused`` is true. That is
-    not a degraded response: an agent-allocated peer's private key was
-    generated on the hub and stored here as
-    ``EXTERNALLY_MANAGED_KEY_SENTINEL``, so this platform has never held
-    it -- and reuse is only ever chosen when the device demonstrably still
-    has it. The setup-script generator omits the ``private-key=`` line in
-    that case rather than writing a sentinel over a working interface.
+    ``peer_private_key`` on a REUSED allocation is the key this platform
+    retained when it allocated the peer (encrypted, exactly like a
+    platform-generated peer's), or ``None`` when it never had one -- an
+    ADOPTED identity, or a peer recorded before 2026-10-02, both stored as
+    ``EXTERNALLY_MANAGED_KEY_SENTINEL``. The setup-script generator omits
+    the ``private-key=`` line only in the ``None`` case.
+
+    Why the key is now retained: reuse was documented as "only ever chosen
+    when the device demonstrably still has it", and that was false. The
+    Add Customer wizard (``LocationProvisioningService``) allocates a peer
+    at create time and nobody ever received its key, so the router's FIRST
+    Generate reused it and produced a script that could not build the
+    tunnel on a fresh device -- and with no tunnel, no ``/radius``
+    (Farmao Cafe, 2026-10-02, "RADIUS nahi aaya").
 
     ``adopted`` means this call *corrected* the recorded identity onto the
     one the hub reports the device handshaking on, rather than allocating.
@@ -1599,6 +1606,9 @@ class WireGuardService:
             requesting_organization_id=requesting_organization_id,
             tunnel_ip_address=wg["router_tunnel_ip"],
             public_key=wg["router_public_key"],
+            # RETAINED, so a later reuse can still hand the device its key.
+            # See `HubTunnelAllocation`'s docstring.
+            private_key=wg["router_private_key"],
         )
         return HubTunnelAllocation(
             peer=peer,
@@ -1623,13 +1633,19 @@ class WireGuardService:
     ) -> HubTunnelAllocation:
         """A ``HubTunnelAllocation`` for a peer this call did NOT allocate.
 
-        ``peer_private_key`` is ``None`` rather than the stored value on
-        purpose -- see ``HubTunnelAllocation``'s own docstring. The hub
-        parameters come from the ``WireGuardServer`` row here, not from a
-        bridge response, because no bridge call was made."""
+        ``peer_private_key`` is the retained key when this platform holds a
+        real one, and ``None`` when the stored value is the sentinel (an
+        adopted identity, or a peer recorded before keys were retained) --
+        never the sentinel itself, which would be written into a device's
+        ``private-key=``. See ``HubTunnelAllocation``'s own docstring. The
+        hub parameters come from the ``WireGuardServer`` row here, not from
+        a bridge response, because no bridge call was made."""
+        stored = decrypt_secret(peer.private_key_encrypted)
         return HubTunnelAllocation(
             peer=peer,
-            peer_private_key=None,
+            peer_private_key=(
+                None if stored == EXTERNALLY_MANAGED_KEY_SENTINEL else stored
+            ),
             hub_public_key=server.public_key,
             hub_endpoint_host=server.endpoint_host,
             hub_endpoint_port=server.endpoint_port,
@@ -1959,6 +1975,7 @@ class WireGuardService:
         requesting_organization_id: uuid.UUID | None,
         tunnel_ip_address: str,
         public_key: str,
+        private_key: str | None = None,
     ) -> WireGuardPeer:
         """Records a peer the Master console's Setup Script panel already
         had a *different*, out-of-band bridge (a small agent process on
@@ -1978,9 +1995,10 @@ class WireGuardService:
         validates the given IP isn't already claimed by a *different*
         peer on this hub (``TunnelIPAllocationConflictError`` if so) and
         writes/updates a real row with the exact values already live on
-        the device. The private key is never known to this domain (the
-        bridge is what generated and pushed it to the hub) -- stored as
-        ``EXTERNALLY_MANAGED_KEY_SENTINEL``, the same convention
+        the device. The private key is stored encrypted when the caller
+        passes it (``allocate_tunnel_via_hub`` does, from the bridge's one
+        allocate response) so a later reuse can still deliver it; otherwise
+        it is stored as ``EXTERNALLY_MANAGED_KEY_SENTINEL``, the same convention
         ``create_tunnel``'s own ``external_public_key`` path already
         establishes for "a real key exists, but not one this domain ever
         held or can hand back."
@@ -2010,7 +2028,14 @@ class WireGuardService:
             "server_id": server.id,
             "tunnel_ip_address": tunnel_ip_address,
             "public_key": public_key,
-            "private_key_encrypted": encrypt_secret(EXTERNALLY_MANAGED_KEY_SENTINEL),
+            # The bridge returns the key it generated exactly once, in the
+            # allocate response; `allocate_tunnel_via_hub` passes it here so
+            # a later REUSE can still give it to a device that never got it.
+            # Without it (`private_key=None`, e.g. a caller recording a peer
+            # whose key it genuinely never saw) the sentinel stands.
+            "private_key_encrypted": encrypt_secret(
+                private_key if private_key else EXTERNALLY_MANAGED_KEY_SENTINEL
+            ),
             "status": PeerStatus.PENDING.value,
             "revoked_at": None,
         }
