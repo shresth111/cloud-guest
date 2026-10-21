@@ -312,6 +312,13 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Self-service -- CurrentUser only; flips the caller's own "
         "data-masking preference, gated by the OTP step-up above."
     ),
+    # -- TR-069 edge auth (ISP partner): nginx auth_request only ---------
+    ("GET", "/api/v1/internal/tr069/acs-auth"): (
+        "nginx auth_request subrequest for CPEs reaching the ACS. A CPE has "
+        "no platform identity; it presents HTTP Basic checked against "
+        "tr069_acs_credentials. The route 404s unless the X-Wyfy-Acs-Gate "
+        "shared secret matches (constant-time) and both feature flags are on."
+    ),
     # -- WebFig reverse proxy: an <iframe src> navigation cannot carry a
     # Bearer header, so these cannot sit behind CurrentUser/
     # RequirePermission. Authorization really happens at POST

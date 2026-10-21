@@ -307,6 +307,16 @@ LOCATION_SCOPED: dict[str, str] = {
 PENDING: dict[str, str] = {}
 
 EXEMPT: dict[str, str] = {
+    "tr069": (
+        "TR-069 control plane (ISP partner). `tr069_devices.location_id` is an "
+        "optional placement and `tr069_location_settings.location_id` keys a "
+        "per-venue switch. Every route is under /isp/tr069, pins tr069.* to "
+        "ScopeType.ORGANIZATION on the ISP org (keys held only by the isp-* "
+        "roles, never at LOCATION scope), and resolves every location/device "
+        "id through isp_partner.scoping.IspScope, which checks the owning "
+        "customer against the ISP and the caller's customer confinement. "
+        "There is no location-confined caller to protect against."
+    ),
     "ipdr": (
         "IPDR. `ipdr_day_files.location_id` says which venue an archived day "
         "belongs to. Both routes pin `ipdr.read` / `ipdr.export` to "

@@ -139,6 +139,7 @@ class IspScope:
             if location_id is not None and router.location_id != location_id:
                 raise IspRouterNotFoundError()
             customer_id = router.organization_id
+            location_id = router.location_id
             router_id = router.id
         return customer_id, location_id, router_id
 
