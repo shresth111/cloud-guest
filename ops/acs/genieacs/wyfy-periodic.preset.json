@@ -1,0 +1,9 @@
+{
+  "weight": 0,
+  "channel": "",
+  "events": {},
+  "precondition": "",
+  "configurations": [
+    { "type": "provision", "name": "wyfy-periodic", "args": null }
+  ]
+}
