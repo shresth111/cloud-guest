@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.domains.auth.password import PasswordManager
 from app.domains.isp_partner.exceptions import (
     IspConfinementNotAllowedError,
     IspCustomerNotFoundError,
@@ -16,7 +17,6 @@ from app.domains.isp_partner.exceptions import (
     IspUserNotFoundError,
 )
 from app.domains.isp_partner.users_service import IspUsersService, temporary_password
-from app.domains.auth.password import PasswordManager
 from tests.unit.isp_partner_fixtures import (
     CUST_A1,
     CUST_B1,
@@ -27,14 +27,24 @@ from tests.unit.isp_partner_fixtures import (
     estate,
 )
 
-ROLE_IDS = {slug: uuid.uuid4() for slug in ("isp-owner", "isp-admin", "isp-noc", "isp-technician", "isp-viewer")}
+ROLE_IDS = {
+    slug: uuid.uuid4()
+    for slug in ("isp-owner", "isp-admin", "isp-noc", "isp-technician", "isp-viewer")
+}
 
 
 def _user(uid, *, active=True):
     return SimpleNamespace(
-        id=uid, first_name="A", last_name="B", email=f"{uid.hex[:6]}@example.com", phone=None,
-        username=f"{uid.hex[:6]}@example.com", is_active=active, is_deleted=False,
-        last_login_at=None, created_at=NOW,
+        id=uid,
+        first_name="A",
+        last_name="B",
+        email=f"{uid.hex[:6]}@example.com",
+        phone=None,
+        username=f"{uid.hex[:6]}@example.com",
+        is_active=active,
+        is_deleted=False,
+        last_login_at=None,
+        created_at=NOW,
     )
 
 
@@ -53,11 +63,18 @@ class Repo(FakeIspRepository):
         if user_id not in self.roles:
             return []
         slug = self.roles[user_id]
-        return [(SimpleNamespace(id=uuid.uuid4(), user_id=user_id), SimpleNamespace(slug=slug))]
+        return [
+            (
+                SimpleNamespace(id=uuid.uuid4(), user_id=user_id),
+                SimpleNamespace(slug=slug),
+            )
+        ]
 
     async def count_active_owners(self, isp_org_id):
         return sum(
-            1 for u, s in self.roles.items() if s == "isp-owner" and self.users[u].is_active
+            1
+            for u, s in self.roles.items()
+            if s == "isp-owner" and self.users[u].is_active
         )
 
     async def scopes_for_users(self, isp, ids):
@@ -73,7 +90,11 @@ class Rbac:
         self.deactivated: list = []
 
     async def get_role_by_slug(self, slug, org):
-        return SimpleNamespace(id=ROLE_IDS[slug], slug=slug, organization_id=None) if slug in ROLE_IDS else None
+        return (
+            SimpleNamespace(id=ROLE_IDS[slug], slug=slug, organization_id=None)
+            if slug in ROLE_IDS
+            else None
+        )
 
     async def create_user_role(self, **kw):
         self.created.append(kw)
@@ -140,15 +161,27 @@ def _svc():
     identity = Identity()
     cache = Cache()
     svc = IspUsersService(
-        repository=repo, user_service=users, identity_repository=identity,
-        rbac_repository=rbac, permission_cache=cache, audit=rbac,
+        repository=repo,
+        user_service=users,
+        identity_repository=identity,
+        rbac_repository=rbac,
+        permission_cache=cache,
+        audit=rbac,
     )
-    return SimpleNamespace(svc=svc, repo=repo, rbac=rbac, users=users, identity=identity, cache=cache)
+    return SimpleNamespace(
+        svc=svc, repo=repo, rbac=rbac, users=users, identity=identity, cache=cache
+    )
 
 
 def _body(role, **kw):
-    return {"first_name": "A", "last_name": "B", "email": "a@example.com", "role": role,
-            "send_welcome_email": False, **kw}
+    return {
+        "first_name": "A",
+        "last_name": "B",
+        "email": "a@example.com",
+        "role": role,
+        "send_welcome_email": False,
+        **kw,
+    }
 
 
 def _with(t, slug):
@@ -160,8 +193,10 @@ def _with(t, slug):
 
 async def test_create_puts_user_in_isp_org_with_isp_role_only() -> None:
     t = _svc()
-    out = await t.svc.create_user(context(t.repo), _body("isp-technician", customer_ids=[CUST_A1]))
-    (_, kw), = t.users.calls
+    out = await t.svc.create_user(
+        context(t.repo), _body("isp-technician", customer_ids=[CUST_A1])
+    )
+    ((_, kw),) = t.users.calls
     assert kw["organization_id"] == ISP_A and kw["requesting_organization_id"] == ISP_A
     assert kw["initial_role_id"] is None  # never RBACService.assign_role_to_user
     (grant,) = t.rbac.created
@@ -174,7 +209,9 @@ async def test_create_puts_user_in_isp_org_with_isp_role_only() -> None:
     assert t.repo.replaced == [(uuid.UUID(out["user"]["id"]), [CUST_A1])]
 
 
-@pytest.mark.parametrize("role", ["organization-owner", "organization-admin", "msp-owner", "super-admin"])
+@pytest.mark.parametrize(
+    "role", ["organization-owner", "organization-admin", "msp-owner", "super-admin"]
+)
 async def test_non_isp_roles_are_invalid(role) -> None:
     t = _svc()
     with pytest.raises(IspRoleInvalidError):
@@ -194,9 +231,13 @@ async def test_only_owner_grants_owner_or_admin() -> None:
 async def test_owners_and_admins_cannot_be_confined_and_ids_are_scoped() -> None:
     t = _svc()
     with pytest.raises(IspConfinementNotAllowedError):
-        await t.svc.create_user(context(t.repo), _body("isp-admin", customer_ids=[CUST_A1]))
+        await t.svc.create_user(
+            context(t.repo), _body("isp-admin", customer_ids=[CUST_A1])
+        )
     with pytest.raises(IspCustomerNotFoundError):
-        await t.svc.create_user(context(t.repo), _body("isp-noc", customer_ids=[CUST_B1]))
+        await t.svc.create_user(
+            context(t.repo), _body("isp-noc", customer_ids=[CUST_B1])
+        )
     assert t.users.calls == []
 
 
@@ -225,7 +266,14 @@ async def test_last_owner_cannot_be_disabled_or_demoted() -> None:
         await t.svc.update_user(context(t.repo), owner.id, {"role": "isp-admin"})
     second = _with(t, "isp-owner")
     await t.svc.set_enabled(context(t.repo), owner.id, False)
-    assert ("deactivate", {"actor_user_id": context(t.repo).user_id, "user_id": owner.id, "requesting_organization_id": ISP_A}) in t.users.calls
+    assert (
+        "deactivate",
+        {
+            "actor_user_id": context(t.repo).user_id,
+            "user_id": owner.id,
+            "requesting_organization_id": ISP_A,
+        },
+    ) in t.users.calls
     assert second
 
 
@@ -243,7 +291,9 @@ async def test_reset_sets_must_change_and_ends_sessions() -> None:
     noc = _with(t, "isp-noc")
     out = await t.svc.reset_password(context(t.repo), noc.id)
     assert t.identity.updates[-1]["must_change_password"] is True
-    assert PasswordManager.verify(out["temporary_password"], t.identity.updates[-1]["password_hash"])
+    assert PasswordManager.verify(
+        out["temporary_password"], t.identity.updates[-1]["password_hash"]
+    )
     assert t.users.calls[-1][0] == "force_logout"
 
 
@@ -271,6 +321,10 @@ def test_temporary_password_meets_policy() -> None:
 
 async def test_role_rows_must_resolve_to_isp_slugs() -> None:
     with pytest.raises(IspRoleInvalidError):
-        await IspUsersService._assert_isp_role(SimpleNamespace(slug="organization-owner", organization_id=None))
+        await IspUsersService._assert_isp_role(
+            SimpleNamespace(slug="organization-owner", organization_id=None)
+        )
     with pytest.raises(IspRoleInvalidError):
-        await IspUsersService._assert_isp_role(SimpleNamespace(slug="isp-owner", organization_id=uuid.uuid4()))
+        await IspUsersService._assert_isp_role(
+            SimpleNamespace(slug="isp-owner", organization_id=uuid.uuid4())
+        )

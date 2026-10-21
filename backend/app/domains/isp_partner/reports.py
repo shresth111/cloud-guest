@@ -215,11 +215,15 @@ class IspReportsService:
                         1 for x in locations if x.status == LocationStatus.ACTIVE.value
                     ),
                     "suspended": sum(
-                        1 for x in locations if x.status == LocationStatus.SUSPENDED.value
+                        1
+                        for x in locations
+                        if x.status == LocationStatus.SUSPENDED.value
                     ),
                 },
                 "routers": {
-                    "online": sum(1 for r in routers if r.status == RouterStatus.ONLINE.value),
+                    "online": sum(
+                        1 for r in routers if r.status == RouterStatus.ONLINE.value
+                    ),
                     "offline": sum(
                         1 for r in routers if r.status == RouterStatus.OFFLINE.value
                     ),
@@ -239,7 +243,9 @@ class IspReportsService:
                 "logins": logins,
                 "unique_guests": unique,
                 "avg_session_minutes": (
-                    round(float(avg_seconds) / 60, 1) if avg_seconds is not None else None
+                    round(float(avg_seconds) / 60, 1)
+                    if avg_seconds is not None
+                    else None
                 ),
                 "by_day": sessions["by_day"],
             },
@@ -250,16 +256,24 @@ class IspReportsService:
                     "name": u["name"],
                     "bytes_total": u["bytes_total"],
                 }
-                for u in sorted(usage, key=lambda u: (-u["bytes_total"], u["name"]))[:10]
+                for u in sorted(usage, key=lambda u: (-u["bytes_total"], u["name"]))[
+                    :10
+                ]
             ],
             "tr069": {
                 "total": len(devices),
                 "online": online,
                 "offline": len(devices) - online,
-                "unassigned": sum(1 for d in devices if d.customer_organization_id is None),
+                "unassigned": sum(
+                    1 for d in devices if d.customer_organization_id is None
+                ),
                 "by_model": sorted(
                     by_model.values(),
-                    key=lambda e: (-e["count"], str(e["model"]), str(e["software_version"])),
+                    key=lambda e: (
+                        -e["count"],
+                        str(e["model"]),
+                        str(e["software_version"]),
+                    ),
                 ),
             },
         }
@@ -295,15 +309,35 @@ def _rows_for(section: str, report: dict) -> tuple[list[str], list[list[Any]]]:
             for d in report["guest_activity"]["by_day"]
         ]
     if section == "usage_by_customer":
-        header = ["customer", "logins", "unique_guests", "bytes_up", "bytes_down", "bytes_total"]
+        header = [
+            "customer",
+            "logins",
+            "unique_guests",
+            "bytes_up",
+            "bytes_down",
+            "bytes_total",
+        ]
         return header, [
-            [u["name"], u["logins"], u["unique_guests"], u["bytes_up"], u["bytes_down"], u["bytes_total"]]
+            [
+                u["name"],
+                u["logins"],
+                u["unique_guests"],
+                u["bytes_up"],
+                u["bytes_down"],
+                u["bytes_total"],
+            ]
             for u in report["usage_by_customer"]
         ]
     if section == "tr069":
         header = ["manufacturer", "model", "software_version", "count", "online"]
         return header, [
-            [m["manufacturer"], m["model"], m["software_version"], m["count"], m["online"]]
+            [
+                m["manufacturer"],
+                m["model"],
+                m["software_version"],
+                m["count"],
+                m["online"],
+            ]
             for m in report["tr069"]["by_model"]
         ]
     raise IspBadRequestError("unknown section", field="section")

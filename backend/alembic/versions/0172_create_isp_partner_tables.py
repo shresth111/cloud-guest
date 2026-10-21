@@ -87,9 +87,7 @@ def upgrade() -> None:
             _fk("organizations.id", "CASCADE"),
             nullable=False,
         ),
-        sa.Column(
-            "status", sa.String(20), nullable=False, server_default="active"
-        ),
+        sa.Column("status", sa.String(20), nullable=False, server_default="active"),
         sa.Column("gstin", sa.String(15), nullable=True),
         sa.Column("support_phone", sa.String(20), nullable=True),
         sa.Column("support_email", sa.String(255), nullable=True),

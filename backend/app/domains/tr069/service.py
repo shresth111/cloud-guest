@@ -33,7 +33,9 @@ AUDIT_TASK_QUEUED = "tr069_task_queued"
 AUDIT_DEVICE_ASSIGNED = "tr069_device_assigned"
 AUDIT_CREDENTIAL_ROTATED = "tr069_credential_rotated"
 AUDIT_CUSTOMER_TOGGLED = "tr069_customer_toggled"
-QUEUED_MESSAGE = "Queued. The device runs it at its next check-in (within about 5 minutes)."
+QUEUED_MESSAGE = (
+    "Queued. The device runs it at its next check-in (within about 5 minutes)."
+)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -41,7 +43,9 @@ def _iso(value: datetime | None) -> str | None:
 
 
 class Tr069Service:
-    def __init__(self, *, session: Any, nbi: Any, audit: Any, clock: Any = None) -> None:
+    def __init__(
+        self, *, session: Any, nbi: Any, audit: Any, clock: Any = None
+    ) -> None:
         self.session = session
         self.nbi = nbi
         self.audit = audit
@@ -49,7 +53,14 @@ class Tr069Service:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def _audit(
-        self, isp: IspContext, action: str, *, entity_type: str, entity_id: Any, organization_id: Any = None, **meta: Any
+        self,
+        isp: IspContext,
+        action: str,
+        *,
+        entity_type: str,
+        entity_id: Any,
+        organization_id: Any = None,
+        **meta: Any,
     ) -> None:
         await self.audit.create_audit_log_entry(
             actor_user_id=isp.user_id,
@@ -57,7 +68,11 @@ class Tr069Service:
             entity_type=entity_type,
             entity_id=entity_id,
             description=action.replace("_", " "),
-            event_metadata={"console": "isp", "isp_organization_id": str(isp.isp_org_id), **meta},
+            event_metadata={
+                "console": "isp",
+                "isp_organization_id": str(isp.isp_org_id),
+                **meta,
+            },
             organization_id=organization_id or isp.isp_org_id,
             location_id=None,
         )
@@ -93,7 +108,9 @@ class Tr069Service:
                 isp.isp_org_id, None, actor_user_id=isp.user_id
             )
         return self._credential_view(
-            credential, show_password=True, note="Devices using this credential arrive unassigned."
+            credential,
+            show_password=True,
+            note="Devices using this credential arrive unassigned.",
         )
 
     async def rotate_isp(self, isp: IspContext) -> dict:
@@ -104,9 +121,16 @@ class Tr069Service:
             )
         else:
             await self.credentials.rotate(credential, actor_user_id=isp.user_id)
-        await self._audit(isp, AUDIT_CREDENTIAL_ROTATED, entity_type="tr069_acs_credential", entity_id=credential.id)
+        await self._audit(
+            isp,
+            AUDIT_CREDENTIAL_ROTATED,
+            entity_type="tr069_acs_credential",
+            entity_id=credential.id,
+        )
         return self._credential_view(
-            credential, show_password=True, note="Devices using this credential arrive unassigned."
+            credential,
+            show_password=True,
+            note="Devices using this credential arrive unassigned.",
         )
 
     async def customer_state(
@@ -144,7 +168,9 @@ class Tr069Service:
         )
         return await self.customer_state(isp, customer.id, show_password=True)
 
-    async def rotate_customer(self, isp: IspContext, isp_customer_id: uuid.UUID) -> dict:
+    async def rotate_customer(
+        self, isp: IspContext, isp_customer_id: uuid.UUID
+    ) -> dict:
         customer = await IspScope.assert_customer(isp, isp_customer_id)
         credential = await self.credentials.get(isp.isp_org_id, customer.id)
         if credential is None:
@@ -154,13 +180,18 @@ class Tr069Service:
         else:
             await self.credentials.rotate(credential, actor_user_id=isp.user_id)
         await self._audit(
-            isp, AUDIT_CREDENTIAL_ROTATED, entity_type="tr069_acs_credential", entity_id=credential.id,
+            isp,
+            AUDIT_CREDENTIAL_ROTATED,
+            entity_type="tr069_acs_credential",
+            entity_id=credential.id,
             organization_id=customer.id,
         )
         return await self.customer_state(isp, customer.id, show_password=True)
 
     # -- locations ---------------------------------------------------------
-    async def _location_setting(self, location_id: uuid.UUID) -> Tr069LocationSetting | None:
+    async def _location_setting(
+        self, location_id: uuid.UUID
+    ) -> Tr069LocationSetting | None:
         return (
             await self.session.execute(
                 select(Tr069LocationSetting).where(
@@ -177,12 +208,19 @@ class Tr069Service:
             "isp_location_id": str(location.id),
             "enabled": bool(setting and setting.enabled),
             "periodic_inform_interval_s": (
-                setting.periodic_inform_interval_s if setting else RECOMMENDED_INTERVAL_S
+                setting.periodic_inform_interval_s
+                if setting
+                else RECOMMENDED_INTERVAL_S
             ),
         }
 
     async def set_location(
-        self, isp: IspContext, isp_location_id: uuid.UUID, *, enabled: bool, interval_s: int | None
+        self,
+        isp: IspContext,
+        isp_location_id: uuid.UUID,
+        *,
+        enabled: bool,
+        interval_s: int | None,
     ) -> dict:
         location = await IspScope.assert_location(isp, isp_location_id)
         setting = await self._location_setting(location.id)
@@ -216,7 +254,9 @@ class Tr069Service:
             acs_url=self._acs_url(),
             username=credential.username,
             password=CredentialStore.plaintext(credential),
-            interval_s=setting.periodic_inform_interval_s if setting else RECOMMENDED_INTERVAL_S,
+            interval_s=setting.periodic_inform_interval_s
+            if setting
+            else RECOMMENDED_INTERVAL_S,
             enabled=bool(setting and setting.enabled),
             now=self._clock(),
         )
@@ -231,7 +271,9 @@ class Tr069Service:
         return script
 
     # -- devices -----------------------------------------------------------
-    async def _management_enabled(self, isp: IspContext, devices: list[Tr069Device]) -> dict:
+    async def _management_enabled(
+        self, isp: IspContext, devices: list[Tr069Device]
+    ) -> dict:
         rows = await self.session.execute(
             select(Tr069AcsCredential).where(
                 Tr069AcsCredential.isp_organization_id == isp.isp_org_id,
@@ -239,7 +281,11 @@ class Tr069Service:
             )
         )
         creds = list(rows.scalars().all())
-        customer_on = {c.customer_organization_id for c in creds if c.customer_organization_id and c.enabled}
+        customer_on = {
+            c.customer_organization_id
+            for c in creds
+            if c.customer_organization_id and c.enabled
+        }
         isp_on = any(c.customer_organization_id is None and c.enabled for c in creds)
         return {
             d.id: (d.customer_organization_id in customer_on)
@@ -249,7 +295,9 @@ class Tr069Service:
         }
 
     async def _views(self, isp: IspContext, devices: list[Tr069Device]) -> list[dict]:
-        orgs = await isp.repository.names(Organization, [d.customer_organization_id for d in devices])
+        orgs = await isp.repository.names(
+            Organization, [d.customer_organization_id for d in devices]
+        )
         locs = await isp.repository.names(Location, [d.location_id for d in devices])
         mgmt = await self._management_enabled(isp, devices)
         now = self._clock()
@@ -258,7 +306,9 @@ class Tr069Service:
                 "id": str(d.id),
                 "genieacs_device_id": d.genieacs_device_id,
                 "label": d.label,
-                "isp_customer_id": str(d.customer_organization_id) if d.customer_organization_id else None,
+                "isp_customer_id": str(d.customer_organization_id)
+                if d.customer_organization_id
+                else None,
                 "customer_name": orgs.get(d.customer_organization_id),
                 "isp_location_id": str(d.location_id) if d.location_id else None,
                 "location_name": locs.get(d.location_id),
@@ -297,14 +347,18 @@ class Tr069Service:
             conditions.append(Tr069Device.customer_organization_id == isp_customer_id)
         elif isp.confined_customer_ids is not None:
             conditions.append(
-                Tr069Device.customer_organization_id.in_(await isp.child_ids() or [uuid.UUID(int=0)])
+                Tr069Device.customer_organization_id.in_(
+                    await isp.child_ids() or [uuid.UUID(int=0)]
+                )
             )
         else:
             children = await isp.child_ids()
             conditions.append(
                 or_(
                     Tr069Device.customer_organization_id.is_(None),
-                    Tr069Device.customer_organization_id.in_(children or [uuid.UUID(int=0)]),
+                    Tr069Device.customer_organization_id.in_(
+                        children or [uuid.UUID(int=0)]
+                    ),
                 )
             )
         if assigned is True:
@@ -322,7 +376,9 @@ class Tr069Service:
                 )
             )
         rows = await self.session.execute(
-            select(Tr069Device).where(*conditions).order_by(Tr069Device.first_seen_at.desc(), Tr069Device.id)
+            select(Tr069Device)
+            .where(*conditions)
+            .order_by(Tr069Device.first_seen_at.desc(), Tr069Device.id)
         )
         devices = list(rows.scalars().all())
         if online is not None:
@@ -347,21 +403,33 @@ class Tr069Service:
         view = (await self._views(isp, [device]))[0]
         cache = dict(device.params_cache or {})
         allowed = {
-            "uptime_s", "wan_ip", "wan_connection_type", "pppoe_username", "wifi",
-            "lan_hosts", "hardware_version", "software_version",
+            "uptime_s",
+            "wan_ip",
+            "wan_connection_type",
+            "pppoe_username",
+            "wifi",
+            "lan_hosts",
+            "hardware_version",
+            "software_version",
         }
         view["params"] = {k: cache.get(k) for k in sorted(allowed)}
         view["params"]["wifi"] = cache.get("wifi") or []
         view["params_refreshed_at"] = _iso(device.params_refreshed_at)
         last = await self._last_task(device.id)
         view["last_task"] = (
-            {"kind": last.kind, "status": last.status, "created_at": _iso(last.created_at)}
+            {
+                "kind": last.kind,
+                "status": last.status,
+                "created_at": _iso(last.created_at),
+            }
             if last
             else None
         )
         return view
 
-    async def assign_device(self, isp: IspContext, cpe_id: uuid.UUID, data: dict) -> dict:
+    async def assign_device(
+        self, isp: IspContext, cpe_id: uuid.UUID, data: dict
+    ) -> dict:
         device = await IspScope.assert_cpe(isp, cpe_id)
         if "isp_customer_id" in data:
             customer_id = data["isp_customer_id"]
@@ -388,7 +456,9 @@ class Tr069Service:
             entity_type="tr069_device",
             entity_id=device.id,
             fields=sorted(data),
-            isp_customer_id=str(device.customer_organization_id) if device.customer_organization_id else None,
+            isp_customer_id=str(device.customer_organization_id)
+            if device.customer_organization_id
+            else None,
         )
         return await self.device_detail(isp, device.id)
 
@@ -414,7 +484,9 @@ class Tr069Service:
                 "name": "getParameterValues",
                 "parameterNames": P.refresh_parameter_names(device.data_model),
             }
-        status_code, task_json = await self.nbi.post_task(device.genieacs_device_id, body)
+        status_code, task_json = await self.nbi.post_task(
+            device.genieacs_device_id, body
+        )
         now = self._clock()
         done = status_code == 200
         task = Tr069Task(
@@ -422,7 +494,9 @@ class Tr069Service:
             isp_organization_id=isp.isp_org_id,
             requested_by=isp.user_id,
             kind=kind,
-            genieacs_task_id=(str(task_json.get("_id")) if task_json.get("_id") else None),
+            genieacs_task_id=(
+                str(task_json.get("_id")) if task_json.get("_id") else None
+            ),
             status="done" if done else "queued",
             completed_at=now if done else None,
             created_by=isp.user_id,
@@ -434,7 +508,11 @@ class Tr069Service:
                 apply_facts(device, doc)
         await self.session.flush()
         await self._audit(
-            isp, AUDIT_TASK_QUEUED, entity_type="tr069_device", entity_id=device.id, kind=kind,
+            isp,
+            AUDIT_TASK_QUEUED,
+            entity_type="tr069_device",
+            entity_id=device.id,
+            kind=kind,
             status=task.status,
         )
         return {
@@ -444,10 +522,16 @@ class Tr069Service:
             "message": "Done." if done else QUEUED_MESSAGE,
         }
 
-    async def list_tasks(self, isp: IspContext, cpe_id: uuid.UUID, *, page_no: int, page_size: int) -> dict:
+    async def list_tasks(
+        self, isp: IspContext, cpe_id: uuid.UUID, *, page_no: int, page_size: int
+    ) -> dict:
         device = await IspScope.assert_cpe(isp, cpe_id)
         total = int(
-            (await self.session.execute(select(func.count()).where(Tr069Task.device_id == device.id))).scalar_one()
+            (
+                await self.session.execute(
+                    select(func.count()).where(Tr069Task.device_id == device.id)
+                )
+            ).scalar_one()
         )
         rows = await self.session.execute(
             select(Tr069Task)

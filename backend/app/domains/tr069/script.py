@@ -37,7 +37,7 @@ def render_tr069_script(
     lines = [
         "# Wyfy Guest Network: TR-069 management",
         "# Paste into a RouterOS terminal. Needs the tr069-client package.",
-        ":if ([:len [/system package find name=\"tr069-client\"]] = 0) do={ "
+        ':if ([:len [/system package find name="tr069-client"]] = 0) do={ '
         ':error "WYFY-TR069: install the tr069-client package for this RouterOS '
         'version and architecture, reboot, then paste this again" }',
         f":if ([:len [/certificate find name={ros_quote(CA_NAME)}]] = 0) do={{ "

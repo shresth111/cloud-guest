@@ -18,6 +18,7 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.isp_partner import config as isp_config
 from app.domains.isp_partner.dependencies import get_isp_repository
@@ -33,7 +34,6 @@ from app.domains.rbac.dependencies import (
     get_rbac_repository,
 )
 from app.domains.rbac.organization_scope import OrganizationScope
-from app.database.session import get_db_session
 from tests.unit.isp_partner_fixtures import (
     CFG_B1,
     CPE_B,
@@ -58,7 +58,9 @@ class RoleStore:
         self.assignments: dict[uuid.UUID, list] = {}
         self.role_keys: dict[uuid.UUID, set[str]] = {}
 
-    def grant(self, user, slug, keys, *, scope="organization", org=None, role_scope=None):
+    def grant(
+        self, user, slug, keys, *, scope="organization", org=None, role_scope=None
+    ):
         role = SimpleNamespace(
             id=uuid.uuid4(),
             slug=slug,
@@ -106,7 +108,9 @@ class RoleStore:
 WRITES: list = []
 AUDITS: list = []
 STORE = RoleStore()
-STORE.grant(ISP_USER, "isp-owner", ROLES_BY_SLUG["isp-owner"].permission_keys, org=ISP_A)
+STORE.grant(
+    ISP_USER, "isp-owner", ROLES_BY_SLUG["isp-owner"].permission_keys, org=ISP_A
+)
 STORE.grant(
     SUPER_ADMIN,
     "super-admin",
@@ -159,7 +163,9 @@ def _app():
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(
-        isp_config, "get_isp_partner_settings", lambda: isp_config.IspPartnerSettings(enabled=True)
+        isp_config,
+        "get_isp_partner_settings",
+        lambda: isp_config.IspPartnerSettings(enabled=True),
     )
     from app.domains.tr069 import config as tr_config
 
@@ -230,7 +236,9 @@ BODY = {"name": "Cafe X", "contact_email": "amit@example.com"}
 
 
 def test_1_customer_with_msp_org_type_is_422(client) -> None:
-    r = client.c.post("/api/v1/isp/customers", json=dict(BODY, org_type="msp"), headers=_h())
+    r = client.c.post(
+        "/api/v1/isp/customers", json=dict(BODY, org_type="msp"), headers=_h()
+    )
     assert r.status_code == 422
     _nothing_written(client)
 
@@ -242,7 +250,9 @@ def test_2_grandchild_attempt_is_422_and_no_nested_route(client) -> None:
         headers=_h(),
     )
     assert r.status_code == 422
-    r = client.c.post(f"/api/v1/isp/customers/{CUST_A1}/customers", json=BODY, headers=_h())
+    r = client.c.post(
+        f"/api/v1/isp/customers/{CUST_A1}/customers", json=BODY, headers=_h()
+    )
     assert r.status_code in (404, 405)
     _nothing_written(client)
 
@@ -251,21 +261,71 @@ def test_2_grandchild_attempt_is_422_and_no_nested_route(client) -> None:
     ("method", "path", "body", "org"),
     [
         # 4: existing POST /organizations, header = the ISP, parent = a customer
-        ("POST", "/api/v1/organizations", {"name": "x", "slug": "x-1", "contact_email": "a@example.com", "parent_organization_id": str(CUST_A1)}, ISP_A),
+        (
+            "POST",
+            "/api/v1/organizations",
+            {
+                "name": "x",
+                "slug": "x-1",
+                "contact_email": "a@example.com",
+                "parent_organization_id": str(CUST_A1),
+            },
+            ISP_A,
+        ),
         # 5: existing user creation / invite with the customer as header org
-        ("POST", "/api/v1/users", {"first_name": "a", "last_name": "b", "email": "a@example.com", "username": "ab", "temporary_password": "Xy7!aaaaaaaa"}, CUST_A1),
-        ("POST", "/api/v1/users/invite", {"first_name": "a", "last_name": "b", "email": "a@example.com"}, CUST_A1),
+        (
+            "POST",
+            "/api/v1/users",
+            {
+                "first_name": "a",
+                "last_name": "b",
+                "email": "a@example.com",
+                "username": "ab",
+                "temporary_password": "Xy7!aaaaaaaa",
+            },
+            CUST_A1,
+        ),
+        (
+            "POST",
+            "/api/v1/users/invite",
+            {"first_name": "a", "last_name": "b", "email": "a@example.com"},
+            CUST_A1,
+        ),
         # 6: existing membership invite on a customer
-        ("POST", f"/api/v1/organizations/{CUST_A1}/members", {"user_id": str(uuid.uuid4())}, ISP_A),
+        (
+            "POST",
+            f"/api/v1/organizations/{CUST_A1}/members",
+            {"user_id": str(uuid.uuid4())},
+            ISP_A,
+        ),
         # 7: existing role assignment on the customer org
-        ("POST", f"/api/v1/users/{uuid.uuid4()}/roles", {"role_id": str(uuid.uuid4()), "scope_type": "organization", "organization_id": str(CUST_A1)}, CUST_A1),
+        (
+            "POST",
+            f"/api/v1/users/{uuid.uuid4()}/roles",
+            {
+                "role_id": str(uuid.uuid4()),
+                "scope_type": "organization",
+                "organization_id": str(CUST_A1),
+            },
+            CUST_A1,
+        ),
         # 11: existing smart provisioning
         ("POST", "/api/v1/customers/onboard", {}, ISP_A),
         ("POST", "/api/v1/locations/provision", {}, ISP_A),
     ],
-    ids=["4-orgs", "5-users", "5-invite", "6-members", "7-roles", "11-onboard", "11-provision"],
+    ids=[
+        "4-orgs",
+        "5-users",
+        "5-invite",
+        "6-members",
+        "7-roles",
+        "11-onboard",
+        "11-provision",
+    ],
 )
-def test_isp_user_is_refused_by_existing_endpoints(client, method, path, body, org) -> None:
+def test_isp_user_is_refused_by_existing_endpoints(
+    client, method, path, body, org
+) -> None:
     r = client.c.request(method, path, json=body, headers=_h(org))
     assert r.status_code == 403, r.text
     # refused by the permission engine itself, not by something incidental
@@ -277,7 +337,12 @@ def test_8_customer_role_slugs_are_isp_role_invalid(client) -> None:
     for role in ("organization-owner", "organization-admin", "msp-owner"):
         r = client.c.post(
             "/api/v1/isp/users",
-            json={"first_name": "a", "last_name": "b", "email": "a@example.com", "role": role},
+            json={
+                "first_name": "a",
+                "last_name": "b",
+                "email": "a@example.com",
+                "role": role,
+            },
             headers=_h(),
         )
         assert r.status_code == 422
@@ -290,8 +355,11 @@ def test_9_user_body_naming_an_organization_is_422(client) -> None:
         r = client.c.post(
             "/api/v1/isp/users",
             json={
-                "first_name": "a", "last_name": "b", "email": "a@example.com",
-                "role": "isp-viewer", field: str(CUST_A1),
+                "first_name": "a",
+                "last_name": "b",
+                "email": "a@example.com",
+                "role": "isp-viewer",
+                field: str(CUST_A1),
             },
             headers=_h(),
         )

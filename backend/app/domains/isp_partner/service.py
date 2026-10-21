@@ -65,7 +65,10 @@ from .views import (
 
 logger = logging.getLogger(__name__)
 
-PENDING_STATUSES = {RouterStatus.PENDING_PROVISIONING.value, RouterStatus.PROVISIONING.value}
+PENDING_STATUSES = {
+    RouterStatus.PENDING_PROVISIONING.value,
+    RouterStatus.PROVISIONING.value,
+}
 _SUSPEND_MARKER = "isp_tr069_disabled_by_suspension"
 _PROFILE_FIELDS = (
     "external_ref",
@@ -146,7 +149,10 @@ class IspPartnerService:
             event_metadata={
                 "console": "isp",
                 "isp_organization_id": str(isp.isp_org_id),
-                **{k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in metadata.items()},
+                **{
+                    k: (str(v) if isinstance(v, uuid.UUID) else v)
+                    for k, v in metadata.items()
+                },
             },
             organization_id=organization_id or isp.isp_org_id,
             location_id=location_id,
@@ -156,7 +162,12 @@ class IspPartnerService:
     async def me(self, isp: IspContext, *, user: Any, permissions: list[str]) -> dict:
         org = isp.organization
         name = " ".join(
-            p for p in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if p
+            p
+            for p in (
+                getattr(user, "first_name", None),
+                getattr(user, "last_name", None),
+            )
+            if p
         )
         return {
             "isp": {
@@ -231,7 +242,9 @@ class IspPartnerService:
                 profiles.get(o.id),
                 locations=[x for x in facts["locations"] if x.organization_id == o.id],
                 routers=[x for x in facts["routers"] if x.organization_id == o.id],
-                cpes=sum(1 for d in tr["devices"] if d.customer_organization_id == o.id),
+                cpes=sum(
+                    1 for d in tr["devices"] if d.customer_organization_id == o.id
+                ),
                 tr069_enabled=o.id in tr["customer_enabled"],
             )
             for o in organizations
@@ -252,7 +265,9 @@ class IspPartnerService:
         devices = [
             d
             for d in tr["devices"]
-            if (d.customer_organization_id is None and isp.confined_customer_ids is None)
+            if (
+                d.customer_organization_id is None and isp.confined_customer_ids is None
+            )
             or d.customer_organization_id in orgs
         ]
         online_cpes = [d for d in devices if cpe_online(d, now=now)]
@@ -263,12 +278,19 @@ class IspPartnerService:
             if org is None:
                 continue
             since = r.last_seen_at or r.created_at
-            if r.status == RouterStatus.OFFLINE.value and since and (
-                now - since >= timedelta(minutes=ATTENTION_ROUTER_OFFLINE_MINUTES)
+            if (
+                r.status == RouterStatus.OFFLINE.value
+                and since
+                and (now - since >= timedelta(minutes=ATTENTION_ROUTER_OFFLINE_MINUTES))
             ):
                 kind = "router_offline"
-            elif r.status in PENDING_STATUSES and r.created_at and (
-                now - r.created_at >= timedelta(hours=ATTENTION_ROUTER_PENDING_HOURS)
+            elif (
+                r.status in PENDING_STATUSES
+                and r.created_at
+                and (
+                    now - r.created_at
+                    >= timedelta(hours=ATTENTION_ROUTER_PENDING_HOURS)
+                )
             ):
                 kind = "router_pending"
                 since = r.created_at
@@ -292,7 +314,11 @@ class IspPartnerService:
                 seconds=3 * interval
             ):
                 continue
-            org = orgs.get(d.customer_organization_id) if d.customer_organization_id else None
+            org = (
+                orgs.get(d.customer_organization_id)
+                if d.customer_organization_id
+                else None
+            )
             if org is None:
                 continue  # unassigned CPEs have no customer to attach the item to
             attention.append(
@@ -318,23 +344,33 @@ class IspPartnerService:
             },
             "locations": {
                 "total": len(locations),
-                "active": sum(1 for x in locations if x.status == LocationStatus.ACTIVE.value),
+                "active": sum(
+                    1 for x in locations if x.status == LocationStatus.ACTIVE.value
+                ),
             },
             "routers": {
                 "total": len(routers),
-                "online": sum(1 for r in routers if r.status == RouterStatus.ONLINE.value),
-                "offline": sum(1 for r in routers if r.status == RouterStatus.OFFLINE.value),
+                "online": sum(
+                    1 for r in routers if r.status == RouterStatus.ONLINE.value
+                ),
+                "offline": sum(
+                    1 for r in routers if r.status == RouterStatus.OFFLINE.value
+                ),
                 "pending": sum(1 for r in routers if r.status in PENDING_STATUSES),
             },
             "guests": {
-                "today_unique": await self.repository.distinct_guests_since(ids, since=today),
+                "today_unique": await self.repository.distinct_guests_since(
+                    ids, since=today
+                ),
                 "active_sessions": await self.repository.active_sessions(ids),
             },
             "cpes": {
                 "total": len(devices),
                 "online": len(online_cpes),
                 "offline": len(devices) - len(online_cpes),
-                "unassigned": sum(1 for d in devices if d.customer_organization_id is None),
+                "unassigned": sum(
+                    1 for d in devices if d.customer_organization_id is None
+                ),
             },
             "attention": attention[:ATTENTION_CAP],
             "per_customer": [
@@ -346,9 +382,12 @@ class IspPartnerService:
                     "routers_online": sum(
                         1
                         for r in routers
-                        if r.organization_id == o.id and r.status == RouterStatus.ONLINE.value
+                        if r.organization_id == o.id
+                        and r.status == RouterStatus.ONLINE.value
                     ),
-                    "routers_total": sum(1 for r in routers if r.organization_id == o.id),
+                    "routers_total": sum(
+                        1 for r in routers if r.organization_id == o.id
+                    ),
                     "guests_today": per_org_today.get(o.id, (0, 0))[0],
                     "bytes_today": per_org_today.get(o.id, (0, 0))[1],
                 }
@@ -460,7 +499,9 @@ class IspPartnerService:
         self, isp: IspContext, isp_customer_id: uuid.UUID, data: dict[str, Any]
     ) -> dict:
         if "slug" in data:
-            raise IspImmutableFieldError("A customer's slug cannot be changed", field="slug")
+            raise IspImmutableFieldError(
+                "A customer's slug cannot be changed", field="slug"
+            )
         org = await IspScope.assert_customer(isp, isp_customer_id)
         if data.get("external_ref") and await self.repository.external_ref_taken(
             isp.isp_org_id, data["external_ref"], except_customer_id=org.id
@@ -531,7 +572,9 @@ class IspPartnerService:
         )
         return (await self._customer_views(isp, [org]))[0]
 
-    async def activate_customer(self, isp: IspContext, isp_customer_id: uuid.UUID) -> dict:
+    async def activate_customer(
+        self, isp: IspContext, isp_customer_id: uuid.UUID
+    ) -> dict:
         org = await IspScope.assert_customer(isp, isp_customer_id)
         org = await self.organization_service.activate_organization(
             actor_user_id=isp.user_id,
@@ -677,7 +720,9 @@ class IspPartnerService:
     ) -> dict:
         location = await IspScope.assert_location(isp, isp_location_id)
         if "property_type" in data and data["property_type"] is not None:
-            data["property_type"] = getattr(data["property_type"], "value", data["property_type"])
+            data["property_type"] = getattr(
+                data["property_type"], "value", data["property_type"]
+            )
         location = await self.location_service.update_location(
             actor_user_id=isp.user_id,
             location_id=location.id,
@@ -704,7 +749,9 @@ class IspPartnerService:
 
     # -- routers ---------------------------------------------------------
     async def _router_views(self, isp: IspContext, routers: list[Router]) -> list[dict]:
-        orgs = await self.repository.names(Organization, [r.organization_id for r in routers])
+        orgs = await self.repository.names(
+            Organization, [r.organization_id for r in routers]
+        )
         locs = await self.repository.names(Location, [r.location_id for r in routers])
         enabled = await self._location_tr069(list({r.location_id for r in routers}))
         devices = await self.repository.cpes_for_isp(isp.isp_org_id)
@@ -737,7 +784,11 @@ class IspPartnerService:
         )
         ids = [customer_id] if customer_id is not None else await isp.child_ids()
         rows, total = await self.repository.list_routers(
-            ids, location_id=location_id, status=status, page=page_no, page_size=page_size
+            ids,
+            location_id=location_id,
+            status=status,
+            page=page_no,
+            page_size=page_size,
         )
         return page(await self._router_views(isp, rows), total, page_no, page_size)
 

@@ -1,3 +1,4 @@
+# ruff: noqa: E501 -- snapshot strings and SQL are kept verbatim
 """BE-10 pure parts: curated params (no passwords, ever), the RouterOS
 script, the NBI client against GenieACS-shaped JSON fixtures, ACS
 credentials, and the nginx ``acs-auth`` endpoint."""
@@ -26,7 +27,14 @@ from app.domains.tr069.sync import apply_facts, username_query
 FIX = pathlib.Path(__file__).parent / "fixtures" / "genieacs"
 TR181 = json.loads((FIX / "device_tr181.json").read_text())[0]
 TR098 = json.loads((FIX / "device_tr098.json").read_text())[0]
-LEAKS = ("acs-secret-leak", "pppoe-secret-leak", "wifi-secret-leak", "psk-leak", "ppp-leak", "wlan-leak")
+LEAKS = (
+    "acs-secret-leak",
+    "pppoe-secret-leak",
+    "wifi-secret-leak",
+    "psk-leak",
+    "ppp-leak",
+    "wlan-leak",
+)
 
 
 class TestParams:
@@ -38,8 +46,20 @@ class TestParams:
             "wan_connection_type": "pppoe",
             "pppoe_username": "cafe-x@isp",
             "wifi": [
-                {"index": 1, "ssid": "Cafe X", "band": "2.4GHz", "enabled": True, "clients": 7},
-                {"index": 2, "ssid": "Cafe X 5G", "band": "5GHz", "enabled": False, "clients": 0},
+                {
+                    "index": 1,
+                    "ssid": "Cafe X",
+                    "band": "2.4GHz",
+                    "enabled": True,
+                    "clients": 7,
+                },
+                {
+                    "index": 2,
+                    "ssid": "Cafe X 5G",
+                    "band": "5GHz",
+                    "enabled": False,
+                    "clients": 0,
+                },
             ],
             "lan_hosts": 12,
             "hardware_version": "r3",
@@ -69,14 +89,18 @@ class TestParams:
         assert not any(P.is_denied(p) for p in P.projection())
 
     def test_resolver_refuses_denied_paths(self) -> None:
-        assert P.resolve(TR181, "Device.WiFi.AccessPoint.1.Security.KeyPassphrase") is None
+        assert (
+            P.resolve(TR181, "Device.WiFi.AccessPoint.1.Security.KeyPassphrase") is None
+        )
         assert P.resolve(TR181, "Device.ManagementServer.Password") is None
         assert P.resolve(TR181, "Device.ManagementServer.Username") == "cust-1a2b3c4d"
 
     def test_username_query_matches_both_data_models(self) -> None:
         q = username_query(["isp-1", "cust-2"])
         assert {"Device.ManagementServer.Username._value": "cust-2"} in q["$or"]
-        assert {"InternetGatewayDevice.ManagementServer.Username._value": "isp-1"} in q["$or"]
+        assert {"InternetGatewayDevice.ManagementServer.Username._value": "isp-1"} in q[
+            "$or"
+        ]
 
 
 class TestScript:
@@ -118,8 +142,11 @@ class TestScript:
 
     def test_disabled_location_still_renders_with_enabled_no(self) -> None:
         script = render_tr069_script(
-            acs_url="https://acs.example.com/", username="u", password="p",
-            interval_s=600, enabled=False,
+            acs_url="https://acs.example.com/",
+            username="u",
+            password="p",
+            interval_s=600,
+            enabled=False,
         )
         assert "enabled=no" in script and "periodic-inform-interval=600s" in script
         assert "PASS" not in script
@@ -142,7 +169,9 @@ class TestNbiClient:
             seen["projection"] = request.url.params["projection"]
             return httpx.Response(200, json=[TR181])
 
-        docs = await _client(handler).query_devices(username_query(["cust-1"]), ["_id", "_lastInform"])
+        docs = await _client(handler).query_devices(
+            username_query(["cust-1"]), ["_id", "_lastInform"]
+        )
         assert docs[0]["_id"] == TR181["_id"]
         assert seen["path"] == "/devices/" and "$or" in seen["query"]
         assert seen["projection"] == "_id,_lastInform"
@@ -153,9 +182,13 @@ class TestNbiClient:
             assert request.url.path == "/devices/E48D8C-RB750Gr3-HG3XXXX/tasks"
             assert "connection_request" in request.url.params
             assert json.loads(request.content) == {"name": "reboot"}
-            return httpx.Response(code, json=json.loads((FIX / "task_202.json").read_text()))
+            return httpx.Response(
+                code, json=json.loads((FIX / "task_202.json").read_text())
+            )
 
-        status, body = await _client(handler).post_task("E48D8C-RB750Gr3-HG3XXXX", {"name": "reboot"})
+        status, body = await _client(handler).post_task(
+            "E48D8C-RB750Gr3-HG3XXXX", {"name": "reboot"}
+        )
         assert status == code and body["_id"] == "6717a1f0c3b4a2001234abcd"
 
     async def test_device_id_is_url_encoded(self) -> None:
@@ -168,9 +201,13 @@ class TestNbiClient:
     async def test_faults(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.url.path == "/faults/"
-            return httpx.Response(200, json=json.loads((FIX / "faults.json").read_text()))
+            return httpx.Response(
+                200, json=json.loads((FIX / "faults.json").read_text())
+            )
 
-        faults = await _client(handler).get_faults({"device": "E48D8C-RB750Gr3-HG3XXXX"})
+        faults = await _client(handler).get_faults(
+            {"device": "E48D8C-RB750Gr3-HG3XXXX"}
+        )
         assert faults[0]["code"] == "cwmp.9002"
 
     @pytest.mark.parametrize(
@@ -219,7 +256,9 @@ def edge(monkeypatch):
     monkeypatch.setattr(tr_config, "get_tr069_settings", lambda: settings)
     monkeypatch.setattr(internal_router, "get_tr069_settings", lambda: settings)
     monkeypatch.setattr(
-        isp_config, "get_isp_partner_settings", lambda: isp_config.IspPartnerSettings(enabled=True)
+        isp_config,
+        "get_isp_partner_settings",
+        lambda: isp_config.IspPartnerSettings(enabled=True),
     )
     password = "AbcdEfgh1234IjklMnop5678"
     cred = SimpleNamespace(
@@ -294,13 +333,22 @@ def test_acs_auth_good_credential_is_204_with_user_header(edge) -> None:
 
 def test_acs_auth_positive_result_is_cached(edge) -> None:
     for _ in range(3):
-        assert _call(edge, auth=_basic(edge.cred.username, edge.password)).status_code == 204
+        assert (
+            _call(edge, auth=_basic(edge.cred.username, edge.password)).status_code
+            == 204
+        )
     assert edge.lookups == 1
 
 
 @pytest.mark.parametrize(
     "auth",
-    [None, "Bearer x", "Basic !!!", _basic("cust-1a2b3c4d", "wrong"), _basic("nobody", "x")],
+    [
+        None,
+        "Bearer x",
+        "Basic !!!",
+        _basic("cust-1a2b3c4d", "wrong"),
+        _basic("nobody", "x"),
+    ],
     ids=["none", "bearer", "garbage", "wrong-password", "unknown-user"],
 )
 def test_acs_auth_bad_credential_is_401(edge, auth) -> None:
@@ -309,10 +357,14 @@ def test_acs_auth_bad_credential_is_401(edge, auth) -> None:
 
 def test_acs_auth_disabled_credential_or_inactive_owner_is_401(edge) -> None:
     edge.cred.enabled = False
-    assert _call(edge, auth=_basic(edge.cred.username, edge.password)).status_code == 401
+    assert (
+        _call(edge, auth=_basic(edge.cred.username, edge.password)).status_code == 401
+    )
     edge.cred.enabled = True
     edge.owner_ok = False  # suspended ISP or disabled customer
-    assert _call(edge, auth=_basic(edge.cred.username, edge.password)).status_code == 401
+    assert (
+        _call(edge, auth=_basic(edge.cred.username, edge.password)).status_code == 401
+    )
 
 
 @pytest.mark.parametrize("gate", [None, "", "wrong"], ids=["absent", "empty", "wrong"])
@@ -329,7 +381,9 @@ async def test_owner_active_rules() -> None:
     isp_id, cust_id = uuid.uuid4(), uuid.uuid4()
     profile = SimpleNamespace(status="active")
     isp_org = SimpleNamespace(id=isp_id, org_type="msp", status="active")
-    customer = SimpleNamespace(id=cust_id, parent_organization_id=isp_id, status="active")
+    customer = SimpleNamespace(
+        id=cust_id, parent_organization_id=isp_id, status="active"
+    )
 
     class Repo:
         def __init__(self, session):
@@ -346,7 +400,9 @@ async def test_owner_active_rules() -> None:
     original = repo_mod.IspRepository
     repo_mod.IspRepository = Repo  # type: ignore[misc]
     try:
-        cred = SimpleNamespace(isp_organization_id=isp_id, customer_organization_id=cust_id)
+        cred = SimpleNamespace(
+            isp_organization_id=isp_id, customer_organization_id=cust_id
+        )
         assert await _owner_active(None, cred)
         customer.status = "suspended"
         assert not await _owner_active(None, cred)
@@ -355,6 +411,9 @@ async def test_owner_active_rules() -> None:
         assert not await _owner_active(None, cred)
         profile.status = "active"
         isp_org.status = "suspended"
-        assert not await _owner_active(None, SimpleNamespace(isp_organization_id=isp_id, customer_organization_id=None))
+        assert not await _owner_active(
+            None,
+            SimpleNamespace(isp_organization_id=isp_id, customer_organization_id=None),
+        )
     finally:
         repo_mod.IspRepository = original  # type: ignore[misc]

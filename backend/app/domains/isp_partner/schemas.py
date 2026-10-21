@@ -78,7 +78,7 @@ class CustomerUpdateRequest(_Body):
 
 
 # -- locations --------------------------------------------------------------
-class LocationCreateRequest(_Body):
+class IspLocationCreateRequest(_Body):
     name: str = Field(min_length=1, max_length=200)
     slug: str | None = Field(
         default=None, min_length=2, max_length=150, pattern=r"^[a-z0-9][a-z0-9-]*$"
@@ -100,7 +100,7 @@ class LocationCreateRequest(_Body):
     _check_email = field_validator("contact_email")(_email)
 
 
-class LocationUpdateRequest(_Body):
+class IspLocationUpdateRequest(_Body):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     property_type: PropertyType | None = None
     address_line1: str | None = Field(default=None, min_length=1, max_length=255)
@@ -120,7 +120,7 @@ class LocationUpdateRequest(_Body):
 
 
 # -- routers ----------------------------------------------------------------
-class RouterCreateRequest(_Body):
+class IspRouterCreateRequest(_Body):
     name: str = Field(min_length=1, max_length=200)
     serial_number: str = Field(min_length=1, max_length=100)
     mac_address: str = Field(
@@ -130,7 +130,7 @@ class RouterCreateRequest(_Body):
     vendor: str = Field(default="mikrotik", max_length=50)
 
 
-class RouterUpdateRequest(_Body):
+class IspRouterUpdateRequest(_Body):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     model: str | None = Field(default=None, min_length=1, max_length=100)
 

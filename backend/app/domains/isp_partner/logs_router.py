@@ -31,7 +31,11 @@ from app.domains.controller_logs.service import ControllerLogsService
 from app.domains.device_logs.constants import (
     CUSTOMER_EXPORT_CHUNK,
     CUSTOMER_EXPORT_MAX_ROWS,
+)
+from app.domains.device_logs.constants import (
     DEFAULT_PAGE_SIZE as NETLOG_DEFAULT_PAGE,
+)
+from app.domains.device_logs.constants import (
     MAX_PAGE_SIZE as NETLOG_MAX_PAGE,
 )
 from app.domains.device_logs.customer_scope import LogsConfinement
@@ -50,8 +54,10 @@ from app.domains.ipdr.constants import (
     AUDIT_ACTION_IPDR_LISTED,
     EXPORT_MAX_ROWS,
     IPDR_COLUMNS,
-    MAX_PAGE_SIZE as IPDR_MAX_PAGE,
     PROVENANCE_COLUMNS,
+)
+from app.domains.ipdr.constants import (
+    MAX_PAGE_SIZE as IPDR_MAX_PAGE,
 )
 from app.domains.ipdr.dependencies import get_ipdr_service, ipdr_service_for
 from app.domains.ipdr.formatting import csv_cells
@@ -71,8 +77,8 @@ from .constants import (
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import IspCustomerRequiredError
-from .logs_repository import IspLogsRepository
 from .http import ok
+from .logs_repository import IspLogsRepository
 from .scoping import IspScope
 
 logger = get_logger(__name__)
@@ -525,7 +531,9 @@ async def export_ipdr(
         _stream_ipdr(targets, provenance=include_provenance),
         media_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="isp-ipdr-{scope}-{stamp}.csv"',
+            "Content-Disposition": (
+                f'attachment; filename="isp-ipdr-{scope}-{stamp}.csv"'
+            ),
             "Cache-Control": "no-store",
         },
     )
@@ -571,7 +579,13 @@ async def list_auth_logs(
     if customer_id is not None:
         guest_repository = GuestRepository(db)
         service = ControllerLogsService(
-            None, None, None, None, None, guest_repository, None  # type: ignore[arg-type]
+            None,
+            None,
+            None,
+            None,
+            None,
+            guest_repository,
+            None,  # type: ignore[arg-type]
         )
         entries, meta = await service.list_guest_authentication_logs(
             requesting_organization_id=customer_id,
@@ -590,7 +604,9 @@ async def list_auth_logs(
         total = int(
             (
                 await db.execute(
-                    select(func.count()).select_from(GuestLoginHistory).where(*conditions)
+                    select(func.count())
+                    .select_from(GuestLoginHistory)
+                    .where(*conditions)
                 )
             ).scalar_one()
         )
@@ -599,7 +615,9 @@ async def list_auth_logs(
                 await db.execute(
                     select(GuestLoginHistory)
                     .where(*conditions)
-                    .order_by(GuestLoginHistory.attempted_at.desc(), GuestLoginHistory.id)
+                    .order_by(
+                        GuestLoginHistory.attempted_at.desc(), GuestLoginHistory.id
+                    )
                     .offset((page - 1) * page_size)
                     .limit(page_size)
                 )

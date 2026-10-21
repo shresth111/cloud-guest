@@ -18,18 +18,38 @@ from app.domains.rbac import seed as rbac_seed
 
 EXPECTED = {
     "isp-owner": {
-        "isp_partner.read", "isp_partner.create", "isp_partner.update", "isp_partner.manage",
-        "isp_partner.execute", "isp_partner.export", "isp_partner.assign",
-        "isp_logs.read", "isp_logs.export", "isp_ipdr.read", "isp_ipdr.export",
-        "tr069.read", "tr069.execute", "tr069.manage",
+        "isp_partner.read",
+        "isp_partner.create",
+        "isp_partner.update",
+        "isp_partner.manage",
+        "isp_partner.execute",
+        "isp_partner.export",
+        "isp_partner.assign",
+        "isp_logs.read",
+        "isp_logs.export",
+        "isp_ipdr.read",
+        "isp_ipdr.export",
+        "tr069.read",
+        "tr069.execute",
+        "tr069.manage",
     },
     "isp-noc": {
-        "isp_partner.read", "isp_partner.export", "isp_logs.read", "isp_logs.export",
-        "tr069.read", "tr069.execute",
+        "isp_partner.read",
+        "isp_partner.export",
+        "isp_logs.read",
+        "isp_logs.export",
+        "tr069.read",
+        "tr069.execute",
     },
     "isp-technician": {
-        "isp_partner.read", "isp_partner.create", "isp_partner.update", "isp_partner.execute",
-        "isp_logs.read", "tr069.read", "tr069.execute", "tr069.manage",
+        "isp_partner.read",
+        "isp_partner.create",
+        "isp_partner.update",
+        "isp_partner.execute",
+        "isp_logs.read",
+        "tr069.read",
+        "tr069.execute",
+        "tr069.manage",
     },
     "isp-viewer": {"isp_partner.read", "isp_partner.export", "tr069.read"},
 }
@@ -88,7 +108,10 @@ class InMemoryRBAC:
         self.writes.append(("role_scope", role_id))
 
     async def get_role_permissions(self, role_id):
-        return [SimpleNamespace(permission_id=p) for p in self.role_permissions.get(role_id, set())]
+        return [
+            SimpleNamespace(permission_id=p)
+            for p in self.role_permissions.get(role_id, set())
+        ]
 
     async def add_role_permission(self, role_id, permission_id, *, granted_by):
         self.role_permissions.setdefault(role_id, set()).add(permission_id)
@@ -170,6 +193,8 @@ async def test_existing_rbac_seed_afterwards_leaves_isp_rows_alone(repo) -> None
 
 
 async def test_a_non_system_role_squatting_a_slug_is_refused(repo) -> None:
-    repo.roles["isp-owner"] = SimpleNamespace(id=uuid.uuid4(), slug="isp-owner", is_system_role=False)
+    repo.roles["isp-owner"] = SimpleNamespace(
+        id=uuid.uuid4(), slug="isp-owner", is_system_role=False
+    )
     with pytest.raises(isp_seed.IspSeedConflictError):
         await isp_seed.seed_isp_partner_rbac(repo)

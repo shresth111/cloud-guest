@@ -1,3 +1,4 @@
+# ruff: noqa: E501 -- snapshot strings and SQL are kept verbatim
 """End-to-end on a real PostgreSQL + Redis (skipped unless
 ``ISP_TEST_PG_DSN`` is set -- CI has neither). Run locally against a scratch
 database migrated to head::
@@ -81,9 +82,16 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
             assert await _grants(s, isp=False) == before
             isp_rows = await _grants(s, isp=True)
             assert {slug for slug, _ in isp_rows} == {
-                "isp-owner", "isp-admin", "isp-noc", "isp-technician", "isp-viewer"
+                "isp-owner",
+                "isp-admin",
+                "isp-noc",
+                "isp-technician",
+                "isp-viewer",
             }
-            assert all(key.split(".")[0] in {"isp_partner", "isp_logs", "isp_ipdr", "tr069"} for _, key in isp_rows)
+            assert all(
+                key.split(".")[0] in {"isp_partner", "isp_logs", "isp_ipdr", "tr069"}
+                for _, key in isp_rows
+            )
             again = await seed_isp_partner_rbac(RBACRepository(s))
             assert again.roles_created == again.role_permissions_created == 0
             await seed_rbac(s)  # the existing seeder afterwards
@@ -95,36 +103,70 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
         # ---- 2. an ISP with one owner ---------------------------------------
         async with SessionLocal() as s:
             plan = Plan(
-                name=f"ISP plan {tag}", slug=f"isp-plan-{tag}", plan_type="standard",
-                billing_cycle="monthly", base_price=Decimal("0"), currency="INR",
-                is_active=True, is_public=False,
+                name=f"ISP plan {tag}",
+                slug=f"isp-plan-{tag}",
+                plan_type="standard",
+                billing_cycle="monthly",
+                base_price=Decimal("0"),
+                currency="INR",
+                is_active=True,
+                is_public=False,
             )
             s.add(plan)
             isp = Organization(
-                name=f"Airlink {tag}", slug=f"airlink-{tag}", org_type="msp", status="active",
-                contact_email=f"ops-{tag}@example.com", timezone="Asia/Kolkata", settings={},
+                name=f"Airlink {tag}",
+                slug=f"airlink-{tag}",
+                org_type="msp",
+                status="active",
+                contact_email=f"ops-{tag}@example.com",
+                timezone="Asia/Kolkata",
+                settings={},
             )
             empty_isp = Organization(
-                name=f"Empty {tag}", slug=f"empty-{tag}", org_type="msp", status="active",
-                contact_email=f"e-{tag}@example.com", timezone="Asia/Kolkata", settings={},
+                name=f"Empty {tag}",
+                slug=f"empty-{tag}",
+                org_type="msp",
+                status="active",
+                contact_email=f"e-{tag}@example.com",
+                timezone="Asia/Kolkata",
+                settings={},
             )
             owner = User(
-                first_name="Ravi", last_name="Kumar", email=f"ravi-{tag}@example.com",
-                username=f"ravi-{tag}", password_hash="x", is_active=True, is_verified=True,
+                first_name="Ravi",
+                last_name="Kumar",
+                email=f"ravi-{tag}@example.com",
+                username=f"ravi-{tag}",
+                password_hash="x",
+                is_active=True,
+                is_verified=True,
             )
             s.add_all([isp, empty_isp, owner])
             await s.flush()
             for org in (isp, empty_isp):
-                s.add(IspPartnerProfile(organization_id=org.id, default_customer_plan_id=plan.id))
-                s.add(OrganizationMember(organization_id=org.id, user_id=owner.id, status="active"))
+                s.add(
+                    IspPartnerProfile(
+                        organization_id=org.id, default_customer_plan_id=plan.id
+                    )
+                )
+                s.add(
+                    OrganizationMember(
+                        organization_id=org.id, user_id=owner.id, status="active"
+                    )
+                )
             from sqlalchemy import select
 
-            role = (await s.execute(select(Role).where(Role.slug == "isp-owner"))).scalar_one()
+            role = (
+                await s.execute(select(Role).where(Role.slug == "isp-owner"))
+            ).scalar_one()
             for org in (isp, empty_isp):
                 s.add(
                     UserRole(
-                        user_id=owner.id, role_id=role.id, scope_type="organization",
-                        organization_id=org.id, granted_at=datetime.now(UTC), is_active=True,
+                        user_id=owner.id,
+                        role_id=role.id,
+                        scope_type="organization",
+                        organization_id=org.id,
+                        granted_at=datetime.now(UTC),
+                        is_active=True,
                     )
                 )
             await s.commit()
@@ -151,7 +193,10 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
             for name in ("Cafe X", "Hostel Y"):
                 r = await c.post(
                     "/api/v1/isp/customers",
-                    json={"name": f"{name} {tag}", "contact_email": f"c-{tag}@example.com"},
+                    json={
+                        "name": f"{name} {tag}",
+                        "contact_email": f"c-{tag}@example.com",
+                    },
                     headers=h,
                 )
                 assert r.status_code == 201, r.text
@@ -161,8 +206,11 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                 r = await c.post(
                     f"/api/v1/isp/customers/{cust['id']}/locations",
                     json={
-                        "name": "Main", "address_line1": "1 Road", "city": "Noida",
-                        "state_province": "UP", "postal_code": "201301",
+                        "name": "Main",
+                        "address_line1": "1 Road",
+                        "city": "Noida",
+                        "state_province": "UP",
+                        "postal_code": "201301",
                     },
                     headers=h,
                 )
@@ -181,15 +229,23 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                         i=uuid.UUID(cust["id"]),
                     )
                     assert row == f"standard:{isp_id}"
-                    assert await _scalar(
-                        s, "select count(*) from subscriptions where organization_id = :i and status = 'active'",
-                        i=uuid.UUID(cust["id"]),
-                    ) == 1
+                    assert (
+                        await _scalar(
+                            s,
+                            "select count(*) from subscriptions where organization_id = :i and status = 'active'",
+                            i=uuid.UUID(cust["id"]),
+                        )
+                        == 1
+                    )
                 for loc in locations:
-                    assert await _scalar(
-                        s, "select count(*) from captive_portal_configs where location_id = :i and is_active",
-                        i=uuid.UUID(loc["id"]),
-                    ) == 1
+                    assert (
+                        await _scalar(
+                            s,
+                            "select count(*) from captive_portal_configs where location_id = :i and is_active",
+                            i=uuid.UUID(loc["id"]),
+                        )
+                        == 1
+                    )
 
             # the child passes the existing licence gate for writes
             from app.common.exceptions import register_exception_handlers
@@ -197,14 +253,22 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
             probe = FastAPI()
             register_exception_handlers(probe)
 
-            @probe.post("/probe", dependencies=[Depends(RequireActiveLicenseForWrites())])
+            @probe.post(
+                "/probe", dependencies=[Depends(RequireActiveLicenseForWrites())]
+            )
             async def _probe() -> dict:
                 return {"ok": True}
 
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=probe), base_url="http://p") as pc:
-                ok = await pc.post("/probe", headers={"X-Organization-Id": customers[0]["id"]})
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=probe), base_url="http://p"
+            ) as pc:
+                ok = await pc.post(
+                    "/probe", headers={"X-Organization-Id": customers[0]["id"]}
+                )
                 assert ok.status_code == 200, ok.text
-                lapsed = await pc.post("/probe", headers={"X-Organization-Id": str(empty_id)})
+                lapsed = await pc.post(
+                    "/probe", headers={"X-Organization-Id": str(empty_id)}
+                )
                 assert lapsed.status_code == 402
 
             # ---- 4. routers + sessions over 3 days, reports vs SQL ------------
@@ -213,14 +277,18 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                 r = await c.post(
                     f"/api/v1/isp/locations/{loc['id']}/routers",
                     json={
-                        "name": f"hEX {i}", "serial_number": f"SN{tag}{i}",
-                        "mac_address": f"E4:8D:8C:{tag[:2]}:{tag[2:4]}:0{i}", "model": "RB750Gr3",
+                        "name": f"hEX {i}",
+                        "serial_number": f"SN{tag}{i}",
+                        "mac_address": f"E4:8D:8C:{tag[:2]}:{tag[2:4]}:0{i}",
+                        "model": "RB750Gr3",
                     },
                     headers=h,
                 )
                 assert r.status_code == 201, r.text
                 routers.append(r.json()["data"])
-            day0 = datetime.now(UTC).replace(hour=6, minute=0, second=0, microsecond=0) - timedelta(days=3)
+            day0 = datetime.now(UTC).replace(
+                hour=6, minute=0, second=0, microsecond=0
+            ) - timedelta(days=3)
             async with SessionLocal() as s:
                 for ci, cust in enumerate(customers):
                     org_id = uuid.UUID(cust["id"])
@@ -229,8 +297,11 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                     guests = []
                     for g in range(2 + ci):
                         guest = Guest(
-                            organization_id=org_id, location_id=loc_id,
-                            identifier=f"+9190000{ci}{g:04d}", first_seen_at=day0, last_seen_at=day0,
+                            organization_id=org_id,
+                            location_id=loc_id,
+                            identifier=f"+9190000{ci}{g:04d}",
+                            first_seen_at=day0,
+                            last_seen_at=day0,
                         )
                         s.add(guest)
                         guests.append(guest)
@@ -240,17 +311,27 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                             start = day0 + timedelta(days=d, hours=gi)
                             s.add(
                                 GuestSession(
-                                    guest_id=guest.id, router_id=rtr_id, location_id=loc_id,
-                                    organization_id=org_id, auth_method="otp_sms", status="disconnected",
-                                    started_at=start, ended_at=start + timedelta(minutes=30 + 10 * gi),
-                                    last_activity_at=start, bytes_uploaded=1000 * (d + 1),
+                                    guest_id=guest.id,
+                                    router_id=rtr_id,
+                                    location_id=loc_id,
+                                    organization_id=org_id,
+                                    auth_method="otp_sms",
+                                    status="disconnected",
+                                    started_at=start,
+                                    ended_at=start + timedelta(minutes=30 + 10 * gi),
+                                    last_activity_at=start,
+                                    bytes_uploaded=1000 * (d + 1),
                                     bytes_downloaded=5000 * (gi + 1),
                                 )
                             )
                 await s.commit()
             since = (day0 - timedelta(hours=1)).isoformat()
             until = datetime.now(UTC).isoformat()
-            rep = await c.get("/api/v1/isp/reports/summary", params={"since": since, "until": until}, headers=h)
+            rep = await c.get(
+                "/api/v1/isp/reports/summary",
+                params={"since": since, "until": until},
+                headers=h,
+            )
             assert rep.status_code == 200, rep.text
             data = rep.json()["data"]
             async with SessionLocal() as s:
@@ -265,16 +346,31 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                     and started_at >= :s and started_at < :u"""
                 ).bindparams(bindparam("ids", expanding=True))
                 logins, uniq, up, down, avg_min = (
-                    await s.execute(q, {"ids": ids, "s": datetime.fromisoformat(since), "u": datetime.fromisoformat(until)})
+                    await s.execute(
+                        q,
+                        {
+                            "ids": ids,
+                            "s": datetime.fromisoformat(since),
+                            "u": datetime.fromisoformat(until),
+                        },
+                    )
                 ).one()
             assert data["guest_activity"]["logins"] == logins == 15
             assert data["guest_activity"]["unique_guests"] == uniq == 5
-            assert data["guest_activity"]["avg_session_minutes"] == round(float(avg_min), 1)
+            assert data["guest_activity"]["avg_session_minutes"] == round(
+                float(avg_min), 1
+            )
             usage = {u["isp_customer_id"]: u for u in data["usage_by_customer"]}
             assert sum(u["bytes_total"] for u in usage.values()) == up + down
-            assert usage[customers[0]["id"]]["logins"] == 6 and usage[customers[1]["id"]]["logins"] == 9
+            assert (
+                usage[customers[0]["id"]]["logins"] == 6
+                and usage[customers[1]["id"]]["logins"] == 9
+            )
             assert sum(d["logins"] for d in data["guest_activity"]["by_day"]) == 15
-            assert all(r["availability_percentage"] is None for r in data["portfolio"]["router_availability"])
+            assert all(
+                r["availability_percentage"] is None
+                for r in data["portfolio"]["router_availability"]
+            )
             assert data["portfolio"]["customers"]["active"] == 2
             too_long = await c.get(
                 "/api/v1/isp/reports/summary",
@@ -286,35 +382,60 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
             for fmt, section in (("csv", "usage_by_customer"), ("pdf", "all")):
                 ex = await c.get(
                     "/api/v1/isp/reports/export",
-                    params={"format": fmt, "section": section, "since": since, "until": until},
+                    params={
+                        "format": fmt,
+                        "section": section,
+                        "since": since,
+                        "until": until,
+                    },
                     headers=h,
                 )
                 assert ex.status_code == 200, ex.text
-                assert ex.headers["content-disposition"].startswith('attachment; filename="isp-report-')
+                assert ex.headers["content-disposition"].startswith(
+                    'attachment; filename="isp-report-'
+                )
             # a fresh ISP with no customers: zeros, never platform totals
             empty = await c.get(
-                "/api/v1/isp/reports/summary", headers={"X-Organization-Id": str(empty_id)}
+                "/api/v1/isp/reports/summary",
+                headers={"X-Organization-Id": str(empty_id)},
             )
             ed = empty.json()["data"]
             assert ed["guest_activity"]["logins"] == 0 and ed["usage_by_customer"] == []
-            assert ed["portfolio"]["routers"] == {"online": 0, "offline": 0, "pending": 0}
-            ov = await c.get("/api/v1/isp/overview", headers={"X-Organization-Id": str(empty_id)})
-            assert ov.status_code == 200 and ov.json()["data"]["customers"]["total"] == 0
+            assert ed["portfolio"]["routers"] == {
+                "online": 0,
+                "offline": 0,
+                "pending": 0,
+            }
+            ov = await c.get(
+                "/api/v1/isp/overview", headers={"X-Organization-Id": str(empty_id)}
+            )
+            assert (
+                ov.status_code == 200 and ov.json()["data"]["customers"]["total"] == 0
+            )
 
             # ---- 5. guests are masked ------------------------------------------
-            g = await c.get(f"/api/v1/isp/customers/{customers[0]['id']}/guests", headers=h)
+            g = await c.get(
+                f"/api/v1/isp/customers/{customers[0]['id']}/guests", headers=h
+            )
             item = g.json()["data"]["items"][0]
-            assert item["phone_masked"].startswith("X") and "90000" not in item["phone_masked"][:5]
+            assert (
+                item["phone_masked"].startswith("X")
+                and "90000" not in item["phone_masked"][:5]
+            )
 
             # ---- 6. TR-069 credentials + sync ------------------------------------
             acs = await c.get("/api/v1/isp/tr069/acs", headers=h)
             assert acs.status_code == 200, acs.text
             isp_user = acs.json()["data"]["username"]
             on = await c.put(
-                f"/api/v1/isp/tr069/customers/{customers[0]['id']}", json={"enabled": True}, headers=h
+                f"/api/v1/isp/tr069/customers/{customers[0]['id']}",
+                json={"enabled": True},
+                headers=h,
             )
             cust_user = on.json()["data"]["username"]
-            script = await c.get(f"/api/v1/isp/tr069/routers/{routers[0]['id']}/script", headers=h)
+            script = await c.get(
+                f"/api/v1/isp/tr069/routers/{routers[0]['id']}/script", headers=h
+            )
             assert script.status_code == 200 and cust_user in script.text
             assert script.headers["cache-control"] == "no-store"
 
@@ -322,11 +443,16 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
 
             def doc(genie_id, username):
                 return {
-                    "_id": genie_id, "_lastInform": datetime.now(UTC).isoformat(),
+                    "_id": genie_id,
+                    "_lastInform": datetime.now(UTC).isoformat(),
                     "Device": {
                         "ManagementServer": {"Username": {"_value": username}},
                         "DeviceInfo": {"ModelName": {"_value": "RB750Gr3"}},
-                        "WiFi": {"AccessPoint": {"1": {"Security": {"KeyPassphrase": {"_value": "leak"}}}}},
+                        "WiFi": {
+                            "AccessPoint": {
+                                "1": {"Security": {"KeyPassphrase": {"_value": "leak"}}}
+                            }
+                        },
                     },
                 }
 
@@ -335,10 +461,13 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                     self.docs = docs
 
                 async def query_devices(self, query, projection=None):
-                    names = {
-                        v for clause in query["$or"] for v in clause.values()
-                    }
-                    return [d for d in self.docs if d["Device"]["ManagementServer"]["Username"]["_value"] in names]
+                    names = {v for clause in query["$or"] for v in clause.values()}
+                    return [
+                        d
+                        for d in self.docs
+                        if d["Device"]["ManagementServer"]["Username"]["_value"]
+                        in names
+                    ]
 
                 async def add_tag(self, *a):
                     return None
@@ -349,27 +478,37 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                 async def get_faults(self, q):
                     return []
 
-            nbi = Nbi([
-                doc(f"A-{tag}", cust_user),
-                doc(f"B-{tag}", isp_user),
-                doc(f"C-{tag}", "isp-someoneelse"),
-            ])
+            nbi = Nbi(
+                [
+                    doc(f"A-{tag}", cust_user),
+                    doc(f"B-{tag}", isp_user),
+                    doc(f"C-{tag}", "isp-someoneelse"),
+                ]
+            )
             async with SessionLocal() as s:
                 await Tr069SyncService(s, nbi).sync_isp(isp_id)
                 await s.commit()
             devices = await c.get("/api/v1/isp/tr069/devices", headers=h)
-            items = {d["genieacs_device_id"]: d for d in devices.json()["data"]["items"]}
+            items = {
+                d["genieacs_device_id"]: d for d in devices.json()["data"]["items"]
+            }
             assert set(items) == {f"A-{tag}", f"B-{tag}"}
             assert items[f"A-{tag}"]["isp_customer_id"] == customers[0]["id"]
             assert items[f"B-{tag}"]["isp_customer_id"] is None
             async with SessionLocal() as s:
                 assert "leak" not in str(
-                    await _scalar(s, "select params_cache::text from tr069_devices where genieacs_device_id = :g", g=f"A-{tag}")
+                    await _scalar(
+                        s,
+                        "select params_cache::text from tr069_devices where genieacs_device_id = :g",
+                        g=f"A-{tag}",
+                    )
                 )
             # manual assignment survives the next sync
             cpe = items[f"B-{tag}"]["id"]
             pa = await c.patch(
-                f"/api/v1/isp/tr069/devices/{cpe}", json={"isp_customer_id": customers[1]["id"]}, headers=h
+                f"/api/v1/isp/tr069/devices/{cpe}",
+                json={"isp_customer_id": customers[1]["id"]},
+                headers=h,
             )
             assert pa.status_code == 200, pa.text
             async with SessionLocal() as s:
@@ -379,24 +518,42 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
             assert again.json()["data"]["isp_customer_id"] == customers[1]["id"]
             # disabling the customer blocks tasks with 409, keeps inventory
             off = await c.put(
-                f"/api/v1/isp/tr069/customers/{customers[0]['id']}", json={"enabled": False}, headers=h
+                f"/api/v1/isp/tr069/customers/{customers[0]['id']}",
+                json={"enabled": False},
+                headers=h,
             )
             assert off.json()["data"]["password"] is None
             a_id = items[f"A-{tag}"]["id"]
-            blocked = await c.post(f"/api/v1/isp/tr069/devices/{a_id}/reboot", headers=h)
+            blocked = await c.post(
+                f"/api/v1/isp/tr069/devices/{a_id}/reboot", headers=h
+            )
             assert blocked.status_code == 409
             assert blocked.json()["data"]["code"] == "TR069_DISABLED_FOR_CUSTOMER"
-            assert (await c.get(f"/api/v1/isp/tr069/devices/{a_id}", headers=h)).status_code == 200
+            assert (
+                await c.get(f"/api/v1/isp/tr069/devices/{a_id}", headers=h)
+            ).status_code == 200
 
             # ---- 7. suspend: org suspended, guest WiFi untouched -----------------
-            sus = await c.post(f"/api/v1/isp/customers/{customers[1]['id']}/suspend", json={"reason": "test"}, headers=h)
-            assert sus.status_code == 200 and sus.json()["data"]["status"] == "suspended"
+            sus = await c.post(
+                f"/api/v1/isp/customers/{customers[1]['id']}/suspend",
+                json={"reason": "test"},
+                headers=h,
+            )
+            assert (
+                sus.status_code == 200 and sus.json()["data"]["status"] == "suspended"
+            )
             async with SessionLocal() as s:
-                assert await _scalar(
-                    s, "select count(*) from captive_portal_configs where organization_id = :i and is_active",
-                    i=uuid.UUID(customers[1]["id"]),
-                ) == 1
-            act = await c.post(f"/api/v1/isp/customers/{customers[1]['id']}/activate", headers=h)
+                assert (
+                    await _scalar(
+                        s,
+                        "select count(*) from captive_portal_configs where organization_id = :i and is_active",
+                        i=uuid.UUID(customers[1]["id"]),
+                    )
+                    == 1
+                )
+            act = await c.post(
+                f"/api/v1/isp/customers/{customers[1]['id']}/activate", headers=h
+            )
             assert act.json()["data"]["status"] == "active"
 
             # ---- 8. NetLogs: partition pruning for a 24 h window -----------------
@@ -407,16 +564,33 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
             from app.domains.isp_partner.logs_repository import isp_conditions
 
             now = datetime.now(UTC)
-            f = CustomerFilters(organization_id=ids[0], since=now - timedelta(hours=24), until=now)
-            stmt = sa_select(DeviceLogEvent.id).where(*isp_conditions(f, ids)).order_by(
-                DeviceLogEvent.received_at.desc(), DeviceLogEvent.id.desc()
-            ).limit(101)
+            f = CustomerFilters(
+                organization_id=ids[0], since=now - timedelta(hours=24), until=now
+            )
+            stmt = (
+                sa_select(DeviceLogEvent.id)
+                .where(*isp_conditions(f, ids))
+                .order_by(DeviceLogEvent.received_at.desc(), DeviceLogEvent.id.desc())
+                .limit(101)
+            )
             async with SessionLocal() as s:
                 compiled = stmt.compile(compile_kwargs={"literal_binds": True})
-                plan_rows = (await s.execute(__import__("sqlalchemy").text(f"EXPLAIN {compiled}"))).scalars().all()
+                plan_rows = (
+                    (
+                        await s.execute(
+                            __import__("sqlalchemy").text(f"EXPLAIN {compiled}")
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
             plan_text = "\n".join(plan_rows)
             print("\nEXPLAIN (24h window):\n" + plan_text)
-            scanned = {p for p in ("p202610", "p202611", "p202612", "p202701", "default") if f"device_log_events_{p}" in plan_text}
+            scanned = {
+                p
+                for p in ("p202610", "p202611", "p202612", "p202701", "default")
+                if f"device_log_events_{p}" in plan_text
+            }
             assert len(scanned) <= 2, plan_text
     finally:
         await engine.dispose()

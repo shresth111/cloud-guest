@@ -21,7 +21,11 @@ from app.domains.isp_partner.constants import (
     TR069_MANAGE,
     TR069_READ,
 )
-from app.domains.isp_partner.dependencies import IspContext, RequireIspPartner, isp_guards
+from app.domains.isp_partner.dependencies import (
+    IspContext,
+    RequireIspPartner,
+    isp_guards,
+)
 from app.domains.isp_partner.http import ok
 from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import get_access_validator, get_rbac_repository
@@ -130,7 +134,9 @@ async def get_location_tr069(
     isp: IspContext = Depends(RequireIspPartner),
     service: Tr069Service = Depends(get_tr069_service),
 ) -> dict:
-    return ok(request, await service.location_state(isp, isp_location_id), "Location TR-069")
+    return ok(
+        request, await service.location_state(isp, isp_location_id), "Location TR-069"
+    )
 
 
 @tr069_router.put("/locations/{isp_location_id}", dependencies=isp_guards(TR069_MANAGE))
@@ -209,7 +215,9 @@ async def patch_device(
     isp: IspContext = Depends(RequireIspPartner),
     service: Tr069Service = Depends(get_tr069_service),
 ) -> dict:
-    data = await service.assign_device(isp, cpe_id, payload.model_dump(exclude_unset=True))
+    data = await service.assign_device(
+        isp, cpe_id, payload.model_dump(exclude_unset=True)
+    )
     return ok(request, data, "TR-069 device updated")
 
 
@@ -224,7 +232,9 @@ async def refresh_device(
     isp: IspContext = Depends(RequireIspPartner),
     service: Tr069Service = Depends(get_tr069_service),
 ) -> dict:
-    return ok(request, await service.queue_task(isp, cpe_id, "refresh_params"), "Refresh")
+    return ok(
+        request, await service.queue_task(isp, cpe_id, "refresh_params"), "Refresh"
+    )
 
 
 @tr069_router.post(

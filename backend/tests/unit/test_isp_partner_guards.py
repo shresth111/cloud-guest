@@ -70,24 +70,37 @@ def guard_problems(route) -> list[str]:
     problems: list[str] = []
     expected = [RejectLocationRouterHeaders, RequireOrganization]
     positions = {}
-    for name, target in (("RejectLocationRouterHeaders", expected[0]), ("RequireOrganization", expected[1]), ("RequireIspPartner", RequireIspPartner)):
+    for name, target in (
+        ("RejectLocationRouterHeaders", expected[0]),
+        ("RequireOrganization", expected[1]),
+        ("RequireIspPartner", RequireIspPartner),
+    ):
         if target not in calls:
             problems.append(f"missing {name}")
         else:
             positions[name] = calls.index(target)
     perms = [
-        c for c in calls if getattr(c, "__qualname__", "").startswith("RequirePermission")
+        c
+        for c in calls
+        if getattr(c, "__qualname__", "").startswith("RequirePermission")
     ]
     if len(perms) != 1:
         problems.append(f"expected exactly one RequirePermission, found {len(perms)}")
     else:
         values = _closure_values(perms[0])
         if ScopeType.ORGANIZATION not in values:
-            problems.append(f"RequirePermission scope is not pinned to ORGANIZATION: {values}")
+            problems.append(
+                f"RequirePermission scope is not pinned to ORGANIZATION: {values}"
+            )
         if None in values:
             problems.append("RequirePermission has scope=None (inferred scope)")
         positions["RequirePermission"] = calls.index(perms[0])
-    order = ["RejectLocationRouterHeaders", "RequireOrganization", "RequirePermission", "RequireIspPartner"]
+    order = [
+        "RejectLocationRouterHeaders",
+        "RequireOrganization",
+        "RequirePermission",
+        "RequireIspPartner",
+    ]
     seen = [positions[n] for n in order if n in positions]
     if seen != sorted(seen):
         problems.append(f"guards out of order: {positions}")
@@ -127,7 +140,9 @@ def test_every_isp_route_carries_the_guard_stack(route) -> None:
 def test_no_route_creates_a_child_under_a_customer() -> None:
     """BE-T 2: no /isp/customers/{id}/customers (or any org-type route)."""
     for route in _isp_routes():
-        assert not route.path.startswith("/api/v1/isp/customers/{isp_customer_id}/customers")
+        assert not route.path.startswith(
+            "/api/v1/isp/customers/{isp_customer_id}/customers"
+        )
         assert "org_type" not in route.path
 
 
@@ -174,7 +189,9 @@ def test_checker_detects_a_scope_alias_parameter() -> None:
         dependencies=[
             Depends(RejectLocationRouterHeaders),
             Depends(RequireOrganization),
-            Depends(RequirePermission("isp_partner.read", scope=ScopeType.ORGANIZATION)),
+            Depends(
+                RequirePermission("isp_partner.read", scope=ScopeType.ORGANIZATION)
+            ),
             Depends(RequireIspPartner),
         ],
     )
@@ -219,7 +236,9 @@ def flags(monkeypatch):
         from app.domains.tr069 import config as tr_config
 
         monkeypatch.setattr(
-            isp_config, "get_isp_partner_settings", lambda: isp_config.IspPartnerSettings(enabled=isp)
+            isp_config,
+            "get_isp_partner_settings",
+            lambda: isp_config.IspPartnerSettings(enabled=isp),
         )
         monkeypatch.setattr(
             tr_config,
@@ -228,7 +247,9 @@ def flags(monkeypatch):
         )
         from app.domains.tr069 import internal_router
 
-        monkeypatch.setattr(internal_router, "get_tr069_settings", tr_config.get_tr069_settings)
+        monkeypatch.setattr(
+            internal_router, "get_tr069_settings", tr_config.get_tr069_settings
+        )
 
     return set_flags
 
@@ -280,3 +301,32 @@ def test_flag_on_unauthenticated_is_401_not_404(flags) -> None:
     flags(isp=True, tr069=True)
     client = TestClient(_app(), raise_server_exceptions=False)
     assert client.get("/api/v1/isp/me").status_code == 401
+
+
+def test_no_isp_schema_name_collides_with_an_existing_one() -> None:
+    """A request model named like an existing one (``LocationCreateRequest``)
+    makes FastAPI rename BOTH to ``app__domains__...`` in the OpenAPI
+    document, which changes existing paths' schemas. BE-Z 3b forbids that."""
+    import inspect
+
+    from pydantic import BaseModel
+
+    from app.domains.isp_partner import schemas as isp_schemas
+    from app.domains.tr069 import router as tr_router
+
+    ours = {
+        name
+        for module in (isp_schemas, tr_router)
+        for name, obj in vars(module).items()
+        if inspect.isclass(obj)
+        and issubclass(obj, BaseModel)
+        and obj.__module__ == module.__name__
+    }
+    assert "IspLocationCreateRequest" in ours
+    schemas = _app().openapi()["components"]["schemas"]
+    clashes = sorted(
+        name
+        for name in schemas
+        if name.startswith("app__") and name.rsplit("__", 1)[-1] in ours
+    )
+    assert clashes == [], clashes

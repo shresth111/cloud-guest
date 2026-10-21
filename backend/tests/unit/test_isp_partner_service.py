@@ -20,8 +20,8 @@ from app.domains.isp_partner.exceptions import (
 from app.domains.isp_partner.schemas import (
     CustomerCreateRequest,
     CustomerUpdateRequest,
+    IspLocationCreateRequest,
     IspUserCreateRequest,
-    LocationCreateRequest,
 )
 from app.domains.isp_partner.service import IspPartnerService
 from app.domains.organization.exceptions import DuplicateSlugError
@@ -120,7 +120,11 @@ class Recorder:
         self.calls.append(("create_organization", kw))
         if self.slug_taken:
             raise DuplicateSlugError(kw["slug"])
-        new = org(uuid.uuid4(), parent=kw["parent_organization_id"], org_type=kw["org_type"].value)
+        new = org(
+            uuid.uuid4(),
+            parent=kw["parent_organization_id"],
+            org_type=kw["org_type"].value,
+        )
         new.name = kw["name"]
         new.slug = kw["slug"]
         new.settings = kw["settings"]
@@ -260,22 +264,51 @@ class TestCreateCustomer:
             alerted.append(kw)
 
         service = _service(repo, rec, alerting=alerting)
-        data = await service.create_customer(context(repo), dict(_BODY, external_ref="AIR-1"))
+        data = await service.create_customer(
+            context(repo), dict(_BODY, external_ref="AIR-1")
+        )
         (call,) = rec.named("create_organization")
         assert call["org_type"].value == "standard"
         assert call["parent_organization_id"] == ISP_A
-        assert call["settings"] == {"onboarded_via": "isp_partner", "isp_organization_id": str(ISP_A)}
+        assert call["settings"] == {
+            "onboarded_via": "isp_partner",
+            "isp_organization_id": str(ISP_A),
+        }
         (sub,) = rec.named("create_subscription")
-        assert sub["plan_id"] == PLAN and sub["organization_id"] == uuid.UUID(data["id"])
+        assert sub["plan_id"] == PLAN and sub["organization_id"] == uuid.UUID(
+            data["id"]
+        )
         assert alerted and alerted[0]["organization_id"] == uuid.UUID(data["id"])
         assert any(a["action"] == "isp_customer_created" for a in rec.named("audit"))
         assert data["status"] == "active" and data["tr069_enabled"] is False
         assert set(data) == {
-            "id", "name", "slug", "status", "legal_name", "gstin", "external_ref", "contact_name",
-            "contact_email", "contact_phone", "address_line1", "city", "state_province",
-            "postal_code", "timezone", "notes", "counts", "tr069_enabled", "created_at", "updated_at",
+            "id",
+            "name",
+            "slug",
+            "status",
+            "legal_name",
+            "gstin",
+            "external_ref",
+            "contact_name",
+            "contact_email",
+            "contact_phone",
+            "address_line1",
+            "city",
+            "state_province",
+            "postal_code",
+            "timezone",
+            "notes",
+            "counts",
+            "tr069_enabled",
+            "created_at",
+            "updated_at",
         }
-        assert set(data["counts"]) == {"locations", "routers_total", "routers_online", "cpes"}
+        assert set(data["counts"]) == {
+            "locations",
+            "routers_total",
+            "routers_online",
+            "cpes",
+        }
 
     async def test_no_user_membership_or_role_is_ever_created(self) -> None:
         """BE-4: the service has no user/membership/role collaborator at all,
@@ -288,19 +321,24 @@ class TestCreateCustomer:
             context(repo),
             uuid.UUID(created["id"]),
             {
-                "name": "Sector 18", "address_line1": "1 Main", "city": "Noida",
-                "state_province": "UP", "postal_code": "201301", "country": "IN",
+                "name": "Sector 18",
+                "address_line1": "1 Main",
+                "city": "Noida",
+                "state_province": "UP",
+                "postal_code": "201301",
+                "country": "IN",
                 "timezone": "Asia/Kolkata",
             },
         )
         names = {n for n, _ in rec.calls}
         assert names <= {
-            "create_organization", "create_subscription", "audit", "create_location",
+            "create_organization",
+            "create_subscription",
+            "audit",
+            "create_location",
             "create_config",
         }
-        assert not any(
-            "user" in n or "member" in n or "role" in n for n in names
-        )
+        assert not any("user" in n or "member" in n or "role" in n for n in names)
 
     async def test_alerting_failure_does_not_fail_creation(self) -> None:
         repo = _repo()
@@ -317,7 +355,9 @@ class TestCreateCustomer:
         repo = _repo()
         repo.profiles[ISP_A].max_customers = 2
         with pytest.raises(IspCustomerLimitError) as err:
-            await _service(repo, Recorder(repo)).create_customer(context(repo), dict(_BODY))
+            await _service(repo, Recorder(repo)).create_customer(
+                context(repo), dict(_BODY)
+            )
         assert err.value.status_code == 409
         repo.profiles[ISP_A].max_customers = None
         with pytest.raises(IspCustomerSlugTakenError):
@@ -344,7 +384,10 @@ class TestCreateCustomer:
             dict(_BODY, org_type="msp", parent_organization_id=str(CUST_A1)),
         )
         (call,) = rec.named("create_organization")
-        assert call["org_type"].value == "standard" and call["parent_organization_id"] == ISP_A
+        assert (
+            call["org_type"].value == "standard"
+            and call["parent_organization_id"] == ISP_A
+        )
 
 
 class TestUpdateSuspend:
@@ -365,10 +408,16 @@ class TestUpdateSuspend:
         data = await service.suspend_customer(context(repo), CUST_A1, reason="unpaid")
         assert data["status"] == "suspended"
         (suspend,) = rec.named("suspend_organization")
-        assert suspend["requesting_organization_id"] == CUST_A1  # never None, never the ISP
+        assert (
+            suspend["requesting_organization_id"] == CUST_A1
+        )  # never None, never the ISP
         assert creds.toggles == [(CUST_A1, False)]
         # no guest/RADIUS/portal collaborator exists to touch
-        assert {n for n, _ in rec.calls} <= {"suspend_organization", "update_organization", "audit"}
+        assert {n for n, _ in rec.calls} <= {
+            "suspend_organization",
+            "update_organization",
+            "audit",
+        }
         await service.activate_customer(context(repo), CUST_A1)
         assert creds.toggles == [(CUST_A1, False), (CUST_A1, True)]
 
@@ -401,8 +450,12 @@ class TestLocationsRouters:
             context(repo),
             CUST_A1,
             {
-                "name": "Sector 18", "address_line1": "1 Main", "city": "Noida",
-                "state_province": "UP", "postal_code": "201301", "country": "IN",
+                "name": "Sector 18",
+                "address_line1": "1 Main",
+                "city": "Noida",
+                "state_province": "UP",
+                "postal_code": "201301",
+                "country": "IN",
                 "timezone": "Asia/Kolkata",
             },
         )
@@ -421,14 +474,19 @@ class TestLocationsRouters:
         rec = Recorder(repo)
         service = _service(repo, rec)
         body = {
-            "name": "hEX", "serial_number": "HG3X", "mac_address": "e4:8d:8c:00:00:01",
-            "model": "RB750Gr3", "vendor": "mikrotik",
+            "name": "hEX",
+            "serial_number": "HG3X",
+            "mac_address": "e4:8d:8c:00:00:01",
+            "model": "RB750Gr3",
+            "vendor": "mikrotik",
         }
         data = await service.create_router(context(repo), LOC_A1, body)
         assert data["cloud_link"] == "unknown" and data["vendor"] == "mikrotik"
         assert rec.named("create_router")[0]["requesting_organization_id"] == CUST_A1
         with pytest.raises(IspVendorNotSupportedError):
-            await service.create_router(context(repo), LOC_A1, dict(body, vendor="aruba"))
+            await service.create_router(
+                context(repo), LOC_A1, dict(body, vendor="aruba")
+            )
         from app.domains.isp_partner.exceptions import IspLocationNotFoundError
 
         with pytest.raises(IspLocationNotFoundError):
@@ -454,14 +512,22 @@ class TestSchemas:
 
     def test_location_and_user_bodies_refuse_org_fields(self) -> None:
         with pytest.raises(ValidationError):
-            LocationCreateRequest(
-                name="x", address_line1="a", city="c", state_province="s",
-                postal_code="1", organization_id=str(uuid.uuid4()),
+            IspLocationCreateRequest(
+                name="x",
+                address_line1="a",
+                city="c",
+                state_province="s",
+                postal_code="1",
+                organization_id=str(uuid.uuid4()),
             )
         for extra in ({"organization_id": str(uuid.uuid4())}, {"organization": "x"}):
             with pytest.raises(ValidationError):
                 IspUserCreateRequest(
-                    first_name="a", last_name="b", email="a@example.com", role="isp-viewer", **extra
+                    first_name="a",
+                    last_name="b",
+                    email="a@example.com",
+                    role="isp-viewer",
+                    **extra,
                 )
 
     def test_contact_email_is_required_and_validated(self) -> None:

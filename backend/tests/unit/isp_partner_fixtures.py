@@ -66,7 +66,9 @@ class FakeIspRepository:
     configs: dict[uuid.UUID, Any] = field(default_factory=dict)
     cpes: dict[uuid.UUID, Any] = field(default_factory=dict)
     profiles: dict[uuid.UUID, Any] = field(default_factory=dict)
-    scopes: dict[tuple[uuid.UUID, uuid.UUID], set[uuid.UUID]] = field(default_factory=dict)
+    scopes: dict[tuple[uuid.UUID, uuid.UUID], set[uuid.UUID]] = field(
+        default_factory=dict
+    )
     session: Any = None
 
     async def get_organization(self, organization_id):
@@ -128,10 +130,17 @@ def estate() -> FakeIspRepository:
         repo.routers[rtr] = SimpleNamespace(
             id=rtr, organization_id=owner, location_id=loc, name="hEX", is_deleted=False
         )
-    repo.configs[CFG_A1] = SimpleNamespace(id=CFG_A1, organization_id=CUST_A1, is_deleted=False)
-    repo.configs[CFG_B1] = SimpleNamespace(id=CFG_B1, organization_id=CUST_B1, is_deleted=False)
+    repo.configs[CFG_A1] = SimpleNamespace(
+        id=CFG_A1, organization_id=CUST_A1, is_deleted=False
+    )
+    repo.configs[CFG_B1] = SimpleNamespace(
+        id=CFG_B1, organization_id=CUST_B1, is_deleted=False
+    )
     repo.cpes[CPE_A] = SimpleNamespace(
-        id=CPE_A, isp_organization_id=ISP_A, customer_organization_id=CUST_A1, is_deleted=False
+        id=CPE_A,
+        isp_organization_id=ISP_A,
+        customer_organization_id=CUST_A1,
+        is_deleted=False,
     )
     repo.cpes[CPE_A_UNASSIGNED] = SimpleNamespace(
         id=CPE_A_UNASSIGNED,
@@ -140,7 +149,10 @@ def estate() -> FakeIspRepository:
         is_deleted=False,
     )
     repo.cpes[CPE_B] = SimpleNamespace(
-        id=CPE_B, isp_organization_id=ISP_B, customer_organization_id=CUST_B1, is_deleted=False
+        id=CPE_B,
+        isp_organization_id=ISP_B,
+        customer_organization_id=CUST_B1,
+        is_deleted=False,
     )
     for isp in (ISP_A, ISP_B):
         repo.profiles[isp] = SimpleNamespace(

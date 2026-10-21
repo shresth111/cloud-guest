@@ -49,7 +49,9 @@ class TestAssertCustomer:
         assert (await IspScope.assert_customer(context(repo), CUST_A1)).id == CUST_A1
 
     @pytest.mark.parametrize(
-        "target", [CUST_B1, ISP_A, ISP_B, uuid.uuid4()], ids=["other-isp", "self", "isp-b", "unknown"]
+        "target",
+        [CUST_B1, ISP_A, ISP_B, uuid.uuid4()],
+        ids=["other-isp", "self", "isp-b", "unknown"],
     )
     async def test_anything_else_is_404(self, target) -> None:
         with pytest.raises(IspCustomerNotFoundError) as err:
@@ -100,7 +102,9 @@ class TestDerivedEntities:
         assert (await IspScope.assert_cpe(isp, CPE_A)).id == CPE_A
         assert (await IspScope.assert_cpe(isp, CPE_A_UNASSIGNED)).id == CPE_A_UNASSIGNED
 
-    async def test_confined_technician_cannot_reach_other_customers_router(self) -> None:
+    async def test_confined_technician_cannot_reach_other_customers_router(
+        self,
+    ) -> None:
         isp = context(estate(), role="isp-technician", confined={CUST_A2})
         with pytest.raises(IspRouterNotFoundError):
             await IspScope.assert_router(isp, RTR_A1)
@@ -118,12 +122,16 @@ class TestDerivedEntities:
             RTR_A1,
         )
         with pytest.raises(IspLocationNotFoundError):
-            await IspScope.optional_filters(isp, isp_customer_id=CUST_A2, isp_location_id=LOC_A1)
+            await IspScope.optional_filters(
+                isp, isp_customer_id=CUST_A2, isp_location_id=LOC_A1
+            )
 
     async def test_child_ids_respect_confinement_and_can_be_empty(self) -> None:
         repo = estate()
         assert await context(repo).child_ids() == [CUST_A1, CUST_A2]
-        assert await context(repo, role="isp-noc", confined={CUST_A2}).child_ids() == [CUST_A2]
+        assert await context(repo, role="isp-noc", confined={CUST_A2}).child_ids() == [
+            CUST_A2
+        ]
         fresh = uuid.uuid4()
         repo.orgs[fresh] = org(fresh, parent=None, org_type="msp")
         repo.profiles[fresh] = repo.profiles[ISP_A]
@@ -133,7 +141,9 @@ class TestDerivedEntities:
 # -- RequireIspPartner --------------------------------------------------------
 
 
-def _assignment(slug, *, org_id=ISP_A, scope_type="organization", role_scope="organization"):
+def _assignment(
+    slug, *, org_id=ISP_A, scope_type="organization", role_scope="organization"
+):
     return SimpleNamespace(
         role=SimpleNamespace(
             id=uuid.uuid4(), slug=slug, organization_id=None, scope_type=role_scope
@@ -170,11 +180,17 @@ class TestRequireIspPartner:
 
     async def test_global_caller_is_refused(self, roles) -> None:
         roles.append(_assignment("isp-owner"))
-        roles.append(_assignment("super-admin", org_id=None, scope_type="global", role_scope="global"))
+        roles.append(
+            _assignment(
+                "super-admin", org_id=None, scope_type="global", role_scope="global"
+            )
+        )
         with pytest.raises(IspRoleRequiredError):
             await deps.RequireIspPartner(ISP_A, _user(), None, estate())
 
-    async def test_customer_org_owner_naming_own_org_is_role_required(self, roles) -> None:
+    async def test_customer_org_owner_naming_own_org_is_role_required(
+        self, roles
+    ) -> None:
         """BE-T 12."""
         roles.append(_assignment("organization-owner", org_id=CUST_A1))
         with pytest.raises(IspRoleRequiredError) as err:

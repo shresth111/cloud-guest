@@ -27,9 +27,18 @@ TR098 = "InternetGatewayDevice."
 
 #: logical name -> (TR-181 path, TR-098 path)
 SCALARS: dict[str, tuple[str, str]] = {
-    "manufacturer": ("Device.DeviceInfo.Manufacturer", "InternetGatewayDevice.DeviceInfo.Manufacturer"),
-    "model": ("Device.DeviceInfo.ModelName", "InternetGatewayDevice.DeviceInfo.ModelName"),
-    "serial_number": ("Device.DeviceInfo.SerialNumber", "InternetGatewayDevice.DeviceInfo.SerialNumber"),
+    "manufacturer": (
+        "Device.DeviceInfo.Manufacturer",
+        "InternetGatewayDevice.DeviceInfo.Manufacturer",
+    ),
+    "model": (
+        "Device.DeviceInfo.ModelName",
+        "InternetGatewayDevice.DeviceInfo.ModelName",
+    ),
+    "serial_number": (
+        "Device.DeviceInfo.SerialNumber",
+        "InternetGatewayDevice.DeviceInfo.SerialNumber",
+    ),
     "software_version": (
         "Device.DeviceInfo.SoftwareVersion",
         "InternetGatewayDevice.DeviceInfo.SoftwareVersion",
@@ -64,7 +73,8 @@ WAN_IP_PATHS: tuple[str, ...] = (
 )
 _TR098_PPP_IP = WAN_IP_PATHS[1]
 _TR098_IP_TYPE = (
-    "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1.WANIPConnection.1.AddressingType"
+    "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1."
+    "WANIPConnection.1.AddressingType"
 )
 
 

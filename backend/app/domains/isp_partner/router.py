@@ -35,10 +35,13 @@ from app.domains.guest.dependencies import get_radius_service
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.authorization import AccessValidator
-from app.domains.rbac.dependencies import CurrentUser, get_access_validator
+from app.domains.rbac.dependencies import (
+    CurrentUser,
+    get_access_validator,
+    get_rbac_repository,
+)
 from app.domains.rbac.enums import ScopeType
 from app.domains.rbac.repository import RBACRepositoryProtocol
-from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.router import router as router_routes
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.schemas import RouterManagementAccessRequest
@@ -62,20 +65,20 @@ from .constants import (
     SETUP_SCRIPT_ROLES,
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
-from .http import ok
 from .exceptions import IspForceNotAllowedError, IspSetupNotAllowedError
+from .http import ok
 from .providers import get_isp_partner_service
 from .rbac_roles import all_permission_keys
-from .scoping import IspScope
 from .schemas import (
     CustomerCreateRequest,
     CustomerUpdateRequest,
-    LocationCreateRequest,
-    LocationUpdateRequest,
-    RouterCreateRequest,
-    RouterUpdateRequest,
+    IspLocationCreateRequest,
+    IspLocationUpdateRequest,
+    IspRouterCreateRequest,
+    IspRouterUpdateRequest,
     SuspendRequest,
 )
+from .scoping import IspScope
 from .service import IspPartnerService
 
 __all__ = ["isp_partner_router"]
@@ -110,7 +113,9 @@ async def effective_isp_permissions(
             and grant.scope.organization_id == isp.isp_org_id
         )
 
-    allowed = {g.permission_key for g in grants.allow if g.permission_key in ours and on_isp(g)}
+    allowed = {
+        g.permission_key for g in grants.allow if g.permission_key in ours and on_isp(g)
+    }
     denied = {g.permission_key for g in grants.deny if on_isp(g)}
     return sorted(allowed - denied)
 
@@ -224,7 +229,11 @@ async def activate_customer(
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
 ) -> dict:
-    return ok(request, await service.activate_customer(isp, isp_customer_id), "Customer activated")
+    return ok(
+        request,
+        await service.activate_customer(isp, isp_customer_id),
+        "Customer activated",
+    )
 
 
 # ============================================================================
@@ -264,7 +273,7 @@ async def list_customer_locations(
 async def create_location(
     request: Request,
     isp_customer_id: uuid.UUID,
-    payload: LocationCreateRequest,
+    payload: IspLocationCreateRequest,
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
 ) -> dict:
@@ -308,7 +317,7 @@ async def get_location(
 async def update_location(
     request: Request,
     isp_location_id: uuid.UUID,
-    payload: LocationUpdateRequest,
+    payload: IspLocationUpdateRequest,
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
 ) -> dict:
@@ -379,7 +388,7 @@ async def list_routers(
 async def create_router(
     request: Request,
     isp_location_id: uuid.UUID,
-    payload: RouterCreateRequest,
+    payload: IspRouterCreateRequest,
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
 ) -> dict:
@@ -401,7 +410,7 @@ async def get_router(
 async def update_router(
     request: Request,
     isp_router_id: uuid.UUID,
-    payload: RouterUpdateRequest,
+    payload: IspRouterUpdateRequest,
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
 ) -> dict:
@@ -454,7 +463,11 @@ async def _setup_target(isp: IspContext, isp_router_id: uuid.UUID) -> Any:
 
 
 async def _audit_setup(
-    audit: RBACRepositoryProtocol, isp: IspContext, router: Any, action: str, **extra: Any
+    audit: RBACRepositoryProtocol,
+    isp: IspContext,
+    router: Any,
+    action: str,
+    **extra: Any,
 ) -> None:
     await audit.create_audit_log_entry(
         actor_user_id=isp.user_id,
@@ -641,7 +654,9 @@ async def list_portal_configs(
     )
 
 
-@core.get("/captive-portal-configs/{config_id}", dependencies=isp_guards(ISP_PARTNER_READ))
+@core.get(
+    "/captive-portal-configs/{config_id}", dependencies=isp_guards(ISP_PARTNER_READ)
+)
 async def get_portal_config(
     request: Request,
     config_id: uuid.UUID,
@@ -657,7 +672,9 @@ async def get_portal_config(
     )
 
 
-@core.put("/captive-portal-configs/{config_id}", dependencies=isp_guards(ISP_PARTNER_UPDATE))
+@core.put(
+    "/captive-portal-configs/{config_id}", dependencies=isp_guards(ISP_PARTNER_UPDATE)
+)
 async def update_portal_config(
     request: Request,
     config_id: uuid.UUID,
@@ -735,7 +752,9 @@ def _looks_like_phone(value: str | None) -> bool:
     return digits >= 6
 
 
-@core.get("/customers/{isp_customer_id}/guests", dependencies=isp_guards(ISP_PARTNER_READ))
+@core.get(
+    "/customers/{isp_customer_id}/guests", dependencies=isp_guards(ISP_PARTNER_READ)
+)
 async def list_guests(
     request: Request,
     isp_customer_id: uuid.UUID,
@@ -757,22 +776,34 @@ async def list_guests(
             raise IspLocationNotFoundError()
         location_id = location.id
     rows, total = await isp.repository.list_guests(
-        customer.id, location_id=location_id, search=search, page=page, page_size=page_size
+        customer.id,
+        location_id=location_id,
+        search=search,
+        page=page,
+        page_size=page_size,
     )
     items = []
     for guest, sessions in rows:
         phone = guest.identifier if _looks_like_phone(guest.identifier) else None
-        email = guest.email or (guest.identifier if "@" in (guest.identifier or "") else None)
+        email = guest.email or (
+            guest.identifier if "@" in (guest.identifier or "") else None
+        )
         items.append(
             {
                 "id": str(guest.id),
                 "display_name": guest.display_name,
                 "phone_masked": mask_mobile(phone),
                 "email_masked": mask_email(email),
-                "first_seen_at": guest.first_seen_at.isoformat() if guest.first_seen_at else None,
-                "last_seen_at": guest.last_seen_at.isoformat() if guest.last_seen_at else None,
+                "first_seen_at": guest.first_seen_at.isoformat()
+                if guest.first_seen_at
+                else None,
+                "last_seen_at": guest.last_seen_at.isoformat()
+                if guest.last_seen_at
+                else None,
                 "session_count": sessions,
-                "isp_location_id": str(guest.location_id) if guest.location_id else None,
+                "isp_location_id": str(guest.location_id)
+                if guest.location_id
+                else None,
             }
         )
     return ok(request, make_page(items, total, page, page_size), "Guests")

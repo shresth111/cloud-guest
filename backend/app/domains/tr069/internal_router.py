@@ -140,7 +140,9 @@ async def acs_auth(
     username, password = parsed
     key = (username, hashlib.sha256(password.encode()).hexdigest())
     if positive_cache.hit(key):
-        return Response(status_code=status.HTTP_204_NO_CONTENT, headers={USER_HEADER: username})
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT, headers={USER_HEADER: username}
+        )
     credential = await CredentialStore(session).get_by_username(username)
     if credential is None or not credential.enabled:
         return _unauthorized()
@@ -149,4 +151,6 @@ async def acs_auth(
     if not await _owner_active(session, credential):
         return _unauthorized()
     positive_cache.put(key)
-    return Response(status_code=status.HTTP_204_NO_CONTENT, headers={USER_HEADER: username})
+    return Response(
+        status_code=status.HTTP_204_NO_CONTENT, headers={USER_HEADER: username}
+    )

@@ -17,8 +17,20 @@ from app.domains.isp_partner.logs_repository import (
     IspLogsRepository,
     isp_conditions,
 )
-from tests.unit.isp_partner_fixtures import CUST_A1, CUST_A2, CUST_B1, ISP_A, context, estate
-from tests.unit.test_isp_partner_hard_rules import AUDITS, _app, _h, client  # noqa: F401
+from tests.unit.isp_partner_fixtures import (
+    CUST_A1,
+    CUST_A2,
+    CUST_B1,
+    ISP_A,
+    context,
+    estate,
+)
+from tests.unit.test_isp_partner_hard_rules import (  # noqa: F401
+    AUDITS,
+    _app,
+    _h,
+    client,
+)
 
 T1 = datetime(2026, 10, 21, 0, 0, tzinfo=UTC)
 T2 = T1 + timedelta(hours=24)
@@ -69,7 +81,9 @@ class TestIspConditions:
         with pytest.raises(ValueError):
             isp_conditions(_filters(), [])
 
-    async def test_repository_with_no_customers_returns_nothing_without_a_query(self) -> None:
+    async def test_repository_with_no_customers_returns_nothing_without_a_query(
+        self,
+    ) -> None:
         class NoSession:
             async def execute(self, *a, **k):
                 raise AssertionError("must not query")
@@ -84,7 +98,9 @@ class TestIspConditions:
 class TestScopeHelper:
     async def test_confined_caller_without_a_customer_gets_only_theirs(self) -> None:
         isp = context(estate(), role="isp-noc", confined={CUST_A2})
-        customer, location, router, org_ids = await logs_router._scope(isp, None, None, None)
+        customer, location, router, org_ids = await logs_router._scope(
+            isp, None, None, None
+        )
         assert (customer, location, router) == (None, None, None)
         assert org_ids == [CUST_A2]
 
@@ -118,7 +134,13 @@ class FakeIpdr:
         )
 
     async def list_page(self, filters, *, limit=None):
-        return {"since": T1, "until": T2, "items": [], "next_cursor": None, "coverage": []}
+        return {
+            "since": T1,
+            "until": T2,
+            "items": [],
+            "next_cursor": None,
+            "coverage": [],
+        }
 
 
 @pytest.fixture
@@ -169,7 +191,9 @@ def test_ipdr_list_of_another_isps_customer_is_404(client, ipdr) -> None:  # noq
 def test_ipdr_export_all_customers_is_one_csv_one_audit_row_each(client, ipdr) -> None:  # noqa: F811
     r = client.c.get("/api/v1/isp/logs/ipdr/export.csv", headers=_h())
     assert r.status_code == 200, r.text
-    assert r.headers["content-disposition"].startswith('attachment; filename="isp-ipdr-all-')
+    assert r.headers["content-disposition"].startswith(
+        'attachment; filename="isp-ipdr-all-'
+    )
     names = [client.repo.orgs[c].name for c in (CUST_A1, CUST_A2)]
     assert ipdr.streamed == sorted(names)
     rows = [a for a in AUDITS if a["action"] == "ipdr_exported"]

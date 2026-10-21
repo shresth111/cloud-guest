@@ -23,7 +23,12 @@ TR069_MANAGE = "tr069.manage"
 
 #: The four permission groups this feature owns. Every key above belongs to
 #: exactly one of them (the part before the dot).
-ISP_PERMISSION_GROUPS: tuple[str, ...] = ("isp_partner", "isp_logs", "isp_ipdr", "tr069")
+ISP_PERMISSION_GROUPS: tuple[str, ...] = (
+    "isp_partner",
+    "isp_logs",
+    "isp_ipdr",
+    "tr069",
+)
 
 
 class IspRole(StrEnum):

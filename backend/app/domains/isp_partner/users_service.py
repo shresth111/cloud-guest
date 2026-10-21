@@ -25,7 +25,14 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from app.core.email_layout import button, esc, heading, info_box, paragraph, render_email
+from app.core.email_layout import (
+    button,
+    esc,
+    heading,
+    info_box,
+    paragraph,
+    render_email,
+)
 from app.domains.auth.password import PasswordManager
 from app.domains.auth.service import EmailAlreadyExistsError, UsernameAlreadyExistsError
 from app.domains.notification.constants import (
@@ -94,7 +101,12 @@ class IspUsersService:
 
     # -- helpers ---------------------------------------------------------
     async def _audit(
-        self, isp: IspContext, action: str, user_id: uuid.UUID, description: str, **meta: Any
+        self,
+        isp: IspContext,
+        action: str,
+        user_id: uuid.UUID,
+        description: str,
+        **meta: Any,
     ) -> None:
         await self.audit.create_audit_log_entry(
             actor_user_id=isp.user_id,
@@ -153,10 +165,14 @@ class IspUsersService:
                 out.append(customer_id)
         return out
 
-    async def _target(self, isp: IspContext, isp_user_id: uuid.UUID) -> tuple[Any, Any, Any]:
+    async def _target(
+        self, isp: IspContext, isp_user_id: uuid.UUID
+    ) -> tuple[Any, Any, Any]:
         """(user, assignment, role) for a user whose isp-* role is on this
         ISP org; anything else is the same 404."""
-        rows = await self.repository.isp_role_assignments(isp.isp_org_id, user_id=isp_user_id)
+        rows = await self.repository.isp_role_assignments(
+            isp.isp_org_id, user_id=isp_user_id
+        )
         user = await self.repository.get_user(isp_user_id)
         if not rows or user is None or getattr(user, "is_deleted", False):
             raise IspUserNotFoundError()
@@ -185,7 +201,9 @@ class IspUsersService:
                 if scope_ids
                 else None
             ),
-            "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+            "last_login_at": user.last_login_at.isoformat()
+            if user.last_login_at
+            else None,
             "created_at": user.created_at.isoformat() if user.created_at else None,
         }
 
@@ -204,7 +222,13 @@ class IspUsersService:
             is_active=True,
         )
         await self.permission_cache.invalidate(user_id)
-        await self._audit(isp, AUDIT_ROLE_ASSIGNED, user_id, f"Role '{role.slug}' assigned", role=role.slug)
+        await self._audit(
+            isp,
+            AUDIT_ROLE_ASSIGNED,
+            user_id,
+            f"Role '{role.slug}' assigned",
+            role=role.slug,
+        )
 
     async def _send_welcome(self, user: Any, password: str, isp: IspContext) -> None:
         login_url = get_isp_partner_settings().login_url
@@ -216,7 +240,10 @@ class IspUsersService:
                 "time you sign in."
             )
             + info_box(
-                [("Username", esc(user.username)), ("Temporary password", esc(password))],
+                [
+                    ("Username", esc(user.username)),
+                    ("Temporary password", esc(password)),
+                ],
                 mono_values=True,
             )
             + button("Sign in", login_url)
@@ -295,13 +322,17 @@ class IspUsersService:
             )
         except (EmailAlreadyExistsError, UsernameAlreadyExistsError) as exc:
             raise UserEmailTakenError() from exc
-        user = await self.identity_repository.update_user(user, must_change_password=True)
+        user = await self.identity_repository.update_user(
+            user, must_change_password=True
+        )
         await self._grant(isp, user.id, role)
         if confinement:
             await self.repository.replace_scopes(
                 isp.isp_org_id, user.id, confinement, actor_user_id=isp.user_id
             )
-        await self._audit(isp, AUDIT_ISP_USER_CREATED, user.id, "ISP user created", role=slug)
+        await self._audit(
+            isp, AUDIT_ISP_USER_CREATED, user.id, "ISP user created", role=slug
+        )
         if data.get("send_welcome_email", True):
             try:
                 await self._send_welcome(user, password, isp)
@@ -309,7 +340,10 @@ class IspUsersService:
                 import logging
 
                 logging.getLogger(__name__).exception("isp_user_welcome_email_failed")
-        return {"user": await self._view(isp, user, slug), "temporary_password": password}
+        return {
+            "user": await self._view(isp, user, slug),
+            "temporary_password": password,
+        }
 
     async def update_user(
         self, isp: IspContext, isp_user_id: uuid.UUID, data: dict[str, Any]
@@ -317,7 +351,9 @@ class IspUsersService:
         user, assignment, role = await self._target(isp, isp_user_id)
         self._check_target(isp, role.slug)
         new_slug = data.pop("role", None)
-        profile = {k: v for k, v in data.items() if k in {"first_name", "last_name", "phone"}}
+        profile = {
+            k: v for k, v in data.items() if k in {"first_name", "last_name", "phone"}
+        }
         if profile:
             user = await self.identity_repository.update_user(user, **profile)
         if new_slug is not None and new_slug != role.slug:
@@ -339,7 +375,10 @@ class IspUsersService:
         return await self._view(isp, user, role.slug)
 
     async def set_scope(
-        self, isp: IspContext, isp_user_id: uuid.UUID, customer_ids: list[uuid.UUID] | None
+        self,
+        isp: IspContext,
+        isp_user_id: uuid.UUID,
+        customer_ids: list[uuid.UUID] | None,
     ) -> dict:
         user, _, role = await self._target(isp, isp_user_id)
         self._check_target(isp, role.slug)
@@ -357,7 +396,9 @@ class IspUsersService:
         )
         return await self._view(isp, user, role.slug)
 
-    async def set_enabled(self, isp: IspContext, isp_user_id: uuid.UUID, enabled: bool) -> dict:
+    async def set_enabled(
+        self, isp: IspContext, isp_user_id: uuid.UUID, enabled: bool
+    ) -> dict:
         user, _, role = await self._target(isp, isp_user_id)
         self._check_target(isp, role.slug)
         if enabled:
@@ -393,15 +434,24 @@ class IspUsersService:
         )
         # Old sessions end with the old password.
         user = await self.user_service.force_logout_user(
-            actor_user_id=isp.user_id, user_id=user.id, requesting_organization_id=isp.isp_org_id
+            actor_user_id=isp.user_id,
+            user_id=user.id,
+            requesting_organization_id=isp.isp_org_id,
         )
-        await self._audit(isp, AUDIT_ISP_USER_PASSWORD_RESET, user.id, "ISP user password reset")
-        return {"user": await self._view(isp, user, role.slug), "temporary_password": password}
+        await self._audit(
+            isp, AUDIT_ISP_USER_PASSWORD_RESET, user.id, "ISP user password reset"
+        )
+        return {
+            "user": await self._view(isp, user, role.slug),
+            "temporary_password": password,
+        }
 
     async def force_logout(self, isp: IspContext, isp_user_id: uuid.UUID) -> dict:
         user, _, role = await self._target(isp, isp_user_id)
         self._check_target(isp, role.slug)
         user = await self.user_service.force_logout_user(
-            actor_user_id=isp.user_id, user_id=user.id, requesting_organization_id=isp.isp_org_id
+            actor_user_id=isp.user_id,
+            user_id=user.id,
+            requesting_organization_id=isp.isp_org_id,
         )
         return await self._view(isp, user, role.slug)

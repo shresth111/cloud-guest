@@ -47,12 +47,19 @@ async def list_users(
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     search: str | None = Query(default=None, max_length=200),
     role: str | None = Query(default=None, max_length=50),
-    status_filter: str | None = Query(default=None, alias="status", pattern="^(active|disabled)$"),
+    status_filter: str | None = Query(
+        default=None, alias="status", pattern="^(active|disabled)$"
+    ),
     isp: IspContext = Depends(RequireIspPartner),
     service: IspUsersService = Depends(get_isp_users_service),
 ) -> dict:
     data = await service.list_users(
-        isp, search=search, role=role, status=status_filter, page_no=page, page_size=page_size
+        isp,
+        search=search,
+        role=role,
+        status=status_filter,
+        page_no=page,
+        page_size=page_size,
     )
     return ok(request, data, "ISP users")
 
@@ -64,7 +71,11 @@ async def create_user(
     isp: IspContext = Depends(RequireIspPartner),
     service: IspUsersService = Depends(get_isp_users_service),
 ) -> dict:
-    return ok(request, await service.create_user(isp, payload.model_dump()), "ISP user created")
+    return ok(
+        request,
+        await service.create_user(isp, payload.model_dump()),
+        "ISP user created",
+    )
 
 
 @users_router.get("/users/{isp_user_id}", dependencies=_GUARDS)
@@ -85,7 +96,9 @@ async def update_user(
     isp: IspContext = Depends(RequireIspPartner),
     service: IspUsersService = Depends(get_isp_users_service),
 ) -> dict:
-    data = await service.update_user(isp, isp_user_id, payload.model_dump(exclude_unset=True))
+    data = await service.update_user(
+        isp, isp_user_id, payload.model_dump(exclude_unset=True)
+    )
     return ok(request, data, "ISP user updated")
 
 
@@ -108,7 +121,9 @@ async def disable_user(
     isp: IspContext = Depends(RequireIspPartner),
     service: IspUsersService = Depends(get_isp_users_service),
 ) -> dict:
-    return ok(request, await service.set_enabled(isp, isp_user_id, False), "ISP user disabled")
+    return ok(
+        request, await service.set_enabled(isp, isp_user_id, False), "ISP user disabled"
+    )
 
 
 @users_router.post("/users/{isp_user_id}/enable", dependencies=_GUARDS)
@@ -118,7 +133,9 @@ async def enable_user(
     isp: IspContext = Depends(RequireIspPartner),
     service: IspUsersService = Depends(get_isp_users_service),
 ) -> dict:
-    return ok(request, await service.set_enabled(isp, isp_user_id, True), "ISP user enabled")
+    return ok(
+        request, await service.set_enabled(isp, isp_user_id, True), "ISP user enabled"
+    )
 
 
 @users_router.post("/users/{isp_user_id}/reset-password", dependencies=_GUARDS)
@@ -138,7 +155,9 @@ async def force_logout(
     isp: IspContext = Depends(RequireIspPartner),
     service: IspUsersService = Depends(get_isp_users_service),
 ) -> dict:
-    return ok(request, await service.force_logout(isp, isp_user_id), "Signed out everywhere")
+    return ok(
+        request, await service.force_logout(isp, isp_user_id), "Signed out everywhere"
+    )
 
 
 @users_router.get("/roles", dependencies=_GUARDS)

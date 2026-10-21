@@ -64,7 +64,9 @@ class IspRepository:
     async def get_router(self, router_id: uuid.UUID) -> Router | None:
         return await self.session.get(Router, router_id)
 
-    async def get_portal_config(self, config_id: uuid.UUID) -> CaptivePortalConfig | None:
+    async def get_portal_config(
+        self, config_id: uuid.UUID
+    ) -> CaptivePortalConfig | None:
         return await self.session.get(CaptivePortalConfig, config_id)
 
     async def get_cpe(self, cpe_id: uuid.UUID) -> Tr069Device | None:
@@ -350,7 +352,9 @@ class IspRepository:
                 GuestSession.organization_id,
                 func.count(func.distinct(GuestSession.guest_id)),
                 func.coalesce(
-                    func.sum(GuestSession.bytes_uploaded + GuestSession.bytes_downloaded),
+                    func.sum(
+                        GuestSession.bytes_uploaded + GuestSession.bytes_downloaded
+                    ),
                     0,
                 ),
             )
@@ -502,7 +506,9 @@ class IspRepository:
         if user_id is not None:
             conditions.append(UserRole.user_id == user_id)
         rows = await self.session.execute(
-            select(UserRole, Role).join(Role, Role.id == UserRole.role_id).where(*conditions)
+            select(UserRole, Role)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(*conditions)
         )
         return [(a, r) for a, r in rows.all()]
 

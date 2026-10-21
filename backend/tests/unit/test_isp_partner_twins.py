@@ -26,7 +26,9 @@ from tests.unit.test_isp_partner_hard_rules import STORE, _app, _h, client  # no
 
 NOW = datetime(2026, 10, 22, 6, 0, tzinfo=UTC)
 TECH = uuid.UUID("00000000-0000-0000-0000-00000000ec01")
-STORE.grant(TECH, "isp-technician", ROLES_BY_SLUG["isp-technician"].permission_keys, org=ISP_A)
+STORE.grant(
+    TECH, "isp-technician", ROLES_BY_SLUG["isp-technician"].permission_keys, org=ISP_A
+)
 
 
 def _router():
@@ -62,35 +64,68 @@ class Fakes:
         self.seen: list[tuple[str, object]] = []
         self.router = _router()
         self.peer = SimpleNamespace(
-            id=uuid.UUID(int=21), router_id=RTR_A1, server_id=uuid.UUID(int=22),
-            tunnel_ip_address="10.20.0.9", public_key="pk", status="active",
-            rotation_count=0, last_handshake_at=None, created_at=NOW, updated_at=NOW,
+            id=uuid.UUID(int=21),
+            router_id=RTR_A1,
+            server_id=uuid.UUID(int=22),
+            tunnel_ip_address="10.20.0.9",
+            public_key="pk",
+            status="active",
+            rotation_count=0,
+            last_handshake_at=None,
+            created_at=NOW,
+            updated_at=NOW,
         )
         self.nas = SimpleNamespace(
-            id=uuid.UUID(int=31), nas_code="NAS-1", router_id=RTR_A1, organization_id=CUST_A1,
-            location_id=uuid.UUID(int=11), nas_identifier="cg-abc", status="active",
-            is_active=True, name="n", description=None, ip_address="10.20.0.9",
-            hub_client_synced_ip="10.20.0.9", hub_client_synced_at=NOW, device_push_status="pending",
-            device_push_error=None, device_pushed_at=None, vendor="mikrotik",
-            created_at=NOW, updated_at=NOW,
+            id=uuid.UUID(int=31),
+            nas_code="NAS-1",
+            router_id=RTR_A1,
+            organization_id=CUST_A1,
+            location_id=uuid.UUID(int=11),
+            nas_identifier="cg-abc",
+            status="active",
+            is_active=True,
+            name="n",
+            description=None,
+            ip_address="10.20.0.9",
+            hub_client_synced_ip="10.20.0.9",
+            hub_client_synced_at=NOW,
+            device_push_status="pending",
+            device_push_error=None,
+            device_pushed_at=None,
+            vendor="mikrotik",
+            created_at=NOW,
+            updated_at=NOW,
         )
 
     # RouterService
-    async def get_router(self, router_id, *, requesting_organization_id=None, include_deleted=False):
+    async def get_router(
+        self, router_id, *, requesting_organization_id=None, include_deleted=False
+    ):
         self.seen.append(("get_router", requesting_organization_id))
         return self.router
 
     async def controller_context(self, routers):
         return {
-            r.id: SimpleNamespace(state=None, reason=None, last_contacted_at=None, vendor_claim_is_contradicted=False)
+            r.id: SimpleNamespace(
+                state=None,
+                reason=None,
+                last_contacted_at=None,
+                vendor_claim_is_contradicted=False,
+            )
             for r in routers
         }
 
-    async def generate_provisioning_token(self, *, actor_user_id, router_id, requesting_organization_id):
+    async def generate_provisioning_token(
+        self, *, actor_user_id, router_id, requesting_organization_id
+    ):
         self.seen.append(("token", requesting_organization_id))
-        return SimpleNamespace(router_id=router_id, expires_at=NOW + timedelta(hours=1)), "tok-plain"
+        return SimpleNamespace(
+            router_id=router_id, expires_at=NOW + timedelta(hours=1)
+        ), "tok-plain"
 
-    async def update_router(self, *, actor_user_id, router_id, requesting_organization_id, data):
+    async def update_router(
+        self, *, actor_user_id, router_id, requesting_organization_id, data
+    ):
         self.seen.append(("update_router", requesting_organization_id))
         return self.router
 
@@ -102,9 +137,14 @@ class Fakes:
     async def allocate_tunnel_via_hub(self, **kw):
         self.seen.append(("allocate", kw["requesting_organization_id"], kw["force"]))
         return SimpleNamespace(
-            peer=self.peer, peer_private_key="priv", reused=False, hub_public_key="hub",
-            hub_endpoint_host="hub.example.com", hub_endpoint_port=51820,
-            tunnel_network_cidr="10.20.0.0/24", hub_tunnel_ip_address="10.20.0.1",
+            peer=self.peer,
+            peer_private_key="priv",
+            reused=False,
+            hub_public_key="hub",
+            hub_endpoint_host="hub.example.com",
+            hub_endpoint_port=51820,
+            tunnel_network_cidr="10.20.0.0/24",
+            hub_tunnel_ip_address="10.20.0.1",
             message="allocated",
         )
 
@@ -131,7 +171,12 @@ class Fakes:
 def fakes(client, monkeypatch):  # noqa: F811
     f = Fakes()
     app = _app()
-    for dep in (get_router_service, get_router_agent_service, get_wireguard_service, get_radius_service):
+    for dep in (
+        get_router_service,
+        get_router_agent_service,
+        get_wireguard_service,
+        get_radius_service,
+    ):
         app.dependency_overrides[dep] = lambda: f
     pushed: list = []
 
@@ -146,7 +191,15 @@ def fakes(client, monkeypatch):  # noqa: F811
 def _request():
     from starlette.requests import Request
 
-    return Request({"type": "http", "method": "POST", "path": "/", "headers": [], "query_string": b""})
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
 
 
 def _data(payload):
@@ -162,17 +215,34 @@ async def _originals(f: Fakes) -> dict[str, dict]:
     req = _request()
     return {
         "provisioning-token": await router_routes.generate_provisioning_token(
-            req, router_id=RTR_A1, user=USER, requesting_organization_id=CUST_A1, router_service=f
+            req,
+            router_id=RTR_A1,
+            user=USER,
+            requesting_organization_id=CUST_A1,
+            router_service=f,
         ),
         "agent-credential/regenerate": await router_routes.regenerate_agent_credential(
-            req, router_id=RTR_A1, requesting_organization_id=CUST_A1, router_service=f, agent_service=f
+            req,
+            router_id=RTR_A1,
+            requesting_organization_id=CUST_A1,
+            router_service=f,
+            agent_service=f,
         ),
-        "wireguard-peer/allocate-external": await wg_routes.allocate_external_wireguard_peer(
-            req, router_id=RTR_A1, rotate=False, force=False, user=USER,
-            requesting_organization_id=CUST_A1, service=f,
+        "wireguard-peer/allocate-external": await wg_routes.allocate_external_wireguard_peer(  # noqa: E501
+            req,
+            router_id=RTR_A1,
+            rotate=False,
+            force=False,
+            user=USER,
+            requesting_organization_id=CUST_A1,
+            service=f,
         ),
         "radius-nas/register-external": await guest_routes.register_external_radius_nas(
-            req, router_id=RTR_A1, user=USER, requesting_organization_id=CUST_A1, service=f,
+            req,
+            router_id=RTR_A1,
+            user=USER,
+            requesting_organization_id=CUST_A1,
+            service=f,
             wireguard_service=f,
         ),
     }
@@ -215,7 +285,9 @@ async def test_management_access_matches_the_platform_serializer(client, fakes) 
         headers=_h(),
     )
     assert r.status_code == 200, r.text
-    expected = (await router_routes._one_platform(fakes.router, fakes)).model_dump(mode="json")
+    expected = (await router_routes._one_platform(fakes.router, fakes)).model_dump(
+        mode="json"
+    )
     assert r.json()["data"] == expected
     assert ("update_router", CUST_A1) in fakes.seen
 
@@ -254,7 +326,10 @@ def test_technician_on_own_customer_may_generate(client, fakes) -> None:  # noqa
     assert r.status_code == 201, r.text
 
 
-async def test_as_router_device_is_the_router_response_shape_plus_names(client, fakes) -> None:  # noqa: F811
+async def test_as_router_device_is_the_router_response_shape_plus_names(
+    client,  # noqa: F811
+    fakes,
+) -> None:
     r = client.c.get(f"/api/v1/isp/routers/{RTR_A1}/as-router-device", headers=_h())
     assert r.status_code == 200, r.text
     data = r.json()["data"]
@@ -263,5 +338,13 @@ async def test_as_router_device_is_the_router_response_shape_plus_names(client, 
     assert set(data) - set(original) == {"organization_name", "location_name"}
     assert data["organization_name"] == client.repo.orgs[CUST_A1].name
     # the FE RouterDevice mapper reads these
-    for key in ("id", "name", "status", "vendor", "location_id", "organization_id", "mac_address"):
+    for key in (
+        "id",
+        "name",
+        "status",
+        "vendor",
+        "location_id",
+        "organization_id",
+        "mac_address",
+    ):
         assert key in data

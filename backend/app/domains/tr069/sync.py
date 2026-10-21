@@ -18,6 +18,7 @@ Tags ``isp:<id>`` / ``cust:<id>`` are posted best-effort, for ops only.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 import uuid
@@ -72,10 +73,8 @@ def apply_facts(row: Tr069Device, doc: dict[str, Any]) -> None:
     if informed is not None:
         row.last_inform_at = informed
     interval = P.scalar(doc, "periodic_inform_interval_s")
-    try:
+    with contextlib.suppress(TypeError, ValueError):
         row.periodic_inform_interval_s = int(interval) if interval is not None else None
-    except (TypeError, ValueError):
-        pass
     row.params_cache = P.curate(doc)
     row.params_refreshed_at = datetime.now(UTC)
 
@@ -220,10 +219,8 @@ class Tr069SyncService:
                 task.status = "expired"
                 task.completed_at = now
                 if task.genieacs_task_id:
-                    try:
+                    with contextlib.suppress(Tr069AcsUnavailableError):
                         await self.nbi.delete_task(task.genieacs_task_id)
-                    except Tr069AcsUnavailableError:
-                        pass
                 continue
             if not task.genieacs_task_id:
                 continue

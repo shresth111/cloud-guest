@@ -39,7 +39,9 @@ class NbiClient:
             async with self._client() as client:
                 response = await client.request(method, path, **kw)
         except httpx.HTTPError as exc:
-            logger.warning("tr069_nbi_unreachable", extra={"error_type": type(exc).__name__})
+            logger.warning(
+                "tr069_nbi_unreachable", extra={"error_type": type(exc).__name__}
+            )
             raise Tr069AcsUnavailableError() from exc
         if response.status_code >= 500:
             logger.warning("tr069_nbi_5xx", extra={"status": response.status_code})
@@ -89,7 +91,9 @@ class NbiClient:
 
     async def get_faults(self, query: dict[str, Any]) -> list[dict[str, Any]]:
         response = await self._request(
-            "GET", "/faults/", params={"query": json.dumps(query, separators=(",", ":"))}
+            "GET",
+            "/faults/",
+            params={"query": json.dumps(query, separators=(",", ":"))},
         )
         data = response.json() if response.status_code == 200 else []
         return data if isinstance(data, list) else []

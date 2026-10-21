@@ -37,11 +37,9 @@ def _is_visible_customer(isp: IspContext, organization: Any) -> bool:
         return False
     if organization.parent_organization_id != isp.isp_org_id:
         return False
-    if isp.confined_customer_ids is not None and (
-        organization.id not in isp.confined_customer_ids
-    ):
-        return False
-    return True
+    return isp.confined_customer_ids is None or (
+        organization.id in isp.confined_customer_ids
+    )
 
 
 class IspScope:

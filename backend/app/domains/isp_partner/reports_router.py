@@ -20,7 +20,9 @@ from .reports import SECTIONS, IspReportsService, render_csv, render_pdf
 reports_router = APIRouter(prefix="/reports", tags=["ISP Partner: reports"])
 
 
-def get_reports_service(isp: IspContext = Depends(RequireIspPartner)) -> IspReportsService:
+def get_reports_service(
+    isp: IspContext = Depends(RequireIspPartner),
+) -> IspReportsService:
     return IspReportsService(isp.repository)
 
 
@@ -45,7 +47,10 @@ async def report_summary(
 @reports_router.get("/export", dependencies=isp_guards(ISP_PARTNER_EXPORT))
 async def report_export(
     format: str = Query(pattern="^(csv|pdf)$"),
-    section: str = Query(default="all", pattern="^(portfolio|guest_activity|usage_by_customer|tr069|all)$"),
+    section: str = Query(
+        default="all",
+        pattern="^(portfolio|guest_activity|usage_by_customer|tr069|all)$",
+    ),
     since: datetime | None = Query(default=None),
     until: datetime | None = Query(default=None),
     isp_customer_id: uuid.UUID | None = Query(default=None),
