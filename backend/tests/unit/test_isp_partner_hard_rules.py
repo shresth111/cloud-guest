@@ -100,9 +100,11 @@ class RoleStore:
 
     async def create_audit_log_entry(self, **fields):
         WRITES.append(("audit", fields.get("action")))
+        AUDITS.append(fields)
 
 
 WRITES: list = []
+AUDITS: list = []
 STORE = RoleStore()
 STORE.grant(ISP_USER, "isp-owner", ROLES_BY_SLUG["isp-owner"].permission_keys, org=ISP_A)
 STORE.grant(
@@ -207,6 +209,7 @@ def client(monkeypatch):
     )
     state.users = users
     WRITES.clear()
+    AUDITS.clear()
     with TestClient(app, raise_server_exceptions=False) as c:
         state.c = c
         yield state
