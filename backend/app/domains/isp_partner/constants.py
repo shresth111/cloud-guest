@@ -1,0 +1,88 @@
+"""Constants for the ISP partner domain: permission keys, role slugs, audit
+actions and the few policy switches the founder has not decided yet."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+# -- permission keys (API_CONTRACT §1.1) -------------------------------------
+ISP_PARTNER_READ = "isp_partner.read"
+ISP_PARTNER_CREATE = "isp_partner.create"
+ISP_PARTNER_UPDATE = "isp_partner.update"
+ISP_PARTNER_MANAGE = "isp_partner.manage"
+ISP_PARTNER_EXECUTE = "isp_partner.execute"
+ISP_PARTNER_EXPORT = "isp_partner.export"
+ISP_PARTNER_ASSIGN = "isp_partner.assign"
+ISP_LOGS_READ = "isp_logs.read"
+ISP_LOGS_EXPORT = "isp_logs.export"
+ISP_IPDR_READ = "isp_ipdr.read"
+ISP_IPDR_EXPORT = "isp_ipdr.export"
+TR069_READ = "tr069.read"
+TR069_EXECUTE = "tr069.execute"
+TR069_MANAGE = "tr069.manage"
+
+#: The four permission groups this feature owns. Every key above belongs to
+#: exactly one of them (the part before the dot).
+ISP_PERMISSION_GROUPS: tuple[str, ...] = ("isp_partner", "isp_logs", "isp_ipdr", "tr069")
+
+
+class IspRole(StrEnum):
+    OWNER = "isp-owner"
+    ADMIN = "isp-admin"
+    NOC = "isp-noc"
+    TECHNICIAN = "isp-technician"
+    VIEWER = "isp-viewer"
+
+
+ISP_ROLE_SLUGS: frozenset[str] = frozenset(r.value for r in IspRole)
+#: Roles that may never be confined to a customer list (API_CONTRACT §1.3).
+UNCONFINABLE_ROLES: frozenset[str] = frozenset({IspRole.OWNER, IspRole.ADMIN})
+#: Roles only an ``isp-owner`` may grant.
+OWNER_GRANTED_ROLES: frozenset[str] = frozenset({IspRole.OWNER, IspRole.ADMIN})
+
+
+class IspProfileStatus(StrEnum):
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+
+
+# -- audit actions ----------------------------------------------------------
+AUDIT_ISP_CUSTOMER_CREATED = "isp_customer_created"
+AUDIT_ISP_CUSTOMER_UPDATED = "isp_customer_updated"
+AUDIT_ISP_CUSTOMER_SUSPENDED = "isp_customer_suspended"
+AUDIT_ISP_CUSTOMER_ACTIVATED = "isp_customer_activated"
+AUDIT_ISP_ROUTER_SETUP_PREFIX = "isp_router_setup_"
+AUDIT_ISP_USER_CREATED = "isp_user_created"
+AUDIT_ROLE_ASSIGNED = "role_assigned"
+AUDIT_ISP_USER_SCOPE_CHANGED = "isp_user_customer_scope_changed"
+AUDIT_ISP_USER_PASSWORD_RESET = "isp_user_password_reset"
+AUDIT_ISP_REPORT_EXPORTED = "isp_report_exported"
+
+# -- limits -----------------------------------------------------------------
+REPORT_MAX_RANGE_DAYS = 92
+ATTENTION_CAP = 50
+#: PRD §4.2: an offline router is "needs attention" after 15 minutes, a
+#: pending one after 24 hours.
+ATTENTION_ROUTER_OFFLINE_MINUTES = 15
+ATTENTION_ROUTER_PENDING_HOURS = 24
+DEFAULT_PAGE_SIZE = 25
+MAX_PAGE_SIZE = 100
+
+# -- undecided founder questions (STATUS Q2, Q4) -----------------------------
+#
+# Each is isolated here so flipping it is one line, and each defaults to the
+# conservative choice.
+
+#: Q2 (answered yes, 2026-10-22). Roles that may run the router setup twins,
+#: whose script carries the router's management-tunnel key. Technicians are
+#: included; IspScope still limits them to the customers they are confined
+#: to, and every generation writes an ``isp_router_setup_*`` audit row.
+SETUP_SCRIPT_ROLES: frozenset[str] = frozenset(
+    {IspRole.OWNER, IspRole.ADMIN, IspRole.TECHNICIAN}
+)
+
+#: Q4. Whether suspending an ISP customer also cuts the venue's guest WiFi.
+#: False: suspension changes the organization's status and disables its TR-069
+#: credential only. Guest sessions, RADIUS and the captive portal are not
+#: touched (the platform's "never cut guests over billing" rule).
+SUSPEND_CUTS_GUEST_WIFI = False
