@@ -53,6 +53,23 @@ PERMISSION_GROUPS: tuple[IspPermissionGroup, ...] = (
         actions=("read", "execute", "manage"),
         sort_order=1003,
     ),
+    # Phase 1b (ADDENDUM_01 §B.3, ADDENDUM_03 §11): added by the same
+    # seeder, as new rows only.
+    IspPermissionGroup(
+        key="isp_billing",
+        name="ISP Billing",
+        actions=("read", "create", "update", "execute", "export", "manage"),
+        sort_order=1004,
+    ),
+    IspPermissionGroup(
+        key="isp_invoices",
+        name="ISP Invoices",
+        actions=("read", "create", "execute", "export", "manage"),
+        sort_order=1005,
+    ),
+    IspPermissionGroup(
+        key="isp_zones", name="ISP Zones", actions=("read", "manage"), sort_order=1006
+    ),
 )
 
 ALLOWED_SCOPE_TYPES: tuple[ScopeType, ...] = (ScopeType.ORGANIZATION,)
@@ -72,6 +89,9 @@ def _keys(**groups: str) -> tuple[str, ...]:
 
 _FULL = "read create update manage execute export assign"
 
+_BILLING_FULL = "read create update execute export manage"
+_INVOICES_FULL = "read create execute export manage"
+
 ROLES: tuple[IspRoleDefinition, ...] = (
     IspRoleDefinition(
         slug=IspRole.OWNER.value,
@@ -82,6 +102,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_logs="read export",
             isp_ipdr="read export",
             tr069="read execute manage",
+            isp_billing=_BILLING_FULL,
+            isp_invoices=_INVOICES_FULL,
+            isp_zones="read manage",
         ),
     ),
     IspRoleDefinition(
@@ -93,6 +116,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_logs="read export",
             isp_ipdr="read export",
             tr069="read execute manage",
+            isp_billing=_BILLING_FULL,
+            isp_invoices=_INVOICES_FULL,
+            isp_zones="read manage",
         ),
     ),
     IspRoleDefinition(
@@ -103,6 +129,8 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_partner="read export",
             isp_logs="read export",
             tr069="read execute",
+            isp_invoices="read",
+            isp_zones="read",
         ),
     ),
     IspRoleDefinition(
@@ -113,13 +141,31 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_partner="read create update execute",
             isp_logs="read",
             tr069="read execute manage",
+            isp_zones="read",
         ),
     ),
     IspRoleDefinition(
         slug=IspRole.VIEWER.value,
         name="ISP Viewer",
         description="Read-only reports and exports.",
-        permission_keys=_keys(isp_partner="read export", tr069="read"),
+        permission_keys=_keys(
+            isp_partner="read export",
+            tr069="read",
+            isp_billing="read",
+            isp_invoices="read export",
+            isp_zones="read",
+        ),
+    ),
+    IspRoleDefinition(
+        slug=IspRole.BILLING.value,
+        name="ISP Billing",
+        description="Accounts: invoices, payments, dues. Can be confined.",
+        permission_keys=_keys(
+            isp_partner="read",
+            isp_billing="read create update execute export",
+            isp_invoices=_INVOICES_FULL,
+            isp_zones="read",
+        ),
     ),
 )
 

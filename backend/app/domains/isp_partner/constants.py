@@ -37,6 +37,7 @@ class IspRole(StrEnum):
     NOC = "isp-noc"
     TECHNICIAN = "isp-technician"
     VIEWER = "isp-viewer"
+    BILLING = "isp-billing"
 
 
 ISP_ROLE_SLUGS: frozenset[str] = frozenset(r.value for r in IspRole)

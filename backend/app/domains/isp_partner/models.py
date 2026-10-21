@@ -69,6 +69,10 @@ class IspCustomerProfile(BaseModel):
     state_province: Mapped[str | None] = mapped_column(String(100), nullable=True)
     postal_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: ADDENDUM_03 §4: a reporting label only (migration 0173, our own table).
+    zone_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("isp_zones.id"), nullable=True
+    )
 
     __table_args__ = (
         Index(
@@ -109,5 +113,10 @@ class IspStaffCustomerScope(BaseModel):
         ),
     )
 
+
+# Registered on the same metadata via this module, which alembic/env.py
+# already imports (E2), so 1b needs no further registration line.
+from .billing_models import *  # noqa: E402,F403
+from .billing_models import BILLING_TABLES  # noqa: E402,F401
 
 __all__ = ["IspCustomerProfile", "IspPartnerProfile", "IspStaffCustomerScope"]
