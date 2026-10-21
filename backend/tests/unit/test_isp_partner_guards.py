@@ -36,6 +36,10 @@ from app.domains.rbac.enums import ScopeType
 FORBIDDEN_PARAM_NAMES = {"organization_id", "customer_id", "location_id", "router_id"}
 _OUR_MODULES = ("app.domains.isp_partner.", "app.domains.tr069.")
 _INTERNAL = "/api/v1/internal/tr069/"
+#: Master endpoints (FULLSTACK, FS-1). They live in isp_partner.platform_router
+#: but are GLOBAL-pinned platform routes, not /isp routes: excluded from the
+#: /isp guard stack here and asserted GLOBAL-pinned below instead.
+_PLATFORM = "/api/v1/platform/isp-partners"
 
 
 @lru_cache(maxsize=1)
@@ -54,10 +58,18 @@ def _isp_routes(app=None):
             continue
         if not endpoint.__module__.startswith(_OUR_MODULES):
             continue
-        if route.path.startswith(_INTERNAL):
+        if route.path.startswith((_INTERNAL, _PLATFORM)):
             continue
         out.append(route)
     return out
+
+
+def _platform_routes():
+    return [
+        r
+        for r in _app().routes
+        if getattr(r, "methods", None) and r.path.startswith(_PLATFORM)
+    ]
 
 
 def _closure_values(call) -> list:
@@ -135,6 +147,24 @@ def test_the_route_table_has_the_isp_surface() -> None:
 )
 def test_every_isp_route_carries_the_guard_stack(route) -> None:
     assert guard_problems(route) == []
+
+
+def test_platform_isp_partner_routes_are_global_pinned() -> None:
+    """The exclusion above must not hide anything: every Master route under
+    /platform/isp-partners checks a permission pinned to GLOBAL (so no
+    ORGANIZATION grant, isp-* or customer, can satisfy it) and none carries
+    the /isp ORGANIZATION pin."""
+    for route in _platform_routes():
+        perms = [
+            d.dependency
+            for d in route.dependencies
+            if getattr(d.dependency, "__qualname__", "").startswith("RequirePermission")
+        ]
+        assert perms, f"{route.path} checks no permission"
+        for perm in perms:
+            values = _closure_values(perm)
+            assert ScopeType.GLOBAL in values, (route.path, values)
+            assert ScopeType.ORGANIZATION not in values, (route.path, values)
 
 
 def test_no_route_creates_a_child_under_a_customer() -> None:
