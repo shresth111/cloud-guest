@@ -313,7 +313,7 @@ async def test_suspend_cuts_only_the_customer_and_billing_is_isolated(
                         )
                     )
                 await s.commit()
-                r1_id, r2_id, r3_id = r1.id, r2.id, r3.id
+                r1_id, r2_id = r1.id, r2.id
             unreachable.add(r2_id)
 
             async with SessionLocal() as s:
