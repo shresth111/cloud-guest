@@ -223,6 +223,15 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "consumers count `routers.status` as stored, exactly like the "
         "customer dashboard does. No device work is done from this read."
     ),
+    "app/domains/isp_partner/platform_repository.py::IspPlatformRepository.counts": (
+        "Master's ISP partner list/detail tiles (GET /platform/isp-partners): "
+        "routers_total and routers_online per ISP, counting `routers.status` "
+        "as stored over the ISP's customers -- the same rows and the same "
+        "rule as the ISP's own overview (`IspRepository.routers_for_"
+        "organizations`), so Master and the ISP never show different numbers. "
+        "Display only: no alert, attention item or device work is derived "
+        "from it."
+    ),
     "app/domains/isp_partner/logs_repository.py::IspLogsRepository.list_events": (
         "NetLogs across an ISP's customers: an outer join from "
         "device_log_events to routers only to label each line with its "
