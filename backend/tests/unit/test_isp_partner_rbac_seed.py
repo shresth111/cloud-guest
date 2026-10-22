@@ -72,6 +72,25 @@ EXPECTED["isp-billing"] = (
     | (_BILLING - {"isp_billing.manage"})
     | _INVOICES
 )
+# Phase 2a additions (ADDENDUM_02 §7)
+_PLANS = {f"isp_plans.{a}" for a in "read create update delete".split()}
+_COUPONS = {f"isp_coupons.{a}" for a in "read create export update".split()}
+EXPECTED["isp-owner"] |= (
+    _PLANS | _COUPONS | {"isp_subscribers.read", "isp_subscribers.update"}
+)
+EXPECTED["isp-billing"] |= {
+    "isp_plans.read",
+    "isp_subscribers.read",
+    "isp_subscribers.update",
+} | _COUPONS
+EXPECTED["isp-technician"] |= {
+    "isp_plans.read",
+    "isp_coupons.read",
+    "isp_coupons.export",
+    "isp_subscribers.read",
+}
+for _slug in ("isp-noc", "isp-viewer"):
+    EXPECTED[_slug] |= {"isp_plans.read", "isp_coupons.read", "isp_subscribers.read"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -177,8 +196,8 @@ async def test_seeding_never_changes_a_pre_existing_role(repo) -> None:
 async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
-    assert summary.permission_groups_created == 7
-    assert summary.permissions_created == 27
+    assert summary.permission_groups_created == 10
+    assert summary.permissions_created == 37
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED

@@ -99,6 +99,9 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                     "isp_billing",
                     "isp_invoices",
                     "isp_zones",
+                    "isp_plans",
+                    "isp_coupons",
+                    "isp_subscribers",
                 }
                 for _, key in isp_rows
             )
@@ -604,3 +607,7 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
             assert len(scanned) <= 2, plan_text
     finally:
         await engine.dispose()
+        # the app-global redis client pools sockets bound to this test's loop
+        from app.database.redis import redis_client
+
+        await redis_client.connection_pool.disconnect()
