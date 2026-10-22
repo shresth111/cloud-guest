@@ -31,11 +31,9 @@
 name: wyfy-acs
 
 x-genieacs-common: &genieacs-common
-  build:
-    context: .
-    dockerfile: Dockerfile
-    args:
-      GENIEACS_VERSION: "1.2.16"
+  # Built once, by genieacs-cwmp below. Every service sharing a `build:` for
+  # the same tag races on Docker 27+ with the containerd snapshotter
+  # ("image ... already exists"), seen on Ubuntu 24.04 docker.io 2026-10-22.
   image: wyfy/genieacs:1.2.16
   restart: unless-stopped
   depends_on:
@@ -74,6 +72,11 @@ services:
 
   genieacs-cwmp:
     <<: *genieacs-common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GENIEACS_VERSION: "1.2.16"
     command: ["genieacs-cwmp"]
     environment:
       GENIEACS_MONGODB_CONNECTION_URL: mongodb://mongo-acs/genieacs
