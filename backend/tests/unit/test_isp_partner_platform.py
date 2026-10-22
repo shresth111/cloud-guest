@@ -527,7 +527,9 @@ class FakeIdentity:
 class FakeRbac:
     def __init__(self, seeded: bool = True, audit_fails: bool = False) -> None:
         self.role = (
-            SimpleNamespace(id=uuid.uuid4(), slug="isp-owner") if seeded else None
+            SimpleNamespace(id=uuid.uuid4(), slug="isp-owner", organization_id=None)
+            if seeded
+            else None
         )
         self.audits: list[dict] = []
         self.role_rows: list[dict] = []
@@ -832,3 +834,111 @@ def test_temporary_password_meets_the_existing_policy() -> None:
         pw = generate_temporary_password()
         assert len(pw) == 16
         PasswordManager.hash(pw)  # raises PasswordStrengthError if weak
+
+
+# =============================================================================
+# The direct isp-owner role write bypasses RBACService's escalation guard.
+# Pin where it can be reached from and what it can grant.
+# =============================================================================
+class TestDirectOwnerGrantIsContained:
+    def test_service_is_only_constructed_by_the_platform_router(self) -> None:
+        import pathlib
+
+        app_dir = pathlib.Path(__file__).resolve().parents[2] / "app"
+        users = sorted(
+            str(f.relative_to(app_dir))
+            for f in app_dir.rglob("*.py")
+            if "IspPartnerPlatformService" in f.read_text()
+            and f.name != "platform_service.py"
+        )
+        assert users == ["domains/isp_partner/platform_router.py"], users
+
+    def test_only_create_and_add_owner_call_the_direct_write(self) -> None:
+        import inspect
+
+        import app.domains.isp_partner.platform_service as mod
+
+        src = inspect.getsource(mod)
+        assert src.count("self._create_owner(") == 2
+        assert src.count(".create_user_role(") == 1
+        for name in ("create_partner", "add_owner"):
+            assert "self._create_owner(" in inspect.getsource(
+                getattr(IspPartnerPlatformService, name)
+            )
+
+    @pytest.mark.parametrize(
+        "path", ["", "/{isp_partner_id}/owners"], ids=["create", "add-owner"]
+    )
+    def test_both_entry_routes_are_global_pinned(self, path) -> None:
+        route = next(
+            r
+            for r in _routes()
+            if r.path == "/platform/isp-partners" + path and "POST" in r.methods
+        )
+        values = _closure_values(route)
+        assert ScopeType.GLOBAL in values
+        assert {"organizations.create", "organizations.manage"} & set(values)
+
+    async def test_refuses_any_role_but_system_isp_owner(self) -> None:
+        from app.domains.isp_partner.platform_service import IspOwnerGrantRefusedError
+
+        for bad in (
+            SimpleNamespace(
+                id=uuid.uuid4(), slug="organization-owner", organization_id=None
+            ),
+            SimpleNamespace(id=uuid.uuid4(), slug="super-admin", organization_id=None),
+            SimpleNamespace(
+                id=uuid.uuid4(), slug="isp-owner", organization_id=uuid.uuid4()
+            ),
+        ):
+            rbac = FakeRbac()
+            rbac.role = bad
+            svc, p = _service(rbac=rbac)
+            with pytest.raises(IspOwnerGrantRefusedError):
+                await svc.create_partner(actor_user_id=ACTOR, data=_create_request())
+            assert p.rbac.role_rows == [] and p.users.created == []
+
+    async def test_refuses_a_non_isp_org(self) -> None:
+        from app.domains.isp_partner.platform_service import IspOwnerGrantRefusedError
+
+        for org in (
+            _org(org_type=OrganizationType.STANDARD.value),
+            _org(parent_organization_id=uuid.uuid4()),
+        ):
+            repo = FakeRepo()
+            profile = IspPartnerProfile(
+                organization_id=org.id,
+                status="active",
+                default_customer_plan_id=uuid.uuid4(),
+            )
+            repo.partners[org.id] = (profile, org)
+            svc, p = _service(repo=repo)
+            with pytest.raises(IspOwnerGrantRefusedError):
+                await svc.add_owner(
+                    actor_user_id=ACTOR,
+                    isp_org_id=org.id,
+                    data=IspOwnerRequest(first_name="A", last_name="B", email="a@b.in"),
+                )
+            assert p.rbac.role_rows == [] and p.users.created == []
+
+    @pytest.mark.parametrize(
+        "grants", [ISP_OWNER_GRANTS, ORG_OWNER_GRANTS], ids=["isp-owner", "org-owner"]
+    )
+    def test_isp_scoped_callers_cannot_reach_add_owner_or_reset(
+        self, make_client, grants
+    ) -> None:
+        svc = _RecordingService()
+        client = make_client(enabled=True, grants=grants, service=svc)
+        isp = uuid.uuid4()
+        hdr = {"X-Organization-Id": str(isp)}
+        r1 = client.post(
+            f"/api/v1/platform/isp-partners/{isp}/owners",
+            json={"first_name": "A", "last_name": "B", "email": "a@b.in"},
+            headers=hdr,
+        )
+        r2 = client.post(
+            f"/api/v1/platform/isp-partners/{isp}/users/{uuid.uuid4()}/reset-password",
+            headers=hdr,
+        )
+        assert (r1.status_code, r2.status_code) == (403, 403)
+        assert svc.calls == []

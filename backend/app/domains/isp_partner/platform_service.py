@@ -183,6 +183,27 @@ def _clean(value: str | None) -> str | None:
     return value or None
 
 
+class IspOwnerGrantRefusedError(IspError):
+    """Defence in depth: the direct isp-owner write was asked to grant
+    something other than the system isp-owner role on an MSP org."""
+
+    code = "ISP_OWNER_GRANT_REFUSED"
+    status_code_default = status.HTTP_403_FORBIDDEN
+    default_message = (
+        "Only the isp-owner role on an ISP organization can be granted here."
+    )
+
+
+def _assert_owner_grant(role: Any, isp_org: Any) -> None:
+    if (
+        getattr(role, "slug", None) != IspRole.OWNER.value
+        or getattr(role, "organization_id", None) is not None
+        or getattr(isp_org, "org_type", None) != OrganizationType.MSP.value
+        or getattr(isp_org, "parent_organization_id", None) is not None
+    ):
+        raise IspOwnerGrantRefusedError()
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerCredential:
     user: Any
@@ -301,7 +322,7 @@ class IspPartnerPlatformService:
         credential = await self._create_owner(
             actor_user_id=actor_user_id,
             isp_org=org,
-            role_id=owner_role.id,
+            role=owner_role,
             owner=data.owner,
         )
 
@@ -446,7 +467,7 @@ class IspPartnerPlatformService:
         _, org = await self._load(isp_org_id)
         role = await self._owner_role()
         credential = await self._create_owner(
-            actor_user_id=actor_user_id, isp_org=org, role_id=role.id, owner=data
+            actor_user_id=actor_user_id, isp_org=org, role=role, owner=data
         )
         await self._audit(
             actor_user_id,
@@ -525,9 +546,15 @@ class IspPartnerPlatformService:
         *,
         actor_user_id: uuid.UUID,
         isp_org: Organization,
-        role_id: uuid.UUID,
+        role: Any,
         owner: IspOwnerRequest,
     ) -> OwnerCredential:
+        # This method writes a user_roles row WITHOUT RBACService's escalation
+        # guard (see the comment at create_user below). Its blast radius is
+        # therefore pinned here, independently of the GLOBAL-pinned routes
+        # that are its only callers: it can only ever grant the system
+        # isp-owner role, and only on an MSP organization that is an ISP.
+        _assert_owner_grant(role, isp_org)
         username = _username_for(owner.email)
         password = generate_temporary_password()
         try:
@@ -556,7 +583,7 @@ class IspPartnerPlatformService:
             ) from exc
         await self.rbac_repository.create_user_role(
             user_id=user.id,
-            role_id=role_id,
+            role_id=role.id,
             scope_type=ScopeType.ORGANIZATION.value,
             organization_id=isp_org.id,
             location_id=None,
