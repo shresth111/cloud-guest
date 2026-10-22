@@ -82,6 +82,8 @@ from .schemas import (
 from .scoping import IspScope
 from .service import IspPartnerService
 from .service_control import IspServiceControl
+from .twins import mount_twins
+from .twins_venue import VENUE_TWINS
 
 __all__ = ["isp_partner_router"]
 
@@ -930,6 +932,9 @@ def _include_lanes() -> None:
     from .plans_router import plans_router
 
     isp_partner_router.include_router(plans_router)
+    # Phase 2c: the venue twins (the customer dashboard's own feature set,
+    # ISP-gated). One table row per endpoint -- see ``twins.py``.
+    mount_twins(isp_partner_router, VENUE_TWINS)
 
 
 _include_lanes()
