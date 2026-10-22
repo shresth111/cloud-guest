@@ -208,6 +208,14 @@ async def _billing_daily_async() -> dict[str, int]:
                 isp = _SystemContext(org, profile, repo)
                 billing = IspBillingService(session=session, audit=services["audit"])
                 try:
+                    from .plans_service import IspPlansService
+
+                    async with session.begin_nested():
+                        # coupon activations -> subscribers + paid invoices
+                        # (ADDENDUM_03 §7), then customer + postpaid cycles
+                        await IspPlansService(
+                            session=session, audit=services["audit"]
+                        ).sync_subscribers(isp, force=True)
                     async with session.begin_nested():
                         summary["invoices"] += len(await billing.generate_due(isp))
                     if (

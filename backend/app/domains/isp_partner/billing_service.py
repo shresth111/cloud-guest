@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
+from app.common.masking import mask_identifier
+
 from .billing_models import (
     IspBillingSettings,
     IspCustomerBilling,
@@ -66,6 +68,8 @@ from .scoping import IspScope
 
 PAYMENT_MODES = frozenset({"cash", "upi", "bank_transfer", "online"})
 REFERENCE_REQUIRED = frozenset({"upi", "bank_transfer"})
+#: Part B: internal-only mode for coupon activations (never via the API).
+PREPAID_COUPON = "prepaid_coupon"
 CYCLE_MONTHS = {"monthly": 1, "quarterly": 3, "half_yearly": 6, "yearly": 12}
 STATUS_LABELS = {
     "issued": "Unpaid",
@@ -457,6 +461,31 @@ class IspBillingService:
                 return z.state_code
         return settings.state_code
 
+    async def _existing_source(
+        self, isp: IspContext, source_key: str | None
+    ) -> IspInvoice | None:
+        if not source_key:
+            return None
+        return (
+            await self.session.execute(
+                select(IspInvoice).where(
+                    IspInvoice.isp_organization_id == isp.isp_org_id,
+                    IspInvoice.source_key == source_key,
+                )
+            )
+        ).scalar_one_or_none()
+
+    def _check_issue_date(self, isp: IspContext, issue_date: date | None) -> date:
+        today = self.today(isp)
+        issue_date = issue_date or today
+        if (
+            issue_date > today
+            or today - issue_date > timedelta(days=7)
+            or fy_start(issue_date) != fy_start(today)
+        ):
+            raise IspInvoiceDateOutOfRangeError()
+        return issue_date
+
     async def issue_invoice(
         self,
         isp: IspContext,
@@ -475,25 +504,10 @@ class IspBillingService:
     ) -> IspInvoice:
         customer = await self._customer(isp, isp_customer_id)
         settings = await self.settings(isp)
-        if source_key:
-            existing = (
-                await self.session.execute(
-                    select(IspInvoice).where(
-                        IspInvoice.isp_organization_id == isp.isp_org_id,
-                        IspInvoice.source_key == source_key,
-                    )
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                return existing
-        today = self.today(isp)
-        issue_date = issue_date or today
-        if (
-            issue_date > today
-            or today - issue_date > timedelta(days=7)
-            or fy_start(issue_date) != fy_start(today)
-        ):
-            raise IspInvoiceDateOutOfRangeError()
+        existing = await self._existing_source(isp, source_key)
+        if existing is not None:
+            return existing
+        issue_date = self._check_issue_date(isp, issue_date)
         if buyer_gstin and not gstin_valid(buyer_gstin):
             raise IspBuyerGstinInvalidError()
         plan = (
@@ -512,9 +526,128 @@ class IspBillingService:
         ).scalar_one_or_none()
         zone_id = profile.zone_id if profile is not None else None
         pos = await self._place_of_supply(settings, customer.id, plan, zone_id)
-        gst_applied = bool(
-            settings.gst_enabled and (plan is None or plan.gst_applicable)
+        return await self._issue_core(
+            isp,
+            settings,
+            bill_to_kind="customer",
+            customer_organization_id=customer.id,
+            subscriber=None,
+            bill_to_name=customer.legal_name or customer.name,
+            bill_to_gstin=buyer_gstin or (plan.buyer_gstin if plan else None),
+            bill_to_address=(
+                ", ".join(
+                    p
+                    for p in (
+                        getattr(profile, "address_line1", None),
+                        getattr(profile, "city", None),
+                        getattr(profile, "state_province", None),
+                        getattr(profile, "postal_code", None),
+                    )
+                    if p
+                )
+                or None
+            ),
+            pos=pos,
+            zone_id=zone_id,
+            gst_applied=bool(
+                settings.gst_enabled and (plan is None or plan.gst_applicable)
+            ),
+            lines=lines,
+            invoice_kind=invoice_kind,
+            issue_date=issue_date,
+            due_date=due_date,
+            period_start=period_start,
+            period_end=period_end,
+            description=description,
+            po_number=po_number,
+            source_key=source_key,
         )
+
+    async def issue_subscriber_invoice(
+        self,
+        isp: IspContext,
+        subscriber: Any,
+        *,
+        lines: list[dict],
+        invoice_kind: str,
+        issue_date: date | None = None,
+        due_date: date | None = None,
+        period_start: date | None = None,
+        period_end: date | None = None,
+        description: str | None = None,
+        po_number: str | None = None,
+        buyer_gstin: str | None = None,
+        source_key: str | None = None,
+    ) -> IspInvoice:
+        """ADDENDUM_03 Part B: bill an end subscriber. The caller has already
+        resolved ``subscriber`` through IspScope (it belongs to this ISP and
+        to a customer the caller may see). ``customer_organization_id`` is
+        the subscriber's venue, for scoping only; customer-billing paths
+        (ledger, overdue, auto-suspend, advance credit) filter on
+        ``bill_to_kind='customer'`` and never see these rows."""
+        if subscriber.isp_organization_id != isp.isp_org_id:
+            raise IspInvoiceNotFoundError()
+        settings = await self.settings(isp)
+        existing = await self._existing_source(isp, source_key)
+        if existing is not None:
+            return existing
+        issue_date = self._check_issue_date(isp, issue_date)
+        gstin = buyer_gstin or subscriber.gstin
+        if gstin and not gstin_valid(gstin):
+            raise IspBuyerGstinInvalidError()
+        pos = subscriber.state_code or await self._place_of_supply(
+            settings, subscriber.customer_organization_id, None, subscriber.zone_id
+        )
+        name = " ".join(
+            p for p in (subscriber.first_name, subscriber.last_name) if p
+        ) or (subscriber.display_name or mask_identifier(subscriber.identifier))
+        return await self._issue_core(
+            isp,
+            settings,
+            bill_to_kind="subscriber",
+            customer_organization_id=subscriber.customer_organization_id,
+            subscriber=subscriber,
+            bill_to_name=name[:255],
+            bill_to_gstin=gstin,
+            bill_to_address=subscriber.address,
+            pos=pos,
+            zone_id=subscriber.zone_id,
+            gst_applied=bool(settings.gst_enabled),
+            lines=lines,
+            invoice_kind=invoice_kind,
+            issue_date=issue_date,
+            due_date=due_date,
+            period_start=period_start,
+            period_end=period_end,
+            description=description,
+            po_number=po_number,
+            source_key=source_key,
+        )
+
+    async def _issue_core(
+        self,
+        isp: IspContext,
+        settings: IspBillingSettings,
+        *,
+        bill_to_kind: str,
+        customer_organization_id: uuid.UUID,
+        subscriber: Any,
+        bill_to_name: str,
+        bill_to_gstin: str | None,
+        bill_to_address: str | None,
+        pos: str,
+        zone_id: uuid.UUID | None,
+        gst_applied: bool,
+        lines: list[dict],
+        invoice_kind: str,
+        issue_date: date,
+        due_date: date | None,
+        period_start: date | None,
+        period_end: date | None,
+        description: str | None,
+        po_number: str | None,
+        source_key: str | None,
+    ) -> IspInvoice:
         intra = pos == settings.state_code
         taxes: list[LineTax] = []
         for line in lines:
@@ -534,8 +667,17 @@ class IspBillingService:
         inv = IspInvoice(
             isp_organization_id=isp.isp_org_id,
             doc_type="invoice",
-            bill_to_kind="customer",
-            customer_organization_id=customer.id,
+            bill_to_kind=bill_to_kind,
+            customer_organization_id=customer_organization_id,
+            subscriber_id=subscriber.id if subscriber is not None else None,
+            bill_to_username=(
+                mask_identifier(subscriber.identifier)
+                if subscriber is not None
+                else None
+            ),
+            circuit_id_snapshot=(
+                subscriber.circuit_id if subscriber is not None else None
+            ),
             fy=fy,
             seq=seq,
             number=number,
@@ -546,21 +688,9 @@ class IspBillingService:
             period_start=period_start,
             period_end=period_end,
             description=description,
-            bill_to_name=customer.legal_name or customer.name,
-            bill_to_gstin=buyer_gstin or (plan.buyer_gstin if plan else None),
-            bill_to_address=(
-                ", ".join(
-                    p
-                    for p in (
-                        getattr(profile, "address_line1", None),
-                        getattr(profile, "city", None),
-                        getattr(profile, "state_province", None),
-                        getattr(profile, "postal_code", None),
-                    )
-                    if p
-                )
-                or None
-            ),
+            bill_to_name=bill_to_name,
+            bill_to_gstin=bill_to_gstin,
+            bill_to_address=bill_to_address,
             place_of_supply_state_code=pos,
             seller_state_code=settings.state_code,
             zone_id=zone_id,
@@ -594,11 +724,14 @@ class IspBillingService:
                     total_paise=tax.total,
                     period_from=line.get("period_from"),
                     period_to=line.get("period_to"),
+                    package_id=line.get("package_id"),
                 )
             )
         await self.session.flush()
         await self._apply_credit(isp, inv)
-        await self._audit(isp, "isp_invoice_issued", inv.id, customer.id, number=number)
+        await self._audit(
+            isp, "isp_invoice_issued", inv.id, customer_organization_id, number=number
+        )
         return inv
 
     async def _apply_credit(self, isp: IspContext, inv: IspInvoice) -> None:
@@ -609,8 +742,19 @@ class IspBillingService:
                     select(IspPayment)
                     .where(
                         IspPayment.isp_organization_id == isp.isp_org_id,
-                        IspPayment.customer_organization_id
-                        == inv.customer_organization_id,
+                        # a customer's advance never pays a subscriber's bill
+                        # (and vice versa): match the bill-to party exactly
+                        (
+                            IspPayment.subscriber_id == inv.subscriber_id
+                            if inv.subscriber_id is not None
+                            else (
+                                (
+                                    IspPayment.customer_organization_id
+                                    == inv.customer_organization_id
+                                )
+                                & IspPayment.subscriber_id.is_(None)
+                            )
+                        ),
                         IspPayment.status == "confirmed",
                         IspPayment.unallocated_paise > 0,
                     )
@@ -687,6 +831,75 @@ class IspBillingService:
             plan.next_invoice_date = end + timedelta(days=1)
             created.append(inv)
         await self.session.flush()
+        created.extend(await self.generate_subscriber_cycles(isp, children))
+        return created
+
+    #: catch-up bound per subscriber per run (a long-dormant postpaid row
+    #: never floods the series in one go; the next daily run continues)
+    MAX_CYCLES_PER_RUN = 12
+
+    async def generate_subscriber_cycles(
+        self, isp: IspContext, children: set
+    ) -> list[IspInvoice]:
+        """BE-I12: postpaid subscribers whose period ended get the period's
+        invoice and roll forward one validity period. Idempotent on
+        ``cycle:<subscriber>:<period_start>``. Prepaid never auto-invoices."""
+        from .plans_models import IspPackage, IspSubscriber
+
+        now = self._clock()
+        tz = ZoneInfo(isp.organization.timezone or "Asia/Kolkata")
+        rows = (
+            await self.session.execute(
+                select(IspSubscriber, IspPackage)
+                .join(IspPackage, IspPackage.id == IspSubscriber.package_id)
+                .where(
+                    IspSubscriber.isp_organization_id == isp.isp_org_id,
+                    IspSubscriber.is_deleted.is_(False),
+                    IspSubscriber.status != "disabled",
+                    IspSubscriber.valid_until.is_not(None),
+                    IspSubscriber.valid_until <= now,
+                    IspPackage.type == "postpaid",
+                )
+                .with_for_update(of=IspSubscriber)
+            )
+        ).all()
+        created: list[IspInvoice] = []
+        for sub, pkg in rows:
+            if sub.customer_organization_id not in children:
+                continue
+            for _ in range(self.MAX_CYCLES_PER_RUN):
+                if sub.valid_until > now:
+                    break
+                end_at = sub.valid_until
+                start_at = end_at - timedelta(days=pkg.validity_days)
+                start = start_at.astimezone(tz).date()
+                end = (end_at.astimezone(tz) - timedelta(seconds=1)).date()
+                if pkg.price_paise > 0:
+                    created.append(
+                        await self.issue_subscriber_invoice(
+                            isp,
+                            sub,
+                            lines=[
+                                {
+                                    "description": f"{pkg.name} ({start:%d %b %Y} - {end:%d %b %Y})",  # noqa: E501
+                                    "amount_paise": pkg.price_paise,
+                                    "price_includes_gst": pkg.price_includes_gst,
+                                    "period_from": start,
+                                    "period_to": end,
+                                    "package_id": pkg.id,
+                                }
+                            ],
+                            invoice_kind="cycle",
+                            period_start=start,
+                            period_end=end,
+                            description=pkg.name,
+                            source_key=f"cycle:{sub.id}:{start.isoformat()}",
+                        )
+                    )
+                sub.valid_until = end_at + timedelta(days=pkg.validity_days)
+            if sub.valid_until > now and sub.status == "expired":
+                sub.status = "active"
+        await self.session.flush()
         return created
 
     async def credit_note(
@@ -726,6 +939,9 @@ class IspBillingService:
             doc_type="credit_note",
             bill_to_kind=inv.bill_to_kind,
             customer_organization_id=inv.customer_organization_id,
+            subscriber_id=inv.subscriber_id,
+            bill_to_username=inv.bill_to_username,
+            circuit_id_snapshot=inv.circuit_id_snapshot,
             fy=fy,
             seq=seq,
             number=number,
@@ -771,18 +987,39 @@ class IspBillingService:
     # ------------------------------------------------------------------
     # payments
     # ------------------------------------------------------------------
+    async def subscriber_in_scope(
+        self, isp: IspContext, subscriber_id: uuid.UUID
+    ) -> Any:
+        from .plans_models import IspSubscriber
+        from .plans_service import IspSubscriberNotFoundError
+
+        s = await self.session.get(IspSubscriber, subscriber_id)
+        if s is None or s.is_deleted or s.isp_organization_id != isp.isp_org_id:
+            raise IspSubscriberNotFoundError()
+        try:
+            await IspScope.assert_customer(isp, s.customer_organization_id)
+        except IspCustomerNotFoundError:
+            raise IspSubscriberNotFoundError() from None
+        return s
+
     async def record_payment(
         self,
         isp: IspContext,
         *,
-        isp_customer_id: uuid.UUID,
         amount_paise: int,
         mode: str,
+        isp_customer_id: uuid.UUID | None = None,
+        subscriber_id: uuid.UUID | None = None,
         invoice_id: uuid.UUID | None = None,
         reference: str | None = None,
         received_at: datetime | None = None,
         idempotency_key: str | None = None,
+        coupon_batch_id: uuid.UUID | None = None,
+        _internal_mode: bool = False,
     ) -> IspPayment:
+        """Exactly one of ``isp_customer_id`` / ``subscriber_id`` (Part B).
+        ``prepaid_coupon`` is never accepted from the API: only the coupon
+        activation sync passes ``_internal_mode=True``."""
         if idempotency_key:
             repeat = (
                 await self.session.execute(
@@ -794,20 +1031,39 @@ class IspBillingService:
             ).scalar_one_or_none()
             if repeat is not None:
                 return repeat
-        if mode not in PAYMENT_MODES:
+        if mode not in PAYMENT_MODES and not (
+            _internal_mode and mode == PREPAID_COUPON
+        ):
             raise IspPaymentModeInvalidError()
+        if (isp_customer_id is None) == (subscriber_id is None):
+            raise IspPaymentModeInvalidError(
+                "Give exactly one of isp_customer_id or subscriber_id",
+                field="isp_customer_id",
+            )
         if mode in REFERENCE_REQUIRED and not (reference or "").strip():
             raise IspPaymentReferenceRequiredError()
         if amount_paise <= 0:
             raise IspPaymentModeInvalidError(
                 "Amount must be positive", field="amount_paise"
             )
-        customer = await self._customer(isp, isp_customer_id)
+        subscriber = None
+        if subscriber_id is not None:
+            subscriber = await self.subscriber_in_scope(isp, subscriber_id)
+            customer_id = subscriber.customer_organization_id
+        else:
+            customer_id = (await self._customer(isp, isp_customer_id)).id
         settings = await self.settings(isp)
         inv = None
         if invoice_id is not None:
             inv = await self._invoice(isp, invoice_id)
-            if inv.customer_organization_id != customer.id or inv.doc_type != "invoice":
+            if inv.doc_type != "invoice" or (
+                inv.subscriber_id != subscriber_id
+                if subscriber is not None
+                else (
+                    inv.customer_organization_id != customer_id
+                    or inv.bill_to_kind != "customer"
+                )
+            ):
                 raise IspInvoiceNotFoundError()
             if inv.status == "cancelled":
                 raise IspInvoiceCancelledError()
@@ -822,7 +1078,9 @@ class IspBillingService:
         seq = await self._allocate(isp.isp_org_id, "receipt", fy)
         pay = IspPayment(
             isp_organization_id=isp.isp_org_id,
-            customer_organization_id=customer.id,
+            customer_organization_id=customer_id,
+            subscriber_id=subscriber_id,
+            coupon_batch_id=coupon_batch_id,
             amount_paise=amount_paise,
             unallocated_paise=amount_paise,
             mode=mode,
@@ -853,7 +1111,7 @@ class IspBillingService:
             isp,
             "isp_payment_recorded",
             pay.id,
-            customer.id,
+            customer_id,
             receipt=pay.receipt_number,
             mode=mode,
             amount_paise=amount_paise,
@@ -919,6 +1177,9 @@ class IspBillingService:
                     select(IspInvoice).where(
                         IspInvoice.isp_organization_id == isp.isp_org_id,
                         IspInvoice.customer_organization_id.in_(customer_ids),
+                        # subscriber bills never drive a customer's dues,
+                        # attention or auto-suspend (Part B)
+                        IspInvoice.bill_to_kind == "customer",
                         IspInvoice.doc_type == "invoice",
                         IspInvoice.status.in_(["issued", "partially_paid"]),
                         IspInvoice.due_date < cutoff,
@@ -942,6 +1203,7 @@ class IspBillingService:
                     .where(
                         IspInvoice.isp_organization_id == isp.isp_org_id,
                         IspInvoice.customer_organization_id == isp_customer_id,
+                        IspInvoice.bill_to_kind == "customer",
                         IspInvoice.is_deleted.is_(False),
                     )
                     .order_by(IspInvoice.issue_date.desc(), IspInvoice.seq.desc())
@@ -957,6 +1219,7 @@ class IspBillingService:
                     .where(
                         IspPayment.isp_organization_id == isp.isp_org_id,
                         IspPayment.customer_organization_id == isp_customer_id,
+                        IspPayment.subscriber_id.is_(None),
                         IspPayment.is_deleted.is_(False),
                     )
                     .order_by(IspPayment.received_at.desc())
@@ -997,7 +1260,18 @@ class IspBillingService:
         *,
         contact_phone: str | None = None,
         overdue: bool = False,
+        subscriber: dict | None = None,
+        package: dict | None = None,
     ) -> dict:
+        is_sub = inv.bill_to_kind == "subscriber"
+        if is_sub and subscriber is None:
+            subscriber = {
+                "id": str(inv.subscriber_id),
+                "username": inv.bill_to_username,
+                "first_name": None,
+                "last_name": None,
+                "circuit_id": inv.circuit_id_snapshot,
+            }
         return {
             "id": str(inv.id),
             "display_id": inv.display_id,
@@ -1007,17 +1281,21 @@ class IspBillingService:
             "invoice_date": iso(inv.issue_date),
             "due_date": iso(inv.due_date),
             "bill_to_kind": inv.bill_to_kind,
-            "subscriber": None,
-            "customer": {
+            "subscriber": subscriber if is_sub else None,
+            "customer": None
+            if is_sub
+            else {
                 "isp_customer_id": str(inv.customer_organization_id),
                 "name": customer_name or inv.bill_to_name,
                 "contact_phone": contact_phone,
             },
+            # subscriber rows: the venue (ISP customer) the subscriber is at
+            "isp_customer_id": str(inv.customer_organization_id),
             "customer_name": customer_name or inv.bill_to_name,
             "overdue": overdue,
             "zone": zone,
             "invoice_kind": inv.invoice_kind,
-            "package": None,
+            "package": package,
             "po_number": inv.po_number,
             "buyer_gstin": inv.bill_to_gstin,
             "taxable_paise": inv.taxable_paise,
@@ -1051,6 +1329,8 @@ class IspBillingService:
             "invoice_number": invoice_number,
             "recorded_by_name": recorded_by_name,
             "isp_customer_id": str(p.customer_organization_id),
+            "subscriber_id": str(p.subscriber_id) if p.subscriber_id else None,
+            "coupon_batch_id": str(p.coupon_batch_id) if p.coupon_batch_id else None,
             "amount_paise": p.amount_paise,
             "unallocated_paise": p.unallocated_paise,
             "mode": p.mode,
@@ -1106,6 +1386,47 @@ class IspBillingService:
             for p in payments
         ]
 
+    async def row_extras(self, invoices: list) -> tuple[dict, dict]:
+        """Subscriber block + package for each invoice (Part B), batched:
+        ``({invoice_id: subscriber dict}, {invoice_id: package dict})``."""
+        from .plans_models import IspPackage, IspSubscriber
+
+        subs: dict = {}
+        sub_ids = list({i.subscriber_id for i in invoices if i.subscriber_id})
+        if sub_ids:
+            rows = {
+                s.id: s
+                for s in (
+                    await self.session.execute(
+                        select(IspSubscriber).where(IspSubscriber.id.in_(sub_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            }
+            for i in invoices:
+                s = rows.get(i.subscriber_id)
+                if s is not None:
+                    subs[i.id] = {
+                        "id": str(s.id),
+                        "username": i.bill_to_username or mask_identifier(s.identifier),
+                        "first_name": s.first_name,
+                        "last_name": s.last_name,
+                        "circuit_id": i.circuit_id_snapshot or s.circuit_id,
+                    }
+        packages: dict = {}
+        if invoices:
+            rows = (
+                await self.session.execute(
+                    select(IspInvoiceLine.invoice_id, IspPackage.id, IspPackage.name)
+                    .join(IspPackage, IspPackage.id == IspInvoiceLine.package_id)
+                    .where(IspInvoiceLine.invoice_id.in_([i.id for i in invoices]))
+                )
+            ).all()
+            for inv_id, pid, name in rows:
+                packages.setdefault(inv_id, {"id": str(pid), "name": name})
+        return subs, packages
+
     async def invoice_detail(self, isp: IspContext, invoice_id: uuid.UUID) -> dict:
         inv = await self._invoice(isp, invoice_id)
         lines = (
@@ -1156,11 +1477,14 @@ class IspBillingService:
             i.id
             for i in await self.overdue_invoices(isp, [inv.customer_organization_id])
         }
+        subs, packages = await self.row_extras([inv])
         view = self.invoice_row(
             inv,
             customer.name if customer else None,
             contact_phone=customer.contact_phone if customer else None,
             overdue=inv.id in overdue_ids,
+            subscriber=subs.get(inv.id),
+            package=packages.get(inv.id),
         )
         view["lines"] = [
             {
@@ -1176,6 +1500,7 @@ class IspBillingService:
                 "total_paise": li.total_paise,
                 "period_from": iso(li.period_from),
                 "period_to": iso(li.period_to),
+                "package_id": str(li.package_id) if li.package_id else None,
             }
             for li in lines
         ]
@@ -1230,6 +1555,10 @@ class IspBillingService:
         since: date | None = None,
         until: date | None = None,
         search: str | None = None,
+        bill_to_kind: str | None = None,
+        subscriber_id: uuid.UUID | None = None,
+        package_id: uuid.UUID | None = None,
+        username: str | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[IspInvoice], int]:
@@ -1249,6 +1578,30 @@ class IspBillingService:
             cond.append(IspInvoice.status == status)
         if doc_type:
             cond.append(IspInvoice.doc_type == doc_type)
+        if bill_to_kind:
+            cond.append(IspInvoice.bill_to_kind == bill_to_kind)
+        if subscriber_id:
+            cond.append(IspInvoice.subscriber_id == subscriber_id)
+        if package_id:
+            cond.append(
+                IspInvoice.id.in_(
+                    select(IspInvoiceLine.invoice_id).where(
+                        IspInvoiceLine.package_id == package_id
+                    )
+                )
+            )
+        if username:
+            from .plans_models import IspSubscriber
+
+            # the snapshot is masked; match the real identifier, ISP-scoped
+            cond.append(
+                IspInvoice.subscriber_id.in_(
+                    select(IspSubscriber.id).where(
+                        IspSubscriber.isp_organization_id == isp.isp_org_id,
+                        IspSubscriber.identifier.ilike(f"%{username.strip()}%"),
+                    )
+                )
+            )
         if zone_id:
             cond.append(IspInvoice.zone_id == zone_id)
         if since:
@@ -1261,6 +1614,7 @@ class IspBillingService:
                 or_(
                     IspInvoice.number.ilike(pattern),
                     IspInvoice.bill_to_name.ilike(pattern),
+                    IspInvoice.bill_to_username.ilike(pattern),
                 )
             )
         if overdue:

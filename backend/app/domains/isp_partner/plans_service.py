@@ -22,6 +22,7 @@ from .billing_service import IspBillingService
 from .dependencies import IspContext
 from .exceptions import _err
 from .plans_models import (
+    DEFAULT_REMINDER_OPT_IN,
     IspCouponBatch,
     IspCouponBatchPart,
     IspPackage,
@@ -83,6 +84,12 @@ IspSubscriberNotFoundError = _err(
     404,
     "Subscriber not found",
 )
+IspSubscriberDisabledError = _err(
+    "IspSubscriberDisabledError",
+    "ISP_SUBSCRIBER_DISABLED",
+    409,
+    "This subscriber is disabled; enable them first",
+)
 IspNameTakenError = _err(
     "IspNameTakenError", "ISP_NAME_TAKEN", 409, "That name is already used"
 )
@@ -103,6 +110,18 @@ _last_sync: dict[uuid.UUID, datetime] = {}
 
 def suggest_name(group_name: str, type_: str, validity_days: int) -> str:
     return f"{group_name} · {type_.title()} · {validity_days} days"
+
+
+def _local_date(v: datetime, tz: str):  # noqa: ANN202
+    from zoneinfo import ZoneInfo
+
+    return v.astimezone(ZoneInfo(tz)).date()
+
+
+def billing_balance(inv: Any) -> int:
+    from .billing_service import balance_of
+
+    return balance_of(inv)
 
 
 def _iso(v: Any) -> Any:
@@ -163,6 +182,16 @@ class IspPlansService:
         except Exception:  # noqa: BLE001
             raise IspSubscriberNotFoundError() from None
         return s
+
+    async def _new_circuit(self, isp: IspContext) -> int:
+        """ADDENDUM_03 §5: per-ISP circuit id, gap-free, never reset
+        (series ``circuit``, fy ``----``), in the caller's transaction."""
+        return await self._billing()._allocate(isp.isp_org_id, "circuit", "----")
+
+    def _billing(self) -> IspBillingService:
+        return IspBillingService(
+            session=self.session, audit=self.audit, clock=self._clock
+        )
 
     async def _name_taken(
         self, model: Any, isp: IspContext, name: str, *, except_id=None
@@ -1260,6 +1289,7 @@ class IspPlansService:
                 sub = IspSubscriber(
                     isp_organization_id=isp.isp_org_id,
                     customer_organization_id=batch.customer_organization_id,
+                    circuit_id=await self._new_circuit(isp),
                     identifier=v.redeemed_identifier,
                     package_id=batch.package_id,
                     speed_group_id=pkg.speed_group_id if pkg else None,
@@ -1292,7 +1322,109 @@ class IspPlansService:
             if sub.status == "active" and sub.valid_until and sub.valid_until < now:
                 sub.status = "expired"
         await self.session.flush()
+        await self._invoice_activations(isp, rows, existing, packages)
         return changed
+
+    async def _invoice_activations(
+        self, isp: IspContext, rows: list, subs: dict, packages: dict
+    ) -> int:
+        """ADDENDUM_03 §7 / BE-I11: one paid invoice + one ``prepaid_coupon``
+        payment per coupon activation. Default ON (per-ISP toggle
+        ``coupon_invoice_on_activation``); a ₹0 package makes none.
+        Idempotent on ``source_key = coupon:<voucher id>``: re-runs and later
+        syncs never issue a second invoice. Each activation is its own
+        SAVEPOINT, so one failure never blocks the subscriber sync."""
+        import logging
+
+        from .billing_models import IspInvoice
+
+        billing = self._billing()
+        settings = await billing.settings(isp, required=False)
+        if settings is None or not settings.coupon_invoice_on_activation:
+            return 0
+        wanted = [
+            (v, batch)
+            for v, batch in rows
+            if (pkg := packages.get(batch.package_id)) is not None
+            and pkg.price_paise > 0
+        ]
+        if not wanted:
+            return 0
+        keys = [f"coupon:{v.id}" for v, _ in wanted]
+        done = set(
+            (
+                await self.session.execute(
+                    select(IspInvoice.source_key).where(
+                        IspInvoice.isp_organization_id == isp.isp_org_id,
+                        IspInvoice.source_key.in_(keys),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        serials: dict[uuid.UUID, dict] = {}
+        tz = isp.organization.timezone or "Asia/Kolkata"
+        issued = 0
+        for v, batch in wanted:
+            key = f"coupon:{v.id}"
+            if key in done:
+                continue
+            sub = subs.get((batch.customer_organization_id, v.redeemed_identifier))
+            if sub is None or sub.id is None:
+                continue
+            pkg = packages[batch.package_id]
+            if batch.id not in serials:
+                serials[batch.id] = {
+                    voucher.id: serial
+                    for serial, voucher in await self._all_coupons(batch)
+                }
+            serial = serials[batch.id].get(v.id)
+            start = _local_date(v.redeemed_at, tz)
+            end = _local_date(v.expires_at, tz) if v.expires_at else None
+            try:
+                async with self.session.begin_nested():
+                    inv = await billing.issue_subscriber_invoice(
+                        isp,
+                        sub,
+                        lines=[
+                            {
+                                "description": pkg.name
+                                + (f" (coupon {serial})" if serial else ""),
+                                "amount_paise": pkg.price_paise,
+                                "price_includes_gst": pkg.price_includes_gst,
+                                "period_from": start,
+                                "period_to": end,
+                                "package_id": pkg.id,
+                            }
+                        ],
+                        invoice_kind="coupon",
+                        period_start=start,
+                        period_end=end,
+                        description=pkg.name,
+                        source_key=key,
+                    )
+                    if billing_balance(inv) > 0:
+                        await billing.record_payment(
+                            isp,
+                            subscriber_id=sub.id,
+                            invoice_id=inv.id,
+                            amount_paise=billing_balance(inv),
+                            mode="prepaid_coupon",
+                            reference=serial,
+                            received_at=v.redeemed_at,
+                            idempotency_key=key,
+                            coupon_batch_id=batch.id,
+                            _internal_mode=True,
+                        )
+                issued += 1
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "isp coupon activation invoice failed",
+                    exc_info=True,
+                    extra={"isp_organization_id": str(isp.isp_org_id)},
+                )
+        return issued
 
     async def subscriber_views(
         self, isp: IspContext, subs: list[IspSubscriber]
@@ -1329,6 +1461,18 @@ class IspPlansService:
                 .scalars()
                 .all()
             }
+        zones: dict = {}
+        zids = list({s.zone_id for s in subs if s.zone_id})
+        if zids:
+            from .billing_models import IspZone
+
+            zones = dict(
+                (
+                    await self.session.execute(
+                        select(IspZone.id, IspZone.name).where(IspZone.id.in_(zids))
+                    )
+                ).all()
+            )
         seen = {}
         guest_ids = [s.guest_id for s in subs if s.guest_id]
         if guest_ids:
@@ -1361,6 +1505,12 @@ class IspPlansService:
                 "status": s.status,
                 "source": s.source,
                 "last_seen_at": _iso(seen.get(s.guest_id)) if s.guest_id else None,
+                "circuit_id": s.circuit_id,
+                "first_name": s.first_name,
+                "last_name": s.last_name,
+                "zone": {"id": str(s.zone_id), "name": zones.get(s.zone_id)}
+                if s.zone_id
+                else None,
             }
             for s in subs
         ]
@@ -1398,12 +1548,15 @@ class IspPlansService:
             cond.append(IspSubscriber.status == status)
         if search:
             pattern = f"%{search.strip()}%"
-            cond.append(
-                or_(
-                    IspSubscriber.identifier.ilike(pattern),
-                    IspSubscriber.display_name.ilike(pattern),
-                )
-            )
+            terms = [
+                IspSubscriber.identifier.ilike(pattern),
+                IspSubscriber.display_name.ilike(pattern),
+                IspSubscriber.first_name.ilike(pattern),
+                IspSubscriber.last_name.ilike(pattern),
+            ]
+            if search.strip().isdigit() and len(search.strip()) <= 9:
+                terms.append(IspSubscriber.circuit_id == int(search.strip()))
+            cond.append(or_(*terms))
         total = (
             await self.session.execute(
                 select(func.count()).select_from(IspSubscriber).where(*cond)
@@ -1489,6 +1642,14 @@ class IspPlansService:
                 for g, ln in rows
             ]
         view["recent_sessions"] = sessions
+        view.update(
+            phone=s.phone,
+            email=s.email,
+            gstin=s.gstin,
+            address=s.address,
+            state_code=s.state_code,
+            reminder_opt_in=s.reminder_opt_in,
+        )
         return view
 
     async def create_subscriber(self, isp: IspContext, data: dict) -> IspSubscriber:
@@ -1509,11 +1670,14 @@ class IspPlansService:
         ).scalar_one_or_none()
         if existing is not None:
             raise IspNameTakenError("A subscriber with that identifier already exists")
+        contact = await self._contact_fields(isp, data)
         s = IspSubscriber(
             isp_organization_id=isp.isp_org_id,
             customer_organization_id=customer.id,
+            circuit_id=await self._new_circuit(isp),
             identifier=data["identifier"].strip(),
             display_name=data.get("display_name"),
+            **contact,
             package_id=package.id,
             speed_group_id=package.speed_group_id,
             valid_until=start + timedelta(days=package.validity_days),
@@ -1540,8 +1704,184 @@ class IspPlansService:
                 s.status = "active"
         if "display_name" in data:
             s.display_name = data["display_name"]
+        for k, v in (await self._contact_fields(isp, data, s.reminder_opt_in)).items():
+            setattr(s, k, v)
         await self.session.flush()
         return s
+
+    async def _contact_fields(
+        self, isp: IspContext, data: dict, current: dict | None = None
+    ) -> dict:
+        """Part B buyer/contact fields present in ``data`` (PATCH semantics:
+        only keys sent). ``zone_id`` must be one of this ISP's zones."""
+        from .billing_service import IspBuyerGstinInvalidError
+        from .gst import gstin_valid
+
+        out = {
+            k: data[k]
+            for k in (
+                "zone_id",
+                "first_name",
+                "last_name",
+                "phone",
+                "email",
+                "gstin",
+                "address",
+                "state_code",
+            )
+            if k in data
+        }
+        if out.get("zone_id") is not None:
+            await self._billing().zone(isp, out["zone_id"])
+        if out.get("gstin"):
+            out["gstin"] = out["gstin"].upper()
+            if not gstin_valid(out["gstin"]):
+                raise IspBuyerGstinInvalidError()
+        if data.get("reminder_opt_in") is not None:
+            out["reminder_opt_in"] = {
+                **DEFAULT_REMINDER_OPT_IN,
+                **(current or {}),
+                **{
+                    k: bool(v)
+                    for k, v in data["reminder_opt_in"].items()
+                    if k in DEFAULT_REMINDER_OPT_IN and v is not None
+                },
+            }
+        return out
+
+    # ------------------------------------------------------------------
+    # recharge (ADDENDUM_03 §7 / BE-I10)
+    # ------------------------------------------------------------------
+    async def recharge(
+        self, isp: IspContext, subscriber_id: uuid.UUID, data: dict
+    ) -> dict:
+        """Invoice at the package price + optional same-transaction payment +
+        validity extension from ``max(now, valid_until)``. Idempotent on
+        ``idempotency_key``: a replay returns the first result and extends
+        nothing."""
+        from .billing_models import IspPayment
+
+        s = await self.subscriber(isp, subscriber_id)
+        # serialise recharges of one subscriber (replays + validity math)
+        await self.session.execute(
+            select(IspSubscriber.id).where(IspSubscriber.id == s.id).with_for_update()
+        )
+        await self.session.refresh(s)
+        billing = self._billing()
+        key = data.get("idempotency_key")
+        source_key = f"recharge:{s.id}:{key}" if key else None
+        pay_key = f"recharge:{key}" if key else None
+        replay = await billing._existing_source(isp, source_key)
+        if replay is not None:
+            pay = (
+                await self.session.execute(
+                    select(IspPayment).where(
+                        IspPayment.isp_organization_id == isp.isp_org_id,
+                        IspPayment.idempotency_key == pay_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            return await self._recharge_result(isp, billing, s, replay, pay)
+        if s.status == "disabled":
+            raise IspSubscriberDisabledError()
+        package = await self.package(isp, data["package_id"])
+        if package.status != "active":
+            raise IspPackageDisabledError()
+        if package.price_paise <= 0:
+            # no invoice => nothing to key idempotency on; free extensions
+            # go through PATCH valid_until instead
+            raise IspPackageNeedsPriceError()
+        payment = data.get("payment") or {}
+        if data.get("paid_now"):
+            from .billing_service import (
+                PAYMENT_MODES,
+                REFERENCE_REQUIRED,
+                IspPaymentModeInvalidError,
+                IspPaymentReferenceRequiredError,
+            )
+
+            mode = payment.get("mode") or "cash"
+            if mode not in PAYMENT_MODES:
+                raise IspPaymentModeInvalidError()
+            if (
+                mode in REFERENCE_REQUIRED
+                and not (payment.get("reference") or "").strip()
+            ):
+                raise IspPaymentReferenceRequiredError()
+        await self.materialize(isp, package, s.customer_organization_id)
+        now = self._clock()
+        start = max(now, s.valid_until) if s.valid_until else now
+        end = start + timedelta(days=package.validity_days)
+        tz = isp.organization.timezone or "Asia/Kolkata"
+        inv = await billing.issue_subscriber_invoice(
+            isp,
+            s,
+            lines=[
+                {
+                    "description": package.name,
+                    "amount_paise": package.price_paise,
+                    "price_includes_gst": package.price_includes_gst,
+                    "period_from": _local_date(start, tz),
+                    "period_to": _local_date(end, tz),
+                    "package_id": package.id,
+                }
+            ],
+            invoice_kind="recharge",
+            period_start=_local_date(start, tz),
+            period_end=_local_date(end, tz),
+            description=package.name,
+            po_number=data.get("po_number"),
+            source_key=source_key,
+        )
+        s.valid_until = end
+        s.package_id = package.id
+        s.speed_group_id = package.speed_group_id
+        s.status = "active"
+        await self.session.flush()
+        pay = None
+        if data.get("paid_now") and billing_balance(inv) > 0:
+            pay = await billing.record_payment(
+                isp,
+                subscriber_id=s.id,
+                invoice_id=inv.id,
+                amount_paise=int(payment.get("amount_paise") or billing_balance(inv)),
+                mode=payment.get("mode") or "cash",
+                reference=payment.get("reference"),
+                received_at=payment.get("received_at"),
+                idempotency_key=pay_key,
+            )
+        return await self._recharge_result(isp, billing, s, inv, pay)
+
+    async def _recharge_result(
+        self, isp: IspContext, billing: IspBillingService, s: Any, inv: Any, pay: Any
+    ) -> dict:
+        row = None
+        if inv is not None:
+            subs, packages = await billing.row_extras([inv])
+            row = billing.invoice_row(
+                inv, subscriber=subs.get(inv.id), package=packages.get(inv.id)
+            )
+        pkg = await self.session.get(IspPackage, s.package_id) if s.package_id else None
+        return {
+            "invoice": row,
+            "payment": {
+                "id": str(pay.id),
+                "receipt_number": pay.receipt_number,
+                "amount_paise": pay.amount_paise,
+                "mode": pay.mode,
+                "reference": pay.reference,
+                "received_at": _iso(pay.received_at),
+            }
+            if pay is not None
+            else None,
+            "subscriber": {
+                "id": str(s.id),
+                "circuit_id": s.circuit_id,
+                "valid_until": _iso(s.valid_until),
+                "status": s.status,
+                "package": {"id": str(pkg.id), "name": pkg.name} if pkg else None,
+            },
+        }
 
     async def set_subscriber_status(
         self, isp: IspContext, subscriber_id: uuid.UUID, enabled: bool

@@ -27,7 +27,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
@@ -37,6 +37,9 @@ def _fk(target: str, *, nullable: bool = False, ondelete: str | None = None):  #
     return mapped_column(
         UUID(as_uuid=True), ForeignKey(target, ondelete=ondelete), nullable=nullable
     )
+
+
+DEFAULT_REMINDER_OPT_IN = {"email": True, "sms": False, "whatsapp": False}
 
 
 class IspPlanSettings(BaseModel):
@@ -203,8 +206,33 @@ class IspSubscriber(BaseModel):
     source: Mapped[str] = mapped_column(String(10), nullable=False)
     last_voucher_id: Mapped[uuid.UUID | None] = _fk("vouchers.id", nullable=True)
     guest_id: Mapped[uuid.UUID | None] = _fk("guests.id", nullable=True)
+    # ADDENDUM_03 Part B (migration 0175): one circuit id per connection,
+    # unique per ISP, immutable; contact + GST buyer fields; reminder consent.
+    circuit_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    zone_id: Mapped[uuid.UUID | None] = _fk("isp_zones.id", nullable=True)
+    first_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gstin: Mapped[str | None] = mapped_column(String(15), nullable=True)
+    address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state_code: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    reminder_opt_in: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: dict(DEFAULT_REMINDER_OPT_IN),
+        server_default=text(
+            """'{"email": true, "sms": false, "whatsapp": false}'::jsonb"""
+        ),
+    )
 
     __table_args__ = (
+        Index(
+            "uq_isp_subscribers_circuit",
+            "isp_organization_id",
+            "circuit_id",
+            unique=True,
+        ),
         Index(
             "uq_isp_subscribers_customer_identifier",
             "customer_organization_id",
