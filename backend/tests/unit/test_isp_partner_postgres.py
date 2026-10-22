@@ -87,9 +87,19 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                 "isp-noc",
                 "isp-technician",
                 "isp-viewer",
+                "isp-billing",
             }
             assert all(
-                key.split(".")[0] in {"isp_partner", "isp_logs", "isp_ipdr", "tr069"}
+                key.split(".")[0]
+                in {
+                    "isp_partner",
+                    "isp_logs",
+                    "isp_ipdr",
+                    "tr069",
+                    "isp_billing",
+                    "isp_invoices",
+                    "isp_zones",
+                }
                 for _, key in isp_rows
             )
             again = await seed_isp_partner_rbac(RBACRepository(s))

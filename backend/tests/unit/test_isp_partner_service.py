@@ -420,7 +420,9 @@ class TestUpdateSuspend:
             )
         assert err.value.status_code == 422
 
-    async def test_suspend_delegates_to_service_control_and_keeps_tr069_on(self) -> None:
+    async def test_suspend_delegates_to_service_control_and_keeps_tr069_on(
+        self,
+    ) -> None:
         """ADDENDUM_01 / D14: the Phase 1 route now cuts internet through
         IspServiceControl; the TR-069 credential is left enabled (§A.6)."""
         repo = _repo()

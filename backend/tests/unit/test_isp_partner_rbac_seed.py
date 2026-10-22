@@ -54,13 +54,18 @@ EXPECTED = {
     "isp-viewer": {"isp_partner.read", "isp_partner.export", "tr069.read"},
 }
 # Phase 1b additions (ADDENDUM_01 §B.3, ADDENDUM_03 §11)
-_BILLING = {f"isp_billing.{a}" for a in "read create update execute export manage".split()}
+_BILLING = {
+    f"isp_billing.{a}" for a in "read create update execute export manage".split()
+}
 _INVOICES = {f"isp_invoices.{a}" for a in "read create execute export manage".split()}
 EXPECTED["isp-owner"] |= _BILLING | _INVOICES | {"isp_zones.read", "isp_zones.manage"}
 EXPECTED["isp-noc"] |= {"isp_invoices.read", "isp_zones.read"}
 EXPECTED["isp-technician"] |= {"isp_zones.read"}
 EXPECTED["isp-viewer"] |= {
-    "isp_billing.read", "isp_invoices.read", "isp_invoices.export", "isp_zones.read",
+    "isp_billing.read",
+    "isp_invoices.read",
+    "isp_invoices.export",
+    "isp_zones.read",
 }
 EXPECTED["isp-billing"] = (
     {"isp_partner.read", "isp_zones.read"}
