@@ -178,6 +178,13 @@ def fakes(client, monkeypatch):  # noqa: F811
         get_radius_service,
     ):
         app.dependency_overrides[dep] = lambda: f
+    from app.domains.isp_partner.providers import get_service_control
+
+    class NoCut:
+        async def after_nas_registered(self, *a, **k):
+            f.seen.append(("after_nas_registered", CUST_A1))
+
+    app.dependency_overrides[get_service_control] = lambda: NoCut()
     pushed: list = []
 
     async def _push(**kw):

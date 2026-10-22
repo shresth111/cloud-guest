@@ -58,6 +58,9 @@ class Repo(FakeIspRepository):
     async def cpes_for_isp(self, isp):
         return []
 
+    async def service_states(self, ids):
+        return dict(getattr(self, "_states", {}))
+
     async def count_customers(self, isp):
         return len(await self.child_ids(isp))
 
@@ -214,6 +217,22 @@ class Recorder:
         return [kw for n, kw in self.calls if n == name]
 
 
+class FakeControl:
+    def __init__(self, repo) -> None:
+        self.repo = repo
+        self.calls: list = []
+
+    async def suspend(self, isp_org_id, customer, **kw):
+        self.calls.append(("suspend", isp_org_id, customer, kw))
+        customer.status = "suspended"
+        return {"state": "suspended"}
+
+    async def resume(self, isp_org_id, customer, **kw):
+        self.calls.append(("resume", isp_org_id, customer, kw))
+        customer.status = "active"
+        return {"state": "active"}
+
+
 class Creds:
     def __init__(self) -> None:
         self.rows: dict = {}
@@ -300,6 +319,8 @@ class TestCreateCustomer:
             "notes",
             "counts",
             "tr069_enabled",
+            "service_state",
+            "zone_id",
             "created_at",
             "updated_at",
         }
@@ -399,36 +420,37 @@ class TestUpdateSuspend:
             )
         assert err.value.status_code == 422
 
-    async def test_suspend_disables_tr069_only_and_activate_restores_it(self) -> None:
+    async def test_suspend_delegates_to_service_control_and_keeps_tr069_on(self) -> None:
+        """ADDENDUM_01 / D14: the Phase 1 route now cuts internet through
+        IspServiceControl; the TR-069 credential is left enabled (§A.6)."""
         repo = _repo()
         rec = Recorder(repo)
         creds = Creds()
         creds.rows[(ISP_A, CUST_A1)] = SimpleNamespace(enabled=True)
         service = _service(repo, rec, creds)
+        control = FakeControl(repo)
+        service.service_control = control
         data = await service.suspend_customer(context(repo), CUST_A1, reason="unpaid")
         assert data["status"] == "suspended"
-        (suspend,) = rec.named("suspend_organization")
-        assert (
-            suspend["requesting_organization_id"] == CUST_A1
-        )  # never None, never the ISP
-        assert creds.toggles == [(CUST_A1, False)]
-        # no guest/RADIUS/portal collaborator exists to touch
-        assert {n for n, _ in rec.calls} <= {
-            "suspend_organization",
-            "update_organization",
-            "audit",
-        }
+        assert control.calls[0][0] == "suspend"
+        _, isp_id, customer, kw = control.calls[0]
+        assert isp_id == ISP_A and customer.id == CUST_A1
+        assert kw["reason"] == "other" and kw["note"] == "unpaid"
+        assert creds.toggles == []
         await service.activate_customer(context(repo), CUST_A1)
-        assert creds.toggles == [(CUST_A1, False), (CUST_A1, True)]
+        assert control.calls[1][0] == "resume"
+        assert creds.toggles == []
 
-    async def test_activate_does_not_enable_tr069_the_isp_turned_off(self) -> None:
+    async def test_activate_re_enables_tr069_a_phase1_suspend_disabled(self) -> None:
         repo = _repo()
+        repo.orgs[CUST_A1].status = "suspended"
+        repo.orgs[CUST_A1].settings = {"isp_tr069_disabled_by_suspension": True}
         creds = Creds()
         creds.rows[(ISP_A, CUST_A1)] = SimpleNamespace(enabled=False)
         service = _service(repo, Recorder(repo), creds)
-        await service.suspend_customer(context(repo), CUST_A1, reason=None)
+        service.service_control = FakeControl(repo)
         await service.activate_customer(context(repo), CUST_A1)
-        assert creds.toggles == []
+        assert creds.toggles == [(CUST_A1, True)]
 
     async def test_other_isps_customer_is_404(self) -> None:
         repo = _repo()
