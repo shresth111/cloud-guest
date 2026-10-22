@@ -300,6 +300,9 @@ class Tr069Service:
         )
         locs = await isp.repository.names(Location, [d.location_id for d in devices])
         mgmt = await self._management_enabled(isp, devices)
+        states = await isp.repository.service_states(
+            [d.customer_organization_id for d in devices if d.customer_organization_id]
+        )
         now = self._clock()
         return [
             {
@@ -323,6 +326,12 @@ class Tr069Service:
                 "last_inform_at": _iso(d.last_inform_at),
                 "first_seen_at": _iso(d.first_seen_at),
                 "management_enabled": mgmt[d.id],
+                # ADDENDUM_01 §A.6 badge; null for an unassigned CPE.
+                "customer_service_state": (
+                    states.get(d.customer_organization_id, "active")
+                    if d.customer_organization_id
+                    else None
+                ),
             }
             for d in devices
         ]
@@ -464,6 +473,15 @@ class Tr069Service:
 
     async def queue_task(self, isp: IspContext, cpe_id: uuid.UUID, kind: str) -> dict:
         device = await IspScope.assert_cpe(isp, cpe_id)
+        if kind == "reboot" and device.customer_organization_id is not None:
+            # ADDENDUM_01 §A.6: refresh is allowed while suspended, reboot not.
+            from app.domains.isp_partner.exceptions import IspCustomerSuspendedError
+            from app.domains.isp_partner.service_control import IspServiceControl
+
+            if await IspServiceControl(session=self.session).is_cut(
+                device.customer_organization_id
+            ):
+                raise IspCustomerSuspendedError()
         if not (await self._management_enabled(isp, [device]))[device.id]:
             raise Tr069DisabledForCustomerError()
         pending = (

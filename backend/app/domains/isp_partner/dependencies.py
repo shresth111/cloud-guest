@@ -127,7 +127,14 @@ async def RequireIspPartner(
         raise IspRoleRequiredError()
     # One isp-* role per user per ISP is what this API writes; if more exist
     # (hand-edited data) take the most privileged deterministically.
-    order = ["isp-owner", "isp-admin", "isp-noc", "isp-technician", "isp-viewer"]
+    order = [
+        "isp-owner",
+        "isp-admin",
+        "isp-noc",
+        "isp-technician",
+        "isp-billing",
+        "isp-viewer",
+    ]
     chosen = min(isp_roles, key=lambda a: order.index(a.role.slug))
 
     profile = await repository.get_profile(isp_org_id)

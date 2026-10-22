@@ -192,3 +192,120 @@ class PlanNotFoundError(IspError):
     code = "PLAN_NOT_FOUND"
     status_code_default = status.HTTP_422_UNPROCESSABLE_ENTITY
     default_message = "Plan not found"
+
+
+# -- Phase 1b: service control ------------------------------------------------
+class IspServiceTransitionInProgressError(IspError):
+    code = "ISP_SERVICE_TRANSITION_IN_PROGRESS"
+    status_code_default = status.HTTP_409_CONFLICT
+    default_message = "Another suspend or resume for this customer is running"
+
+
+class IspCustomerSuspendedError(IspError):
+    code = "ISP_CUSTOMER_SUSPENDED"
+    status_code_default = status.HTTP_409_CONFLICT
+    default_message = "Not available while this customer is suspended"
+
+
+class IspSuspendReasonInvalidError(IspError):
+    code = "ISP_SUSPEND_REASON_INVALID"
+    status_code_default = status.HTTP_422_UNPROCESSABLE_ENTITY
+    default_message = "Reason must be non_payment, customer_request, abuse or other"
+
+
+class IspScopeViolation(IspError):
+    """A suspension step named a row outside the ISP's customers. Must never
+    happen; aborts the transaction (A.9)."""
+
+    code = "ISP_SCOPE_VIOLATION"
+    status_code_default = status.HTTP_500_INTERNAL_SERVER_ERROR
+    default_message = "Internal scope check failed"
+
+
+# -- Phase 1b: billing --------------------------------------------------------
+def _err(name: str, code: str, http: int, message: str) -> type[IspError]:
+    return type(
+        name,
+        (IspError,),
+        {"code": code, "status_code_default": http, "default_message": message},
+    )
+
+
+IspBillingNotConfiguredError = _err(
+    "IspBillingNotConfiguredError",
+    "ISP_BILLING_NOT_CONFIGURED",
+    409,
+    "Set up billing (legal name, state, prefixes) first",
+)
+IspInvoiceNotFoundError = _err(
+    "IspInvoiceNotFoundError", "ISP_INVOICE_NOT_FOUND", 404, "Invoice not found"
+)
+IspPaymentNotFoundError = _err(
+    "IspPaymentNotFoundError", "ISP_PAYMENT_NOT_FOUND", 404, "Payment not found"
+)
+IspInvoiceVoidError = _err(
+    "IspInvoiceVoidError", "ISP_INVOICE_VOID", 409, "This invoice is cancelled"
+)
+IspInvoiceCancelledError = _err(
+    "IspInvoiceCancelledError",
+    "ISP_INVOICE_CANCELLED",
+    409,
+    "This invoice is cancelled",
+)
+IspInvoicePaidError = _err(
+    "IspInvoicePaidError", "ISP_INVOICE_PAID", 409, "This invoice is already paid"
+)
+IspPaymentModeInvalidError = _err(
+    "IspPaymentModeInvalidError",
+    "ISP_PAYMENT_MODE_INVALID",
+    422,
+    "Mode must be cash, upi, bank_transfer or online",
+)
+IspPaymentReferenceRequiredError = _err(
+    "IspPaymentReferenceRequiredError",
+    "ISP_PAYMENT_REFERENCE_REQUIRED",
+    422,
+    "A reference (UTR) is required for UPI and bank transfers",
+)
+IspCreditExceedsBalanceError = _err(
+    "IspCreditExceedsBalanceError",
+    "ISP_CREDIT_EXCEEDS_BALANCE",
+    422,
+    "The credit note is larger than the invoice balance",
+)
+IspInvoicePrefixTooLongError = _err(
+    "IspInvoicePrefixTooLongError",
+    "ISP_INVOICE_PREFIX_TOO_LONG",
+    422,
+    "Prefix must be 1-4 characters A-Z or 0-9",
+)
+IspInvoiceDateOutOfRangeError = _err(
+    "IspInvoiceDateOutOfRangeError",
+    "ISP_INVOICE_DATE_OUT_OF_RANGE",
+    422,
+    "Invoice date must be within the last 7 days and in the current financial year",
+)
+IspBuyerGstinInvalidError = _err(
+    "IspBuyerGstinInvalidError", "ISP_BUYER_GSTIN_INVALID", 422, "GSTIN is not valid"
+)
+IspZoneInUseError = _err(
+    "IspZoneInUseError", "ISP_ZONE_IN_USE", 409, "The zone is still assigned"
+)
+IspZoneNotFoundError = _err(
+    "IspZoneNotFoundError", "ISP_ZONE_NOT_FOUND", 404, "Zone not found"
+)
+IspBulkTooLargeError = _err(
+    "IspBulkTooLargeError", "ISP_BULK_TOO_LARGE", 422, "At most 500 invoices at once"
+)
+IspInvoiceNumberOverflowError = _err(
+    "IspInvoiceNumberOverflowError",
+    "ISP_INVOICE_NUMBER_OVERFLOW",
+    500,
+    "Invoice number would exceed 16 characters",
+)
+IspNoDuesError = _err(
+    "IspNoDuesError",
+    "ISP_NO_OVERDUE_INVOICES",
+    409,
+    "This customer has no overdue invoices",
+)

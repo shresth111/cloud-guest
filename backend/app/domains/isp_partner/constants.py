@@ -37,9 +37,11 @@ class IspRole(StrEnum):
     NOC = "isp-noc"
     TECHNICIAN = "isp-technician"
     VIEWER = "isp-viewer"
+    BILLING = "isp-billing"
 
 
 ISP_ROLE_SLUGS: frozenset[str] = frozenset(r.value for r in IspRole)
+# isp-billing (1b) is confinable like noc/technician/viewer.
 #: Roles that may never be confined to a customer list (API_CONTRACT §1.3).
 UNCONFINABLE_ROLES: frozenset[str] = frozenset({IspRole.OWNER, IspRole.ADMIN})
 #: Roles only an ``isp-owner`` may grant.
@@ -86,8 +88,35 @@ SETUP_SCRIPT_ROLES: frozenset[str] = frozenset(
     {IspRole.OWNER, IspRole.ADMIN, IspRole.TECHNICIAN}
 )
 
-#: Q4. Whether suspending an ISP customer also cuts the venue's guest WiFi.
-#: False: suspension changes the organization's status and disables its TR-069
-#: credential only. Guest sessions, RADIUS and the captive portal are not
-#: touched (the platform's "never cut guests over billing" rule).
-SUSPEND_CUTS_GUEST_WIFI = False
+#: Q4 (answered 2026-10-22, D14): suspending an ISP customer cuts its
+#: internet -- see ``service_control``. TR-069 credentials stay enabled.
+SUSPEND_CUTS_GUEST_WIFI = True
+
+# -- Phase 1b: service control (ADDENDUM_01 §A) ------------------------------
+from datetime import timedelta as _td  # noqa: E402
+
+AUDIT_ISP_SERVICE_SUSPENDED = "isp_customer_service_suspended"
+AUDIT_ISP_SERVICE_RESUMED = "isp_customer_service_resumed"
+AUDIT_ISP_AUTO_SUSPENDED = "isp_customer_auto_suspended"
+SUSPEND_REASONS: frozenset[str] = frozenset(
+    {"non_payment", "customer_request", "abuse", "other"}
+)
+#: Lazy retries run at most this often per customer.
+SERVICE_RETRY_MIN_INTERVAL = _td(seconds=60)
+#: Kick steps stop retrying after this; sessions end at their own timeout.
+SERVICE_RETRY_GIVE_UP = _td(hours=24)
+
+# -- Phase 1b: billing keys --------------------------------------------------
+ISP_BILLING_READ = "isp_billing.read"
+ISP_BILLING_CREATE = "isp_billing.create"
+ISP_BILLING_UPDATE = "isp_billing.update"
+ISP_BILLING_EXECUTE = "isp_billing.execute"
+ISP_BILLING_EXPORT = "isp_billing.export"
+ISP_BILLING_MANAGE = "isp_billing.manage"
+ISP_INVOICES_READ = "isp_invoices.read"
+ISP_INVOICES_CREATE = "isp_invoices.create"
+ISP_INVOICES_EXECUTE = "isp_invoices.execute"
+ISP_INVOICES_EXPORT = "isp_invoices.export"
+ISP_INVOICES_MANAGE = "isp_invoices.manage"
+ISP_ZONES_READ = "isp_zones.read"
+ISP_ZONES_MANAGE = "isp_zones.manage"

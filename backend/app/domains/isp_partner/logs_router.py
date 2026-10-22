@@ -567,16 +567,21 @@ async def list_auth_logs(
     request: Request,
     isp_customer_id: uuid.UUID | None = Query(default=None),
     isp_location_id: uuid.UUID | None = Query(default=None),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     isp: IspContext = Depends(RequireIspPartner),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    """``since``/``until`` (optional, shared by every log endpoint) filter on
+    ``attempted_at``; with neither, a single customer goes through
+    ``ControllerLogsService`` exactly as the customer console does."""
     customer_id, location_id, _, org_ids = await _scope(
         isp, isp_customer_id, isp_location_id, None
     )
     names = await isp.repository.names(Organization, org_ids)
-    if customer_id is not None:
+    if customer_id is not None and since is None and until is None:
         guest_repository = GuestRepository(db)
         service = ControllerLogsService(
             None,
@@ -601,6 +606,12 @@ async def list_auth_logs(
             GuestLoginHistory.organization_id.in_(org_ids),
             GuestLoginHistory.is_deleted.is_(False),
         ]
+        if location_id is not None:
+            conditions.append(GuestLoginHistory.location_id == location_id)
+        if since is not None:
+            conditions.append(GuestLoginHistory.attempted_at >= since)
+        if until is not None:
+            conditions.append(GuestLoginHistory.attempted_at <= until)
         total = int(
             (
                 await db.execute(

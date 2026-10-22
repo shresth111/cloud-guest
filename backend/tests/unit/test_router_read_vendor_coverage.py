@@ -206,6 +206,21 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 VENDOR_NEUTRAL: dict[str, str] = {
     # -- isp_partner (ISP Partner Dashboard, /isp) ----------------------------
+    "app/domains/isp_partner/service_control.py::IspServiceControl._routers": (
+        "ISP customer suspend/resume (ADDENDUM_01 §A): every router of the "
+        "suspended customer, controller-managed included, on purpose -- a "
+        "suspended customer's internet must stop at every venue. The cut is "
+        "vendor-neutral by construction: it disables the router's NAS rows in "
+        "our DB (RADIUS Access-Reject at the hub for any vendor), and live "
+        "sessions are ended through GuestService.disconnect_session, whose "
+        "terminator already dispatches by vendor (RouterOS 8728 or the "
+        "controller). A router with no NAS row is recorded as skipped."
+    ),
+    "app/domains/isp_partner/service_control.py::IspServiceControl.view": (
+        "Names the routers in a suspend/resume step list for display. The "
+        "`online` flag shows the stored routers.status as-is; no health "
+        "judgement is made and nothing is dispatched from this read."
+    ),
     "app/domains/isp_partner/repository.py::IspRepository.list_routers": (
         "The ISP's router inventory page (GET /isp/routers): every router of "
         "the ISP's customers, controller-managed included, because a router "

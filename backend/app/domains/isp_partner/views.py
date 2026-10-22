@@ -67,6 +67,7 @@ def customer_view(
     routers: list[Any],
     cpes: int,
     tr069_enabled: bool,
+    service_state: str = "active",
 ) -> dict:
     def p(name: str) -> Any:
         return getattr(profile, name, None) if profile is not None else None
@@ -97,6 +98,9 @@ def customer_view(
             "cpes": cpes,
         },
         "tr069_enabled": tr069_enabled,
+        # ADDENDUM_01 §A: active | suspend_pending | suspended | resume_pending
+        "service_state": service_state,
+        "zone_id": _id(p("zone_id")),
         "created_at": _iso(org.created_at),
         "updated_at": _iso(org.updated_at),
     }

@@ -14,6 +14,7 @@ from app.domains.billing.dependencies import get_subscription_service
 from app.domains.billing.service import SubscriptionService
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.guest.dependencies import get_guest_service, get_radius_service
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
 from app.domains.monitoring.default_alerting import ensure_default_alerting
@@ -36,6 +37,44 @@ from app.domains.tr069.credentials import CredentialStore
 from .dependencies import get_isp_repository
 from .repository import IspRepository
 from .service import IspPartnerService
+from .service_control import IspServiceControl
+
+
+def make_live_disconnect(guest_repository, terminator):  # noqa: ANN001, ANN201
+    """Re-kick one already-ended session through the existing
+    ``issue_live_disconnect`` (the session is DISCONNECTED in our records
+    already, so ``disconnect_session`` would refuse the transition)."""
+
+    async def _kick(row):  # noqa: ANN001, ANN202
+        from app.domains.guest.service import issue_live_disconnect
+
+        await issue_live_disconnect(
+            guest_repository, session=row, terminator=terminator
+        )
+        return row.disconnect_enforced
+
+    return _kick
+
+
+def get_service_control(
+    db: AsyncSession = Depends(get_db_session),
+    radius_service=Depends(get_radius_service),  # noqa: B008
+    guest_service=Depends(get_guest_service),  # noqa: B008
+    captive_portal_service: CaptivePortalService = Depends(get_captive_portal_service),
+    organization_service: OrganizationService = Depends(get_organization_service),
+    audit: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> IspServiceControl:
+    return IspServiceControl(
+        session=db,
+        radius_service=radius_service,
+        guest_service=guest_service,
+        captive_portal_service=captive_portal_service,
+        organization_service=organization_service,
+        audit=audit,
+        live_disconnect=make_live_disconnect(
+            guest_service.repository, guest_service.session_end_hook
+        ),
+    )
 
 
 def get_credential_store(db: AsyncSession = Depends(get_db_session)) -> CredentialStore:

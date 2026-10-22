@@ -145,6 +145,7 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "user_id",
         "variable_id",
         "version_id",
+        "zone_id",
     }
 )
 

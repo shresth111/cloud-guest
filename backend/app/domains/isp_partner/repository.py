@@ -173,6 +173,24 @@ class IspRepository:
         )
         return list(rows.scalars().all()), total
 
+    async def service_states(self, ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
+        """ADDENDUM_01 service state per customer; absent = ``active``."""
+        from .billing_models import IspCustomerServiceState
+
+        ids = require_ids(ids)
+        if not ids:
+            return {}
+        rows = await self.session.execute(
+            select(
+                IspCustomerServiceState.customer_organization_id,
+                IspCustomerServiceState.state,
+            ).where(
+                IspCustomerServiceState.customer_organization_id.in_(ids),
+                IspCustomerServiceState.is_deleted.is_(False),
+            )
+        )
+        return {r[0]: r[1] for r in rows.all()}
+
     async def count_customers(self, isp_org_id: uuid.UUID) -> int:
         return len(await self.child_ids(isp_org_id))
 
