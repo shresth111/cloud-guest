@@ -58,6 +58,8 @@ from app.domains.hotspot.router import router as hotspot_router
 from app.domains.hub_reconciliation.router import router as hub_reconciliation_router
 from app.domains.ipdr.router import ipdr_router
 from app.domains.isp.router import router as isp_router
+from app.domains.isp_partner.platform_router import isp_partner_platform_router
+from app.domains.isp_partner.router import isp_partner_router
 from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.live_sessions.router import router as live_sessions_router
 from app.domains.location.router import router as location_router
@@ -111,6 +113,8 @@ from app.domains.security.router import router as security_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
+from app.domains.tr069.internal_router import tr069_internal_router
+from app.domains.tr069.router import tr069_router
 from app.domains.traffic_flow.customer_router import traffic_flow_customer_router
 from app.domains.traffic_flow.destinations_customer_router import (
     traffic_flow_destinations_customer_router,
@@ -344,3 +348,7 @@ api_v1_router.include_router(device_logs_platform_router)
 api_v1_router.include_router(device_logs_ingest_router)
 api_v1_router.include_router(netlogs_customer_router)
 api_v1_router.include_router(ipdr_router)
+api_v1_router.include_router(isp_partner_platform_router)
+api_v1_router.include_router(isp_partner_router)
+api_v1_router.include_router(tr069_router)
+api_v1_router.include_router(tr069_internal_router)

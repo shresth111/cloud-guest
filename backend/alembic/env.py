@@ -63,6 +63,7 @@ from app.domains.guest_teams import models as guest_teams_models  # noqa: F401
 from app.domains.hotspot import models as hotspot_models  # noqa: F401
 from app.domains.ipdr import models as ipdr_models  # noqa: F401
 from app.domains.isp import models as isp_models  # noqa: F401
+from app.domains.isp_partner import models as isp_partner_models  # noqa: F401
 from app.domains.isp_routing import models as isp_routing_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
 from app.domains.mac_authorization import (
@@ -100,6 +101,7 @@ from app.domains.router_provisioning import (
 )
 from app.domains.support_tickets import models as support_tickets_models  # noqa: F401
 from app.domains.system_settings import models as system_settings_models  # noqa: F401
+from app.domains.tr069 import models as tr069_models  # noqa: F401
 from app.domains.traffic_flow import models as traffic_flow_models  # noqa: F401
 from app.domains.vlan import models as vlan_models  # noqa: F401
 from app.domains.voucher import models as voucher_models  # noqa: F401

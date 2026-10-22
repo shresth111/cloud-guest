@@ -1,0 +1,13 @@
+[{"_id":"E48D8C-RB750Gr3-HG3XXXX","_lastInform":"2026-10-22T05:58:00.000Z","_registered":"2026-10-20T10:00:00.000Z",
+"_deviceId":{"_Manufacturer":"MikroTik","_OUI":"E48D8C","_ProductClass":"RB750Gr3","_SerialNumber":"HG3XXXX"},
+"_tags":["isp:x"],
+"Device":{"DeviceInfo":{"Manufacturer":{"_value":"MikroTik"},"ModelName":{"_value":"RB750Gr3"},"SerialNumber":{"_value":"HG3XXXX"},
+  "SoftwareVersion":{"_value":"7.18.2"},"HardwareVersion":{"_value":"r3"},"UpTime":{"_value":123456}},
+ "ManagementServer":{"Username":{"_value":"cust-1a2b3c4d"},"Password":{"_value":"acs-secret-leak"},"PeriodicInformInterval":{"_value":300}},
+ "IP":{"Interface":{"1":{"IPv4Address":{"1":{"IPAddress":{"_value":"203.0.113.10"}}}}}},
+ "PPP":{"Interface":{"1":{"Username":{"_value":"cafe-x@isp"},"Password":{"_value":"pppoe-secret-leak"}}}},
+ "Hosts":{"HostNumberOfEntries":{"_value":12}},
+ "WiFi":{"SSID":{"1":{"SSID":{"_value":"Cafe X"},"Enable":{"_value":true}},"2":{"SSID":{"_value":"Cafe X 5G"},"Enable":{"_value":"false"}}},
+  "AccessPoint":{"1":{"AssociatedDeviceNumberOfEntries":{"_value":7},"Security":{"KeyPassphrase":{"_value":"wifi-secret-leak"},"PreSharedKey":{"_value":"psk-leak"}}},
+                 "2":{"AssociatedDeviceNumberOfEntries":{"_value":0}}},
+  "Radio":{"1":{"OperatingFrequencyBand":{"_value":"2.4GHz"}},"2":{"OperatingFrequencyBand":{"_value":"5GHz"}}}}}}]
