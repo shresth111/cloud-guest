@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile, status
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.common.masking import mask_email, mask_mobile
 from app.domains.auth.models import AuthUser
@@ -67,7 +68,8 @@ from .constants import (
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import IspForceNotAllowedError, IspSetupNotAllowedError
 from .http import ok
-from .providers import get_isp_partner_service
+from .providers import get_isp_partner_service, get_service_control
+from .service_control import IspServiceControl
 from .rbac_roles import all_permission_keys
 from .schemas import (
     CustomerCreateRequest,
@@ -144,6 +146,32 @@ async def get_overview(
     return ok(request, await service.overview(isp), "ISP overview")
 
 
+class IspProfileUpdateRequest(BaseModel):
+    """PRD §4.12: the ISP may edit its own support contact fields only."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    support_phone: str | None = Field(default=None, max_length=20)
+    support_email: str | None = Field(default=None, max_length=255)
+
+
+@core.patch("/profile", dependencies=isp_guards(ISP_PARTNER_MANAGE))
+async def update_profile(
+    request: Request,
+    payload: IspProfileUpdateRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    access_validator: AccessValidator = Depends(get_access_validator),
+    service: IspPartnerService = Depends(get_isp_partner_service),
+) -> dict:
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(isp.profile, key, value)
+    isp.profile.updated_by = isp.user_id
+    await isp.repository.flush()
+    user = await isp.repository.get_user(isp.user_id)
+    permissions = await effective_isp_permissions(isp, access_validator)
+    return ok(request, await service.me(isp, user=user, permissions=permissions), "ISP profile")
+
+
 # ============================================================================
 # 4.3 Customers
 # ============================================================================
@@ -213,7 +241,9 @@ async def suspend_customer(
     payload: SuspendRequest | None = None,
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
+    control: IspServiceControl = Depends(get_service_control),
 ) -> dict:
+    service.service_control = control
     data = await service.suspend_customer(
         isp, isp_customer_id, reason=payload.reason if payload else None
     )
@@ -228,7 +258,9 @@ async def activate_customer(
     isp_customer_id: uuid.UUID,
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
+    control: IspServiceControl = Depends(get_service_control),
 ) -> dict:
+    service.service_control = control
     return ok(
         request,
         await service.activate_customer(isp, isp_customer_id),
@@ -248,7 +280,9 @@ async def list_customer_locations(
     request: Request,
     isp_customer_id: uuid.UUID,
     page: int = _Page,
-    page_size: int = _PageSize,
+    # One customer has a few venues: default to the maximum page so a client
+    # that sends no paging params gets them all (CONTRACT_CHANGES FE #5).
+    page_size: int = Query(default=MAX_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     status_filter: str | None = Query(default=None, alias="status", max_length=20),
     search: str | None = Query(default=None, max_length=200),
     isp: IspContext = Depends(RequireIspPartner),
@@ -580,6 +614,7 @@ async def twin_register_nas(
     service: Any = Depends(get_radius_service),
     wireguard_service: WireGuardService = Depends(get_wireguard_service),
     audit: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    control: IspServiceControl = Depends(get_service_control),
 ) -> dict:
     target = await _setup_target(isp, isp_router_id)
     result = await guest_routes.register_external_radius_nas(
@@ -591,6 +626,9 @@ async def twin_register_nas(
         wireguard_service=wireguard_service,
     )
     await _audit_setup(audit, isp, target, "radius_nas")
+    # ADDENDUM_01 §A.4: a router registered while its customer is suspended
+    # gets its NAS disabled at once, so it can never open a hole.
+    await control.after_nas_registered(isp.isp_org_id, target, isp.user_id)
     return result
 
 

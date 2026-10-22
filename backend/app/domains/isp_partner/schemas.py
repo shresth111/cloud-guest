@@ -59,6 +59,8 @@ class CustomerCreateRequest(_Body):
 
 class CustomerUpdateRequest(_Body):
     name: str | None = Field(default=None, min_length=1, max_length=200)
+    #: ADDENDUM_03 §4; edit only, never on create.
+    zone_id: uuid.UUID | None = None
     #: Present only so the 422 can say "immutable" rather than "unknown".
     slug: str | None = None
     legal_name: str | None = Field(default=None, max_length=255)

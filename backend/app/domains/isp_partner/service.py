@@ -43,7 +43,7 @@ from .constants import (
     AUDIT_ISP_CUSTOMER_CREATED,
     AUDIT_ISP_CUSTOMER_SUSPENDED,
     AUDIT_ISP_CUSTOMER_UPDATED,
-    SUSPEND_CUTS_GUEST_WIFI,
+    SUSPEND_REASONS,
 )
 from .dependencies import IspContext
 from .exceptions import (
@@ -72,6 +72,7 @@ PENDING_STATUSES = {
 }
 _SUSPEND_MARKER = "isp_tr069_disabled_by_suspension"
 _PROFILE_FIELDS = (
+    "zone_id",
     "external_ref",
     "contact_name",
     "gstin",
@@ -115,8 +116,10 @@ class IspPartnerService:
         audit: Any,
         credentials: CredentialStore | Any,
         default_alerting: Any = None,
+        service_control: Any = None,
         clock: Any = None,
     ) -> None:
+        self.service_control = service_control
         self.repository = repository
         self.organization_service = organization_service
         self.location_service = location_service
@@ -177,6 +180,7 @@ class IspPartnerService:
                 "slug": org.slug,
                 "status": isp.profile.status,
                 "support_phone": isp.profile.support_phone,
+                "support_email": isp.profile.support_email,
                 "timezone": org.timezone,
             },
             "user": {
@@ -237,6 +241,7 @@ class IspPartnerService:
         profiles = await self.repository.customer_profiles(ids)
         facts = await self._facts(ids)
         tr = await self._tr069_facts(isp)
+        states = await self.repository.service_states(ids)
         return [
             customer_view(
                 o,
@@ -247,6 +252,7 @@ class IspPartnerService:
                     1 for d in tr["devices"] if d.customer_organization_id == o.id
                 ),
                 tr069_enabled=o.id in tr["customer_enabled"],
+                service_state=states.get(o.id, "active"),
             )
             for o in organizations
         ]
@@ -509,6 +515,14 @@ class IspPartnerService:
                 "A customer's slug cannot be changed", field="slug"
             )
         org = await IspScope.assert_customer(isp, isp_customer_id)
+        if data.get("zone_id") is not None:
+            from .billing_models import IspZone
+
+            zone = await self.repository.session.get(IspZone, data["zone_id"])
+            if zone is None or zone.is_deleted or zone.isp_organization_id != isp.isp_org_id:
+                from .exceptions import IspZoneNotFoundError
+
+                raise IspZoneNotFoundError()
         if data.get("external_ref") and await self.repository.external_ref_taken(
             isp.isp_org_id, data["external_ref"], except_customer_id=org.id
         ):
@@ -551,22 +565,24 @@ class IspPartnerService:
     async def suspend_customer(
         self, isp: IspContext, isp_customer_id: uuid.UUID, *, reason: str | None
     ) -> dict:
-        """Phase 1 (STATUS Q4 default): the organization goes ``suspended`` and
-        its TR-069 credential is disabled. Guest WiFi, RADIUS and the portal
-        are not touched -- ``SUSPEND_CUTS_GUEST_WIFI`` is False."""
+        """Phase 1b (ADDENDUM_01 §A, Q4 answered): delegates to
+        ``IspServiceControl.suspend`` -- the org goes ``suspended`` AND the
+        customer's internet is cut (NAS rows disabled, live sessions kicked).
+        The free-text Phase 1 ``reason`` maps onto the service reasons.
+        TR-069 credentials stay enabled (§A.6)."""
         org = await IspScope.assert_customer(isp, isp_customer_id)
-        assert SUSPEND_CUTS_GUEST_WIFI is False
-        org = await self.organization_service.suspend_organization(
-            actor_user_id=isp.user_id,
-            organization_id=org.id,
-            requesting_organization_id=org.id,
+        known = reason if reason in SUSPEND_REASONS else "other"
+        await self.service_control.suspend(
+            isp.isp_org_id,
+            org,
+            actor=isp.user_id,
+            reason=known,
+            note=None if reason == known else reason,
+            show_suspended_page=True,
+            support_line=isp.profile.support_phone,
+            isp_name=isp.organization.name,
         )
-        credential = await self.credentials.get(isp.isp_org_id, org.id)
-        if credential is not None and credential.enabled:
-            await self.credentials.set_enabled(
-                isp.isp_org_id, org.id, False, actor_user_id=isp.user_id
-            )
-            await self._set_marker(isp, org, True)
+        org = await IspScope.assert_customer(isp, isp_customer_id)
         await self._audit(
             isp,
             AUDIT_ISP_CUSTOMER_SUSPENDED,
@@ -582,12 +598,16 @@ class IspPartnerService:
         self, isp: IspContext, isp_customer_id: uuid.UUID
     ) -> dict:
         org = await IspScope.assert_customer(isp, isp_customer_id)
-        org = await self.organization_service.activate_organization(
-            actor_user_id=isp.user_id,
-            organization_id=org.id,
-            requesting_organization_id=org.id,
-        )
-        # Re-enable TR-069 only if the suspension is what disabled it.
+        await self.service_control.resume(isp.isp_org_id, org, actor=isp.user_id)
+        org = await IspScope.assert_customer(isp, isp_customer_id)
+        if org.status == "suspended":
+            org = await self.organization_service.activate_organization(
+                actor_user_id=isp.user_id,
+                organization_id=org.id,
+                requesting_organization_id=org.id,
+            )
+        # A customer suspended by the Phase 1 code had its TR-069 credential
+        # disabled; re-enable it if (and only if) that is what happened.
         if (org.settings or {}).get(_SUSPEND_MARKER):
             await self.credentials.set_enabled(
                 isp.isp_org_id, org.id, True, actor_user_id=isp.user_id
