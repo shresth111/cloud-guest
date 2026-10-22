@@ -70,6 +70,25 @@ PERMISSION_GROUPS: tuple[IspPermissionGroup, ...] = (
     IspPermissionGroup(
         key="isp_zones", name="ISP Zones", actions=("read", "manage"), sort_order=1006
     ),
+    # Phase 2a (ADDENDUM_02 §7)
+    IspPermissionGroup(
+        key="isp_plans",
+        name="ISP Plans",
+        actions=("read", "create", "update", "delete"),
+        sort_order=1007,
+    ),
+    IspPermissionGroup(
+        key="isp_coupons",
+        name="ISP Coupons",
+        actions=("read", "create", "export", "update"),
+        sort_order=1008,
+    ),
+    IspPermissionGroup(
+        key="isp_subscribers",
+        name="ISP Subscribers",
+        actions=("read", "update"),
+        sort_order=1009,
+    ),
 )
 
 ALLOWED_SCOPE_TYPES: tuple[ScopeType, ...] = (ScopeType.ORGANIZATION,)
@@ -105,6 +124,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_billing=_BILLING_FULL,
             isp_invoices=_INVOICES_FULL,
             isp_zones="read manage",
+            isp_plans="read create update delete",
+            isp_coupons="read create export update",
+            isp_subscribers="read update",
         ),
     ),
     IspRoleDefinition(
@@ -119,6 +141,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_billing=_BILLING_FULL,
             isp_invoices=_INVOICES_FULL,
             isp_zones="read manage",
+            isp_plans="read create update delete",
+            isp_coupons="read create export update",
+            isp_subscribers="read update",
         ),
     ),
     IspRoleDefinition(
@@ -131,6 +156,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             tr069="read execute",
             isp_invoices="read",
             isp_zones="read",
+            isp_plans="read",
+            isp_coupons="read",
+            isp_subscribers="read",
         ),
     ),
     IspRoleDefinition(
@@ -142,6 +170,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_logs="read",
             tr069="read execute manage",
             isp_zones="read",
+            isp_plans="read",
+            isp_coupons="read export",
+            isp_subscribers="read",
         ),
     ),
     IspRoleDefinition(
@@ -154,6 +185,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_billing="read",
             isp_invoices="read export",
             isp_zones="read",
+            isp_plans="read",
+            isp_coupons="read",
+            isp_subscribers="read",
         ),
     ),
     IspRoleDefinition(
@@ -165,6 +199,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_billing="read create update execute export",
             isp_invoices=_INVOICES_FULL,
             isp_zones="read",
+            isp_plans="read",
+            isp_coupons="read create export update",
+            isp_subscribers="read update",
         ),
     ),
 )

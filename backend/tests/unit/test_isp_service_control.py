@@ -809,3 +809,7 @@ async def test_suspend_cuts_only_the_customer_and_billing_is_isolated(
         )  # two earlier + 20 committed (5 rolled back left no gap)
     finally:
         await engine.dispose()
+        # the app-global redis client pools sockets bound to this test's loop
+        from app.database.redis import redis_client
+
+        await redis_client.connection_pool.disconnect()

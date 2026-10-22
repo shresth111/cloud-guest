@@ -926,6 +926,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(service_router)
     isp_partner_router.include_router(billing_router)
+    # Phase 2a (ADDENDUM_02)
+    from .plans_router import plans_router
+
+    isp_partner_router.include_router(plans_router)
 
 
 _include_lanes()
