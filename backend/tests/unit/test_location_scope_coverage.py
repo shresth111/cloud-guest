@@ -307,6 +307,15 @@ LOCATION_SCOPED: dict[str, str] = {
 PENDING: dict[str, str] = {}
 
 EXEMPT: dict[str, str] = {
+    "isp_partner": (
+        "ISP partner (/isp). `isp_service_actions.location_id` records which "
+        "venue a suspend step's 'Service paused' portal page belongs to. "
+        "Every route pins its isp_* key to ScopeType.ORGANIZATION on the ISP "
+        "org (held only by the isp-* roles, never at LOCATION scope), the only "
+        "input is an IspScope-resolved customer id, and staff confinement is "
+        "by customer (isp_staff_customer_scopes), not by location. There is "
+        "no location-confined caller to protect against."
+    ),
     "tr069": (
         "TR-069 control plane (ISP partner). `tr069_devices.location_id` is an "
         "optional placement and `tr069_location_settings.location_id` keys a "
