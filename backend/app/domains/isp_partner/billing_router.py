@@ -25,7 +25,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
@@ -134,12 +134,20 @@ class InvoiceLineIn(_Body):
 
 
 class BillTo(_Body):
-    kind: str = Field(pattern="^customer$")
-    isp_customer_id: uuid.UUID
+    kind: str = Field(pattern="^(customer|subscriber)$")
+    isp_customer_id: uuid.UUID | None = None
+    subscriber_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _one_party(self) -> BillTo:
+        need = "subscriber_id" if self.kind == "subscriber" else "isp_customer_id"
+        if getattr(self, need) is None:
+            raise ValueError(f"{need} is required for kind={self.kind}")
+        return self
 
 
 class ManualInvoiceRequest(_Body):
-    """ADDENDUM_03 §12. ``bill_to.kind = subscriber`` arrives with Part B."""
+    """ADDENDUM_03 §12: bill a customer or (Part B) a subscriber."""
 
     bill_to: BillTo
     invoice_date: date | None = None
@@ -159,7 +167,10 @@ class CreditNoteRequest(_Body):
 
 
 class PaymentRequest(_Body):
-    isp_customer_id: uuid.UUID
+    """Exactly one of ``isp_customer_id`` / ``subscriber_id`` (Part B)."""
+
+    isp_customer_id: uuid.UUID | None = None
+    subscriber_id: uuid.UUID | None = None
     invoice_id: uuid.UUID | None = None
     amount_paise: int = Field(gt=0)
     mode: str = Field(max_length=16)
@@ -213,6 +224,7 @@ async def _rows(isp: IspContext, svc: IspBillingService, invoices: list) -> list
     overdue = (
         {i.id for i in await svc.overdue_invoices(isp, list(orgs))} if orgs else set()
     )
+    subs, packages = await svc.row_extras(invoices)
     out = []
     for i in invoices:
         org = orgs.get(i.customer_organization_id)
@@ -223,9 +235,19 @@ async def _rows(isp: IspContext, svc: IspBillingService, invoices: list) -> list
                 zones.get(str(i.zone_id)) if i.zone_id else None,
                 contact_phone=org.contact_phone if org else None,
                 overdue=i.id in overdue,
+                subscriber=subs.get(i.id),
+                package=packages.get(i.id),
             )
         )
     return out
+
+
+async def _sync_coupon_activations(isp: IspContext, svc: IspBillingService) -> None:
+    """Coupon activations become invoices through the same throttled
+    subscriber sync (ADDENDUM_03 §7); run it before listing so they show."""
+    from .plans_service import IspPlansService
+
+    await IspPlansService(session=svc.session, audit=svc.audit).sync_subscribers(isp)
 
 
 async def _pdf_for(
@@ -381,6 +403,7 @@ async def billing_list_invoices(
         status=status,
         overdue=overdue,
         doc_type="invoice",
+        bill_to_kind="customer",
         since=since,
         until=until,
         page=page,
@@ -504,7 +527,9 @@ async def billing_record_payment(
     data = (await svc.payment_rows(isp, [pay]))[0]
     # "Resume service now?" prompt (B.3): never auto-resume in 1b.
     data["can_resume"] = False
-    if await _is_cut(db, payload.isp_customer_id):
+    if payload.isp_customer_id is not None and await _is_cut(
+        db, payload.isp_customer_id
+    ):
         data["can_resume"] = not await svc.overdue_invoices(
             isp, [payload.isp_customer_id]
         )
@@ -697,6 +722,9 @@ async def list_invoices(
     doc_type: str | None = Query(default=None, pattern="^(invoice|credit_note)$"),
     bill_to_kind: str | None = Query(default=None, pattern="^(customer|subscriber)$"),
     zone_id: uuid.UUID | None = Query(default=None),
+    subscriber_id: uuid.UUID | None = Query(default=None),
+    package_id: uuid.UUID | None = Query(default=None),
+    username: str | None = Query(default=None, max_length=100),
     overdue: bool | None = Query(default=None),
     since: date | None = Query(default=None),
     until: date | None = Query(default=None),
@@ -706,40 +734,27 @@ async def list_invoices(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspBillingService = Depends(get_billing_service),
 ) -> dict:
-    if bill_to_kind == "subscriber":
-        empty = make_page([], 0, page, page_size)
-        empty["totals"] = {
-            "invoiced_paise": 0,
-            "collected_paise": 0,
-            "outstanding_paise": 0,
-        }
-        return ok(request, empty, "Invoices")
+    await _sync_coupon_activations(isp, svc)
+    filters = {
+        "isp_customer_id": isp_customer_id,
+        "status": status,
+        "overdue": overdue,
+        "zone_id": zone_id,
+        "doc_type": doc_type,
+        "since": since,
+        "until": until,
+        "search": search,
+        "bill_to_kind": bill_to_kind,
+        "subscriber_id": subscriber_id,
+        "package_id": package_id,
+        "username": username,
+    }
     rows, total = await svc.list_invoices(
-        isp,
-        isp_customer_id=isp_customer_id,
-        status=status,
-        overdue=overdue,
-        zone_id=zone_id,
-        doc_type=doc_type,
-        since=since,
-        until=until,
-        search=search,
-        page=page,
-        page_size=page_size,
+        isp, page=page, page_size=page_size, **filters
     )
     data = make_page(await _rows(isp, svc, rows), total, page, page_size)
     # Totals for the whole filtered set (CONTRACT_CHANGES FE #30).
-    data["totals"] = await svc.invoice_totals(
-        isp,
-        isp_customer_id=isp_customer_id,
-        status=status,
-        overdue=overdue,
-        zone_id=zone_id,
-        doc_type=doc_type,
-        since=since,
-        until=until,
-        search=search,
-    )
+    data["totals"] = await svc.invoice_totals(isp, **filters)
     return ok(request, data, "Invoices")
 
 
@@ -752,16 +767,20 @@ async def create_manual_invoice(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspBillingService = Depends(get_billing_service),
 ) -> dict:
-    inv = await svc.issue_invoice(
-        isp,
-        payload.bill_to.isp_customer_id,
-        lines=[line.model_dump() for line in payload.lines],
-        invoice_kind="manual",
-        issue_date=payload.invoice_date,
-        due_date=payload.due_date,
-        po_number=payload.po_number,
-        buyer_gstin=payload.buyer_gstin,
-    )
+    bill_to = payload.bill_to
+    common = {
+        "lines": [line.model_dump() for line in payload.lines],
+        "invoice_kind": "manual",
+        "issue_date": payload.invoice_date,
+        "due_date": payload.due_date,
+        "po_number": payload.po_number,
+        "buyer_gstin": payload.buyer_gstin,
+    }
+    if bill_to.kind == "subscriber":
+        sub = await svc.subscriber_in_scope(isp, bill_to.subscriber_id)
+        inv = await svc.issue_subscriber_invoice(isp, sub, **common)
+    else:
+        inv = await svc.issue_invoice(isp, bill_to.isp_customer_id, **common)
     return ok(request, await svc.invoice_detail(isp, inv.id), "Invoice issued")
 
 
@@ -797,6 +816,7 @@ async def export_invoices(
     format: str = Query(default="csv", pattern="^(csv|xlsx)$"),
     status: str | None = Query(default=None),
     zone_id: uuid.UUID | None = Query(default=None),
+    bill_to_kind: str | None = Query(default=None, pattern="^(customer|subscriber)$"),
     since: date | None = Query(default=None),
     until: date | None = Query(default=None),
     isp: IspContext = Depends(RequireIspPartner),
@@ -812,21 +832,25 @@ async def export_invoices(
         zone_id=zone_id,
         since=since,
         until=until,
+        bill_to_kind=bill_to_kind,
         page=1,
         page_size=100_000,
     )
     zones = {z["id"]: z["name"] for z in await svc.list_zones(isp)}
+    subs, packages = await svc.row_extras(rows)
     table = [
         {
             "Created": i.created_at.isoformat() if i.created_at else "",
             "Invoice No.": i.number,
             "Invoice Id": i.display_id,
-            "Username": "",
-            "Circuit Id": "",
-            "First Name": i.bill_to_name,
-            "Last Name": "",
+            "Username": (subs.get(i.id) or {}).get("username")
+            or i.bill_to_username
+            or "",
+            "Circuit Id": i.circuit_id_snapshot or "",
+            "First Name": (subs.get(i.id) or {}).get("first_name") or i.bill_to_name,
+            "Last Name": (subs.get(i.id) or {}).get("last_name") or "",
             "Zone": zones.get(str(i.zone_id), "") if i.zone_id else "",
-            "Package": i.description or "",
+            "Package": (packages.get(i.id) or {}).get("name") or i.description or "",
             "Invoice Kind": i.invoice_kind,
             "PO No.": i.po_number or "",
             "Buyer GSTIN": i.bill_to_gstin or "",

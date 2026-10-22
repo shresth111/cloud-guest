@@ -18,7 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
 from app.domains.queue_management.dependencies import get_queue_management_service
-from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.authorization import AccessValidator
+from app.domains.rbac.dependencies import get_access_validator, get_rbac_repository
+from app.domains.rbac.exceptions import PermissionDeniedError
 from app.domains.voucher.dependencies import get_voucher_service
 
 from .constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
@@ -47,6 +49,7 @@ COUPONS_READ, COUPONS_CREATE, COUPONS_EXPORT, COUPONS_UPDATE = (
     "isp_coupons.update",
 )
 SUBS_READ, SUBS_UPDATE = "isp_subscribers.read", "isp_subscribers.update"
+INVOICES_CREATE, BILLING_EXECUTE = "isp_invoices.create", "isp_billing.execute"
 
 
 def get_plans_service(
@@ -142,7 +145,27 @@ class CouponBatchRequest(_Body):
     shelf_life_days: int | None = Field(default=None, ge=1, le=3650)
 
 
-class SubscriberRequest(_Body):
+class ReminderOptIn(_Body):
+    email: bool | None = None
+    sms: bool | None = None
+    whatsapp: bool | None = None
+
+
+class _SubscriberContact(_Body):
+    """ADDENDUM_03 §10 buyer/contact fields (Part B)."""
+
+    zone_id: uuid.UUID | None = None
+    first_name: str | None = Field(default=None, max_length=100)
+    last_name: str | None = Field(default=None, max_length=100)
+    phone: str | None = Field(default=None, max_length=20)
+    email: str | None = Field(default=None, max_length=255)
+    gstin: str | None = Field(default=None, min_length=15, max_length=15)
+    address: str | None = Field(default=None, max_length=1000)
+    state_code: str | None = Field(default=None, pattern=r"^[0-9]{2}$")
+    reminder_opt_in: ReminderOptIn | None = None
+
+
+class SubscriberRequest(_SubscriberContact):
     isp_customer_id: uuid.UUID
     identifier: str = Field(min_length=3, max_length=255)
     display_name: str | None = Field(default=None, max_length=200)
@@ -150,10 +173,27 @@ class SubscriberRequest(_Body):
     valid_from: datetime | None = None
 
 
-class SubscriberPatch(_Body):
+class SubscriberPatch(_SubscriberContact):
     package_id: uuid.UUID | None = None
     valid_until: datetime | None = None
     display_name: str | None = Field(default=None, max_length=200)
+
+
+class RechargePayment(_Body):
+    mode: str = Field(default="cash", max_length=16)
+    reference: str | None = Field(default=None, max_length=100)
+    amount_paise: int | None = Field(default=None, gt=0)
+    received_at: datetime | None = None
+
+
+class RechargeRequest(_Body):
+    """ADDENDUM_03 §12."""
+
+    package_id: uuid.UUID
+    paid_now: bool = False
+    payment: RechargePayment | None = None
+    po_number: str | None = Field(default=None, max_length=40)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=64)
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +762,7 @@ async def create_subscriber(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspPlansService = Depends(get_plans_service),
 ) -> dict:
-    s = await svc.create_subscriber(isp, payload.model_dump())
+    s = await svc.create_subscriber(isp, payload.model_dump(exclude_unset=True))
     return ok(request, await svc.subscriber_detail(isp, s.id), "Subscriber created")
 
 
@@ -782,3 +822,29 @@ async def enable_subscriber(
     return ok(
         request, await svc.subscriber_detail(isp, subscriber_id), "Subscriber enabled"
     )
+
+
+@plans_router.post(
+    "/subscribers/{subscriber_id}/recharge",
+    status_code=201,
+    dependencies=isp_guards(INVOICES_CREATE),
+)
+async def recharge_subscriber(
+    request: Request,
+    subscriber_id: uuid.UUID,
+    payload: RechargeRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspPlansService = Depends(get_plans_service),
+    access_validator: AccessValidator = Depends(get_access_validator),
+) -> dict:
+    """ADDENDUM_03 §12: ``isp_invoices.create``, plus ``isp_billing.execute``
+    when ``paid_now`` (recording money is a billing action)."""
+    if payload.paid_now:
+        from .router import effective_isp_permissions
+
+        if BILLING_EXECUTE not in await effective_isp_permissions(
+            isp, access_validator
+        ):
+            raise PermissionDeniedError(BILLING_EXECUTE, "organization")
+    result = await svc.recharge(isp, subscriber_id, payload.model_dump())
+    return ok(request, result, "Recharged")

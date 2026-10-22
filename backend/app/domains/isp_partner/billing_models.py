@@ -276,6 +276,13 @@ class IspInvoice(BaseModel):
         String(12), nullable=False, default="customer", server_default="customer"
     )
     customer_organization_id: Mapped[uuid.UUID | None] = _org_fk(nullable=True)
+    #: Part B: set for bill_to_kind='subscriber'; customer_organization_id is
+    #: then the subscriber's venue (scoping + confinement), never billed.
+    subscriber_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("isp_subscribers.id"), nullable=True
+    )
+    bill_to_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    circuit_id_snapshot: Mapped[int | None] = mapped_column(Integer, nullable=True)
     fy: Mapped[str] = mapped_column(String(5), nullable=False)
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     number: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -337,8 +344,10 @@ class IspInvoice(BaseModel):
             "customer_organization_id",
         ),
         Index("ix_isp_invoices_issue_date", "isp_organization_id", "issue_date"),
+        Index("ix_isp_invoices_subscriber", "subscriber_id"),
         CheckConstraint(
-            "bill_to_kind = 'customer' AND customer_organization_id IS NOT NULL",
+            "bill_to_kind = 'customer' AND customer_organization_id IS NOT NULL"
+            " OR bill_to_kind = 'subscriber' AND subscriber_id IS NOT NULL",
             name="bill_to",
         ),
     )
@@ -362,6 +371,9 @@ class IspInvoiceLine(BaseModel):
     total_paise: Mapped[int] = mapped_column(BigInteger, nullable=False)
     period_from: Mapped[date | None] = mapped_column(Date, nullable=True)
     period_to: Mapped[date | None] = mapped_column(Date, nullable=True)
+    package_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("isp_packages.id"), nullable=True
+    )
 
     __table_args__ = (Index("ix_isp_invoice_lines_invoice", "invoice_id"),)
 
@@ -371,6 +383,12 @@ class IspPayment(BaseModel):
 
     isp_organization_id: Mapped[uuid.UUID] = _org_fk()
     customer_organization_id: Mapped[uuid.UUID | None] = _org_fk(nullable=True)
+    subscriber_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("isp_subscribers.id"), nullable=True
+    )
+    coupon_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("isp_coupon_batches.id"), nullable=True
+    )
     amount_paise: Mapped[int] = mapped_column(BigInteger, nullable=False)
     #: amount not allocated to any invoice (advance / credit)
     unallocated_paise: Mapped[int] = mapped_column(
@@ -423,6 +441,7 @@ class IspPayment(BaseModel):
             "isp_organization_id",
             "customer_organization_id",
         ),
+        Index("ix_isp_payments_subscriber", "subscriber_id"),
     )
 
 
