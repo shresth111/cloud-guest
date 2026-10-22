@@ -205,6 +205,35 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- isp_partner (ISP Partner Dashboard, /isp) ----------------------------
+    "app/domains/isp_partner/repository.py::IspRepository.list_routers": (
+        "The ISP's router inventory page (GET /isp/routers): every router of "
+        "the ISP's customers, controller-managed included, because a router "
+        "missing from the inventory is its own lie. Each row carries its "
+        "`vendor`; `views.cloud_link` answers `unknown` (never `down`) for a "
+        "row that is not agent-managed. Nothing is dispatched from the list; "
+        "every device action goes through a by-id twin that calls the "
+        "original handler, which gates on vendor itself."
+    ),
+    "app/domains/isp_partner/repository.py::IspRepository.routers_for_organizations": (
+        "Counts and per-customer tiles for the ISP overview, customer, "
+        "location and report views. The overview's offline/pending "
+        "attention items skip non-agent-managed rows (`is_agent_managed_row`) "
+        "so a controller is never reported as broken hardware; the remaining "
+        "consumers count `routers.status` as stored, exactly like the "
+        "customer dashboard does. No device work is done from this read."
+    ),
+    "app/domains/isp_partner/logs_repository.py::IspLogsRepository.list_events": (
+        "NetLogs across an ISP's customers: an outer join from "
+        "device_log_events to routers only to label each line with its "
+        "router name. The rows are log lines that already exist; no health "
+        "or online judgement is made, and nothing is dispatched."
+    ),
+    "app/domains/isp_partner/logs_repository.py::IspLogsRepository.top_routers": (
+        "The NetLogs summary's busiest-routers table: a count of existing "
+        "log lines grouped by router, joined to routers for the name. Same "
+        "shape as device_logs' customer summary; no device state is judged."
+    ),
     # -- traffic_flow (NetFlow/IPFIX) ---------------------------------------
     "app/domains/traffic_flow/service.py::TrafficFlowRepository.exporter_router_map": (
         "Attribution of a received flow window: joins wireguard_peers to "

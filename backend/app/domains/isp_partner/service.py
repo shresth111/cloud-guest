@@ -32,6 +32,7 @@ from app.domains.organization.exceptions import DuplicateSlugError
 from app.domains.organization.models import Organization
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_agent_managed_row
 from app.domains.tr069.credentials import CredentialStore
 
 from .constants import (
@@ -276,6 +277,11 @@ class IspPartnerService:
         for r in routers:
             org = orgs.get(r.organization_id)
             if org is None:
+                continue
+            # A controller-managed row (e.g. Omada) has no agent heartbeat:
+            # its status is not evidence of broken hardware, so it is never
+            # an "offline" or "pending" attention item.
+            if not is_agent_managed_row(r):
                 continue
             since = r.last_seen_at or r.created_at
             if (

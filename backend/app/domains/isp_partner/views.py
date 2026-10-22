@@ -36,6 +36,10 @@ def page(items: list[Any], total: int, page_no: int, page_size: int) -> dict:
 def cloud_link(router: Any, *, now: datetime | None = None) -> str:
     """``up`` while the agent heartbeats within the platform's own offline
     threshold, ``down`` once it is stale, ``unknown`` before the first."""
+    from app.domains.router.vendor_capabilities import is_agent_managed_row
+
+    if not is_agent_managed_row(router):
+        return "unknown"  # no agent, no heartbeat: not "down"
     seen = getattr(router, "last_seen_at", None)
     if seen is None:
         return "unknown"

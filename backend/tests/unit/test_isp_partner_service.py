@@ -535,3 +535,26 @@ class TestSchemas:
             CustomerCreateRequest(name="x")
         with pytest.raises(ValidationError):
             CustomerCreateRequest(name="x", contact_email="not-an-email")
+
+
+def test_a_controller_managed_router_is_never_reported_down() -> None:
+    """test_router_read_vendor_coverage VENDOR_NEUTRAL argument: an Omada row
+    has no agent heartbeat, so its cloud link is "unknown", never "down"."""
+    from app.domains.isp_partner.views import cloud_link
+
+    omada = SimpleNamespace(
+        vendor="tplink_omada",
+        status="pending_provisioning",
+        last_seen_at=None,
+        api_credentials_encrypted=None,
+        management_ip_address=None,
+        routeros_version=None,
+        snmp_enabled=False,
+    )
+    assert cloud_link(omada, now=NOW) == "unknown"
+    mikrotik = SimpleNamespace(
+        vendor="mikrotik",
+        status="offline",
+        last_seen_at=NOW - __import__("datetime").timedelta(hours=1),
+    )
+    assert cloud_link(mikrotik, now=NOW) == "down"
