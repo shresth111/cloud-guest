@@ -44,7 +44,6 @@ from .exceptions import (
     IspInvoiceNotFoundError,
     IspInvoicePaidError,
     IspInvoicePrefixTooLongError,
-    IspNoDuesError,
     IspPaymentModeInvalidError,
     IspPaymentNotFoundError,
     IspPaymentReferenceRequiredError,
@@ -75,16 +74,38 @@ STATUS_LABELS = {
     "cancelled": "Cancelled",
 }
 SETTINGS_FIELDS = (
-    "legal_name", "gstin", "state_code", "address", "invoice_prefix",
-    "credit_note_prefix", "receipt_prefix", "gst_enabled", "gst_rate_bp", "sac_code",
-    "upi_vpa", "payee_name", "default_due_days", "grace_days", "auto_suspend_enabled",
-    "auto_suspend_after_days", "coupon_invoice_on_activation",
-    "reminder_days_before_expiry", "invoice_footer",
+    "legal_name",
+    "gstin",
+    "state_code",
+    "address",
+    "invoice_prefix",
+    "credit_note_prefix",
+    "receipt_prefix",
+    "gst_enabled",
+    "gst_rate_bp",
+    "sac_code",
+    "upi_vpa",
+    "payee_name",
+    "default_due_days",
+    "grace_days",
+    "auto_suspend_enabled",
+    "auto_suspend_after_days",
+    "coupon_invoice_on_activation",
+    "reminder_days_before_expiry",
+    "invoice_footer",
 )
 PLAN_FIELDS = (
-    "plan_name", "amount_paise", "price_includes_gst", "billing_cycle", "anchor_day",
-    "next_invoice_date", "gst_applicable", "place_of_supply_state_code", "buyer_gstin",
-    "active", "notes",
+    "plan_name",
+    "amount_paise",
+    "price_includes_gst",
+    "billing_cycle",
+    "anchor_day",
+    "next_invoice_date",
+    "gst_applicable",
+    "place_of_supply_state_code",
+    "buyer_gstin",
+    "active",
+    "notes",
 )
 
 
@@ -126,9 +147,15 @@ class IspBillingService:
     # helpers
     # ------------------------------------------------------------------
     def today(self, isp: IspContext) -> date:
-        return self._clock().astimezone(ZoneInfo(isp.organization.timezone or "Asia/Kolkata")).date()
+        return (
+            self._clock()
+            .astimezone(ZoneInfo(isp.organization.timezone or "Asia/Kolkata"))
+            .date()
+        )
 
-    async def _audit(self, isp: IspContext, action: str, entity_id, customer_id=None, **meta) -> None:
+    async def _audit(
+        self, isp: IspContext, action: str, entity_id, customer_id=None, **meta
+    ) -> None:
         if self.audit is None:
             return
         await self.audit.create_audit_log_entry(
@@ -137,12 +164,18 @@ class IspBillingService:
             entity_type="isp_billing",
             entity_id=entity_id,
             description=action.replace("_", " "),
-            event_metadata={"console": "isp", "isp_organization_id": str(isp.isp_org_id), **meta},
+            event_metadata={
+                "console": "isp",
+                "isp_organization_id": str(isp.isp_org_id),
+                **meta,
+            },
             organization_id=customer_id or isp.isp_org_id,
             location_id=None,
         )
 
-    async def settings(self, isp: IspContext, *, required: bool = True) -> IspBillingSettings | None:
+    async def settings(
+        self, isp: IspContext, *, required: bool = True
+    ) -> IspBillingSettings | None:
         row = (
             await self.session.execute(
                 select(IspBillingSettings).where(
@@ -162,10 +195,19 @@ class IspBillingService:
         await self.session.execute(
             insert(IspInvoiceSequence)
             .values(
-                id=uuid.uuid4(), isp_organization_id=isp_org_id, series=series, fy=fy,
-                next_value=1, is_deleted=False, version=1, created_at=now, updated_at=now,
+                id=uuid.uuid4(),
+                isp_organization_id=isp_org_id,
+                series=series,
+                fy=fy,
+                next_value=1,
+                is_deleted=False,
+                version=1,
+                created_at=now,
+                updated_at=now,
             )
-            .on_conflict_do_nothing(index_elements=["isp_organization_id", "series", "fy"])
+            .on_conflict_do_nothing(
+                index_elements=["isp_organization_id", "series", "fy"]
+            )
         )
         row = (
             await self.session.execute(
@@ -218,18 +260,30 @@ class IspBillingService:
 
     async def put_settings(self, isp: IspContext, data: dict) -> dict:
         for key in ("invoice_prefix", "credit_note_prefix"):
-            if key in data and data[key] is not None and not INVOICE_PREFIX.match(data[key]):
+            if (
+                key in data
+                and data[key] is not None
+                and not INVOICE_PREFIX.match(data[key])
+            ):
                 raise IspInvoicePrefixTooLongError(field=key)
         if data.get("gstin") and not gstin_valid(data["gstin"]):
             raise IspBuyerGstinInvalidError(field="gstin")
         row = await self.settings(isp, required=False)
         if row is None:
             if not data.get("legal_name") or not data.get("state_code"):
-                raise IspBillingNotConfiguredError("legal_name and state_code are required")
-            row = IspBillingSettings(isp_organization_id=isp.isp_org_id, created_by=isp.user_id)
+                raise IspBillingNotConfiguredError(
+                    "legal_name and state_code are required"
+                )
+            row = IspBillingSettings(
+                isp_organization_id=isp.isp_org_id, created_by=isp.user_id
+            )
             self.session.add(row)
         nullable = {
-            "gstin", "address", "upi_vpa", "payee_name", "auto_suspend_after_days",
+            "gstin",
+            "address",
+            "upi_vpa",
+            "payee_name",
+            "auto_suspend_after_days",
             "invoice_footer",
         }
         for key in SETTINGS_FIELDS:
@@ -237,10 +291,14 @@ class IspBillingService:
                 setattr(row, key, data[key])
         row.updated_by = isp.user_id
         await self.session.flush()
-        await self._audit(isp, "isp_billing_settings_updated", row.id, fields=sorted(data))
+        await self._audit(
+            isp, "isp_billing_settings_updated", row.id, fields=sorted(data)
+        )
         return self.settings_view(row)
 
-    async def plan(self, isp: IspContext, isp_customer_id: uuid.UUID) -> IspCustomerBilling | None:
+    async def plan(
+        self, isp: IspContext, isp_customer_id: uuid.UUID
+    ) -> IspCustomerBilling | None:
         await self._customer(isp, isp_customer_id)
         return (
             await self.session.execute(
@@ -252,7 +310,9 @@ class IspBillingService:
         ).scalar_one_or_none()
 
     @staticmethod
-    def plan_view(row: IspCustomerBilling | None, customer_id: uuid.UUID) -> dict | None:
+    def plan_view(
+        row: IspCustomerBilling | None, customer_id: uuid.UUID
+    ) -> dict | None:
         """``None`` (200, ``data: null``) when the customer has no plan."""
         if row is None:
             return None
@@ -261,7 +321,9 @@ class IspBillingService:
             **{f: iso(getattr(row, f)) for f in PLAN_FIELDS},
         }
 
-    async def put_plan(self, isp: IspContext, isp_customer_id: uuid.UUID, data: dict) -> dict:
+    async def put_plan(
+        self, isp: IspContext, isp_customer_id: uuid.UUID, data: dict
+    ) -> dict:
         if data.get("buyer_gstin") and not gstin_valid(data["buyer_gstin"]):
             raise IspBuyerGstinInvalidError()
         row = await self.plan(isp, isp_customer_id)
@@ -285,12 +347,19 @@ class IspBillingService:
 
     async def list_zones(self, isp: IspContext) -> list[dict]:
         rows = (
-            await self.session.execute(
-                select(IspZone)
-                .where(IspZone.isp_organization_id == isp.isp_org_id, IspZone.is_deleted.is_(False))
-                .order_by(IspZone.name)
+            (
+                await self.session.execute(
+                    select(IspZone)
+                    .where(
+                        IspZone.isp_organization_id == isp.isp_org_id,
+                        IspZone.is_deleted.is_(False),
+                    )
+                    .order_by(IspZone.name)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         usage = dict(
             (
                 await self.session.execute(
@@ -308,8 +377,12 @@ class IspBillingService:
     @staticmethod
     def _zone_view(z: IspZone, used: int = 0) -> dict:
         return {
-            "id": str(z.id), "name": z.name, "city": z.city, "state_code": z.state_code,
-            "notes": z.notes, "customers": used,
+            "id": str(z.id),
+            "name": z.name,
+            "city": z.city,
+            "state_code": z.state_code,
+            "notes": z.notes,
+            "customers": used,
         }
 
     async def zone(self, isp: IspContext, zone_id: uuid.UUID) -> IspZone:
@@ -324,7 +397,9 @@ class IspBillingService:
         await self.session.flush()
         return self._zone_view(z)
 
-    async def update_zone(self, isp: IspContext, zone_id: uuid.UUID, data: dict) -> dict:
+    async def update_zone(
+        self, isp: IspContext, zone_id: uuid.UUID, data: dict
+    ) -> dict:
         z = await self.zone(isp, zone_id)
         for k, v in data.items():
             setattr(z, k, v)
@@ -339,7 +414,9 @@ class IspBillingService:
             )
         ).scalar_one()
         invoiced = (
-            await self.session.execute(select(func.count()).where(IspInvoice.zone_id == z.id))
+            await self.session.execute(
+                select(func.count()).where(IspInvoice.zone_id == z.id)
+            )
         ).scalar_one()
         if used or invoiced:
             raise IspZoneInUseError()
@@ -361,7 +438,8 @@ class IspBillingService:
         ).scalar_one_or_none()
         if profile is None:
             profile = IspCustomerProfile(
-                isp_organization_id=isp.isp_org_id, customer_organization_id=isp_customer_id
+                isp_organization_id=isp.isp_org_id,
+                customer_organization_id=isp_customer_id,
             )
             self.session.add(profile)
         profile.zone_id = zone_id
@@ -434,7 +512,9 @@ class IspBillingService:
         ).scalar_one_or_none()
         zone_id = profile.zone_id if profile is not None else None
         pos = await self._place_of_supply(settings, customer.id, plan, zone_id)
-        gst_applied = bool(settings.gst_enabled and (plan is None or plan.gst_applicable))
+        gst_applied = bool(
+            settings.gst_enabled and (plan is None or plan.gst_applicable)
+        )
         intra = pos == settings.state_code
         taxes: list[LineTax] = []
         for line in lines:
@@ -470,11 +550,16 @@ class IspBillingService:
             bill_to_gstin=buyer_gstin or (plan.buyer_gstin if plan else None),
             bill_to_address=(
                 ", ".join(
-                    p for p in (
-                        getattr(profile, "address_line1", None), getattr(profile, "city", None),
-                        getattr(profile, "state_province", None), getattr(profile, "postal_code", None),
-                    ) if p
-                ) or None
+                    p
+                    for p in (
+                        getattr(profile, "address_line1", None),
+                        getattr(profile, "city", None),
+                        getattr(profile, "state_province", None),
+                        getattr(profile, "postal_code", None),
+                    )
+                    if p
+                )
+                or None
             ),
             place_of_supply_state_code=pos,
             seller_state_code=settings.state_code,
@@ -519,24 +604,33 @@ class IspBillingService:
     async def _apply_credit(self, isp: IspContext, inv: IspInvoice) -> None:
         """Advances/overpayments (``unallocated_paise``) auto-apply on issue."""
         credits = (
-            await self.session.execute(
-                select(IspPayment)
-                .where(
-                    IspPayment.isp_organization_id == isp.isp_org_id,
-                    IspPayment.customer_organization_id == inv.customer_organization_id,
-                    IspPayment.status == "confirmed",
-                    IspPayment.unallocated_paise > 0,
+            (
+                await self.session.execute(
+                    select(IspPayment)
+                    .where(
+                        IspPayment.isp_organization_id == isp.isp_org_id,
+                        IspPayment.customer_organization_id
+                        == inv.customer_organization_id,
+                        IspPayment.status == "confirmed",
+                        IspPayment.unallocated_paise > 0,
+                    )
+                    .order_by(IspPayment.received_at, IspPayment.id)
+                    .with_for_update()
                 )
-                .order_by(IspPayment.received_at, IspPayment.id)
-                .with_for_update()
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for pay in credits:
             need = balance_of(inv)
             if need <= 0:
                 break
             take = min(need, pay.unallocated_paise)
-            self.session.add(IspPaymentAllocation(payment_id=pay.id, invoice_id=inv.id, amount_paise=take))
+            self.session.add(
+                IspPaymentAllocation(
+                    payment_id=pay.id, invoice_id=inv.id, amount_paise=take
+                )
+            )
             pay.unallocated_paise -= take
             inv.paid_paise += take
         inv.status = status_for(inv)
@@ -548,29 +642,35 @@ class IspBillingService:
         today = self.today(isp)
         children = set(await isp.child_ids())
         plans = (
-            await self.session.execute(
-                select(IspCustomerBilling)
-                .where(
-                    IspCustomerBilling.isp_organization_id == isp.isp_org_id,
-                    IspCustomerBilling.active.is_(True),
-                    IspCustomerBilling.is_deleted.is_(False),
-                    IspCustomerBilling.next_invoice_date <= today,
+            (
+                await self.session.execute(
+                    select(IspCustomerBilling)
+                    .where(
+                        IspCustomerBilling.isp_organization_id == isp.isp_org_id,
+                        IspCustomerBilling.active.is_(True),
+                        IspCustomerBilling.is_deleted.is_(False),
+                        IspCustomerBilling.next_invoice_date <= today,
+                    )
+                    .with_for_update()
                 )
-                .with_for_update()
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         created = []
         for plan in plans:
             if plan.customer_organization_id not in children or plan.amount_paise <= 0:
                 continue
             start = plan.next_invoice_date
-            end = add_months(start, CYCLE_MONTHS.get(plan.billing_cycle, 1), plan.anchor_day) - timedelta(days=1)
+            end = add_months(
+                start, CYCLE_MONTHS.get(plan.billing_cycle, 1), plan.anchor_day
+            ) - timedelta(days=1)
             inv = await self.issue_invoice(
                 isp,
                 plan.customer_organization_id,
                 lines=[
                     {
-                        "description": f"{plan.plan_name} ({start:%d %b %Y} - {end:%d %b %Y})",
+                        "description": f"{plan.plan_name} ({start:%d %b %Y} - {end:%d %b %Y})",  # noqa: E501
                         "amount_paise": plan.amount_paise,
                         "price_includes_gst": plan.price_includes_gst,
                         "period_from": start,
@@ -590,7 +690,12 @@ class IspBillingService:
         return created
 
     async def credit_note(
-        self, isp: IspContext, invoice_id: uuid.UUID, *, amount_paise: int | None, reason: str
+        self,
+        isp: IspContext,
+        invoice_id: uuid.UUID,
+        *,
+        amount_paise: int | None,
+        reason: str,
     ) -> IspInvoice:
         inv = await self._invoice(isp, invoice_id)
         if inv.doc_type != "invoice":
@@ -606,11 +711,16 @@ class IspBillingService:
         fy = fiscal_year(today)
         seq = await self._allocate(isp.isp_org_id, "credit_note", fy)
         number = document_number(settings.credit_note_prefix, fy, seq)
+
         # Tax split proportional to the invoice's, remainder to taxable.
         def part(x: int) -> int:
             return (x * amount) // inv.total_paise if inv.total_paise else 0
 
-        cgst, sgst, igst = part(inv.cgst_paise), part(inv.sgst_paise), part(inv.igst_paise)
+        cgst, sgst, igst = (
+            part(inv.cgst_paise),
+            part(inv.sgst_paise),
+            part(inv.igst_paise),
+        )
         note = IspInvoice(
             isp_organization_id=isp.isp_org_id,
             doc_type="credit_note",
@@ -649,8 +759,12 @@ class IspBillingService:
             inv.cancelled_reason = reason
         await self.session.flush()
         await self._audit(
-            isp, "isp_credit_note_issued", note.id, inv.customer_organization_id,
-            invoice=inv.number, amount_paise=amount,
+            isp,
+            "isp_credit_note_issued",
+            note.id,
+            inv.customer_organization_id,
+            invoice=inv.number,
+            amount_paise=amount,
         )
         return note
 
@@ -667,13 +781,27 @@ class IspBillingService:
         invoice_id: uuid.UUID | None = None,
         reference: str | None = None,
         received_at: datetime | None = None,
+        idempotency_key: str | None = None,
     ) -> IspPayment:
+        if idempotency_key:
+            repeat = (
+                await self.session.execute(
+                    select(IspPayment).where(
+                        IspPayment.isp_organization_id == isp.isp_org_id,
+                        IspPayment.idempotency_key == idempotency_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if repeat is not None:
+                return repeat
         if mode not in PAYMENT_MODES:
             raise IspPaymentModeInvalidError()
         if mode in REFERENCE_REQUIRED and not (reference or "").strip():
             raise IspPaymentReferenceRequiredError()
         if amount_paise <= 0:
-            raise IspPaymentModeInvalidError("Amount must be positive", field="amount_paise")
+            raise IspPaymentModeInvalidError(
+                "Amount must be positive", field="amount_paise"
+            )
         customer = await self._customer(isp, isp_customer_id)
         settings = await self.settings(isp)
         inv = None
@@ -686,7 +814,11 @@ class IspBillingService:
             if balance_of(inv) == 0:
                 raise IspInvoicePaidError()
         when = received_at or self._clock()
-        fy = fiscal_year(when.astimezone(ZoneInfo(isp.organization.timezone or "Asia/Kolkata")).date())
+        fy = fiscal_year(
+            when.astimezone(
+                ZoneInfo(isp.organization.timezone or "Asia/Kolkata")
+            ).date()
+        )
         seq = await self._allocate(isp.isp_org_id, "receipt", fy)
         pay = IspPayment(
             isp_organization_id=isp.isp_org_id,
@@ -701,35 +833,51 @@ class IspBillingService:
             receipt_seq=seq,
             receipt_number=receipt_number(settings.receipt_prefix, fy, seq),
             status="confirmed",
+            idempotency_key=idempotency_key,
             created_by=isp.user_id,
         )
         self.session.add(pay)
         await self.session.flush()
         if inv is not None:
             take = min(balance_of(inv), amount_paise)
-            self.session.add(IspPaymentAllocation(payment_id=pay.id, invoice_id=inv.id, amount_paise=take))
+            self.session.add(
+                IspPaymentAllocation(
+                    payment_id=pay.id, invoice_id=inv.id, amount_paise=take
+                )
+            )
             inv.paid_paise += take
             inv.status = status_for(inv)
             pay.unallocated_paise = amount_paise - take
             await self.session.flush()
         await self._audit(
-            isp, "isp_payment_recorded", pay.id, customer.id,
-            receipt=pay.receipt_number, mode=mode, amount_paise=amount_paise,
+            isp,
+            "isp_payment_recorded",
+            pay.id,
+            customer.id,
+            receipt=pay.receipt_number,
+            mode=mode,
+            amount_paise=amount_paise,
         )
         return pay
 
-    async def void_payment(self, isp: IspContext, payment_id: uuid.UUID, *, reason: str) -> IspPayment:
+    async def void_payment(
+        self, isp: IspContext, payment_id: uuid.UUID, *, reason: str
+    ) -> IspPayment:
         pay = await self._payment(isp, payment_id)
         if pay.status == "voided":
             return pay
         allocations = (
-            await self.session.execute(
-                select(IspPaymentAllocation).where(
-                    IspPaymentAllocation.payment_id == pay.id,
-                    IspPaymentAllocation.is_deleted.is_(False),
+            (
+                await self.session.execute(
+                    select(IspPaymentAllocation).where(
+                        IspPaymentAllocation.payment_id == pay.id,
+                        IspPaymentAllocation.is_deleted.is_(False),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for alloc in allocations:
             inv = await self.session.get(IspInvoice, alloc.invoice_id)
             inv.paid_paise -= alloc.amount_paise
@@ -739,13 +887,26 @@ class IspBillingService:
         pay.voided_reason = reason
         pay.unallocated_paise = 0
         await self.session.flush()
-        await self._audit(isp, "isp_payment_voided", pay.id, pay.customer_organization_id, reason=reason)
+        await self._audit(
+            isp,
+            "isp_payment_voided",
+            pay.id,
+            pay.customer_organization_id,
+            reason=reason,
+        )
         return pay
 
     # ------------------------------------------------------------------
     # ledger / dues
     # ------------------------------------------------------------------
-    async def overdue_invoices(self, isp: IspContext, customer_ids: list[uuid.UUID], *, as_of: date | None = None, min_days: int = 0) -> list[IspInvoice]:
+    async def overdue_invoices(
+        self,
+        isp: IspContext,
+        customer_ids: list[uuid.UUID],
+        *,
+        as_of: date | None = None,
+        min_days: int = 0,
+    ) -> list[IspInvoice]:
         if not customer_ids:
             return []
         settings = await self.settings(isp, required=False)
@@ -753,44 +914,62 @@ class IspBillingService:
         as_of = as_of or self.today(isp)
         cutoff = as_of - timedelta(days=grace + min_days)
         rows = (
-            await self.session.execute(
-                select(IspInvoice).where(
-                    IspInvoice.isp_organization_id == isp.isp_org_id,
-                    IspInvoice.customer_organization_id.in_(customer_ids),
-                    IspInvoice.doc_type == "invoice",
-                    IspInvoice.status.in_(["issued", "partially_paid"]),
-                    IspInvoice.due_date < cutoff,
-                    IspInvoice.is_deleted.is_(False),
+            (
+                await self.session.execute(
+                    select(IspInvoice).where(
+                        IspInvoice.isp_organization_id == isp.isp_org_id,
+                        IspInvoice.customer_organization_id.in_(customer_ids),
+                        IspInvoice.doc_type == "invoice",
+                        IspInvoice.status.in_(["issued", "partially_paid"]),
+                        IspInvoice.due_date < cutoff,
+                        IspInvoice.is_deleted.is_(False),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return [r for r in rows if balance_of(r) > 0]
 
-    async def ledger(self, isp: IspContext, isp_customer_id: uuid.UUID, *, cut: bool) -> dict:
+    async def ledger(
+        self, isp: IspContext, isp_customer_id: uuid.UUID, *, cut: bool
+    ) -> dict:
         await self._customer(isp, isp_customer_id)
         invoices = (
-            await self.session.execute(
-                select(IspInvoice)
-                .where(
-                    IspInvoice.isp_organization_id == isp.isp_org_id,
-                    IspInvoice.customer_organization_id == isp_customer_id,
-                    IspInvoice.is_deleted.is_(False),
+            (
+                await self.session.execute(
+                    select(IspInvoice)
+                    .where(
+                        IspInvoice.isp_organization_id == isp.isp_org_id,
+                        IspInvoice.customer_organization_id == isp_customer_id,
+                        IspInvoice.is_deleted.is_(False),
+                    )
+                    .order_by(IspInvoice.issue_date.desc(), IspInvoice.seq.desc())
                 )
-                .order_by(IspInvoice.issue_date.desc(), IspInvoice.seq.desc())
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         payments = (
-            await self.session.execute(
-                select(IspPayment)
-                .where(
-                    IspPayment.isp_organization_id == isp.isp_org_id,
-                    IspPayment.customer_organization_id == isp_customer_id,
-                    IspPayment.is_deleted.is_(False),
+            (
+                await self.session.execute(
+                    select(IspPayment)
+                    .where(
+                        IspPayment.isp_organization_id == isp.isp_org_id,
+                        IspPayment.customer_organization_id == isp_customer_id,
+                        IspPayment.is_deleted.is_(False),
+                    )
+                    .order_by(IspPayment.received_at.desc())
                 )
-                .order_by(IspPayment.received_at.desc())
             )
-        ).scalars().all()
-        billed = sum(i.total_paise - i.credit_noted_paise for i in invoices if i.doc_type == "invoice")
+            .scalars()
+            .all()
+        )
+        billed = sum(
+            i.total_paise - i.credit_noted_paise
+            for i in invoices
+            if i.doc_type == "invoice"
+        )
         paid = sum(p.amount_paise for p in payments if p.status == "confirmed")
         overdue = await self.overdue_invoices(isp, [isp_customer_id])
         overdue_ids = {i.id for i in overdue}
@@ -801,7 +980,9 @@ class IspBillingService:
             "overdue_paise": overdue_paise,
             "overdue_invoice_ids": [str(i.id) for i in overdue],
             "can_resume": cut and overdue_paise == 0,
-            "invoices": [self.invoice_row(i, overdue=i.id in overdue_ids) for i in invoices],
+            "invoices": [
+                self.invoice_row(i, overdue=i.id in overdue_ids) for i in invoices
+            ],
             "payments": await self.payment_rows(isp, list(payments)),
         }
 
@@ -850,7 +1031,9 @@ class IspBillingService:
             "status": inv.status,
             "status_label": STATUS_LABELS.get(inv.status, inv.status),
             "credit_note_for_invoice_id": (
-                str(inv.credit_note_for_invoice_id) if inv.credit_note_for_invoice_id else None
+                str(inv.credit_note_for_invoice_id)
+                if inv.credit_note_for_invoice_id
+                else None
             ),
         }
 
@@ -926,30 +1109,52 @@ class IspBillingService:
     async def invoice_detail(self, isp: IspContext, invoice_id: uuid.UUID) -> dict:
         inv = await self._invoice(isp, invoice_id)
         lines = (
-            await self.session.execute(
-                select(IspInvoiceLine).where(IspInvoiceLine.invoice_id == inv.id).order_by(IspInvoiceLine.created_at)
+            (
+                await self.session.execute(
+                    select(IspInvoiceLine)
+                    .where(IspInvoiceLine.invoice_id == inv.id)
+                    .order_by(IspInvoiceLine.created_at)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         allocs = (
             await self.session.execute(
                 select(IspPaymentAllocation, IspPayment)
                 .join(IspPayment, IspPayment.id == IspPaymentAllocation.payment_id)
-                .where(IspPaymentAllocation.invoice_id == inv.id, IspPaymentAllocation.is_deleted.is_(False))
+                .where(
+                    IspPaymentAllocation.invoice_id == inv.id,
+                    IspPaymentAllocation.is_deleted.is_(False),
+                )
             )
         ).all()
         notes = (
-            await self.session.execute(
-                select(IspInvoice).where(IspInvoice.credit_note_for_invoice_id == inv.id)
+            (
+                await self.session.execute(
+                    select(IspInvoice).where(
+                        IspInvoice.credit_note_for_invoice_id == inv.id
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         reminders = (
-            await self.session.execute(
-                select(IspInvoiceReminder).where(IspInvoiceReminder.invoice_id == inv.id)
+            (
+                await self.session.execute(
+                    select(IspInvoiceReminder).where(
+                        IspInvoiceReminder.invoice_id == inv.id
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         customer = await isp.repository.get_organization(inv.customer_organization_id)
         overdue_ids = {
-            i.id for i in await self.overdue_invoices(isp, [inv.customer_organization_id])
+            i.id
+            for i in await self.overdue_invoices(isp, [inv.customer_organization_id])
         }
         view = self.invoice_row(
             inv,
@@ -959,11 +1164,18 @@ class IspBillingService:
         )
         view["lines"] = [
             {
-                "description": li.description, "sac_code": li.sac_code, "quantity": li.quantity,
-                "unit_amount_paise": li.unit_amount_paise, "price_includes_gst": li.price_includes_gst,
-                "taxable_paise": li.taxable_paise, "cgst_paise": li.cgst_paise,
-                "sgst_paise": li.sgst_paise, "igst_paise": li.igst_paise, "total_paise": li.total_paise,
-                "period_from": iso(li.period_from), "period_to": iso(li.period_to),
+                "description": li.description,
+                "sac_code": li.sac_code,
+                "quantity": li.quantity,
+                "unit_amount_paise": li.unit_amount_paise,
+                "price_includes_gst": li.price_includes_gst,
+                "taxable_paise": li.taxable_paise,
+                "cgst_paise": li.cgst_paise,
+                "sgst_paise": li.sgst_paise,
+                "igst_paise": li.igst_paise,
+                "total_paise": li.total_paise,
+                "period_from": iso(li.period_from),
+                "period_to": iso(li.period_to),
             }
             for li in lines
         ]
@@ -1000,7 +1212,8 @@ class IspBillingService:
                 {"id": str(orig.id), "number": orig.number} if orig else None
             )
         view["reminders"] = [
-            {"channel": r.channel, "status": r.status, "sent_at": iso(r.sent_at)} for r in reminders
+            {"channel": r.channel, "status": r.status, "sent_at": iso(r.sent_at)}
+            for r in reminders
         ]
         view["payment_link"] = None
         return view
@@ -1044,22 +1257,37 @@ class IspBillingService:
             cond.append(IspInvoice.issue_date <= until)
         if search:
             pattern = f"%{search.strip()}%"
-            cond.append(or_(IspInvoice.number.ilike(pattern), IspInvoice.bill_to_name.ilike(pattern)))
+            cond.append(
+                or_(
+                    IspInvoice.number.ilike(pattern),
+                    IspInvoice.bill_to_name.ilike(pattern),
+                )
+            )
         if overdue:
             overdue_ids = [i.id for i in await self.overdue_invoices(isp, ids)]
             if not overdue_ids:
                 return [], 0
             cond.append(IspInvoice.id.in_(overdue_ids))
-        total = (await self.session.execute(select(func.count()).select_from(IspInvoice).where(*cond))).scalar_one()
-        rows = (
+        total = (
             await self.session.execute(
-                select(IspInvoice)
-                .where(*cond)
-                .order_by(IspInvoice.issue_date.desc(), IspInvoice.created_at.desc())
-                .offset((page - 1) * page_size)
-                .limit(page_size)
+                select(func.count()).select_from(IspInvoice).where(*cond)
             )
-        ).scalars().all()
+        ).scalar_one()
+        rows = (
+            (
+                await self.session.execute(
+                    select(IspInvoice)
+                    .where(*cond)
+                    .order_by(
+                        IspInvoice.issue_date.desc(), IspInvoice.created_at.desc()
+                    )
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            )
+            .scalars()
+            .all()
+        )
         return list(rows), int(total)
 
     async def invoice_totals(self, isp: IspContext, **filters: Any) -> dict:
@@ -1067,13 +1295,20 @@ class IspBillingService:
         rows, _ = await self.list_invoices(isp, page=1, page_size=1_000_000, **filters)
         invoices = [r for r in rows if r.doc_type == "invoice"]
         return {
-            "invoiced_paise": sum(r.total_paise - r.credit_noted_paise for r in invoices),
+            "invoiced_paise": sum(
+                r.total_paise - r.credit_noted_paise for r in invoices
+            ),
             "collected_paise": sum(r.paid_paise for r in invoices),
             "outstanding_paise": sum(balance_of(r) for r in invoices),
         }
 
     async def list_payments(
-        self, isp: IspContext, *, isp_customer_id: uuid.UUID | None, page: int, page_size: int
+        self,
+        isp: IspContext,
+        *,
+        isp_customer_id: uuid.UUID | None,
+        page: int,
+        page_size: int,
     ) -> tuple[list[IspPayment], int]:
         if isp_customer_id is not None:
             await self._customer(isp, isp_customer_id)
@@ -1087,57 +1322,86 @@ class IspBillingService:
             IspPayment.customer_organization_id.in_(ids),
             IspPayment.is_deleted.is_(False),
         ]
-        total = (await self.session.execute(select(func.count()).select_from(IspPayment).where(*cond))).scalar_one()
-        rows = (
+        total = (
             await self.session.execute(
-                select(IspPayment).where(*cond).order_by(IspPayment.received_at.desc()).offset((page - 1) * page_size).limit(page_size)
+                select(func.count()).select_from(IspPayment).where(*cond)
             )
-        ).scalars().all()
+        ).scalar_one()
+        rows = (
+            (
+                await self.session.execute(
+                    select(IspPayment)
+                    .where(*cond)
+                    .order_by(IspPayment.received_at.desc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            )
+            .scalars()
+            .all()
+        )
         return list(rows), int(total)
 
     # ------------------------------------------------------------------
     # reports
     # ------------------------------------------------------------------
-    async def collections(self, isp: IspContext, *, group_by: str, since: date, until: date) -> dict:
+    async def collections(
+        self, isp: IspContext, *, group_by: str, since: date, until: date
+    ) -> dict:
         ids = await isp.child_ids()
         rows: dict[str, dict] = {}
         if ids:
             invoices = (
-                await self.session.execute(
-                    select(IspInvoice).where(
-                        IspInvoice.isp_organization_id == isp.isp_org_id,
-                        IspInvoice.customer_organization_id.in_(ids),
-                        IspInvoice.doc_type == "invoice",
-                        IspInvoice.issue_date >= since,
-                        IspInvoice.issue_date <= until,
+                (
+                    await self.session.execute(
+                        select(IspInvoice).where(
+                            IspInvoice.isp_organization_id == isp.isp_org_id,
+                            IspInvoice.customer_organization_id.in_(ids),
+                            IspInvoice.doc_type == "invoice",
+                            IspInvoice.issue_date >= since,
+                            IspInvoice.issue_date <= until,
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             zone_names = {z["id"]: z["name"] for z in await self.list_zones(isp)}
+
             def key_inv(i):  # noqa: ANN001, ANN202
                 if group_by == "zone":
-                    return zone_names.get(str(i.zone_id), "No zone") if i.zone_id else "No zone"
+                    return (
+                        zone_names.get(str(i.zone_id), "No zone")
+                        if i.zone_id
+                        else "No zone"
+                    )
                 return f"{i.issue_date:%Y-%m}"
+
             for i in invoices:
                 bucket = rows.setdefault(key_inv(i), self._bucket())
                 bucket["invoiced_paise"] += i.total_paise - i.credit_noted_paise
                 bucket["invoices"] += 1
             pays = (
-                await self.session.execute(
-                    select(IspPayment).where(
-                        IspPayment.isp_organization_id == isp.isp_org_id,
-                        IspPayment.customer_organization_id.in_(ids),
-                        IspPayment.status == "confirmed",
+                (
+                    await self.session.execute(
+                        select(IspPayment).where(
+                            IspPayment.isp_organization_id == isp.isp_org_id,
+                            IspPayment.customer_organization_id.in_(ids),
+                            IspPayment.status == "confirmed",
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             tz = ZoneInfo(isp.organization.timezone or "Asia/Kolkata")
             profiles = dict(
                 (
                     await self.session.execute(
-                        select(IspCustomerProfile.customer_organization_id, IspCustomerProfile.zone_id).where(
-                            IspCustomerProfile.customer_organization_id.in_(ids)
-                        )
+                        select(
+                            IspCustomerProfile.customer_organization_id,
+                            IspCustomerProfile.zone_id,
+                        ).where(IspCustomerProfile.customer_organization_id.in_(ids))
                     )
                 ).all()
             )
@@ -1152,7 +1416,9 @@ class IspBillingService:
                     k = f"{day:%Y-%m}"
                 bucket = rows.setdefault(k, self._bucket())
                 bucket["collected_paise"] += p.amount_paise
-                bucket["by_mode"][p.mode] = bucket["by_mode"].get(p.mode, 0) + p.amount_paise
+                bucket["by_mode"][p.mode] = (
+                    bucket["by_mode"].get(p.mode, 0) + p.amount_paise
+                )
                 bucket["payments"] += 1
         out = [{"key": k, **v} for k, v in sorted(rows.items())]
         totals = self._bucket()
@@ -1163,13 +1429,28 @@ class IspBillingService:
             totals["payments"] += r["payments"]
             for m, v in r["by_mode"].items():
                 totals["by_mode"][m] = totals["by_mode"].get(m, 0) + v
-        return {"group_by": group_by, "since": since.isoformat(), "until": until.isoformat(), "rows": out, "totals": totals}
+        return {
+            "group_by": group_by,
+            "since": since.isoformat(),
+            "until": until.isoformat(),
+            "rows": out,
+            "totals": totals,
+        }
 
     @staticmethod
     def _bucket() -> dict:
         return {
-            "invoiced_paise": 0, "collected_paise": 0, "invoices": 0, "payments": 0,
-            "by_mode": {"cash": 0, "upi": 0, "bank_transfer": 0, "online": 0, "prepaid_coupon": 0},
+            "invoiced_paise": 0,
+            "collected_paise": 0,
+            "invoices": 0,
+            "payments": 0,
+            "by_mode": {
+                "cash": 0,
+                "upi": 0,
+                "bank_transfer": 0,
+                "online": 0,
+                "prepaid_coupon": 0,
+            },
         }
 
     async def outstanding(self, isp: IspContext, *, as_of: date) -> dict:
@@ -1178,26 +1459,44 @@ class IspBillingService:
         debtors: dict[uuid.UUID, dict] = {}
         if ids:
             rows = (
-                await self.session.execute(
-                    select(IspInvoice).where(
-                        IspInvoice.isp_organization_id == isp.isp_org_id,
-                        IspInvoice.customer_organization_id.in_(ids),
-                        IspInvoice.doc_type == "invoice",
-                        IspInvoice.status.in_(["issued", "partially_paid"]),
+                (
+                    await self.session.execute(
+                        select(IspInvoice).where(
+                            IspInvoice.isp_organization_id == isp.isp_org_id,
+                            IspInvoice.customer_organization_id.in_(ids),
+                            IspInvoice.doc_type == "invoice",
+                            IspInvoice.status.in_(["issued", "partially_paid"]),
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for i in rows:
                 bal = balance_of(i)
                 if bal <= 0 or i.issue_date > as_of:
                     continue
                 age = (as_of - i.due_date).days
-                key = "0_30" if age <= 30 else "31_60" if age <= 60 else "61_90" if age <= 90 else "90_plus"
+                key = (
+                    "0_30"
+                    if age <= 30
+                    else "31_60"
+                    if age <= 60
+                    else "61_90"
+                    if age <= 90
+                    else "90_plus"
+                )
                 buckets[key] += bal
                 d = debtors.setdefault(
                     i.customer_organization_id,
-                    {"customer": {"isp_customer_id": str(i.customer_organization_id), "name": i.bill_to_name},
-                     "balance_paise": 0, "oldest_due": i.due_date},
+                    {
+                        "customer": {
+                            "isp_customer_id": str(i.customer_organization_id),
+                            "name": i.bill_to_name,
+                        },
+                        "balance_paise": 0,
+                        "oldest_due": i.due_date,
+                    },
                 )
                 d["balance_paise"] += bal
                 d["oldest_due"] = min(d["oldest_due"], i.due_date)

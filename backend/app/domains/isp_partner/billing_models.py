@@ -73,7 +73,9 @@ class IspCustomerServiceState(BaseModel):
     requested_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
-    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -371,11 +373,15 @@ class IspPayment(BaseModel):
     customer_organization_id: Mapped[uuid.UUID | None] = _org_fk(nullable=True)
     amount_paise: Mapped[int] = mapped_column(BigInteger, nullable=False)
     #: amount not allocated to any invoice (advance / credit)
-    unallocated_paise: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    unallocated_paise: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
     #: cash | upi | bank_transfer | online | prepaid_coupon
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     recorded_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
@@ -387,8 +393,17 @@ class IspPayment(BaseModel):
     voided_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gateway_payment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     gateway_link_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Client-supplied ``Idempotency-Key``: a repeat returns the first payment.
+    idempotency_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     __table_args__ = (
+        Index(
+            "uq_isp_payments_idempotency",
+            "isp_organization_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
         Index(
             "uq_isp_payments_receipt",
             "isp_organization_id",
@@ -403,7 +418,11 @@ class IspPayment(BaseModel):
             unique=True,
             postgresql_where=text("gateway_payment_id IS NOT NULL"),
         ),
-        Index("ix_isp_payments_isp_customer", "isp_organization_id", "customer_organization_id"),
+        Index(
+            "ix_isp_payments_isp_customer",
+            "isp_organization_id",
+            "customer_organization_id",
+        ),
     )
 
 

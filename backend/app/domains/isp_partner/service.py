@@ -519,7 +519,11 @@ class IspPartnerService:
             from .billing_models import IspZone
 
             zone = await self.repository.session.get(IspZone, data["zone_id"])
-            if zone is None or zone.is_deleted or zone.isp_organization_id != isp.isp_org_id:
+            if (
+                zone is None
+                or zone.is_deleted
+                or zone.isp_organization_id != isp.isp_org_id
+            ):
                 from .exceptions import IspZoneNotFoundError
 
                 raise IspZoneNotFoundError()

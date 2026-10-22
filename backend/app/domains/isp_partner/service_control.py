@@ -145,7 +145,9 @@ class IspServiceControl:
         router_ids = sorted({s.router_id for s in steps if s.router_id}, key=str)
         routers = {}
         if router_ids:
-            rows = await self.session.execute(select(Router).where(Router.id.in_(router_ids)))
+            rows = await self.session.execute(
+                select(Router).where(Router.id.in_(router_ids))
+            )
             routers = {r.id: r for r in rows.scalars().all()}
         requested_by = None
         if state.requested_by is not None:
@@ -184,8 +186,12 @@ class IspServiceControl:
             "reason": state.reason,
             "note": state.note,
             "requested_by": requested_by,
-            "requested_at": state.requested_at.isoformat() if state.requested_at else None,
-            "completed_at": state.completed_at.isoformat() if state.completed_at else None,
+            "requested_at": state.requested_at.isoformat()
+            if state.requested_at
+            else None,
+            "completed_at": state.completed_at.isoformat()
+            if state.completed_at
+            else None,
             "routers": out_routers,
             "warnings": list(state.warnings or []),
             "bypass_entries_not_cut": 0,
@@ -209,7 +215,8 @@ class IspServiceControl:
         ).first()
         if org is None or org.parent_organization_id != isp_org_id or profile is None:
             raise IspScopeViolation(
-                organization_id=str(organization_id), isp_organization_id=str(isp_org_id)
+                organization_id=str(organization_id),
+                isp_organization_id=str(isp_org_id),
             )
 
     async def _routers(self, customer_id: uuid.UUID) -> list[Router]:
@@ -220,7 +227,9 @@ class IspServiceControl:
         )
         return list(rows.scalars().all())
 
-    async def _nas_rows(self, customer_id: uuid.UUID, router_id: uuid.UUID) -> list[Any]:
+    async def _nas_rows(
+        self, customer_id: uuid.UUID, router_id: uuid.UUID
+    ) -> list[Any]:
         rows = await self.session.execute(
             select(RadiusNasClient).where(
                 RadiusNasClient.organization_id == customer_id,
@@ -273,7 +282,9 @@ class IspServiceControl:
             state = (
                 await self.session.execute(
                     select(IspCustomerServiceState)
-                    .where(IspCustomerServiceState.customer_organization_id == customer_id)
+                    .where(
+                        IspCustomerServiceState.customer_organization_id == customer_id
+                    )
                     .with_for_update(nowait=True)
                     .execution_options(populate_existing=True)
                 )
@@ -284,13 +295,17 @@ class IspServiceControl:
             raise
         return state
 
-    async def _step(self, state: IspCustomerServiceState, **fields: Any) -> IspServiceAction:
+    async def _step(
+        self, state: IspCustomerServiceState, **fields: Any
+    ) -> IspServiceAction:
         step = IspServiceAction(state_id=state.id, attempts=0, prior_state={}, **fields)
         self.session.add(step)
         await self.session.flush()
         return step
 
-    async def _cancel_pending(self, state: IspCustomerServiceState, transition: str) -> None:
+    async def _cancel_pending(
+        self, state: IspCustomerServiceState, transition: str
+    ) -> None:
         for step in await self._steps(state):
             if step.transition == transition and step.status == "pending":
                 step.status = "cancelled"
@@ -461,7 +476,9 @@ class IspServiceControl:
                 if getattr(updated, "disconnect_enforced", None) is False:
                     unconfirmed.append(str(s.id))
             except Exception as exc:  # noqa: BLE001 -- a router failure is a step, not a 5xx
-                logger.warning("isp_suspend_kick_failed", extra={"error": str(exc)[:200]})
+                logger.warning(
+                    "isp_suspend_kick_failed", extra={"error": str(exc)[:200]}
+                )
                 unconfirmed.append(str(s.id))
         step = await self._step(
             state,
@@ -477,7 +494,9 @@ class IspServiceControl:
             step.last_error = "router unreachable"
         return ended
 
-    async def _portal_pages(self, state, customer, actor, *, support_line, isp_name) -> None:
+    async def _portal_pages(
+        self, state, customer, actor, *, support_line, isp_name
+    ) -> None:
         """Best effort; never fails the suspend."""
         if self.captive_portal_service is None:
             return
@@ -485,12 +504,17 @@ class IspServiceControl:
         from app.domains.location.models import Location
 
         locations = (
-            await self.session.execute(
-                select(Location).where(
-                    Location.organization_id == customer.id, Location.is_deleted.is_(False)
+            (
+                await self.session.execute(
+                    select(Location).where(
+                        Location.organization_id == customer.id,
+                        Location.is_deleted.is_(False),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for loc in locations:
             step = await self._step(
                 state,
@@ -502,16 +526,24 @@ class IspServiceControl:
             try:
                 async with self.session.begin_nested():
                     configs = (
-                        await self.session.execute(
-                            select(CaptivePortalConfig).where(
-                                CaptivePortalConfig.organization_id == customer.id,
-                                CaptivePortalConfig.location_id == loc.id,
-                                CaptivePortalConfig.is_deleted.is_(False),
+                        (
+                            await self.session.execute(
+                                select(CaptivePortalConfig).where(
+                                    CaptivePortalConfig.organization_id == customer.id,
+                                    CaptivePortalConfig.location_id == loc.id,
+                                    CaptivePortalConfig.is_deleted.is_(False),
+                                )
                             )
                         )
-                    ).scalars().all()
-                    paused = next((c for c in configs if c.name == SUSPENDED_CONFIG_NAME), None)
-                    prior_active = [str(c.id) for c in configs if c.is_active and c is not paused]
+                        .scalars()
+                        .all()
+                    )
+                    paused = next(
+                        (c for c in configs if c.name == SUSPENDED_CONFIG_NAME), None
+                    )
+                    prior_active = [
+                        str(c.id) for c in configs if c.is_active and c is not paused
+                    ]
                     if paused is None:
                         paused = await self.captive_portal_service.create_config(
                             actor_user_id=actor,
@@ -536,7 +568,7 @@ class IspServiceControl:
                             privacy_policy_url=None,
                             splash_headline=SUSPENDED_HEADLINE,
                             splash_welcome_message=(
-                                f"This WiFi is paused. Please contact {isp_name or 'your ISP'}"
+                                f"This WiFi is paused. Please contact {isp_name or 'your ISP'}"  # noqa: E501
                                 + (f" on {support_line}." if support_line else ".")
                             ),
                             redirect_url=None,
@@ -587,7 +619,9 @@ class IspServiceControl:
             return await self.view(customer)
         if state.state == SUSPEND_PENDING:
             await self._cancel_pending(state, "suspend")
-        suspend_steps = [s for s in await self._steps(state) if s.transition == "suspend"]
+        suspend_steps = [
+            s for s in await self._steps(state) if s.transition == "suspend"
+        ]
         state.state = RESUME_PENDING
         state.note = note or state.note
         state.requested_by = actor
@@ -613,7 +647,12 @@ class IspServiceControl:
             )
         await self._finish(state, "resume")
         await self._audit(
-            isp_org_id, actor, AUDIT_ISP_SERVICE_RESUMED, customer, state, nas_restored=restored
+            isp_org_id,
+            actor,
+            AUDIT_ISP_SERVICE_RESUMED,
+            customer,
+            state,
+            nas_restored=restored,
         )
         response = await self.view(customer)
         state.idempotent_response = response
@@ -721,7 +760,11 @@ class IspServiceControl:
         for step in await self._steps(state):
             if step.status != "pending" or step.kind != "kick_sessions":
                 continue
-            router = await self.session.get(Router, step.router_id) if step.router_id else None
+            router = (
+                await self.session.get(Router, step.router_id)
+                if step.router_id
+                else None
+            )
             if router is None or router.organization_id != customer_id:
                 raise IspScopeViolation(step=str(step.id))
             await self._assert_isp_customer(isp_org_id, router.organization_id)
@@ -738,11 +781,16 @@ class IspServiceControl:
                 row = await self.session.get(GuestSession, uuid.UUID(sid))
                 if row is None or row.organization_id != customer_id:
                     raise IspScopeViolation(session=sid)
-                result = await self.live_disconnect(row) if self.live_disconnect else False
+                result = (
+                    await self.live_disconnect(row) if self.live_disconnect else False
+                )
                 if result is False:
                     still.append(sid)
             step.attempts = (step.attempts or 0) + 1
-            step.prior_state = {**(step.prior_state or {}), "unconfirmed_session_ids": still}
+            step.prior_state = {
+                **(step.prior_state or {}),
+                "unconfirmed_session_ids": still,
+            }
             if not still:
                 step.status = "done"
                 step.last_error = None
@@ -750,7 +798,9 @@ class IspServiceControl:
         await self._finish(state, "suspend" if state.state in CUT_STATES else "resume")
         return True
 
-    async def pending_customers(self, isp_org_id: uuid.UUID | None = None) -> list[tuple]:
+    async def pending_customers(
+        self, isp_org_id: uuid.UUID | None = None
+    ) -> list[tuple]:
         """(isp, customer) pairs with retryable work, for the sweep."""
         q = select(
             IspCustomerServiceState.isp_organization_id,

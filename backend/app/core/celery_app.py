@@ -291,6 +291,7 @@ celery_app = Celery(
         "app.domains.guest_access.tasks",
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
+        "app.domains.isp_partner.tasks",
         "app.domains.marketing.tasks",
         "app.domains.monitoring.tasks",
         "app.domains.network_diagnostics.tasks",
@@ -351,6 +352,10 @@ celery_app.conf.update(
     # pure-DB sweeps on the default queue, not on the one reserved for
     # actual device round trips.
     task_routes={
+        # ISP Partner (E7): the retry kicks sessions over RouterOS 8728.
+        "app.domains.isp_partner.tasks.retry_pending_service_actions": {
+            "queue": DEVICE_IO_QUEUE_NAME
+        },
         TASK_POLL_SINGLE_ROUTER_HEALTH: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_SYNC_SINGLE_ROUTER_DEVICES: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_RUN_ISP_HEALTH_CHECK_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
@@ -435,6 +440,20 @@ celery_app.conf.update(
         TASK_SEND_CAMPAIGN_BATCH: {"queue": MARKETING_QUEUE_NAME},
     },
     beat_schedule={
+        # ISP Partner (exception E7, founder Q7): re-kick suspended customers'
+        # live sessions on routers that were unreachable (the RADIUS cut is
+        # already complete), and the daily billing run (due invoices; auto-
+        # suspend only where an ISP enabled it). Both no-op while
+        # ISP_PARTNER_ENABLED is off.
+        "isp-service-retry": {
+            "task": "app.domains.isp_partner.tasks.retry_pending_service_actions",
+            "schedule": 120.0,
+        },
+        "isp-billing-daily": {
+            "task": "app.domains.isp_partner.tasks.run_isp_billing_daily",
+            # 02:30 IST (the app clock is UTC).
+            "schedule": crontab(hour=21, minute=0),
+        },
         # Guest Marketing: start due campaigns (pure DB, default queue),
         # reap rows a dead worker left in `sending` (at-most-once), and
         # null recipient addresses after 180 days (retention).

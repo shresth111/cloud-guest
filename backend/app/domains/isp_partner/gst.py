@@ -120,11 +120,39 @@ def receipt_number(prefix: str, fy: str, seq: int) -> str:
 
 
 _ONES = (
-    "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
-    "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
-    "Eighteen", "Nineteen",
+    "",
+    "One",
+    "Two",
+    "Three",
+    "Four",
+    "Five",
+    "Six",
+    "Seven",
+    "Eight",
+    "Nine",
+    "Ten",
+    "Eleven",
+    "Twelve",
+    "Thirteen",
+    "Fourteen",
+    "Fifteen",
+    "Sixteen",
+    "Seventeen",
+    "Eighteen",
+    "Nineteen",
 )
-_TENS = ("", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety")
+_TENS = (
+    "",
+    "",
+    "Twenty",
+    "Thirty",
+    "Forty",
+    "Fifty",
+    "Sixty",
+    "Seventy",
+    "Eighty",
+    "Ninety",
+)
 
 
 def _below_hundred(n: int) -> str:
@@ -155,7 +183,9 @@ def rupees_in_words(paise: int) -> str:
         lakh, rupees = divmod(rupees, 100_000)
         thousand, rupees = divmod(rupees, 1000)
         if crore:
-            parts.append(f"{rupees_in_words(crore * 100).removesuffix(' Rupees Only')} Crore")
+            parts.append(
+                f"{rupees_in_words(crore * 100).removesuffix(' Rupees Only')} Crore"
+            )
         if lakh:
             parts.append(f"{_below_hundred(lakh)} Lakh")
         if thousand:

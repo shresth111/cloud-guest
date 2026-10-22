@@ -23,7 +23,7 @@ import zipfile
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -102,7 +102,9 @@ class CustomerPlanRequest(_Body):
     plan_name: str | None = Field(default=None, min_length=1, max_length=100)
     amount_paise: int | None = Field(default=None, ge=0)
     price_includes_gst: bool | None = None
-    billing_cycle: str | None = Field(default=None, pattern="^(monthly|quarterly|half_yearly|yearly)$")
+    billing_cycle: str | None = Field(
+        default=None, pattern="^(monthly|quarterly|half_yearly|yearly)$"
+    )
     anchor_day: int | None = Field(default=None, ge=1, le=28)
     next_invoice_date: date | None = None
     gst_applicable: bool | None = None
@@ -205,10 +207,12 @@ async def _rows(isp: IspContext, svc: IspBillingService, invoices: list) -> list
     orgs = await isp.repository.organizations_by_id(
         list({i.customer_organization_id for i in invoices})
     )
-    zones = {z["id"]: {"id": z["id"], "name": z["name"]} for z in await svc.list_zones(isp)}
-    overdue = {
-        i.id for i in await svc.overdue_invoices(isp, list(orgs))
-    } if orgs else set()
+    zones = {
+        z["id"]: {"id": z["id"], "name": z["name"]} for z in await svc.list_zones(isp)
+    }
+    overdue = (
+        {i.id for i in await svc.overdue_invoices(isp, list(orgs))} if orgs else set()
+    )
     out = []
     for i in invoices:
         org = orgs.get(i.customer_organization_id)
@@ -224,16 +228,22 @@ async def _rows(isp: IspContext, svc: IspBillingService, invoices: list) -> list
     return out
 
 
-async def _pdf_for(isp: IspContext, svc: IspBillingService, invoice_id: uuid.UUID) -> tuple[bytes, str]:
+async def _pdf_for(
+    isp: IspContext, svc: IspBillingService, invoice_id: uuid.UUID
+) -> tuple[bytes, str]:
     view = await svc.invoice_detail(isp, invoice_id)
     settings = svc.settings_view(await svc.settings(isp)) or {}
     against = None
     if view.get("credit_note_for_invoice_id"):
         from .billing_models import IspInvoice
 
-        orig = await svc.session.get(IspInvoice, uuid.UUID(view["credit_note_for_invoice_id"]))
+        orig = await svc.session.get(
+            IspInvoice, uuid.UUID(view["credit_note_for_invoice_id"])
+        )
         against = orig.number if orig else None
-    content = render_invoice_pdf(view, seller=settings, isp_name=isp.organization.name, against=against)
+    content = render_invoice_pdf(
+        view, seller=settings, isp_name=isp.organization.name, against=against
+    )
     return content, view["number"].replace("/", "-") + ".pdf"
 
 
@@ -253,7 +263,12 @@ def _csv(header: list[str], rows: list[list[Any]]) -> bytes:
     w = csv.writer(buf)
     w.writerow(header)
     for r in rows:
-        w.writerow([("'" + str(v)) if isinstance(v, str) and v[:1] in "=+-@\t\r" else v for v in r])
+        w.writerow(
+            [
+                ("'" + str(v)) if isinstance(v, str) and v[:1] in "=+-@\t\r" else v
+                for v in r
+            ]
+        )
     return buf.getvalue().encode()
 
 
@@ -267,27 +282,80 @@ async def _is_cut(db: AsyncSession, customer_id: uuid.UUID) -> bool:
 
 
 @billing_router.get("/billing/settings", dependencies=isp_guards(ISP_BILLING_READ))
-async def get_billing_settings(request: Request, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, svc.settings_view(await svc.settings(isp, required=False)), "Billing settings")
+async def get_billing_settings(
+    request: Request,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        svc.settings_view(await svc.settings(isp, required=False)),
+        "Billing settings",
+    )
 
 
 @billing_router.put("/billing/settings", dependencies=isp_guards(ISP_BILLING_MANAGE))
-async def put_billing_settings(request: Request, payload: BillingSettingsRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, await svc.put_settings(isp, payload.model_dump(exclude_unset=True)), "Billing settings saved")
+async def put_billing_settings(
+    request: Request,
+    payload: BillingSettingsRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        await svc.put_settings(isp, payload.model_dump(exclude_unset=True)),
+        "Billing settings saved",
+    )
 
 
-@billing_router.get("/billing/customers/{isp_customer_id}/plan", dependencies=isp_guards(ISP_BILLING_READ))
-async def get_customer_plan(request: Request, isp_customer_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, svc.plan_view(await svc.plan(isp, isp_customer_id), isp_customer_id), "Customer plan")
+@billing_router.get(
+    "/billing/customers/{isp_customer_id}/plan",
+    dependencies=isp_guards(ISP_BILLING_READ),
+)
+async def get_customer_plan(
+    request: Request,
+    isp_customer_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        svc.plan_view(await svc.plan(isp, isp_customer_id), isp_customer_id),
+        "Customer plan",
+    )
 
 
-@billing_router.put("/billing/customers/{isp_customer_id}/plan", dependencies=isp_guards(ISP_BILLING_UPDATE))
-async def put_customer_plan(request: Request, isp_customer_id: uuid.UUID, payload: CustomerPlanRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, await svc.put_plan(isp, isp_customer_id, payload.model_dump(exclude_unset=True)), "Customer plan saved")
+@billing_router.put(
+    "/billing/customers/{isp_customer_id}/plan",
+    dependencies=isp_guards(ISP_BILLING_UPDATE),
+)
+async def put_customer_plan(
+    request: Request,
+    isp_customer_id: uuid.UUID,
+    payload: CustomerPlanRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        await svc.put_plan(
+            isp, isp_customer_id, payload.model_dump(exclude_unset=True)
+        ),
+        "Customer plan saved",
+    )
 
 
-@billing_router.get("/billing/customers/{isp_customer_id}/ledger", dependencies=isp_guards(ISP_BILLING_READ))
-async def get_ledger(request: Request, isp_customer_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service), db: AsyncSession = Depends(get_db_session)) -> dict:
+@billing_router.get(
+    "/billing/customers/{isp_customer_id}/ledger",
+    dependencies=isp_guards(ISP_BILLING_READ),
+)
+async def get_ledger(
+    request: Request,
+    isp_customer_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     cut = await _is_cut(db, isp_customer_id)
     return ok(request, await svc.ledger(isp, isp_customer_id, cut=cut), "Ledger")
 
@@ -296,7 +364,9 @@ async def get_ledger(request: Request, isp_customer_id: uuid.UUID, isp: IspConte
 async def billing_list_invoices(
     request: Request,
     isp_customer_id: uuid.UUID | None = Query(default=None),
-    status: str | None = Query(default=None, pattern="^(issued|partially_paid|paid|cancelled)$"),
+    status: str | None = Query(
+        default=None, pattern="^(issued|partially_paid|paid|cancelled)$"
+    ),
     overdue: bool | None = Query(default=None),
     since: date | None = Query(default=None),
     until: date | None = Query(default=None),
@@ -306,19 +376,43 @@ async def billing_list_invoices(
     svc: IspBillingService = Depends(get_billing_service),
 ) -> dict:
     rows, total = await svc.list_invoices(
-        isp, isp_customer_id=isp_customer_id, status=status, overdue=overdue, doc_type="invoice",
-        since=since, until=until, page=page, page_size=page_size,
+        isp,
+        isp_customer_id=isp_customer_id,
+        status=status,
+        overdue=overdue,
+        doc_type="invoice",
+        since=since,
+        until=until,
+        page=page,
+        page_size=page_size,
     )
-    return ok(request, make_page(await _rows(isp, svc, rows), total, page, page_size), "Invoices")
+    return ok(
+        request,
+        make_page(await _rows(isp, svc, rows), total, page, page_size),
+        "Invoices",
+    )
 
 
-@billing_router.post("/billing/invoices", status_code=201, dependencies=isp_guards(ISP_BILLING_CREATE))
-async def billing_create_invoice(request: Request, payload: SimpleInvoiceRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.post(
+    "/billing/invoices", status_code=201, dependencies=isp_guards(ISP_BILLING_CREATE)
+)
+async def billing_create_invoice(
+    request: Request,
+    payload: SimpleInvoiceRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     inv = await svc.issue_invoice(
         isp,
         payload.isp_customer_id,
-        lines=[{"description": payload.description, "amount_paise": payload.amount_paise,
-                "period_from": payload.period_start, "period_to": payload.period_end}],
+        lines=[
+            {
+                "description": payload.description,
+                "amount_paise": payload.amount_paise,
+                "period_from": payload.period_start,
+                "period_to": payload.period_end,
+            }
+        ],
         invoice_kind="manual",
         due_date=payload.due_date,
         period_start=payload.period_start,
@@ -328,50 +422,123 @@ async def billing_create_invoice(request: Request, payload: SimpleInvoiceRequest
     return ok(request, (await _rows(isp, svc, [inv]))[0], "Invoice issued")
 
 
-@billing_router.post("/billing/invoices/generate-due", dependencies=isp_guards(ISP_BILLING_CREATE))
-async def billing_generate_due(request: Request, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.post(
+    "/billing/invoices/generate-due", dependencies=isp_guards(ISP_BILLING_CREATE)
+)
+async def billing_generate_due(
+    request: Request,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     created = await svc.generate_due(isp)
-    return ok(request, {"created": await _rows(isp, svc, created)}, "Due invoices generated")
+    return ok(
+        request, {"created": await _rows(isp, svc, created)}, "Due invoices generated"
+    )
 
 
-@billing_router.get("/billing/invoices/{invoice_id}", dependencies=isp_guards(ISP_BILLING_READ))
-async def billing_get_invoice(request: Request, invoice_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.get(
+    "/billing/invoices/{invoice_id}", dependencies=isp_guards(ISP_BILLING_READ)
+)
+async def billing_get_invoice(
+    request: Request,
+    invoice_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     return ok(request, await svc.invoice_detail(isp, invoice_id), "Invoice")
 
 
-@billing_router.get("/billing/invoices/{invoice_id}/pdf", dependencies=isp_guards(ISP_BILLING_READ))
-async def billing_invoice_pdf(invoice_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> Response:
+@billing_router.get(
+    "/billing/invoices/{invoice_id}/pdf", dependencies=isp_guards(ISP_BILLING_READ)
+)
+async def billing_invoice_pdf(
+    invoice_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> Response:
     content, name = await _pdf_for(isp, svc, invoice_id)
     return _file(content, "application/pdf", name)
 
 
-@billing_router.post("/billing/invoices/{invoice_id}/void", dependencies=isp_guards(ISP_BILLING_MANAGE))
-async def billing_void_invoice(request: Request, invoice_id: uuid.UUID, payload: ReasonRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.post(
+    "/billing/invoices/{invoice_id}/void", dependencies=isp_guards(ISP_BILLING_MANAGE)
+)
+async def billing_void_invoice(
+    request: Request,
+    invoice_id: uuid.UUID,
+    payload: ReasonRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     """1b "void" = a full credit note for the remaining balance (Part A:
     numbers are never reused or deleted)."""
-    note = await svc.credit_note(isp, invoice_id, amount_paise=None, reason=payload.reason)
-    return ok(request, {"credit_note": (await _rows(isp, svc, [note]))[0], "invoice": await svc.invoice_detail(isp, invoice_id)}, "Invoice voided")
+    note = await svc.credit_note(
+        isp, invoice_id, amount_paise=None, reason=payload.reason
+    )
+    return ok(
+        request,
+        {
+            "credit_note": (await _rows(isp, svc, [note]))[0],
+            "invoice": await svc.invoice_detail(isp, invoice_id),
+        },
+        "Invoice voided",
+    )
 
 
-@billing_router.post("/billing/payments", status_code=201, dependencies=isp_guards(ISP_BILLING_EXECUTE))
-async def billing_record_payment(request: Request, payload: PaymentRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service), db: AsyncSession = Depends(get_db_session)) -> dict:
-    pay = await svc.record_payment(isp, **payload.model_dump())
+@billing_router.post(
+    "/billing/payments", status_code=201, dependencies=isp_guards(ISP_BILLING_EXECUTE)
+)
+async def billing_record_payment(
+    request: Request,
+    payload: PaymentRequest,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", max_length=100
+    ),
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    pay = await svc.record_payment(
+        isp, idempotency_key=idempotency_key, **payload.model_dump()
+    )
     data = (await svc.payment_rows(isp, [pay]))[0]
     # "Resume service now?" prompt (B.3): never auto-resume in 1b.
     data["can_resume"] = False
     if await _is_cut(db, payload.isp_customer_id):
-        data["can_resume"] = not await svc.overdue_invoices(isp, [payload.isp_customer_id])
+        data["can_resume"] = not await svc.overdue_invoices(
+            isp, [payload.isp_customer_id]
+        )
     return ok(request, data, "Payment recorded")
 
 
 @billing_router.get("/billing/payments", dependencies=isp_guards(ISP_BILLING_READ))
-async def billing_list_payments(request: Request, isp_customer_id: uuid.UUID | None = Query(default=None), page: int = _Page, page_size: int = _PageSize, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    rows, total = await svc.list_payments(isp, isp_customer_id=isp_customer_id, page=page, page_size=page_size)
-    return ok(request, make_page(await svc.payment_rows(isp, rows), total, page, page_size), "Payments")
+async def billing_list_payments(
+    request: Request,
+    isp_customer_id: uuid.UUID | None = Query(default=None),
+    page: int = _Page,
+    page_size: int = _PageSize,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    rows, total = await svc.list_payments(
+        isp, isp_customer_id=isp_customer_id, page=page, page_size=page_size
+    )
+    return ok(
+        request,
+        make_page(await svc.payment_rows(isp, rows), total, page, page_size),
+        "Payments",
+    )
 
 
-@billing_router.get("/billing/payments/{payment_id}/receipt.pdf", dependencies=isp_guards(ISP_BILLING_READ))
-async def billing_receipt_pdf(payment_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> Response:
+@billing_router.get(
+    "/billing/payments/{payment_id}/receipt.pdf",
+    dependencies=isp_guards(ISP_BILLING_READ),
+)
+async def billing_receipt_pdf(
+    payment_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> Response:
     from app.domains.auth.models import User
 
     pay = await svc._payment(isp, payment_id)
@@ -384,24 +551,47 @@ async def billing_receipt_pdf(payment_id: uuid.UUID, isp: IspContext = Depends(R
         recorded_by=f"{user.first_name} {user.last_name}".strip() if user else None,
         customer_name=names.get(pay.customer_organization_id, ""),
     )
-    return _file(content, "application/pdf", pay.receipt_number.replace("/", "-") + ".pdf")
+    return _file(
+        content, "application/pdf", pay.receipt_number.replace("/", "-") + ".pdf"
+    )
 
 
-@billing_router.post("/billing/payments/{payment_id}/void", dependencies=isp_guards(ISP_BILLING_MANAGE))
-async def billing_void_payment(request: Request, payment_id: uuid.UUID, payload: ReasonRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.post(
+    "/billing/payments/{payment_id}/void", dependencies=isp_guards(ISP_BILLING_MANAGE)
+)
+async def billing_void_payment(
+    request: Request,
+    payment_id: uuid.UUID,
+    payload: ReasonRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     pay = await svc.void_payment(isp, payment_id, reason=payload.reason)
     return ok(request, (await svc.payment_rows(isp, [pay]))[0], "Payment voided")
 
 
-@billing_router.post("/billing/customers/{isp_customer_id}/suspend-for-dues", dependencies=isp_guards(ISP_BILLING_EXECUTE))
-async def billing_suspend_for_dues(request: Request, isp_customer_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service), control: IspServiceControl = Depends(get_service_control)) -> dict:
+@billing_router.post(
+    "/billing/customers/{isp_customer_id}/suspend-for-dues",
+    dependencies=isp_guards(ISP_BILLING_EXECUTE),
+)
+async def billing_suspend_for_dues(
+    request: Request,
+    isp_customer_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+    control: IspServiceControl = Depends(get_service_control),
+) -> dict:
     customer = await svc._customer(isp, isp_customer_id)
     overdue = await svc.overdue_invoices(isp, [customer.id])
     if not overdue:
         raise IspNoDuesError()
     data = await control.suspend(
-        isp.isp_org_id, customer, actor=isp.user_id, reason="non_payment",
-        support_line=isp.profile.support_phone, isp_name=isp.organization.name,
+        isp.isp_org_id,
+        customer,
+        actor=isp.user_id,
+        reason="non_payment",
+        support_line=isp.profile.support_phone,
+        isp_name=isp.organization.name,
         extra_audit={"invoice_ids": [str(i.id) for i in overdue]},
     )
     return ok(request, data, "Service suspended for dues")
@@ -417,25 +607,79 @@ async def billing_export(
 ) -> Response:
     stamp = datetime.now(UTC).strftime("%Y%m%d")
     if kind == "payments":
-        rows, _ = await svc.list_payments(isp, isp_customer_id=None, page=1, page_size=100_000)
-        names = await isp.repository.names(Organization, [p.customer_organization_id for p in rows])
+        rows, _ = await svc.list_payments(
+            isp, isp_customer_id=None, page=1, page_size=100_000
+        )
+        names = await isp.repository.names(
+            Organization, [p.customer_organization_id for p in rows]
+        )
         body = _csv(
-            ["receipt", "customer", "received_at", "mode", "reference", "amount", "status"],
-            [[p.receipt_number, names.get(p.customer_organization_id), p.received_at.isoformat(), p.mode,
-              p.reference or "", f"{p.amount_paise / 100:.2f}", p.status] for p in rows
-             if (not since or p.received_at.date() >= since) and (not until or p.received_at.date() <= until)],
+            [
+                "receipt",
+                "customer",
+                "received_at",
+                "mode",
+                "reference",
+                "amount",
+                "status",
+            ],
+            [
+                [
+                    p.receipt_number,
+                    names.get(p.customer_organization_id),
+                    p.received_at.isoformat(),
+                    p.mode,
+                    p.reference or "",
+                    f"{p.amount_paise / 100:.2f}",
+                    p.status,
+                ]
+                for p in rows
+                if (not since or p.received_at.date() >= since)
+                and (not until or p.received_at.date() <= until)
+            ],
         )
     else:
         invoices, _ = await svc.list_invoices(
-            isp, doc_type="invoice", overdue=kind == "dues", since=since, until=until, page=1, page_size=100_000
+            isp,
+            doc_type="invoice",
+            overdue=kind == "dues",
+            since=since,
+            until=until,
+            page=1,
+            page_size=100_000,
         )
         body = _csv(
-            ["number", "customer", "issue_date", "due_date", "total", "paid", "credit_noted", "balance", "status"],
-            [[i.number, i.bill_to_name, i.issue_date.isoformat(), i.due_date.isoformat(),
-              f"{i.total_paise / 100:.2f}", f"{i.paid_paise / 100:.2f}",
-              f"{i.credit_noted_paise / 100:.2f}", f"{balance_of(i) / 100:.2f}", i.status] for i in invoices],
+            [
+                "number",
+                "customer",
+                "issue_date",
+                "due_date",
+                "total",
+                "paid",
+                "credit_noted",
+                "balance",
+                "status",
+            ],
+            [
+                [
+                    i.number,
+                    i.bill_to_name,
+                    i.issue_date.isoformat(),
+                    i.due_date.isoformat(),
+                    f"{i.total_paise / 100:.2f}",
+                    f"{i.paid_paise / 100:.2f}",
+                    f"{i.credit_noted_paise / 100:.2f}",
+                    f"{balance_of(i) / 100:.2f}",
+                    i.status,
+                ]
+                for i in invoices
+            ],
         )
-    return _file(body, "text/csv; charset=utf-8", f"isp-{kind}-{isp.organization.slug}-{stamp}.csv")
+    return _file(
+        body,
+        "text/csv; charset=utf-8",
+        f"isp-{kind}-{isp.organization.slug}-{stamp}.csv",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +691,9 @@ async def billing_export(
 async def list_invoices(
     request: Request,
     isp_customer_id: uuid.UUID | None = Query(default=None),
-    status: str | None = Query(default=None, pattern="^(issued|partially_paid|paid|cancelled)$"),
+    status: str | None = Query(
+        default=None, pattern="^(issued|partially_paid|paid|cancelled)$"
+    ),
     doc_type: str | None = Query(default=None, pattern="^(invoice|credit_note)$"),
     bill_to_kind: str | None = Query(default=None, pattern="^(customer|subscriber)$"),
     zone_id: uuid.UUID | None = Query(default=None),
@@ -462,23 +708,50 @@ async def list_invoices(
 ) -> dict:
     if bill_to_kind == "subscriber":
         empty = make_page([], 0, page, page_size)
-        empty["totals"] = {"invoiced_paise": 0, "collected_paise": 0, "outstanding_paise": 0}
+        empty["totals"] = {
+            "invoiced_paise": 0,
+            "collected_paise": 0,
+            "outstanding_paise": 0,
+        }
         return ok(request, empty, "Invoices")
     rows, total = await svc.list_invoices(
-        isp, isp_customer_id=isp_customer_id, status=status, overdue=overdue, zone_id=zone_id,
-        doc_type=doc_type, since=since, until=until, search=search, page=page, page_size=page_size,
+        isp,
+        isp_customer_id=isp_customer_id,
+        status=status,
+        overdue=overdue,
+        zone_id=zone_id,
+        doc_type=doc_type,
+        since=since,
+        until=until,
+        search=search,
+        page=page,
+        page_size=page_size,
     )
     data = make_page(await _rows(isp, svc, rows), total, page, page_size)
     # Totals for the whole filtered set (CONTRACT_CHANGES FE #30).
     data["totals"] = await svc.invoice_totals(
-        isp, isp_customer_id=isp_customer_id, status=status, overdue=overdue,
-        zone_id=zone_id, doc_type=doc_type, since=since, until=until, search=search,
+        isp,
+        isp_customer_id=isp_customer_id,
+        status=status,
+        overdue=overdue,
+        zone_id=zone_id,
+        doc_type=doc_type,
+        since=since,
+        until=until,
+        search=search,
     )
     return ok(request, data, "Invoices")
 
 
-@billing_router.post("/invoices", status_code=201, dependencies=isp_guards(ISP_INVOICES_CREATE))
-async def create_manual_invoice(request: Request, payload: ManualInvoiceRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.post(
+    "/invoices", status_code=201, dependencies=isp_guards(ISP_INVOICES_CREATE)
+)
+async def create_manual_invoice(
+    request: Request,
+    payload: ManualInvoiceRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     inv = await svc.issue_invoice(
         isp,
         payload.bill_to.isp_customer_id,
@@ -493,13 +766,30 @@ async def create_manual_invoice(request: Request, payload: ManualInvoiceRequest,
 
 
 @billing_router.get("/invoices/settings", dependencies=isp_guards(ISP_INVOICES_READ))
-async def get_invoice_settings(request: Request, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, svc.settings_view(await svc.settings(isp, required=False)), "Invoice settings")
+async def get_invoice_settings(
+    request: Request,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        svc.settings_view(await svc.settings(isp, required=False)),
+        "Invoice settings",
+    )
 
 
 @billing_router.put("/invoices/settings", dependencies=isp_guards(ISP_INVOICES_MANAGE))
-async def put_invoice_settings(request: Request, payload: BillingSettingsRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, await svc.put_settings(isp, payload.model_dump(exclude_unset=True)), "Invoice settings saved")
+async def put_invoice_settings(
+    request: Request,
+    payload: BillingSettingsRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        await svc.put_settings(isp, payload.model_dump(exclude_unset=True)),
+        "Invoice settings saved",
+    )
 
 
 @billing_router.get("/invoices/export", dependencies=isp_guards(ISP_INVOICES_EXPORT))
@@ -516,33 +806,67 @@ async def export_invoices(
     from app.domains.analytics.export import render_report
     from app.domains.analytics.report_types import ReportPayload, ReportSection
 
-    rows, _ = await svc.list_invoices(isp, status=status, zone_id=zone_id, since=since, until=until, page=1, page_size=100_000)
+    rows, _ = await svc.list_invoices(
+        isp,
+        status=status,
+        zone_id=zone_id,
+        since=since,
+        until=until,
+        page=1,
+        page_size=100_000,
+    )
     zones = {z["id"]: z["name"] for z in await svc.list_zones(isp)}
     table = [
         {
             "Created": i.created_at.isoformat() if i.created_at else "",
-            "Invoice No.": i.number, "Invoice Id": i.display_id, "Username": "", "Circuit Id": "",
-            "First Name": i.bill_to_name, "Last Name": "", "Zone": zones.get(str(i.zone_id), "") if i.zone_id else "",
-            "Package": i.description or "", "Invoice Kind": i.invoice_kind, "PO No.": i.po_number or "",
-            "Buyer GSTIN": i.bill_to_gstin or "", "Taxable": i.taxable_paise / 100, "CGST": i.cgst_paise / 100,
-            "SGST": i.sgst_paise / 100, "IGST": i.igst_paise / 100, "Total": i.total_paise / 100,
-            "Paid": i.paid_paise / 100, "Balance": balance_of(i) / 100 if i.doc_type == "invoice" else 0,
+            "Invoice No.": i.number,
+            "Invoice Id": i.display_id,
+            "Username": "",
+            "Circuit Id": "",
+            "First Name": i.bill_to_name,
+            "Last Name": "",
+            "Zone": zones.get(str(i.zone_id), "") if i.zone_id else "",
+            "Package": i.description or "",
+            "Invoice Kind": i.invoice_kind,
+            "PO No.": i.po_number or "",
+            "Buyer GSTIN": i.bill_to_gstin or "",
+            "Taxable": i.taxable_paise / 100,
+            "CGST": i.cgst_paise / 100,
+            "SGST": i.sgst_paise / 100,
+            "IGST": i.igst_paise / 100,
+            "Total": i.total_paise / 100,
+            "Paid": i.paid_paise / 100,
+            "Balance": balance_of(i) / 100 if i.doc_type == "invoice" else 0,
             "Status": i.status,
         }
         for i in rows
     ]
     payload = ReportPayload(
-        report_type="isp_invoices", title=f"{isp.organization.name} invoices",
-        generated_at=datetime.now(UTC).isoformat(), organization_id=None, location_id=None,
-        period_start=since.isoformat() if since else None, period_end=until.isoformat() if until else None,
-        sections=[ReportSection(key="invoices", title="Invoices", data={"invoices": table})],
+        report_type="isp_invoices",
+        title=f"{isp.organization.name} invoices",
+        generated_at=datetime.now(UTC).isoformat(),
+        organization_id=None,
+        location_id=None,
+        period_start=since.isoformat() if since else None,
+        period_end=until.isoformat() if until else None,
+        sections=[
+            ReportSection(key="invoices", title="Invoices", data={"invoices": table})
+        ],
     )
-    rendered = render_report(payload, ExportFormat.CSV if format == "csv" else ExportFormat.EXCEL)
+    rendered = render_report(
+        payload, ExportFormat.CSV if format == "csv" else ExportFormat.EXCEL
+    )
     stamp = datetime.now(UTC).strftime("%Y%m%d")
-    return _file(rendered.content, rendered.content_type, f"invoices-{isp.organization.slug}-{stamp}.{format}")
+    return _file(
+        rendered.content,
+        rendered.content_type,
+        f"invoices-{isp.organization.slug}-{stamp}.{format}",
+    )
 
 
-@billing_router.get("/invoices/reports/collections", dependencies=isp_guards(ISP_INVOICES_READ))
+@billing_router.get(
+    "/invoices/reports/collections", dependencies=isp_guards(ISP_INVOICES_READ)
+)
 async def report_collections(
     request: Request,
     group_by: str = Query(default="month", pattern="^(zone|month|package)$"),
@@ -553,19 +877,37 @@ async def report_collections(
 ) -> dict:
     today = svc.today(isp)
     data = await svc.collections(
-        isp, group_by="month" if group_by == "package" else group_by,
-        since=since or today - timedelta(days=90), until=until or today,
+        isp,
+        group_by="month" if group_by == "package" else group_by,
+        since=since or today - timedelta(days=90),
+        until=until or today,
     )
     return ok(request, data, "Collections")
 
 
-@billing_router.get("/invoices/reports/outstanding", dependencies=isp_guards(ISP_INVOICES_READ))
-async def report_outstanding(request: Request, as_of: date | None = Query(default=None), isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, await svc.outstanding(isp, as_of=as_of or svc.today(isp)), "Outstanding")
+@billing_router.get(
+    "/invoices/reports/outstanding", dependencies=isp_guards(ISP_INVOICES_READ)
+)
+async def report_outstanding(
+    request: Request,
+    as_of: date | None = Query(default=None),
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        await svc.outstanding(isp, as_of=as_of or svc.today(isp)),
+        "Outstanding",
+    )
 
 
 @billing_router.post("/invoices/bulk", dependencies=isp_guards(ISP_INVOICES_EXECUTE))
-async def bulk_invoices(request: Request, payload: BulkRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> Any:
+async def bulk_invoices(
+    request: Request,
+    payload: BulkRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> Any:
     if len(payload.invoice_ids) > 500:
         raise IspBulkTooLargeError()
     from .exceptions import IspInvoiceNotFoundError
@@ -579,7 +921,11 @@ async def bulk_invoices(request: Request, payload: BulkRequest, isp: IspContext 
                 except IspInvoiceNotFoundError:
                     continue
                 zf.writestr(name, content)
-        return _file(buf.getvalue(), "application/zip", f"invoices-{datetime.now(UTC):%Y%m%d}.zip")
+        return _file(
+            buf.getvalue(),
+            "application/zip",
+            f"invoices-{datetime.now(UTC):%Y%m%d}.zip",
+        )
     if payload.action == "send_reminder":
         queued = skipped = 0
         for iid in payload.invoice_ids:
@@ -590,7 +936,11 @@ async def bulk_invoices(request: Request, payload: BulkRequest, isp: IspContext 
                 continue
             queued += int(sent)
             skipped += int(not sent)
-        return ok(request, {"queued": queued, "skipped_no_consent": 0, "skipped_no_contact": skipped}, "Reminders")
+        return ok(
+            request,
+            {"queued": queued, "skipped_no_consent": 0, "skipped_no_contact": skipped},
+            "Reminders",
+        )
     if payload.payment is None:
         from .exceptions import IspPaymentModeInvalidError
 
@@ -608,20 +958,33 @@ async def bulk_invoices(request: Request, payload: BulkRequest, isp: IspContext 
         if balance_of(inv) == 0:
             skipped_rows.append({"invoice_id": str(iid), "reason": "already_paid"})
             continue
-        ref = f"{payload.payment.reference_prefix}-{n}" if payload.payment.reference_prefix else None
+        ref = (
+            f"{payload.payment.reference_prefix}-{n}"
+            if payload.payment.reference_prefix
+            else None
+        )
         await svc.record_payment(
-            isp, isp_customer_id=inv.customer_organization_id, invoice_id=inv.id,
-            amount_paise=balance_of(inv), mode=payload.payment.mode, reference=ref,
+            isp,
+            isp_customer_id=inv.customer_organization_id,
+            invoice_id=inv.id,
+            amount_paise=balance_of(inv),
+            mode=payload.payment.mode,
+            reference=ref,
             received_at=payload.payment.received_at,
         )
         paid += 1
     return ok(request, {"paid": paid, "skipped": skipped_rows}, "Marked paid")
 
 
-async def _remind(isp: IspContext, svc: IspBillingService, invoice_id: uuid.UUID, channel: str) -> bool:
+async def _remind(
+    isp: IspContext, svc: IspBillingService, invoice_id: uuid.UUID, channel: str
+) -> bool:
     """Email only; SMS waits on founder Q13 (``ISP_SMS_REMINDERS_ENABLED``
     off). Queued through the existing notification outbox with the ISP org."""
-    from app.domains.notification.constants import NotificationChannelType, NotificationEventType
+    from app.domains.notification.constants import (
+        NotificationChannelType,
+        NotificationEventType,
+    )
     from app.domains.notification.repository import NotificationRepository
     from app.domains.notification.service import NotificationService
 
@@ -629,11 +992,16 @@ async def _remind(isp: IspContext, svc: IspBillingService, invoice_id: uuid.UUID
 
     inv = await svc._invoice(isp, invoice_id)
     customer = await isp.repository.get_organization(inv.customer_organization_id)
-    if channel != "email" or not customer or not customer.contact_email or balance_of(inv) == 0:
+    if (
+        channel != "email"
+        or not customer
+        or not customer.contact_email
+        or balance_of(inv) == 0
+    ):
         return False
     body = (
-        f"<p>Dear {customer.name},</p><p>Invoice {inv.number} dated {inv.issue_date:%d %b %Y} "
-        f"has a balance of Rs {balance_of(inv) / 100:.2f}, due {inv.due_date:%d %b %Y}.</p>"
+        f"<p>Dear {customer.name},</p><p>Invoice {inv.number} dated {inv.issue_date:%d %b %Y} "  # noqa: E501
+        f"has a balance of Rs {balance_of(inv) / 100:.2f}, due {inv.due_date:%d %b %Y}.</p>"  # noqa: E501
         f"<p>{isp.organization.name}"
         + (f", {isp.profile.support_phone}" if isp.profile.support_phone else "")
         + "</p>"
@@ -648,31 +1016,70 @@ async def _remind(isp: IspContext, svc: IspBillingService, invoice_id: uuid.UUID
         organization_id=isp.isp_org_id,
     )
     svc.session.add(
-        IspInvoiceReminder(invoice_id=inv.id, channel="email", sent_by=isp.user_id, sent_at=datetime.now(UTC), status="queued")
+        IspInvoiceReminder(
+            invoice_id=inv.id,
+            channel="email",
+            sent_by=isp.user_id,
+            sent_at=datetime.now(UTC),
+            status="queued",
+        )
     )
     await svc.session.flush()
     return True
 
 
-@billing_router.get("/invoices/{invoice_id}", dependencies=isp_guards(ISP_INVOICES_READ))
-async def get_invoice(request: Request, invoice_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.get(
+    "/invoices/{invoice_id}", dependencies=isp_guards(ISP_INVOICES_READ)
+)
+async def get_invoice(
+    request: Request,
+    invoice_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     return ok(request, await svc.invoice_detail(isp, invoice_id), "Invoice")
 
 
-@billing_router.get("/invoices/{invoice_id}/pdf", dependencies=isp_guards(ISP_INVOICES_READ))
-async def get_invoice_pdf(invoice_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> Response:
+@billing_router.get(
+    "/invoices/{invoice_id}/pdf", dependencies=isp_guards(ISP_INVOICES_READ)
+)
+async def get_invoice_pdf(
+    invoice_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> Response:
     content, name = await _pdf_for(isp, svc, invoice_id)
     return _file(content, "application/pdf", name)
 
 
-@billing_router.post("/invoices/{invoice_id}/credit-note", status_code=201, dependencies=isp_guards(ISP_INVOICES_MANAGE))
-async def credit_note(request: Request, invoice_id: uuid.UUID, payload: CreditNoteRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    note = await svc.credit_note(isp, invoice_id, amount_paise=payload.amount_paise, reason=payload.reason)
+@billing_router.post(
+    "/invoices/{invoice_id}/credit-note",
+    status_code=201,
+    dependencies=isp_guards(ISP_INVOICES_MANAGE),
+)
+async def credit_note(
+    request: Request,
+    invoice_id: uuid.UUID,
+    payload: CreditNoteRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    note = await svc.credit_note(
+        isp, invoice_id, amount_paise=payload.amount_paise, reason=payload.reason
+    )
     return ok(request, await svc.invoice_detail(isp, note.id), "Credit note issued")
 
 
-@billing_router.post("/invoices/{invoice_id}/remind", dependencies=isp_guards(ISP_INVOICES_EXECUTE))
-async def remind(request: Request, invoice_id: uuid.UUID, payload: RemindRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.post(
+    "/invoices/{invoice_id}/remind", dependencies=isp_guards(ISP_INVOICES_EXECUTE)
+)
+async def remind(
+    request: Request,
+    invoice_id: uuid.UUID,
+    payload: RemindRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     sent = await _remind(isp, svc, invoice_id, payload.channel)
     return ok(request, {"queued": sent, "channel": payload.channel}, "Reminder")
 
@@ -683,21 +1090,47 @@ async def remind(request: Request, invoice_id: uuid.UUID, payload: RemindRequest
 
 
 @billing_router.get("/zones", dependencies=isp_guards(ISP_ZONES_READ))
-async def list_zones(request: Request, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+async def list_zones(
+    request: Request,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     return ok(request, {"items": await svc.list_zones(isp)}, "Zones")
 
 
-@billing_router.post("/zones", status_code=201, dependencies=isp_guards(ISP_ZONES_MANAGE))
-async def create_zone(request: Request, payload: ZoneRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+@billing_router.post(
+    "/zones", status_code=201, dependencies=isp_guards(ISP_ZONES_MANAGE)
+)
+async def create_zone(
+    request: Request,
+    payload: ZoneRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     return ok(request, await svc.create_zone(isp, payload.model_dump()), "Zone created")
 
 
 @billing_router.patch("/zones/{zone_id}", dependencies=isp_guards(ISP_ZONES_MANAGE))
-async def update_zone(request: Request, zone_id: uuid.UUID, payload: ZoneUpdateRequest, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
-    return ok(request, await svc.update_zone(isp, zone_id, payload.model_dump(exclude_unset=True)), "Zone updated")
+async def update_zone(
+    request: Request,
+    zone_id: uuid.UUID,
+    payload: ZoneUpdateRequest,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
+    return ok(
+        request,
+        await svc.update_zone(isp, zone_id, payload.model_dump(exclude_unset=True)),
+        "Zone updated",
+    )
 
 
 @billing_router.delete("/zones/{zone_id}", dependencies=isp_guards(ISP_ZONES_MANAGE))
-async def delete_zone(request: Request, zone_id: uuid.UUID, isp: IspContext = Depends(RequireIspPartner), svc: IspBillingService = Depends(get_billing_service)) -> dict:
+async def delete_zone(
+    request: Request,
+    zone_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspBillingService = Depends(get_billing_service),
+) -> dict:
     await svc.delete_zone(isp, zone_id)
     return ok(request, {"deleted": True}, "Zone deleted")

@@ -403,6 +403,7 @@ def upgrade() -> None:
         sa.Column("voided_reason", sa.String(length=255), nullable=True),
         sa.Column("gateway_payment_id", sa.String(length=64), nullable=True),
         sa.Column("gateway_link_id", sa.String(length=64), nullable=True),
+        sa.Column("idempotency_key", sa.String(length=100), nullable=True),
         sa.Column("id", sa.UUID(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
@@ -455,6 +456,13 @@ def upgrade() -> None:
         ["isp_organization_id", "gateway_payment_id"],
         unique=True,
         postgresql_where=sa.text("gateway_payment_id IS NOT NULL"),
+    )
+    op.create_index(
+        "uq_isp_payments_idempotency",
+        "isp_payments",
+        ["isp_organization_id", "idempotency_key"],
+        unique=True,
+        postgresql_where=sa.text("idempotency_key IS NOT NULL"),
     )
     op.create_index(
         "uq_isp_payments_receipt",

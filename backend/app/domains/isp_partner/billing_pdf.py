@@ -45,7 +45,9 @@ def upi_uri(vpa: str, payee: str, amount_paise: int, note: str) -> str:
 def _qr(data: str, size: float = 3.2 * cm) -> Drawing:
     widget = QrCodeWidget(data)
     x1, y1, x2, y2 = widget.getBounds()
-    drawing = Drawing(size, size, transform=[size / (x2 - x1), 0, 0, size / (y2 - y1), 0, 0])
+    drawing = Drawing(
+        size, size, transform=[size / (x2 - x1), 0, 0, size / (y2 - y1), 0, 0]
+    )
     drawing.add(widget)
     return drawing
 
@@ -65,7 +67,9 @@ def _table(rows: list[list[Any]], widths: list[float] | None = None) -> Table:
     return t
 
 
-def render_invoice_pdf(view: dict, *, seller: dict, isp_name: str, against: str | None = None) -> bytes:
+def render_invoice_pdf(
+    view: dict, *, seller: dict, isp_name: str, against: str | None = None
+) -> bytes:
     """``view`` is ``IspBillingService.invoice_detail``'s output."""
     styles = getSampleStyleSheet()
     buf = io.BytesIO()
@@ -76,8 +80,8 @@ def render_invoice_pdf(view: dict, *, seller: dict, isp_name: str, against: str 
     story: list[Any] = [
         Paragraph(f"<b>{isp_name}</b>", styles["Title"]),
         Paragraph(
-            f"{seller.get('legal_name') or isp_name}<br/>{seller.get('address') or ''}<br/>"
-            f"GSTIN: {seller.get('gstin') or '-'} &nbsp; State code: {seller.get('state_code') or '-'}",
+            f"{seller.get('legal_name') or isp_name}<br/>{seller.get('address') or ''}<br/>"  # noqa: E501
+            f"GSTIN: {seller.get('gstin') or '-'} &nbsp; State code: {seller.get('state_code') or '-'}",  # noqa: E501
             styles["Normal"],
         ),
         Spacer(1, 0.4 * cm),
@@ -85,7 +89,12 @@ def render_invoice_pdf(view: dict, *, seller: dict, isp_name: str, against: str 
         _table(
             [
                 ["Number", "Date", "Due", "Place of supply"],
-                [view["number"], view["invoice_date"], view["due_date"], view.get("place_of_supply_state_code") or "-"],
+                [
+                    view["number"],
+                    view["invoice_date"],
+                    view["due_date"],
+                    view.get("place_of_supply_state_code") or "-",
+                ],
             ]
         ),
     ]
@@ -95,13 +104,26 @@ def render_invoice_pdf(view: dict, *, seller: dict, isp_name: str, against: str 
         Spacer(1, 0.3 * cm),
         Paragraph(
             f"<b>Bill to:</b> {view['customer']['name']}"
-            + (f" &nbsp; GSTIN: {view['buyer_gstin']}" if view.get("buyer_gstin") else "")
+            + (
+                f" &nbsp; GSTIN: {view['buyer_gstin']}"
+                if view.get("buyer_gstin")
+                else ""
+            )
             + (f" &nbsp; PO: {view['po_number']}" if view.get("po_number") else ""),
             styles["Normal"],
         ),
         Spacer(1, 0.3 * cm),
     ]
-    header = ["Description", "SAC", "Period", "Taxable", "CGST", "SGST", "IGST", "Total"]
+    header = [
+        "Description",
+        "SAC",
+        "Period",
+        "Taxable",
+        "CGST",
+        "SGST",
+        "IGST",
+        "Total",
+    ]
     body = [header]
     for li in view.get("lines") or [
         {
@@ -116,7 +138,9 @@ def render_invoice_pdf(view: dict, *, seller: dict, isp_name: str, against: str 
             "total_paise": view["total_paise"],
         }
     ]:
-        period = f"{li['period_from']} - {li['period_to']}" if li.get("period_from") else ""
+        period = (
+            f"{li['period_from']} - {li['period_to']}" if li.get("period_from") else ""
+        )
         body.append(
             [
                 Paragraph(li["description"], styles["Normal"]),
@@ -129,45 +153,81 @@ def render_invoice_pdf(view: dict, *, seller: dict, isp_name: str, against: str 
                 rupees(li["total_paise"]),
             ]
         )
-    body.append(["", "", "Total", rupees(view["taxable_paise"]), rupees(view["cgst_paise"]),
-                 rupees(view["sgst_paise"]), rupees(view["igst_paise"]), rupees(view["total_paise"])])
-    story.append(_table(body, [5 * cm, 1.4 * cm, 3 * cm, 2 * cm, 1.6 * cm, 1.6 * cm, 1.6 * cm, 2 * cm]))
+    body.append(
+        [
+            "",
+            "",
+            "Total",
+            rupees(view["taxable_paise"]),
+            rupees(view["cgst_paise"]),
+            rupees(view["sgst_paise"]),
+            rupees(view["igst_paise"]),
+            rupees(view["total_paise"]),
+        ]
+    )
+    story.append(
+        _table(
+            body,
+            [5 * cm, 1.4 * cm, 3 * cm, 2 * cm, 1.6 * cm, 1.6 * cm, 1.6 * cm, 2 * cm],
+        )
+    )
     story += [
         Spacer(1, 0.2 * cm),
-        Paragraph(f"Amount in words: {rupees_in_words(view['total_paise'])}", styles["Normal"]),
+        Paragraph(
+            f"Amount in words: {rupees_in_words(view['total_paise'])}", styles["Normal"]
+        ),
     ]
     if not is_note:
         story.append(
             Paragraph(
                 f"Paid: {rupees(view['paid_paise'])} &nbsp; Credit notes: "
-                f"{rupees(view['credit_noted_paise'])} &nbsp; <b>Balance: {rupees(view['balance_paise'])}</b>",
+                f"{rupees(view['credit_noted_paise'])} &nbsp; <b>Balance: {rupees(view['balance_paise'])}</b>",  # noqa: E501
                 styles["Normal"],
             )
         )
         modes = sorted({p["mode"] for p in view.get("payments", [])})
         if modes:
-            story.append(Paragraph("Payment mode(s): " + ", ".join(modes), styles["Normal"]))
+            story.append(
+                Paragraph("Payment mode(s): " + ", ".join(modes), styles["Normal"])
+            )
         if view["balance_paise"] > 0 and seller.get("upi_vpa"):
             story += [
                 Spacer(1, 0.3 * cm),
                 Paragraph("Scan to pay by UPI", styles["Normal"]),
-                _qr(upi_uri(seller["upi_vpa"], seller.get("payee_name") or isp_name, view["balance_paise"], view["number"])),
+                _qr(
+                    upi_uri(
+                        seller["upi_vpa"],
+                        seller.get("payee_name") or isp_name,
+                        view["balance_paise"],
+                        view["number"],
+                    )
+                ),
             ]
     if seller.get("invoice_footer"):
         story.append(Paragraph(seller["invoice_footer"], styles["Normal"]))
-    story += [Spacer(1, 0.5 * cm), Paragraph("Computer-generated document.", styles["Italic"])]
+    story += [
+        Spacer(1, 0.5 * cm),
+        Paragraph("Computer-generated document.", styles["Italic"]),
+    ]
     doc.build(story)
     return buf.getvalue()
 
 
-def render_receipt_pdf(payment: dict, *, isp_name: str, seller: dict, recorded_by: str | None, customer_name: str) -> bytes:
+def render_receipt_pdf(
+    payment: dict,
+    *,
+    isp_name: str,
+    seller: dict,
+    recorded_by: str | None,
+    customer_name: str,
+) -> bytes:
     styles = getSampleStyleSheet()
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5 * cm, rightMargin=1.5 * cm)
     story = [
         Paragraph(f"<b>{isp_name}</b>", styles["Title"]),
         Paragraph(
-            f"{seller.get('legal_name') or isp_name}<br/>{seller.get('address') or ''}<br/>"
+            f"{seller.get('legal_name') or isp_name}<br/>{seller.get('address') or ''}<br/>"  # noqa: E501
             f"GSTIN: {seller.get('gstin') or '-'}",
             styles["Normal"],
         ),
@@ -176,17 +236,32 @@ def render_receipt_pdf(payment: dict, *, isp_name: str, seller: dict, recorded_b
         _table(
             [
                 ["Receipt", "Received", "Mode", "Reference", "Amount"],
-                [payment["receipt_number"], payment["received_at"][:10], payment["mode"],
-                 payment.get("reference") or "-", rupees(payment["amount_paise"])],
+                [
+                    payment["receipt_number"],
+                    payment["received_at"][:10],
+                    payment["mode"],
+                    payment.get("reference") or "-",
+                    rupees(payment["amount_paise"]),
+                ],
             ]
         ),
         Spacer(1, 0.3 * cm),
         Paragraph(f"Received from: {customer_name}", styles["Normal"]),
-        Paragraph(f"Amount in words: {rupees_in_words(payment['amount_paise'])}", styles["Normal"]),
+        Paragraph(
+            f"Amount in words: {rupees_in_words(payment['amount_paise'])}",
+            styles["Normal"],
+        ),
         Paragraph(f"Recorded by: {recorded_by or '-'}", styles["Normal"]),
     ]
     if payment["status"] == "voided":
-        story.append(Paragraph(f"<b>VOIDED</b>: {payment.get('voided_reason') or ''}", styles["Normal"]))
-    story += [Spacer(1, 0.5 * cm), Paragraph("Computer-generated receipt.", styles["Italic"])]
+        story.append(
+            Paragraph(
+                f"<b>VOIDED</b>: {payment.get('voided_reason') or ''}", styles["Normal"]
+            )
+        )
+    story += [
+        Spacer(1, 0.5 * cm),
+        Paragraph("Computer-generated receipt.", styles["Italic"]),
+    ]
     doc.build(story)
     return buf.getvalue()

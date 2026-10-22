@@ -48,7 +48,9 @@ def make_live_disconnect(guest_repository, terminator):  # noqa: ANN001, ANN201
     async def _kick(row):  # noqa: ANN001, ANN202
         from app.domains.guest.service import issue_live_disconnect
 
-        await issue_live_disconnect(guest_repository, session=row, terminator=terminator)
+        await issue_live_disconnect(
+            guest_repository, session=row, terminator=terminator
+        )
         return row.disconnect_enforced
 
     return _kick

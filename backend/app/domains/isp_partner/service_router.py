@@ -57,7 +57,9 @@ async def suspend_service(
     request: Request,
     isp_customer_id: uuid.UUID,
     payload: SuspendServiceRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=100),
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", max_length=100
+    ),
     isp: IspContext = Depends(RequireIspPartner),
     control: IspServiceControl = Depends(get_service_control),
 ) -> dict:
@@ -84,7 +86,9 @@ async def resume_service(
     request: Request,
     isp_customer_id: uuid.UUID,
     payload: ResumeServiceRequest | None = None,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=100),
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", max_length=100
+    ),
     isp: IspContext = Depends(RequireIspPartner),
     control: IspServiceControl = Depends(get_service_control),
 ) -> dict:
