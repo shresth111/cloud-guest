@@ -530,7 +530,11 @@ class FakeRbac:
             SimpleNamespace(id=uuid.uuid4(), slug="isp-owner") if seeded else None
         )
         self.audits: list[dict] = []
+        self.role_rows: list[dict] = []
         self.audit_fails = audit_fails
+
+    async def create_user_role(self, **fields):
+        self.role_rows.append(fields)
 
     async def get_role_by_slug(self, slug, organization_id):
         assert slug == "isp-owner" and organization_id is None
@@ -630,7 +634,15 @@ class TestCreate:
 
         (user_call,) = p.users.created
         assert user_call["organization_id"] == result.isp_partner.id
-        assert user_call["initial_role_id"] == p.rbac.role.id
+        # initial_role_id would run RBACService.assign_role_to_user, whose
+        # escalation guard refuses isp-owner for a Super Admin (staging E2E,
+        # 2026-10-22); the role row is written directly instead.
+        assert user_call["initial_role_id"] is None
+        (role_row,) = p.rbac.role_rows
+        assert role_row["role_id"] == p.rbac.role.id
+        assert role_row["organization_id"] == result.isp_partner.id
+        assert role_row["scope_type"] == "organization"
+        assert role_row["is_active"] is True
         assert user_call["requesting_organization_id"] is None
         assert {"must_change_password": True} in p.identity.updates
 
@@ -780,7 +792,9 @@ class TestOwnersAndReset:
             data=IspOwnerRequest(first_name="A", last_name="B", email="a@b.in"),
         )
         assert p.users.created[0]["organization_id"] == isp
-        assert p.users.created[0]["initial_role_id"] == p.rbac.role.id
+        assert p.users.created[0]["initial_role_id"] is None
+        assert p.rbac.role_rows[0]["organization_id"] == isp
+        assert p.rbac.role_rows[0]["role_id"] == p.rbac.role.id
         assert cred.temporary_password
 
     async def test_reset_requires_an_isp_role_on_this_isp(self) -> None:

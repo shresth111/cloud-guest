@@ -41,9 +41,11 @@ from app.domains.notification.dependencies import get_notification_service
 from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
+from app.domains.rbac.cache import PermissionCache
 from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
+    get_permission_cache,
     get_rbac_repository,
 )
 from app.domains.rbac.enums import ScopeType
@@ -108,6 +110,7 @@ def get_isp_partner_platform_service(
     rbac_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     plan_service: PlanService = Depends(get_plan_service),
     notification_service: NotificationService = Depends(get_notification_service),
+    permission_cache: PermissionCache = Depends(get_permission_cache),
 ) -> IspPartnerPlatformService:
     # Every provider above resolves the same request-scoped AsyncSession, so
     # the whole create is one transaction (get_db_session commits at the end
@@ -123,6 +126,7 @@ def get_isp_partner_platform_service(
         IspRepository(db),
         notification_service,
         login_url=get_isp_partner_settings().login_url,
+        permission_cache=permission_cache,
     )
 
 

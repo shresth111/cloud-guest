@@ -49,6 +49,7 @@ from app.domains.notification.constants import (
 from app.domains.organization.enums import OrganizationStatus, OrganizationType
 from app.domains.organization.exceptions import DuplicateSlugError
 from app.domains.organization.models import Organization
+from app.domains.rbac.enums import ScopeType
 
 from .constants import (
     AUDIT_ISP_USER_PASSWORD_RESET,
@@ -130,6 +131,7 @@ class _RbacRepository(Protocol):
         self, slug: str, organization_id: uuid.UUID | None
     ) -> Any: ...
     async def create_audit_log_entry(self, **fields: object) -> object: ...
+    async def create_user_role(self, **fields: object) -> object: ...
 
 
 class _PlanService(Protocol):
@@ -202,6 +204,7 @@ class IspPartnerPlatformService:
         notifications: _Notifications,
         *,
         login_url: str,
+        permission_cache: Any = None,
     ) -> None:
         self.repository = repository
         self.organization_service = organization_service
@@ -213,6 +216,7 @@ class IspPartnerPlatformService:
         self.isp_roles = isp_roles
         self.notifications = notifications
         self.login_url = login_url.rstrip("/") or login_url
+        self.permission_cache = permission_cache
 
     # ---------------------------------------------------------------- reads
     async def list_partners(
@@ -538,12 +542,32 @@ class IspPartnerPlatformService:
                 phone=_clean(owner.phone),
                 timezone=isp_org.timezone or "UTC",
                 organization_id=isp_org.id,
-                initial_role_id=role_id,
+                # Not initial_role_id: that path runs
+                # RBACService.assign_role_to_user, whose escalation guard
+                # refuses a role granting keys the actor lacks, and by design
+                # no existing role (Super Admin included) holds an isp_* key.
+                # The isp-owner row is written directly below, as the BE
+                # lane's users_service does for ISP staff.
+                initial_role_id=None,
             )
         except (EmailAlreadyExistsError, UsernameAlreadyExistsError) as exc:
             raise UserEmailTakenError(
                 "A user with this email already exists.", email=owner.email
             ) from exc
+        await self.rbac_repository.create_user_role(
+            user_id=user.id,
+            role_id=role_id,
+            scope_type=ScopeType.ORGANIZATION.value,
+            organization_id=isp_org.id,
+            location_id=None,
+            router_id=None,
+            granted_at=datetime.now(UTC),
+            granted_by=actor_user_id,
+            expires_at=None,
+            is_active=True,
+        )
+        if self.permission_cache is not None:
+            await self.permission_cache.invalidate(user.id)
         user = await self.identity_repository.update_user(
             user, must_change_password=True
         )
