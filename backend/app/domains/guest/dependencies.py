@@ -36,6 +36,7 @@ from app.domains.guest_access.enforcement import LiveSessionTerminator
 from app.domains.guest_access.service import GuestAccessService
 from app.domains.guest_teams.quota import SharedQuotaResolver
 from app.domains.guest_teams.repository import GuestTeamRepository
+from app.domains.isp_partner.rate_limit import IspRateLimitLookup
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
 from app.domains.mac_authorization.dependencies import get_mac_authorization_service
@@ -271,7 +272,7 @@ def get_radius_service(
         location_service,
         nas_code_counter_repository,
         audit_writer=audit_repository,
-        queue_lookup=queue_management_service,
+        queue_lookup=IspRateLimitLookup(queue_management_service),
         caller_location_scope=caller_location_scope,
         # NetLogs: one row per Authorize verdict, in this request's own
         # transaction (SAVEPOINT; never fails the verdict).
