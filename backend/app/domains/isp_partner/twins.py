@@ -416,8 +416,11 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         for kwarg in spec.deps:
             kwargs_for_handler[kwarg] = kwargs[kwarg]
         force_masking()
+        # By keyword: some originals declare a path id BEFORE ``request``
+        # (the Traffic Lens customer routes), where a positional call would
+        # bind the request to that id.
         if takes_request:
-            result = await spec.handler(request, **kwargs_for_handler)
+            result = await spec.handler(request=request, **kwargs_for_handler)
         else:
             result = await spec.handler(**kwargs_for_handler)
         return redact(result, spec.redact_fields)

@@ -98,7 +98,7 @@ class TestRouteStructure:
             for m in r.methods
         }
         assert mounted == set(PLATFORM_ROUTE_PERMISSIONS)
-        assert len(mounted) == 8
+        assert len(mounted) == 10  # +2 ADDENDUM_04 B6 add-on allowance (PARITY-2)
 
     @pytest.mark.parametrize(
         "route", _routes(), ids=lambda r: f"{sorted(r.methods)}{r.path}"

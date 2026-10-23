@@ -89,6 +89,11 @@ PLATFORM_ROUTE_PERMISSIONS: dict[tuple[str, str], str] = {
         "POST",
         "/{isp_partner_id}/users/{isp_user_id}/reset-password",
     ): "organizations.manage",
+    # ADDENDUM_04 B6 (PARITY-2, isp_addons.py): mounted on this router from
+    # isp_partner.router._include_lanes; listed here so the contract tests
+    # cover them.
+    ("GET", "/{isp_partner_id}/addon-allowances"): "organizations.read",
+    ("PUT", "/{isp_partner_id}/addon-allowances"): "organizations.manage",
 }
 
 
