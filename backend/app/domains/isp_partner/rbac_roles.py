@@ -107,6 +107,37 @@ PERMISSION_GROUPS: tuple[IspPermissionGroup, ...] = (
         actions=("read", "create", "update", "delete", "execute"),
         sort_order=1011,
     ),
+    # ADDENDUM_04 §4: the remaining customer-dashboard surfaces.
+    IspPermissionGroup(
+        key="isp_engage",
+        name="ISP Venue Engagement",
+        actions=("read", "create", "update", "delete", "manage"),
+        sort_order=1012,
+    ),
+    IspPermissionGroup(
+        key="isp_security",
+        name="ISP Venue Security",
+        actions=("read", "create", "update", "delete", "execute"),
+        sort_order=1013,
+    ),
+    IspPermissionGroup(
+        key="isp_ops",
+        name="ISP Venue Operations",
+        actions=("execute",),
+        sort_order=1014,
+    ),
+    IspPermissionGroup(
+        key="isp_monitor",
+        name="ISP Venue Monitoring",
+        actions=("read", "update"),
+        sort_order=1015,
+    ),
+    IspPermissionGroup(
+        key="isp_support",
+        name="ISP Support",
+        actions=("read", "create"),
+        sort_order=1016,
+    ),
 )
 
 ALLOWED_SCOPE_TYPES: tuple[ScopeType, ...] = (ScopeType.ORGANIZATION,)
@@ -147,6 +178,11 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_subscribers="read update",
             isp_network="read create update delete execute",
             isp_access="read create update delete execute",
+            isp_engage="read create update delete manage",
+            isp_security="read create update delete execute",
+            isp_ops="execute",
+            isp_monitor="read update",
+            isp_support="read create",
         ),
     ),
     IspRoleDefinition(
@@ -166,6 +202,11 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_subscribers="read update",
             isp_network="read create update delete execute",
             isp_access="read create update delete execute",
+            isp_engage="read create update delete manage",
+            isp_security="read create update delete execute",
+            isp_ops="execute",
+            isp_monitor="read update",
+            isp_support="read create",
         ),
     ),
     IspRoleDefinition(
@@ -183,6 +224,11 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_subscribers="read",
             isp_network="read execute",
             isp_access="read",
+            isp_engage="read",
+            isp_security="read",
+            isp_ops="execute",
+            isp_monitor="read update",
+            isp_support="read create",
         ),
     ),
     IspRoleDefinition(
@@ -199,6 +245,11 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_subscribers="read",
             isp_network="read create update execute",
             isp_access="read create update",
+            isp_engage="read",
+            isp_security="read create update execute",
+            isp_ops="execute",
+            isp_monitor="read update",
+            isp_support="read create",
         ),
     ),
     IspRoleDefinition(
@@ -216,6 +267,10 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_subscribers="read",
             isp_network="read",
             isp_access="read",
+            isp_engage="read",
+            isp_security="read",
+            isp_monitor="read",
+            isp_support="read",
         ),
     ),
     IspRoleDefinition(
@@ -230,6 +285,9 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_plans="read",
             isp_coupons="read create export update",
             isp_subscribers="read update",
+            isp_engage="read",
+            isp_monitor="read",
+            isp_support="read create",
         ),
     ),
 )
