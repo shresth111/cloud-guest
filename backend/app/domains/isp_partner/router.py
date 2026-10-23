@@ -82,6 +82,11 @@ from .schemas import (
 from .scoping import IspScope
 from .service import IspPartnerService
 from .service_control import IspServiceControl
+from .twin_gates import (
+    HAND_TWIN_GATES,
+    enforce_customer_gates,
+    get_twin_entitlement_checker,
+)
 from .twins import mount_twins
 from .twins_venue import VENUE_TWINS
 
@@ -670,6 +675,20 @@ async def twin_management_access(
     )
 
 
+async def _hand_gate(name: str, request: Request, checker: Any, org_id) -> None:
+    """ADDENDUM_04 §1: the original route's licence/feature gates, run on the
+    CUSTOMER org. The declaration lives in ``twin_gates.HAND_TWIN_GATES`` so
+    the parity test can compare it with the original route."""
+    spec = HAND_TWIN_GATES[name]
+    await enforce_customer_gates(
+        checker,
+        org_id,
+        method=request.method,
+        paid_write=spec.paid_write,
+        features=spec.features,
+    )
+
+
 # ============================================================================
 # 4.7 Captive portal (per location) -- the original handlers, customer-scoped
 # ============================================================================
@@ -728,8 +747,12 @@ async def update_portal_config(
     service: CaptivePortalService = Depends(
         portal_routes.get_entitlement_aware_captive_portal_service
     ),
+    checker: Any = Depends(get_twin_entitlement_checker),
 ) -> dict:
     config = await IspScope.assert_portal_config(isp, config_id)
+    await _hand_gate(
+        "update_portal_config", request, checker, config.organization_id
+    )
     return await portal_routes.update_captive_portal_config(
         request,
         config_id=config.id,
@@ -750,8 +773,12 @@ async def activate_portal_config(
     user: AuthUser = Depends(CurrentUser),
     isp: IspContext = Depends(RequireIspPartner),
     service: CaptivePortalService = Depends(get_captive_portal_service),
+    checker: Any = Depends(get_twin_entitlement_checker),
 ) -> dict:
     config = await IspScope.assert_portal_config(isp, config_id)
+    await _hand_gate(
+        "activate_portal_config", request, checker, config.organization_id
+    )
     return await portal_routes.activate_captive_portal_config(
         request,
         config_id=config.id,
@@ -772,8 +799,12 @@ async def upload_portal_content_image(
     user: AuthUser = Depends(CurrentUser),
     isp: IspContext = Depends(RequireIspPartner),
     service: CaptivePortalService = Depends(get_captive_portal_service),
+    checker: Any = Depends(get_twin_entitlement_checker),
 ) -> dict:
     config = await IspScope.assert_portal_config(isp, config_id)
+    await _hand_gate(
+        "upload_portal_content_image", request, checker, config.organization_id
+    )
     return await portal_routes.upload_captive_portal_content_image(
         request,
         config_id=config.id,

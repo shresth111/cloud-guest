@@ -52,6 +52,9 @@ INVARIANTS (checked by ``tests/unit/test_isp_partner_guards.py``)
   ``location_id`` / ``router_id`` -- those are RBAC scope aliases. The twin's
   own ids are ``isp_*``, and the *customer's* ids only ever reach the original
   handler as forwarded arguments, never as request parameters;
+- (ADDENDUM_04 §1, ``test_isp_partner_twin_gates.py``) each row declares the
+  same ``RequireFeature`` keys and ``_PAID_WRITES`` licence gate as its
+  original route, and ``build_twin`` evaluates them against the CUSTOMER org;
 - the endpoint function's ``__module__`` is this module, so the guard test's
   discovery (which keys off the module, not the path) sees it.
 """
@@ -73,6 +76,12 @@ from .exceptions import (
     IspRouterNotFoundError,
 )
 from .scoping import IspScope
+from .twin_gates import (
+    GATE_KWARG,
+    enforce_customer_gates,
+    get_twin_entitlement_checker,
+    is_write,
+)
 from .twin_headers import HEADER_CUSTOMER, HEADER_LOCATION
 
 __all__ = [
@@ -187,6 +196,27 @@ class TwinSpec:
     deps: dict[str, Callable[..., Any]] = field(default_factory=dict)
     inject: dict[str, tuple[str, ...]] = field(default_factory=dict)
     status_code: int | None = None
+    #: ADDENDUM_04 §1. Every ``RequireFeature(<key>)`` the ORIGINAL route
+    #: carries, evaluated against the resolved CUSTOMER org (402
+    #: ``feature_not_entitled``). ``test_isp_partner_twin_gates.py`` asserts
+    #: this equals the original route's set.
+    requires_features: tuple[Any, ...] = ()
+    #: ``RequireActiveLicenseForWrites`` (the ``_PAID_WRITES`` include) against
+    #: the CUSTOMER org. ``None`` = the default: on for every state-changing
+    #: method (fail closed); set ``False`` explicitly only where the original
+    #: router is deliberately ungated (e.g. ``voucher_router``).
+    paid_write: bool | None = None
+
+    @property
+    def effective_paid_write(self) -> bool:
+        """Whether the lapsed-licence write check applies to this row."""
+        if not is_write(self.method):
+            return False
+        return True if self.paid_write is None else self.paid_write
+
+    @property
+    def gated(self) -> bool:
+        return bool(self.requires_features) or self.effective_paid_write
 
     @property
     def name(self) -> str:
@@ -303,12 +333,25 @@ def _value(
 def build_twin(spec: TwinSpec) -> Callable[..., Any]:
     """Build the real route function for one table row."""
     needs_user = any(source[0] == "user" for source in spec.inject.values())
+    if spec.gated and spec.target == "none":
+        # A gate needs a customer org to check; a target-less row has none.
+        raise ValueError(f"{spec.name}: a gated twin must resolve a customer")
 
     async def twin(**kwargs: Any) -> Any:
         request: Request = kwargs["request"]
         isp: IspContext = kwargs["isp"]
         args = {p.name: kwargs[p.name] for p in spec.params}
         resolved = await _resolve(spec, isp, request, args)
+        if spec.gated:
+            # ADDENDUM_04 §1: the original route's feature/licence gates, run
+            # against the CUSTOMER org (resolved[1]), never the ISP's header org.
+            await enforce_customer_gates(
+                kwargs.get(GATE_KWARG),
+                resolved[1],
+                method=spec.method,
+                paid_write=spec.effective_paid_write,
+                features=spec.requires_features,
+            )
         kwargs_for_handler = _value(spec, resolved, args, kwargs.get("_actor"))
         # Every DECLARED parameter reaches the handler, under the name the
         # handler uses -- unless an ``inject`` entry already renamed it (a param
@@ -405,6 +448,15 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
                 inspect.Parameter.KEYWORD_ONLY,
                 annotation=inspect.Parameter.empty,
                 default=Depends(provider),
+            )
+        )
+    if spec.gated:
+        parameters.append(
+            inspect.Parameter(
+                GATE_KWARG,
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=inspect.Parameter.empty,
+                default=Depends(get_twin_entitlement_checker),
             )
         )
     if needs_user:

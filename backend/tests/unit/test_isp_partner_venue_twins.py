@@ -34,6 +34,7 @@ from dataclasses import replace
 import pytest
 from starlette.requests import Request
 
+from app.domains.isp_partner.twin_gates import GATE_KWARG
 from app.domains.isp_partner.twin_headers import HEADER_LOCATION
 from app.domains.isp_partner.twins import Param, TwinSpec, build_twin
 from app.domains.isp_partner.twins_venue import VENUE_TWINS
@@ -148,6 +149,12 @@ def _recording(spec: TwinSpec) -> tuple[TwinSpec, Recorder]:
 def _kwargs(spec: TwinSpec) -> dict:
     """The non-dependency values the twin's own signature will receive."""
     out: dict = {"request": None, "isp": None}
+    if spec.gated:
+        # A permissive checker so these seam tests reach the handler; the
+        # gates themselves are pinned by test_isp_partner_twin_gates.py.
+        from tests.unit.isp_partner_gate_fakes import entitled_everything
+
+        out[GATE_KWARG] = entitled_everything()
     for param in spec.params:
         if param.required:
             out[param.name] = _sample(param)
