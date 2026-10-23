@@ -40,6 +40,11 @@ _INTERNAL = "/api/v1/internal/tr069/"
 #: but are GLOBAL-pinned platform routes, not /isp routes: excluded from the
 #: /isp guard stack here and asserted GLOBAL-pinned below instead.
 _PLATFORM = "/api/v1/platform/isp-partners"
+#: The one public ISP route family: self-service forgot password
+#: (isp_partner.password_reset_router). Unauthenticated by design, so it is
+#: excluded from the guard stack and pinned exactly below instead.
+_PUBLIC_AUTH = "/api/v1/isp/auth/"
+_PUBLIC_AUTH_ROUTES = {("POST", "/api/v1/isp/auth/forgot-password")}
 
 
 @lru_cache(maxsize=1)
@@ -58,7 +63,7 @@ def _isp_routes(app=None):
             continue
         if not endpoint.__module__.startswith(_OUR_MODULES):
             continue
-        if route.path.startswith((_INTERNAL, _PLATFORM)):
+        if route.path.startswith((_INTERNAL, _PLATFORM, _PUBLIC_AUTH)):
             continue
         out.append(route)
     return out
@@ -360,3 +365,21 @@ def test_no_isp_schema_name_collides_with_an_existing_one() -> None:
         if name.startswith("app__") and name.rsplit("__", 1)[-1] in ours
     )
     assert clashes == [], clashes
+
+
+def test_the_public_isp_auth_surface_is_exactly_forgot_password() -> None:
+    from app.domains.isp_partner.config import RequireIspFeatureEnabled
+
+    public = [
+        r
+        for r in _app().routes
+        if getattr(r, "methods", None) and r.path.startswith(_PUBLIC_AUTH)
+    ]
+    assert {(m, r.path) for r in public for m in r.methods} == _PUBLIC_AUTH_ROUTES
+    for r in public:
+        assert r.endpoint.__module__ == "app.domains.isp_partner.password_reset_router"
+        calls = [d.dependency for d in r.dependencies]
+        # Flag-gated like every /isp route, and never a session-bound guard.
+        assert RequireIspFeatureEnabled in calls
+        assert RequireOrganization not in calls
+        assert RequireIspPartner not in calls

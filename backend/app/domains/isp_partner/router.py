@@ -992,6 +992,10 @@ def _include_lanes() -> None:
     isp_partner_router.include_router(isp_parity_router)
     isp_partner_router.include_router(isp_messaging_router)
     isp_partner_router.include_router(venue_marketing_router)
+    # Founder 2026-10-23: self-service forgot password (public; see module).
+    from .password_reset_router import password_reset_router
+
+    isp_partner_router.include_router(password_reset_router)
 
 
 _include_lanes()
