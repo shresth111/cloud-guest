@@ -84,6 +84,14 @@ async def enforce_customer_gates(
     callers, which an ISP never is).
     """
     features = tuple(features)
+    if PlanFeatureKey.WHITE_LABEL in features:
+        from .policy import get_isp_partner_policy
+
+        if get_isp_partner_policy().white_label == "off" and organization_id:
+            # F4 flip: no white-label twin for ISPs at all.
+            raise FeatureNotEntitledError(
+                organization_id, PlanFeatureKey.WHITE_LABEL.value
+            )
     needs_licence = bool(features) or (paid_write and is_write(method))
     if not needs_licence:
         return

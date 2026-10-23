@@ -49,7 +49,7 @@ from app.domains.isp_partner.twin_gates import (
 )
 from app.domains.isp_partner.twin_headers import HEADER_LOCATION
 from app.domains.isp_partner.twins import TwinSpec, build_twin
-from app.domains.isp_partner.twins_venue import VENUE_TWINS
+from app.domains.isp_partner.twins_all import ALL_TWINS as VENUE_TWINS
 from tests.unit.isp_partner_fixtures import CUST_A1, ISP_A, LOC_A1, context, estate
 from tests.unit.isp_partner_gate_fakes import FakeChecker, FakeSnapshot
 

@@ -18,7 +18,7 @@ from app.domains.isp_partner.exceptions import (
     IspRouterNotFoundError,
 )
 from app.domains.isp_partner.twin_body import BodyId, apply_body_ids, is_id_shaped
-from app.domains.isp_partner.twins_venue import VENUE_TWINS
+from app.domains.isp_partner.twins_all import ALL_TWINS as VENUE_TWINS
 from tests.unit.isp_partner_fixtures import (
     CUST_A1,
     LOC_A1,
