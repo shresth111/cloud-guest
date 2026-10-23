@@ -141,3 +141,29 @@ ISP_ACCESS_CREATE = "isp_access.create"
 ISP_ACCESS_UPDATE = "isp_access.update"
 ISP_ACCESS_DELETE = "isp_access.delete"
 ISP_ACCESS_EXECUTE = "isp_access.execute"
+
+# -- ADDENDUM_04 §4: the rest of the customer dashboard (parity batches) -----
+#
+# Same rule as the two groups above: one group per customer surface, checked
+# on the ISP org by a twin or an ISP wrapper; no customer key is ever granted.
+#: Engagement: Login Page Offers writes, venue voucher batches, Guest Messaging.
+ISP_ENGAGE_READ = "isp_engage.read"
+ISP_ENGAGE_CREATE = "isp_engage.create"
+ISP_ENGAGE_UPDATE = "isp_engage.update"
+ISP_ENGAGE_DELETE = "isp_engage.delete"
+ISP_ENGAGE_MANAGE = "isp_engage.manage"
+#: Security: Security Score, Block Websites, the customer's own firewall rules
+#: (never the Wyfy firewall band, which stays GLOBAL and Master-only).
+ISP_SECURITY_READ = "isp_security.read"
+ISP_SECURITY_CREATE = "isp_security.create"
+ISP_SECURITY_UPDATE = "isp_security.update"
+ISP_SECURITY_DELETE = "isp_security.delete"
+ISP_SECURITY_EXECUTE = "isp_security.execute"
+#: Operations: Fix a Problem (diagnostics run on the venue's router).
+ISP_OPS_EXECUTE = "isp_ops.execute"
+#: Monitoring: alerts, connected clients, monitored hardware.
+ISP_MONITOR_READ = "isp_monitor.read"
+ISP_MONITOR_UPDATE = "isp_monitor.update"
+#: Support: ISP -> Wyfy support tickets.
+ISP_SUPPORT_READ = "isp_support.read"
+ISP_SUPPORT_CREATE = "isp_support.create"

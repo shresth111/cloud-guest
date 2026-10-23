@@ -117,6 +117,46 @@ EXPECTED["isp-technician"] |= {
     "isp_access.update",
 }
 EXPECTED["isp-viewer"] |= {"isp_access.read"}
+# ADDENDUM_04 §4: engage / security / ops / monitor / support.
+EXPECTED["isp-owner"] |= (
+    {f"isp_engage.{a}" for a in "read create update delete manage".split()}
+    | {f"isp_security.{a}" for a in "read create update delete execute".split()}
+    | {"isp_ops.execute", "isp_monitor.read", "isp_monitor.update"}
+    | {"isp_support.read", "isp_support.create"}
+)
+EXPECTED["isp-noc"] |= {
+    "isp_engage.read",
+    "isp_security.read",
+    "isp_ops.execute",
+    "isp_monitor.read",
+    "isp_monitor.update",
+    "isp_support.read",
+    "isp_support.create",
+}
+EXPECTED["isp-technician"] |= {
+    "isp_engage.read",
+    "isp_security.read",
+    "isp_security.create",
+    "isp_security.update",
+    "isp_security.execute",
+    "isp_ops.execute",
+    "isp_monitor.read",
+    "isp_monitor.update",
+    "isp_support.read",
+    "isp_support.create",
+}
+EXPECTED["isp-viewer"] |= {
+    "isp_engage.read",
+    "isp_security.read",
+    "isp_monitor.read",
+    "isp_support.read",
+}
+EXPECTED["isp-billing"] |= {
+    "isp_engage.read",
+    "isp_monitor.read",
+    "isp_support.read",
+    "isp_support.create",
+}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -222,8 +262,8 @@ async def test_seeding_never_changes_a_pre_existing_role(repo) -> None:
 async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
-    assert summary.permission_groups_created == 12
-    assert summary.permissions_created == 47
+    assert summary.permission_groups_created == 17  # +5 ADDENDUM_04 §4
+    assert summary.permissions_created == 62  # +15 ADDENDUM_04 §4
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED
