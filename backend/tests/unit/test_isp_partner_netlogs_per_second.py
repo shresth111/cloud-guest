@@ -121,7 +121,10 @@ async def test_dense_series_scoped_and_partition_pruned(monkeypatch) -> None:
         ({"NETLOGS_DISPLAY_CAP_PER_MIN": "junk"}, 3000),
         ({"NETLOGS_DISPLAY_CAP_UNLIMITED": "true"}, None),
         (
-            {"NETLOGS_DISPLAY_CAP_UNLIMITED": "true", "NETLOGS_DISPLAY_CAP_PER_MIN": "50"},
+            {
+                "NETLOGS_DISPLAY_CAP_UNLIMITED": "true",
+                "NETLOGS_DISPLAY_CAP_PER_MIN": "50",
+            },
             None,
         ),
     ],
