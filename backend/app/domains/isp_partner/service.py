@@ -210,7 +210,9 @@ class IspPartnerService:
             "customer_enabled": {
                 c.customer_organization_id
                 for c in creds
-                if c.customer_organization_id is not None and c.enabled
+                if c.customer_organization_id is not None
+                and c.location_id is None
+                and c.enabled
             },
             "isp_enabled": any(
                 c.customer_organization_id is None and c.enabled for c in creds
