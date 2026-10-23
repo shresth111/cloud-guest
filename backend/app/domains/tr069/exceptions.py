@@ -25,6 +25,12 @@ class Tr069DisabledForCustomerError(IspError):
     default_message = "TR-069 is disabled for this customer"
 
 
+class Tr069DisabledForLocationError(IspError):
+    code = "TR069_DISABLED_FOR_LOCATION"
+    status_code_default = status.HTTP_409_CONFLICT
+    default_message = "TR-069 is disabled for this device's location"
+
+
 class Tr069TaskPendingError(IspError):
     code = "TR069_TASK_PENDING"
     status_code_default = status.HTTP_409_CONFLICT

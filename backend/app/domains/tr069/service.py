@@ -22,7 +22,11 @@ from app.domains.organization.models import Organization
 from . import params as P
 from .config import get_tr069_settings
 from .credentials import CredentialStore
-from .exceptions import Tr069DisabledForCustomerError, Tr069TaskPendingError
+from .exceptions import (
+    Tr069DisabledForCustomerError,
+    Tr069DisabledForLocationError,
+    Tr069TaskPendingError,
+)
 from .models import Tr069AcsCredential, Tr069Device, Tr069LocationSetting, Tr069Task
 from .script import render_tr069_script
 from .sync import apply_facts
@@ -201,18 +205,36 @@ class Tr069Service:
             )
         ).scalar_one_or_none()
 
-    async def location_state(self, isp: IspContext, isp_location_id: uuid.UUID) -> dict:
+    async def location_state(
+        self,
+        isp: IspContext,
+        isp_location_id: uuid.UUID,
+        *,
+        show_password: bool = False,
+    ) -> dict:
         location = await IspScope.assert_location(isp, isp_location_id)
         setting = await self._location_setting(location.id)
-        return {
-            "isp_location_id": str(location.id),
-            "enabled": bool(setting and setting.enabled),
-            "periodic_inform_interval_s": (
-                setting.periodic_inform_interval_s
-                if setting
-                else RECOMMENDED_INTERVAL_S
-            ),
-        }
+        enabled = bool(setting and setting.enabled)
+        credential = await self.credentials.get_location(isp.isp_org_id, location.id)
+        view = self._credential_view(
+            credential if enabled else None,
+            show_password=show_password,
+            note="Devices using this credential are assigned to this location. "
+            "Turning TR-069 off here refuses them at the ACS on their next "
+            "request.",
+        )
+        view.update(
+            {
+                "isp_location_id": str(location.id),
+                "enabled": enabled,
+                "periodic_inform_interval_s": (
+                    setting.periodic_inform_interval_s
+                    if setting
+                    else RECOMMENDED_INTERVAL_S
+                ),
+            }
+        )
+        return view
 
     async def set_location(
         self,
@@ -237,13 +259,40 @@ class Tr069Service:
             if interval_s is not None:
                 setting.periodic_inform_interval_s = interval_s
             setting.updated_by = isp.user_id
+        # The location credential follows the toggle. acs-auth reads the toggle
+        # itself on every request, so this flag is for clarity, not enforcement.
+        if enabled:
+            await self.credentials.ensure_location(
+                isp.isp_org_id,
+                location.organization_id,
+                location.id,
+                actor_user_id=isp.user_id,
+            )
+        else:
+            existing = await self.credentials.get_location(isp.isp_org_id, location.id)
+            if existing is not None and existing.enabled:
+                existing.enabled = False
+                existing.updated_by = isp.user_id
         await self.session.flush()
-        return await self.location_state(isp, location.id)
+        return await self.location_state(isp, location.id, show_password=True)
 
     async def router_script(self, isp: IspContext, isp_router_id: uuid.UUID) -> str:
         router = await IspScope.assert_router(isp, isp_router_id)
         setting = await self._location_setting(router.location_id)
-        credential = await self.credentials.get(isp.isp_org_id, router.organization_id)
+        credential = None
+        if setting is not None and setting.enabled and router.location_id:
+            # 0176: the router gets its LOCATION's credential, so the location
+            # toggle is enforced at the ACS for this CPE.
+            credential = await self.credentials.ensure_location(
+                isp.isp_org_id,
+                router.organization_id,
+                router.location_id,
+                actor_user_id=isp.user_id,
+            )
+        if credential is None:
+            credential = await self.credentials.get(
+                isp.isp_org_id, router.organization_id
+            )
         if credential is None or not credential.enabled:
             credential = await self.credentials.get(isp.isp_org_id, None)
             if credential is None:
@@ -271,9 +320,18 @@ class Tr069Service:
         return script
 
     # -- devices -----------------------------------------------------------
-    async def _management_enabled(
+    async def _management_blocks(
         self, isp: IspContext, devices: list[Tr069Device]
-    ) -> dict:
+    ) -> dict[uuid.UUID, str | None]:
+        """Per device: None when the platform may manage it, otherwise why
+        not (``isp_off`` / ``customer_off`` / ``location_off``).
+
+        A device that informs with a customer (not location) credential
+        cannot be refused at the edge by location: nginx's auth subrequest
+        carries no body, so acs-auth never learns which CPE is calling. Such a
+        device, assigned to a location whose toggle is explicitly OFF, is
+        blocked here instead: every task is refused (409) and the inventory
+        shows the reason."""
         rows = await self.session.execute(
             select(Tr069AcsCredential).where(
                 Tr069AcsCredential.isp_organization_id == isp.isp_org_id,
@@ -281,25 +339,55 @@ class Tr069Service:
             )
         )
         creds = list(rows.scalars().all())
-        customer_on = {
-            c.customer_organization_id
+        customer_cred = {
+            c.customer_organization_id: c
             for c in creds
-            if c.customer_organization_id and c.enabled
+            if c.customer_organization_id is not None and c.location_id is None
+        }
+        location_cred_on = {
+            c.id for c in creds if c.location_id is not None and c.enabled
         }
         isp_on = any(c.customer_organization_id is None and c.enabled for c in creds)
-        return {
-            d.id: (d.customer_organization_id in customer_on)
-            if d.customer_organization_id is not None
-            else isp_on
-            for d in devices
-        }
+        loc_ids = {d.location_id for d in devices if d.location_id is not None}
+        off_locations: set[uuid.UUID] = set()
+        if loc_ids:
+            off = await self.session.execute(
+                select(Tr069LocationSetting.location_id).where(
+                    Tr069LocationSetting.location_id.in_(loc_ids),
+                    Tr069LocationSetting.enabled.is_(False),
+                    Tr069LocationSetting.is_deleted.is_(False),
+                )
+            )
+            off_locations = set(off.scalars().all())
+        out: dict[uuid.UUID, str | None] = {}
+        for d in devices:
+            if d.customer_organization_id is None:
+                out[d.id] = None if isp_on else "isp_off"
+                continue
+            cc = customer_cred.get(d.customer_organization_id)
+            if cc is not None and not cc.enabled:
+                out[d.id] = "customer_off"
+            elif d.location_id is not None and d.location_id in off_locations:
+                out[d.id] = "location_off"
+            elif cc is None and d.credential_id not in location_cred_on:
+                out[d.id] = "customer_off"
+            else:
+                out[d.id] = None
+        return out
+
+    async def _management_enabled(
+        self, isp: IspContext, devices: list[Tr069Device]
+    ) -> dict:
+        blocks = await self._management_blocks(isp, devices)
+        return {d.id: blocks[d.id] is None for d in devices}
 
     async def _views(self, isp: IspContext, devices: list[Tr069Device]) -> list[dict]:
         orgs = await isp.repository.names(
             Organization, [d.customer_organization_id for d in devices]
         )
         locs = await isp.repository.names(Location, [d.location_id for d in devices])
-        mgmt = await self._management_enabled(isp, devices)
+        blocks = await self._management_blocks(isp, devices)
+        mgmt = {d.id: blocks[d.id] is None for d in devices}
         states = await isp.repository.service_states(
             [d.customer_organization_id for d in devices if d.customer_organization_id]
         )
@@ -326,6 +414,7 @@ class Tr069Service:
                 "last_inform_at": _iso(d.last_inform_at),
                 "first_seen_at": _iso(d.first_seen_at),
                 "management_enabled": mgmt[d.id],
+                "management_blocked_reason": blocks[d.id],
                 # ADDENDUM_01 §A.6 badge; null for an unassigned CPE.
                 "customer_service_state": (
                     states.get(d.customer_organization_id, "active")
@@ -482,7 +571,10 @@ class Tr069Service:
                 device.customer_organization_id
             ):
                 raise IspCustomerSuspendedError()
-        if not (await self._management_enabled(isp, [device]))[device.id]:
+        blocked = (await self._management_blocks(isp, [device]))[device.id]
+        if blocked == "location_off":
+            raise Tr069DisabledForLocationError()
+        if blocked is not None:
             raise Tr069DisabledForCustomerError()
         pending = (
             await self.session.execute(

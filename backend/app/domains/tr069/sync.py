@@ -129,6 +129,7 @@ class Tr069SyncService:
                 row = Tr069Device(
                     isp_organization_id=isp_org_id,
                     customer_organization_id=cred.customer_organization_id,
+                    location_id=cred.location_id,
                     genieacs_device_id=genie_id,
                     credential_id=cred.id,
                     first_seen_at=_parse_time(doc.get("_registered")) or now,
@@ -141,7 +142,7 @@ class Tr069SyncService:
                 old_isp = row.isp_organization_id
                 row.isp_organization_id = isp_org_id
                 row.customer_organization_id = cred.customer_organization_id
-                row.location_id = None
+                row.location_id = cred.location_id
                 row.router_id = None
                 row.label = None
                 row.credential_id = cred.id
@@ -153,6 +154,12 @@ class Tr069SyncService:
                 if row.is_deleted:
                     row.restore_deleted()
                     row.customer_organization_id = cred.customer_organization_id
+                    row.location_id = cred.location_id
+                elif cred.location_id is not None and row.credential_id != cred.id:
+                    # Re-configured onto a location credential: that location
+                    # now owns it (its toggle is what acs-auth enforces).
+                    row.customer_organization_id = cred.customer_organization_id
+                    row.location_id = cred.location_id
                 row.credential_id = cred.id
                 apply_facts(row, doc)
                 stats["updated"] += 1
