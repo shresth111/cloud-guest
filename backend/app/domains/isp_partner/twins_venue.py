@@ -833,6 +833,19 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
             "location_id": ("location",),
         },
     ),
+    TwinSpec(
+        method="GET",
+        path="/venue/campaigns/{campaign_id}/results",
+        permission_key=ISP_ACCESS_READ,
+        handler=campaigns_routes.get_campaign_results,
+        target="header_location",
+        params=(Param("campaign_id", "path", uuid.UUID),),
+        deps={"service": get_campaigns_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "campaign_id": ("param", "campaign_id"),
+        },
+    ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------
     TwinSpec(
         method="GET",
