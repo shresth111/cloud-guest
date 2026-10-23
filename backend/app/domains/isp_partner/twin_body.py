@@ -106,10 +106,27 @@ async def _pinned_router(isp, raw: Any, org_id, location_id) -> uuid.UUID | None
     return router.id
 
 
+def _wants_str(payload: Any, field: str) -> bool:
+    """Whether the body model declares ``field`` as a string (``str`` or
+    ``str | None``), whatever the client happened to send."""
+    info = type(payload).model_fields.get(field)
+    if info is None:
+        return False
+    ann = info.annotation
+    args = getattr(ann, "__args__", None) or (ann,)
+    return str in args and uuid.UUID not in args
+
+
 def _with(payload: Any, field: str, value: Any) -> Any:
+    """QA-001: the forced id must take the TYPE the model declares. Converting
+    only when the client sent a string left a raw (asyncpg) UUID in a
+    ``str | None`` field when the optional key was omitted, and the original
+    handler's ``uuid.UUID(payload.location_id)`` then 500'd."""
     original = getattr(payload, field, None)
-    if isinstance(original, str) and value is not None:
+    if value is not None and (isinstance(original, str) or _wants_str(payload, field)):
         value = str(value)
+    elif value is not None and not isinstance(value, uuid.UUID):
+        value = uuid.UUID(str(value))
     return payload.model_copy(update={field: value})
 
 

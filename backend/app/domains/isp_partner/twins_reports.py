@@ -34,6 +34,8 @@ REPORT_PATHS: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/venue/otp/requests"),
         ("GET", "/venue/guest-login-history"),
         ("GET", "/venue/campaigns"),
+        ("GET", "/venue/guest-teams"),
+        ("GET", "/venue/voucher-batches"),
     }
 )
 
@@ -43,7 +45,13 @@ def with_report_location(spec: TwinSpec) -> TwinSpec:
         return spec
     location_keys = [k for k, src in spec.inject.items() if src == ("location",)]
     if "location_id" not in location_keys:
-        return spec
+        # QA-025: the original has no location filter (voucher batches are
+        # org-wide), so the Business Unit cannot narrow it -- but a foreign
+        # Business Unit must still be refused, not silently ignored.
+        extra = Extra(
+            "isp_location_id", "query", "location", "location_id", validate_only=True
+        )
+        return replace(spec, extras=spec.extras + (extra,))
     also = tuple(k for k in location_keys if k != "location_id")
     extra = Extra(
         "isp_location_id",

@@ -56,6 +56,10 @@ class _Rec:
         return {"data": {}}
 
 
+def _validate_only(spec) -> bool:
+    return any(e.validate_only for e in spec.extras if e.name == "isp_location_id")
+
+
 def _rows():
     return [s for s in ALL_TWINS if (s.method, s.path) in REPORT_PATHS]
 
@@ -86,6 +90,9 @@ async def test_omitted_business_unit_stays_on_the_workspace(spec) -> None:
     rec = _Rec()
     twin = build_twin(replace(spec, handler=rec))
     await twin(**_kwargs(spec))
+    if _validate_only(spec):
+        assert "location_id" not in rec.calls[0]
+        return
     assert rec.calls[0]["location_id"] == LOC_A1
 
 
@@ -97,6 +104,11 @@ async def test_another_location_of_the_same_customer_is_used_everywhere(spec) ->
     twin = build_twin(replace(spec, handler=rec))
     await twin(**_kwargs(spec, isp_location_id=LOC_A1_SECOND))
     call = rec.calls[0]
+    if _validate_only(spec):
+        # QA-025: the original has no location filter; the id is checked, not
+        # forwarded.
+        assert "location_id" not in call
+        return
     assert call["location_id"] == LOC_A1_SECOND
     for key, src in spec.inject.items():
         if src == ("location",):

@@ -167,6 +167,9 @@ class Extra:
     #: Further handler keywords that take the same resolved value (a report's
     #: ``location_id`` filter and its ``scope_location_id`` must agree).
     forward_also: tuple[str, ...] = ()
+    #: Resolve and pin the id (404 when foreign) but pass nothing to the
+    #: handler: for a report whose original has no such filter (QA-025).
+    validate_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -271,6 +274,51 @@ def _not_found_for(target: Target) -> Exception:
 
 
 async def _resolve(
+    spec: TwinSpec, isp: IspContext, request: Request, args: dict[str, Any]
+):
+    """Resolve the target, then check it against BOTH venue headers.
+
+    QA-002: a customer header plus a location of ANOTHER customer of the same
+    ISP used to be accepted (the location won, so one customer's rows were
+    served under the other's name), and a customer-level row ignored the
+    location header altogether. Every header the request carries must now
+    agree with what the row resolved -- the location must belong to the header
+    customer, a path-resolved row must belong to it too -- or the answer is the
+    same 404 a foreign id gets. QA-003: a target-less row still validates any
+    venue header it is sent.
+    """
+    resolved = await _resolve_target(spec, isp, request, args)
+    await _cross_check_headers(isp, request, resolved)
+    return resolved
+
+
+def _header_uuid(request: Request, header: str) -> uuid.UUID | None:
+    raw = request.headers.get(header)
+    return _scope_header(request, header) if raw else None
+
+
+async def _cross_check_headers(
+    isp: IspContext, request: Request, resolved: tuple[Any, Any, Any, Any]
+) -> None:
+    _target, org_id, location_id, _router = resolved
+    customer_h = _header_uuid(request, HEADER_CUSTOMER)
+    location_h = _header_uuid(request, HEADER_LOCATION)
+    if customer_h is not None:
+        customer = await IspScope.assert_customer(isp, customer_h)
+        if org_id is not None and customer.id != org_id:
+            raise IspCustomerNotFoundError()
+        org_id = org_id or customer.id
+    if location_h is not None:
+        if location_id is not None:
+            if location_h != location_id:
+                raise IspLocationNotFoundError()
+        else:
+            location = await IspScope.assert_location(isp, location_h)
+            if org_id is not None and location.organization_id != org_id:
+                raise IspLocationNotFoundError()
+
+
+async def _resolve_target(
     spec: TwinSpec, isp: IspContext, request: Request, args: dict[str, Any]
 ):
     """Resolve the row the caller named, via the shared ``IspScope``.
@@ -396,6 +444,8 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         # is refused here, before the handler runs.
         for extra in spec.extras:
             value = kwargs.get(extra.name)
+            if value is None and extra.validate_only:
+                continue
             if value is None:
                 if extra.required:  # pragma: no cover - FastAPI enforces it
                     raise AssertionError(f"{extra.name} is required")
@@ -418,6 +468,8 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
                 and row_location != resolved[2]
             ):
                 raise _not_found_for(extra.target)
+            if extra.validate_only:
+                continue
             kwargs_for_handler[extra.forward] = getattr(row, extra.attr)
             for also in extra.forward_also:
                 kwargs_for_handler[also] = getattr(row, extra.attr)
