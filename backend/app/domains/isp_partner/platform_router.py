@@ -26,3 +26,9 @@ __all__ = ["isp_partner_platform_router"]
 from .isp_addons import addon_platform_router  # noqa: E402
 
 isp_partner_platform_router.include_router(addon_platform_router)
+
+# ADDENDUM_04 F1-F3 (PARITY-2, parity_settings.py): per-ISP unmask switch and
+# the ISP's messaging credit wallet, GLOBAL-pinned on organizations.*.
+from .parity_settings import parity_platform_router  # noqa: E402
+
+isp_partner_platform_router.include_router(parity_platform_router)
