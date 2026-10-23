@@ -411,7 +411,10 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         for kwarg in spec.deps:
             kwargs_for_handler[kwarg] = kwargs[kwarg]
         force_masking()
-        result = await spec.handler(request, **kwargs_for_handler)
+        # By keyword: some originals declare a path id BEFORE ``request``
+        # (the Traffic Lens customer routes), where a positional call would
+        # bind the request to that id.
+        result = await spec.handler(request=request, **kwargs_for_handler)
         return redact(result, spec.redact_fields)
 
     # -- the signature FastAPI actually reads -------------------------------

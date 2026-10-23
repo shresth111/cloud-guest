@@ -19,3 +19,10 @@ isp_partner_platform_router = APIRouter(
 )
 
 __all__ = ["isp_partner_platform_router"]
+
+
+# ADDENDUM_04 B6 §2 (PARITY-2): Master's per-ISP add-on allowance
+# (``isp_addons.py``), GLOBAL-pinned on organizations.* like the routes above.
+from .isp_addons import addon_platform_router  # noqa: E402
+
+isp_partner_platform_router.include_router(addon_platform_router)

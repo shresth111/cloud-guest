@@ -975,6 +975,11 @@ def _include_lanes() -> None:
     from .monitor_support import monitor_support_router
 
     isp_partner_router.include_router(monitor_support_router)
+    # ADDENDUM_04 B6 §2: the ISP's per-customer add-on toggle (the Master
+    # allowance routes are registered in platform_router.py).
+    from .isp_addons import isp_addons_router
+
+    isp_partner_router.include_router(isp_addons_router)
 
 
 _include_lanes()

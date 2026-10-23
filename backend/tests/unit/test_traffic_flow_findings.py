@@ -1489,7 +1489,12 @@ class TestMasterRoute:
     def test_exactly_one_master_and_one_customer_route(self) -> None:
         from app.api.v1.router import api_v1_router
 
-        assert sorted(r.path for r in api_v1_router.routes if "findings" in r.path) == [
+        assert sorted(
+            r.path
+            for r in api_v1_router.routes
+            # ISP venue twins (ADDENDUM_04 B6) excluded: same handler, ISP guards.
+            if "findings" in r.path and not r.path.startswith("/isp/venue/")
+        ) == [
             "/platform/traffic-flow/findings",
             "/traffic-flow/locations/{location_id}/findings",
         ]
