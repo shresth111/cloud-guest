@@ -35,10 +35,11 @@ import pytest
 from starlette.requests import Request
 
 from app.domains.isp_partner.twin_gates import GATE_KWARG
-from app.domains.isp_partner.twin_headers import HEADER_LOCATION
+from app.domains.isp_partner.twin_headers import HEADER_CUSTOMER, HEADER_LOCATION
 from app.domains.isp_partner.twins import Param, TwinSpec, build_twin
-from app.domains.isp_partner.twins_venue import VENUE_TWINS
+from app.domains.isp_partner.twins_all import ALL_TWINS as VENUE_TWINS
 from tests.unit.isp_partner_fixtures import (
+    CFG_A1,
     CUST_A1,
     ISP_A,
     LOC_A1,
@@ -54,7 +55,11 @@ FORBIDDEN_PARAM_NAMES = {"organization_id", "customer_id", "location_id", "route
 def _request(**headers: str) -> Request:
     raw = [
         (k.lower().encode(), v.encode())
-        for k, v in {"X-Organization-Id": str(ISP_A), **headers}.items()
+        for k, v in {
+            "X-Organization-Id": str(ISP_A),
+            HEADER_CUSTOMER: str(CUST_A1),
+            **headers,
+        }.items()
     ]
     return Request({"type": "http", "method": "GET", "headers": raw, "path": "/"})
 
@@ -156,16 +161,29 @@ def _kwargs(spec: TwinSpec) -> dict:
 
         out[GATE_KWARG] = entitled_everything()
     for param in spec.params:
-        if param.required:
+        if param.name == spec.resolve_param:
+            # The row resolves through this id: a real fixture row of CUST_A1.
+            out[param.name] = _RESOLVABLE[spec.target]
+        elif param.required:
             out[param.name] = _sample(param)
         elif param.source == "query":
             out[param.name] = param.default
+        else:  # an optional body part, e.g. an UploadFile with a File() default
+            out[param.name] = object()
     for extra in spec.extras:
         # A real fixture row, not a random id: resolution runs before the
         # handler, so a made-up id would 404 and never reach the recorder.
         out[extra.name] = _KNOWN[extra.target] if extra.required else None
     return out
 
+
+#: A resolvable id per path-resolved target, all CUST_A1's.
+_RESOLVABLE = {
+    "customer": CUST_A1,
+    "portal_config": CFG_A1,
+    "location": LOC_A1,
+    "router": RTR_A1,
+}
 
 #: Real rows from ``estate()``, all belonging to ISP A's customer CUST_A1.
 _KNOWN = {"router": RTR_A1, "location": LOC_A1, "customer": CUST_A1}

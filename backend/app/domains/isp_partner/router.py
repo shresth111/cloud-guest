@@ -88,7 +88,7 @@ from .twin_gates import (
     get_twin_entitlement_checker,
 )
 from .twins import mount_twins
-from .twins_venue import VENUE_TWINS
+from .twins_all import ALL_TWINS
 
 __all__ = ["isp_partner_router"]
 
@@ -965,7 +965,11 @@ def _include_lanes() -> None:
     isp_partner_router.include_router(plans_router)
     # Phase 2c: the venue twins (the customer dashboard's own feature set,
     # ISP-gated). One table row per endpoint -- see ``twins.py``.
-    mount_twins(isp_partner_router, VENUE_TWINS)
+    mount_twins(isp_partner_router, ALL_TWINS)
+    # The venue's answer to /me/organizations (see venue_session.py).
+    from .venue_session import venue_session_router
+
+    isp_partner_router.include_router(venue_session_router)
 
 
 _include_lanes()
