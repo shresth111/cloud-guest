@@ -970,6 +970,11 @@ def _include_lanes() -> None:
     from .venue_session import venue_session_router
 
     isp_partner_router.include_router(venue_session_router)
+    # ADDENDUM_04 B5: venue alert rules, ISP alert feed, ISP->Wyfy support
+    # tickets, staff activity (see monitor_support.py).
+    from .monitor_support import monitor_support_router
+
+    isp_partner_router.include_router(monitor_support_router)
 
 
 _include_lanes()
