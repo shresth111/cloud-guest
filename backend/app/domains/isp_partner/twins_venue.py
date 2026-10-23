@@ -755,6 +755,8 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         path="/venue/guest-sessions",
         permission_key=ISP_ACCESS_READ,
         handler=guest_routes.list_guest_sessions,
+        # F2: the original returns this as a plain, unmasked str.
+        redact_fields=("guest_identifier",),
         target="header_location",
         params=(
             _Page,
@@ -856,6 +858,8 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         path="/venue/analytics/voucher-redemptions/log",
         permission_key=ISP_ACCESS_READ,
         handler=analytics_routes.list_voucher_redemptions,
+        # F2: the original returns this as a plain, unmasked str.
+        redact_fields=("redeemed_identifier",),
         target="header_location",
         params=(
             _Page,
@@ -876,6 +880,8 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         path="/venue/otp/requests",
         permission_key=ISP_ACCESS_READ,
         handler=otp_routes.list_otp_requests,
+        # F2: the original returns this as a plain, unmasked str.
+        redact_fields=("identifier",),
         target="header_location",
         params=(
             _Page,
