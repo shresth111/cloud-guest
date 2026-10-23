@@ -89,6 +89,24 @@ PERMISSION_GROUPS: tuple[IspPermissionGroup, ...] = (
         actions=("read", "update"),
         sort_order=1009,
     ),
+    # Phase 2c: the venue twins. One group covers the customer network/QoS
+    # domains the ISP runs on a customer's venue (DHCP pools, VLANs, port
+    # forwarding, QoS). Adding another customer domain means adding its own
+    # group here, not widening this one -- the keys are the audit surface.
+    IspPermissionGroup(
+        key="isp_network",
+        name="ISP Venue Network",
+        actions=("read", "create", "update", "delete", "execute"),
+        sort_order=1010,
+    ),
+    # The venue twins' Access & Policy surface: access rules, the guest
+    # allow-list, trusted devices and open hours.
+    IspPermissionGroup(
+        key="isp_access",
+        name="ISP Venue Access",
+        actions=("read", "create", "update", "delete", "execute"),
+        sort_order=1011,
+    ),
 )
 
 ALLOWED_SCOPE_TYPES: tuple[ScopeType, ...] = (ScopeType.ORGANIZATION,)
@@ -127,6 +145,8 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_plans="read create update delete",
             isp_coupons="read create export update",
             isp_subscribers="read update",
+            isp_network="read create update delete execute",
+            isp_access="read create update delete execute",
         ),
     ),
     IspRoleDefinition(
@@ -144,6 +164,8 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_plans="read create update delete",
             isp_coupons="read create export update",
             isp_subscribers="read update",
+            isp_network="read create update delete execute",
+            isp_access="read create update delete execute",
         ),
     ),
     IspRoleDefinition(
@@ -159,6 +181,8 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_plans="read",
             isp_coupons="read",
             isp_subscribers="read",
+            isp_network="read execute",
+            isp_access="read",
         ),
     ),
     IspRoleDefinition(
@@ -173,6 +197,8 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_plans="read",
             isp_coupons="read export",
             isp_subscribers="read",
+            isp_network="read create update execute",
+            isp_access="read create update",
         ),
     ),
     IspRoleDefinition(
@@ -188,6 +214,8 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_plans="read",
             isp_coupons="read",
             isp_subscribers="read",
+            isp_network="read",
+            isp_access="read",
         ),
     ),
     IspRoleDefinition(

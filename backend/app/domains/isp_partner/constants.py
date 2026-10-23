@@ -120,3 +120,24 @@ ISP_INVOICES_EXPORT = "isp_invoices.export"
 ISP_INVOICES_MANAGE = "isp_invoices.manage"
 ISP_ZONES_READ = "isp_zones.read"
 ISP_ZONES_MANAGE = "isp_zones.manage"
+
+# -- Phase 2c: venue twins (the customer dashboard's own feature set) ---------
+#
+# One group per customer domain the ISP manages on a customer's venue. The
+# keys are the ISP-side gate for the ``/isp/venue/*`` twins in ``twins_venue``:
+# a twin checks one of these on the ISP org, then calls the customer handler
+# with ``requesting_organization_id=<the customer>``. No customer key
+# (``dhcp.read``, ``vlan.read``, ...) is ever granted to an ISP role.
+ISP_NETWORK_READ = "isp_network.read"
+ISP_NETWORK_CREATE = "isp_network.create"
+ISP_NETWORK_UPDATE = "isp_network.update"
+ISP_NETWORK_DELETE = "isp_network.delete"
+ISP_NETWORK_EXECUTE = "isp_network.execute"
+
+#: The customer app's Access & Policy screens: access rules (policies), the
+#: guest allow-list, trusted devices (MAC authorization) and open hours.
+ISP_ACCESS_READ = "isp_access.read"
+ISP_ACCESS_CREATE = "isp_access.create"
+ISP_ACCESS_UPDATE = "isp_access.update"
+ISP_ACCESS_DELETE = "isp_access.delete"
+ISP_ACCESS_EXECUTE = "isp_access.execute"

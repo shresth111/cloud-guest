@@ -91,6 +91,32 @@ EXPECTED["isp-technician"] |= {
 }
 for _slug in ("isp-noc", "isp-viewer"):
     EXPECTED[_slug] |= {"isp_plans.read", "isp_coupons.read", "isp_subscribers.read"}
+# Phase 2c additions: the venue twins (the customer dashboard's own feature
+# set, ISP-gated). One group today; each further customer domain gets its own.
+_NETWORK_FULL = {
+    f"isp_network.{a}" for a in "read create update delete execute".split()
+}
+_NETWORK_CONFIGURE = {
+    "isp_network.read",
+    "isp_network.create",
+    "isp_network.update",
+    "isp_network.execute",
+}
+EXPECTED["isp-owner"] |= _NETWORK_FULL
+EXPECTED["isp-noc"] |= {"isp_network.read", "isp_network.execute"}
+EXPECTED["isp-technician"] |= _NETWORK_CONFIGURE
+EXPECTED["isp-viewer"] |= {"isp_network.read"}
+# ... and the Access & Policy surface (policies, allow-list, trusted devices,
+# open hours).
+_ACCESS_FULL = {f"isp_access.{a}" for a in "read create update delete execute".split()}
+EXPECTED["isp-owner"] |= _ACCESS_FULL
+EXPECTED["isp-noc"] |= {"isp_access.read"}
+EXPECTED["isp-technician"] |= {
+    "isp_access.read",
+    "isp_access.create",
+    "isp_access.update",
+}
+EXPECTED["isp-viewer"] |= {"isp_access.read"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -196,8 +222,8 @@ async def test_seeding_never_changes_a_pre_existing_role(repo) -> None:
 async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
-    assert summary.permission_groups_created == 10
-    assert summary.permissions_created == 37
+    assert summary.permission_groups_created == 12
+    assert summary.permissions_created == 47
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED
