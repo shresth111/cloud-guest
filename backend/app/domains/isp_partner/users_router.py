@@ -13,11 +13,18 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.user.dependencies import get_identity_repository, get_user_service
 from app.domains.user.service import UserService
 
-from .constants import DEFAULT_PAGE_SIZE, ISP_PARTNER_ASSIGN, MAX_PAGE_SIZE
+from .constants import (
+    DEFAULT_PAGE_SIZE,
+    ISP_PARTNER_ASSIGN,
+    ISP_ROLE_SLUGS,
+    MAX_PAGE_SIZE,
+)
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .http import ok
 from .schemas import IspUserCreateRequest, IspUserScopeRequest, IspUserUpdateRequest
 from .users_service import IspUsersService
+
+_ROLE_PATTERN = "^(" + "|".join(sorted(ISP_ROLE_SLUGS)) + ")$"
 
 users_router = APIRouter(tags=["ISP Partner: users"])
 _GUARDS = isp_guards(ISP_PARTNER_ASSIGN)
@@ -46,7 +53,8 @@ async def list_users(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     search: str | None = Query(default=None, max_length=200),
-    role: str | None = Query(default=None, max_length=50),
+    # QA-009: an isp-* role slug or a 422 (not a silently empty list).
+    role: str | None = Query(default=None, pattern=_ROLE_PATTERN),
     status_filter: str | None = Query(
         default=None, alias="status", pattern="^(active|disabled)$"
     ),

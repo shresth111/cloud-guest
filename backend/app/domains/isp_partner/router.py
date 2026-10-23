@@ -33,7 +33,9 @@ from app.domains.captive_portal.schemas import CaptivePortalConfigUpdateRequest
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest import router as guest_routes
 from app.domains.guest.dependencies import get_radius_service
+from app.domains.location.enums import LocationStatus
 from app.domains.location.models import Location
+from app.domains.organization.enums import OrganizationStatus
 from app.domains.organization.models import Organization
 from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import (
@@ -45,6 +47,7 @@ from app.domains.rbac.enums import ScopeType
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router import router as router_routes
 from app.domains.router.dependencies import get_router_service
+from app.domains.router.enums import RouterStatus
 from app.domains.router.schemas import RouterManagementAccessRequest
 from app.domains.router.service import RouterService
 from app.domains.router_agent.dependencies import get_router_agent_service
@@ -91,6 +94,17 @@ from .twins import mount_twins
 from .twins_all import ALL_TWINS
 
 __all__ = ["isp_partner_router"]
+
+
+def _one_of(values) -> str:
+    """QA-009: a status filter takes a known value or is a 422, never a
+    silently empty list."""
+    return "^(" + "|".join(sorted(str(v.value) for v in values)) + ")$"
+
+
+_CUSTOMER_STATUS = _one_of(OrganizationStatus)
+_LOCATION_STATUS = _one_of(LocationStatus)
+_ROUTER_STATUS = _one_of(RouterStatus)
 
 isp_partner_router = APIRouter(
     prefix="/isp",
@@ -193,7 +207,9 @@ async def list_customers(
     request: Request,
     page: int = _Page,
     page_size: int = _PageSize,
-    status_filter: str | None = Query(default=None, alias="status", max_length=20),
+    status_filter: str | None = Query(
+        default=None, alias="status", pattern=_CUSTOMER_STATUS
+    ),
     search: str | None = Query(default=None, max_length=200),
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
@@ -294,7 +310,9 @@ async def list_customer_locations(
     # One customer has a few venues: default to the maximum page so a client
     # that sends no paging params gets them all (CONTRACT_CHANGES FE #5).
     page_size: int = Query(default=MAX_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-    status_filter: str | None = Query(default=None, alias="status", max_length=20),
+    status_filter: str | None = Query(
+        default=None, alias="status", pattern=_LOCATION_STATUS
+    ),
     search: str | None = Query(default=None, max_length=200),
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
@@ -332,7 +350,9 @@ async def list_locations(
     isp_customer_id: uuid.UUID | None = Query(default=None),
     page: int = _Page,
     page_size: int = _PageSize,
-    status_filter: str | None = Query(default=None, alias="status", max_length=20),
+    status_filter: str | None = Query(
+        default=None, alias="status", pattern=_LOCATION_STATUS
+    ),
     search: str | None = Query(default=None, max_length=200),
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
@@ -408,7 +428,9 @@ async def list_routers(
     request: Request,
     isp_customer_id: uuid.UUID | None = Query(default=None),
     isp_location_id: uuid.UUID | None = Query(default=None),
-    status_filter: str | None = Query(default=None, alias="status", max_length=30),
+    status_filter: str | None = Query(
+        default=None, alias="status", pattern=_ROUTER_STATUS
+    ),
     page: int = _Page,
     page_size: int = _PageSize,
     isp: IspContext = Depends(RequireIspPartner),
@@ -750,9 +772,7 @@ async def update_portal_config(
     checker: Any = Depends(get_twin_entitlement_checker),
 ) -> dict:
     config = await IspScope.assert_portal_config(isp, config_id)
-    await _hand_gate(
-        "update_portal_config", request, checker, config.organization_id
-    )
+    await _hand_gate("update_portal_config", request, checker, config.organization_id)
     return await portal_routes.update_captive_portal_config(
         request,
         config_id=config.id,
@@ -776,9 +796,7 @@ async def activate_portal_config(
     checker: Any = Depends(get_twin_entitlement_checker),
 ) -> dict:
     config = await IspScope.assert_portal_config(isp, config_id)
-    await _hand_gate(
-        "activate_portal_config", request, checker, config.organization_id
-    )
+    await _hand_gate("activate_portal_config", request, checker, config.organization_id)
     return await portal_routes.activate_captive_portal_config(
         request,
         config_id=config.id,
