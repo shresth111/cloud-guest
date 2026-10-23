@@ -769,6 +769,28 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
             "status_filter": ("const", None),
         },
     ),
+    # -- Reports: guests (the other half of the report catalogue's base) ------
+    TwinSpec(
+        method="GET",
+        path="/venue/guests",
+        permission_key=ISP_ACCESS_READ,
+        handler=guest_routes.list_guests,
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("search", "query", str | None, None),
+        ),
+        deps={"service": get_guest_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "location_id": ("location",),
+            "scope_location_id": ("location",),
+            # Not exposed; supplied explicitly so the handler's Query default
+            # never reaches the DB layer.
+            "is_blocked": ("const", None),
+        },
+    ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------
     TwinSpec(
         method="GET",
