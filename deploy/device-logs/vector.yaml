@@ -42,8 +42,15 @@ transforms:
     type: throttle
     inputs: [shape]
     key_field: "{{ source_ip }}"
-    threshold: 3000
+    # NETLOGS_DISPLAY_CAP_PER_MIN: lines per router per minute kept for the
+    # online index (unset = 3000, the value this file always had). Must be > 0.
+    # NETLOGS_DISPLAY_CAP_UNLIMITED=true: no cap at all (every line is
+    # excluded from the throttle). Both are read once, at config load.
+    threshold: ${NETLOGS_DISPLAY_CAP_PER_MIN:-3000}
     window_secs: 60
+    exclude:
+      type: vrl
+      source: '"${NETLOGS_DISPLAY_CAP_UNLIMITED:-false}" == "true"'
 
 sinks:
   raw_archive:
