@@ -133,3 +133,29 @@ async def test_policy_target_user_or_role_is_refused(target_type) -> None:
             (BodyId("target_id", "policy_target"),),
             _Body(target_type=target_type, target_id=uuid.uuid4()),
         )
+
+
+async def test_policy_target_guest_is_refused_until_357_is_on_main(monkeypatch) -> None:
+    from app.domains.isp_partner import policy
+
+    body = _Body(target_type="guest", target_id=uuid.uuid4())
+    with pytest.raises(IspBadRequestError):
+        await _apply((BodyId("target_id", "policy_target"),), body)
+    monkeypatch.setenv("ISP_PARTNER_POLICY_GUEST_TARGETS", "true")
+    policy.get_isp_partner_policy.cache_clear()
+    try:
+        await _apply((BodyId("target_id", "policy_target"),), body)
+    finally:
+        policy.get_isp_partner_policy.cache_clear()
+
+
+def test_guest_teams_list_always_forces_the_workspace_location() -> None:
+    """Open defect PR #309: an empty location_id lists the whole org."""
+    from app.domains.isp_partner.twins_access import ACCESS_TWINS
+
+    listing = next(
+        s for s in ACCESS_TWINS if s.method == "GET" and s.path == "/venue/guest-teams"
+    )
+    assert listing.inject["location_id"] == ("location",)
+    assert listing.target == "header_location"
+    assert all(p.name != "location_id" for p in listing.params)

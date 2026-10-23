@@ -28,10 +28,11 @@ Modes
                      ``location`` -> must be the header location, ``router`` ->
                      pinned like ``router``; anything else (``global``, ``msp``)
                      is refused (422).
-``policy_target``    the ``target_type``/``target_id`` pair: ``none``,
-                     ``members`` and ``guest`` pass (a guest id is checked by
-                     the service against the customer org); ``user``/``role``
-                     are refused -- an ISP customer has no users or roles.
+``policy_target``    the ``target_type``/``target_id`` pair: ``none`` and
+                     ``members`` pass; ``user``/``role`` are refused (an ISP
+                     customer has none); ``guest`` is refused until the
+                     cross-org target fix (PR #357, staging only) is on main
+                     -- ``ISP_PARTNER_POLICY_GUEST_TARGETS=true`` lifts it.
 ``opaque``           not a tenant id (a VLAN tag number, say). Declared so the
                      coverage test knows it was looked at.
 """
@@ -146,6 +147,15 @@ async def apply_body_ids(
                 raise IspBadRequestError(
                     "an ISP customer has no users or roles to target"
                 )
+            if kind == "guest":
+                from .policy import get_isp_partner_policy
+
+                if not get_isp_partner_policy().policy_guest_targets:
+                    # PR #357 (cross-org target check) is not on main yet.
+                    raise IspBadRequestError(
+                        "assigning an access rule to one guest is not available "
+                        "from the partner console yet"
+                    )
         else:  # pragma: no cover - a typo in the table, caught by tests
             raise AssertionError(f"unknown body id mode {spec.mode!r}")
         kwargs[spec.param] = payload
