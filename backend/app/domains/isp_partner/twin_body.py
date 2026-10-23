@@ -28,10 +28,16 @@ Modes
                      ``location`` -> must be the header location, ``router`` ->
                      pinned like ``router``; anything else (``global``, ``msp``)
                      is refused (422).
-``policy_target``    the ``target_type``/``target_id`` pair: ``none``,
-                     ``members`` and ``guest`` pass (a guest id is checked by
-                     the service against the customer org); ``user``/``role``
-                     are refused -- an ISP customer has no users or roles.
+``policy_target``    the ``target_type``/``target_id`` pair: ``none`` and
+                     ``members`` pass; ``user``/``role`` are refused (an ISP
+                     customer has none); ``guest`` is refused until the
+                     cross-org target fix (PR #357, staging only) is on main
+                     -- ``ISP_PARTNER_POLICY_GUEST_TARGETS=true`` lifts it.
+``service_checked``  a row id the original SERVICE loads with
+                     ``requesting_organization_id`` (404 for another org) and
+                     cross-checks; ``note`` must say where.
+``null_only``        a row id the original service stores WITHOUT an org
+                     check: an ISP may only send null (422 otherwise).
 ``opaque``           not a tenant id (a VLAN tag number, say). Declared so the
                      coverage test knows it was looked at.
 """
@@ -57,6 +63,8 @@ BodyIdMode = Literal[
     "force_location",
     "policy_scope",
     "policy_target",
+    "service_checked",
+    "null_only",
     "opaque",
 ]
 
@@ -67,6 +75,8 @@ class BodyId:
     mode: BodyIdMode
     #: Name of the body parameter this applies to (``payload`` everywhere today).
     param: str = "payload"
+    #: Required for ``service_checked``: where the service checks it.
+    note: str = ""
 
 
 def is_id_shaped(name: str) -> bool:
@@ -116,6 +126,14 @@ async def apply_body_ids(
         if payload is None or spec.mode == "opaque":
             continue
         raw = getattr(payload, spec.field, None)
+        if spec.mode == "service_checked":
+            continue
+        if spec.mode == "null_only":
+            if raw not in (None, ""):
+                raise IspBadRequestError(
+                    f"{spec.field} cannot be set from the partner console"
+                )
+            continue
         if spec.mode == "router":
             pinned = await _pinned_router(isp, raw, org_id, location_id)
             if pinned is not None:
@@ -146,6 +164,15 @@ async def apply_body_ids(
                 raise IspBadRequestError(
                     "an ISP customer has no users or roles to target"
                 )
+            if kind == "guest":
+                from .policy import get_isp_partner_policy
+
+                if not get_isp_partner_policy().policy_guest_targets:
+                    # PR #357 (cross-org target check) is not on main yet.
+                    raise IspBadRequestError(
+                        "assigning an access rule to one guest is not available "
+                        "from the partner console yet"
+                    )
         else:  # pragma: no cover - a typo in the table, caught by tests
             raise AssertionError(f"unknown body id mode {spec.mode!r}")
         kwargs[spec.param] = payload

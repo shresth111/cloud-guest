@@ -46,6 +46,12 @@ class IspPartnerPolicy(BaseSettings):
     pii_unmasked: bool = Field(default=False)
     byo_sender_scope: Literal["isp", "customer"] = Field(default="isp")
     white_label: Literal["plan", "off"] = Field(default="plan")
+    #: Not a founder question: a safety latch. The policy-assignment cross-org
+    #: fix (PR #357) is merged to staging but NOT to main, so on main a
+    #: ``target_type="guest"`` assignment is not checked against the org. The
+    #: twins refuse guest targets until it lands; then set
+    #: ISP_PARTNER_POLICY_GUEST_TARGETS=true.
+    policy_guest_targets: bool = Field(default=False)
 
 
 @lru_cache(maxsize=1)
