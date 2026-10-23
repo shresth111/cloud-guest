@@ -55,6 +55,7 @@ def test_auto_twin_refuses_an_unknown_override() -> None:
 def test_auto_twin_forces_location_and_never_exposes_scope_aliases() -> None:
     for spec in ENGAGE_TWINS:
         exposed = {p.name for p in spec.params} | {e.name for e in spec.extras}
-        assert not exposed & {"organization_id", "customer_id", "location_id", "router_id"}
+        aliases = {"organization_id", "customer_id", "location_id", "router_id"}
+        assert not exposed & aliases
         if "location_id" in spec.inject:
             assert spec.inject["location_id"] == ("location",)
