@@ -288,6 +288,20 @@ IspInvoiceDateOutOfRangeError = _err(
 IspBuyerGstinInvalidError = _err(
     "IspBuyerGstinInvalidError", "ISP_BUYER_GSTIN_INVALID", 422, "GSTIN is not valid"
 )
+# QA-007: SMS reminders are deferred (founder Q13); never report one as sent.
+IspSmsRemindersUnavailableError = _err(
+    "IspSmsRemindersUnavailableError",
+    "ISP_SMS_REMINDERS_UNAVAILABLE",
+    409,
+    "SMS reminders are not available yet. Send an e-mail reminder instead.",
+)
+# QA-004: the ISP's own (seller) GSTIN in billing/invoice settings.
+IspSellerGstinInvalidError = _err(
+    "IspSellerGstinInvalidError",
+    "ISP_SELLER_GSTIN_INVALID",
+    422,
+    "Your GSTIN is not valid",
+)
 IspZoneInUseError = _err(
     "IspZoneInUseError", "ISP_ZONE_IN_USE", 409, "The zone is still assigned"
 )

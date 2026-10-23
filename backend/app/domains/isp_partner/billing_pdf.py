@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 from typing import Any
 from urllib.parse import quote
+from xml.sax.saxutils import escape
 
 from reportlab.graphics.barcode.qr import QrCodeWidget
 from reportlab.graphics.shapes import Drawing
@@ -67,6 +68,34 @@ def _table(rows: list[list[Any]], widths: list[float] | None = None) -> Table:
     return t
 
 
+def _e(value: Any) -> str:
+    """Escape a value for a reportlab Paragraph (its mini-HTML chokes on & < >)."""
+    return escape(str(value)) if value is not None else ""
+
+
+def bill_to_text(view: dict) -> str:
+    """The "Bill to" line, already escaped for a reportlab Paragraph.
+
+    Customer-billed invoices name the customer. Subscriber invoices (manual,
+    recharge, coupon activation: ADDENDUM_03 Part B) carry ``customer: None``
+    and a ``subscriber`` block instead: name (or username), username, circuit
+    id, and the venue (the ISP customer) they are at."""
+    customer = view.get("customer")
+    if customer:
+        return escape(str(customer.get("name") or "-"))
+    sub = view.get("subscriber") or {}
+    full = " ".join(p for p in (sub.get("first_name"), sub.get("last_name")) if p)
+    username = sub.get("username")
+    parts = [escape(full or str(username or "Subscriber"))]
+    if username and full:
+        parts.append(f"Username: {escape(str(username))}")
+    if sub.get("circuit_id"):
+        parts.append(f"Circuit ID: {escape(str(sub['circuit_id']))}")
+    if view.get("customer_name"):
+        parts.append(f"At: {escape(str(view['customer_name']))}")
+    return " &nbsp; ".join(parts)
+
+
 def render_invoice_pdf(
     view: dict, *, seller: dict, isp_name: str, against: str | None = None
 ) -> bytes:
@@ -78,10 +107,10 @@ def render_invoice_pdf(
     gst = view["cgst_paise"] or view["sgst_paise"] or view["igst_paise"]
     title = "Credit Note" if is_note else ("Tax Invoice" if gst else "Bill of Supply")
     story: list[Any] = [
-        Paragraph(f"<b>{isp_name}</b>", styles["Title"]),
+        Paragraph(f"<b>{escape(isp_name)}</b>", styles["Title"]),
         Paragraph(
-            f"{seller.get('legal_name') or isp_name}<br/>{seller.get('address') or ''}<br/>"  # noqa: E501
-            f"GSTIN: {seller.get('gstin') or '-'} &nbsp; State code: {seller.get('state_code') or '-'}",  # noqa: E501
+            f"{_e(seller.get('legal_name') or isp_name)}<br/>{_e(seller.get('address'))}<br/>"  # noqa: E501
+            f"GSTIN: {_e(seller.get('gstin') or '-')} &nbsp; State code: {_e(seller.get('state_code') or '-')}",  # noqa: E501
             styles["Normal"],
         ),
         Spacer(1, 0.4 * cm),
@@ -103,13 +132,17 @@ def render_invoice_pdf(
     story += [
         Spacer(1, 0.3 * cm),
         Paragraph(
-            f"<b>Bill to:</b> {view['customer']['name']}"
+            f"<b>Bill to:</b> {bill_to_text(view)}"
             + (
-                f" &nbsp; GSTIN: {view['buyer_gstin']}"
+                f" &nbsp; GSTIN: {escape(str(view['buyer_gstin']))}"
                 if view.get("buyer_gstin")
                 else ""
             )
-            + (f" &nbsp; PO: {view['po_number']}" if view.get("po_number") else ""),
+            + (
+                f" &nbsp; PO: {escape(str(view['po_number']))}"
+                if view.get("po_number")
+                else ""
+            ),
             styles["Normal"],
         ),
         Spacer(1, 0.3 * cm),
@@ -143,7 +176,7 @@ def render_invoice_pdf(
         )
         body.append(
             [
-                Paragraph(li["description"], styles["Normal"]),
+                Paragraph(escape(str(li["description"] or "")), styles["Normal"]),
                 li["sac_code"],
                 period,
                 rupees(li["taxable_paise"]),
@@ -204,7 +237,7 @@ def render_invoice_pdf(
                 ),
             ]
     if seller.get("invoice_footer"):
-        story.append(Paragraph(seller["invoice_footer"], styles["Normal"]))
+        story.append(Paragraph(_e(seller["invoice_footer"]), styles["Normal"]))
     story += [
         Spacer(1, 0.5 * cm),
         Paragraph("Computer-generated document.", styles["Italic"]),
@@ -225,10 +258,10 @@ def render_receipt_pdf(
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5 * cm, rightMargin=1.5 * cm)
     story = [
-        Paragraph(f"<b>{isp_name}</b>", styles["Title"]),
+        Paragraph(f"<b>{escape(isp_name)}</b>", styles["Title"]),
         Paragraph(
-            f"{seller.get('legal_name') or isp_name}<br/>{seller.get('address') or ''}<br/>"  # noqa: E501
-            f"GSTIN: {seller.get('gstin') or '-'}",
+            f"{_e(seller.get('legal_name') or isp_name)}<br/>{_e(seller.get('address'))}<br/>"  # noqa: E501
+            f"GSTIN: {_e(seller.get('gstin') or '-')}",
             styles["Normal"],
         ),
         Spacer(1, 0.4 * cm),
@@ -246,7 +279,9 @@ def render_receipt_pdf(
             ]
         ),
         Spacer(1, 0.3 * cm),
-        Paragraph(f"Received from: {customer_name}", styles["Normal"]),
+        Paragraph(
+            f"Received from: {escape(str(customer_name or '-'))}", styles["Normal"]
+        ),
         Paragraph(
             f"Amount in words: {rupees_in_words(payment['amount_paise'])}",
             styles["Normal"],
@@ -256,7 +291,7 @@ def render_receipt_pdf(
     if payment["status"] == "voided":
         story.append(
             Paragraph(
-                f"<b>VOIDED</b>: {payment.get('voided_reason') or ''}", styles["Normal"]
+                f"<b>VOIDED</b>: {_e(payment.get('voided_reason'))}", styles["Normal"]
             )
         )
     story += [
