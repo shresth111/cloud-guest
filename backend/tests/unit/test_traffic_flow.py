@@ -1446,7 +1446,13 @@ class TestAuthorization:
         # and nothing else:
         # no Master route is reachable without the GLOBAL pin.
         assert {
-            p for p in paths if "traffic-flow" in p and not p.startswith("/platform/")
+            p
+            for p in paths
+            if "traffic-flow" in p
+            and not p.startswith("/platform/")
+            # ISP partner venue twins (ADDENDUM_04 B6) call these same
+            # handlers behind the ISP guard stack; not customer routes.
+            and not p.startswith("/isp/venue/")
         } == {
             "/traffic-flow/locations/{location_id}/status",
             "/traffic-flow/locations/{location_id}/summary",

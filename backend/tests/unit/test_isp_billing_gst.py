@@ -174,6 +174,8 @@ def test_no_suspension_or_billing_route_takes_a_router_or_nas_id() -> None:
         path = getattr(route, "path", "")
         if "/isp/" not in path:
             continue
+        if path.startswith("/api/v1/isp/venue/"):
+            continue  # venue twins (e.g. Traffic Lens "/services/destinations")
         if not any(
             part in path for part in ("/service", "/billing", "/invoices", "/zones")
         ):
