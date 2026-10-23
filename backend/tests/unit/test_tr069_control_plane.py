@@ -331,13 +331,65 @@ def test_acs_auth_good_credential_is_204_with_user_header(edge) -> None:
     assert r.headers["X-Wyfy-Acs-User"] == edge.cred.username
 
 
-def test_acs_auth_positive_result_is_cached(edge) -> None:
+def _count_verifies(monkeypatch) -> list[int]:
+    calls = [0]
+    real = internal_router.verify_password
+
+    def counting(password, password_hash):
+        calls[0] += 1
+        return real(password, password_hash)
+
+    monkeypatch.setattr(internal_router, "verify_password", counting)
+    return calls
+
+
+def test_acs_auth_positive_result_is_cached(edge, monkeypatch) -> None:
+    """The cache skips only the Argon2id verify. The credential row is read
+    on every request (that read is what makes "off" immediate)."""
+    verifies = _count_verifies(monkeypatch)
     for _ in range(3):
         assert (
             _call(edge, auth=_basic(edge.cred.username, edge.password)).status_code
             == 204
         )
-    assert edge.lookups == 1
+    assert verifies[0] == 1
+    assert edge.lookups == 3
+
+
+def _ok(state, password=None) -> int:
+    return _call(
+        state, auth=_basic(state.cred.username, password or state.password)
+    ).status_code
+
+
+def test_acs_auth_off_toggle_applies_on_the_next_request(edge) -> None:
+    """PUT /isp/tr069/customers/{id} {"enabled": false} flips the row. A CPE
+    whose positive answer is cached must get 401 on its very next request,
+    not up to 60 s later (measured on wyfy-isp-test before this fix)."""
+    assert _ok(edge) == 204  # now cached
+    edge.cred.enabled = False
+    assert _ok(edge) == 401
+    edge.cred.enabled = True
+    assert _ok(edge) == 204
+
+
+def test_acs_auth_suspended_owner_applies_on_the_next_request(edge) -> None:
+    """ISP suspended or customer disabled after a cached positive -> 401 next."""
+    assert _ok(edge) == 204
+    edge.owner_ok = False
+    assert _ok(edge) == 401
+
+
+def test_acs_auth_rotation_applies_on_the_next_request(edge) -> None:
+    """Rotate writes a new hash (same username). The old password, cached a
+    moment ago, must fail on the next request; the new one must work."""
+    old = edge.password
+    assert _ok(edge, old) == 204
+    new = credentials.generate_password()
+    edge.cred.password_hash = credentials.hash_password(new)
+    assert _ok(edge, old) == 401
+    assert _ok(edge, new) == 204
+    assert _ok(edge, old) == 401
 
 
 @pytest.mark.parametrize(
