@@ -17,6 +17,7 @@ ids.
 from __future__ import annotations
 
 import csv
+import html
 import io
 import uuid
 import zipfile
@@ -495,9 +496,7 @@ async def billing_void_invoice(
 ) -> dict:
     """1b "void" = a full credit note for the remaining balance (Part A:
     numbers are never reused or deleted)."""
-    note = await svc.credit_note(
-        isp, invoice_id, amount_paise=None, reason=payload.reason
-    )
+    note = await svc.void_invoice(isp, invoice_id, reason=payload.reason)
     return ok(
         request,
         {
@@ -1024,10 +1023,14 @@ async def _remind(
     ):
         return False
     body = (
-        f"<p>Dear {customer.name},</p><p>Invoice {inv.number} dated {inv.issue_date:%d %b %Y} "  # noqa: E501
+        f"<p>Dear {html.escape(customer.name)},</p><p>Invoice {inv.number} dated {inv.issue_date:%d %b %Y} "  # noqa: E501
         f"has a balance of Rs {balance_of(inv) / 100:.2f}, due {inv.due_date:%d %b %Y}.</p>"  # noqa: E501
-        f"<p>{isp.organization.name}"
-        + (f", {isp.profile.support_phone}" if isp.profile.support_phone else "")
+        f"<p>{html.escape(isp.organization.name)}"
+        + (
+            f", {html.escape(isp.profile.support_phone)}"
+            if isp.profile.support_phone
+            else ""
+        )
         + "</p>"
     )
     outbox = NotificationService(NotificationRepository(svc.session))
@@ -1104,6 +1107,10 @@ async def remind(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspBillingService = Depends(get_billing_service),
 ) -> dict:
+    if payload.channel != "email":
+        from .exceptions import IspSmsRemindersUnavailableError
+
+        raise IspSmsRemindersUnavailableError()
     sent = await _remind(isp, svc, invoice_id, payload.channel)
     return ok(request, {"queued": sent, "channel": payload.channel}, "Reminder")
 
