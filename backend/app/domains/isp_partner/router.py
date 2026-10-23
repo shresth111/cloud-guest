@@ -952,6 +952,10 @@ def _include_lanes() -> None:
     from .users_router import users_router
 
     isp_partner_router.include_router(logs_router)
+    # Founder 2026-10-23: NetLogs events per second (logs_rate_router.py).
+    from .logs_rate_router import logs_rate_router
+
+    isp_partner_router.include_router(logs_rate_router)
     isp_partner_router.include_router(reports_router)
     isp_partner_router.include_router(users_router)
     # Phase 1b (ADDENDUM_01, ADDENDUM_03 Part A)
