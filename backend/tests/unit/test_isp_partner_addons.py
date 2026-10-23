@@ -167,3 +167,28 @@ def test_routes_are_mounted_with_their_pins() -> None:
         ]
         expected = ScopeType.GLOBAL if "/platform/" in path else ScopeType.ORGANIZATION
         assert expected in scopes and all(s == expected for s in scopes), (path, scopes)
+
+
+def test_traffic_lens_twins_declare_traffic_flow_and_take_no_path_location() -> None:
+    from app.domains.billing.constants import PlanFeatureKey
+    from app.domains.isp_partner.twins_addons import ADDON_TWINS
+    from app.domains.isp_partner.twins_all import ALL_TWINS
+
+    assert len(ADDON_TWINS) == 6
+    for spec in ADDON_TWINS:
+        assert any(spec is t for t in ALL_TWINS)
+        assert spec.requires_features == (PlanFeatureKey.TRAFFIC_FLOW,)
+        assert "{" not in spec.path, spec.path
+        assert spec.inject["location_id"] == ("location",)
+        assert spec.inject["header_location_id"] == ("location",)
+
+
+def test_flow_records_are_not_twinned_until_f2() -> None:
+    from app.domains.isp_partner.twins_all import ALL_TWINS
+    from app.domains.traffic_flow import flow_records_customer_router as records
+
+    record_handlers = {
+        records.search_venue_flow_records,
+        records.export_venue_flow_records,
+    }
+    assert not [s for s in ALL_TWINS if s.handler in record_handlers]
