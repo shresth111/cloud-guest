@@ -314,6 +314,40 @@ async def test_every_declared_parameter_reaches_the_handler(spec: TwinSpec) -> N
 
 
 @pytest.mark.parametrize("spec", VENUE_TWINS, ids=_ids())
+def test_row_supplies_every_handler_parameter_not_just_the_required_ones(
+    spec: TwinSpec,
+) -> None:
+    """An OPTIONAL handler parameter the row never supplies is a 500, not a no-op.
+
+    The handlers declare optional filters as `param: X | None = Query(default=None)`.
+    FastAPI turns those into real values only through its own signature, which a
+    twin never goes through -- it calls the handler directly, so the default that
+    arrives is the raw `Query` OBJECT. That object then reaches the repository as
+    a bind parameter:
+
+        asyncpg DataError: invalid input for query argument $2: Query(None)
+
+    Found on the test box: `GET /isp/venue/vlans` supplied neither `router_id`
+    (it had no router extra) nor the guest allow-list's `identifier`/`rule_type`.
+    The "required parameters" test above cannot see this, because all three have
+    defaults.
+    """
+    supplied = _supplied(spec)
+    missing = [
+        name
+        for name, param in inspect.signature(spec.handler).parameters.items()
+        if param.kind
+        in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        and name not in supplied
+    ]
+    assert not missing, (
+        f"{spec.name} never supplies {missing} to "
+        f"{spec.handler.__module__}.{spec.handler.__name__}; those handler defaults "
+        "are Query objects when called directly, and leak into the DB layer"
+    )
+
+
+@pytest.mark.parametrize("spec", VENUE_TWINS, ids=_ids())
 async def test_a_router_extra_from_another_location_is_refused(spec: TwinSpec) -> None:
     """Same customer, DIFFERENT location: the ISP manages each location's
     routers separately, so that router is out of scope for this workspace."""

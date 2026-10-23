@@ -52,6 +52,7 @@ from app.domains.dhcp.schemas import (
     DhcpPoolUpdateRequest,
 )
 from app.domains.guest_access import router as guest_access_routes
+from app.domains.guest_access.constants import AccessRuleType
 from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.schemas import GuestAccessRuleCreate
 from app.domains.isp import router as isp_link_routes
@@ -134,6 +135,11 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         handler=vlan_routes.list_vlans,
         target="header_location",
         params=(_Page, _PageSize),
+        # The router filter. Without it the handler falls back to its own
+        # `router_id: uuid.UUID | None = Query(None)` default, and a Query
+        # object reaches the repository as a bind parameter -- a 500, not an
+        # unfiltered list. Found on the test box.
+        extras=(_RouterQuery,),
         deps={"service": get_vlan_service},
         inject={
             "requesting_organization_id": ("org",),
@@ -624,7 +630,15 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         permission_key=ISP_ACCESS_READ,
         handler=guest_access_routes.list_guest_rules,
         target="header_location",
-        params=(_Page, _PageSize),
+        params=(
+            _Page,
+            _PageSize,
+            # Both filters are supplied even when the caller omits them: the
+            # handler's own defaults are `Query(None)` objects, which reach the
+            # repository as bind parameters if they are not passed.
+            Param("identifier", "query", str | None, None),
+            Param("rule_type", "query", AccessRuleType | None, None),
+        ),
         deps={"service": get_guest_access_service},
         inject={
             "requesting_organization_id": ("org",),
