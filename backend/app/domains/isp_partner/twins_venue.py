@@ -41,6 +41,8 @@ import inspect
 import uuid
 from datetime import datetime
 
+from app.domains.analytics import router as analytics_routes
+from app.domains.analytics.dependencies import get_voucher_analytics_service
 from app.domains.campaigns import router as campaigns_routes
 from app.domains.campaigns.dependencies import get_campaigns_service
 from app.domains.captive_portal import router as portal_routes
@@ -844,6 +846,26 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         inject={
             "requesting_organization_id": ("org",),
             "campaign_id": ("param", "campaign_id"),
+        },
+    ),
+    # -- Reports: voucher redemption log (and "most redeemed") ----------------
+    TwinSpec(
+        method="GET",
+        path="/venue/analytics/voucher-redemptions/log",
+        permission_key=ISP_ACCESS_READ,
+        handler=analytics_routes.list_voucher_redemptions,
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("start_date", "query", datetime | None, None),
+            Param("end_date", "query", datetime | None, None),
+            Param("sort", "query", str, "recent"),
+        ),
+        deps={"service": get_voucher_analytics_service},
+        inject={
+            "organization_id": ("org",),
+            "location_id": ("location",),
         },
     ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------
