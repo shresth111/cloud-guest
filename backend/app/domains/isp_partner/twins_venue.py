@@ -92,6 +92,8 @@ from app.domains.qos.schemas import (
 from app.domains.vlan import router as vlan_routes
 from app.domains.vlan.dependencies import get_vlan_service
 from app.domains.vlan.schemas import VlanCreateRequest, VlanUpdateRequest
+from app.domains.voucher import router as voucher_routes
+from app.domains.voucher.dependencies import get_voucher_service
 
 from .constants import (
     ISP_ACCESS_CREATE,
@@ -790,6 +792,17 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
             # never reaches the DB layer.
             "is_blocked": ("const", None),
         },
+    ),
+    # -- Reports: voucher batches (batch redemption rate) ---------------------
+    TwinSpec(
+        method="GET",
+        path="/venue/voucher-batches",
+        permission_key=ISP_ACCESS_READ,
+        handler=voucher_routes.list_voucher_batches,
+        target="header_location",
+        params=(_Page, _PageSize),
+        deps={"service": get_voucher_service},
+        inject={"requesting_organization_id": ("org",)},
     ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------
     TwinSpec(
