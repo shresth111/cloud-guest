@@ -41,6 +41,8 @@ import inspect
 import uuid
 from datetime import datetime
 
+from app.domains.campaigns import router as campaigns_routes
+from app.domains.campaigns.dependencies import get_campaigns_service
 from app.domains.captive_portal import router as portal_routes
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.dhcp import router as dhcp_routes
@@ -803,6 +805,20 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         params=(_Page, _PageSize),
         deps={"service": get_voucher_service},
         inject={"requesting_organization_id": ("org",)},
+    ),
+    # -- Reports: campaigns (engagement) --------------------------------------
+    TwinSpec(
+        method="GET",
+        path="/venue/campaigns",
+        permission_key=ISP_ACCESS_READ,
+        handler=campaigns_routes.list_campaigns,
+        target="header_location",
+        params=(_Page, _PageSize),
+        deps={"service": get_campaigns_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "location_id": ("location",),
+        },
     ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------
     TwinSpec(
