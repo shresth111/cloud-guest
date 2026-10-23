@@ -74,6 +74,8 @@ from app.domains.mac_authorization.schemas import (
     MacAuthorizationEntryCreateRequest,
     MacAuthorizationEntryUpdateRequest,
 )
+from app.domains.otp import router as otp_routes
+from app.domains.otp.dependencies import get_otp_service
 from app.domains.policy import router as policy_routes
 from app.domains.policy.constants import PolicyType
 from app.domains.policy.dependencies import get_policy_service, get_role_resolver
@@ -866,6 +868,27 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         inject={
             "organization_id": ("org",),
             "location_id": ("location",),
+        },
+    ),
+    # -- Reports: OTP requests (delivery) -------------------------------------
+    TwinSpec(
+        method="GET",
+        path="/venue/otp/requests",
+        permission_key=ISP_ACCESS_READ,
+        handler=otp_routes.list_otp_requests,
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("identifier", "query", str | None, None),
+        ),
+        deps={"service": get_otp_service},
+        inject={
+            "organization_id": ("org",),
+            "location_id": ("location",),
+            # Not exposed; supplied so the handler's Query default never reaches
+            # the DB layer (and to avoid importing the OtpPurpose enum here).
+            "purpose": ("const", None),
         },
     ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------
