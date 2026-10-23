@@ -806,6 +806,19 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         deps={"service": get_voucher_service},
         inject={"requesting_organization_id": ("org",)},
     ),
+    TwinSpec(
+        method="GET",
+        path="/venue/voucher-batches/{batch_id}/stats",
+        permission_key=ISP_ACCESS_READ,
+        handler=voucher_routes.get_voucher_batch_stats,
+        target="header_location",
+        params=(Param("batch_id", "path", uuid.UUID),),
+        deps={"service": get_voucher_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "batch_id": ("param", "batch_id"),
+        },
+    ),
     # -- Reports: campaigns (engagement) --------------------------------------
     TwinSpec(
         method="GET",
