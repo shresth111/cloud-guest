@@ -29,7 +29,10 @@ from app.database.base import BaseModel
 
 class Tr069AcsCredential(BaseModel):
     """One per ISP (``customer_organization_id`` NULL: devices arrive
-    unassigned) and one per customer with TR-069 enabled."""
+    unassigned), one per customer with TR-069 enabled, and one per location
+    with TR-069 enabled (``location_id`` set; ``customer_organization_id`` is
+    the location's customer). acs-auth checks a location credential against
+    that location's toggle on every request (0176)."""
 
     __tablename__ = "tr069_acs_credentials"
 
@@ -38,6 +41,9 @@ class Tr069AcsCredential(BaseModel):
     )
     customer_organization_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True
+    )
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("locations.id"), nullable=True
     )
     username: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -50,7 +56,8 @@ class Tr069AcsCredential(BaseModel):
     )
 
     __table_args__ = (
-        # One credential per (ISP, customer), and exactly one ISP credential.
+        # One credential per (ISP, customer), one per (ISP, location), and
+        # exactly one ISP credential.
         # Two partial indexes rather than NULLS NOT DISTINCT, which needs
         # PostgreSQL 15.
         Index(
@@ -58,7 +65,16 @@ class Tr069AcsCredential(BaseModel):
             "isp_organization_id",
             "customer_organization_id",
             unique=True,
-            postgresql_where=text("customer_organization_id IS NOT NULL"),
+            postgresql_where=text(
+                "customer_organization_id IS NOT NULL AND location_id IS NULL"
+            ),
+        ),
+        Index(
+            "uq_tr069_acs_credentials_isp_location",
+            "isp_organization_id",
+            "location_id",
+            unique=True,
+            postgresql_where=text("location_id IS NOT NULL"),
         ),
         Index(
             "uq_tr069_acs_credentials_isp_only",

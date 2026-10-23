@@ -132,11 +132,14 @@ async def get_location_tr069(
     request: Request,
     isp_location_id: uuid.UUID,
     isp: IspContext = Depends(RequireIspPartner),
+    access_validator: AccessValidator = Depends(get_access_validator),
     service: Tr069Service = Depends(get_tr069_service),
 ) -> dict:
-    return ok(
-        request, await service.location_state(isp, isp_location_id), "Location TR-069"
-    )
+    from app.domains.isp_partner.router import effective_isp_permissions
+
+    show = TR069_MANAGE in await effective_isp_permissions(isp, access_validator)
+    data = await service.location_state(isp, isp_location_id, show_password=show)
+    return ok(request, data, "Location TR-069")
 
 
 @tr069_router.put("/locations/{isp_location_id}", dependencies=isp_guards(TR069_MANAGE))

@@ -28,8 +28,8 @@ PASSWORD_LENGTH = 24
 
 
 def generate_username(kind: str) -> str:
-    """``isp-<8hex>`` or ``cust-<8hex>``."""
-    if kind not in {"isp", "cust"}:
+    """``isp-<8hex>``, ``cust-<8hex>`` or ``loc-<8hex>``."""
+    if kind not in {"isp", "cust", "loc"}:
         raise ValueError(kind)
     return f"{kind}-{secrets.token_hex(4)}"
 
@@ -66,6 +66,7 @@ class CredentialStore:
                 select(Tr069AcsCredential).where(
                     Tr069AcsCredential.isp_organization_id == isp_org_id,
                     condition,
+                    Tr069AcsCredential.location_id.is_(None),
                     Tr069AcsCredential.is_deleted.is_(False),
                 )
             )
@@ -127,6 +128,53 @@ class CredentialStore:
             existing.updated_by = actor_user_id
             await self.session.flush()
         return existing
+
+    # -- per-location credentials (0176) -----------------------------------
+    async def get_location(
+        self, isp_org_id: uuid.UUID, location_id: uuid.UUID
+    ) -> Tr069AcsCredential | None:
+        return (
+            await self.session.execute(
+                select(Tr069AcsCredential).where(
+                    Tr069AcsCredential.isp_organization_id == isp_org_id,
+                    Tr069AcsCredential.location_id == location_id,
+                    Tr069AcsCredential.is_deleted.is_(False),
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def ensure_location(
+        self,
+        isp_org_id: uuid.UUID,
+        customer_org_id: uuid.UUID,
+        location_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        enabled: bool = True,
+    ) -> Tr069AcsCredential:
+        """Return the location's credential, minting it on first use.
+        Re-enabling keeps its username and password."""
+        existing = await self.get_location(isp_org_id, location_id)
+        if existing is not None:
+            if existing.enabled != enabled:
+                existing.enabled = enabled
+                existing.updated_by = actor_user_id
+                await self.session.flush()
+            return existing
+        password = generate_password()
+        row = Tr069AcsCredential(
+            isp_organization_id=isp_org_id,
+            customer_organization_id=customer_org_id,
+            location_id=location_id,
+            username=generate_username("loc"),
+            password_hash=hash_password(password),
+            password_encrypted=encrypt_secret(password),
+            enabled=enabled,
+            created_by=actor_user_id,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
 
     async def rotate(
         self, credential: Tr069AcsCredential, *, actor_user_id: uuid.UUID | None

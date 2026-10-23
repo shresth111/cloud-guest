@@ -5,7 +5,9 @@
   (constant-time compare). To anything else this endpoint does not exist.
 * 204 + ``X-Wyfy-Acs-User`` when the forwarded HTTP Basic credential matches
   an enabled ``tr069_acs_credentials`` row of an active ISP (and, for a
-  customer credential, an active customer). 401 otherwise.
+  customer credential, an active customer; for a location credential, also
+  that location's TR-069 toggle ON and the customer's switch not OFF). 401
+  otherwise.
 
 No body and no DB write on the hot path. The credential row and the
 owner state (ISP profile, ISP org, customer org) are READ on every request,
@@ -136,6 +138,50 @@ async def _owner_active(session: AsyncSession, credential: object) -> bool:
     return True
 
 
+async def _location_active(session: AsyncSession, credential: object) -> bool:
+    """A location credential (0176) is valid only while that location's
+    TR-069 toggle is ON, the location still belongs to the credential's
+    customer, and the customer's own TR-069 switch is not explicitly OFF.
+    Read on every request, like ``_owner_active``."""
+    from sqlalchemy import select
+
+    from app.domains.location.models import Location
+
+    from .models import Tr069AcsCredential, Tr069LocationSetting
+
+    location_id = credential.location_id  # type: ignore[attr-defined]
+    setting = (
+        await session.execute(
+            select(Tr069LocationSetting).where(
+                Tr069LocationSetting.location_id == location_id,
+                Tr069LocationSetting.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one_or_none()
+    if setting is None or not setting.enabled:
+        return False
+    location = await session.get(Location, location_id)
+    if (
+        location is None
+        or location.is_deleted
+        or location.organization_id != credential.customer_organization_id  # type: ignore[attr-defined]
+    ):
+        return False
+    customer_cred = (
+        await session.execute(
+            select(Tr069AcsCredential).where(
+                Tr069AcsCredential.isp_organization_id
+                == credential.isp_organization_id,  # type: ignore[attr-defined]
+                Tr069AcsCredential.customer_organization_id
+                == credential.customer_organization_id,  # type: ignore[attr-defined]
+                Tr069AcsCredential.location_id.is_(None),
+                Tr069AcsCredential.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one_or_none()
+    return customer_cred is None or bool(customer_cred.enabled)
+
+
 @tr069_internal_router.get("/acs-auth", status_code=status.HTTP_204_NO_CONTENT)
 async def acs_auth(
     request: Request, session: AsyncSession = Depends(get_db_session)
@@ -157,6 +203,10 @@ async def acs_auth(
             return _unauthorized()
         positive_cache.put(key)
     if not await _owner_active(session, credential):
+        return _unauthorized()
+    if getattr(credential, "location_id", None) is not None and not (
+        await _location_active(session, credential)
+    ):
         return _unauthorized()
     return Response(
         status_code=status.HTTP_204_NO_CONTENT, headers={USER_HEADER: username}
