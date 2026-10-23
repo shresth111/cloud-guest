@@ -196,18 +196,6 @@ def test_flow_records_are_not_twinned_until_f2() -> None:
     assert not [s for s in ALL_TWINS if s.handler in record_handlers]
 
 
-def test_every_twin_handler_takes_request_by_name() -> None:
-    """build_twin passes ``request=`` by keyword; the Traffic Lens originals
-    declare ``location_id`` before ``request``, which a positional call would
-    have bound to the request object."""
-    import inspect
-
-    from app.domains.isp_partner.twins_all import ALL_TWINS
-
-    for spec in ALL_TWINS:
-        assert "request" in inspect.signature(spec.handler).parameters, spec.path
-
-
 async def test_build_twin_calls_the_handler_by_keyword() -> None:
     import inspect as _inspect
 

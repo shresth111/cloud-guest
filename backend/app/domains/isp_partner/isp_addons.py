@@ -5,8 +5,8 @@ Two layers, both new code that calls the EXISTING add-on machinery:
 * **Master** sets, per ISP, which add-ons the ISP may switch on for its
   customers, with an optional cap (``isp_addon_allowances``). Routes:
   ``GET/PUT /platform/isp-partners/{isp_partner_id}/addon-allowances``, pinned
-  ``billing.read`` / ``billing.manage`` at GLOBAL -- the same keys and pin as
-  Master's existing per-organization add-on panel.
+  ``organizations.read`` / ``organizations.manage`` at GLOBAL -- the same keys
+  and pin as every other Master ISP route (STATUS D5, ``platform_router``).
 * **The ISP** switches an allowed add-on on or off for ONE customer:
   ``PUT /isp/customers/{isp_customer_id}/addons/{feature_key}``
   (``isp_partner.manage``). It calls ``AddonService.set_addon`` -- the same
@@ -279,7 +279,9 @@ async def _require_isp(db: AsyncSession, isp_partner_id: uuid.UUID) -> None:
 
 @addon_platform_router.get(
     "/{isp_partner_id}/addon-allowances",
-    dependencies=[Depends(RequirePermission("billing.read", scope=ScopeType.GLOBAL))],
+    dependencies=[
+        Depends(RequirePermission("organizations.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_isp_addon_allowances(
     request: Request,
@@ -310,7 +312,9 @@ class AddonAllowanceUpdateRequest(BaseModel):
 
 @addon_platform_router.put(
     "/{isp_partner_id}/addon-allowances",
-    dependencies=[Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))],
+    dependencies=[
+        Depends(RequirePermission("organizations.manage", scope=ScopeType.GLOBAL))
+    ],
 )
 async def set_isp_addon_allowances(
     request: Request,
