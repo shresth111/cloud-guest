@@ -76,6 +76,7 @@ from .exceptions import (
     IspRouterNotFoundError,
 )
 from .scoping import IspScope
+from .twin_body import BodyId, apply_body_ids
 from .twin_gates import (
     GATE_KWARG,
     enforce_customer_gates,
@@ -206,6 +207,9 @@ class TwinSpec:
     #: method (fail closed); set ``False`` explicitly only where the original
     #: router is deliberately ungated (e.g. ``voucher_router``).
     paid_write: bool | None = None
+    #: Tenant ids inside the request body, each checked or overwritten
+    #: against the resolved target (see ``twin_body``).
+    body_ids: tuple[BodyId, ...] = ()
 
     @property
     def effective_paid_write(self) -> bool:
@@ -342,6 +346,8 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         isp: IspContext = kwargs["isp"]
         args = {p.name: kwargs[p.name] for p in spec.params}
         resolved = await _resolve(spec, isp, request, args)
+        if spec.body_ids:
+            await apply_body_ids(spec.body_ids, args, isp, resolved[1], resolved[2])
         if spec.gated:
             # ADDENDUM_04 §1: the original route's feature/licence gates, run
             # against the CUSTOMER org (resolved[1]), never the ISP's header org.

@@ -176,8 +176,15 @@ def _sample(param: Param):
         return uuid.uuid4()
     if param.annotation is int:
         return param.default if param.default is not inspect.Parameter.empty else 1
-    # a body model: a minimal instance is not needed, the recorder takes Any
-    return object()
+    # a body model: an unvalidated instance, so the twin's body-id checks
+    # (twin_body.py) have real attributes to read. A policy assignment needs a
+    # scope an ISP may use.
+    construct = getattr(param.annotation, "model_construct", None)
+    if construct is None:
+        return object()
+    if "scope_type" in param.annotation.model_fields:
+        return construct(scope_type="organization")
+    return construct()
 
 
 @pytest.mark.parametrize("spec", VENUE_TWINS, ids=_ids())

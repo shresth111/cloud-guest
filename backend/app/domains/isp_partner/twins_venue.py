@@ -103,6 +103,7 @@ from .constants import (
     ISP_NETWORK_READ,
     ISP_NETWORK_UPDATE,
 )
+from .twin_body import BodyId
 from .twins import Extra, Param, TwinSpec
 
 __all__ = ["VENUE_TWINS"]
@@ -149,6 +150,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/vlans",
+        body_ids=(
+            BodyId("router_id", "router"), BodyId("vlan_id", "opaque"),
+        ),
         permission_key=ISP_NETWORK_CREATE,
         handler=vlan_routes.create_vlan,
         target="header_location",
@@ -176,6 +180,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="PUT",
         path="/venue/vlans/{vlan_pk}",
+        body_ids=(
+            BodyId("vlan_id", "opaque"),
+        ),
         permission_key=ISP_NETWORK_UPDATE,
         handler=vlan_routes.update_vlan,
         target="header_location",
@@ -233,6 +240,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/dhcp-pools",
+        body_ids=(
+            BodyId("router_id", "router"),
+        ),
         permission_key=ISP_NETWORK_CREATE,
         handler=dhcp_routes.create_dhcp_pool,
         target="header_location",
@@ -377,6 +387,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/port-forwarding/rules",
+        body_ids=(
+            BodyId("router_id", "router"),
+        ),
         permission_key=ISP_NETWORK_CREATE,
         handler=port_forwarding_routes.create_port_forwarding_rule,
         target="header_location",
@@ -470,6 +483,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/qos-rules",
+        body_ids=(
+            BodyId("router_id", "router"),
+        ),
         permission_key=ISP_NETWORK_CREATE,
         handler=qos_routes.create_qos_rule,
         target="header_location",
@@ -559,6 +575,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/mac-authorization/entries",
+        body_ids=(
+            BodyId("location_id", "force_location"),
+        ),
         permission_key=ISP_ACCESS_CREATE,
         handler=mac_auth_routes.create_mac_authorization_entry,
         target="header_location",
@@ -590,6 +609,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="PUT",
         path="/venue/mac-authorization/entries/{entry_id}",
+        body_ids=(
+            BodyId("location_id", "force_location"),
+        ),
         permission_key=ISP_ACCESS_UPDATE,
         handler=mac_auth_routes.update_mac_authorization_entry,
         target="header_location",
@@ -648,6 +670,10 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/guest-access/rules",
+        body_ids=(
+            BodyId("organization_id", "force_org"),
+            BodyId("location_id", "force_location"),
+        ),
         permission_key=ISP_ACCESS_CREATE,
         handler=guest_access_routes.create_guest_rule,
         target="header_location",
@@ -784,6 +810,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/policies",
+        body_ids=(
+            BodyId("organization_id", "force_org"),
+        ),
         permission_key=ISP_ACCESS_CREATE,
         handler=policy_routes.create_policy,
         target="header_location",
@@ -824,6 +853,10 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/policies/{policy_id}/assignments",
+        body_ids=(
+            BodyId("scope_id", "policy_scope"),
+            BodyId("target_id", "policy_target"),
+        ),
         permission_key=ISP_ACCESS_CREATE,
         handler=policy_routes.create_policy_assignment,
         target="header_location",
@@ -874,6 +907,9 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="POST",
         path="/venue/isp/links",
+        body_ids=(
+            BodyId("router_id", "router"),
+        ),
         permission_key=ISP_NETWORK_CREATE,
         handler=isp_link_routes.create_isp_link,
         target="header_location",
