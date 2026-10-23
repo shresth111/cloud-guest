@@ -164,6 +164,9 @@ class Extra:
     #: Attribute of the resolved row to forward. ``id`` for every twin today;
     #: ``location_id`` would be the other candidate if a handler ever needs it.
     attr: str = "id"
+    #: Further handler keywords that take the same resolved value (a report's
+    #: ``location_id`` filter and its ``scope_location_id`` must agree).
+    forward_also: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -396,7 +399,11 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
             if value is None:
                 if extra.required:  # pragma: no cover - FastAPI enforces it
                     raise AssertionError(f"{extra.name} is required")
-                kwargs_for_handler[extra.forward] = None
+                # An optional extra the caller left out never overrides a value
+                # the row already injected (a report's location falls back to
+                # the workspace location instead of becoming "every location").
+                if extra.forward not in kwargs_for_handler:
+                    kwargs_for_handler[extra.forward] = None
                 continue
             row = await _assert_row(isp, extra.target, value)
             if (
@@ -412,6 +419,8 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
             ):
                 raise _not_found_for(extra.target)
             kwargs_for_handler[extra.forward] = getattr(row, extra.attr)
+            for also in extra.forward_also:
+                kwargs_for_handler[also] = getattr(row, extra.attr)
         # Dependency providers the original route declared.
         for kwarg in spec.deps:
             kwargs_for_handler[kwarg] = kwargs[kwarg]

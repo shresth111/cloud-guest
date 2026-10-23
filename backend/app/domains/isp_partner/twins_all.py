@@ -13,17 +13,21 @@ from .twins_access import ACCESS_TWINS
 from .twins_addons import ADDON_TWINS
 from .twins_engage import ENGAGE_TWINS
 from .twins_portal import PORTAL_TWINS
+from .twins_reports import with_report_location
 from .twins_security_ops import SECURITY_OPS_TWINS
 from .twins_venue import VENUE_TWINS
 
 __all__ = ["ALL_TWINS"]
 
-ALL_TWINS: tuple[TwinSpec, ...] = (
-    VENUE_TWINS
-    + PORTAL_TWINS
-    + ACCESS_TWINS
-    + ENGAGE_TWINS
-    + SECURITY_OPS_TWINS
-    + MONITOR_TWINS
-    + ADDON_TWINS
+ALL_TWINS: tuple[TwinSpec, ...] = tuple(
+    with_report_location(spec)
+    for spec in (
+        VENUE_TWINS
+        + PORTAL_TWINS
+        + ACCESS_TWINS
+        + ENGAGE_TWINS
+        + SECURITY_OPS_TWINS
+        + MONITOR_TWINS
+        + ADDON_TWINS
+    )
 )
