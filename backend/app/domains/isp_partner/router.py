@@ -974,6 +974,10 @@ def _include_lanes() -> None:
     from .venue_session import venue_session_router
 
     isp_partner_router.include_router(venue_session_router)
+    # Founder 2026-10-23: self-service forgot password (public; see module).
+    from .password_reset_router import password_reset_router
+
+    isp_partner_router.include_router(password_reset_router)
 
 
 _include_lanes()
