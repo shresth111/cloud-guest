@@ -47,6 +47,7 @@ from .exceptions import (
     IspPaymentModeInvalidError,
     IspPaymentNotFoundError,
     IspPaymentReferenceRequiredError,
+    IspSellerGstinInvalidError,
     IspZoneInUseError,
     IspZoneNotFoundError,
 )
@@ -270,7 +271,7 @@ class IspBillingService:
             ):
                 raise IspInvoicePrefixTooLongError(field=key)
         if data.get("gstin") and not gstin_valid(data["gstin"]):
-            raise IspBuyerGstinInvalidError(field="gstin")
+            raise IspSellerGstinInvalidError(field="gstin")
         row = await self.settings(isp, required=False)
         if row is None:
             if not data.get("legal_name") or not data.get("state_code"):
@@ -1119,6 +1120,20 @@ class IspBillingService:
             amount_paise=amount_paise,
         )
         return pay
+
+    async def void_invoice(
+        self, isp: IspContext, invoice_id: uuid.UUID, *, reason: str
+    ) -> IspInvoice:
+        """1b "void": a credit note for the whole remaining balance, and the
+        invoice is CANCELLED. Numbers are never reused. Without the explicit
+        status, a partly paid invoice ended with balance 0 and read "paid"
+        in lists, dues and exports (QA-008). Any payment already received
+        stays recorded against it."""
+        note = await self.credit_note(isp, invoice_id, amount_paise=None, reason=reason)
+        inv = await self._invoice(isp, invoice_id)
+        inv.status = "cancelled"
+        await self.session.flush()
+        return note
 
     async def void_payment(
         self, isp: IspContext, payment_id: uuid.UUID, *, reason: str
