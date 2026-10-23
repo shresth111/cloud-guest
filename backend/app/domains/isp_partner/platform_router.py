@@ -94,6 +94,11 @@ PLATFORM_ROUTE_PERMISSIONS: dict[tuple[str, str], str] = {
     # cover them.
     ("GET", "/{isp_partner_id}/addon-allowances"): "organizations.read",
     ("PUT", "/{isp_partner_id}/addon-allowances"): "organizations.manage",
+    # ADDENDUM_04 F1-F3 (PARITY-2, parity_settings.py).
+    ("GET", "/{isp_partner_id}/parity-settings"): "organizations.read",
+    ("PUT", "/{isp_partner_id}/parity-settings"): "organizations.manage",
+    ("GET", "/{isp_partner_id}/wallet"): "organizations.read",
+    ("POST", "/{isp_partner_id}/wallet/topups"): "organizations.manage",
 }
 
 
@@ -336,3 +341,9 @@ __all__ = [
 from .isp_addons import addon_platform_router  # noqa: E402
 
 isp_partner_platform_router.include_router(addon_platform_router)
+
+# ADDENDUM_04 F1-F3 (PARITY-2, parity_settings.py): per-ISP unmask switch and
+# the ISP's messaging credit wallet, GLOBAL-pinned on organizations.*.
+from .parity_settings import parity_platform_router  # noqa: E402
+
+isp_partner_platform_router.include_router(parity_platform_router)

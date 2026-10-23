@@ -22,8 +22,13 @@ def _fresh_policy(monkeypatch):
     get_isp_partner_policy.cache_clear()
 
 
-def _row(key, enabled=True, cap=None):
-    return SimpleNamespace(feature_key=key, enabled=enabled, max_customers=cap)
+def _row(key, enabled=True, cap=None, price=None):
+    return SimpleNamespace(
+        feature_key=key,
+        enabled=enabled,
+        max_customers=cap,
+        price_per_customer_paise=price,
+    )
 
 
 def test_default_allowance_is_none() -> None:
@@ -32,15 +37,14 @@ def test_default_allowance_is_none() -> None:
     assert not any(a["allowed"] for a in out.values())
 
 
-def test_default_all_flip_but_byo_follows_f3(monkeypatch) -> None:
+def test_default_all_flip(monkeypatch) -> None:
     monkeypatch.setenv("ISP_PARTNER_ADDON_DEFAULT_ALLOWANCE", "all")
     get_isp_partner_policy.cache_clear()
     out = mod.resolve_allowances([])
-    assert out["guest_marketing"]["allowed"] and out["traffic_flow"]["allowed"]
-    assert not out["guest_marketing_byo"]["allowed"]  # F3 default: ISP-level sender
-    monkeypatch.setenv("ISP_PARTNER_BYO_SENDER_SCOPE", "customer")
-    get_isp_partner_policy.cache_clear()
-    assert mod.resolve_allowances([])["guest_marketing_byo"]["allowed"]
+    assert all(a["allowed"] for a in out.values())
+    # F3 no longer blocks the BYO add-on: whose sender is used is a separate
+    # per-ISP setting (parity_settings).
+    assert out["guest_marketing_byo"]["allowed"]
 
 
 def test_master_rows_win_and_missing_keys_are_not_allowed(monkeypatch) -> None:
@@ -50,6 +54,7 @@ def test_master_rows_win_and_missing_keys_are_not_allowed(monkeypatch) -> None:
     assert out["traffic_flow"] == {
         "allowed": True,
         "max_customers": 2,
+        "price_per_customer_paise": None,
         "source": "master",
     }
     assert not out["guest_marketing"]["allowed"]
@@ -141,6 +146,26 @@ async def test_unknown_key_is_refused(monkeypatch) -> None:
         await _toggle(context(estate()), CUST_A1, "white_label", True, _Service())
 
 
+async def test_flow_records_refused_while_masked(monkeypatch) -> None:
+    from app.domains.isp_partner import parity_settings
+    from app.domains.isp_partner.twins_addons import (
+        IspPiiMaskedError,
+        isp_flow_record_query,
+    )
+
+    async def masked(db, isp):
+        return False
+
+    monkeypatch.setattr(parity_settings, "pii_unmasked_for", masked)
+    with pytest.raises(IspPiiMaskedError):
+        await isp_flow_record_query(
+            SimpleNamespace(headers={}),
+            isp=context(estate()),
+            db=None,
+            isp_router_id=None,
+        )
+
+
 def test_routes_are_mounted_with_their_pins() -> None:
     from app.domains.rbac.enums import ScopeType
     from app.main import create_app
@@ -174,8 +199,9 @@ def test_traffic_lens_twins_declare_traffic_flow_and_pin_the_path_location() -> 
     from app.domains.isp_partner.twins_addons import ADDON_TWINS
     from app.domains.isp_partner.twins_all import ALL_TWINS
 
-    assert len(ADDON_TWINS) == 6
-    for spec in ADDON_TWINS:
+    lens = [s for s in ADDON_TWINS if not s.path.endswith("/flows")]
+    assert len(lens) == 6
+    for spec in lens:
         assert any(spec is t for t in ALL_TWINS)
         assert spec.requires_features == (PlanFeatureKey.TRAFFIC_FLOW,)
         assert spec.path.startswith("/venue/traffic-flow/locations/{isp_location_id}/")
@@ -185,15 +211,25 @@ def test_traffic_lens_twins_declare_traffic_flow_and_pin_the_path_location() -> 
         assert spec.inject["header_location_id"] == ("location",)
 
 
-def test_flow_records_are_not_twinned_until_f2() -> None:
-    from app.domains.isp_partner.twins_all import ALL_TWINS
+def test_flow_records_twin_needs_the_records_addon_and_f2() -> None:
+    from app.domains.billing.constants import PlanFeatureKey
+    from app.domains.isp_partner.twins_addons import (
+        FLOW_RECORD_TWINS,
+        isp_flow_record_query,
+    )
     from app.domains.traffic_flow import flow_records_customer_router as records
 
-    record_handlers = {
-        records.search_venue_flow_records,
-        records.export_venue_flow_records,
-    }
-    assert not [s for s in ALL_TWINS if s.handler in record_handlers]
+    (spec,) = FLOW_RECORD_TWINS
+    assert spec.handler is records.search_venue_flow_records
+    assert spec.requires_features == (PlanFeatureKey.TRAFFIC_FLOW_RECORDS,)
+    assert spec.permission_key == "isp_ipdr.read"
+    assert spec.deps["query"] is isp_flow_record_query
+    # the original filter dependency exposes ``router_id`` (a scope alias);
+    # the twin's never does
+    import inspect
+
+    names = set(inspect.signature(isp_flow_record_query).parameters)
+    assert "router_id" not in names and "isp_router_id" in names
 
 
 async def test_build_twin_calls_the_handler_by_keyword() -> None:

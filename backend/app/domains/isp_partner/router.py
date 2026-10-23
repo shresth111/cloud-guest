@@ -984,6 +984,14 @@ def _include_lanes() -> None:
     from .isp_addons import isp_addons_router
 
     isp_partner_router.include_router(isp_addons_router)
+    # ADDENDUM_04 F1-F3 (coordinator defaults, per-ISP settings): wallet,
+    # messaging settings, the ISP-level sender, the venue credits view.
+    from .parity_settings import isp_parity_router
+    from .twins_marketing import isp_messaging_router, venue_marketing_router
+
+    isp_partner_router.include_router(isp_parity_router)
+    isp_partner_router.include_router(isp_messaging_router)
+    isp_partner_router.include_router(venue_marketing_router)
 
 
 _include_lanes()

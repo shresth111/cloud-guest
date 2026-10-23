@@ -12,6 +12,7 @@ from .twins import TwinSpec
 from .twins_access import ACCESS_TWINS
 from .twins_addons import ADDON_TWINS
 from .twins_engage import ENGAGE_TWINS
+from .twins_marketing import MARKETING_TWINS
 from .twins_portal import PORTAL_TWINS
 from .twins_reports import with_report_location
 from .twins_security_ops import SECURITY_OPS_TWINS
@@ -29,5 +30,6 @@ ALL_TWINS: tuple[TwinSpec, ...] = tuple(
         + SECURITY_OPS_TWINS
         + MONITOR_TWINS
         + ADDON_TWINS
+        + MARKETING_TWINS
     )
 )
