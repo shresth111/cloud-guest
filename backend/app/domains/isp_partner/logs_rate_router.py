@@ -18,10 +18,11 @@ WHAT "PER SECOND" MEANS HERE (measured on origin/main)
   (``syslog-time-format=bsd-syslog``): whole seconds, no year. The series uses
   ``received_at`` (always present, one clock for every router).
 - The ONE place capture is coarser than "every line": Vector's
-  ``throttle_index`` keeps at most ``VECTOR_THROTTLE_PER_MINUTE`` lines per
-  router per 60 s for the API index (the raw archive keeps everything). A
-  minute at that ceiling is reported in ``throttled_minutes`` so a flat top in
-  the chart is never read as the real rate.
+  ``throttle_index`` keeps at most ``NETLOGS_DISPLAY_CAP_PER_MIN`` (default
+  3000) lines per router per 60 s for the API index (the raw archive keeps
+  everything); ``NETLOGS_DISPLAY_CAP_UNLIMITED=true`` lifts it. A minute at the
+  ceiling is reported in ``throttled_minutes`` so a flat top in the chart is
+  never read as the real rate; with no cap, nothing is reported.
 
 Bounds: 1-second buckets, at most ``MAX_WINDOW`` (3 hours = 10,800 points).
 The response is dense (zero-filled), so the chart never interpolates gaps.
@@ -29,6 +30,7 @@ The response is dense (zero-filled), so the chart never interpolates gaps.
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -54,11 +56,22 @@ logs_rate_router = APIRouter(prefix="/logs", tags=["ISP Partner: logs"])
 MAX_WINDOW = timedelta(hours=3)
 #: Presets the console offers.
 PRESET_MINUTES = (5, 15, 60)
-#: ``throttle_index.threshold`` / ``window_secs`` in deploy/device-logs/vector.yaml.
+#: ``throttle_index.threshold`` default in deploy/device-logs/vector.yaml.
 VECTOR_THROTTLE_PER_MINUTE = 3000
-#: A minute counts as "at the ceiling" from 98 % of it (Vector's window is
-#: rolling, ours is the calendar minute).
-_CEILING = int(VECTOR_THROTTLE_PER_MINUTE * 0.98)
+
+
+def display_cap_per_minute() -> int | None:
+    """The collector's cap, read from the SAME variables vector.yaml uses
+    (``NETLOGS_DISPLAY_CAP_PER_MIN``, ``NETLOGS_DISPLAY_CAP_UNLIMITED``), so
+    the "throttled" warning follows the collector. ``None`` = unlimited."""
+    if os.environ.get("NETLOGS_DISPLAY_CAP_UNLIMITED", "false").lower() == "true":
+        return None
+    raw = os.environ.get("NETLOGS_DISPLAY_CAP_PER_MIN", "")
+    try:
+        cap = int(raw) if raw else VECTOR_THROTTLE_PER_MINUTE
+    except ValueError:
+        cap = VECTOR_THROTTLE_PER_MINUTE
+    return cap if cap > 0 else VECTOR_THROTTLE_PER_MINUTE
 
 
 def _window(
@@ -119,6 +132,7 @@ async def netlogs_per_second(
     seconds = int((end - start).total_seconds())
     counts = [0] * seconds
     throttled: list[dict] = []
+    cap = display_cap_per_minute()
     if service.enabled and org_ids:
         conditions = isp_conditions(filters, org_ids)
         bucket = func.date_trunc("second", DeviceLogEvent.received_at).label("s")
@@ -129,17 +143,20 @@ async def netlogs_per_second(
             i = int((at - start).total_seconds())
             if 0 <= i < seconds:
                 counts[i] = int(n)
-        minute = func.date_trunc("minute", DeviceLogEvent.received_at).label("m")
-        capped = await db.execute(
-            select(DeviceLogEvent.router_id, minute, func.count())
-            .where(*conditions)
-            .group_by(DeviceLogEvent.router_id, minute)
-            .having(func.count() >= _CEILING)
-        )
-        throttled = [
-            {"router_id": str(r), "minute": m.isoformat(), "count": int(n)}
-            for r, m, n in capped.all()
-        ]
+        if cap is not None:
+            # A minute counts as "at the ceiling" from 98 % of it (Vector's
+            # window is rolling, ours is the calendar minute).
+            minute = func.date_trunc("minute", DeviceLogEvent.received_at).label("m")
+            capped = await db.execute(
+                select(DeviceLogEvent.router_id, minute, func.count())
+                .where(*conditions)
+                .group_by(DeviceLogEvent.router_id, minute)
+                .having(func.count() >= int(cap * 0.98))
+            )
+            throttled = [
+                {"router_id": str(r), "minute": m.isoformat(), "count": int(n)}
+                for r, m, n in capped.all()
+            ]
     total = sum(counts)
     return ok(
         request,
@@ -152,7 +169,7 @@ async def netlogs_per_second(
             "total": total,
             "peak": max(counts) if counts else 0,
             "clock": "received_at",
-            "throttle_per_router_per_minute": VECTOR_THROTTLE_PER_MINUTE,
+            "throttle_per_router_per_minute": cap,
             "throttled_minutes": throttled,
         },
         "Network logs per second",
