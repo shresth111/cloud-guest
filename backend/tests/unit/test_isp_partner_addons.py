@@ -169,7 +169,7 @@ def test_routes_are_mounted_with_their_pins() -> None:
         assert expected in scopes and all(s == expected for s in scopes), (path, scopes)
 
 
-def test_traffic_lens_twins_declare_traffic_flow_and_take_no_path_location() -> None:
+def test_traffic_lens_twins_declare_traffic_flow_and_pin_the_path_location() -> None:
     from app.domains.billing.constants import PlanFeatureKey
     from app.domains.isp_partner.twins_addons import ADDON_TWINS
     from app.domains.isp_partner.twins_all import ALL_TWINS
@@ -178,8 +178,10 @@ def test_traffic_lens_twins_declare_traffic_flow_and_take_no_path_location() -> 
     for spec in ADDON_TWINS:
         assert any(spec is t for t in ALL_TWINS)
         assert spec.requires_features == (PlanFeatureKey.TRAFFIC_FLOW,)
-        assert "{" not in spec.path, spec.path
-        assert spec.inject["location_id"] == ("location",)
+        assert spec.path.startswith("/venue/traffic-flow/locations/{isp_location_id}/")
+        loc = [e for e in spec.extras if e.name == "isp_location_id"]
+        assert loc and loc[0].target == "location" and loc[0].forward == "location_id"
+        assert "location_id" not in spec.inject
         assert spec.inject["header_location_id"] == ("location",)
 
 
@@ -192,3 +194,42 @@ def test_flow_records_are_not_twinned_until_f2() -> None:
         records.export_venue_flow_records,
     }
     assert not [s for s in ALL_TWINS if s.handler in record_handlers]
+
+
+def test_every_twin_handler_takes_request_by_name() -> None:
+    """build_twin passes ``request=`` by keyword; the Traffic Lens originals
+    declare ``location_id`` before ``request``, which a positional call would
+    have bound to the request object."""
+    import inspect
+
+    from app.domains.isp_partner.twins_all import ALL_TWINS
+
+    for spec in ALL_TWINS:
+        assert "request" in inspect.signature(spec.handler).parameters, spec.path
+
+
+async def test_build_twin_calls_the_handler_by_keyword() -> None:
+    import inspect as _inspect
+
+    from app.domains.isp_partner.twins import TwinSpec, build_twin
+
+    seen = {}
+
+    async def handler(location_id=None, request=None, organization_id=None):
+        seen["request"] = request
+        seen["location_id"] = location_id
+        return {"ok": True}
+
+    spec = TwinSpec(
+        method="GET",
+        path="/venue/x/{isp_location_id}",
+        permission_key="isp_network.read",
+        handler=handler,
+        target="none",
+        params=(),
+    )
+    twin = build_twin(spec)
+    sentinel = object()
+    assert "request" in _inspect.signature(twin).parameters
+    await twin(request=sentinel, isp=None)
+    assert seen["request"] is sentinel

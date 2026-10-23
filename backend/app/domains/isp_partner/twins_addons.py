@@ -9,11 +9,12 @@ evaluates it against the CUSTOMER org -- so the twin answers 402
 ``feature_not_entitled`` unless the add-on is on for that customer, which an
 ISP can only do within Master's allowance (``isp_addons``).
 
-The original paths carry ``{location_id}``. The twins take NO location in the
-path: the location is injected from ``X-Isp-Location-Id`` (resolved through
-``IspScope``), both as ``location_id`` and as the handler's own
-``header_location_id`` cross-check. The partner console calls
-``/isp/venue/traffic-flow/<view>``.
+The twins keep the customer path shape
+(``/traffic-flow/locations/{id}/<view>``) so the customer's own Traffic Lens
+page can be mounted unchanged behind the shim's prefix rewrite. The path id is
+``isp_location_id``, resolved through ``IspScope`` and pinned to the header's
+customer; the handler's ``header_location_id`` cross-check receives the
+HEADER location, so a path naming another venue is refused by the original.
 
 NOT twinned: the per-connection flow records (``/flows``, ``/flows/export``,
 ``TRAFFIC_FLOW_RECORDS``). They hold per-guest source data; ADDENDUM_04 treats
@@ -44,9 +45,14 @@ _Router = Extra("isp_router_id", "query", "router", "router_id")
 _Since = Param("since", "query", datetime | None, None)
 _Until = Param("until", "query", datetime | None, None)
 _Limit = Param("limit", "query", int | None, None)
+#: The customer path's ``{location_id}``, exposed under the ISP name and
+#: resolved through ``IspScope`` (same customer as the header, or 404). The
+#: handler's own ``header_location_id`` cross-check gets the HEADER location,
+#: so a path naming another venue than the one pinned is refused by the
+#: original handler itself.
+_LocPath = Extra("isp_location_id", "path", "location", "location_id", required=True)
 _LOC = {
     "organization_id": ("org",),
-    "location_id": ("location",),
     "header_location_id": ("location",),
 }
 _DEST_FILTERS = (
@@ -63,41 +69,42 @@ _DEST_FILTERS = (
 ADDON_TWINS: tuple[TwinSpec, ...] = (
     TwinSpec(
         method="GET",
-        path="/venue/traffic-flow/status",
+        path="/venue/traffic-flow/locations/{isp_location_id}/status",
         permission_key=ISP_NETWORK_READ,
         handler=tf_routes.get_venue_traffic_status,
         target="header_location",
         requires_features=_TF,
+        extras=(_LocPath,),
         deps={"service": get_traffic_flow_customer_service},
         inject=_LOC,
     ),
     TwinSpec(
         method="GET",
-        path="/venue/traffic-flow/summary",
+        path="/venue/traffic-flow/locations/{isp_location_id}/summary",
         permission_key=ISP_NETWORK_READ,
         handler=tf_routes.get_venue_traffic_summary,
         target="header_location",
         requires_features=_TF,
         params=(_Since, _Until, _Limit, Param("series", "query", int | None, None)),
-        extras=(_Router,),
+        extras=(_LocPath, _Router),
         deps={"service": get_traffic_flow_customer_service},
         inject=_LOC,
     ),
     TwinSpec(
         method="GET",
-        path="/venue/traffic-flow/destinations",
+        path="/venue/traffic-flow/locations/{isp_location_id}/destinations",
         permission_key=ISP_NETWORK_READ,
         handler=tf_dest.search_venue_destinations,
         target="header_location",
         requires_features=_TF,
         params=_DEST_FILTERS,
-        extras=(_Router,),
+        extras=(_LocPath, _Router),
         deps={"service": tf_dest.get_customer_destination_service},
         inject={**_LOC, "user": ("user",)},
     ),
     TwinSpec(
         method="GET",
-        path="/venue/traffic-flow/services/destinations",
+        path="/venue/traffic-flow/locations/{isp_location_id}/services/destinations",
         permission_key=ISP_NETWORK_READ,
         handler=tf_dest.get_venue_service_destinations,
         target="header_location",
@@ -109,30 +116,31 @@ ADDON_TWINS: tuple[TwinSpec, ...] = (
             _Until,
             _Limit,
         ),
-        extras=(_Router,),
+        extras=(_LocPath, _Router),
         deps={"service": tf_dest.get_customer_destination_service},
         inject={**_LOC, "user": ("user",)},
     ),
     TwinSpec(
         method="GET",
-        path="/venue/traffic-flow/geo",
+        path="/venue/traffic-flow/locations/{isp_location_id}/geo",
         permission_key=ISP_NETWORK_READ,
         handler=tf_geo.get_venue_traffic_geo,
         target="header_location",
         requires_features=_TF,
         params=(_Since, _Until, _Limit, Param("networks", "query", int | None, None)),
-        extras=(_Router,),
+        extras=(_LocPath, _Router),
         deps={"service": tf_geo.get_customer_geo_service},
         inject=_LOC,
     ),
     TwinSpec(
         method="GET",
-        path="/venue/traffic-flow/findings",
+        path="/venue/traffic-flow/locations/{isp_location_id}/findings",
         permission_key=ISP_NETWORK_READ,
         handler=tf_findings.get_venue_traffic_findings,
         target="header_location",
         requires_features=_TF,
         params=(_Since, _Until),
+        extras=(_LocPath,),
         deps={"service": tf_findings.get_customer_findings_service},
         inject=_LOC,
     ),
