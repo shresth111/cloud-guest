@@ -7,9 +7,15 @@
   an enabled ``tr069_acs_credentials`` row of an active ISP (and, for a
   customer credential, an active customer). 401 otherwise.
 
-No body and no DB write on the hot path. Positive answers are cached
-in-process for 60 s keyed by (username, password digest), so the Argon2id
-verify runs at most once a minute per CPE credential.
+No body and no DB write on the hot path. The credential row and the
+owner state (ISP profile, ISP org, customer org) are READ on every request,
+so turning TR-069 off for a customer, suspending the ISP or disabling the
+customer takes effect on the very next request. Only the Argon2id verify is
+cached: in-process for 60 s, keyed by (username, password digest, stored
+hash). A rotation writes a new hash, so the old password misses the cache and
+fails the verify on the next request. Nothing has to invalidate the cache,
+so there is no window between a commit and an invalidation, and it stays
+correct with several API processes.
 """
 
 from __future__ import annotations
@@ -59,9 +65,9 @@ tr069_internal_router = APIRouter(
 
 class _PositiveCache:
     def __init__(self) -> None:
-        self._items: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self._items: OrderedDict[tuple[str, str, str], float] = OrderedDict()
 
-    def hit(self, key: tuple[str, str]) -> bool:
+    def hit(self, key: tuple[str, str, str]) -> bool:
         expires = self._items.get(key)
         if expires is None:
             return False
@@ -71,7 +77,7 @@ class _PositiveCache:
         self._items.move_to_end(key)
         return True
 
-    def put(self, key: tuple[str, str]) -> None:
+    def put(self, key: tuple[str, str, str]) -> None:
         self._items[key] = time.monotonic() + CACHE_TTL_S
         self._items.move_to_end(key)
         while len(self._items) > CACHE_MAX:
@@ -138,19 +144,20 @@ async def acs_auth(
     if parsed is None:
         return _unauthorized()
     username, password = parsed
-    key = (username, hashlib.sha256(password.encode()).hexdigest())
-    if positive_cache.hit(key):
-        return Response(
-            status_code=status.HTTP_204_NO_CONTENT, headers={USER_HEADER: username}
-        )
     credential = await CredentialStore(session).get_by_username(username)
     if credential is None or not credential.enabled:
         return _unauthorized()
-    if not verify_password(password, credential.password_hash):
-        return _unauthorized()
+    key = (
+        username,
+        hashlib.sha256(password.encode()).hexdigest(),
+        credential.password_hash,
+    )
+    if not positive_cache.hit(key):
+        if not verify_password(password, credential.password_hash):
+            return _unauthorized()
+        positive_cache.put(key)
     if not await _owner_active(session, credential):
         return _unauthorized()
-    positive_cache.put(key)
     return Response(
         status_code=status.HTTP_204_NO_CONTENT, headers={USER_HEADER: username}
     )
