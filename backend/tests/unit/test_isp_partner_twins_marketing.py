@@ -241,6 +241,10 @@ def test_marketing_rows_declare_the_addon_and_are_mounted() -> None:
     from app.domains.billing.constants import PlanFeatureKey
 
     for spec in tm.MARKETING_TWINS:
+        if spec.path == "/venue/me/entitlements":
+            # ungated like the original; answers the CUSTOMER's entitlements
+            assert spec.inject["organization_id"] == ("org",)
+            continue
         assert PlanFeatureKey.GUEST_MARKETING in spec.requires_features, spec.path
         if "/providers" in spec.path:
             assert PlanFeatureKey.GUEST_MARKETING_BYO in spec.requires_features
