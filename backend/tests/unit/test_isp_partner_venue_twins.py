@@ -78,7 +78,8 @@ def _supplied(spec: TwinSpec) -> set[str]:
     names |= set(spec.inject)
     names |= set(spec.deps)
     names |= {p.forward or p.name for p in spec.params if p.name not in renamed}
-    names |= {e.forward for e in spec.extras}
+    names |= {e.forward for e in spec.extras if not e.validate_only}
+    names |= {a for e in spec.extras if not e.validate_only for a in e.forward_also}
     return names
 
 
@@ -134,7 +135,7 @@ def test_row_exposes_no_scope_alias_parameter_name(spec: TwinSpec) -> None:
 
 @pytest.mark.parametrize("spec", VENUE_TWINS, ids=_ids())
 def test_every_extra_is_reachable_and_isp_prefixed(spec: TwinSpec) -> None:
-    for extra in spec.extras:
+    for extra in [e for e in spec.extras if not e.validate_only]:
         assert extra.name.startswith("isp_"), extra.name
         assert extra.forward in inspect.signature(spec.handler).parameters, (
             f"{spec.name}: extra forwards {extra.forward!r}, not a handler parameter"

@@ -32,6 +32,7 @@ from .plans_models import (
     IspSubscriber,
 )
 from .scoping import IspScope
+from .subscriber_identity import subscriber_identifier
 
 IspGroupInUseError = _err(
     "IspGroupInUseError",
@@ -1490,7 +1491,7 @@ class IspPlansService:
                 "id": str(s.id),
                 "isp_customer_id": str(s.customer_organization_id),
                 "customer_name": orgs.get(s.customer_organization_id),
-                "identifier": mask_identifier(s.identifier),
+                "identifier": subscriber_identifier(s.identifier, s.source),
                 "display_name": s.display_name,
                 "package": {"id": str(s.package_id), "name": pkgs[s.package_id].name}
                 if s.package_id in pkgs

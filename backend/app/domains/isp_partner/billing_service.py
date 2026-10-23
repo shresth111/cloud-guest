@@ -22,8 +22,6 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
-from app.common.masking import mask_identifier
-
 from .billing_models import (
     IspBillingSettings,
     IspCustomerBilling,
@@ -65,6 +63,7 @@ from .gst import (
 )
 from .models import IspCustomerProfile
 from .scoping import IspScope
+from .subscriber_identity import subscriber_identifier
 
 PAYMENT_MODES = frozenset({"cash", "upi", "bank_transfer", "online"})
 REFERENCE_REQUIRED = frozenset({"upi", "bank_transfer"})
@@ -600,7 +599,10 @@ class IspBillingService:
         )
         name = " ".join(
             p for p in (subscriber.first_name, subscriber.last_name) if p
-        ) or (subscriber.display_name or mask_identifier(subscriber.identifier))
+        ) or (
+            subscriber.display_name
+            or subscriber_identifier(subscriber.identifier, subscriber.source)
+        )
         return await self._issue_core(
             isp,
             settings,
@@ -671,7 +673,7 @@ class IspBillingService:
             customer_organization_id=customer_organization_id,
             subscriber_id=subscriber.id if subscriber is not None else None,
             bill_to_username=(
-                mask_identifier(subscriber.identifier)
+                subscriber_identifier(subscriber.identifier, subscriber.source)
                 if subscriber is not None
                 else None
             ),
@@ -1409,7 +1411,8 @@ class IspBillingService:
                 if s is not None:
                     subs[i.id] = {
                         "id": str(s.id),
-                        "username": i.bill_to_username or mask_identifier(s.identifier),
+                        "username": i.bill_to_username
+                        or subscriber_identifier(s.identifier, s.source),
                         "first_name": s.first_name,
                         "last_name": s.last_name,
                         "circuit_id": i.circuit_id_snapshot or s.circuit_id,
