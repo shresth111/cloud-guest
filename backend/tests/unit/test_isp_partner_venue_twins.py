@@ -81,6 +81,15 @@ def _supplied(spec: TwinSpec) -> set[str]:
     return names
 
 
+def _scoped_by_marketing_scope(spec: TwinSpec) -> bool:
+    from app.domains.isp_partner import twins_marketing
+
+    return spec.deps.get("scope") in (
+        twins_marketing.isp_marketing_scope,
+        twins_marketing.isp_marketing_scope_own_sender,
+    )
+
+
 def _ids() -> list[str]:
     return [f"{s.method} {s.path}" for s in VENUE_TWINS]
 
@@ -231,6 +240,11 @@ async def test_header_location_rows_resolve_to_the_customers_org(
     # captive-portal resolve), so read it off the row's own declaration rather
     # than assuming a name.
     org_keys = [k for k, src in twin_spec.inject.items() if src[0] == "org"]
+    if not org_keys and _scoped_by_marketing_scope(spec):
+        # The marketing originals take the org inside ``scope: CallerScope``,
+        # supplied by twins_marketing.isp_marketing_scope from the same header
+        # (resolution pinned in test_isp_partner_twins_marketing.py).
+        return
     assert org_keys, f"{twin_spec.name} scopes the handler to no organization"
     for key in org_keys:
         assert call[key] == CUST_A1, (
