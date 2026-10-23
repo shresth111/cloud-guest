@@ -159,3 +159,31 @@ def test_guest_teams_list_always_forces_the_workspace_location() -> None:
     assert listing.inject["location_id"] == ("location",)
     assert listing.target == "header_location"
     assert all(p.name != "location_id" for p in listing.params)
+
+
+def test_service_checked_ids_say_where_the_service_checks_them() -> None:
+    for spec in VENUE_TWINS:
+        for b in spec.body_ids:
+            if b.mode == "service_checked":
+                assert len(b.note) > 20, f"{spec.method} {spec.path}: {b.field}"
+
+
+async def test_null_only_refuses_a_value() -> None:
+    class _P(BaseModel):
+        policy_id: str | None = None
+
+    await apply_body_ids(
+        (BodyId("policy_id", "null_only"),),
+        {"payload": _P()},
+        context(estate()),
+        CUST_A1,
+        LOC_A1,
+    )
+    with pytest.raises(IspBadRequestError):
+        await apply_body_ids(
+            (BodyId("policy_id", "null_only"),),
+            {"payload": _P(policy_id=str(uuid.uuid4()))},
+            context(estate()),
+            CUST_A1,
+            LOC_A1,
+        )
