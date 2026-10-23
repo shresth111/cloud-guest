@@ -51,6 +51,8 @@ from app.domains.dhcp.schemas import (
     DhcpPoolCreateRequest,
     DhcpPoolUpdateRequest,
 )
+from app.domains.guest import router as guest_routes
+from app.domains.guest.dependencies import get_guest_service
 from app.domains.guest_access import router as guest_access_routes
 from app.domains.guest_access.constants import AccessRuleType
 from app.domains.guest_access.dependencies import get_guest_access_service
@@ -737,6 +739,34 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
             "requesting_organization_id": ("org",),
             "user": ("user",),
             "rule_id": ("param", "rule_id"),
+        },
+    ),
+    # -- Reports: guest sessions (the base of most of the report catalogue) ----
+    TwinSpec(
+        method="GET",
+        path="/venue/guest-sessions",
+        permission_key=ISP_ACCESS_READ,
+        handler=guest_routes.list_guest_sessions,
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("start_date", "query", datetime | None, None),
+            Param("end_date", "query", datetime | None, None),
+        ),
+        extras=(_RouterQuery,),
+        deps={"service": get_guest_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "location_id": ("location",),
+            # CurrentLocation is a dependency on the original route; /isp refuses
+            # X-Location-Id, so the twin supplies the resolved location itself.
+            "scope_location_id": ("location",),
+            # Optional filters the twin does not expose. They MUST be supplied:
+            # their handler defaults are Query objects, which reach the DB layer
+            # as bind parameters (see the contract test).
+            "guest_id": ("const", None),
+            "status_filter": ("const", None),
         },
     ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------
