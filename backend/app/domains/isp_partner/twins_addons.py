@@ -26,16 +26,35 @@ Key: ``isp_network.read`` (ADDENDUM_04 table).
 
 from __future__ import annotations
 
+import uuid as _uuid
 from datetime import datetime
+from datetime import datetime as _dt
+from typing import Any as _Any
 
+from fastapi import Depends as _Depends
+from fastapi import Query as _Query
+from fastapi import Request as _Request
+from fastapi import status as _status
+from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+from app.database.session import get_db_session as _get_db_session
 from app.domains.billing.constants import PlanFeatureKey
 from app.domains.traffic_flow import customer_router as tf_routes
 from app.domains.traffic_flow import destinations_customer_router as tf_dest
 from app.domains.traffic_flow import findings_customer_router as tf_findings
+from app.domains.traffic_flow import (
+    flow_records_customer_router as tf_records,
+)
 from app.domains.traffic_flow import geo_customer_router as tf_geo
 from app.domains.traffic_flow.dependencies import get_traffic_flow_customer_service
 
-from .constants import ISP_NETWORK_READ
+from .constants import ISP_IPDR_READ, ISP_NETWORK_READ
+from .dependencies import IspContext as _IspContext
+from .dependencies import RequireIspPartner as _RequireIspPartner
+from .exceptions import IspError as _IspError
+from .exceptions import IspRouterNotFoundError as _IspRouterNotFoundError
+from .scoping import IspScope as _IspScope
+from .twin_headers import HEADER_LOCATION as _HEADER_LOCATION
 from .twins import Extra, Param, TwinSpec
 
 __all__ = ["ADDON_TWINS"]
@@ -145,3 +164,90 @@ ADDON_TWINS: tuple[TwinSpec, ...] = (
         inject=_LOC,
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# F2: Traffic Lens flow records (per-connection source data)
+# ---------------------------------------------------------------------------
+#
+# Served only when Master enabled unmasking for this ISP AND the caller is its
+# owner/admin (``parity_settings.pii_unmasked_for``); otherwise 403
+# ``ISP_PII_MASKED``. Every served page is audited by ``build_twin``
+# (``pii_policy``: the path is a PII path). The original's ``_query`` filter
+# dependency exposes ``router_id`` -- a scope alias -- so the twin supplies an
+# equivalent dict built from ``isp_router_id``, pinned through ``IspScope`` to
+# the header location. The CSV export is not twinned (its handler takes no
+# ``request``).
+
+
+class IspPiiMaskedError(_IspError):
+    code = "ISP_PII_MASKED"
+    status_code_default = _status.HTTP_403_FORBIDDEN
+    default_message = (
+        "Connection records show guest addresses. Wyfy has not enabled unmasked "
+        "records for your account, or your role is not owner/admin."
+    )
+
+
+async def isp_flow_record_query(
+    request: _Request,
+    isp: _IspContext = _Depends(_RequireIspPartner),
+    db: _AsyncSession = _Depends(_get_db_session),
+    isp_router_id: _uuid.UUID | None = _Query(default=None),
+    since: _dt | None = _Query(default=None),
+    until: _dt | None = _Query(default=None),
+    address: str | None = _Query(default=None, max_length=64),
+    src_address: str | None = _Query(default=None, max_length=64),
+    dst_address: str | None = _Query(default=None, max_length=64),
+    port: int | None = _Query(default=None, ge=0, le=65535),
+    src_port: int | None = _Query(default=None, ge=0, le=65535),
+    dst_port: int | None = _Query(default=None, ge=0, le=65535),
+    protocol: int | None = _Query(default=None, ge=0, le=255),
+    sort: str | None = _Query(default=None, max_length=16),
+    order: str | None = _Query(default=None, max_length=8),
+) -> dict[str, _Any]:
+    from .parity_settings import pii_unmasked_for
+
+    if not await pii_unmasked_for(db, isp):
+        raise IspPiiMaskedError()
+    router_id = None
+    if isp_router_id is not None:
+        router = await _IspScope.assert_router(isp, isp_router_id)
+        header = request.headers.get(_HEADER_LOCATION)
+        if header is None or str(router.location_id) != header:
+            raise _IspRouterNotFoundError()
+        router_id = router.id
+    return {
+        "router_id": router_id,
+        "since": since,
+        "until": until,
+        "address": address,
+        "src_address": src_address,
+        "dst_address": dst_address,
+        "port": port,
+        "src_port": src_port,
+        "dst_port": dst_port,
+        "protocol": protocol,
+        "sort": sort,
+        "order": order,
+    }
+
+
+FLOW_RECORD_TWINS: tuple[TwinSpec, ...] = (
+    TwinSpec(
+        method="GET",
+        path="/venue/traffic-flow/locations/{isp_location_id}/flows",
+        permission_key=ISP_IPDR_READ,
+        handler=tf_records.search_venue_flow_records,
+        target="header_location",
+        requires_features=(PlanFeatureKey.TRAFFIC_FLOW_RECORDS,),
+        extras=(_LocPath,),
+        deps={
+            "query": isp_flow_record_query,
+            "service": tf_records.get_customer_flow_record_service,
+        },
+        inject={**_LOC, "user": ("user",)},
+    ),
+)
+
+ADDON_TWINS = ADDON_TWINS + FLOW_RECORD_TWINS

@@ -22,9 +22,10 @@ Rules:
   ``ISP_ADDON_NOT_ALLOWED``; at the cap -> 409 ``ISP_ADDON_LIMIT``.
 * No allowance rows = ``ISP_PARTNER_ADDON_DEFAULT_ALLOWANCE`` (``none`` until
   founder F1 is answered; ``all`` = every add-on, no cap).
-* ``guest_marketing_byo`` follows F3: with ``ISP_PARTNER_BYO_SENDER_SCOPE=isp``
-  (default) a customer does not bring its own sender, so the ISP cannot switch
-  it on per customer (403 ``ISP_ADDON_NOT_ALLOWED``).
+* ``guest_marketing_byo`` is an ordinary allowance row. WHOSE sender a
+  customer uses (the ISP-level one or its own) is F3, in ``parity_settings``.
+* F1: each allowance row may carry ``price_per_customer_paise`` -- a record
+  of the agreed price; nothing bills from it (the ISP pays Wyfy in cash).
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
-from app.domains.billing.constants import ADDON_FEATURE_KEYS, PlanFeatureKey
+from app.domains.billing.constants import ADDON_FEATURE_KEYS
 from app.domains.billing.models import OrganizationFeatureOverride
 from app.domains.feature_entitlement.addons import AddonService, AddonView
 from app.domains.feature_entitlement.dependencies import get_addon_service
@@ -112,16 +113,25 @@ def resolve_allowances(rows: list[Any]) -> dict[str, dict[str, Any]]:
             out[key] = {
                 "allowed": bool(row.enabled),
                 "max_customers": row.max_customers,
+                "price_per_customer_paise": getattr(
+                    row, "price_per_customer_paise", None
+                ),
                 "source": "master",
             }
         elif not rows and policy.addon_default_allowance == "all":
-            out[key] = {"allowed": True, "max_customers": None, "source": "default"}
+            out[key] = {
+                "allowed": True,
+                "max_customers": None,
+                "price_per_customer_paise": None,
+                "source": "default",
+            }
         else:
-            out[key] = {"allowed": False, "max_customers": None, "source": "default"}
-    if policy.byo_sender_scope == "isp":
-        # F3 default: one ISP-level sender; no per-customer BYO switch.
-        out[PlanFeatureKey.GUEST_MARKETING_BYO.value]["allowed"] = False
-        out[PlanFeatureKey.GUEST_MARKETING_BYO.value]["source"] = "policy_f3"
+            out[key] = {
+                "allowed": False,
+                "max_customers": None,
+                "price_per_customer_paise": None,
+                "source": "default",
+            }
     return out
 
 
@@ -304,6 +314,8 @@ class AddonAllowanceItem(BaseModel):
     key: str
     enabled: bool
     max_customers: int | None = Field(default=None, ge=0)
+    #: F1: agreed price per customer per month (paise). A record only.
+    price_per_customer_paise: int | None = Field(default=None, ge=0)
 
 
 class AddonAllowanceUpdateRequest(BaseModel):
@@ -339,6 +351,7 @@ async def set_isp_addon_allowances(
                     feature_key=key,
                     enabled=item.enabled,
                     max_customers=item.max_customers,
+                    price_per_customer_paise=item.price_per_customer_paise,
                     created_by=actor_id,
                     updated_by=actor_id,
                 )
@@ -346,6 +359,7 @@ async def set_isp_addon_allowances(
         else:
             row.enabled = item.enabled
             row.max_customers = item.max_customers
+            row.price_per_customer_paise = item.price_per_customer_paise
             row.updated_by = actor_id
     from app.domains.rbac.models import AuditLogEntry
 

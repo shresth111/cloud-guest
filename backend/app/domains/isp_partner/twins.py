@@ -75,6 +75,7 @@ from .exceptions import (
     IspLocationNotFoundError,
     IspRouterNotFoundError,
 )
+from .pii_policy import apply_pii_policy, audit_if_pii
 from .scoping import IspScope
 from .twin_body import BodyId, apply_body_ids
 from .twin_gates import (
@@ -84,7 +85,7 @@ from .twin_gates import (
     is_write,
 )
 from .twin_headers import HEADER_CUSTOMER, HEADER_LOCATION
-from .twin_privacy import force_masking, redact
+from .twin_privacy import redact
 
 __all__ = [
     "Extra",
@@ -410,11 +411,16 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         # Dependency providers the original route declared.
         for kwarg in spec.deps:
             kwargs_for_handler[kwarg] = kwargs[kwarg]
-        force_masking()
+        # F2 per ISP (pii_policy): masked unless Master enabled unmasking for
+        # this ISP and the caller is its owner/admin.
+        unmasked = await apply_pii_policy(isp)
         # By keyword: some originals declare a path id BEFORE ``request``
         # (the Traffic Lens customer routes), where a positional call would
         # bind the request to that id.
         result = await spec.handler(request=request, **kwargs_for_handler)
+        if unmasked:
+            await audit_if_pii(spec, isp, resolved)
+            return result
         return redact(result, spec.redact_fields)
 
     # -- the signature FastAPI actually reads -------------------------------
