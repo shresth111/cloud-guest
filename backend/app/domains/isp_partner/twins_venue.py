@@ -41,6 +41,10 @@ import inspect
 import uuid
 from datetime import datetime
 
+from app.domains.analytics import router as analytics_routes
+from app.domains.analytics.dependencies import get_voucher_analytics_service
+from app.domains.campaigns import router as campaigns_routes
+from app.domains.campaigns.dependencies import get_campaigns_service
 from app.domains.captive_portal import router as portal_routes
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.dhcp import router as dhcp_routes
@@ -51,6 +55,8 @@ from app.domains.dhcp.schemas import (
     DhcpPoolCreateRequest,
     DhcpPoolUpdateRequest,
 )
+from app.domains.guest import router as guest_routes
+from app.domains.guest.dependencies import get_guest_service
 from app.domains.guest_access import router as guest_access_routes
 from app.domains.guest_access.constants import AccessRuleType
 from app.domains.guest_access.dependencies import get_guest_access_service
@@ -68,6 +74,8 @@ from app.domains.mac_authorization.schemas import (
     MacAuthorizationEntryCreateRequest,
     MacAuthorizationEntryUpdateRequest,
 )
+from app.domains.otp import router as otp_routes
+from app.domains.otp.dependencies import get_otp_service
 from app.domains.policy import router as policy_routes
 from app.domains.policy.constants import PolicyType
 from app.domains.policy.dependencies import get_policy_service, get_role_resolver
@@ -90,6 +98,8 @@ from app.domains.qos.schemas import (
 from app.domains.vlan import router as vlan_routes
 from app.domains.vlan.dependencies import get_vlan_service
 from app.domains.vlan.schemas import VlanCreateRequest, VlanUpdateRequest
+from app.domains.voucher import router as voucher_routes
+from app.domains.voucher.dependencies import get_voucher_service
 
 from .constants import (
     ISP_ACCESS_CREATE,
@@ -737,6 +747,154 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
             "requesting_organization_id": ("org",),
             "user": ("user",),
             "rule_id": ("param", "rule_id"),
+        },
+    ),
+    # -- Reports: guest sessions (the base of most of the report catalogue) ----
+    TwinSpec(
+        method="GET",
+        path="/venue/guest-sessions",
+        permission_key=ISP_ACCESS_READ,
+        handler=guest_routes.list_guest_sessions,
+        # F2: the original returns this as a plain, unmasked str.
+        redact_fields=("guest_identifier",),
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("start_date", "query", datetime | None, None),
+            Param("end_date", "query", datetime | None, None),
+        ),
+        extras=(_RouterQuery,),
+        deps={"service": get_guest_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "location_id": ("location",),
+            # CurrentLocation is a dependency on the original route; /isp refuses
+            # X-Location-Id, so the twin supplies the resolved location itself.
+            "scope_location_id": ("location",),
+            # Optional filters the twin does not expose. They MUST be supplied:
+            # their handler defaults are Query objects, which reach the DB layer
+            # as bind parameters (see the contract test).
+            "guest_id": ("const", None),
+            "status_filter": ("const", None),
+        },
+    ),
+    # -- Reports: guests (the other half of the report catalogue's base) ------
+    TwinSpec(
+        method="GET",
+        path="/venue/guests",
+        permission_key=ISP_ACCESS_READ,
+        handler=guest_routes.list_guests,
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("search", "query", str | None, None),
+        ),
+        deps={"service": get_guest_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "location_id": ("location",),
+            "scope_location_id": ("location",),
+            # Not exposed; supplied explicitly so the handler's Query default
+            # never reaches the DB layer.
+            "is_blocked": ("const", None),
+        },
+    ),
+    # -- Reports: voucher batches (batch redemption rate) ---------------------
+    TwinSpec(
+        method="GET",
+        path="/venue/voucher-batches",
+        permission_key=ISP_ACCESS_READ,
+        handler=voucher_routes.list_voucher_batches,
+        target="header_location",
+        params=(_Page, _PageSize),
+        deps={"service": get_voucher_service},
+        inject={"requesting_organization_id": ("org",)},
+    ),
+    TwinSpec(
+        method="GET",
+        path="/venue/voucher-batches/{batch_id}/stats",
+        permission_key=ISP_ACCESS_READ,
+        handler=voucher_routes.get_voucher_batch_stats,
+        target="header_location",
+        params=(Param("batch_id", "path", uuid.UUID),),
+        deps={"service": get_voucher_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "batch_id": ("param", "batch_id"),
+        },
+    ),
+    # -- Reports: campaigns (engagement) --------------------------------------
+    TwinSpec(
+        method="GET",
+        path="/venue/campaigns",
+        permission_key=ISP_ACCESS_READ,
+        handler=campaigns_routes.list_campaigns,
+        target="header_location",
+        params=(_Page, _PageSize),
+        deps={"service": get_campaigns_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "location_id": ("location",),
+        },
+    ),
+    TwinSpec(
+        method="GET",
+        path="/venue/campaigns/{campaign_id}/results",
+        permission_key=ISP_ACCESS_READ,
+        handler=campaigns_routes.get_campaign_results,
+        target="header_location",
+        params=(Param("campaign_id", "path", uuid.UUID),),
+        deps={"service": get_campaigns_service},
+        inject={
+            "requesting_organization_id": ("org",),
+            "campaign_id": ("param", "campaign_id"),
+        },
+    ),
+    # -- Reports: voucher redemption log (and "most redeemed") ----------------
+    TwinSpec(
+        method="GET",
+        path="/venue/analytics/voucher-redemptions/log",
+        permission_key=ISP_ACCESS_READ,
+        handler=analytics_routes.list_voucher_redemptions,
+        # F2: the original returns this as a plain, unmasked str.
+        redact_fields=("redeemed_identifier",),
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("start_date", "query", datetime | None, None),
+            Param("end_date", "query", datetime | None, None),
+            Param("sort", "query", str, "recent"),
+        ),
+        deps={"service": get_voucher_analytics_service},
+        inject={
+            "organization_id": ("org",),
+            "location_id": ("location",),
+        },
+    ),
+    # -- Reports: OTP requests (delivery) -------------------------------------
+    TwinSpec(
+        method="GET",
+        path="/venue/otp/requests",
+        permission_key=ISP_ACCESS_READ,
+        handler=otp_routes.list_otp_requests,
+        # F2: the original returns this as a plain, unmasked str.
+        redact_fields=("identifier",),
+        target="header_location",
+        params=(
+            _Page,
+            _PageSize,
+            Param("identifier", "query", str | None, None),
+        ),
+        deps={"service": get_otp_service},
+        inject={
+            "organization_id": ("org",),
+            "location_id": ("location",),
+            # Not exposed; supplied so the handler's Query default never reaches
+            # the DB layer (and to avoid importing the OtpPurpose enum here).
+            "purpose": ("const", None),
         },
     ),
     # -- Open Hours (the captive-portal resolve the page reads) ---------------

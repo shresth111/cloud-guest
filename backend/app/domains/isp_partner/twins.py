@@ -84,6 +84,7 @@ from .twin_gates import (
     is_write,
 )
 from .twin_headers import HEADER_CUSTOMER, HEADER_LOCATION
+from .twin_privacy import force_masking, redact
 
 __all__ = [
     "Extra",
@@ -210,6 +211,9 @@ class TwinSpec:
     #: Tenant ids inside the request body, each checked or overwritten
     #: against the resolved target (see ``twin_body``).
     body_ids: tuple[BodyId, ...] = ()
+    #: F2 (masked by default, see ``twin_privacy``): response keys the
+    #: original returns as a plain, unmasked ``str`` identifier.
+    redact_fields: tuple[str, ...] = ()
 
     @property
     def effective_paid_write(self) -> bool:
@@ -406,7 +410,9 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         # Dependency providers the original route declared.
         for kwarg in spec.deps:
             kwargs_for_handler[kwarg] = kwargs[kwarg]
-        return await spec.handler(request, **kwargs_for_handler)
+        force_masking()
+        result = await spec.handler(request, **kwargs_for_handler)
+        return redact(result, spec.redact_fields)
 
     # -- the signature FastAPI actually reads -------------------------------
     parameters: list[inspect.Parameter] = [

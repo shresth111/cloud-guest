@@ -394,3 +394,87 @@ def test_gated_twin_signature_requests_the_checker() -> None:
     assert GATE_KWARG in inspect.signature(build_twin(spec)).parameters
     ungated, _ = _probe("GET")
     assert GATE_KWARG not in inspect.signature(build_twin(ungated)).parameters
+
+
+# ---------------------------------------------------------------------------
+# 5. F2: ISP staff see masked PII by default
+# ---------------------------------------------------------------------------
+
+
+def _plain_str_identifier_rows() -> dict[str, str]:
+    return {
+        "list_guest_sessions": "guest_identifier",
+        "list_otp_requests": "identifier",
+        "list_voucher_redemptions": "redeemed_identifier",
+    }
+
+
+def test_rows_over_plain_str_identifiers_redact_them() -> None:
+    want = _plain_str_identifier_rows()
+    seen = {}
+    for spec in VENUE_TWINS:
+        name = getattr(spec.handler, "__name__", "")
+        if name in want:
+            seen[name] = spec.redact_fields
+    for name, field in want.items():
+        assert name in seen, f"{name} twin missing"
+        assert field in seen[name], f"{name} twin must redact {field}"
+
+
+async def test_twin_masks_identifiers_and_forces_the_masking_context() -> None:
+    from app.middleware.request_context import (
+        MaskingContext,
+        get_masking_context,
+        masking_context,
+    )
+
+    async def handler(request, **kwargs):
+        ctx = get_masking_context()
+        return {
+            "data": {
+                "items": [{"guest_identifier": "+919876598647", "n": 1}],
+                "masking": ctx.masking_enabled,
+            }
+        }
+
+    spec = TwinSpec(
+        method="GET",
+        path="/venue/_probe",
+        permission_key="isp_access.read",
+        handler=handler,
+        target="header_location",
+        redact_fields=("guest_identifier",),
+    )
+    token = masking_context.set(MaskingContext(masking_enabled=False))
+    try:
+        out = await build_twin(spec)(request=_request(), isp=context(estate()))
+    finally:
+        masking_context.reset(token)
+    item = out["data"]["items"][0]
+    assert item["guest_identifier"] != "+919876598647"
+    assert item["guest_identifier"].endswith("98647")
+    assert out["data"]["masking"] is True, "an unmasked ISP user was not masked"
+
+
+async def test_pii_flip_restores_the_original_body(monkeypatch) -> None:
+    from app.domains.isp_partner import policy
+
+    monkeypatch.setenv("ISP_PARTNER_PII_UNMASKED", "true")
+    policy.get_isp_partner_policy.cache_clear()
+    try:
+
+        async def handler(request, **kwargs):
+            return {"data": {"guest_identifier": "+919876598647"}}
+
+        spec = TwinSpec(
+            method="GET",
+            path="/venue/_probe",
+            permission_key="isp_access.read",
+            handler=handler,
+            target="header_location",
+            redact_fields=("guest_identifier",),
+        )
+        out = await build_twin(spec)(request=_request(), isp=context(estate()))
+        assert out["data"]["guest_identifier"] == "+919876598647"
+    finally:
+        policy.get_isp_partner_policy.cache_clear()
