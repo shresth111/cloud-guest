@@ -513,6 +513,31 @@ MARKETING_TWINS: tuple[TwinSpec, ...] = (
 )
 
 
+# The customer pages ask "what is my organization entitled to?" to decide
+# which add-on screens to unlock (Marketing, Traffic Lens records). The venue
+# answer is the pinned CUSTOMER's entitlements -- the same read the original
+# gives a customer user, never the ISP's own.
+from app.domains.feature_entitlement import router as fe_routes  # noqa: E402
+from app.domains.feature_entitlement.dependencies import (  # noqa: E402
+    get_feature_entitlement_service,
+)
+
+from .constants import ISP_PARTNER_READ  # noqa: E402
+
+ENTITLEMENT_TWINS: tuple[TwinSpec, ...] = (
+    TwinSpec(
+        method="GET",
+        path="/venue/me/entitlements",
+        permission_key=ISP_PARTNER_READ,
+        handler=fe_routes.get_my_entitlements,
+        target="header_location",
+        deps={"service": get_feature_entitlement_service},
+        inject={"organization_id": ("org",), "user": ("user",)},
+    ),
+)
+
+MARKETING_TWINS = MARKETING_TWINS + ENTITLEMENT_TWINS
+
 # -- the credits view: customer wallet + the ISP pool -------------------------
 
 venue_marketing_router = APIRouter(tags=["ISP Partner: venue marketing"])
