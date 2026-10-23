@@ -73,7 +73,8 @@ def _supplied(spec: TwinSpec) -> set[str]:
     name is only "supplied" when nothing renames it.
     """
     renamed = {src[1] for src in spec.inject.values() if src[0] == "param"}
-    names = {"request"}
+    takes_request = "request" in inspect.signature(spec.handler).parameters
+    names = {"request"} if takes_request else set()
     names |= set(spec.inject)
     names |= set(spec.deps)
     names |= {p.forward or p.name for p in spec.params if p.name not in renamed}

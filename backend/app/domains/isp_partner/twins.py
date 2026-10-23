@@ -341,6 +341,11 @@ def _value(
 def build_twin(spec: TwinSpec) -> Callable[..., Any]:
     """Build the real route function for one table row."""
     needs_user = any(source[0] == "user" for source in spec.inject.values())
+    # A few originals (voucher CSV/PDF downloads) take no ``request``.
+    try:
+        takes_request = "request" in inspect.signature(spec.handler).parameters
+    except (TypeError, ValueError):  # pragma: no cover - a C callable
+        takes_request = True
     if spec.gated and spec.target == "none":
         # A gate needs a customer org to check; a target-less row has none.
         raise ValueError(f"{spec.name}: a gated twin must resolve a customer")
@@ -411,7 +416,10 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         for kwarg in spec.deps:
             kwargs_for_handler[kwarg] = kwargs[kwarg]
         force_masking()
-        result = await spec.handler(request, **kwargs_for_handler)
+        if takes_request:
+            result = await spec.handler(request, **kwargs_for_handler)
+        else:
+            result = await spec.handler(**kwargs_for_handler)
         return redact(result, spec.redact_fields)
 
     # -- the signature FastAPI actually reads -------------------------------
