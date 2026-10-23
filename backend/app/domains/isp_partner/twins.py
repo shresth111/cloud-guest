@@ -310,6 +310,24 @@ def build_twin(spec: TwinSpec) -> Callable[..., Any]:
         args = {p.name: kwargs[p.name] for p in spec.params}
         resolved = await _resolve(spec, isp, request, args)
         kwargs_for_handler = _value(spec, resolved, args, kwargs.get("_actor"))
+        # Every DECLARED parameter reaches the handler, under the name the
+        # handler uses -- unless an ``inject`` entry already renamed it (a param
+        # consumed as ``("param", name)`` arrives under the inject key instead).
+        #
+        # This is not a convenience. The original handlers declare their query
+        # parameters with FastAPI defaults (`page: int = Query(default=1)`), and
+        # those defaults are `Query` OBJECTS until FastAPI resolves them through
+        # its own signature -- which never happens for a twin, because the twin
+        # calls the handler directly. A parameter the twin parsed but did not
+        # forward therefore falls back to a raw `Query` instance inside the
+        # service, which is a 500 (`TypeError: '>' not supported between
+        # instances of 'int' and 'Query'` inside PageParams), not a sensible
+        # error -- found on the test box, not by the contract test.
+        renamed = {src[1] for src in spec.inject.values() if src[0] == "param"}
+        for param in spec.params:
+            if param.name in renamed:
+                continue
+            kwargs_for_handler[param.forward or param.name] = args[param.name]
         # Extra ids: resolved through the same IspScope and pinned to the same
         # customer AND the same location as the primary target. An ISP manages
         # each location's routers separately, so a router belonging to another

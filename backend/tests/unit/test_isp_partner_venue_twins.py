@@ -277,6 +277,43 @@ async def test_a_router_extra_from_another_customer_is_refused(spec: TwinSpec) -
 
 
 @pytest.mark.parametrize("spec", VENUE_TWINS, ids=_ids())
+async def test_every_declared_parameter_reaches_the_handler(spec: TwinSpec) -> None:
+    """A param the twin parses but never forwards is a silent 500.
+
+    The original handlers declare query parameters with FastAPI defaults
+    (`page: int = Query(default=1)`). Those defaults are `Query` OBJECTS until
+    FastAPI resolves them through its own signature -- which never happens for a
+    twin, because the twin calls the handler directly. So a dropped parameter
+    reaches the service as a `Query` and dies in `PageParams` with
+    `TypeError: '>' not supported between instances of 'int' and 'Query'`.
+
+    This was found on the test box, not here: the earlier tests only required
+    that the handler's REQUIRED parameters were supplied, and `page` has a
+    default, so nothing noticed it was missing.
+    """
+    twin_spec, rec = _recording(spec)
+    twin = build_twin(twin_spec)
+    kwargs = _kwargs(twin_spec)
+    kwargs["request"] = _request(**{HEADER_LOCATION: str(LOC_A1)})
+    kwargs["isp"] = context(estate())
+    for dep in twin_spec.deps:
+        kwargs[dep] = None
+
+    await twin(**kwargs)
+
+    assert rec.calls, "the handler was never called"
+    got = rec.calls[0]
+    renamed = {src[1] for src in twin_spec.inject.values() if src[0] == "param"}
+    for param in twin_spec.params:
+        if param.name in renamed:
+            continue
+        assert (param.forward or param.name) in got, (
+            f"{spec.name} declares {param.name!r} but never forwards it, so the "
+            f"handler would fall back to its own Query default"
+        )
+
+
+@pytest.mark.parametrize("spec", VENUE_TWINS, ids=_ids())
 async def test_a_router_extra_from_another_location_is_refused(spec: TwinSpec) -> None:
     """Same customer, DIFFERENT location: the ISP manages each location's
     routers separately, so that router is out of scope for this workspace."""
