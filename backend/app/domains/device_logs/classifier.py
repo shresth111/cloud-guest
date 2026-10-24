@@ -155,7 +155,39 @@ def _from_topics(topics: str | None) -> str:
     return LogCategory.OTHER.value
 
 
-def classify(message: str, *, topics: str | None = None) -> Classification:
+#: QA-029 (founder-approved addition, 2026-10-24). A line whose syslog head
+#: the parser could not read (e.g. a sender that space-pads the hour) is stored
+#: whole as the message with NO topics, so the topic-driven rules never ran and
+#: DHCP / wireless / system lines landed in "other". This reads the RouterOS
+#: topics ("dhcp,info") out of the message's own head. Used ONLY on the path
+#: that would otherwise return "other" with no topics, and only to reach the
+#: dhcp, wireless or system categories -- every line classified today keeps
+#: its exact result (test_device_logs_classify_corpus.py).
+_UNPARSED_HEAD = re.compile(
+    r"^(?:<\d{1,3}>)?"
+    r"(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} +"
+    r"\d{1,2}:\d{2}:\d{2} +)?"
+    r"(?:\S+ +)?"
+    r"(?:wyfy-[0-9a-f]{8}:? +)?"
+    r"(?P<topics>[a-z0-9-]+(?:,[a-z0-9-]+)+) +(?P<rest>.+)$",
+    re.DOTALL,
+)
+_UNPARSED_HEAD_CATEGORIES = frozenset(
+    {LogCategory.DHCP.value, LogCategory.WIRELESS.value, LogCategory.SYSTEM.value}
+)
+
+
+def _from_unparsed_head(message: str) -> Classification | None:
+    m = _UNPARSED_HEAD.match((message or "").strip())
+    if not m:
+        return None
+    again = classify(m.group("rest"), topics=m.group("topics"), _fallback=False)
+    return again if again.category in _UNPARSED_HEAD_CATEGORIES else None
+
+
+def classify(
+    message: str, *, topics: str | None = None, _fallback: bool = True
+) -> Classification:
     """Structured fields for one stored message. Never raises."""
     body = message_body((message or "").strip())
 
@@ -242,6 +274,10 @@ def classify(message: str, *, topics: str | None = None) -> Classification:
             protocol="HOTSPOT",
             src_ip=_ip(any_hotspot.group("ip")) if any_hotspot else None,
         )
+    if category == LogCategory.OTHER.value and not topics and _fallback:
+        recovered = _from_unparsed_head(message)
+        if recovered is not None:
+            return recovered
     return Classification(category=category)
 
 
