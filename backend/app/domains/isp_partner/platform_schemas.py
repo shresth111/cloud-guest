@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
+from functools import lru_cache
+from zoneinfo import ZoneInfo, available_timezones
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -52,6 +54,31 @@ class IspOwnerRequest(_Body):
     _v_email = field_validator("email")(_email)
 
 
+@lru_cache(maxsize=1)
+def _iana_zones() -> frozenset[str]:
+    return frozenset(available_timezones())
+
+
+def _tz(value: str | None) -> str | None:
+    """QA-006 (Master side): an IANA zone name, e.g. ``Asia/Kolkata``, else
+    422. The ISP's billing dates and reports do ``ZoneInfo(tz)`` on it."""
+    if value is None:
+        return value
+    value = value.strip()
+    zones = _iana_zones()
+    if zones:
+        ok = value in zones
+    else:  # no zone list on this host: fall back to loading it
+        try:
+            ZoneInfo(value)
+            ok = bool(value)
+        except Exception:  # noqa: BLE001
+            ok = False
+    if not ok:
+        raise ValueError("must be an IANA time zone name, e.g. Asia/Kolkata")
+    return value
+
+
 class IspPartnerCreateRequest(_Body):
     name: str = Field(min_length=2, max_length=200)
     slug: str = Field(min_length=2, max_length=100, pattern=_SLUG)
@@ -70,6 +97,7 @@ class IspPartnerCreateRequest(_Body):
     _v_contact = field_validator("contact_email")(_email)
     _v_support = field_validator("support_email")(_email)
     _v_gstin = field_validator("gstin")(_gstin)
+    _v_tz = field_validator("timezone")(_tz)
 
 
 class IspPartnerUpdateRequest(_Body):
@@ -91,6 +119,7 @@ class IspPartnerUpdateRequest(_Body):
     _v_contact = field_validator("contact_email")(_email)
     _v_support = field_validator("support_email")(_email)
     _v_gstin = field_validator("gstin")(_gstin)
+    _v_tz = field_validator("timezone")(_tz)
 
 
 class IspPartnerSuspendRequest(_Body):
