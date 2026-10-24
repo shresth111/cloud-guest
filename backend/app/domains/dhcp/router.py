@@ -46,6 +46,8 @@ from .schemas import (
     DhcpLeaseKeepResponse,
     DhcpLeaseListResponse,
     DhcpLeaseResponse,
+    DhcpLivePoolListResponse,
+    DhcpLivePoolResponse,
     DhcpPoolCreateRequest,
     DhcpPoolListResponse,
     DhcpPoolResponse,
@@ -497,6 +499,49 @@ async def list_router_dhcp_leases(
         data=DhcpLeaseListResponse(
             router_id=str(router_id),
             items=[_lease_response(lease) for lease in leases],
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/live-pools",
+    response_model=ApiResponse[DhcpLivePoolListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("dhcp.read"))],
+)
+async def list_router_live_pools(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: DhcpService = Depends(get_dhcp_service),
+):
+    """Every address pool on this router, read live -- the range guests are
+    actually getting, with its DHCP server, gateway, DNS and lease time,
+    whether or not it was created through the platform. The IP Addresses
+    page shows it as "Current on router"."""
+    pools = await service.list_router_live_pools(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Address pools read from device",
+        data=DhcpLivePoolListResponse(
+            router_id=str(router_id),
+            items=[
+                DhcpLivePoolResponse(
+                    pool_name=p.pool_name,
+                    ranges=list(p.ranges),
+                    server=p.server,
+                    interface=p.interface,
+                    lease_time=p.lease_time,
+                    server_disabled=p.server_disabled,
+                    network=p.network,
+                    gateway=p.gateway,
+                    dns_servers=list(p.dns_servers),
+                )
+                for p in pools
+            ],
         ).model_dump(),
         request_id=_request_id(request),
     )
