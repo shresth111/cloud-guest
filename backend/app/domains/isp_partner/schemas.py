@@ -10,12 +10,39 @@ from __future__ import annotations
 
 import re
 import uuid
+from functools import lru_cache
+from zoneinfo import ZoneInfo, available_timezones
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domains.location.enums import PropertyType
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+@lru_cache(maxsize=1)
+def _iana_zones() -> frozenset[str]:
+    return frozenset(available_timezones())
+
+
+def _tz(value: str | None) -> str | None:
+    """QA-006: an IANA zone name (e.g. ``Asia/Kolkata``), else 422. Day
+    boundaries, open hours and reports do ``ZoneInfo(tz)`` on it."""
+    if value is None:
+        return value
+    value = value.strip()
+    zones = _iana_zones()
+    if zones:
+        ok = value in zones
+    else:  # no zone list on this host: fall back to loading it
+        try:
+            ZoneInfo(value)
+            ok = bool(value)
+        except Exception:  # noqa: BLE001
+            ok = False
+    if not ok:
+        raise ValueError("must be an IANA time zone name, e.g. Asia/Kolkata")
+    return value
 
 
 def _email(value: str | None) -> str | None:
@@ -55,6 +82,7 @@ class CustomerCreateRequest(_Body):
     notes: str | None = None
 
     _check_email = field_validator("contact_email")(_email)
+    _check_tz = field_validator("timezone")(_tz)
 
 
 class CustomerUpdateRequest(_Body):
@@ -77,6 +105,7 @@ class CustomerUpdateRequest(_Body):
     notes: str | None = None
 
     _check_email = field_validator("contact_email")(_email)
+    _check_tz = field_validator("timezone")(_tz)
 
 
 # -- locations --------------------------------------------------------------
@@ -100,6 +129,7 @@ class IspLocationCreateRequest(_Body):
     contact_email: str | None = Field(default=None, max_length=255)
 
     _check_email = field_validator("contact_email")(_email)
+    _check_tz = field_validator("timezone")(_tz)
 
 
 class IspLocationUpdateRequest(_Body):
@@ -119,6 +149,7 @@ class IspLocationUpdateRequest(_Body):
     contact_email: str | None = Field(default=None, max_length=255)
 
     _check_email = field_validator("contact_email")(_email)
+    _check_tz = field_validator("timezone")(_tz)
 
 
 # -- routers ----------------------------------------------------------------
