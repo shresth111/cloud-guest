@@ -86,3 +86,23 @@ def test_partial_credit_plus_payment_without_void_is_still_paid() -> None:
     """Only an explicit void cancels; a normal credit note that settles the
     balance together with payments keeps the invoice "paid"."""
     assert status_for(_inv(credit_noted_paise=139240 - 118100)) == "paid"
+
+
+def _status_pattern(endpoint) -> str:
+    import inspect
+
+    query = inspect.signature(endpoint).parameters["status"].default
+    return next(m.pattern for m in query.metadata if hasattr(m, "pattern"))
+
+
+def test_invoice_export_status_filter_is_validated() -> None:
+    """QA-009 class: GET /isp/invoices/export?status=<unknown> must be 422,
+    with the same allowed values as the invoice list."""
+    import re
+
+    pattern = _status_pattern(billing_router.export_invoices)
+    assert pattern == _status_pattern(billing_router.list_invoices)
+    for good in ("issued", "partially_paid", "paid", "cancelled"):
+        assert re.fullmatch(pattern, good)
+    for bad in ("bogus", "void", "", "paid "):
+        assert not re.fullmatch(pattern, bad)
