@@ -36,7 +36,7 @@ from .constants import (
     CAPTIVE_PORTAL_DHCP_OPTION_NAME,
 )
 from .dependencies import get_dhcp_service
-from .device_adapters import DhcpLeaseReading
+from .device_adapters import DhcpLeaseReading, DhcpPoolReading
 from .models import DhcpPool
 from .schemas import (
     CaptivePortalDhcpOptionConvergenceResponse,
@@ -48,6 +48,7 @@ from .schemas import (
     DhcpLeaseResponse,
     DhcpLivePoolListResponse,
     DhcpLivePoolResponse,
+    DhcpLivePoolUpdateRequest,
     DhcpPoolCreateRequest,
     DhcpPoolListResponse,
     DhcpPoolResponse,
@@ -462,6 +463,20 @@ async def write_captive_portal_dhcp_option(
 # the service before any device call.
 
 
+def _live_pool_response(p: DhcpPoolReading) -> DhcpLivePoolResponse:
+    return DhcpLivePoolResponse(
+        pool_name=p.pool_name,
+        ranges=list(p.ranges),
+        server=p.server,
+        interface=p.interface,
+        lease_time=p.lease_time,
+        server_disabled=p.server_disabled,
+        network=p.network,
+        gateway=p.gateway,
+        dns_servers=list(p.dns_servers),
+    )
+
+
 def _lease_response(lease: DhcpLeaseReading) -> DhcpLeaseResponse:
     return DhcpLeaseResponse(
         mac_address=lease.mac_address,
@@ -529,20 +544,48 @@ async def list_router_live_pools(
         data=DhcpLivePoolListResponse(
             router_id=str(router_id),
             items=[
-                DhcpLivePoolResponse(
-                    pool_name=p.pool_name,
-                    ranges=list(p.ranges),
-                    server=p.server,
-                    interface=p.interface,
-                    lease_time=p.lease_time,
-                    server_disabled=p.server_disabled,
-                    network=p.network,
-                    gateway=p.gateway,
-                    dns_servers=list(p.dns_servers),
-                )
-                for p in pools
+                _live_pool_response(p) for p in pools
             ],
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/routers/{router_id}/live-pools/{pool_name}",
+    response_model=ApiResponse[DhcpLivePoolResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("dhcp.execute"))],
+)
+async def update_router_live_pool(
+    request: Request,
+    router_id: uuid.UUID,
+    pool_name: str,
+    payload: DhcpLivePoolUpdateRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: DhcpService = Depends(get_dhcp_service),
+):
+    """Edit the pool this router is handing out now, in place on the
+    device: range, lease time, DNS. ``dhcp.execute`` -- it changes the live
+    router. 422 with ``DHCP_LIVE_POOL_EDIT_REFUSED`` and nothing written
+    for a range outside the pool's network or over the router's own
+    address; 404 for no such pool; 502 when the router cannot be reached
+    or did not keep the change."""
+    p = await service.update_router_live_pool(
+        router_id,
+        pool_name,
+        range_start=payload.range_start,
+        range_end=payload.range_end,
+        lease_time_seconds=payload.lease_time_seconds,
+        dns_servers=payload.dns_servers,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Address pool updated on the router",
+        data=_live_pool_response(p).model_dump(),
         request_id=_request_id(request),
     )
 
