@@ -813,7 +813,10 @@ async def put_invoice_settings(
 @billing_router.get("/invoices/export", dependencies=isp_guards(ISP_INVOICES_EXPORT))
 async def export_invoices(
     format: str = Query(default="csv", pattern="^(csv|xlsx)$"),
-    status: str | None = Query(default=None),
+    # Same values as GET /isp/invoices; anything else is 422 (QA-009).
+    status: str | None = Query(
+        default=None, pattern="^(issued|partially_paid|paid|cancelled)$"
+    ),
     zone_id: uuid.UUID | None = Query(default=None),
     bill_to_kind: str | None = Query(default=None, pattern="^(customer|subscriber)$"),
     since: date | None = Query(default=None),
