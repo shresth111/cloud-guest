@@ -89,3 +89,74 @@ async def test_failed_read_raises_rather_than_answering_empty(patch_connect, mik
     patch_connect(api)
     with pytest.raises(MikroTikDeviceError):
         await MikroTikAdapter().read_dhcp_pools(mikrotik_creds)
+
+
+# --------------------------------------------------------------------------
+# Editing the router's own pool in place (the setup script's hotspot-pool)
+# --------------------------------------------------------------------------
+
+
+def _hotspot_router() -> FakeRouterOSApi:
+    return _api(
+        pools=[{".id": "*1", "name": "hotspot-pool", "ranges": "10.5.50.10-10.5.50.254"}],
+        servers=[
+            {
+                ".id": "*A",
+                "name": "dhcp1",
+                "interface": "bridge",
+                "address-pool": "hotspot-pool",
+                "lease-time": "30m",
+            }
+        ],
+        networks=[
+            {".id": "*N", "address": "10.5.50.0/24", "gateway": "10.5.50.1", "dns-server": "10.5.50.1"}
+        ],
+    )
+
+
+def _menu(api: FakeRouterOSApi, path) -> list[dict]:
+    return list(api.path(*path))
+
+
+async def test_edit_changes_the_existing_rows_in_place(patch_connect, mikrotik_creds):
+    api = _hotspot_router()
+    patch_connect(api)
+    state = await MikroTikAdapter().update_dhcp_pool_in_place(
+        mikrotik_creds,
+        pool_name="hotspot-pool",
+        ranges="10.5.50.20-10.5.50.200",
+        lease_time="1h",
+        dns_servers=("1.1.1.1", "8.8.8.8"),
+    )
+    assert state.ranges == ("10.5.50.20-10.5.50.200",)
+    assert state.lease_time == "1h"
+    assert state.dns_servers == ("1.1.1.1", "8.8.8.8")
+    # Same rows, edited -- nothing added, gateway and network untouched.
+    assert [op for op in api.ops if op[0] == "add"] == []
+    assert [p["name"] for p in _menu(api, _POOL)] == ["hotspot-pool"]
+    assert [s["name"] for s in _menu(api, _SERVER)] == ["dhcp1"]
+    net = _menu(api, _NETWORK)[0]
+    assert (net["address"], net["gateway"]) == ("10.5.50.0/24", "10.5.50.1")
+
+
+async def test_unchanged_fields_are_not_written(patch_connect, mikrotik_creds):
+    api = _hotspot_router()
+    patch_connect(api)
+    await MikroTikAdapter().update_dhcp_pool_in_place(
+        mikrotik_creds,
+        pool_name="hotspot-pool",
+        ranges="10.5.50.10-10.5.50.254",
+        lease_time="30m",
+        dns_servers=("10.5.50.1",),
+    )
+    assert [op for op in api.ops if op[0] != "command"] == []
+
+
+async def test_unknown_pool_raises_without_writing(patch_connect, mikrotik_creds):
+    api = _hotspot_router()
+    patch_connect(api)
+    with pytest.raises(MikroTikDeviceError):
+        await MikroTikAdapter().update_dhcp_pool_in_place(
+            mikrotik_creds, pool_name="nope", ranges="10.5.50.20-10.5.50.30"
+        )
+    assert [op for op in api.ops if op[0] != "command"] == []

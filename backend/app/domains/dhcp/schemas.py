@@ -190,6 +190,18 @@ class DhcpLivePoolListResponse(BaseModel):
     items: list[DhcpLivePoolResponse]
 
 
+class DhcpLivePoolUpdateRequest(BaseModel):
+    """Edit the router's own pool in place. The range must stay inside the
+    pool's network and not cover the router's address. ``dns_servers``
+    omitted (``None``) leaves the router's DNS alone; ``[]`` is refused as
+    a list of nothing would leave guests with no resolver."""
+
+    range_start: str = Field(min_length=1, max_length=45)
+    range_end: str = Field(min_length=1, max_length=45)
+    lease_time_seconds: int | None = Field(default=None, ge=60, le=604800)
+    dns_servers: list[str] | None = Field(default=None, min_length=1, max_length=3)
+
+
 class DhcpLeaseKeepRequest(BaseModel):
     """Keep this device on this address. ``ip_address`` is the address the
     caller is about to write into a rule; the router refuses (409) if the

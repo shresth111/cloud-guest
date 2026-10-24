@@ -33,6 +33,8 @@ __all__ = [
     "DhcpOptionValueRequiredError",
     "DhcpLeaseNotFoundError",
     "DhcpLeaseConflictError",
+    "DhcpLivePoolNotFoundError",
+    "DhcpLivePoolEditRefusedError",
 ]
 
 
@@ -350,4 +352,31 @@ class DhcpLeaseConflictError(DhcpError):
                 "requested_address": requested_address,
                 "current_address": current_address,
             },
+        )
+
+
+class DhcpLivePoolNotFoundError(DhcpError):
+    """The router has no address pool of that name (any more). Nothing was
+    written."""
+
+    def __init__(self, pool_name: str) -> None:
+        super().__init__(
+            f"This router has no address pool named '{pool_name}'. Refresh "
+            "and try again.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            data={"code": "DHCP_LIVE_POOL_NOT_FOUND", "pool_name": pool_name},
+        )
+
+
+class DhcpLivePoolEditRefusedError(DhcpError):
+    """An edit to a router's own pool that would break it was refused before
+    anything was written: a range outside the pool's network (that would
+    need the router's own address changed, and the hotspot behind it), or
+    one that hands out the router's own address."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            reason,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            data={"code": "DHCP_LIVE_POOL_EDIT_REFUSED"},
         )

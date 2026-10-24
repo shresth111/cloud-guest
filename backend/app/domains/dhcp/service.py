@@ -42,6 +42,7 @@ for why this is a service-layer check, not a database constraint.
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -84,6 +85,8 @@ from .exceptions import (
     CrossLocationDhcpPoolAccessError,
     CrossOrganizationDhcpPoolAccessError,
     DhcpError,
+    DhcpLivePoolEditRefusedError,
+    DhcpLivePoolNotFoundError,
     DhcpMissingCredentialsError,
     DhcpOptionValueRequiredError,
     DhcpPoolMissingGatewayError,
@@ -1063,6 +1066,102 @@ class DhcpService:
         credentials = self._resolve_device_credentials(router)
         adapter = get_dhcp_adapter(router.vendor)
         return await adapter.read_dhcp_pools(credentials)
+
+    async def update_router_live_pool(
+        self,
+        router_id: uuid.UUID,
+        pool_name: str,
+        *,
+        range_start: str,
+        range_end: str,
+        lease_time_seconds: int | None,
+        dns_servers: list[str] | None,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> DhcpPoolReading:
+        """Edit the pool the router is handing out now -- the setup
+        script's own ``/ip pool``, which has no ``dhcp_pools`` row -- in
+        place, and read it back.
+
+        Refused before any write (422) when the new range leaves the pool's
+        network or covers the router's own address: either would need the
+        router's address on that interface changed, and the hotspot with
+        it, which this edit never touches. 404 when the router has no pool
+        of that name; 502 when the router cannot be reached or did not keep
+        the change. Audited as ``DHCP_POOL_UPDATED`` on the router.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature="IP Addresses")
+        start, end = range_start.strip(), range_end.strip()
+        validate_address_range(start, end)
+        dns = [d.strip() for d in (dns_servers or []) if d.strip()]
+        for d in dns:
+            validate_ipv4_host("dns_server", d)
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+
+        current = next(
+            (
+                p
+                for p in await adapter.read_dhcp_pools(credentials)
+                if p.pool_name == pool_name
+            ),
+            None,
+        )
+        if current is None:
+            raise DhcpLivePoolNotFoundError(pool_name)
+        if current.network is None:
+            raise DhcpLivePoolEditRefusedError(
+                "This pool has no network settings on the router, so the "
+                "range can't be checked. Nothing was changed."
+            )
+        network = ipaddress.ip_network(current.network, strict=False)
+        start_ip, end_ip = ipaddress.ip_address(start), ipaddress.ip_address(end)
+        if start_ip not in network or end_ip not in network:
+            raise DhcpLivePoolEditRefusedError(
+                f"The range has to stay inside {current.network}. Moving it "
+                "to another network would change the router's own address "
+                "and the hotspot. Nothing was changed."
+            )
+        if start_ip in (network.network_address, network.broadcast_address) or (
+            end_ip == network.broadcast_address
+        ):
+            raise DhcpLivePoolEditRefusedError(
+                f"{start if start_ip == network.network_address else end} can't "
+                "be handed out to a device. Nothing was changed."
+            )
+        if current.gateway:
+            gateway = ipaddress.ip_address(current.gateway)
+            if start_ip <= gateway <= end_ip:
+                raise DhcpLivePoolEditRefusedError(
+                    f"The range includes the router's own address "
+                    f"{current.gateway}. Start it after that address. "
+                    "Nothing was changed."
+                )
+
+        updated = await adapter.update_dhcp_pool_in_place(
+            credentials,
+            pool_name=pool_name,
+            ranges=f"{start}-{end}",
+            lease_time=(
+                f"{lease_time_seconds}s" if lease_time_seconds is not None else None
+            ),
+            dns_servers=tuple(dns) if dns_servers is not None else None,
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.DHCP_POOL_UPDATED,
+            entity_id=router_id,
+            organization_id=router.organization_id,
+            description=(
+                f"Router pool {pool_name} on router {router_id} set to "
+                f"{start}-{end}"
+            ),
+            entity_type="router",
+        )
+        return updated
 
     async def keep_lease_address(
         self,

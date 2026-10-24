@@ -2068,6 +2068,117 @@ class MikroTikAdapter:
             api.close()
         return _join_dhcp_pools(pools, servers, networks)
 
+    async def update_dhcp_pool_in_place(
+        self,
+        creds: DeviceCredentials,
+        *,
+        pool_name: str,
+        ranges: str,
+        lease_time: str | None = None,
+        dns_servers: tuple[str, ...] | None = None,
+    ) -> DhcpPoolState:
+        """Edit an address pool that already lives on the router -- by its
+        own name, in place -- and read it back.
+
+        :meth:`configure_dhcp_pool` cannot do this: it names everything
+        after the interface (``bridge-pool``/``bridge-dhcp``) and refuses an
+        interface that already serves DHCP, which is every router the setup
+        script made. This changes the setup script's own rows instead:
+
+        * ``/ip pool`` ``ranges`` of ``pool_name``;
+        * ``lease-time`` of the ``/ip dhcp-server`` that hands that pool
+          out, when ``lease_time`` is given and there is one;
+        * ``dns-server`` of the ``/ip dhcp-server network`` row that covers
+          the pool, when ``dns_servers`` is given and there is one.
+
+        Never the gateway or the network's address: those are the
+        router's own address on the interface, and the hotspot behind it.
+        Each field is written only when it differs, and the pool is read
+        again afterwards; a range the router did not keep raises rather
+        than reporting success. No pool of that name raises without
+        writing anything.
+        """
+        return await asyncio.to_thread(
+            self._update_dhcp_pool_in_place_sync,
+            creds,
+            pool_name,
+            ranges,
+            lease_time,
+            dns_servers,
+        )
+
+    def _update_dhcp_pool_in_place_sync(
+        self,
+        creds: DeviceCredentials,
+        pool_name: str,
+        ranges: str,
+        lease_time: str | None,
+        dns_servers: tuple[str, ...] | None,
+    ) -> DhcpPoolState:
+        api = self._connect_api(creds)
+        try:
+            try:
+                pool_row = next(
+                    (r for r in api.path(*_IP_POOL_PATH) if r.get("name") == pool_name),
+                    None,
+                )
+                if pool_row is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"update_dhcp_pool_in_place: no pool named {pool_name!r}",
+                    )
+                if str(pool_row.get("ranges") or "") != ranges:
+                    api.path(*_IP_POOL_PATH).update(
+                        **{".id": pool_row[".id"], "ranges": ranges}
+                    )
+                if lease_time is not None:
+                    for srv in api.path(*_DHCP_SERVER_PATH):
+                        if srv.get("address-pool") == pool_name:
+                            if not _same_routeros_duration(
+                                srv.get("lease-time"), lease_time
+                            ):
+                                api.path(*_DHCP_SERVER_PATH).update(
+                                    **{".id": srv[".id"], "lease-time": lease_time}
+                                )
+                            break
+                if dns_servers is not None:
+                    first = _pool_first_address(
+                        tuple(r.strip() for r in ranges.split(",") if r.strip())
+                    )
+                    wanted = ",".join(dns_servers)
+                    for row in api.path(*_DHCP_NETWORK_PATH):
+                        try:
+                            net = ipaddress.ip_network(
+                                str(row.get("address") or ""), strict=False
+                            )
+                        except ValueError:
+                            continue
+                        if first is not None and first in net:
+                            if str(row.get("dns-server") or "") != wanted:
+                                api.path(*_DHCP_NETWORK_PATH).update(
+                                    **{".id": row[".id"], "dns-server": wanted}
+                                )
+                            break
+                after = _join_dhcp_pools(
+                    list(api.path(*_IP_POOL_PATH)),
+                    list(api.path(*_DHCP_SERVER_PATH)),
+                    list(api.path(*_DHCP_NETWORK_PATH)),
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"update_dhcp_pool_in_place: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        state = next((p for p in after if p.pool_name == pool_name), None)
+        if state is None or ",".join(state.ranges) != ranges:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"update_dhcp_pool_in_place: {pool_name!r} did not keep ranges "
+                f"{ranges!r} (read back {state.ranges if state else None!r})",
+            )
+        return state
+
     async def keep_dhcp_lease_address(
         self, creds: DeviceCredentials, *, mac_address: str, address: str
     ) -> DhcpLeaseKeepResult:

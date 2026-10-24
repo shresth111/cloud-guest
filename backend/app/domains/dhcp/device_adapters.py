@@ -381,6 +381,19 @@ class BaseDhcpAdapter(Protocol):
         than answering an empty list."""
         ...
 
+    async def update_dhcp_pool_in_place(
+        self,
+        credentials: DhcpCredentials,
+        *,
+        pool_name: str,
+        ranges: str,
+        lease_time: str | None,
+        dns_servers: tuple[str, ...] | None,
+    ) -> DhcpPoolReading:
+        """Edit the router's own pool ``pool_name`` in place (range, lease
+        time, DNS) and read it back. Never the gateway or network."""
+        ...
+
     async def keep_dhcp_lease_address(
         self, credentials: DhcpCredentials, *, mac_address: str, address: str
     ) -> tuple[DhcpLeaseReading, bool]:
@@ -637,20 +650,47 @@ class MikroTikDhcpAdapter:
             raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
         except MikroTikDeviceError as exc:
             raise DhcpDeviceOperationError("read_dhcp_pools", exc.detail) from exc
-        return [
-            DhcpPoolReading(
-                pool_name=p.pool_name,
-                ranges=tuple(p.ranges),
-                server=p.server,
-                interface=p.interface,
-                lease_time=p.lease_time,
-                server_disabled=p.server_disabled,
-                network=p.network,
-                gateway=p.gateway,
-                dns_servers=tuple(p.dns_servers),
+        return [self._pool_reading(p) for p in pools]
+
+    @staticmethod
+    def _pool_reading(p) -> DhcpPoolReading:  # noqa: ANN001
+        return DhcpPoolReading(
+            pool_name=p.pool_name,
+            ranges=tuple(p.ranges),
+            server=p.server,
+            interface=p.interface,
+            lease_time=p.lease_time,
+            server_disabled=p.server_disabled,
+            network=p.network,
+            gateway=p.gateway,
+            dns_servers=tuple(p.dns_servers),
+        )
+
+    async def update_dhcp_pool_in_place(
+        self,
+        credentials: DhcpCredentials,
+        *,
+        pool_name: str,
+        ranges: str,
+        lease_time: str | None,
+        dns_servers: tuple[str, ...] | None,
+    ) -> DhcpPoolReading:
+        creds = self._gateway_credentials(credentials)
+        try:
+            p = await get_adapter(DeviceVendor.MIKROTIK).update_dhcp_pool_in_place(
+                creds,
+                pool_name=pool_name,
+                ranges=ranges,
+                lease_time=lease_time,
+                dns_servers=dns_servers,
             )
-            for p in pools
-        ]
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError(
+                "update_dhcp_pool_in_place", exc.detail
+            ) from exc
+        return self._pool_reading(p)
 
     async def keep_dhcp_lease_address(
         self, credentials: DhcpCredentials, *, mac_address: str, address: str
