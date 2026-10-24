@@ -110,6 +110,8 @@ class TestScript:
             ros_quote("a\nb")
 
     def test_snapshot(self) -> None:
+        """The full behaviour (auto-install, all versions/arches) is pinned
+        in test_tr069_script_install.py; this keeps the credential quoting."""
         script = render_tr069_script(
             acs_url="https://acs.example.com/",
             username="cust-1a2b3c4d",
@@ -118,26 +120,14 @@ class TestScript:
             enabled=True,
             now=datetime(2026, 10, 22, 6, 0, tzinfo=UTC),
         )
-        assert script == (
-            "# Wyfy Guest Network: TR-069 management\n"
-            "# Paste into a RouterOS terminal. Needs the tr069-client package.\n"
-            ':if ([:len [/system package find name="tr069-client"]] = 0) do={ :error '
-            '"WYFY-TR069: install the tr069-client package for this RouterOS version and '
-            'architecture, reboot, then paste this again" }\n'
-            ':if ([:len [/certificate find name="wyfy-acs-root"]] = 0) do={ /tool fetch '
-            'url="https://letsencrypt.org/certs/isrgrootx1.pem" dst-path="wyfy-acs-root.pem"; '
-            ':delay 2s; /certificate import file-name="wyfy-acs-root.pem" name="wyfy-acs-root" '
-            'passphrase="" }\n'
-            ':if ([:len [/certificate find name="wyfy-acs-root"]] = 0) do={ :error '
-            '"WYFY-TR069: could not import the ACS root certificate" }\n'
-            '/tr069-client set acs-url="https://acs.example.com/" username="cust-1a2b3c4d" '
-            'password="pa\\"ss\\$word\\\\x" periodic-inform-enabled=yes '
-            "periodic-inform-interval=300s enabled=yes\n"
-            ":delay 10s\n"
-            ":local st [/tr069-client get status]\n"
-            ':if ($st = "running") do={ :put "WYFY-TR069: PASS (status=running)" } else={ '
-            ':error ("WYFY-TR069: status=" . $st . " " . [/tr069-client get last-session-error]) }\n'
-            '/system note set note="wyfy-tr069 2026-10-22T06:00:00Z"\n'
+        assert script.startswith(
+            "# Wyfy Guest Network: TR-069 management (generated 2026-10-22T06:00:00Z)\n"
+        )
+        # the password is RouterOS-quoted in the config script, then the
+        # source as a whole is quoted once more
+        assert 'password=\\"pa\\\\\\"ss\\\\\\$word\\\\\\\\x\\"' in script
+        assert script.rstrip().endswith(
+            '/system script remove [find where name="wyfy-tr069-install"]'
         )
 
     def test_disabled_location_still_renders_with_enabled_no(self) -> None:
