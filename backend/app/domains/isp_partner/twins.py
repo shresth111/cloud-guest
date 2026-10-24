@@ -289,7 +289,7 @@ async def _resolve(
     venue header it is sent.
     """
     resolved = await _resolve_target(spec, isp, request, args)
-    await _cross_check_headers(isp, request, resolved)
+    await _cross_check_headers(isp, request, resolved, target=spec.target)
     return resolved
 
 
@@ -299,9 +299,23 @@ def _header_uuid(request: Request, header: str) -> uuid.UUID | None:
 
 
 async def _cross_check_headers(
-    isp: IspContext, request: Request, resolved: tuple[Any, Any, Any, Any]
+    isp: IspContext,
+    request: Request,
+    resolved: tuple[Any, Any, Any, Any],
+    *,
+    target: str = "header_location",
 ) -> None:
-    _target, org_id, location_id, _router = resolved
+    """Both venue headers must name THIS customer.
+
+    - The customer header must be the resolved row's customer.
+    - The location header must be a location of that customer. A row whose
+      target IS the header location trivially agrees; a row resolved from a
+      PATH id (``/venue/locations/{other}/routers``, a router, a portal
+      config) may name another location of the SAME customer -- the customer
+      pages read their other locations that way (QA-026, the Business Unit
+      and location pickers) -- but never another customer's.
+    """
+    _target, org_id, _location_id, _router = resolved
     customer_h = _header_uuid(request, HEADER_CUSTOMER)
     location_h = _header_uuid(request, HEADER_LOCATION)
     if customer_h is not None:
@@ -309,14 +323,10 @@ async def _cross_check_headers(
         if org_id is not None and customer.id != org_id:
             raise IspCustomerNotFoundError()
         org_id = org_id or customer.id
-    if location_h is not None:
-        if location_id is not None:
-            if location_h != location_id:
-                raise IspLocationNotFoundError()
-        else:
-            location = await IspScope.assert_location(isp, location_h)
-            if org_id is not None and location.organization_id != org_id:
-                raise IspLocationNotFoundError()
+    if location_h is not None and target != "header_location":
+        location = await IspScope.assert_location(isp, location_h)
+        if org_id is not None and location.organization_id != org_id:
+            raise IspLocationNotFoundError()
 
 
 async def _resolve_target(

@@ -23,9 +23,10 @@ from fastapi import APIRouter, Depends, Request
 
 from .constants import ISP_PARTNER_READ
 from .dependencies import IspContext, RequireIspPartner, isp_guards
+from .exceptions import IspLocationNotFoundError
 from .http import ok
 from .scoping import IspScope
-from .twin_headers import HEADER_CUSTOMER
+from .twin_headers import HEADER_CUSTOMER, HEADER_LOCATION
 from .twins import _scope_header
 
 __all__ = ["venue_session_router"]
@@ -42,6 +43,14 @@ async def venue_me_organizations(
     customer = await IspScope.assert_customer(
         isp, _scope_header(request, HEADER_CUSTOMER)
     )
+    # Same rule as every twin (QA-002 leftover): a location header must be a
+    # location of this customer.
+    if request.headers.get(HEADER_LOCATION):
+        location = await IspScope.assert_location(
+            isp, _scope_header(request, HEADER_LOCATION)
+        )
+        if location.organization_id != customer.id:
+            raise IspLocationNotFoundError()
     now = datetime.now(UTC).isoformat()
     row = {
         "id": f"isp-venue-{customer.id}",
