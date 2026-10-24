@@ -10,6 +10,7 @@ from __future__ import annotations
 from .twins import TwinSpec
 from .twins_access import ACCESS_TWINS
 from .twins_engage import ENGAGE_TWINS
+from .twins_keys import with_aligned_key
 from .twins_portal import PORTAL_TWINS
 from .twins_reports import with_report_location
 from .twins_venue import VENUE_TWINS
@@ -17,6 +18,6 @@ from .twins_venue import VENUE_TWINS
 __all__ = ["ALL_TWINS"]
 
 ALL_TWINS: tuple[TwinSpec, ...] = tuple(
-    with_report_location(spec)
+    with_aligned_key(with_report_location(spec))
     for spec in VENUE_TWINS + PORTAL_TWINS + ACCESS_TWINS + ENGAGE_TWINS
 )
