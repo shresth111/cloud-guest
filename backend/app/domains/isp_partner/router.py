@@ -1015,5 +1015,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(password_reset_router)
 
+    # QA-021: public, read-only ISP support contact for the guest portal footer.
+    from .portal_support_router import portal_support_router
+
+    isp_partner_router.include_router(portal_support_router)
+
 
 _include_lanes()

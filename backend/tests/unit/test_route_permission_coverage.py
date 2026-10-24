@@ -130,6 +130,11 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Initiates a reset -- must work for a locked-out user."
     ),
     ("POST", "/api/v1/auth/reset-password"): "Completed via a single-use reset token.",
+    ("GET", "/api/v1/isp/public/portal-support"): (
+        "Guest portal footer: the ISP's published support phone/email for a "
+        "location of one of its customers (QA-021). Read-only, no other "
+        "fields, 404 for non-ISP locations, flag-gated, rate limited per IP."
+    ),
     ("POST", "/api/v1/isp/auth/forgot-password"): (
         "ISP partner console forgot password -- must work for a locked-out "
         "user; flag-gated, rate limited per IP and per email, one response."
