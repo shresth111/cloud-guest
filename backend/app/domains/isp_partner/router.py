@@ -875,6 +875,13 @@ async def list_guests(
         page=page,
         page_size=page_size,
     )
+    # QA-027: the same F2 rule as the venue Guests twin (pii_policy): raw only
+    # when Master enabled unmasking for this ISP and the caller is its
+    # owner/admin, and then audited once per view. The field names stay
+    # ``*_masked`` for FE compatibility; ``masked`` says which it is.
+    from .parity_settings import pii_unmasked_for, record_unmasked_view
+
+    unmasked = await pii_unmasked_for(isp.repository.session, isp)
     items = []
     for guest, sessions in rows:
         phone = guest.identifier if _looks_like_phone(guest.identifier) else None
@@ -885,8 +892,9 @@ async def list_guests(
             {
                 "id": str(guest.id),
                 "display_name": guest.display_name,
-                "phone_masked": mask_mobile(phone),
-                "email_masked": mask_email(email),
+                "phone_masked": phone if unmasked else mask_mobile(phone),
+                "email_masked": email if unmasked else mask_email(email),
+                "masked": not unmasked,
                 "first_seen_at": guest.first_seen_at.isoformat()
                 if guest.first_seen_at
                 else None,
@@ -898,6 +906,14 @@ async def list_guests(
                 if guest.location_id
                 else None,
             }
+        )
+    if unmasked and items:
+        await record_unmasked_view(
+            isp.repository.session,
+            isp,
+            what="GET /customers/{isp_customer_id}/guests",
+            customer_org_id=customer.id,
+            location_id=location_id,
         )
     return ok(request, make_page(items, total, page, page_size), "Guests")
 
