@@ -227,6 +227,25 @@ class DhcpLeaseReading:
     disabled: bool
 
 
+@dataclass(frozen=True, slots=True)
+class DhcpPoolReading:
+    """One address pool as the device reported it on one read: the
+    ``/ip pool`` range joined to the DHCP server that hands it out and the
+    network row (gateway, DNS) that covers it. ``server`` is ``None`` for a
+    pool no DHCP server uses. Independently defined, like the readings
+    above."""
+
+    pool_name: str
+    ranges: tuple[str, ...]
+    server: str | None
+    interface: str | None
+    lease_time: str | None
+    server_disabled: bool
+    network: str | None
+    gateway: str | None
+    dns_servers: tuple[str, ...]
+
+
 class BaseDhcpAdapter(Protocol):
     """What a vendor implements to plug real DHCP operations into this
     domain."""
@@ -352,6 +371,14 @@ class BaseDhcpAdapter(Protocol):
     ) -> list[DhcpLeaseReading]:
         """Every DHCP lease on the router, dynamic and static. Raises on a
         failed read rather than answering an empty list."""
+        ...
+
+    async def read_dhcp_pools(
+        self, credentials: DhcpCredentials
+    ) -> list[DhcpPoolReading]:
+        """Every address pool on the router, read live, with the DHCP
+        server and network it belongs to. Raises on a failed read rather
+        than answering an empty list."""
         ...
 
     async def keep_dhcp_lease_address(
@@ -599,6 +626,31 @@ class MikroTikDhcpAdapter:
         except MikroTikDeviceError as exc:
             raise DhcpDeviceOperationError("read_dhcp_leases", exc.detail) from exc
         return [self._lease_reading(lease) for lease in leases]
+
+    async def read_dhcp_pools(
+        self, credentials: DhcpCredentials
+    ) -> list[DhcpPoolReading]:
+        creds = self._gateway_credentials(credentials)
+        try:
+            pools = await get_adapter(DeviceVendor.MIKROTIK).read_dhcp_pools(creds)
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError("read_dhcp_pools", exc.detail) from exc
+        return [
+            DhcpPoolReading(
+                pool_name=p.pool_name,
+                ranges=tuple(p.ranges),
+                server=p.server,
+                interface=p.interface,
+                lease_time=p.lease_time,
+                server_disabled=p.server_disabled,
+                network=p.network,
+                gateway=p.gateway,
+                dns_servers=tuple(p.dns_servers),
+            )
+            for p in pools
+        ]
 
     async def keep_dhcp_lease_address(
         self, credentials: DhcpCredentials, *, mac_address: str, address: str
