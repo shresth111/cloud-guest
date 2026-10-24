@@ -59,13 +59,12 @@ from .constants import (
     ISP_ENGAGE_UPDATE,
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
-from .exceptions import IspBadRequestError, IspError
+from .exceptions import IspError
 from .http import ok
-from .scoping import IspScope
 from .twin_body import BodyId
 from .twin_gates import enforce_customer_gates, get_twin_entitlement_checker
-from .twin_headers import HEADER_LOCATION
 from .twins import Param, TwinSpec
+from .venue_headers import resolve_venue_location
 
 __all__ = [
     "MARKETING_TWINS",
@@ -85,14 +84,8 @@ class IspSenderIsIspLevelError(IspError):
 
 
 async def _header_location(request: Request, isp: IspContext) -> Any:
-    raw = request.headers.get(HEADER_LOCATION)
-    if not raw:
-        raise IspBadRequestError(f"{HEADER_LOCATION} is required")
-    try:
-        location_id = uuid.UUID(raw)
-    except ValueError:
-        raise IspBadRequestError(f"{HEADER_LOCATION} is not a valid id") from None
-    return await IspScope.assert_location(isp, location_id)
+    # The location header, plus the customer header when sent (must agree).
+    return await resolve_venue_location(request, isp)
 
 
 async def isp_marketing_scope(

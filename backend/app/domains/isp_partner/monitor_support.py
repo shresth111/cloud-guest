@@ -67,8 +67,8 @@ from .constants import (
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .http import ok
 from .scoping import IspScope
-from .twin_headers import HEADER_LOCATION
 from .twins import Extra, Param, TwinSpec
+from .venue_headers import resolve_venue_location
 
 __all__ = ["MONITOR_TWINS", "monitor_support_router"]
 
@@ -164,18 +164,7 @@ async def list_venue_alert_rules(
 ):
     """The customer's alert rules, read-only. Not the original by-id handler
     (path-id defect); a plain query pinned to the resolved customer org."""
-    raw = request.headers.get(HEADER_LOCATION)
-    if not raw:
-        from .exceptions import IspBadRequestError
-
-        raise IspBadRequestError(f"{HEADER_LOCATION} is required")
-    try:
-        location_id = uuid.UUID(raw)
-    except ValueError:
-        from .exceptions import IspBadRequestError
-
-        raise IspBadRequestError(f"{HEADER_LOCATION} is not a valid id") from None
-    location = await IspScope.assert_location(isp, location_id)
+    location = await resolve_venue_location(request, isp)
     org_id = location.organization_id
     where = and_(AlertRule.organization_id == org_id, AlertRule.is_deleted.is_(False))
     total = (

@@ -253,7 +253,10 @@ async def test_build_twin_calls_the_handler_by_keyword() -> None:
         params=(),
     )
     twin = build_twin(spec)
-    sentinel = object()
+    from starlette.datastructures import Headers
+
+    # A request-shaped object: build_twin may read headers before resolving.
+    sentinel = SimpleNamespace(headers=Headers({}))
     assert "request" in _inspect.signature(twin).parameters
     await twin(request=sentinel, isp=None)
     assert seen["request"] is sentinel

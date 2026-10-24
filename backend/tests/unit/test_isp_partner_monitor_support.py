@@ -20,7 +20,10 @@ from types import SimpleNamespace
 import pytest
 
 from app.domains.isp_partner import monitor_support as b5
-from app.domains.isp_partner.exceptions import IspCustomerNotFoundError
+from app.domains.isp_partner.exceptions import (
+    IspCustomerNotFoundError,
+    IspLocationNotFoundError,
+)
 from app.domains.isp_partner.twins_all import ALL_TWINS
 from app.domains.monitoring import router as monitoring_routes
 from tests.unit.isp_partner_fixtures import CUST_A1, CUST_B1, ISP_A, context, estate
@@ -202,3 +205,53 @@ def test_b5_routes_are_mounted_with_their_keys() -> None:
     assert set(found) == set(_EXPECTED)
     for route, key in _EXPECTED.items():
         assert key in found[route], (route, found[route])
+
+
+def _venue_request(location, customer=None):
+    from starlette.datastructures import Headers
+
+    h = {"x-isp-location-id": str(location)}
+    if customer is not None:
+        h["x-isp-customer-id"] = str(customer)
+    return SimpleNamespace(headers=Headers(h), state=SimpleNamespace(request_id="t"))
+
+
+async def test_alert_rules_refuse_a_mismatched_header_pair() -> None:
+    """QA-002 for the hand route: customer header of ANOTHER customer of the
+    same ISP + this location is a 404, before any query."""
+    from tests.unit.isp_partner_fixtures import CUST_A2, LOC_A1
+
+    with pytest.raises(IspLocationNotFoundError):
+        await b5.list_venue_alert_rules(
+            _venue_request(LOC_A1, CUST_A2),
+            page=1,
+            page_size=50,
+            isp=context(estate()),
+            db=_NoQueryDb(),
+        )
+
+
+async def test_alert_rules_refuse_another_isps_customer_header() -> None:
+    from tests.unit.isp_partner_fixtures import LOC_A1
+
+    with pytest.raises(IspCustomerNotFoundError):
+        await b5.list_venue_alert_rules(
+            _venue_request(LOC_A1, CUST_B1),
+            page=1,
+            page_size=50,
+            isp=context(estate()),
+            db=_NoQueryDb(),
+        )
+
+
+async def test_alert_rules_matching_pair_reaches_the_query() -> None:
+    from tests.unit.isp_partner_fixtures import LOC_A1
+
+    with pytest.raises(AssertionError, match="must not run a query"):
+        await b5.list_venue_alert_rules(
+            _venue_request(LOC_A1, CUST_A1),
+            page=1,
+            page_size=50,
+            isp=context(estate()),
+            db=_NoQueryDb(),
+        )

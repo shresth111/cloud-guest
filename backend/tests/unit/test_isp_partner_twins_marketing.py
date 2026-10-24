@@ -352,3 +352,19 @@ def test_f1_f3_routes_are_mounted_with_their_keys() -> None:
         assert key in found[route], route
         want = ScopeType.GLOBAL if "/platform/" in route[1] else ScopeType.ORGANIZATION
         assert want in found[route], route
+
+
+async def test_marketing_scope_refuses_a_mismatched_header_pair() -> None:
+    from starlette.datastructures import Headers
+
+    from tests.unit.isp_partner_fixtures import CUST_A2
+
+    req = SimpleNamespace(
+        headers=Headers(
+            {"x-isp-location-id": str(LOC_A1), "x-isp-customer-id": str(CUST_A2)}
+        )
+    )
+    with pytest.raises(IspLocationNotFoundError):
+        await tm.isp_marketing_scope(
+            req, isp=context(estate()), user=SimpleNamespace(id=str(uuid.uuid4()))
+        )
