@@ -70,6 +70,7 @@ from .device_adapters import (
     DhcpLeaseReading,
     DhcpOptionSnapshotReading,
     DhcpOptionSpec,
+    DhcpPoolReading,
     RogueDhcpInterfaceReading,
     get_dhcp_adapter,
 )
@@ -1040,6 +1041,28 @@ class DhcpService:
         credentials = self._resolve_device_credentials(router)
         adapter = get_dhcp_adapter(router.vendor)
         return await adapter.read_dhcp_leases(credentials)
+
+    async def list_router_live_pools(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[DhcpPoolReading]:
+        """Every address pool on this router, read live over 8728.
+
+        The ``dhcp_pools`` table only holds ranges created through the
+        platform; the pool the setup script made exists on the device and
+        nowhere else, so the IP Addresses page showed nothing for most
+        routers. This is that page's "current on router" read. Read-only;
+        a failed read raises (502) rather than answering an empty list.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature="IP Addresses")
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+        return await adapter.read_dhcp_pools(credentials)
 
     async def keep_lease_address(
         self,

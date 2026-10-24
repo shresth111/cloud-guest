@@ -831,6 +831,32 @@ class HotspotDeviceUnblockResult:
 
 
 @dataclass(frozen=True, slots=True)
+class DhcpPoolState:
+    """One address pool as it lives on the router right now: an ``/ip pool``
+    row joined to the ``/ip dhcp-server`` that hands it out and the
+    ``/ip dhcp-server network`` row whose subnet holds it.
+
+    Most routers never had their pool created through the platform -- the
+    setup script made it -- so this is the only place the customer can see
+    the range their guests are actually getting. ``server``/``interface``
+    are ``None`` for a pool no DHCP server uses (e.g. one only a hotspot
+    profile references); ``network``/``gateway``/``dns_servers`` are empty
+    when no network row covers the range. ``lease_time`` is RouterOS's own
+    duration string (``30m``, ``1d``), passed through.
+    """
+
+    pool_name: str
+    ranges: tuple[str, ...]
+    server: str | None
+    interface: str | None
+    lease_time: str | None
+    server_disabled: bool
+    network: str | None
+    gateway: str | None
+    dns_servers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DhcpLease:
     """One ``/ip dhcp-server lease`` row, as the router reported it.
 
@@ -2116,6 +2142,7 @@ __all__ = [
     "HotspotDisconnectResult",
     "HotspotDeviceBlockResult",
     "DhcpLease",
+    "DhcpPoolState",
     "DhcpLeaseKeepResult",
     "HotspotDeviceUnblockResult",
     "FloodLimitStatus",

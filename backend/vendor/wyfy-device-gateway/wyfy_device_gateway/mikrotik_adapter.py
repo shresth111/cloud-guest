@@ -97,6 +97,7 @@ from .contract import (
     DeviceVendor,
     DhcpLease,
     DhcpLeaseKeepResult,
+    DhcpPoolState,
     DhcpOptionBinding,
     DhcpOptionConfig,
     DhcpOptionInfo,
@@ -153,6 +154,8 @@ _DHCP_OPTION_PATH = ("ip", "dhcp-server", "option")
 _DHCP_OPTION_SET_PATH = ("ip", "dhcp-server", "option", "sets")
 _DHCP_NETWORK_PATH = ("ip", "dhcp-server", "network")
 _DHCP_LEASE_PATH = ("ip", "dhcp-server", "lease")
+_DHCP_SERVER_PATH = ("ip", "dhcp-server")
+_IP_POOL_PATH = ("ip", "pool")
 # Every menu whose rows can hand a DHCP option to clients, paired with the
 # field that identifies a row to a human. ``/ip dhcp-server`` itself is
 # deliberately absent: it carries no ``dhcp-option``/``dhcp-option-set``
@@ -2023,6 +2026,32 @@ class MikroTikAdapter:
         finally:
             api.close()
         return [lease for row in rows if (lease := _lease_from_row(row)) is not None]
+
+    async def read_dhcp_pools(self, creds: DeviceCredentials) -> list[DhcpPoolState]:
+        """Every ``/ip pool`` on the router, each joined to the DHCP server
+        that uses it and the network row that covers it. Read-only.
+
+        Three menus on one connection. A failed read of any of them raises
+        :class:`MikroTikDeviceError` rather than answering ``[]`` -- "this
+        router has no pool" and "we could not ask" are different answers,
+        for the same reason as :meth:`read_dhcp_leases`.
+        """
+        return await asyncio.to_thread(self._read_dhcp_pools_sync, creds)
+
+    def _read_dhcp_pools_sync(self, creds: DeviceCredentials) -> list[DhcpPoolState]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                pools = list(api.path(*_IP_POOL_PATH))
+                servers = list(api.path(*_DHCP_SERVER_PATH))
+                networks = list(api.path(*_DHCP_NETWORK_PATH))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dhcp_pools: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return _join_dhcp_pools(pools, servers, networks)
 
     async def keep_dhcp_lease_address(
         self, creds: DeviceCredentials, *, mac_address: str, address: str
@@ -8200,6 +8229,78 @@ def _row_mac(row: dict[str, object]) -> str | None:
 # plain numeric `signal` with `rx-rate`/`tx-rate` alongside it, so the
 # parser to write depends on which wireless stack the device actually
 # runs -- which is the version gate described in that method's docstring.
+
+
+def _pool_first_address(ranges: tuple[str, ...]) -> ipaddress.IPv4Address | None:
+    """The first address of an ``/ip pool`` ``ranges`` value (``a-b``,
+    ``a/24`` or a bare ``a``), or ``None`` when it does not parse."""
+    for part in ranges:
+        head = part.split("-", 1)[0].strip()
+        try:
+            if "/" in head:
+                return next(ipaddress.ip_network(head, strict=False).hosts(), None)
+            return ipaddress.IPv4Address(head)
+        except ValueError:
+            continue
+    return None
+
+
+def _join_dhcp_pools(
+    pools: list[Mapping[str, object]],
+    servers: list[Mapping[str, object]],
+    networks: list[Mapping[str, object]],
+) -> list[DhcpPoolState]:
+    """``/ip pool`` + ``/ip dhcp-server`` + ``/ip dhcp-server network`` rows
+    -> one :class:`DhcpPoolState` per pool, in the router's own order.
+
+    A pool is joined to the first server whose ``address-pool`` names it,
+    and to the first network row whose subnet contains the pool's first
+    address -- the same match RouterOS itself makes when it picks which
+    gateway/DNS to hand a lease from that pool."""
+    by_pool: dict[str, Mapping[str, object]] = {}
+    for srv in servers:
+        name = _safe_str(srv.get("address-pool"))
+        if name and name not in by_pool:
+            by_pool[name] = srv
+    parsed_networks: list[tuple[ipaddress.IPv4Network, Mapping[str, object]]] = []
+    for row in networks:
+        try:
+            net = ipaddress.ip_network(str(row.get("address") or ""), strict=False)
+        except ValueError:
+            continue
+        if isinstance(net, ipaddress.IPv4Network):
+            parsed_networks.append((net, row))
+
+    out: list[DhcpPoolState] = []
+    for row in pools:
+        name = _safe_str(row.get("name"))
+        if name is None:
+            continue
+        ranges = tuple(
+            r.strip() for r in str(row.get("ranges") or "").split(",") if r.strip()
+        )
+        srv = by_pool.get(name)
+        first = _pool_first_address(ranges)
+        net_row = next(
+            (r for n, r in parsed_networks if first is not None and first in n), None
+        )
+        dns = _safe_str(net_row.get("dns-server")) if net_row else None
+        out.append(
+            DhcpPoolState(
+                pool_name=name,
+                ranges=ranges,
+                server=_safe_str(srv.get("name")) if srv else None,
+                interface=_safe_str(srv.get("interface")) if srv else None,
+                lease_time=_safe_str(srv.get("lease-time")) if srv else None,
+                server_disabled=_is_truthy(srv.get("disabled")) if srv else False,
+                network=_safe_str(net_row.get("address")) if net_row else None,
+                gateway=_safe_str(net_row.get("gateway")) if net_row else None,
+                dns_servers=tuple(
+                    d.strip() for d in (dns or "").split(",") if d.strip()
+                ),
+            )
+        )
+    return out
 
 
 def _lease_from_row(row: Mapping[str, object]) -> DhcpLease | None:

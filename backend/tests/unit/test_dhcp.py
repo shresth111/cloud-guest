@@ -540,7 +540,7 @@ class TestListPoolsForRouter:
 
 class TestEveryRouteRequiresPermission:
     def test_every_dhcp_route_has_a_permission_dependency(self) -> None:
-        assert len(dhcp_router.routes) == 11
+        assert len(dhcp_router.routes) == 12
         for route in dhcp_router.routes:
             assert (
                 route.dependencies != []
@@ -2019,6 +2019,7 @@ class TestCaptivePortalDhcpOptionLeafReachability:
 class FakeLeaseAdapter:
     vendor: str = "mikrotik"
     leases: list = field(default_factory=list)
+    pools: list = field(default_factory=list)
     keeps: list[dict[str, object]] = field(default_factory=list)
     changed: bool = True
     raises: Exception | None = None
@@ -2027,6 +2028,11 @@ class FakeLeaseAdapter:
         if self.raises is not None:
             raise self.raises
         return list(self.leases)
+
+    async def read_dhcp_pools(self, credentials):
+        if self.raises is not None:
+            raise self.raises
+        return list(self.pools)
 
     async def keep_dhcp_lease_address(self, credentials, *, mac_address, address):
         self.keeps.append(
@@ -2226,6 +2232,78 @@ class TestKeepLeaseAddress:
 
         with pytest.raises(DhcpDeviceConnectionError):
             await h.service.list_router_leases(
+                router.id, requesting_organization_id=router.organization_id
+            )
+
+
+class TestListRouterLivePools:
+    """The IP Addresses page's "current on router": the pool the setup
+    script made lives only on the device, so it is read live."""
+
+    async def test_reads_the_device(self, lease_adapter: FakeLeaseAdapter) -> None:
+        from app.domains.dhcp.device_adapters import DhcpPoolReading
+
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.pools = [
+            DhcpPoolReading(
+                pool_name="hs-pool",
+                ranges=("10.5.50.2-10.5.50.254",),
+                server="dhcp-guest",
+                interface="bridge-guest",
+                lease_time="1h",
+                server_disabled=False,
+                network="10.5.50.0/24",
+                gateway="10.5.50.1",
+                dns_servers=("10.5.50.1",),
+            )
+        ]
+
+        pools = await h.service.list_router_live_pools(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert [(p.pool_name, p.gateway) for p in pools] == [("hs-pool", "10.5.50.1")]
+        # A read writes nothing and audits nothing.
+        assert h.audit_writer.entries == []
+
+    async def test_another_tenants_router_is_not_found(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.list_router_live_pools(
+                router.id, requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_controller_managed_router_is_refused(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        from app.domains.router.device_domain_gate import (
+            ControllerManagedFeatureUnavailableError,
+        )
+
+        h = make_harness()
+        router = _make_router()
+        router.vendor = "tplink_omada"
+        h.router_lookup.add(router)
+
+        with pytest.raises(ControllerManagedFeatureUnavailableError):
+            await h.service.list_router_live_pools(
+                router.id, requesting_organization_id=router.organization_id
+            )
+
+    async def test_a_failed_read_is_an_error_not_an_empty_list(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.raises = DhcpDeviceConnectionError("10.0.0.1", "timed out")
+
+        with pytest.raises(DhcpDeviceConnectionError):
+            await h.service.list_router_live_pools(
                 router.id, requesting_organization_id=router.organization_id
             )
 
