@@ -2260,6 +2260,149 @@ class TestKeepLeaseAddress:
             )
 
 
+def _lease(
+    mac: str, address: str | None, *, dynamic: bool = True, disabled: bool = False
+):
+    from app.domains.dhcp.device_adapters import DhcpLeaseReading
+
+    return DhcpLeaseReading(
+        mac_address=mac,
+        address=address,
+        dynamic=dynamic,
+        status="bound",
+        host_name=None,
+        server="hotspot-dhcp",
+        disabled=disabled,
+    )
+
+
+class TestPinDeviceLeases:
+    """Registered hardware (an AP, a printer) gets its current address made
+    static on the router -- the IP is bound to the MAC from then on."""
+
+    async def test_dynamic_lease_is_made_static_and_audited(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.leases = [
+            _lease("e4:fa:c4:3b:90:46", "10.5.50.224"),
+            _lease("AA:AA:AA:AA:AA:AA", "10.5.50.30"),
+        ]
+
+        outcomes = await h.service.pin_device_leases(
+            router, ["E4-FA-C4-3B-90-46"], actor_user_id=None
+        )
+
+        assert [(o.mac_address, o.status, o.ip_address) for o in outcomes] == [
+            ("E4:FA:C4:3B:90:46", "pinned", "10.5.50.224")
+        ]
+        # Only the registered MAC is touched, on the address it already had.
+        assert lease_adapter.keeps == [
+            {
+                "host": "10.0.0.1",
+                "mac_address": "E4:FA:C4:3B:90:46",
+                "address": "10.5.50.224",
+            }
+        ]
+        assert [e["action"] for e in h.audit_writer.entries] == [
+            AuditAction.DHCP_LEASE_MADE_STATIC.value
+        ]
+
+    async def test_already_static_writes_nothing(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.leases = [
+            _lease("E4:FA:C4:3B:90:46", "10.5.50.224"),
+            _lease("E4:FA:C4:3B:90:46", "10.5.50.200", dynamic=False),
+        ]
+
+        outcomes = await h.service.pin_device_leases(
+            router, ["E4:FA:C4:3B:90:46"], actor_user_id=None
+        )
+
+        # The reservation wins over the dynamic row for the same MAC.
+        assert [(o.status, o.ip_address) for o in outcomes] == [
+            ("already_static", "10.5.50.200")
+        ]
+        assert lease_adapter.keeps == []
+        assert h.audit_writer.entries == []
+
+    async def test_no_lease_is_reported_not_raised(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.leases = [_lease("E4:FA:C4:3B:90:46", None)]
+
+        outcomes = await h.service.pin_device_leases(
+            router, ["E4:FA:C4:3B:90:46", "5C:A6:E6:31:E6:58"], actor_user_id=None
+        )
+
+        assert [o.status for o in outcomes] == ["no_lease", "no_lease"]
+        assert lease_adapter.keeps == []
+
+    async def test_one_failed_write_does_not_stop_the_rest(
+        self, lease_adapter: FakeLeaseAdapter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.leases = [
+            _lease("11:11:11:11:11:11", "10.5.50.11"),
+            _lease("22:22:22:22:22:22", "10.5.50.22"),
+        ]
+        real_keep = lease_adapter.keep_dhcp_lease_address
+
+        async def flaky(credentials, *, mac_address, address):
+            if mac_address == "11:11:11:11:11:11":
+                raise DhcpDeviceOperationError("keep_dhcp_lease_address", "busy")
+            return await real_keep(
+                credentials, mac_address=mac_address, address=address
+            )
+
+        monkeypatch.setattr(lease_adapter, "keep_dhcp_lease_address", flaky)
+
+        outcomes = await h.service.pin_device_leases(
+            router, ["22:22:22:22:22:22", "11:11:11:11:11:11"], actor_user_id=None
+        )
+
+        assert {o.mac_address: o.status for o in outcomes} == {
+            "11:11:11:11:11:11": "failed",
+            "22:22:22:22:22:22": "pinned",
+        }
+
+    async def test_a_failed_lease_read_raises(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        lease_adapter.raises = DhcpDeviceConnectionError("10.0.0.1", "timed out")
+
+        with pytest.raises(DhcpDeviceConnectionError):
+            await h.service.pin_device_leases(
+                router, ["E4:FA:C4:3B:90:46"], actor_user_id=None
+            )
+
+    async def test_controller_router_or_no_macs_is_a_no_op(
+        self, lease_adapter: FakeLeaseAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        assert await h.service.pin_device_leases(router, [], actor_user_id=None) == []
+
+        omada = h.router_lookup.add(_make_router())
+        omada.vendor = "tplink_omada"
+        lease_adapter.raises = AssertionError("must not dial a controller")
+        assert (
+            await h.service.pin_device_leases(
+                omada, ["E4:FA:C4:3B:90:46"], actor_user_id=None
+            )
+            == []
+        )
+
+
 class TestListRouterLivePools:
     """The IP Addresses page's "current on router": the pool the setup
     script made lives only on the device, so it is read live."""
