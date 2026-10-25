@@ -193,6 +193,17 @@ class MonitoredHardwareService:
         )
         return device
 
+    async def lease_router_ids(self, device: MonitoredHardware) -> list[uuid.UUID]:
+        """The RouterOS routers that could hold this device's DHCP lease:
+        its own router when it names one, else every agent-managed router
+        at its location. A controller-managed router has no lease table."""
+        vendors = await self._router_vendors_at(device.location_id, None)
+        if device.router_id is not None:
+            candidates = [device.router_id]
+        else:
+            candidates = sorted(vendors, key=str)
+        return [rid for rid in candidates if is_agent_managed(vendors.get(rid))]
+
     async def get_device(
         self,
         device_id: uuid.UUID,

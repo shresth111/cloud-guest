@@ -13,6 +13,7 @@ from app.domains.auth.schemas import MessageResponse
 
 __all__ = [
     "MessageResponse",
+    "MonitoredHardwareAddressBinding",
     "MonitoredHardwareHealth",
     "MonitoredHardwareHealthEvent",
     "MonitoredHardwareRegisterRequest",
@@ -73,6 +74,25 @@ class MonitoredHardwareHealth(BaseModel):
     events_24h: list[MonitoredHardwareHealthEvent]
 
 
+class MonitoredHardwareAddressBinding(BaseModel):
+    """What registration did about this device's IP address: its current
+    DHCP lease made static on the router, so the address stays bound to
+    this MAC. Sent only on the register response.
+
+    ``status`` is a code (the console owns the words):
+    ``pinned`` / ``already_static`` -- bound on ``ip_address``;
+    ``no_lease`` -- the device holds no lease yet, and the next device sync
+    (every ~15 min) binds it once it takes one;
+    ``conflict`` / ``failed`` -- the router refused or could not be reached;
+    ``unsupported`` -- no RouterOS router at this location (a controller-
+    managed venue), so there is nothing to bind on."""
+
+    status: str
+    ip_address: str | None = None
+    router_id: str | None = None
+    detail: str | None = None
+
+
 class MonitoredHardwareResponse(BaseModel):
     id: str
     organization_id: str
@@ -113,6 +133,8 @@ class MonitoredHardwareResponse(BaseModel):
     # True when another organization registered this MAC, sent only for a
     # row this location has never observed. Never says which.
     registered_elsewhere: bool = False
+    # Register response only -- see MonitoredHardwareAddressBinding.
+    address_binding: MonitoredHardwareAddressBinding | None = None
     created_at: datetime
 
 

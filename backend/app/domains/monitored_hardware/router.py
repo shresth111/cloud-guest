@@ -17,6 +17,7 @@ first-match-wins routing resolves the literal path first, mirroring
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -25,6 +26,8 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import AuthUser
+from app.domains.dhcp.dependencies import get_dhcp_service
+from app.domains.dhcp.service import DhcpService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -32,8 +35,10 @@ from app.domains.rbac.dependencies import (
 )
 
 from .dependencies import get_monitored_hardware_service
+from .models import MonitoredHardware
 from .schemas import (
     MessageResponse,
+    MonitoredHardwareAddressBinding,
     MonitoredHardwareHealth,
     MonitoredHardwareHealthEvent,
     MonitoredHardwareListResponse,
@@ -41,6 +46,8 @@ from .schemas import (
     MonitoredHardwareResponse,
 )
 from .service import HardwareWithStatus, MonitoredHardwareService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/monitored-hardware", tags=["Monitored Hardware"])
 
@@ -129,6 +136,54 @@ def _device_response(item: HardwareWithStatus) -> MonitoredHardwareResponse:
     )
 
 
+async def _bind_address(
+    device: MonitoredHardware,
+    service: MonitoredHardwareService,
+    dhcp_service: DhcpService,
+    *,
+    actor_user_id: uuid.UUID,
+) -> MonitoredHardwareAddressBinding:
+    """Registering hardware binds its IP: the lease it holds right now is
+    made static on the router that serves it. Best-effort -- the device is
+    already registered, so nothing here may fail the request; a device
+    with no lease yet is bound by the next device sync instead (see
+    ``connected_devices.tasks._pin_monitored_hardware_leases``)."""
+    router_ids = await service.lease_router_ids(device)
+    if not router_ids:
+        return MonitoredHardwareAddressBinding(status="unsupported")
+    last_problem: MonitoredHardwareAddressBinding | None = None
+    for router_id in router_ids:
+        try:
+            router_row = await dhcp_service.router_lookup.get_router(
+                router_id, requesting_organization_id=device.organization_id
+            )
+            outcomes = await dhcp_service.pin_device_leases(
+                router_row, [device.mac_address], actor_user_id=actor_user_id
+            )
+        except Exception as exc:  # noqa: BLE001 -- best-effort, see docstring
+            logger.warning(
+                "monitored_hardware_bind_failed",
+                extra={"router_id": str(router_id), "error": str(exc)},
+            )
+            last_problem = MonitoredHardwareAddressBinding(
+                status="failed", router_id=str(router_id), detail=str(exc)
+            )
+            continue
+        for outcome in outcomes:
+            if outcome.status == "no_lease":
+                continue
+            binding = MonitoredHardwareAddressBinding(
+                status=outcome.status,
+                ip_address=outcome.ip_address,
+                router_id=str(router_id),
+                detail=outcome.detail,
+            )
+            if outcome.status in {"pinned", "already_static"}:
+                return binding
+            last_problem = binding
+    return last_problem or MonitoredHardwareAddressBinding(status="no_lease")
+
+
 @router.post(
     "",
     response_model=ApiResponse[MonitoredHardwareResponse],
@@ -141,6 +196,7 @@ async def register_monitored_hardware(
     actor: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: MonitoredHardwareService = Depends(get_monitored_hardware_service),
+    dhcp_service: DhcpService = Depends(get_dhcp_service),
 ):
     device = await service.register_device(
         actor_user_id=uuid.UUID(actor.id),
@@ -152,11 +208,16 @@ async def register_monitored_hardware(
         device_type=payload.device_type,
         floor=payload.floor,
     )
+    binding = await _bind_address(
+        device, service, dhcp_service, actor_user_id=uuid.UUID(actor.id)
+    )
     item = await service.with_status(device)
+    response = _device_response(item)
+    response.address_binding = binding
     return build_response(
         success=True,
         message="Monitored hardware registered",
-        data=_device_response(item).model_dump(),
+        data=response.model_dump(),
         request_id=_request_id(request),
     )
 
