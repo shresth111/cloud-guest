@@ -70,6 +70,11 @@ from app.domains.otp.service import (
     SmsProviderProtocol,
 )
 from app.domains.router_provisioning.service import render_template
+from app.domains.sms_delivery.constants import SmsPurpose
+from app.domains.sms_delivery.recorder import (
+    SmsDeliveryRecorderProtocol,
+    send_sms_and_record,
+)
 
 from .constants import (
     DISPATCH_SWEEP_BATCH_SIZE,
@@ -130,9 +135,13 @@ class NotificationService:
         sales_webhook_sender: SalesWebhookSenderProtocol | None = None,
         max_attempts: int = 5,
         retry_backoff_seconds: int = 300,
+        sms_delivery_recorder: SmsDeliveryRecorderProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.object_storage = object_storage
+        # One sms_delivery_logs row per real SMS attempt; see
+        # app.domains.sms_delivery.recorder.
+        self.sms_delivery_recorder = sms_delivery_recorder
         self.email_provider: EmailProviderProtocol = (
             email_provider or LoggingEmailProvider()
         )
@@ -427,7 +436,15 @@ class NotificationService:
                 # sender (from Settings), never on the row.
                 await self.sales_webhook_sender.send(delivery.body)
             else:
-                await self.sms_provider.send(delivery.recipient, delivery.body)
+                await send_sms_and_record(
+                    self.sms_provider,
+                    delivery.recipient,
+                    delivery.body,
+                    recorder=self.sms_delivery_recorder,
+                    purpose=SmsPurpose.NOTIFICATION.value,
+                    organization_id=delivery.organization_id,
+                    reference_id=delivery.id,
+                )
         except Exception as exc:  # noqa: BLE001 -- a real provider failure must
             # never crash the sweep; see NotificationDeliveryFailed's own
             # module docstring cross-reference to

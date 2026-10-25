@@ -140,6 +140,11 @@ from app.core.email_layout import (
     render_email,
 )
 from app.domains.rbac.enums import AuditAction
+from app.domains.sms_delivery.constants import SmsPurpose
+from app.domains.sms_delivery.recorder import (
+    SmsDeliveryRecorderProtocol,
+    send_sms_and_record,
+)
 
 from .constants import OTP_REQUEST_RATE_LIMIT_KEY_TEMPLATE, OtpChannel, OtpPurpose
 from .events import OtpRequested, OtpVerificationFailed, OtpVerified
@@ -214,7 +219,11 @@ def _render_otp_email(*, intro: str, code: str, minutes: int) -> str:
 
 
 class SmsProviderProtocol(Protocol):
-    async def send(self, phone_number: str, message: str) -> None: ...
+    """``send`` returns the provider's message id when it gives one (used by
+    ``app.domains.sms_delivery`` to match delivery reports), else ``None``.
+    Implementations also carry a short ``provider_name``."""
+
+    async def send(self, phone_number: str, message: str) -> str | None: ...
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -288,6 +297,8 @@ class LoggingSmsProvider:
     i.e. every SMS OTP dispatch through this provider) the moment the
     root logger's level actually let an INFO record through, which is
     exactly production's configured level."""
+
+    provider_name = "logging"
 
     async def send(self, phone_number: str, message: str) -> None:
         logger.info(
@@ -880,6 +891,20 @@ class SesEmailProvider:
         )
 
 
+def _json_field(response: object, path: tuple[str, ...]) -> str | None:
+    """``response.json()[path...]`` as a string, or ``None`` when the body is
+    not JSON or the field is absent -- never raises."""
+    try:
+        value: object = response.json()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return None
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return str(value) if value not in (None, "") else None
+
+
 class TwilioSmsProvider:
     """Real ``SmsProviderProtocol`` implementation: a plain
     ``httpx.AsyncClient`` POST to Twilio's documented REST API
@@ -893,12 +918,14 @@ class TwilioSmsProvider:
     )
     _TIMEOUT_SECONDS = 10.0
 
+    provider_name = "twilio"
+
     def __init__(self, *, account_sid: str, auth_token: str, from_number: str) -> None:
         self.account_sid = account_sid
         self.auth_token = auth_token
         self.from_number = from_number
 
-    async def send(self, phone_number: str, message: str) -> None:
+    async def send(self, phone_number: str, message: str) -> str | None:
         import httpx
 
         url = self._API_URL_TEMPLATE.format(sid=self.account_sid)
@@ -909,6 +936,9 @@ class TwilioSmsProvider:
                 data={"From": self.from_number, "To": phone_number, "Body": message},
             )
             response.raise_for_status()
+        # Twilio's Message resource: the SID is the id its StatusCallback
+        # reports delivery against.
+        return _json_field(response, ("sid",))
 
 
 class TwilioWhatsAppProvider:
@@ -993,6 +1023,7 @@ class ExotelSmsProvider:
     text, since carriers silently drop a body that doesn't match."""
 
     _TIMEOUT_SECONDS = 10.0
+    provider_name = "exotel"
 
     def __init__(
         self,
@@ -1013,7 +1044,7 @@ class ExotelSmsProvider:
         self.dlt_entity_id = dlt_entity_id
         self.dlt_template_id = dlt_template_id
 
-    async def send(self, phone_number: str, message: str) -> None:
+    async def send(self, phone_number: str, message: str) -> str | None:
         import httpx
 
         url = f"https://{self.subdomain}/v1/Accounts/{self.account_sid}/Sms/send"
@@ -1027,6 +1058,9 @@ class ExotelSmsProvider:
                 url, auth=(self.api_key, self.api_token), data=data
             )
             response.raise_for_status()
+        # Only when Exotel answered JSON (``SMSMessage.Sid``); its default
+        # XML answer is not parsed, and the id is then honestly unknown.
+        return _json_field(response, ("SMSMessage", "Sid"))
 
 
 class Ping4SmsProvider:
@@ -1058,6 +1092,7 @@ class Ping4SmsProvider:
     ``raise_for_status`` catches transport-level failures."""
 
     _TIMEOUT_SECONDS = 10.0
+    provider_name = "ping4sms"
 
     # Documented Ping4SMS error codes (numeric, returned with HTTP 200 --
     # see the provider docstring above for why they must be checked even
@@ -1088,7 +1123,7 @@ class Ping4SmsProvider:
         self.sender_id = sender_id
         self.dlt_template_id = dlt_template_id
 
-    async def send(self, phone_number: str, message: str) -> None:
+    async def send(self, phone_number: str, message: str) -> str | None:
         import httpx
 
         params = {
@@ -1111,7 +1146,9 @@ class Ping4SmsProvider:
                 if code in self._ERROR_CODES:
                     reason = self._ERROR_CODES[code]
                     raise RuntimeError(f"ping4sms send failed: {reason}")
-                return
+                # The numeric body is the message id Ping4SMS's delivery
+                # report API (``dlrapi?messageid=``) is keyed on.
+                return body
             raise RuntimeError(f"ping4sms send failed: {body}")
 
 
@@ -1390,8 +1427,12 @@ class OtpService:
         max_requests_per_window: int = 5,
         request_window_minutes: int = 60,
         sms_message_template: str = "",
+        sms_delivery_recorder: SmsDeliveryRecorderProtocol | None = None,
     ) -> None:
         self.repository = repository
+        # One sms_delivery_logs row per real SMS attempt (None = not
+        # recorded, e.g. unit tests); see app.domains.sms_delivery.recorder.
+        self.sms_delivery_recorder = sms_delivery_recorder
         self.redis = redis
         self.sms_provider: SmsProviderProtocol = sms_provider or LoggingSmsProvider()
         self.email_provider: EmailProviderProtocol = (
@@ -1500,7 +1541,20 @@ class OtpService:
             # the DLT-gated guest sign-in).
             if self.sms_message_template and purpose == OtpPurpose.GUEST_LOGIN:
                 message = self.sms_message_template.replace("{#num#}", code)
-            await self.sms_provider.send(otp_request.identifier, message)
+            await send_sms_and_record(
+                self.sms_provider,
+                otp_request.identifier,
+                message,
+                recorder=self.sms_delivery_recorder,
+                purpose=(
+                    SmsPurpose.ACCOUNT_OTP.value
+                    if purpose == OtpPurpose.ACCOUNT_DATA_MASKING
+                    else SmsPurpose.GUEST_OTP.value
+                ),
+                organization_id=otp_request.organization_id,
+                location_id=otp_request.location_id,
+                reference_id=otp_request.id,
+            )
         elif channel == OtpChannel.WHATSAPP:
             await self.whatsapp_provider.send(
                 otp_request.identifier, code=code, message=message

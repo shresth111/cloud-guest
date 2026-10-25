@@ -32,6 +32,7 @@ from app.domains.otp.service import (
     get_configured_email_providers_by_identity,
     get_configured_sms_provider,
 )
+from app.domains.sms_delivery.recorder import build_default_recorder
 
 from .constants import (
     DISPATCH_SWEEP_BATCH_SIZE,
@@ -77,6 +78,7 @@ async def _run_notification_dispatch_sweep_async() -> dict[str, int]:
             sales_webhook_sender=get_configured_sales_webhook_sender(settings),
             max_attempts=settings.notification_max_delivery_attempts,
             retry_backoff_seconds=settings.notification_retry_backoff_seconds,
+            sms_delivery_recorder=build_default_recorder(),
         )
         summary = await service.dispatch_pending(batch_size=DISPATCH_SWEEP_BATCH_SIZE)
         await session.commit()
@@ -126,6 +128,7 @@ async def _record_onboarding_failure_async(
             NotificationRepository(session),
             max_attempts=settings.notification_max_delivery_attempts,
             retry_backoff_seconds=settings.notification_retry_backoff_seconds,
+            sms_delivery_recorder=build_default_recorder(),
         )
         await service.enqueue(
             event_type=notice.event_type,

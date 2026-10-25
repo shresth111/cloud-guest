@@ -94,6 +94,7 @@ from app.domains.otp.service import get_configured_sms_provider
 from app.domains.rbac.repository import RBACRepository
 from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
+from app.domains.sms_delivery.recorder import build_default_recorder
 from app.domains.wireguard.dependencies import (
     make_hub_peer_deregistrar,
     make_hub_peer_lister,
@@ -128,6 +129,7 @@ async def _run_alert_rule_evaluation_sweep_async() -> AlertEvaluationResult:
                 repository,
                 http_client,
                 sms_provider=get_configured_sms_provider(settings),
+                sms_delivery_recorder=build_default_recorder(),
                 email_provider=resolve_email_provider(settings),
             )
             # Real composition chain for ALERT_TARGET_MONITORED_HARDWARE
@@ -287,6 +289,7 @@ async def _send_channel_test_notification_async(channel_id: uuid.UUID) -> str:
             repository,
             http_client,
             sms_provider=get_configured_sms_provider(settings),
+            sms_delivery_recorder=build_default_recorder(),
             email_provider=resolve_email_provider(settings),
         )
         channel = await repository.get_notification_channel(channel_id)

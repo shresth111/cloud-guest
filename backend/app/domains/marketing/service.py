@@ -39,6 +39,12 @@ from typing import Any
 from app.core.config import Settings
 from app.database.utils.pagination import PaginationMeta
 from app.domains.rbac.enums import AuditAction
+from app.domains.sms_delivery.constants import (
+    ProviderSource,
+    SmsDeliveryStatus,
+    SmsPurpose,
+)
+from app.domains.sms_delivery.recorder import SmsDeliveryRecorderProtocol
 
 from .constants import (
     ACTIVE_CAMPAIGN_STATUSES,
@@ -396,8 +402,12 @@ class MarketingService:
         byo_entitlement_check: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
         own_sender_factory: Callable[[Any], OwnSenders] | None = None,
         credits: CampaignCredits | None = None,
+        sms_delivery_recorder: SmsDeliveryRecorderProtocol | None = None,
     ) -> None:
         self.repository = repository
+        # One sms_delivery_logs row per real SMS attempt (campaign and test
+        # sends); see app.domains.sms_delivery.recorder.
+        self.sms_delivery_recorder = sms_delivery_recorder
         # Spec §13 charge flow. None only in tests that predate credits; every
         # production wiring (API dependencies and the Celery tasks) passes it.
         self.credits = credits
@@ -2246,8 +2256,33 @@ class MarketingService:
                 token=SAMPLE_UNSUBSCRIBE_TOKEN,
             )
             try:
-                result, _ = await self._deliver(
-                    channel, snapshot, values, address, test=True, own=own
+                try:
+                    result, _ = await self._deliver(
+                        channel, snapshot, values, address, test=True, own=own
+                    )
+                except SendError as exc:
+                    if own is not None:
+                        exc.message = own.scrubber(exc.message) or ""
+                    await self._record_sms(
+                        channel,
+                        own=own,
+                        purpose=SmsPurpose.MARKETING_TEST,
+                        address=address,
+                        organization_id=campaign.organization_id,
+                        location_id=None,
+                        reference_id=campaign.id,
+                        error=exc,
+                    )
+                    raise
+                await self._record_sms(
+                    channel,
+                    own=own,
+                    purpose=SmsPurpose.MARKETING_TEST,
+                    address=address,
+                    organization_id=campaign.organization_id,
+                    location_id=None,
+                    reference_id=campaign.id,
+                    result=result,
                 )
                 charged = 0
                 if test_price is not None and self.credits is not None:
@@ -3120,6 +3155,52 @@ class MarketingService:
             await self.repository.commit()
         return {"requeue": None, "claimed": len(claimed)}
 
+    async def _record_sms(
+        self,
+        channel: Channel,
+        *,
+        own: OwnSenders | None,
+        purpose: SmsPurpose,
+        address: str | None,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        reference_id: uuid.UUID,
+        result: ProviderResult | None = None,
+        error: SendError | None = None,
+    ) -> None:
+        """One sms_delivery_logs row for an SMS attempt that reached a
+        provider. Not for other channels, and not when no SMS sender was
+        configured at all (nothing was attempted)."""
+        if self.sms_delivery_recorder is None or channel is not Channel.SMS:
+            return
+        sender = own.sms if own is not None else self.senders.sms
+        if sender is None:
+            return
+        provider = (
+            result.provider if result is not None else getattr(sender, "provider", "")
+        ) or type(sender).__name__
+        await self.sms_delivery_recorder.record(
+            purpose=purpose.value,
+            provider=str(provider),
+            provider_source=(
+                ProviderSource.OWN.value
+                if own is not None
+                else ProviderSource.WYFY.value
+            ),
+            phone_number=address,
+            status=(
+                SmsDeliveryStatus.FAILED.value
+                if error is not None
+                else SmsDeliveryStatus.SENT.value
+            ),
+            organization_id=organization_id,
+            location_id=location_id,
+            provider_message_id=result.message_id if result is not None else None,
+            error_code=error.code if error is not None else None,
+            error_message=error.message if error is not None else None,
+            reference_id=reference_id,
+        )
+
     async def _send_one(
         self,
         campaign: MarketingCampaign,
@@ -3172,10 +3253,20 @@ class MarketingService:
         except SendError as exc:
             if own is not None:
                 exc.message = own.scrubber(exc.message) or ""
-                if exc.auth:
-                    # §12.1 row 2: the venue's account refused our
-                    # credentials. Stop; nothing goes through Wyfy.
-                    raise _OwnProviderTripped(exc.message) from exc
+            await self._record_sms(
+                channel,
+                own=own,
+                purpose=SmsPurpose.MARKETING,
+                address=recipient.address,
+                organization_id=campaign.organization_id,
+                location_id=recipient.location_id,
+                reference_id=recipient.id,
+                error=exc,
+            )
+            if own is not None and exc.auth:
+                # §12.1 row 2: the venue's account refused our
+                # credentials. Stop; nothing goes through Wyfy.
+                raise _OwnProviderTripped(exc.message) from exc
             if not exc.permanent and recipient.attempt_count < SEND_MAX_ATTEMPTS:
                 await self.repository.update_recipient(
                     recipient.id,
@@ -3203,6 +3294,16 @@ class MarketingService:
                     source_recipient_id=recipient.id,
                 )
             return "failed"
+        await self._record_sms(
+            channel,
+            own=own,
+            purpose=SmsPurpose.MARKETING,
+            address=recipient.address,
+            organization_id=campaign.organization_id,
+            location_id=recipient.location_id,
+            reference_id=recipient.id,
+            result=result,
+        )
         await self.repository.update_recipient(
             recipient.id,
             status=RecipientStatus.SUBMITTED.value,
