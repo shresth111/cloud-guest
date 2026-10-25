@@ -8,13 +8,17 @@ from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
 from app.domains.auth.router import router as auth_router
+from app.domains.billing.constants import PlanFeatureKey
 from app.domains.billing.credits_router import (
     customer_router as marketing_credits_router,
 )
 from app.domains.billing.credits_router import (
     platform_router as platform_credits_router,
 )
-from app.domains.billing.dependencies import RequireActiveLicenseForWrites
+from app.domains.billing.dependencies import (
+    RequireActiveLicenseForWrites,
+    RequireFeature,
+)
 from app.domains.billing.router import router as billing_router
 from app.domains.branding.router import router as branding_router
 from app.domains.campaigns.router import guest_router as campaigns_guest_router
@@ -267,10 +271,21 @@ api_v1_router.include_router(network_integration_aruba_ap_platform_router)
 api_v1_router.include_router(queue_speed_gateway_customer_router)
 api_v1_router.include_router(queue_speed_gateway_platform_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
-api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
+# Block Websites (content filtering + Cloudflare categories below) is part of
+# the Firewall add-on: every route also carries RequireFeature(FIREWALL), a
+# 402 before any permission check, reads included. Firewall rules carry the
+# same gate per route in app.domains.firewall.router (all but the Master-only
+# band routes). The Security router further down is deliberately NOT gated.
+_FIREWALL_ADDON = [Depends(RequireFeature(PlanFeatureKey.FIREWALL))]
+api_v1_router.include_router(
+    content_filtering_router, dependencies=[*_PAID_WRITES, *_FIREWALL_ADDON]
+)
 # Cloudflare Gateway category filtering: the provider-backed half of the same
-# customer feature, gated on the same licence rule (writes need an active plan).
-api_v1_router.include_router(dns_filtering_router, dependencies=_PAID_WRITES)
+# customer feature, gated on the same licence rule (writes need an active plan)
+# and the same Firewall add-on.
+api_v1_router.include_router(
+    dns_filtering_router, dependencies=[*_PAID_WRITES, *_FIREWALL_ADDON]
+)
 # Security: venue posture (overview, score) and the capability matrix.
 #
 # Deliberately NOT on _PAID_WRITES, and this is a decision rather than an

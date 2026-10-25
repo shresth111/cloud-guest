@@ -106,6 +106,12 @@ FEATURE_META: dict[PlanFeatureKey, tuple[str, str, str]] = {
         "Send campaigns through the venue's own SMS, WhatsApp or email account",
         "marketing",
     ),
+    PlanFeatureKey.FIREWALL: (
+        "Firewall",
+        "Firewall rules and Block Websites (websites, apps, categories and "
+        "addresses) pushed to the venue's router",
+        "security",
+    ),
 }
 
 
@@ -151,6 +157,7 @@ class FeatureEntitlementService:
                     # turns it on.
                     PlanFeatureKey.GUEST_MARKETING,
                     PlanFeatureKey.GUEST_MARKETING_BYO,
+                    PlanFeatureKey.FIREWALL,
                 ),
                 tier_options=[tier.value for tier in SupportTier] if is_tier else [],
                 default_tier_value=SupportTier.BASIC.value if is_tier else None,

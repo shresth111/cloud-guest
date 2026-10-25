@@ -151,6 +151,18 @@ class PlanFeatureKey(StrEnum):
     # (see FEATURE_REQUIRES below).
     GUEST_MARKETING_BYO = "guest_marketing_byo"
 
+    # -- Firewall, customer side: the venue's Firewall section -- firewall
+    # rules and their push (``app.domains.firewall``, except the Master-only
+    # band routes) and Block Websites (``app.domains.content_filtering`` and
+    # ``app.domains.dns_filtering``). BOOLEAN, off by default and carried by
+    # no seeded plan, unlocked per organization from the Master console the
+    # same way as GUEST_MARKETING. Organizations that were already using any
+    # of it when the add-on was introduced got an enabled override row from
+    # migration 0178 so nothing they had stopped working. The Security
+    # Check (``app.domains.security``, read-only) is NOT behind it: a venue
+    # can always read its own exposure.
+    FIREWALL = "firewall"
+
 
 class PlanFeatureType(StrEnum):
     """The value-shape a :class:`~.models.PlanFeature` row carries -- see
@@ -223,6 +235,7 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.ISP_FAILOVER,
         PlanFeatureKey.GUEST_MARKETING,
         PlanFeatureKey.GUEST_MARKETING_BYO,
+        PlanFeatureKey.FIREWALL,
     }
 )
 
@@ -232,7 +245,11 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
 # an override silently diverging from a customer's plan is a billing act,
 # and each add-on that can be sold separately is a product decision.
 ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
-    {PlanFeatureKey.GUEST_MARKETING, PlanFeatureKey.GUEST_MARKETING_BYO}
+    {
+        PlanFeatureKey.GUEST_MARKETING,
+        PlanFeatureKey.GUEST_MARKETING_BYO,
+        PlanFeatureKey.FIREWALL,
+    }
 )
 
 # An add-on that only means anything on top of another one. The entitlement
