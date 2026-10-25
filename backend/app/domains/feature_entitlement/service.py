@@ -119,6 +119,12 @@ FEATURE_META: dict[PlanFeatureKey, tuple[str, str, str]] = {
         "Lens. Unlock only after the venue's guest notice covers it",
         "network",
     ),
+    PlanFeatureKey.FIREWALL: (
+        "Firewall",
+        "Firewall rules and Block Websites (websites, apps, categories and "
+        "addresses) pushed to the venue's router",
+        "security",
+    ),
 }
 
 
@@ -166,6 +172,7 @@ class FeatureEntitlementService:
                     PlanFeatureKey.GUEST_MARKETING_BYO,
                     PlanFeatureKey.TRAFFIC_FLOW,
                     PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
+                    PlanFeatureKey.FIREWALL,
                 ),
                 tier_options=[tier.value for tier in SupportTier] if is_tier else [],
                 default_tier_value=SupportTier.BASIC.value if is_tier else None,
