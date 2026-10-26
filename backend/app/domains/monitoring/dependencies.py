@@ -26,6 +26,7 @@ from app.domains.rbac.location_scope import (
     LocationScope,
     OptionalCallerLocationScope,
 )
+from app.domains.sms_delivery.recorder import build_default_recorder
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
@@ -85,6 +86,7 @@ def get_notification_service(
         repository,
         http_client,
         sms_provider=get_configured_sms_provider(settings),
+        sms_delivery_recorder=build_default_recorder(),
         # Not ``get_configured_email_provider`` directly: it raises on an
         # incomplete SMTP configuration, and this is a FastAPI dependency,
         # so one wrong mail setting would 500 every monitoring endpoint

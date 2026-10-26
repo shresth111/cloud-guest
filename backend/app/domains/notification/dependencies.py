@@ -18,6 +18,7 @@ from app.domains.otp.service import (
     get_configured_email_providers_by_identity,
     get_configured_sms_provider,
 )
+from app.domains.sms_delivery.recorder import build_default_recorder
 
 from .onboarding_slack import (
     OnboardingSlackNotifier,
@@ -66,6 +67,7 @@ def get_notification_service(
         sales_webhook_sender=get_configured_sales_webhook_sender(settings),
         max_attempts=settings.notification_max_delivery_attempts,
         retry_backoff_seconds=settings.notification_retry_backoff_seconds,
+        sms_delivery_recorder=build_default_recorder(),
     )
 
 

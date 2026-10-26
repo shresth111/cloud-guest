@@ -53,6 +53,11 @@ from app.domains.otp.service import (
     SmsProviderProtocol,
 )
 from app.domains.rbac.enums import AuditAction
+from app.domains.sms_delivery.constants import SmsPurpose
+from app.domains.sms_delivery.recorder import (
+    SmsDeliveryRecorderProtocol,
+    send_sms_and_record,
+)
 
 from .constants import (
     CHANNEL_PARTNER_PRODUCT_NAME,
@@ -127,9 +132,11 @@ class ChannelPartnerService:
         sms_provider: SmsProviderProtocol | None = None,
         email_provider: EmailProviderProtocol | None = None,
         audit_writer: AuditLogWriter | None = None,
+        sms_delivery_recorder: SmsDeliveryRecorderProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.sms_provider = sms_provider
+        self.sms_delivery_recorder = sms_delivery_recorder
         self.email_provider = email_provider
         self.audit_writer = audit_writer
 
@@ -185,7 +192,14 @@ class ChannelPartnerService:
             product=CHANNEL_PARTNER_PRODUCT_NAME, name=partner.name
         )
         try:
-            await self.sms_provider.send(partner.phone, message)
+            await send_sms_and_record(
+                self.sms_provider,
+                partner.phone,
+                message,
+                recorder=self.sms_delivery_recorder,
+                purpose=SmsPurpose.PARTNER_WELCOME.value,
+                reference_id=partner.id,
+            )
         except Exception as exc:  # noqa: BLE001 -- a send failure must never
             # crash partner onboarding; mirrors
             # QuotationService._send_quotation_email's identical resilience

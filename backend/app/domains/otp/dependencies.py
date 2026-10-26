@@ -35,6 +35,7 @@ from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
+from app.domains.sms_delivery.recorder import build_default_recorder
 
 from .repository import OtpRepository, OtpRepositoryProtocol
 from .service import (
@@ -80,6 +81,7 @@ def get_otp_service(
         max_requests_per_window=settings.otp_max_requests_per_window,
         request_window_minutes=settings.otp_request_window_minutes,
         sms_message_template=settings.otp_sms_message_template,
+        sms_delivery_recorder=build_default_recorder(),
     )
 
 

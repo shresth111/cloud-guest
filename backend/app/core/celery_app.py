@@ -237,6 +237,14 @@ from app.domains.router.constants import (
     TASK_RUN_ROUTER_REACHABILITY_SWEEP,
     TASK_RUN_STALE_HEARTBEAT_SWEEP,
 )
+from app.domains.sms_delivery.constants import (
+    DLR_POLL_SWEEP_INTERVAL_SECONDS,
+    TASK_POLL_SMS_DLRS,
+    TASK_PRUNE_SMS_DELIVERY_LOGS,
+)
+from app.domains.sms_delivery.constants import (
+    RETENTION_SWEEP_INTERVAL_SECONDS as SMS_RETENTION_SWEEP_INTERVAL_SECONDS,
+)
 from app.domains.traffic_flow.constants import (
     TASK_RUN_TRAFFIC_FLOW_PULL_SWEEP,
     TRAFFIC_FLOW_PULL_SWEEP_INTERVAL_SECONDS,
@@ -301,6 +309,7 @@ celery_app = Celery(
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
         "app.domains.router.tasks",
+        "app.domains.sms_delivery.tasks",
         "app.domains.traffic_flow.tasks",
     ],
 )
@@ -435,6 +444,17 @@ celery_app.conf.update(
         TASK_SEND_CAMPAIGN_BATCH: {"queue": MARKETING_QUEUE_NAME},
     },
     beat_schedule={
+        # SMS delivery log: poll Ping4SMS for delivery reports on recent
+        # Wyfy-sent rows (no-op unless configured), and the daily retention
+        # sweep. See app.domains.sms_delivery.tasks.
+        "sms-delivery-poll-dlrs": {
+            "task": TASK_POLL_SMS_DLRS,
+            "schedule": DLR_POLL_SWEEP_INTERVAL_SECONDS,
+        },
+        "sms-delivery-prune-logs": {
+            "task": TASK_PRUNE_SMS_DELIVERY_LOGS,
+            "schedule": SMS_RETENTION_SWEEP_INTERVAL_SECONDS,
+        },
         # Guest Marketing: start due campaigns (pure DB, default queue),
         # reap rows a dead worker left in `sending` (at-most-once), and
         # null recipient addresses after 180 days (retention).

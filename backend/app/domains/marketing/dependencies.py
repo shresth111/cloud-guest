@@ -42,6 +42,7 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.location_scope import CallerLocationScope, LocationScope
 from app.domains.rbac.repository import RBACRepositoryProtocol
+from app.domains.sms_delivery.recorder import build_default_recorder
 
 from .credits import build_campaign_credits
 from .exceptions import CrossLocationError
@@ -122,6 +123,7 @@ def get_marketing_service(
         credits=build_campaign_credits(
             repository.session, audit_writer=audit_repository
         ),
+        sms_delivery_recorder=build_default_recorder(),
     )
 
 
