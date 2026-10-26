@@ -12,14 +12,18 @@ and "an admin-facing paginated list" both need.
 from __future__ import annotations
 
 import uuid
+from datetime import date
 from typing import Protocol
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
+from app.domains.location.models import Location
 
+from .constants import OtpChannel
 from .models import OtpRequest
 
 
@@ -47,6 +51,14 @@ class OtpRepositoryProtocol(Protocol):
         sort_by: str = DEFAULT_SORT_FIELD,
         sort_order: SortOrder = SortOrder.DESC,
     ) -> tuple[list[OtpRequest], PaginationMeta]: ...
+
+    async def get_daily_sms_consumption(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start_date: date,
+        end_date: date,
+    ) -> list[tuple[date, uuid.UUID, str, int]]: ...
 
 
 class OtpRepository:
@@ -103,6 +115,51 @@ class OtpRepository:
             sort_by=sort_by,
             sort_order=sort_order,
         )
+
+    async def get_daily_sms_consumption(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start_date: date,
+        end_date: date,
+    ) -> list[tuple[date, uuid.UUID, str, int]]:
+        """Count created SMS OTP requests by each location's local day.
+
+        ``otp_requests`` is the authoritative record available in every
+        deployment. It records an issued code, not carrier acceptance or
+        handset delivery, so this query intentionally makes no such claim.
+        Locations without requests have no row rather than invented zeroes.
+        """
+        usage_date = func.date(
+            func.timezone(Location.timezone, OtpRequest.created_at)
+        ).label("usage_date")
+        clauses: list[object] = [
+            OtpRequest.is_deleted.is_(False),
+            Location.is_deleted.is_(False),
+            OtpRequest.channel == OtpChannel.SMS.value,
+            usage_date >= start_date,
+            usage_date <= end_date,
+        ]
+        if organization_id is not None:
+            clauses.append(OtpRequest.organization_id == organization_id)
+
+        statement = (
+            select(
+                usage_date,
+                OtpRequest.location_id,
+                Location.name,
+                func.count(OtpRequest.id).label("sms_otp_requests"),
+            )
+            .join(Location, Location.id == OtpRequest.location_id)
+            .where(*clauses)
+            .group_by(usage_date, OtpRequest.location_id, Location.name)
+            .order_by(usage_date.asc(), Location.name.asc())
+        )
+        result = await self.session.execute(statement)
+        return [
+            (row[0], row[1], row[2], int(row[3]))
+            for row in result.all()
+        ]
 
 
 __all__ = ["OtpRepositoryProtocol", "OtpRepository"]
