@@ -98,7 +98,6 @@ from app.domains.router_agent import models as router_agent_models  # noqa: F401
 from app.domains.router_provisioning import (
     models as router_provisioning_models,  # noqa: F401,E501
 )
-from app.domains.sms_delivery import models as sms_delivery_models  # noqa: F401
 from app.domains.support_tickets import models as support_tickets_models  # noqa: F401
 from app.domains.system_settings import models as system_settings_models  # noqa: F401
 from app.domains.traffic_flow import models as traffic_flow_models  # noqa: F401

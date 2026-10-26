@@ -29,7 +29,6 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.database.redis import redis_client
 from app.database.session import SessionLocal
-from app.domains.sms_delivery.recorder import build_default_recorder
 
 from .constants import (
     MARKETING_QUEUE_NAME,
@@ -71,7 +70,6 @@ def _service(session) -> MarketingService:  # noqa: ANN001
         ),
         enqueue_batch=enqueue_send_batch,
         credits=build_campaign_credits(session),
-        sms_delivery_recorder=build_default_recorder(),
     )
 
 

@@ -117,11 +117,6 @@ from app.domains.router.vendor_capabilities import (
 )
 from app.domains.router_provisioning.constants import EnrollmentStatus
 from app.domains.router_provisioning.models import RouterEvent
-from app.domains.sms_delivery.constants import SmsPurpose
-from app.domains.sms_delivery.recorder import (
-    SmsDeliveryRecorderProtocol,
-    send_sms_and_record,
-)
 
 from .channel_config import ChannelConfigSummary, summarize_channel_config
 from .constants import (
@@ -3172,27 +3167,12 @@ class SmsNotifier:
     """Wraps ``app.domains.otp``'s existing ``SmsProviderProtocol`` --
     composition, not a second SMS-provider abstraction."""
 
-    def __init__(
-        self,
-        sms_provider: SmsProviderProtocol,
-        *,
-        sms_delivery_recorder: SmsDeliveryRecorderProtocol | None = None,
-    ) -> None:
+    def __init__(self, sms_provider: SmsProviderProtocol) -> None:
         self.sms_provider = sms_provider
-        self.sms_delivery_recorder = sms_delivery_recorder
 
     async def send(self, *, alert: Alert, config: dict[str, object]) -> str:
         phone_number = str(config["phone_number"])
-        await send_sms_and_record(
-            self.sms_provider,
-            phone_number,
-            _format_alert_message(alert),
-            recorder=self.sms_delivery_recorder,
-            purpose=SmsPurpose.ALERT.value,
-            organization_id=getattr(alert, "organization_id", None),
-            location_id=getattr(alert, "location_id", None),
-            reference_id=getattr(alert, "id", None),
-        )
+        await self.sms_provider.send(phone_number, _format_alert_message(alert))
         return f"queued to {phone_number} via SmsProviderProtocol"
 
 
@@ -3419,7 +3399,6 @@ class NotificationService:
         *,
         sms_provider: SmsProviderProtocol | None = None,
         email_provider: EmailProviderProtocol | None = None,
-        sms_delivery_recorder: SmsDeliveryRecorderProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.http_client = http_client
@@ -3428,8 +3407,7 @@ class NotificationService:
                 email_provider or LoggingEmailProvider()
             ),
             NotificationChannelType.SMS.value: SmsNotifier(
-                sms_provider or LoggingSmsProvider(),
-                sms_delivery_recorder=sms_delivery_recorder,
+                sms_provider or LoggingSmsProvider()
             ),
             NotificationChannelType.WHATSAPP.value: WhatsAppNotifier(),
             NotificationChannelType.SLACK.value: SlackNotifier(http_client),

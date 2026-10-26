@@ -2079,38 +2079,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    # -- SMS delivery log + delivery reports (app.domains.sms_delivery) --
-    sms_dlr_poll_enabled: bool = Field(
-        default=True,
-        description=(
-            "Poll Ping4SMS's delivery-report API (GET "
-            "https://site.ping4sms.com/api/dlrapi?key=&messageid=) for SMS "
-            "Wyfy sent through its own Ping4SMS account. A row only ever "
-            "becomes 'delivered'/'undelivered' when the provider's answer "
-            "contains a recognised DLR status token; anything else leaves "
-            "the row at 'sent' and keeps the raw answer for diagnosis."
-        ),
-    )
-    sms_dlr_webhook_token: str = Field(
-        default="",
-        description=(
-            "Shared secret for the inbound DLR callback "
-            "(/api/v1/sms-delivery/dlr/{provider}?token=...). Empty = the "
-            "callback answers 404. Secret -- set via environment, never "
-            "committed; rotate it if the callback URL ever leaks."
-        ),
-    )
-    sms_delivery_log_retention_days: int = Field(
-        default=180,
-        ge=30,
-        description=(
-            "Rows in sms_delivery_logs older than this are deleted by the "
-            "nightly retention sweep. The rows hold masked numbers only; "
-            "CERT-In connection logs (otp_requests) are a different table "
-            "and are not touched."
-        ),
-    )
-
     whatsapp_delivery_provider: str = Field(
         default="logging",
         description=(

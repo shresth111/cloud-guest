@@ -108,7 +108,6 @@ from app.domains.router.snmp_router import router as router_snmp_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.security.router import router as security_router
-from app.domains.sms_delivery.router import router as sms_delivery_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
@@ -205,9 +204,6 @@ api_v1_router.include_router(router_agent_router)
 api_v1_router.include_router(wireguard_router)
 api_v1_router.include_router(hub_reconciliation_router)
 api_v1_router.include_router(otp_router)
-# SMS delivery report (read) + provider DLR callback (machine push, no
-# organization context) -- neither is a paid write, so not licence-gated.
-api_v1_router.include_router(sms_delivery_router)
 api_v1_router.include_router(voucher_router)
 api_v1_router.include_router(captive_portal_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_router)

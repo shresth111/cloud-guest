@@ -18,11 +18,6 @@ from typing import Any
 
 from app.core.config import Settings
 from app.domains.rbac.enums import AuditAction
-from app.domains.sms_delivery.constants import (
-    ProviderSource,
-    SmsDeliveryStatus,
-    SmsPurpose,
-)
 
 from .constants import (
     CHANNEL_ORDER,
@@ -458,41 +453,8 @@ class ProviderService:
             body = "[TEST] " + render(template.sms_body, values)
             dlt = template.sms_dlt_template_id
 
-            recorder = getattr(self.marketing, "sms_delivery_recorder", None)
-            organization_id = scope.organization_id
-
             async def send():
-                # A real SMS through the venue's own account: one
-                # sms_delivery_logs row either way (see app.domains.sms_delivery).
-                provider = getattr(senders.sms, "provider", "") or "own"
-                try:
-                    result = await senders.sms.send(
-                        address, body, dlt_template_id=dlt
-                    )
-                except SendError as exc:
-                    if recorder is not None:
-                        await recorder.record(
-                            purpose=SmsPurpose.MARKETING_TEST.value,
-                            provider=provider,
-                            provider_source=ProviderSource.OWN.value,
-                            phone_number=address,
-                            status=SmsDeliveryStatus.FAILED.value,
-                            organization_id=organization_id,
-                            error_code=exc.code,
-                            error_message=senders.scrubber(exc.message),
-                        )
-                    raise
-                if recorder is not None:
-                    await recorder.record(
-                        purpose=SmsPurpose.MARKETING_TEST.value,
-                        provider=result.provider or provider,
-                        provider_source=ProviderSource.OWN.value,
-                        phone_number=address,
-                        status=SmsDeliveryStatus.SENT.value,
-                        organization_id=organization_id,
-                        provider_message_id=result.message_id,
-                    )
-                return result
+                return await senders.sms.send(address, body, dlt_template_id=dlt)
 
         elif channel is Channel.EMAIL:
 
