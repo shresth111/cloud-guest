@@ -43,7 +43,7 @@ import ipaddress
 import re
 from dataclasses import dataclass
 
-from .constants import LogCategory, LogStatus
+from .constants import SERVER_SOURCE_PORTAL, LogCategory, LogStatus
 from .guest_events import GuestEventKind, message_body, parse_guest_event
 
 
@@ -282,7 +282,11 @@ _SUMMARIES: dict[tuple[str, str | None], str] = {
 }
 
 
-def summary_for(category: str | None, status: str | None) -> str | None:
+def summary_for(
+    category: str | None, status: str | None, *, source: str | None = None
+) -> str | None:
+    if source == SERVER_SOURCE_PORTAL and category == LogCategory.HOTSPOT_AUTH.value:
+        return "Portal sign-in failed" if status == LogStatus.FAILURE.value else None
     if category is None:
         return None
     return _SUMMARIES.get((category, status))
