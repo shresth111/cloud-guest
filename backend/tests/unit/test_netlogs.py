@@ -194,6 +194,10 @@ class TestClassifier:
         assert summary_for("firewall", "blocked") == "Traffic denied"
         assert summary_for("dhcp", "success") == "IP assigned"
         assert summary_for("radius", "reject") == "RADIUS rejected"
+        assert (
+            summary_for("hotspot_auth", "failure", source="captive_portal")
+            == "Portal sign-in failed"
+        )
         assert summary_for("other", None) is None
 
 
@@ -1141,6 +1145,7 @@ class TestServerEvents:
             now=NOW,
             organization_id=ORG_A,
             location_id=LOC_A1,
+            router_id=RTR_A1,
             auth_method="otp_sms",
             reason="OtpCodeMismatchError",
             ip_address="10.5.50.12",
@@ -1148,6 +1153,7 @@ class TestServerEvents:
         assert row["message"] == "otp_sms sign-in failed: Invalid OTP"
         assert row["status"] == "failure" and row["category"] == "hotspot_auth"
         assert row["src_ip"] == "10.5.50.12"
+        assert row["router_id"] == RTR_A1
         assert "identifier" not in row
 
     async def test_portal_recorder_commits_its_own_session(self) -> None:

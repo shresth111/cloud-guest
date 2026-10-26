@@ -153,7 +153,7 @@ def event_view(row: dict[str, Any]) -> dict[str, Any]:
         "severity_name": SEVERITY_NAMES.get(e.severity)
         if e.severity is not None
         else None,
-        "summary": summary_for(category, e.status),
+        "summary": summary_for(category, e.status, source=e.source),
         "message": redact_internal(e.message),
     }
 

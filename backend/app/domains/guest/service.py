@@ -3364,6 +3364,7 @@ class GuestService:
                 auth_method=auth_method,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                router_id=router.id,
                 reason=type(exc).__name__,
                 ip_address=ip_address,
             )
@@ -3545,6 +3546,7 @@ class GuestService:
                 auth_method=GuestAuthMethod.VOUCHER,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                router_id=router.id,
                 reason=type(exc).__name__,
                 ip_address=ip_address,
             )
@@ -3745,6 +3747,7 @@ class GuestService:
                 auth_method=GuestAuthMethod.USERNAME_PASSWORD,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                router_id=router.id,
                 reason="GuestPasswordLoginFailedError",
                 ip_address=ip_address,
             )
@@ -4050,6 +4053,7 @@ class GuestService:
                 auth_method=GuestAuthMethod.PIN,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                router_id=router.id,
                 reason="GuestPinLoginFailedError",
                 ip_address=ip_address,
             )
@@ -7741,6 +7745,7 @@ class GuestService:
         auth_method: GuestAuthMethod,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        router_id: uuid.UUID | None = None,
         reason: str,
         ip_address: str | None,
     ) -> None:
@@ -7769,6 +7774,7 @@ class GuestService:
                 await self.login_event_recorder.record_login_failure(
                     organization_id=organization_id,
                     location_id=location_id,
+                    router_id=router_id,
                     auth_method=auth_method.value,
                     reason=reason,
                     ip_address=ip_address,
