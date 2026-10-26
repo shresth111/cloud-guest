@@ -70,6 +70,7 @@ router; nothing imports it but ``app.main``.
 from __future__ import annotations
 
 import uuid
+from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
@@ -88,6 +89,8 @@ from .schemas import (
     OtpRequestCreate,
     OtpRequestListResponse,
     OtpRequestResponse,
+    OtpSmsDailyLocationConsumption,
+    OtpSmsDailyLocationConsumptionResponse,
     OtpVerifyRequest,
     OtpVerifyResponse,
 )
@@ -259,6 +262,56 @@ async def verify_otp(
 # ============================================================================
 # Admin-facing endpoint
 # ============================================================================
+
+
+@router.get(
+    "/requests/sms-daily-consumption",
+    response_model=ApiResponse[OtpSmsDailyLocationConsumptionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("otp.read"))],
+)
+async def get_daily_sms_consumption(
+    request: Request,
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: OtpService = Depends(get_otp_service),
+):
+    """Return actual SMS OTP request volume per location and local day.
+
+    This deliberately reports rows created in ``otp_requests``; it does not
+    present a request as provider acceptance, delivery, or a billable carrier
+    event. Each location's configured timezone defines its calendar day.
+    """
+    resolved_end_date = end_date or date.today()
+    resolved_start_date = start_date or (resolved_end_date - timedelta(days=29))
+    if resolved_start_date > resolved_end_date:
+        resolved_start_date, resolved_end_date = resolved_end_date, resolved_start_date
+
+    rows = await service.repository.get_daily_sms_consumption(
+        organization_id=organization_id,
+        start_date=resolved_start_date,
+        end_date=resolved_end_date,
+    )
+    payload = OtpSmsDailyLocationConsumptionResponse(
+        start_date=resolved_start_date,
+        end_date=resolved_end_date,
+        items=[
+            OtpSmsDailyLocationConsumption(
+                usage_date=usage_date,
+                location_id=str(location_id),
+                location_name=location_name,
+                sms_otp_requests=count,
+            )
+            for usage_date, location_id, location_name, count in rows
+        ],
+    )
+    return build_response(
+        success=True,
+        message="Daily SMS OTP request consumption retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
 
 
 @router.get(

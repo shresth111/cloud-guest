@@ -23,7 +23,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -50,7 +50,12 @@ from app.domains.otp.exceptions import (
     OtpRequestRateLimitExceededError,
 )
 from app.domains.otp.models import OtpRequest
-from app.domains.otp.router import router as otp_router
+from app.domains.otp.router import (
+    get_daily_sms_consumption,
+)
+from app.domains.otp.router import (
+    router as otp_router,
+)
 from app.domains.otp.service import (
     LoggingEmailProvider,
     LoggingSmsProvider,
@@ -1231,6 +1236,47 @@ def test_otp_requests_listing_resolves_org_from_auth_scope_not_query_param():
     # ... it is resolved via the CurrentOrganization dependency instead.
     dependency_calls = {dep.call for dep in dependant.dependencies}
     assert CurrentOrganization in dependency_calls
+
+
+async def test_daily_sms_consumption_returns_only_real_request_counts():
+    """The report is an ``otp_requests`` volume report, never a DLR proxy."""
+
+    class DailyUsageRepository:
+        async def get_daily_sms_consumption(self, **kwargs):  # noqa: ANN003
+            assert kwargs == {
+                "organization_id": organization_id,
+                "start_date": date(2026, 10, 1),
+                "end_date": date(2026, 10, 2),
+            }
+            return [(date(2026, 10, 1), location_id, "Main Campus", 7)]
+
+    organization_id = uuid.uuid4()
+    location_id = uuid.uuid4()
+    response = await get_daily_sms_consumption(
+        request=SimpleNamespace(state=SimpleNamespace(request_id="request-123")),
+        start_date=date(2026, 10, 1),
+        end_date=date(2026, 10, 2),
+        organization_id=organization_id,
+        service=SimpleNamespace(repository=DailyUsageRepository()),
+    )
+
+    assert response == {
+        "success": True,
+        "message": "Daily SMS OTP request consumption retrieved",
+        "data": {
+            "start_date": date(2026, 10, 1),
+            "end_date": date(2026, 10, 2),
+            "items": [
+                {
+                    "usage_date": date(2026, 10, 1),
+                    "location_id": str(location_id),
+                    "location_name": "Main Campus",
+                    "sms_otp_requests": 7,
+                }
+            ],
+        },
+        "request_id": "request-123",
+    }
 
 
 # ============================================================================
