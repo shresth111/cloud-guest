@@ -865,6 +865,8 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
         "reports-run-scheduled",
+        # Login funnel "portal opened" rows: 92-day retention.
+        "analytics-portal-impression-retention-sweep",
         "billing-subscription-renewal-sweep",
         "billing-invoice-overdue-sweep",
         "guest-session-timeout-sweep",
