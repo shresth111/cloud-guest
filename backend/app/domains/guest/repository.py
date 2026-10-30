@@ -1086,8 +1086,9 @@ class GuestRepository:
         inside a SAVEPOINT and never raises: a failure here must not poison
         the caller's transaction (RADIUS accounting, the gate push, the
         Omada usage sweep), whose own work matters more than this column.
-        ``version``/``updated_at`` are left alone on purpose, so an ORM
-        instance of the row loaded by the caller stays writable."""
+        ``version`` is left alone on purpose, so an ORM instance of the row
+        the caller already loaded stays writable (``updated_at`` is stamped
+        by the column's own ``onupdate``)."""
         try:
             async with self.session.begin_nested():
                 result = await self.session.execute(

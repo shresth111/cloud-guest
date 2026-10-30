@@ -709,7 +709,7 @@ async def resolve_captive_portal_config(
     resolved = await service.resolve_portal_config(
         organization_id=organization_id, location_id=location_id
     )
-    if record_impression and location_id is not None:
+    if record_impression is True and location_id is not None:
         # The organization the config resolved to, which
         # ``resolve_portal_config`` has already proved owns the location;
         # the insert re-checks both in SQL anyway.

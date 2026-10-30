@@ -26,19 +26,25 @@ from httpx import ASGITransport, AsyncClient
 from app.common.exceptions import register_exception_handlers
 from app.domains.analytics.venue_insights import (
     MAX_WINDOW_DAYS,
+    NO_ROUTER_MESSAGE,
+    OMADA_LEGACY_MESSAGE,
     OTP_AUTH_METHODS,
     GuestMixRow,
+    InternetConfirmedRow,
     InvalidInsightWindowError,
     LocationActivityRow,
     LocationContext,
     LoginMethodRow,
     OtpFunnelRow,
+    PortalImpressionRow,
+    RouterCoverageRow,
     RouterLivenessRow,
     VenueInsightsRepository,
     VenueInsightsService,
     percent,
     resolve_timezone,
     resolve_window,
+    router_confirmation_gap,
 )
 from app.domains.analytics.venue_insights_router import (
     get_venue_insights_service,
@@ -123,6 +129,8 @@ class _ReferenceRepository:
         self.otps: list[dict] = []
         self.logins: list[dict] = []
         self.routers: list[dict] = []
+        self.impressions: list[dict] = []
+        self.integrations: list[dict] = []
         self.calls: list[uuid.UUID] = []
 
     # --- seeding --------------------------------------------------------
@@ -146,6 +154,12 @@ class _ReferenceRepository:
 
     async def add_router(self, **row) -> None:
         self.routers.append({"is_deleted": False, **row})
+
+    async def add_impression(self, **row) -> None:
+        self.impressions.append(row)
+
+    async def add_integration(self, **row) -> None:
+        self.integrations.append({"is_deleted": False, **row})
 
     # --- protocol -------------------------------------------------------
     def _scoped_sessions(self, org, loc, start, end):
@@ -255,6 +269,74 @@ class _ReferenceRepository:
             for m, (ok, bad, ids) in grouped.items()
         ]
 
+    async def get_portal_impressions(self, *, organization_id, location_id, start, end):
+        scoped = [
+            i
+            for i in self.impressions
+            if i["organization_id"] == organization_id
+            and i["location_id"] == location_id
+        ]
+        window = [i for i in scoped if start <= i["occurred_at"] < end]
+        return PortalImpressionRow(
+            impressions=len(window),
+            devices=len({i["client_mac_hash"] for i in window if i["client_mac_hash"]}),
+            tracked_since=min((i["occurred_at"] for i in scoped), default=None),
+        )
+
+    async def get_internet_confirmed(self, *, organization_id, location_id, start, end):
+        scoped = [
+            s
+            for s in self.sessions
+            if s["organization_id"] == organization_id
+            and s["location_id"] == location_id
+            and not s["is_deleted"]
+            and s.get("internet_confirmed_at") is not None
+        ]
+        window = [s for s in scoped if start <= s["internet_confirmed_at"] < end]
+        return InternetConfirmedRow(
+            guests=len({s["guest_id"] for s in window}),
+            otp_guests=len(
+                {
+                    s["guest_id"]
+                    for s in window
+                    if s.get("auth_method", "otp_sms") in OTP_AUTH_METHODS
+                }
+            ),
+            sessions=len(window),
+            tracked_since=min(
+                (s["internet_confirmed_at"] for s in scoped), default=None
+            ),
+        )
+
+    async def get_router_coverage(self, *, organization_id, location_id):
+        out = []
+        for r in self.routers:
+            if not (
+                r["organization_id"] == organization_id
+                and r["location_id"] == location_id
+                and not r["is_deleted"]
+                and r["status"] != "decommissioned"
+            ):
+                continue
+            integ = next(
+                (
+                    i
+                    for i in self.integrations
+                    if i["router_id"] == r["id"]
+                    and i["organization_id"] == organization_id
+                    and not i["is_deleted"]
+                ),
+                None,
+            )
+            out.append(
+                RouterCoverageRow(
+                    vendor=r.get("vendor", "mikrotik"),
+                    integration_auth_mode=integ and integ["auth_mode"],
+                    integration_portal_mode=integ and integ["portal_mode"],
+                )
+            )
+        return out
+
     async def get_location_activity(self, *, organization_id, start, end):
         out = []
         for loc_id, loc in self.locations.items():
@@ -344,13 +426,15 @@ class _PostgresHarness:
 
         await self._insert(
             GuestSession,
-            router_id=uuid.uuid4(),
-            auth_method="otp_sms",
-            status="disconnected",
-            last_activity_at=row["started_at"],
-            bytes_uploaded=0,
-            bytes_downloaded=0,
-            **row,
+            **{
+                "router_id": uuid.uuid4(),
+                "auth_method": "otp_sms",
+                "status": "disconnected",
+                "last_activity_at": row["started_at"],
+                "bytes_uploaded": 0,
+                "bytes_downloaded": 0,
+                **row,
+            },
         )
 
     async def add_otp(self, **row) -> None:
@@ -383,6 +467,27 @@ class _PostgresHarness:
             **row,
         )
 
+    async def add_impression(self, **row) -> None:
+        from sqlalchemy import insert
+
+        from app.domains.analytics.models import PortalImpression
+
+        await self.session.execute(
+            insert(PortalImpression.__table__).values(id=uuid.uuid4(), **row)
+        )
+        await self.session.flush()
+
+    async def add_integration(self, **row) -> None:
+        from app.domains.network_integration.models import NetworkIntegration
+
+        await self._insert(
+            NetworkIntegration,
+            provider="omada",
+            name="omada",
+            base_url="https://c",
+            **row,
+        )
+
 
 @pytest.fixture(params=["reference", "postgres"])
 async def harness(request):
@@ -395,8 +500,10 @@ async def harness(request):
     from sqlalchemy import Column, MetaData, Table, text
     from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+    from app.domains.analytics.models import PortalImpression
     from app.domains.guest.models import GuestLoginHistory, GuestSession
     from app.domains.location.models import Location
+    from app.domains.network_integration.models import NetworkIntegration
     from app.domains.organization.models import Organization
     from app.domains.otp.models import OtpRequest
     from app.domains.router.models import Router
@@ -416,6 +523,8 @@ async def harness(request):
         Location,
         Organization,
         Router,
+        PortalImpression,
+        NetworkIntegration,
     ):
         Table(
             model.__tablename__,
@@ -639,12 +748,153 @@ class TestLoginFunnel:
         assert result.otp_requested_guests == 3
         assert result.otp_verified_guests == 2
         assert result.otp_signed_in_guests == 1
-        assert result.portal_opened.available is False
+        # No router, no impressions: portal opened is tracked but empty,
+        # internet confirmed says why it cannot be reported.
+        assert result.portal_opened.available is True
+        assert result.portal_opened.count == 0
+        assert result.portal_opened.tracked_since is None
         assert result.internet_confirmed.available is False
+        assert result.internet_confirmed.message == NO_ROUTER_MESSAGE
         assert [
             (m.auth_method, m.successful_logins, m.failed_logins, m.guests)
             for m in result.methods
         ] == [("voucher", 2, 0, 1), ("otp_sms", 1, 1, 1)]
+
+
+class TestFunnelStages:
+    """ "Portal opened" and "internet confirmed": counts, tracked_since, and
+    the per-venue unavailable reason."""
+
+    async def _venue(self, h, *, vendor="mikrotik"):
+        await h.add_location(LOC_A, ORG_A)
+        router_id = uuid.uuid4()
+        await h.add_router(
+            id=router_id,
+            organization_id=ORG_A,
+            location_id=LOC_A,
+            status="online",
+            last_seen_at=_utc(2026, 10, 28),
+            vendor=vendor,
+        )
+        return router_id
+
+    async def _funnel(self, repo, org=ORG_A, loc=LOC_A):
+        return await VenueInsightsService(repo).get_login_funnel(
+            organization_id=org, location_id=loc, start=WIN_START, end=WIN_END
+        )
+
+    async def test_portal_opened_counts_window_and_tracked_since(self, harness):
+        h, repo = harness
+        await self._venue(h)
+        await h.add_location(LOC_B, ORG_B)
+        first = _utc(2026, 9, 20)  # before the window: tracked_since only
+        await h.add_impression(
+            organization_id=ORG_A,
+            location_id=LOC_A,
+            router_id=None,
+            occurred_at=first,
+            client_mac_hash="d1",
+        )
+        for when, key in (
+            (_utc(2026, 10, 2), "d1"),
+            (_utc(2026, 10, 3), "d1"),
+            (_utc(2026, 10, 3), "d2"),
+            (_utc(2026, 10, 4), None),
+        ):
+            await h.add_impression(
+                organization_id=ORG_A,
+                location_id=LOC_A,
+                router_id=None,
+                occurred_at=when,
+                client_mac_hash=key,
+            )
+        # Another tenant's impression is never counted.
+        await h.add_impression(
+            organization_id=ORG_B,
+            location_id=LOC_B,
+            router_id=None,
+            occurred_at=_utc(2026, 10, 2),
+            client_mac_hash="x",
+        )
+        result = await self._funnel(repo)
+        stage = result.portal_opened
+        assert stage.available is True
+        assert (stage.count, stage.devices) == (4, 2)
+        assert stage.tracked_since == first.isoformat()
+
+    async def test_internet_confirmed_counts_and_otp_split(self, harness):
+        h, repo = harness
+        await self._venue(h)
+        t = _utc(2026, 10, 5, 10)
+        await h.add_session(
+            **_s(t, guest_id=G1), internet_confirmed_at=t, auth_method="otp_sms"
+        )
+        await h.add_session(
+            **_s(t + timedelta(hours=1), guest_id=G1),
+            internet_confirmed_at=t + timedelta(hours=1),
+            auth_method="otp_sms",
+        )
+        await h.add_session(
+            **_s(t, guest_id=G2), internet_confirmed_at=t, auth_method="voucher"
+        )
+        # Signed in but never confirmed: not counted.
+        await h.add_session(**_s(t, guest_id=G3), auth_method="otp_sms")
+        result = await self._funnel(repo)
+        stage = result.internet_confirmed
+        assert stage.available is True
+        assert (stage.count, stage.otp_guests, stage.sessions) == (2, 1, 3)
+        assert stage.tracked_since == t.isoformat()
+        assert stage.note is None
+
+    async def test_omada_legacy_only_venue_is_unavailable_with_reason(self, harness):
+        h, repo = harness
+        router_id = await self._venue(h, vendor="tplink_omada")
+        await h.add_integration(
+            organization_id=ORG_A,
+            router_id=router_id,
+            auth_mode="legacy",
+            portal_mode="external_portal",
+        )
+        result = await self._funnel(repo)
+        assert result.internet_confirmed.available is False
+        assert result.internet_confirmed.message == OMADA_LEGACY_MESSAGE
+
+    async def test_mixed_venue_is_available_with_partial_note(self, harness):
+        h, repo = harness
+        omada = await self._venue(h, vendor="tplink_omada")
+        await h.add_integration(
+            organization_id=ORG_A,
+            router_id=omada,
+            auth_mode="legacy",
+            portal_mode="external_portal",
+        )
+        await h.add_router(
+            id=uuid.uuid4(),
+            organization_id=ORG_A,
+            location_id=LOC_A,
+            status="online",
+            last_seen_at=_utc(2026, 10, 28),
+            vendor="mikrotik",
+        )
+        result = await self._funnel(repo)
+        assert result.internet_confirmed.available is True
+        assert result.internet_confirmed.note.startswith("1 of 2 routers")
+
+
+class TestRouterConfirmationGap:
+    @pytest.mark.parametrize(
+        ("vendor", "auth", "mode", "has_signal"),
+        [
+            ("mikrotik", None, None, True),
+            ("aruba_instant_on", None, None, True),
+            ("tplink_omada", "openapi", "external_portal", True),
+            ("tplink_omada", "legacy", "radius", True),
+            ("tplink_omada", "legacy", "external_portal", False),
+            ("tplink_omada", None, None, False),
+        ],
+    )
+    def test_rule(self, vendor, auth, mode, has_signal) -> None:
+        assert (router_confirmation_gap(vendor, auth, mode) is None) is has_signal
 
 
 class TestLocationComparison:
@@ -844,6 +1094,26 @@ class TestHttp:
         assert body["data"]["cells"] == [
             {"weekday": 4, "hour": 18, "sessions": 1, "guests": 1}
         ]
+
+
+async def test_login_funnel_wire_shape_is_discriminated_on_available() -> None:
+    repo = _ReferenceRepository()
+    await repo.add_location(LOC_A, ORG_A)
+    response = await _get(
+        _app(repo), "/login-funnel", location_id=str(LOC_A), **_WINDOW
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["portal_opened"] == {
+        "available": True,
+        "count": 0,
+        "devices": 0,
+        "tracked_since": None,
+    }
+    assert data["internet_confirmed"] == {
+        "available": False,
+        "message": NO_ROUTER_MESSAGE,
+    }
 
 
 def test_current_organization_is_not_used() -> None:
