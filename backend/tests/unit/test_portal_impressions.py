@@ -201,7 +201,7 @@ class TestResolveRoute:
     """The guest-facing endpoint: records only on the marker, with the
     resolved organization, and never lets the recorder break the response."""
 
-    async def _call(self, monkeypatch, *, record_impression, recorder):
+    async def _call(self, monkeypatch, *, record_impression, recorder, router_id=None):
         from app.domains.captive_portal import router as router_module
         from tests.unit.test_captive_portal import (
             _apply_column_defaults,
@@ -220,8 +220,9 @@ class TestResolveRoute:
             _resolve_request(),
             organization_id=None,
             location_id=location.id,
-            record_impression=record_impression,
-            router_id=ROUTER,
+            # The route takes these as raw query strings on purpose.
+            record_impression="true" if record_impression else None,
+            router_id=str(ROUTER) if router_id is None else router_id,
             device_mac=MAC,
             service=fx.service,
         )
@@ -253,6 +254,19 @@ class TestResolveRoute:
         )
         assert response["success"] is True
         assert calls == []
+
+    async def test_malformed_router_id_never_breaks_resolve(self, monkeypatch) -> None:
+        # A typed UUID query param would have made this a 422 and left the
+        # guest with no login page; now it just drops the router from the row.
+        calls: list[dict] = []
+        _, _, response = await self._call(
+            monkeypatch,
+            record_impression=True,
+            recorder=lambda **kw: calls.append(kw) or True,
+            router_id="not-a-uuid",
+        )
+        assert response["success"] is True
+        assert len(calls) == 1 and calls[0]["router_id"] is None
 
     async def test_real_recorder_failure_does_not_break_resolve(
         self, monkeypatch

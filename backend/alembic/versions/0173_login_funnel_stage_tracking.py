@@ -88,16 +88,27 @@ def upgrade() -> None:
         "guest_sessions",
         sa.Column("internet_confirmed_source", sa.String(length=40), nullable=True),
     )
-    op.create_index(
-        "ix_guest_sessions_internet_confirmed",
-        "guest_sessions",
-        ["location_id", "internet_confirmed_at"],
-        postgresql_where=sa.text("internet_confirmed_at IS NOT NULL"),
-    )
+    # CONCURRENTLY: guest_sessions takes a write on every guest sign-in, and
+    # a plain CREATE INDEX blocks writes for the length of the build (same
+    # reasoning as 0075). The new tables above are empty, so they don't
+    # need it.
+    with op.get_context().autocommit_block():
+        op.create_index(
+            "ix_guest_sessions_internet_confirmed",
+            "guest_sessions",
+            ["location_id", "internet_confirmed_at"],
+            postgresql_where=sa.text("internet_confirmed_at IS NOT NULL"),
+            postgresql_concurrently=True,
+        )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_guest_sessions_internet_confirmed", table_name="guest_sessions")
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            "ix_guest_sessions_internet_confirmed",
+            table_name="guest_sessions",
+            postgresql_concurrently=True,
+        )
     op.drop_column("guest_sessions", "internet_confirmed_source")
     op.drop_column("guest_sessions", "internet_confirmed_at")
 

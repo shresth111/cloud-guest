@@ -687,6 +687,15 @@ async def get_review_stats(
     )
 
 
+def _uuid_or_none(value: str | None) -> uuid.UUID | None:
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
+
+
 @router.get(
     "/captive-portal/resolve",
     response_model=ApiResponse[ResolvedCaptivePortalConfigResponse],
@@ -701,23 +710,27 @@ async def resolve_captive_portal_config(
     # Preview calls this same endpoint without it and is never counted. The
     # write is detached from this request (see
     # ``analytics.portal_impressions``): it can neither fail nor slow it.
-    record_impression: bool = Query(default=False),
-    router_id: uuid.UUID | None = Query(default=None),
-    device_mac: str | None = Query(default=None, max_length=64),
+    # Loose types on purpose: these ride along on the call that loads the
+    # portal, so a malformed value must never turn it into a 422 and leave
+    # the guest without a login page. Parsed below; bad input just drops
+    # the field from the impression.
+    record_impression: str | None = Query(default=None),
+    router_id: str | None = Query(default=None),
+    device_mac: str | None = Query(default=None),
     service: CaptivePortalService = Depends(get_captive_portal_service),
 ):
     resolved = await service.resolve_portal_config(
         organization_id=organization_id, location_id=location_id
     )
-    if record_impression is True and location_id is not None:
+    if record_impression == "true" and location_id is not None:
         # The organization the config resolved to, which
         # ``resolve_portal_config`` has already proved owns the location;
         # the insert re-checks both in SQL anyway.
         schedule_portal_impression(
             organization_id=resolved.config.organization_id,
             location_id=location_id,
-            router_id=router_id,
-            device_mac=device_mac,
+            router_id=_uuid_or_none(router_id),
+            device_mac=device_mac[:64] if device_mac else None,
         )
     config_payload = _config_response(resolved.config).model_dump()
 

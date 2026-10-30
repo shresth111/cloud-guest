@@ -7,6 +7,7 @@ and its downgrade undoes every one of its upgrade's objects.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import pathlib
 from typing import Any
@@ -28,9 +29,18 @@ def _load() -> Any:
     return module
 
 
+class _MigrationContext:
+    @contextlib.contextmanager
+    def autocommit_block(self):
+        yield
+
+
 class _Recorder:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple, dict]] = []
+
+    def get_context(self) -> _MigrationContext:
+        return _MigrationContext()
 
     def __getattr__(self, name: str):
         def _call(*args, **kwargs):
@@ -101,3 +111,15 @@ def test_downgrade_undoes_upgrade(monkeypatch) -> None:
     # Indexes go before their table.
     names = [c[0] for c in down.calls]
     assert names.index("drop_table") == len(names) - 1
+
+
+def test_guest_sessions_index_is_built_concurrently(monkeypatch) -> None:
+    # guest_sessions takes a write on every sign-in; a plain CREATE INDEX
+    # would block those for the length of the build.
+    rec = _run(monkeypatch, "upgrade")
+    idx = [
+        kw
+        for name, args, kw in rec.calls
+        if name == "create_index" and args and args[1] == "guest_sessions"
+    ]
+    assert idx and all(kw.get("postgresql_concurrently") is True for kw in idx)
