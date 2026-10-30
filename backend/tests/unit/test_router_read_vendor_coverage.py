@@ -97,6 +97,16 @@ NARROWING_HELPERS = frozenset({"agent_managed_only", "agent_managed_vendor_crite
 # ---------------------------------------------------------------------------
 
 AGENT_MANAGED_ONLY: dict[str, str] = {
+    "app/domains/analytics/venue_insights.py::"
+    "VenueInsightsRepository.get_router_liveness": (
+        "The customer venue-comparison card judges each router online or "
+        "not by heartbeat (`compute_internet_availability`: status ONLINE "
+        "and last_seen_at within the stale window). A controller-managed "
+        "row never heartbeats, so counting it would report a working Omada "
+        "or Aruba venue as offline. Narrowed here; a venue left with no "
+        "agent-managed router is shown as 'status not reported', never as "
+        "offline or as having no equipment."
+    ),
     "app/domains/guest/tasks.py::_run_hotspot_binding_reconcile_sweep_async": (
         "The routers the session-bypass reconciliation sweep runs on: each "
         "row gets an 8728 session with its own stored credentials and may "

@@ -122,6 +122,7 @@ from .schemas import (
 )
 from .service import AnalyticsService
 from .validators import validate_date_range
+from .venue_insights_router import router as venue_insights_router
 from .voucher_analytics_schemas import (
     VoucherRedemptionAnalyticsResponse,
     VoucherRedemptionListResponse,
@@ -893,6 +894,8 @@ async def get_operational_recommendations(
 # ============================================================================
 
 router.include_router(report_router)
+# Customer-dashboard venue insights -- see venue_insights.py.
+router.include_router(venue_insights_router)
 
 
 __all__ = ["router"]
