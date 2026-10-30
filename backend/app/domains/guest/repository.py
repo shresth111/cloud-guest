@@ -206,7 +206,13 @@ def guest_identifier_clause(
     # branch predates `and_`/`or_` being imported here at all -- and a helper
     # that silently depends on it fails only where it is deployed, never
     # where it was written.
-    spelling = Guest.identifier.in_(terms.exact)
+    # An email compares ``lower(identifier)``: new rows are stored
+    # lower-cased (``normalize_identifier``), rows written before that are
+    # still in whatever case the guest typed, and both must resolve to the
+    # same person. Phones keep the plain ``IN`` so the unique
+    # ``(organization_id, identifier)`` index still serves them.
+    column = func.lower(Guest.identifier) if terms.casefold else Guest.identifier
+    spelling = column.in_(terms.exact)
     for pattern in terms.prefix_patterns:
         spelling = spelling | Guest.identifier.like(pattern)
     return (
@@ -639,10 +645,11 @@ class GuestRepository:
         rewriting guest identifiers is a data decision, not a lookup one.
         Nothing here merges rows that are *already* split.
 
-        Emails are unaffected -- ``identifier_match_terms`` returns a single
-        exact term for anything it cannot prove is a phone number, and
-        ``canonicalize_rule_identifier`` returns email addresses exactly as
-        they arrive, case preserved.
+        Emails are matched case-insensitively -- ``identifier_match_terms``
+        returns the single lower-cased address with ``casefold=True`` and
+        the clause compares ``lower(identifier)``, so ``Guest@Gmail.com``
+        stored before emails were normalised is still the guest who now
+        signs in as ``guest@gmail.com``. See ``normalize_identifier``.
 
         ## The trade-off, named rather than discovered later
 

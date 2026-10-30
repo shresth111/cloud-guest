@@ -153,7 +153,7 @@ from .exceptions import (
 )
 from .models import OtpRequest
 from .repository import OtpRepositoryProtocol
-from .validators import validate_identifier
+from .validators import normalize_otp_identifier, validate_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -1421,7 +1421,7 @@ class OtpService:
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
     ) -> OtpRequest:
-        identifier = identifier.strip()
+        identifier = normalize_otp_identifier(identifier)
         validate_identifier(identifier, channel)
 
         await OtpRateLimiter.check_and_increment(
@@ -1520,7 +1520,7 @@ class OtpService:
     async def verify_otp(
         self, *, identifier: str, code: str, purpose: OtpPurpose
     ) -> OtpRequest:
-        identifier = identifier.strip()
+        identifier = normalize_otp_identifier(identifier)
         otp_request = await self.repository.get_latest_for_identifier(
             identifier, purpose.value
         )

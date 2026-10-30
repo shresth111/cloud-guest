@@ -916,11 +916,15 @@ class FakeGuestRepository:
     async def get_guest_by_identifier(
         self, organization_id: uuid.UUID, identifier: str
     ) -> Guest | None:
+        # Emails mirror the real clause's ``lower(identifier)`` comparison
+        # (``guest_identifier_clause``); everything else stays exact, as
+        # this fake always was.
+        casefold = "@" in identifier
         for guest in self.guests.values():
-            if (
-                guest.organization_id == organization_id
-                and guest.identifier == identifier
-            ):
+            if guest.organization_id != organization_id:
+                continue
+            stored = guest.identifier.lower() if casefold else guest.identifier
+            if stored == (identifier.lower() if casefold else identifier):
                 return guest
         return None
 
