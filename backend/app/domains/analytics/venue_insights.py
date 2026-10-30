@@ -74,6 +74,7 @@ from app.domains.organization.models import Organization
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
 from app.domains.router.enums import RouterStatus
+from app.domains.router.fleet_scope import agent_managed_only
 from app.domains.router.models import Router
 
 from .exceptions import AnalyticsError
@@ -516,12 +517,17 @@ class VenueInsightsRepository:
     async def get_router_liveness(
         self, *, organization_id: uuid.UUID
     ) -> list[RouterLivenessRow]:
-        statement = select(
-            Router.location_id, Router.status, Router.last_seen_at
-        ).where(
-            Router.organization_id == organization_id,
-            Router.is_deleted.is_(False),
-            Router.status != RouterStatus.DECOMMISSIONED.value,
+        # Agent-managed rows only: `compute_internet_availability` judges a
+        # router by heartbeat, and a controller-managed row (Omada, Aruba)
+        # never heartbeats, so it would always read as offline. A venue
+        # with only controller equipment comes back with zero routers here
+        # and the card shows "status not reported", not "offline".
+        statement = agent_managed_only(
+            select(Router.location_id, Router.status, Router.last_seen_at).where(
+                Router.organization_id == organization_id,
+                Router.is_deleted.is_(False),
+                Router.status != RouterStatus.DECOMMISSIONED.value,
+            )
         )
         rows = (await self.session.execute(statement)).all()
         return [
