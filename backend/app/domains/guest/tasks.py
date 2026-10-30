@@ -748,9 +748,10 @@ async def _hotspot_gate_hold_remaining(session_id: str) -> float:
 
 
 async def _open_hotspot_gate_async(*, session_id: str, router_id: str):  # noqa: ANN202
-    """One attempt, on a fresh ``AsyncSession``. Read-only against this
-    platform's database -- the only write is the one on the router -- so
-    there is nothing to commit and nothing to roll back.
+    """One attempt, on a fresh ``AsyncSession``. The only database write is
+    ``internet_confirmed_at`` when the router read says the device is
+    through (``_record_gate_internet_confirmation``); everything else is a
+    read, and the device write is the one on the router.
 
     Unlike ``_assign_guest_queue_async`` this *does* re-read
     ``guest_sessions``, deliberately: whether the session is still one the
@@ -776,15 +777,50 @@ async def _open_hotspot_gate_async(*, session_id: str, router_id: str):  # noqa:
             organization_service,
             location_code_counter=LocationCodeCounterRepository(session),
         )
-        return await open_hotspot_gate_for_session(
+        guest_repository = GuestRepository(session)
+        result = await open_hotspot_gate_for_session(
             session_id=uuid.UUID(session_id),
             router_id=uuid.UUID(router_id),
-            guest_repository=GuestRepository(session),
+            guest_repository=guest_repository,
             access_decision_service=_build_access_decision_service(session),
             captive_portal_service=_build_captive_portal_service(session),
             router_lookup=RouterService(
                 RouterRepository(session), location_service, organization_service
             ),
+        )
+        await _record_gate_internet_confirmation(
+            session, guest_repository, session_id=session_id, result=result
+        )
+        return result
+
+
+async def _record_gate_internet_confirmation(
+    db_session: AsyncSession,
+    guest_repository: GuestRepository,
+    *,
+    session_id: str,
+    result: HotspotGateResult,
+) -> None:
+    """The one database write this task makes: when the router read the
+    attempt took says the device is through (``hotspot_gate
+    .internet_confirmation_source``), stamp ``internet_confirmed_at`` --
+    first report wins. No extra device call; the reading is the one the
+    gate push already took. Never raises: the router write above is the
+    task's job and this must not turn its outcome into a retry."""
+    from .hotspot_gate import internet_confirmation_source
+
+    source = internet_confirmation_source(result)
+    if source is None:
+        return
+    try:
+        await guest_repository.mark_internet_confirmed(
+            uuid.UUID(session_id), at=datetime.now(UTC), source=source
+        )
+        await db_session.commit()
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_task_open_hotspot_gate_confirm_failed",
+            extra={"session_id": session_id, "source": source, "error": str(exc)},
         )
 
 

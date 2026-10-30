@@ -500,6 +500,33 @@ class GuestSession(BaseModel):
     review_link_opened_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    #: When the network itself first reported this session's device as let
+    #: through -- not when this platform *asked* it to. Set once, first
+    #: report wins (``GuestRepository.mark_internet_confirmed``), and only
+    #: from a reading that originates on the NAS or controller:
+    #:
+    #: * a RADIUS Accounting-Start / Interim-Update for the session (any NAS
+    #:   that sends accounting: MikroTik hotspot logins, Omada RADIUS portal
+    #:   mode, Aruba Instant On);
+    #: * the sign-in gate push's own read of the MikroTik (the MAC is an
+    #:   ``/ip hotspot active`` session, its host reads ``bypassed``, or the
+    #:   router already holds a ``bypassed`` binding for it);
+    #: * an Omada Open-API client read reporting ``authStatus`` authorized.
+    #:
+    #: NULL means "no such report", never "no internet": a guest admitted
+    #: only by the router's own authorized-MAC poll, or at a venue whose
+    #: vendor reports nothing back, stays NULL however well it works.
+    #: ``0 bytes`` is not used either way -- bypassed guests never produce
+    #: accounting, so it would mislabel working sessions.
+    internet_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: Which of the readings above set ``internet_confirmed_at`` -- one of
+    #: ``constants.InternetConfirmationSource``. For debugging a venue's
+    #: funnel, not for display.
+    internet_confirmed_source: Mapped[str | None] = mapped_column(
+        String(40), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_guest_sessions_guest_id", "guest_id"),
@@ -518,6 +545,14 @@ class GuestSession(BaseModel):
                 "review_prompt_shown_at IS NOT NULL "
                 "OR review_link_opened_at IS NOT NULL"
             ),
+        ),
+        # The login funnel's "internet confirmed" stage: one venue, one
+        # window, only the rows that have a confirmation at all.
+        Index(
+            "ix_guest_sessions_internet_confirmed",
+            "location_id",
+            "internet_confirmed_at",
+            postgresql_where=text("internet_confirmed_at IS NOT NULL"),
         ),
     )
 
@@ -840,9 +875,7 @@ class RadiusNasClient(BaseModel):
     # two differing is a queryable, retryable condition, so a failed
     # re-push converges on the next pass instead of needing a human to
     # notice a log line.
-    hub_client_synced_ip: Mapped[str | None] = mapped_column(
-        String(45), nullable=True
-    )
+    hub_client_synced_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     hub_client_synced_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -84,7 +84,7 @@ import ipaddress
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,6 +94,7 @@ from app.core.celery_app import celery_app
 from app.core.logging import get_logger
 from app.database.redis import redis_client
 from app.database.session import SessionLocal
+from app.domains.guest.constants import InternetConfirmationSource
 from app.domains.guest.repository import GuestRepository
 from app.domains.guest.service import GuestService
 from app.domains.location.repository import (
@@ -121,6 +122,7 @@ logger = get_logger(__name__)
 __all__ = [
     "OmadaUsageSyncSummary",
     "apply_controller_usage",
+    "controller_authorized_session_ids",
     "run_omada_usage_sync_sweep",
     "sync_omada_session_usage",
 ]
@@ -166,6 +168,7 @@ class OmadaUsageSyncSummary:
     bytes_uploaded_applied: int = 0
     bytes_downloaded_applied: int = 0
     session_ips_updated: int = 0
+    sessions_internet_confirmed: int = 0
 
 
 def _canonical_mac(raw: str | None) -> str | None:
@@ -298,6 +301,38 @@ def controller_client_ip_updates(
         if address != session.ip_address:
             updates[session.id] = address
     return updates
+
+
+def controller_authorized_session_ids(
+    *,
+    clients: Sequence[ProviderClient],
+    active_sessions: Sequence[_ActiveSession],
+    devices_by_id: Mapping[uuid.UUID, _Device],
+) -> list[uuid.UUID]:
+    """Matched active sessions whose controller client reads
+    ``is_authorized is True`` (Omada ``authStatus`` authorized) and that have
+    no ``internet_confirmed_at`` yet -- the "internet confirmed" funnel stage
+    for Open-API venues.
+
+    Only ``True`` counts. ``None`` is "the controller did not say" and
+    ``False`` is pending / connected-without-auth (see
+    ``ProviderClient.is_authorized``); traffic bytes are not used, because a
+    pre-auth client moves portal traffic too. Pure: matching by the same MAC
+    rule as the usage delta, no reads or writes."""
+    session_by_mac = _session_by_mac(active_sessions, devices_by_id)
+    confirmed: list[uuid.UUID] = []
+    for client in clients:
+        if client.is_authorized is not True:
+            continue
+        canonical = _canonical_mac(client.mac)
+        if canonical is None:
+            continue
+        session = session_by_mac.get(canonical)
+        if session is None or getattr(session, "internet_confirmed_at", None):
+            continue
+        if session.id not in confirmed:
+            confirmed.append(session.id)
+    return confirmed
 
 
 async def apply_controller_usage(
@@ -488,6 +523,23 @@ async def sync_omada_session_usage(
                 sessions_by_id[session_id], {"ip_address": address}
             )
         summary.session_ips_updated += len(ip_updates)
+
+        # "Internet confirmed" for the login funnel, off this same client
+        # read -- the controller's own authStatus, no extra call. The
+        # repository method is first-write-wins and never raises.
+        observed_at = datetime.now(UTC)
+        mark_confirmed = getattr(guest_repository, "mark_internet_confirmed", None)
+        for session_id in controller_authorized_session_ids(
+            clients=clients,
+            active_sessions=active_sessions,
+            devices_by_id=devices_by_id,
+        ):
+            if mark_confirmed is not None and await mark_confirmed(
+                session_id,
+                at=observed_at,
+                source=InternetConfirmationSource.OMADA_CLIENT_AUTHORIZED.value,
+            ):
+                summary.sessions_internet_confirmed += 1
         summary.integrations_synced += 1
         summary.sessions_updated += updated
         summary.bytes_uploaded_applied += up_applied
@@ -608,6 +660,7 @@ def run_omada_usage_sync_sweep() -> dict[str, int]:
         "sessions_updated": summary.sessions_updated,
         "bytes_uploaded_applied": summary.bytes_uploaded_applied,
         "bytes_downloaded_applied": summary.bytes_downloaded_applied,
+        "sessions_internet_confirmed": summary.sessions_internet_confirmed,
     }
     logger.info("omada_usage_sync_sweep_completed", extra=result)
     return result

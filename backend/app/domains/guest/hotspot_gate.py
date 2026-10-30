@@ -153,6 +153,42 @@ class HotspotGateResult:
     hold_seconds: float = 0.0
 
 
+#: Gateway outcomes that carry ``existing_bindings`` read off the router.
+_OUTCOMES_WITH_BINDINGS = frozenset({"already_bound", "raced"})
+
+
+def internet_confirmation_source(result: HotspotGateResult) -> str | None:
+    """Whether this gate-push attempt *read* the router letting the device
+    through, and if so which reading -- an
+    ``InternetConfirmationSource`` value, or ``None``.
+
+    Only readings, never the write: a binding this task added proves the
+    platform asked, not that the host is through. So:
+
+    * ``active_session`` -- the MAC is in ``/ip hotspot active``: logged in.
+    * ``created`` with ``host_state == "bypassed"`` -- after the write the
+      router's own host row for the MAC reads ``bypassed=true``. ``absent``
+      (device not seen by the router) and ``pending`` are not confirmation.
+    * ``already_bound`` / ``raced`` with a ``bypassed`` binding and no
+      ``blocked`` one -- the router's own authorized-MAC poll had already
+      applied the bypass for this MAC.
+
+    Everything else -- refusals, ``no_reconciler``, ``no_hotspot``, held,
+    device errors -- is ``None``.
+    """
+    from .constants import InternetConfirmationSource
+
+    if result.outcome == "active_session":
+        return InternetConfirmationSource.MIKROTIK_HOTSPOT_ACTIVE.value
+    if result.outcome == "created" and result.host_state == "bypassed":
+        return InternetConfirmationSource.MIKROTIK_HOST_BYPASSED.value
+    if result.outcome in _OUTCOMES_WITH_BINDINGS:
+        types = {entry.split(":", 1)[0] for entry in result.existing_bindings}
+        if "bypassed" in types and "blocked" not in types:
+            return InternetConfirmationSource.MIKROTIK_BINDING_BYPASSED.value
+    return None
+
+
 def router_takes_hotspot_bindings(router: object) -> bool:
     """Whether ``router`` is a device this platform itself logs in to.
 
@@ -330,6 +366,7 @@ __all__ = [
     "OUTCOME_NO_CREDENTIALS",
     "OUTCOME_ROUTER_NOT_FOUND",
     "OUTCOME_UNSUPPORTED_VENDOR",
+    "internet_confirmation_source",
     "open_hotspot_gate_for_session",
     "open_hotspot_gate_for_trusted_entry",
     "router_takes_hotspot_bindings",

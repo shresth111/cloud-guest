@@ -929,7 +929,34 @@ NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES = 32
 WHITELIST_ONLY_LOGIN_FAILURE_REASON = "WhitelistOnlyAccessDeniedError"
 
 
+class InternetConfirmationSource(StrEnum):
+    """What set ``GuestSession.internet_confirmed_at`` -- each one a reading
+    taken from the NAS or controller, never this platform's own request.
+    See that column's docstring."""
+
+    #: RADIUS Accounting-Start: the NAS opened an accounting session for
+    #: the guest, which it does only once it has let the device through.
+    RADIUS_ACCOUNTING_START = "radius_accounting_start"
+    #: RADIUS Interim-Update: the same, for a session whose Start was
+    #: missed (lost packet, deploy window, hub restart).
+    RADIUS_ACCOUNTING_INTERIM = "radius_accounting_interim"
+    #: Gate push read ``/ip hotspot active``: the MAC is a logged-in hotspot
+    #: session on the MikroTik right now.
+    MIKROTIK_HOTSPOT_ACTIVE = "mikrotik_hotspot_active"
+    #: Gate push added the binding, read it back, and the MikroTik's
+    #: ``/ip hotspot host`` row for the MAC reads ``bypassed=true``.
+    MIKROTIK_HOST_BYPASSED = "mikrotik_host_bypassed"
+    #: Gate push found the router already holding a ``type=bypassed``
+    #: binding for the MAC (its own authorized-MAC poll got there first)
+    #: and no ``blocked`` one.
+    MIKROTIK_BINDING_BYPASSED = "mikrotik_binding_bypassed"
+    #: Omada Open-API client read (the usage sweep's) reports the device
+    #: ``authStatus`` authorized.
+    OMADA_CLIENT_AUTHORIZED = "omada_client_authorized"
+
+
 __all__ = [
+    "InternetConfirmationSource",
     "GUEST_DISPLAY_NAME_MAX_LENGTH",
     "GUEST_NAME_INVALID_CODE",
     "GUEST_NAME_REQUIRED_CODE",

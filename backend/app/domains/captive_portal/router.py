@@ -51,6 +51,7 @@ from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
 from app.core.storage import ObjectStorageError, get_object_storage
 from app.database.session import get_db_session
+from app.domains.analytics.portal_impressions import schedule_portal_impression
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
 from app.domains.billing.dependencies import get_entitlement_checker
@@ -695,11 +696,29 @@ async def resolve_captive_portal_config(
     request: Request,
     organization_id: uuid.UUID | None = Query(default=None),
     location_id: uuid.UUID | None = Query(default=None),
+    # "Portal opened" for the venue dashboard's login funnel. Sent only by
+    # the guest portal runtime, once per page load -- the dashboard's Portal
+    # Preview calls this same endpoint without it and is never counted. The
+    # write is detached from this request (see
+    # ``analytics.portal_impressions``): it can neither fail nor slow it.
+    record_impression: bool = Query(default=False),
+    router_id: uuid.UUID | None = Query(default=None),
+    device_mac: str | None = Query(default=None, max_length=64),
     service: CaptivePortalService = Depends(get_captive_portal_service),
 ):
     resolved = await service.resolve_portal_config(
         organization_id=organization_id, location_id=location_id
     )
+    if record_impression and location_id is not None:
+        # The organization the config resolved to, which
+        # ``resolve_portal_config`` has already proved owns the location;
+        # the insert re-checks both in SQL anyway.
+        schedule_portal_impression(
+            organization_id=resolved.config.organization_id,
+            location_id=location_id,
+            router_id=router_id,
+            device_mac=device_mac,
+        )
     config_payload = _config_response(resolved.config).model_dump()
 
     # Whitelist-only mode is an operator setting, not something a guest is
