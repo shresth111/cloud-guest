@@ -203,13 +203,40 @@ def canonical_mac_key(raw: str | None) -> str | None:
 
 
 def normalize_identifier(identifier: str) -> str:
-    """Strips surrounding whitespace -- mirrors
-    ``app.domains.voucher.validators.normalize_redeemed_identifier``'s
-    identical, deliberately unopinionated normalization (this module has no
-    delivery channel of its own to protect; channel-specific shape
-    validation already happened inside ``app.domains.otp`` before this
-    module ever sees the identifier)."""
-    return identifier.strip()
+    """The guest identity key: surrounding whitespace stripped, and an
+    email address (anything containing ``@``) lower-cased.
+
+    ## Why emails are case-folded here
+
+    This is the one normalizer every portal login path (OTP, voucher,
+    password, PIN, team join), the RADIUS ``authorize``/accounting username
+    lookup and the PIN-lockout key already call, so folding here keeps them
+    agreeing with each other. Before, it only stripped, and every lookup
+    was exact: ``Guest@Gmail.com`` and ``guest@gmail.com`` were two guests.
+    Mobile keyboards capitalise the first letter of the portal's plain-text
+    "Mobile or email" field, so the same person routinely arrived in both
+    spellings -- a correct password rejected, a second ``Guest`` row, and a
+    blocked guest re-admitted under a new capital letter.
+
+    No mail provider a guest will realistically use treats the local part
+    case-sensitively, and ``app.domains.auth`` already lower-cases dashboard
+    users' emails for the same reason.
+
+    ## What is deliberately not folded
+
+    Non-email identifiers (phone numbers, ``mac:...`` identities, free-text
+    voucher identifiers) keep their case -- there is no evidence a venue
+    relies on, or a guest expects, case-insensitivity there, and phone
+    digits have none. Passwords and PINs never pass through here.
+
+    Rows written before this change still hold the email as typed; the
+    lookups (``guest_identifier_clause``, ``identifier_match_terms``)
+    compare ``lower(identifier)`` so they are still found. Nothing rewrites
+    them."""
+    stripped = identifier.strip()
+    if "@" in stripped:
+        return stripped.lower()
+    return stripped
 
 
 def validate_session_status_transition(
