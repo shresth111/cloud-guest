@@ -54,6 +54,7 @@ from app.domains.guest.service import GuestAnalyticsService
 from .constants import (
     TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
     TASK_RUN_DAILY_AGGREGATION_FOR_ORGANIZATION,
+    TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP,
 )
 from .repository import AnalyticsRepository
 from .service import AggregationBatchResult, AnalyticsService
@@ -161,7 +162,26 @@ def run_daily_aggregation_for_organization(
     return {"organization_id": organization_id, "snapshot_count": snapshot_count}
 
 
+async def _run_portal_impression_retention_sweep_async() -> dict[str, object]:
+    """Fresh ``AsyncSession`` per run; the purge commits per batch."""
+    from .portal_impressions import purge_expired_impressions
+
+    async with SessionLocal() as session:
+        return await purge_expired_impressions(session)
+
+
+@celery_app.task(name=TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP)
+def run_portal_impression_retention_sweep() -> dict[str, object]:
+    """Beat-scheduled daily. Hard-deletes ``portal_impressions`` rows older
+    than ``portal_impressions.PORTAL_IMPRESSION_RETENTION_DAYS`` (92, the
+    venue-insight endpoints' longest window). Pure DB, default queue."""
+    summary = run_celery_task(_run_portal_impression_retention_sweep_async())
+    logger.info("analytics_task_portal_impression_retention_completed", extra=summary)
+    return summary
+
+
 __all__ = [
+    "run_portal_impression_retention_sweep",
     "run_daily_aggregation_for_all_organizations",
     "run_daily_aggregation_for_organization",
 ]

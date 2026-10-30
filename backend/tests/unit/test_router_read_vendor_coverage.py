@@ -215,6 +215,24 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- analytics (venue insights: login funnel) --------------------------
+    "app/domains/analytics/portal_impressions.py::build_impression_insert": (
+        "Scoping only: a portal impression keeps its router_id when that "
+        "router is at the impression's location in the same org, and drops "
+        "it otherwise. Any vendor's router is a valid answer to 'is this "
+        "router at this venue'; nothing is judged about the device, and "
+        "nothing is dispatched."
+    ),
+    "app/domains/analytics/venue_insights.py::"
+    "VenueInsightsRepository.get_router_coverage": (
+        "Decides per venue whether 'internet confirmed' can be measured at "
+        "all, by vendor and integration mode (`router_confirmation_gap`). "
+        "It needs every row: the controller rows are exactly the ones it "
+        "reasons about (Omada Open-API or RADIUS portal mode report; legacy "
+        "external-portal mode does not, and is shown as 'not tracked' with "
+        "that reason). A controller is never reported as broken hardware "
+        "from this read."
+    ),
     # -- traffic_flow (NetFlow/IPFIX) ---------------------------------------
     "app/domains/traffic_flow/service.py::TrafficFlowRepository.exporter_router_map": (
         "Attribution of a received flow window: joins wireguard_peers to "

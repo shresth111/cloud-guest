@@ -106,8 +106,10 @@ from celery.schedules import crontab
 
 from app.core.config import get_settings
 from app.domains.analytics.constants import (
+    PORTAL_IMPRESSION_RETENTION_SWEEP_INTERVAL_SECONDS,
     SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS,
     TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
+    TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP,
     TASK_RUN_SCHEDULED_REPORTS,
 )
 from app.domains.billing.constants import (
@@ -512,6 +514,14 @@ celery_app.conf.update(
         "reports-run-scheduled": {
             "task": TASK_RUN_SCHEDULED_REPORTS,
             "schedule": SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS,
+        },
+        # Login funnel "portal opened" rows: hard-deleted after 92 days (the
+        # venue-insight endpoints' longest window), in bounded batches. In
+        # the app rather than the box's wyfy-retention.sh so it ships with
+        # the table. Pure DB, default queue.
+        "analytics-portal-impression-retention-sweep": {
+            "task": TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP,
+            "schedule": PORTAL_IMPRESSION_RETENTION_SWEEP_INTERVAL_SECONDS,
         },
         # BE-013 Part 2: Renewal Engine sweep -- hourly, not every 15
         # minutes like the analytics rolling tick above. See

@@ -33,11 +33,13 @@ from sqlalchemy import (
     or_,
     select,
     true,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.core.logging import get_logger
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta
@@ -64,6 +66,8 @@ from .models import (
     RadiusNasCodeCounter,
 )
 from .validators import DevicePresenceObservation
+
+logger = get_logger(__name__)
 
 # ============================================================================
 # Analytics read-models (repository-layer return shapes -- service.py wraps
@@ -1070,6 +1074,44 @@ class GuestRepository:
     ) -> GuestSession:
         return await self.sessions.update(session, data)
 
+    async def mark_internet_confirmed(
+        self, session_id: uuid.UUID, *, at: datetime, source: str
+    ) -> bool:
+        """Set ``internet_confirmed_at``/``_source`` if not already set.
+        First report wins; returns whether this call set it.
+
+        One conditional ``UPDATE`` (``WHERE internet_confirmed_at IS NULL``)
+        so concurrent reports for the same session -- an Accounting-Start and
+        the gate push landing together -- cannot overwrite each other. Run
+        inside a SAVEPOINT and never raises: a failure here must not poison
+        the caller's transaction (RADIUS accounting, the gate push, the
+        Omada usage sweep), whose own work matters more than this column.
+        ``version`` is left alone on purpose, so an ORM instance of the row
+        the caller already loaded stays writable (``updated_at`` is stamped
+        by the column's own ``onupdate``)."""
+        try:
+            async with self.session.begin_nested():
+                result = await self.session.execute(
+                    update(GuestSession)
+                    .where(
+                        GuestSession.id == session_id,
+                        GuestSession.internet_confirmed_at.is_(None),
+                    )
+                    .values(internet_confirmed_at=at, internet_confirmed_source=source)
+                    .execution_options(synchronize_session=False)
+                )
+            return bool(result.rowcount)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "guest_internet_confirmed_write_failed",
+                extra={
+                    "session_id": str(session_id),
+                    "source": source,
+                    "error": str(exc),
+                },
+            )
+            return False
+
     async def has_blocking_review_activity(
         self,
         *,
@@ -1247,14 +1289,11 @@ class GuestRepository:
         optionally excluding one device id -- the device currently logging
         in, so a reconnect/refresh of an already-online device never counts
         against itself."""
-        query = (
-            select(func.count(func.distinct(GuestSession.device_id)))
-            .where(
-                GuestSession.guest_id == guest_id,
-                GuestSession.status == GuestSessionStatus.ACTIVE.value,
-                GuestSession.device_id.is_not(None),
-                GuestSession.is_deleted.is_(False),
-            )
+        query = select(func.count(func.distinct(GuestSession.device_id))).where(
+            GuestSession.guest_id == guest_id,
+            GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            GuestSession.device_id.is_not(None),
+            GuestSession.is_deleted.is_(False),
         )
         if exclude_device_id is not None:
             query = query.where(GuestSession.device_id != exclude_device_id)

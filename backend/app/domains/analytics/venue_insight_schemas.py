@@ -6,8 +6,9 @@ rather than estimated."""
 from __future__ import annotations
 
 import uuid
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class PeakHourCell(BaseModel):
@@ -51,8 +52,49 @@ class GuestMixResponse(BaseModel):
 
 
 class FunnelStageUnavailable(BaseModel):
-    available: bool = False
+    """A stage this venue cannot report. ``message`` says why, per venue."""
+
+    available: Literal[False] = False
     message: str
+
+
+class PortalOpenedStage(BaseModel):
+    """``portal_impressions`` in the window. ``count`` is page loads with one
+    device's reloads inside ten minutes collapsed into one; ``devices`` is
+    distinct devices among loads that carried a MAC (a load without one is
+    in ``count`` only)."""
+
+    available: Literal[True] = True
+    count: int
+    devices: int
+    #: Earliest impression this platform holds for the venue, or None when
+    #: there is none yet. A window starting before it is only partly counted.
+    tracked_since: str | None
+
+
+class InternetConfirmedStage(BaseModel):
+    """Sessions whose ``internet_confirmed_at`` falls in the window -- the
+    NAS or controller itself reported the device through."""
+
+    available: Literal[True] = True
+    #: Distinct guests, every login method.
+    count: int
+    #: Distinct guests on an OTP-method session: the number to set against
+    #: ``otp_signed_in_guests``.
+    otp_guests: int
+    sessions: int
+    tracked_since: str | None
+    #: Set when some of the venue's routers cannot report this stage, so the
+    #: count can be lower than reality.
+    note: str | None = None
+
+
+PortalOpened = Annotated[
+    PortalOpenedStage | FunnelStageUnavailable, Field(discriminator="available")
+]
+InternetConfirmed = Annotated[
+    InternetConfirmedStage | FunnelStageUnavailable, Field(discriminator="available")
+]
 
 
 class LoginMethodItem(BaseModel):
@@ -75,8 +117,8 @@ class LoginFunnelResponse(BaseModel):
     #: Distinct identifiers with a successful OTP login recorded, i.e. a
     #: guest session was issued.
     otp_signed_in_guests: int
-    portal_opened: FunnelStageUnavailable
-    internet_confirmed: FunnelStageUnavailable
+    portal_opened: PortalOpened
+    internet_confirmed: InternetConfirmed
     methods: list[LoginMethodItem]
 
 
@@ -103,6 +145,8 @@ class LocationComparisonResponse(BaseModel):
 
 __all__ = [
     "FunnelStageUnavailable",
+    "InternetConfirmedStage",
+    "PortalOpenedStage",
     "GuestMixResponse",
     "LocationComparisonItem",
     "LocationComparisonResponse",

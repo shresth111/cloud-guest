@@ -333,6 +333,7 @@ from .constants import (
     GuestAuthMethod,
     GuestSessionEndedReason,
     GuestSessionStatus,
+    InternetConfirmationSource,
     NasStatus,
     QuotaPeriodType,
     RadiusNasDevicePushStatus,
@@ -735,9 +736,7 @@ async def enforce_session_timeouts(
     """
     now = datetime.now(UTC)
     candidates = await repository.list_timed_out_sessions(now=now)
-    observable_by_venue: dict[
-        tuple[uuid.UUID | None, uuid.UUID | None], bool
-    ] = {}
+    observable_by_venue: dict[tuple[uuid.UUID | None, uuid.UUID | None], bool] = {}
     read_by_router: dict[uuid.UUID, RouterActivityRead] = {}
     expired: list[GuestSession] = []
     for session in candidates:
@@ -784,9 +783,7 @@ async def enforce_session_timeouts(
                 # Per session, so the venue-wide answer is left as it was
                 # for this venue's other guests.
                 observable = False
-        if not is_session_stale(
-            session, now=now, activity_is_observable=observable
-        ):
+        if not is_session_stale(session, now=now, activity_is_observable=observable):
             continue  # defensive re-check against the SQL-level filter
         updated = await repository.update_session(
             session,
@@ -2242,6 +2239,7 @@ async def issue_live_disconnect(
     the row is flipped to ``EXPIRED``/``TERMINATED`` **before** this is
     called and this never raises, so without a loud log the platform
     reports an enforcement action it did not perform."""
+
     async def _record(enforced: bool) -> None:
         """Persist the outcome on the row itself.
 
@@ -5557,9 +5555,7 @@ class GuestService:
             session=session,
             device=device,
             is_new_guest=False,
-            name_required=await self.session_awaits_required_name(
-                session, guest=guest
-            ),
+            name_required=await self.session_awaits_required_name(session, guest=guest),
         )
 
     async def _active_session_past_its_limit(
@@ -6353,9 +6349,7 @@ class GuestService:
         (including this module's own pre-existing test suite) keeps working
         unchanged. See that function's own docstring for why the real logic
         was pulled out to module scope."""
-        return await enforce_session_timeouts(
-            self.repository, self.session_end_hook
-        )
+        return await enforce_session_timeouts(self.repository, self.session_end_hook)
 
     async def check_portal_admission(
         self,
@@ -8974,11 +8968,37 @@ class RadiusService:
         calling_station_id: str | None = None,
     ) -> GuestSession:
         """See module docstring for why this confirms an existing session
-        rather than fabricating one."""
+        rather than fabricating one.
+
+        Also the strongest "internet confirmed" reading this platform gets:
+        a NAS opens an accounting session only for a device it has let
+        through. Recorded once per session (first report wins); see
+        ``GuestSession.internet_confirmed_at``."""
         session = await self._get_session_for_nas(
             nas_client, username, calling_station_id=calling_station_id
         )
+        await self._confirm_internet(
+            session, InternetConfirmationSource.RADIUS_ACCOUNTING_START
+        )
         return session
+
+    async def _confirm_internet(
+        self, session: GuestSession, source: InternetConfirmationSource
+    ) -> None:
+        """First-write-wins ``internet_confirmed_at`` for an ACTIVE session.
+
+        Only an active session: a late or retransmitted packet resolved onto
+        a session this platform has already ended says nothing about the
+        login being measured. Skipped when already set (no write per
+        Interim-Update), and when the repository has no such method (the
+        in-memory fakes several test suites use). Never raises -- the
+        repository method swallows into a SAVEPOINT."""
+        if not session.is_active() or session.internet_confirmed_at is not None:
+            return
+        mark = getattr(self.repository, "mark_internet_confirmed", None)
+        if mark is None:
+            return
+        await mark(session.id, at=datetime.now(UTC), source=source.value)
 
     async def accounting_interim_update(
         self,
@@ -9023,6 +9043,11 @@ class RadiusService:
         """
         session = await self._get_session_for_nas(
             nas_client, username, calling_station_id=calling_station_id
+        )
+        # An Interim-Update for a session whose Start never arrived (lost
+        # packet, deploy window, hub restart) is the same NAS-side proof.
+        await self._confirm_internet(
+            session, InternetConfirmationSource.RADIUS_ACCOUNTING_INTERIM
         )
         if bytes_uploaded_total is not None:
             bytes_uploaded_delta = max(0, bytes_uploaded_total - session.bytes_uploaded)

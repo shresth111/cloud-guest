@@ -15,15 +15,19 @@ already records -- nothing is estimated, sampled or back-filled:
   different local calendar days.
 * **Login funnel** -- OTP codes requested -> verified (``otp_requests``) ->
   signed in (successful ``guest_login_history`` rows for an OTP method,
-  written only after the guest session exists). Two stages are reported
-  as unavailable, not guessed:
+  written only after the guest session exists). Two more stages, each
+  recorded only from the 0173 deploy onward and so returned with a
+  ``tracked_since``:
 
-  - *Portal opened*: no table records a captive-portal page view.
-  - *Internet confirmed*: the hotspot-gate dispatch that opens the network
-    is fire-and-forget and its outcome is not stored, and per-session byte
-    counters come only from RADIUS accounting, which bypassed (authorized-
-    MAC) guests never produce -- so "0 bytes" would mislabel most of the
-    fleet's working sessions as failures.
+  - *Portal opened*: ``portal_impressions`` (``portal_impressions.py``),
+    one row per real portal page load, one device's reloads collapsed.
+  - *Internet confirmed*: ``guest_sessions.internet_confirmed_at``, set only
+    from a reading the NAS or controller took -- RADIUS accounting, the
+    MikroTik gate push's read-back, the Omada Open-API client read. Never
+    from "we sent the request", and never from byte counters (bypassed
+    guests never produce accounting, so "0 bytes" would mislabel working
+    sessions). A venue whose routers cannot produce any such reading
+    (``confirmation_gap``) reports the stage unavailable with the reason.
 
   The login-method split is ``guest_login_history`` grouped by
   ``auth_method``.
@@ -70,6 +74,11 @@ from app.domains.guest.constants import GuestAuthMethod
 from app.domains.guest.models import GuestLoginHistory, GuestSession
 from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.location.models import Location
+from app.domains.network_integration.constants import (
+    ControllerAuthMode,
+    PortalAuthMode,
+)
+from app.domains.network_integration.models import NetworkIntegration
 from app.domains.organization.models import Organization
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
@@ -78,16 +87,19 @@ from app.domains.router.fleet_scope import agent_managed_only
 from app.domains.router.models import Router
 
 from .exceptions import AnalyticsError
+from .models import PortalImpression
 from .router_availability import compute_internet_availability
 from .venue_insight_schemas import (
     FunnelStageUnavailable,
     GuestMixResponse,
+    InternetConfirmedStage,
     LocationComparisonItem,
     LocationComparisonResponse,
     LoginFunnelResponse,
     LoginMethodItem,
     PeakHourCell,
     PeakHoursResponse,
+    PortalOpenedStage,
 )
 
 DEFAULT_WINDOW_DAYS = 28
@@ -99,14 +111,50 @@ OTP_AUTH_METHODS: tuple[str, ...] = (
     GuestAuthMethod.OTP_WHATSAPP.value,
 )
 
-PORTAL_OPENED_MESSAGE = (
-    "Not recorded: the platform does not log captive-portal page views, so "
-    "guests who opened the portal and left are not counted anywhere."
+NO_ROUTER_MESSAGE = (
+    "Not available: no router is registered at this venue, so nothing can "
+    "report a guest getting online."
 )
-INTERNET_CONFIRMED_MESSAGE = (
-    "Not recorded: whether the router actually let a signed-in guest onto "
-    "the internet is not stored per session."
+OMADA_LEGACY_MESSAGE = (
+    "Not available: this venue's TP-Link Omada controller is connected with "
+    "hotspot-operator credentials in external-portal mode, which report "
+    "nothing back after a guest signs in. Connecting it with Open API "
+    "credentials (or RADIUS portal mode) turns this on."
 )
+PARTIAL_COVERAGE_NOTE = (
+    "{missing} of {total} routers at this venue cannot report this, so the "
+    "number can be lower than reality."
+)
+
+#: Router vendors that report back only through a vendor controller.
+_OMADA_VENDOR = "tplink_omada"
+
+
+def router_confirmation_gap(
+    vendor: str | None,
+    integration_auth_mode: str | None,
+    integration_portal_mode: str | None,
+) -> str | None:
+    """``None`` when a router of this kind feeds ``internet_confirmed_at``
+    from a signal that already reaches the backend, else the message saying
+    why not.
+
+    * MikroTik (and every agent-managed vendor): RADIUS accounting from the
+      hotspot login, plus the gate push's read of ``/ip hotspot``.
+    * Aruba Instant On: RADIUS accounting (it is a RADIUS NAS and nothing
+      else).
+    * TP-Link Omada: the Open-API usage sweep reads ``authStatus``; RADIUS
+      portal mode sends accounting. A hotspot-operator (``legacy``)
+      integration in external-portal mode has neither -- the authorize call
+      answering ``errorCode 0`` is the request, not a reading.
+    """
+    if vendor != _OMADA_VENDOR:
+        return None
+    if integration_auth_mode == ControllerAuthMode.OPENAPI.value:
+        return None
+    if integration_portal_mode == PortalAuthMode.RADIUS.value:
+        return None
+    return OMADA_LEGACY_MESSAGE
 
 
 class InvalidInsightWindowError(AnalyticsError):
@@ -162,6 +210,10 @@ def _is_valid_tz(name: str) -> bool:
     return True
 
 
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def percent(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
@@ -194,6 +246,28 @@ class OtpFunnelRow:
     requested_identifiers: int
     verified_identifiers: int
     signed_in_identifiers: int
+
+
+@dataclass(frozen=True)
+class PortalImpressionRow:
+    impressions: int
+    devices: int
+    tracked_since: datetime | None
+
+
+@dataclass(frozen=True)
+class InternetConfirmedRow:
+    guests: int
+    otp_guests: int
+    sessions: int
+    tracked_since: datetime | None
+
+
+@dataclass(frozen=True)
+class RouterCoverageRow:
+    vendor: str | None
+    integration_auth_mode: str | None
+    integration_portal_mode: str | None
 
 
 @dataclass(frozen=True)
@@ -261,6 +335,28 @@ class VenueInsightsRepositoryProtocol(Protocol):
         start: datetime,
         end: datetime,
     ) -> list[LoginMethodRow]: ...
+
+    async def get_portal_impressions(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> PortalImpressionRow: ...
+
+    async def get_internet_confirmed(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> InternetConfirmedRow: ...
+
+    async def get_router_coverage(
+        self, *, organization_id: uuid.UUID, location_id: uuid.UUID
+    ) -> list[RouterCoverageRow]: ...
 
     async def get_location_activity(
         self, *, organization_id: uuid.UUID, start: datetime, end: datetime
@@ -476,6 +572,111 @@ class VenueInsightsRepository:
             for method, ok, bad, guests in rows
         ]
 
+    async def get_portal_impressions(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> PortalImpressionRow:
+        scope = (
+            PortalImpression.organization_id == organization_id,
+            PortalImpression.location_id == location_id,
+        )
+        count, devices = (
+            await self.session.execute(
+                select(
+                    func.count(PortalImpression.id),
+                    func.count(distinct(PortalImpression.client_mac_hash)),
+                ).where(
+                    *scope,
+                    PortalImpression.occurred_at >= start,
+                    PortalImpression.occurred_at < end,
+                )
+            )
+        ).one()
+        since = (
+            await self.session.execute(
+                select(func.min(PortalImpression.occurred_at)).where(*scope)
+            )
+        ).scalar_one_or_none()
+        return PortalImpressionRow(
+            impressions=int(count or 0), devices=int(devices or 0), tracked_since=since
+        )
+
+    async def get_internet_confirmed(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> InternetConfirmedRow:
+        scope = (
+            GuestSession.organization_id == organization_id,
+            GuestSession.location_id == location_id,
+            GuestSession.is_deleted.is_(False),
+            GuestSession.internet_confirmed_at.is_not(None),
+        )
+        is_otp = GuestSession.auth_method.in_(OTP_AUTH_METHODS)
+        guests, otp_guests, sessions = (
+            await self.session.execute(
+                select(
+                    func.count(distinct(GuestSession.guest_id)),
+                    func.count(distinct(GuestSession.guest_id)).filter(is_otp),
+                    func.count(GuestSession.id),
+                ).where(
+                    *scope,
+                    GuestSession.internet_confirmed_at >= start,
+                    GuestSession.internet_confirmed_at < end,
+                )
+            )
+        ).one()
+        since = (
+            await self.session.execute(
+                select(func.min(GuestSession.internet_confirmed_at)).where(*scope)
+            )
+        ).scalar_one_or_none()
+        return InternetConfirmedRow(
+            guests=int(guests or 0),
+            otp_guests=int(otp_guests or 0),
+            sessions=int(sessions or 0),
+            tracked_since=since,
+        )
+
+    async def get_router_coverage(
+        self, *, organization_id: uuid.UUID, location_id: uuid.UUID
+    ) -> list[RouterCoverageRow]:
+        statement = (
+            select(
+                Router.vendor,
+                NetworkIntegration.auth_mode,
+                NetworkIntegration.portal_mode,
+            )
+            .outerjoin(
+                NetworkIntegration,
+                and_(
+                    NetworkIntegration.router_id == Router.id,
+                    NetworkIntegration.organization_id == organization_id,
+                    NetworkIntegration.is_deleted.is_(False),
+                ),
+            )
+            .where(
+                Router.organization_id == organization_id,
+                Router.location_id == location_id,
+                Router.is_deleted.is_(False),
+                Router.status != RouterStatus.DECOMMISSIONED.value,
+            )
+        )
+        rows = (await self.session.execute(statement)).all()
+        return [
+            RouterCoverageRow(
+                vendor=vendor, integration_auth_mode=auth, integration_portal_mode=mode
+            )
+            for vendor, auth, mode in rows
+        ]
+
     async def get_location_activity(
         self, *, organization_id: uuid.UUID, start: datetime, end: datetime
     ) -> list[LocationActivityRow]:
@@ -646,6 +847,18 @@ class VenueInsightsService:
             start=start,
             end=end,
         )
+        impressions = await self.repository.get_portal_impressions(
+            organization_id=organization_id,
+            location_id=location_id,
+            start=start,
+            end=end,
+        )
+        internet_confirmed = await self._internet_confirmed_stage(
+            organization_id=organization_id,
+            location_id=location_id,
+            start=start,
+            end=end,
+        )
         return LoginFunnelResponse(
             location_id=location_id,
             window_start=start.isoformat(),
@@ -654,10 +867,12 @@ class VenueInsightsService:
             otp_requested_guests=otp.requested_identifiers,
             otp_verified_guests=otp.verified_identifiers,
             otp_signed_in_guests=otp.signed_in_identifiers,
-            portal_opened=FunnelStageUnavailable(message=PORTAL_OPENED_MESSAGE),
-            internet_confirmed=FunnelStageUnavailable(
-                message=INTERNET_CONFIRMED_MESSAGE
+            portal_opened=PortalOpenedStage(
+                count=impressions.impressions,
+                devices=impressions.devices,
+                tracked_since=_iso(impressions.tracked_since),
             ),
+            internet_confirmed=internet_confirmed,
             methods=[
                 LoginMethodItem(
                     auth_method=m.auth_method,
@@ -669,6 +884,51 @@ class VenueInsightsService:
                     methods, key=lambda m: (-m.successful, -m.failed, m.auth_method)
                 )
             ],
+        )
+
+    async def _internet_confirmed_stage(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> InternetConfirmedStage | FunnelStageUnavailable:
+        """Unavailable, with the reason, when no router at the venue can
+        report it; otherwise the counts, plus a note when only some can."""
+        coverage = await self.repository.get_router_coverage(
+            organization_id=organization_id, location_id=location_id
+        )
+        if not coverage:
+            return FunnelStageUnavailable(message=NO_ROUTER_MESSAGE)
+        gaps = [
+            gap
+            for gap in (
+                router_confirmation_gap(
+                    r.vendor, r.integration_auth_mode, r.integration_portal_mode
+                )
+                for r in coverage
+            )
+            if gap is not None
+        ]
+        if len(gaps) == len(coverage):
+            return FunnelStageUnavailable(message=gaps[0])
+        row = await self.repository.get_internet_confirmed(
+            organization_id=organization_id,
+            location_id=location_id,
+            start=start,
+            end=end,
+        )
+        return InternetConfirmedStage(
+            count=row.guests,
+            otp_guests=row.otp_guests,
+            sessions=row.sessions,
+            tracked_since=_iso(row.tracked_since),
+            note=(
+                PARTIAL_COVERAGE_NOTE.format(missing=len(gaps), total=len(coverage))
+                if gaps
+                else None
+            ),
         )
 
     async def get_location_comparison(
@@ -735,5 +995,6 @@ __all__ = [
     "VenueInsightsService",
     "percent",
     "resolve_timezone",
+    "router_confirmation_gap",
     "resolve_window",
 ]
