@@ -1077,5 +1077,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(fiber_router)
 
+    # ONBOARD-1: one-page "Add subscriber" (/isp/onboarding), composing the
+    # JAZE lanes above in one transaction.
+    from .onboarding_router import onboarding_router
+
+    isp_partner_router.include_router(onboarding_router)
+
 
 _include_lanes()
