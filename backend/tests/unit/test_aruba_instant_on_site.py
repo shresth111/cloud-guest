@@ -446,6 +446,59 @@ class TestIdentity:
         assert old.serial_number == _AP21_SERIAL
         assert len(repo.routers) == 1
 
+    async def test_live_row_at_a_deleted_location_is_released(self) -> None:
+        """Prod 2026-11-01: the AP21 test location was deleted, its Instant On
+        row stayed live, and adding the same AP at a new venue said "A router
+        with serial number 'VNV5M1K1M6' already exists"."""
+        service, _repo, locations, _orgs, audit, org, old_location = _setup()
+        ident = {"serial_number": _AP21_SERIAL, "mac_address": _AP21_MAC}
+        orphan, _s, _m = await _create(service, org, old_location, **ident)
+        old_location.is_deleted = True
+        new_location = locations.add(organization_id=org.id)
+
+        fresh, _s, _m = await _create(service, org, new_location, **ident)
+
+        assert fresh.serial_number == _AP21_SERIAL
+        assert fresh.mac_address == _AP21_MAC
+        assert orphan.is_deleted is True
+        assert orphan.status == RouterStatus.DECOMMISSIONED.value
+        assert orphan.serial_number.startswith(NAS_ONLY_SYNTHETIC_SERIAL_PREFIX)
+        assert orphan.mac_address != _AP21_MAC
+        decommissioned = [
+            e
+            for e in audit.entries
+            if e["action"] == AuditAction.ROUTER_DECOMMISSIONED.value
+        ]
+        assert decommissioned and decommissioned[0]["entity_id"] == orphan.id
+        metadata = decommissioned[0]["event_metadata"]
+        assert metadata["reason"] == "orphaned_by_deleted_location"
+
+    async def test_live_row_at_a_live_location_is_still_a_conflict(self) -> None:
+        service, _repo, locations, _orgs, _audit, org, location = _setup()
+        holder, _s, _m = await _create(
+            service, org, location, serial_number=_AP21_SERIAL
+        )
+        other = locations.add(organization_id=org.id)
+        with pytest.raises(DuplicateSerialNumberError):
+            await _create(service, org, other, serial_number=_AP21_SERIAL)
+        assert holder.is_deleted is False
+        assert holder.serial_number == _AP21_SERIAL
+
+    async def test_live_mikrotik_at_a_deleted_location_is_not_touched(self) -> None:
+        service, repo, locations, _orgs, _audit, org, location = _setup()
+        gone = locations.add(organization_id=org.id)
+        mikrotik = await make_router(
+            repo,
+            location_id=gone.id,
+            organization_id=org.id,
+            serial_number=_AP21_SERIAL,
+        )
+        gone.is_deleted = True
+        with pytest.raises(DuplicateSerialNumberError):
+            await _create(service, org, location, serial_number=_AP21_SERIAL)
+        assert mikrotik.is_deleted is False
+        assert mikrotik.serial_number == _AP21_SERIAL
+
 
 # ---------------------------------------------------------------------------
 # Request schema
