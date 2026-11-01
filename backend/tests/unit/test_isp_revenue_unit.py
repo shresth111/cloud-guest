@@ -14,24 +14,34 @@ NOW = datetime(2026, 11, 15, 6, 0, tzinfo=UTC)
 TZ = "Asia/Kolkata"
 
 
-def test_states_follow_display_state_and_the_churn_window() -> None:
+def test_states_are_the_overview_buckets() -> None:
+    """ACTIVE-ALIGN: the hub maps DASH-1 buckets, it never re-derives them."""
+    from app.domains.isp_partner import dashboard_logic as dash
+
     w = timedelta(days=60)
-    assert (
-        logic.state_of("active", valid_until=None, now=NOW, churn_after=w) == "active"
+    for b in ("active", "pending", "expired", "churned"):
+        assert logic.state_of(b) == b
+    for b in ("suspended", "frozen", "blocked", "other"):
+        assert logic.state_of(b) == "other"
+    assert set(dash.BUCKETS) >= {"active", "pending", "expired", "churned"}
+    # KYC outstanding: the Overview says pending, so does the hub
+    b = dash.bucket_of(
+        "active", valid_until=None, now=NOW, churn_after=w, kyc_pending=True
     )
-    assert logic.state_of("grace", valid_until=NOW, now=NOW, churn_after=w) == "active"
-    ten = NOW - timedelta(days=10)
-    assert (
-        logic.state_of("expired", valid_until=ten, now=NOW, churn_after=w) == "expired"
-    )
+    assert logic.state_of(b) == "pending"
+    b = dash.bucket_of("scheduled", valid_until=None, now=NOW, churn_after=w)
+    assert logic.state_of(b) == "pending"
     old = NOW - timedelta(days=61)
-    assert (
-        logic.state_of("expired", valid_until=old, now=NOW, churn_after=w) == "churned"
-    )
-    for s in ("blocked", "permanently_blocked", "frozen", "suspended", "disabled"):
-        assert logic.state_of(s, valid_until=old, now=NOW, churn_after=w) == "other"
+    b = dash.bucket_of("expired", valid_until=old, now=NOW, churn_after=w)
+    assert logic.state_of(b) == "churned"
     assert logic.churned_at("churned", old, w) == old + w
-    assert logic.churned_at("expired", ten, w) is None
+    assert logic.churned_at("expired", old, w) is None
+    import inspect
+
+    from app.domains.isp_partner import revenue_service
+
+    src = inspect.getsource(revenue_service)
+    assert "dash_logic.bucket_of(" in src and "kyc_pending_ids(" in src
 
 
 def test_mrr_is_taxable_and_scaled_to_30_days() -> None:

@@ -2,17 +2,17 @@
 churn-risk list apply lives here, so the definitions in ``DEFINITIONS`` and
 the code cannot drift apart.
 
-Subscriber states come from JAZE-1 ``display_state`` (the single source of
-truth, ``IspSubscriber360Service.display_state``):
+Subscriber states are the Overview's (DASH-1 ``dashboard_logic.bucket_of``
+over JAZE-1 ``display_state``, plus JAZE-3 KYC and churn window); this module
+never re-derives them:
 
-* **active**: display state ``active`` or ``grace``. These are the paying
-  subscribers. MRR and ARPU are taken over them.
-* **churned**: display state ``expired`` and expired longer ago than the
-  ISP's ``churn_after_days`` (JAZE-3 compliance setting, default 60), the same
-  rule as DASH-1's "churned" tile. The moment of churn is
-  ``valid_until + churn_after_days``.
-* **expired**: display state ``expired``, inside that window (not churned yet).
-* **other**: any other state (blocked, frozen, suspended, scheduled, disabled).
+* **active**: DASH-1 bucket ``active`` (active or grace, KYC + installation
+  done). These are the paying subscribers. MRR and ARPU are taken over them.
+* **pending**: DASH-1 bucket ``pending`` (activation scheduled, or KYC /
+  installation outstanding). Not in MRR.
+* **churned** / **expired**: DASH-1 buckets ``churned`` / ``expired``. The
+  moment of churn is ``valid_until + churn_after_days``.
+* **other**: DASH-1 buckets suspended, frozen, blocked, other.
 
 Money is integer paise. MRR and billed revenue are GST-exclusive (taxable
 value); dues and collections are what the subscriber owes / paid (GST
@@ -31,7 +31,7 @@ from .gst import compute_line
 #: One month for MRR normalisation (package validity is counted in days).
 MONTH_DAYS = 30
 
-STATES: tuple[str, ...] = ("active", "expired", "churned", "other")
+STATES: tuple[str, ...] = ("active", "pending", "expired", "churned", "other")
 
 #: Dues ageing by days past the invoice's due date. ``not_due`` holds open
 #: invoices whose due date has not come yet, so the five buckets add up to
@@ -41,6 +41,7 @@ AGEING: tuple[str, ...] = ("not_due", "d0_30", "d31_60", "d61_90", "d90_plus")
 #: Drill-down keys a KPI tile opens (``GET /isp/revenue/list?metric=``).
 SUBSCRIBER_METRICS: tuple[str, ...] = (
     "active",
+    "pending",
     "expired",
     "churned",
     "other",
@@ -90,8 +91,8 @@ RULES = RiskRules()
 
 DEFINITIONS: dict[str, str] = {
     "active": (
-        "Subscribers whose JAZE-1 state is active or grace (service on and paid "
-        "up). MRR and ARPU are taken over them."
+        "The Overview's Active: JAZE-1 state active or grace with KYC and "
+        "installation done. MRR and ARPU are taken over them."
     ),
     "expired": (
         "State expired, but for no longer than the churn window (Compliance "
@@ -101,7 +102,11 @@ DEFINITIONS: dict[str, str] = {
         "State expired for longer than the churn window. Churned on "
         "valid-until + churn window."
     ),
-    "other": "Blocked, frozen, suspended, scheduled or switched off.",
+    "pending": (
+        "The Overview's Pending: activation scheduled for later, or KYC / "
+        "installation not done yet. Not in MRR."
+    ),
+    "other": "Blocked, frozen, suspended or switched off.",
     "mrr": (
         "Monthly recurring revenue: for every active subscriber, the price they "
         "renew at (the 360 override price, else the package price) without GST, "
@@ -222,20 +227,12 @@ def local_date(dt: datetime, tz: str) -> date:
 # --------------------------------------------------------------------------
 
 
-def state_of(
-    display_state: str,
-    *,
-    valid_until: datetime | None,
-    now: datetime,
-    churn_after: timedelta,
-) -> str:
-    if display_state in ("active", "grace"):
-        return "active"
-    if display_state == "expired":
-        if valid_until is not None and now - valid_until > churn_after:
-            return "churned"
-        return "expired"
-    return "other"
+def state_of(bucket: str) -> str:
+    """Revenue state of a DASH-1 bucket (``dashboard_logic.bucket_of``, the
+    single rule for "active"; the Overview and the hub never disagree)."""
+    if bucket in ("active", "pending", "expired", "churned"):
+        return bucket
+    return "other"  # suspended, frozen, blocked, other
 
 
 def churned_at(

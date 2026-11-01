@@ -22,7 +22,9 @@ from typing import Any
 
 from sqlalchemy import func, or_, select
 
+from . import dashboard_logic as dash_logic
 from . import revenue_logic as logic
+from .dashboard_service import kyc_pending_ids
 from .dependencies import IspContext
 from .exceptions import IspBadRequestError, IspZoneNotFoundError
 
@@ -152,6 +154,7 @@ class IspRevenueService:
             sorted({s.customer_organization_id for s, _p, _k in found}),
         )
         now, churn_after = b["now"], b["churn_after"]
+        kyc_pending = await kyc_pending_ids(self.session, [s.id for s, _p, _k in found])
         clock = SimpleNamespace(now=lambda: now)
         rows = []
         for s, p, pkg in found:
@@ -161,9 +164,14 @@ class IspRevenueService:
             display = IspSubscriber360Service.display_state(
                 clock, s, p, customer_suspended=s.customer_organization_id in suspended
             )
-            state = logic.state_of(
-                display, valid_until=s.valid_until, now=now, churn_after=churn_after
+            bucket = dash_logic.bucket_of(
+                display,
+                valid_until=s.valid_until,
+                now=now,
+                churn_after=churn_after,
+                kyc_pending=s.id in kyc_pending,
             )
+            state = logic.state_of(bucket)
             price = None
             if pkg is not None:
                 price = (
@@ -468,6 +476,7 @@ class IspRevenueService:
                 "mrr_paise": mrr,
                 "arpu_paise": mrr // active if active else None,
                 "active": active,
+                "pending": counts["pending"],
                 "expired": counts["expired"],
                 "churned": counts["churned"],
                 "other": counts["other"],
