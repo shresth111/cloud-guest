@@ -438,6 +438,7 @@ class IspReferralsService:
                 inv.id,
                 amount_paise=amount,
                 reason=f"Referral credit: {label(b) if b else 'new subscriber'}",
+                settles=True,
             )
             r.applied_invoice_id, r.credit_note_id = inv.id, note.id
             r.applied_paise, r.applied_at = amount, self.now()

@@ -18,6 +18,8 @@ from typing import Any
 
 from sqlalchemy import and_, func, select
 
+from app.core.logging import get_logger
+
 from .billing_models import IspInvoice, IspPayment, IspPaymentAllocation, IspZone
 from .billing_service import IspBillingService, add_months
 from .dependencies import IspContext
@@ -33,6 +35,8 @@ from .finance_models import (
     IspZoneProfile,
 )
 from .gst import compute_line, fiscal_year, fy_start, gstin_valid
+
+logger = get_logger(__name__)
 
 PAN_RE = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
 IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
@@ -639,55 +643,68 @@ class IspFinanceService:
         issued = 0
         settings = await self.billing.settings(isp)
         for lease in leases:
-            start = (
-                lease.billed_through + timedelta(days=1)
-                if lease.billed_through
-                else lease.active_since
-            )
-            end_cap = lease.active_until or today
-            guard = 0
-            while start <= min(today, end_cap) and guard < 24:
-                guard += 1
-                period_end = add_months(start, 1) - timedelta(days=1)
-                if lease.active_until and period_end > lease.active_until:
-                    period_end = lease.active_until
-                line = {
-                    "description": f"Static IP {lease.ip_address}",
-                    "sac_code": settings.sac_code,
-                    "amount_paise": lease.monthly_amount_paise,
-                    "price_includes_gst": lease.price_includes_gst,
-                    "period_from": start,
-                    "period_to": period_end,
-                }
-                key = f"sip:{lease.id}:{start.isoformat()}"
-                if lease.subscriber_id:
-                    sub = await self.billing.subscriber_in_scope(
-                        isp, lease.subscriber_id
+            # BE-REVIEW R4: one SAVEPOINT per lease. A lease that cannot be
+            # billed (archived customer, subscriber out of reach, bad GSTIN)
+            # used to roll back every other lease of the ISP, every day.
+            n, lease_id = 0, lease.id
+            try:
+                async with self.session.begin_nested():
+                    start = (
+                        lease.billed_through + timedelta(days=1)
+                        if lease.billed_through
+                        else lease.active_since
                     )
-                    await self.billing.issue_subscriber_invoice(
-                        isp,
-                        sub,
-                        lines=[line],
-                        invoice_kind="cycle",
-                        period_start=start,
-                        period_end=period_end,
-                        description=line["description"],
-                        source_key=key,
-                    )
-                else:
-                    await self.billing.issue_invoice(
-                        isp,
-                        lease.customer_organization_id,
-                        lines=[line],
-                        invoice_kind="cycle",
-                        period_start=start,
-                        period_end=period_end,
-                        description=line["description"],
-                        source_key=key,
-                    )
-                issued += 1
-                lease.billed_through = period_end
-                start = period_end + timedelta(days=1)
+                    end_cap = lease.active_until or today
+                    guard = 0
+                    while start <= min(today, end_cap) and guard < 24:
+                        guard += 1
+                        period_end = add_months(start, 1) - timedelta(days=1)
+                        if lease.active_until and period_end > lease.active_until:
+                            period_end = lease.active_until
+                        line = {
+                            "description": f"Static IP {lease.ip_address}",
+                            "sac_code": settings.sac_code,
+                            "amount_paise": lease.monthly_amount_paise,
+                            "price_includes_gst": lease.price_includes_gst,
+                            "period_from": start,
+                            "period_to": period_end,
+                        }
+                        key = f"sip:{lease.id}:{start.isoformat()}"
+                        if lease.subscriber_id:
+                            sub = await self.billing.subscriber_in_scope(
+                                isp, lease.subscriber_id
+                            )
+                            await self.billing.issue_subscriber_invoice(
+                                isp,
+                                sub,
+                                lines=[line],
+                                invoice_kind="cycle",
+                                period_start=start,
+                                period_end=period_end,
+                                description=line["description"],
+                                source_key=key,
+                            )
+                        else:
+                            await self.billing.issue_invoice(
+                                isp,
+                                lease.customer_organization_id,
+                                lines=[line],
+                                invoice_kind="cycle",
+                                period_start=start,
+                                period_end=period_end,
+                                description=line["description"],
+                                source_key=key,
+                            )
+                        n += 1
+                        lease.billed_through = period_end
+                        start = period_end + timedelta(days=1)
+                issued += n
+            except Exception:  # noqa: BLE001 -- logged, the rest still bill
+                logger.warning(
+                    "isp_lease_billing_row_failed",
+                    exc_info=True,
+                    extra={"lease": str(lease_id)},
+                )
         await self.session.flush()
         return {"invoices_issued": issued}
 

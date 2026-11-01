@@ -28,6 +28,8 @@ rewritten; it sees the customer narrowing only.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -217,6 +219,27 @@ def clear_scope(session: Any) -> None:
         info.pop(_INFO_KEY, None)
 
 
+@contextmanager
+def unscoped(session: Any) -> Iterator[None]:
+    """BE-REVIEW R3: run a block without the request's zone filter.
+
+    The ``do_orm_execute`` criteria narrow every ORM select of
+    ``isp_subscribers`` / ``isp_invoices`` in a zone-scoped request. That is
+    right for what the caller is SHOWN, and wrong for internal bookkeeping
+    that must see the whole ISP: the coupon subscriber sync (it would miss a
+    subscriber outside the zone, try to create it again and hit the unique
+    index), invoice idempotency lookups and duplicate-identifier checks. The
+    customer confinement on ``IspContext`` is untouched, so this never widens
+    what a confined user can reach."""
+    info = getattr(session, "info", None)
+    saved = info.pop(_INFO_KEY, None) if info is not None else None
+    try:
+        yield
+    finally:
+        if saved is not None:
+            info[_INFO_KEY] = saved
+
+
 def _subscriber_criteria(scope: ZoneScope) -> Any:
     from .plans_models import IspSubscriber
 
@@ -288,5 +311,6 @@ __all__ = [
     "narrow",
     "parent_map",
     "subtree_ids",
+    "unscoped",
     "zone_rows",
 ]
