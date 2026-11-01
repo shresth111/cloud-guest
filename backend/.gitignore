@@ -18,3 +18,4 @@ data/geo/
 # Spamhaus DROP files fetched by scripts/fetch_threat_data.py (never
 # committed: their terms grant no right to redistribute)
 data/threat/
+.venv
