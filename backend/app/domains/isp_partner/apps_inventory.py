@@ -169,6 +169,11 @@ class InventoryService:
 
     async def update_item(self, isp: Any, item_id: uuid.UUID, data: dict) -> dict:
         i = await self._item(isp, item_id)
+        # P3-SWEEP: an explicit null on a required column used to reach the
+        # flush as a NOT NULL violation (500); refuse it as a 422 instead.
+        for k in ("name", "sku", "category"):
+            if k in data and data[k] is None:
+                raise IspAppsInvalidError(f"The item {k} cannot be empty")
         if "sku" in data:
             other = await self._item_by_sku(isp, data["sku"])
             if other is not None and other.id != i.id:

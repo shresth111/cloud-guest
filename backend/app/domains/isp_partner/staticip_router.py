@@ -120,6 +120,17 @@ async def _rows(
             IspStaticIpLease.customer_organization_id.in_(children),
         )
     )
+    # P3-SWEEP: in a zone-scoped request a lease follows its subscriber's own
+    # zone (else the customer's zone), not just the customer narrowing. The
+    # outer join above cannot do it: ZONE-1's loader criterion lands in the
+    # join's ON clause and only blanks the subscriber.
+    from .zones_scope import party_zone_clause
+
+    zone_clause = party_zone_clause(
+        db, IspStaticIpLease.subscriber_id, IspStaticIpLease.customer_organization_id
+    )
+    if zone_clause is not None:
+        q = q.where(zone_clause)
     if status_:
         q = q.where(IspStaticIpLease.status == status_)
     if subscriber_id is not None:

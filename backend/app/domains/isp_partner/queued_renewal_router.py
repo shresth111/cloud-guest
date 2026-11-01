@@ -65,10 +65,28 @@ async def list_pending(
     request: Request,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
+    status: str = Query(default="pending", pattern="^(pending|active|cancelled|all)$"),
+    q: str | None = Query(default=None, max_length=100),
+    package_id: uuid.UUID | None = None,
+    starts_within_days: int | None = Query(default=None, ge=1, le=366),
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspQueuedRenewalService = Depends(get_queued_service),
 ) -> dict:
-    return ok(request, await svc.list_pending(isp, page, page_size), "Queued renewals")
+    """ISP-wide queued renewals (P3-SWEEP: filters + subscriber names; the
+    default is still pending only). Cancel stays the per-subscriber route."""
+    return ok(
+        request,
+        await svc.list_pending(
+            isp,
+            page,
+            page_size,
+            status=status,
+            q=q,
+            package_id=package_id,
+            starts_within_days=starts_within_days,
+        ),
+        "Queued renewals",
+    )
 
 
 @queued_renewal_router.get(

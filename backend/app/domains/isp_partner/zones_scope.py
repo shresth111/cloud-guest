@@ -268,6 +268,70 @@ def _invoice_criteria(scope: ZoneScope) -> Any:
     )
 
 
+def subscriber_zone_clause(session: Any, subscriber_col: Any) -> Any:
+    """P3-SWEEP: the ZONE-1 subscriber rule for a table keyed by subscriber
+    (collections, incidents, referrals, queued renewals, static IPs, revenue).
+
+    ``None`` when the request has no zone scope (nothing to add). Otherwise a
+    criterion "the row's subscriber is in the zone": the subscriber's own
+    ``zone_id`` is in the subtree, or it has none and its customer's profile
+    zone is. It is ANDed onto a query that is already confined by customer,
+    so it can only narrow. A NULL subscriber column never matches it; callers
+    with customer-level rows (no subscriber) decide for themselves."""
+    scope = current_scope(session)
+    if scope is None:
+        return None
+    from .plans_models import IspSubscriber
+
+    return subscriber_col.in_(
+        select(IspSubscriber.id).where(_subscriber_criteria(scope))
+    )
+
+
+def party_zone_clause(session: Any, subscriber_col: Any, customer_col: Any) -> Any:
+    """P3-SWEEP: the ZONE-1 rule for a row that names a subscriber OR only a
+    customer (collection promises, static-IP leases). A subscriber row uses
+    ``subscriber_zone_clause``; a customer-level row (no subscriber) falls
+    back to its customer's profile zone, exactly like a subscriber without a
+    zone. ``None`` when there is no zone scope. Only narrows."""
+    scope = current_scope(session)
+    if scope is None:
+        return None
+    return or_(
+        and_(
+            subscriber_col.is_not(None),
+            subscriber_zone_clause(session, subscriber_col),
+        ),
+        and_(
+            subscriber_col.is_(None),
+            customer_col.in_(scope.profile_customer_ids or {NO_MATCH}),
+        ),
+    )
+
+
+async def zone_visible_subscribers(session: Any, ids: Any) -> set[uuid.UUID] | None:
+    """P3-SWEEP: which of ``ids`` pass the ZONE-1 subscriber rule in this
+    request. ``None`` = no zone scope (every id passes). For services that
+    build their rows in Python after a customer-level query."""
+    scope = current_scope(session)
+    if scope is None:
+        return None
+    wanted = {i for i in ids if i is not None}
+    if not wanted:
+        return set()
+    from .plans_models import IspSubscriber
+
+    return set(
+        (
+            await session.execute(
+                select(IspSubscriber.id).where(
+                    IspSubscriber.id.in_(wanted), _subscriber_criteria(scope)
+                )
+            )
+        ).scalars()
+    )
+
+
 @event.listens_for(Session, "do_orm_execute")
 def _zone_criteria(state: Any) -> None:
     scope = state.session.info.get(_INFO_KEY)
@@ -310,7 +374,10 @@ __all__ = [
     "lock_tree",
     "narrow",
     "parent_map",
+    "party_zone_clause",
+    "subscriber_zone_clause",
     "subtree_ids",
     "unscoped",
+    "zone_visible_subscribers",
     "zone_rows",
 ]

@@ -53,6 +53,10 @@ def label(s: Any) -> str:
     return name or s.display_name or s.identifier
 
 
+#: statuses counted in the list summary (P3-SWEEP: SQL GROUP BY)
+_SUMMARY_STATUSES = ("pending", "earned", "applied", "rejected", "cancelled")
+
+
 class IspReferralsService:
     def __init__(self, *, session: Any, audit: Any = None, clock: Any = None) -> None:
         self.session = session
@@ -231,7 +235,19 @@ class IspReferralsService:
         if r.is_deleted or r.isp_organization_id != isp.isp_org_id:
             return False
         ids = set(await isp.child_ids())
-        return r.referrer_customer_id in ids and r.referred_customer_id in ids
+        if not (r.referrer_customer_id in ids and r.referred_customer_id in ids):
+            return False
+        # P3-SWEEP: in a zone-scoped request both subscribers must also pass
+        # the ZONE-1 subscriber rule (own zone, else the customer's zone), the
+        # same "both sides" rule as the customer check above. Only narrows.
+        from .zones_scope import zone_visible_subscribers
+
+        ok = await zone_visible_subscribers(
+            self.session, [r.referrer_subscriber_id, r.referred_subscriber_id]
+        )
+        return ok is None or (
+            r.referrer_subscriber_id in ok and r.referred_subscriber_id in ok
+        )
 
     async def referral(self, isp: Any, referral_id: uuid.UUID) -> IspReferral:
         r = await self.session.get(IspReferral, referral_id)
@@ -313,6 +329,8 @@ class IspReferralsService:
             await self.billing.subscriber_in_scope(isp, subscriber_id)  # 404
         ids = await isp.child_ids()
         rows: list = []
+        counts: dict[str, int] = {}
+        credited_total = 0
         if ids:
             q = select(IspReferral).where(
                 IspReferral.isp_organization_id == isp.isp_org_id,
@@ -320,6 +338,16 @@ class IspReferralsService:
                 IspReferral.referrer_customer_id.in_(ids),
                 IspReferral.referred_customer_id.in_(ids),
             )
+            # P3-SWEEP: ZONE-1 subscriber rule on both sides (see _visible).
+            from .zones_scope import subscriber_zone_clause
+
+            for col in (
+                IspReferral.referrer_subscriber_id,
+                IspReferral.referred_subscriber_id,
+            ):
+                zone = subscriber_zone_clause(self.session, col)
+                if zone is not None:
+                    q = q.where(zone)
             if status:
                 q = q.where(IspReferral.status == status)
             if subscriber_id:
@@ -329,22 +357,38 @@ class IspReferralsService:
                         IspReferral.referred_subscriber_id == subscriber_id,
                     )
                 )
+            # P3-SWEEP (GAP #17): page and summarise in SQL instead of loading
+            # every referral in scope. Same rows, order and summary as before.
             rows = list(
-                (await self.session.execute(q.order_by(IspReferral.created_at.desc())))
+                (
+                    await self.session.execute(
+                        q.order_by(IspReferral.created_at.desc(), IspReferral.id)
+                        .offset((page - 1) * page_size)
+                        .limit(page_size)
+                    )
+                )
                 .scalars()
                 .all()
             )
-        start = (page - 1) * page_size
+            sub = q.subquery()
+            for st, n, credited in (
+                await self.session.execute(
+                    select(
+                        sub.c.status,
+                        func.count(),
+                        func.coalesce(func.sum(sub.c.applied_paise), 0),
+                    ).group_by(sub.c.status)
+                )
+            ).all():
+                counts[st] = int(n)
+                credited_total += int(credited)
         return {
-            "items": await self.views(isp, rows[start : start + page_size]),
-            "total": len(rows),
+            "items": await self.views(isp, rows),
+            "total": sum(counts.values()),
             "page": page,
             "page_size": page_size,
-            "summary": {
-                s: sum(1 for r in rows if r.status == s)
-                for s in ("pending", "earned", "applied", "rejected", "cancelled")
-            }
-            | {"credited_paise": sum(r.applied_paise or 0 for r in rows)},
+            "summary": {s: counts.get(s, 0) for s in _SUMMARY_STATUSES}
+            | {"credited_paise": credited_total},
         }
 
     async def cancel(self, isp: Any, referral_id: uuid.UUID, reason: str) -> dict:

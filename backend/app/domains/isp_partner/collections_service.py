@@ -193,6 +193,19 @@ class IspCollectionsService:
             IspCollectionPromise.customer_organization_id.in_(customer_ids),
             IspCollectionPromise.is_deleted.is_(False),
         )
+        # P3-SWEEP: in a zone-scoped request a promise follows its
+        # subscriber's own zone (customer-level promises: the customer's
+        # zone), like ZONE-1 does for invoices. Only narrows; no zone scope
+        # (incl. the daily Celery pass) = unchanged.
+        from .zones_scope import party_zone_clause
+
+        zone = party_zone_clause(
+            self.session,
+            IspCollectionPromise.subscriber_id,
+            IspCollectionPromise.customer_organization_id,
+        )
+        if zone is not None:
+            q = q.where(zone)
         if statuses:
             q = q.where(IspCollectionPromise.status.in_(statuses))
         return list((await self.session.execute(q)).scalars().all())
@@ -1057,8 +1070,13 @@ class IspCollectionsService:
         promises = await self._party_promises(isp, party)
         open_ = [p for p in promises if p.status == L.PROMISE_OPEN]
         overdue = await self._overdue_for_party(isp, party)
+        # P3-SWEEP (Subscriber 360 card): everything still owed, due or not.
+        open_paise = sum(
+            balance_of(i) for i in await self._open_invoices(isp, [party[0]], party)
+        )
         return {
             "items": out[:limit],
+            "open_paise": open_paise,
             "promises": await self.promise_views(
                 isp, sorted(promises, key=lambda p: p.created_at, reverse=True)[:20]
             ),
