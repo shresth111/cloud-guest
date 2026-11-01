@@ -155,8 +155,14 @@ def _build_router_lookup(session: AsyncSession):
         organization_service,
         location_code_counter=LocationCodeCounterRepository(session),
     )
+    # By keyword: the constructor is (repository, location_lookup,
+    # organization_lookup). The staging original passed these two the other
+    # way round -- harmless for `get_router`, which uses neither, but caught
+    # by test_task_service_wiring and wrong for anything else.
     return RouterService(
-        RouterRepository(session), organization_service, location_service
+        RouterRepository(session),
+        location_lookup=location_service,
+        organization_lookup=organization_service,
     )
 
 
