@@ -45,6 +45,7 @@ from .constants import (
     ISP_ZONES_READ,
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
+from .exceptions import IspBadRequestError
 from .finance_config import (
     RequireFinanceExtras,
     RequireTelegramAlerts,
@@ -668,13 +669,27 @@ async def _email_via_own(
     return failed
 
 
+THERMAL_WIDTHS = (58, 80)
+
+
+def thermal_width(
+    width: int = Query(default=80, description="Paper width in mm: 58 or 80"),
+) -> int:
+    """``?width=58`` arrives as the string "58"; a ``Literal[58, 80]`` query
+    parameter is not coerced from it (422 for every width), so the value is
+    read as an int and checked here."""
+    if width not in THERMAL_WIDTHS:
+        raise IspBadRequestError("Slip width is 58 or 80 mm", field="width")
+    return width
+
+
 @finance_router.get(
     "/finance/invoices/{invoice_id}/thermal.pdf",
     dependencies=_EXTRAS + isp_guards(ISP_INVOICES_READ),
 )  # noqa: E501
 async def thermal_invoice(
     invoice_id: uuid.UUID,
-    width: Literal[58, 80] = 80,
+    width: int = Depends(thermal_width),
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspFinanceService = Depends(get_finance_service),
 ) -> Response:  # noqa: E501
@@ -698,7 +713,7 @@ async def thermal_invoice(
 )  # noqa: E501
 async def thermal_receipt(
     payment_id: uuid.UUID,
-    width: Literal[58, 80] = 80,
+    width: int = Depends(thermal_width),
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspFinanceService = Depends(get_finance_service),
 ) -> Response:  # noqa: E501

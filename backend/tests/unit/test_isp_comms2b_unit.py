@@ -118,6 +118,12 @@ def test_parameter_rows_name_each_position() -> None:
 
 def test_new_triggers_are_accepted_and_silent_when_unmapped() -> None:
     assert {"overdue", "welcome"} <= set(automation.TRIGGERS)
-    assert set(automation.OPT_IN_TRIGGERS) == {"overdue", "welcome"}
+    # INCIDENTS-1 adds outage/restored (sent only from an incident broadcast).
+    assert set(automation.OPT_IN_TRIGGERS) == {
+        "overdue",
+        "welcome",
+        "outage",
+        "restored",
+    }
     for event in ("overdue", "welcome"):
         assert EVENTS[event]["trigger"] == event

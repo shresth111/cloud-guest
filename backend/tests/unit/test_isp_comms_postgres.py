@@ -420,7 +420,7 @@ async def test_comms_hub_end_to_end() -> None:  # noqa: PLR0915
 
             # template library -----------------------------------------------------
             t = await call("GET", "/comms/templates")
-            assert len(t["items"]) == 12
+            assert len(t["items"]) == 16  # 8 events x 2 channels (+INCIDENTS-1)
             r = await c.put(
                 f"{api}/comms/templates/unpaid_invoice/email",
                 json={

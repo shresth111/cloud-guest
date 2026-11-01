@@ -1161,5 +1161,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(collections_router)
 
+    # INCIDENTS-1: /isp/incidents, behind ISP_INCIDENTS_ENABLED.
+    from .incidents_router import incidents_router
+
+    isp_partner_router.include_router(incidents_router)
+
 
 _include_lanes()

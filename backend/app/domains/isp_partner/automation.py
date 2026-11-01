@@ -66,9 +66,20 @@ from .finance_models import (
 
 logger = get_logger(__name__)
 
-TRIGGERS = ("pre_expiry", "unpaid", "receipt", "renewal", "overdue", "welcome")
+TRIGGERS = (
+    "pre_expiry",
+    "unpaid",
+    "receipt",
+    "renewal",
+    "overdue",
+    "welcome",
+    # INCIDENTS-1: sent only from an incident's broadcast, never by a sweep.
+    # {{1}} name, {{2}} area, {{3}} since / back at (local time).
+    "outage",
+    "restored",
+)
 #: COMMS-2b triggers: silent (no "skipped" row) while no template is mapped.
-OPT_IN_TRIGGERS = ("overdue", "welcome")
+OPT_IN_TRIGGERS = ("overdue", "welcome", "outage", "restored")
 PAY_LINK_TTL = timedelta(days=30)
 TELEGRAM_API = "https://api.telegram.org"
 _IST = ZoneInfo("Asia/Kolkata")
