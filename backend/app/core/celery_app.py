@@ -356,6 +356,10 @@ celery_app.conf.update(
         "app.domains.isp_partner.tasks.retry_pending_service_actions": {
             "queue": DEVICE_IO_QUEUE_NAME
         },
+        # ISP Partner JAZE-2 (E7): the enforcement sweep ends sessions over 8728.
+        "app.domains.isp_partner.tasks.run_isp_enforcement_sweep": {
+            "queue": DEVICE_IO_QUEUE_NAME
+        },
         TASK_POLL_SINGLE_ROUTER_HEALTH: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_SYNC_SINGLE_ROUTER_DEVICES: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_RUN_ISP_HEALTH_CHECK_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
@@ -448,6 +452,12 @@ celery_app.conf.update(
         "isp-service-retry": {
             "task": "app.domains.isp_partner.tasks.retry_pending_service_actions",
             "schedule": 120.0,
+        },
+        # ISP Partner JAZE-2: FUP / night boost / access rules, every minute.
+        # No-op unless ISP_PARTNER_ENFORCEMENT_ENABLED is on.
+        "isp-enforcement-sweep": {
+            "task": "app.domains.isp_partner.tasks.run_isp_enforcement_sweep",
+            "schedule": 60.0,
         },
         "isp-billing-daily": {
             "task": "app.domains.isp_partner.tasks.run_isp_billing_daily",

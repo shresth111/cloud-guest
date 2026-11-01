@@ -118,6 +118,9 @@ class IspStaffCustomerScope(BaseModel):
 # already imports (E2), so 1b needs no further registration line.
 from .billing_models import *  # noqa: E402,F403
 from .billing_models import BILLING_TABLES  # noqa: E402,F401
+
+# JAZE-2 (ADDENDUM_05 J3/J8): package policy, usage, MAC/IP bindings.
+from .enforcement_models import *  # noqa: E402,F403
 from .plans_models import *  # noqa: E402,F403
 
 __all__ = ["IspCustomerProfile", "IspPartnerProfile", "IspStaffCustomerScope"]
