@@ -233,6 +233,139 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "that reason). A controller is never reported as broken hardware "
         "from this read."
     ),
+    # -- isp_partner (ISP Partner Dashboard, /isp) ----------------------------
+    "app/domains/isp_partner/service_control.py::IspServiceControl._routers": (
+        "ISP customer suspend/resume (ADDENDUM_01 §A): every router of the "
+        "suspended customer, controller-managed included, on purpose -- a "
+        "suspended customer's internet must stop at every venue. The cut is "
+        "vendor-neutral by construction: it disables the router's NAS rows in "
+        "our DB (RADIUS Access-Reject at the hub for any vendor), and live "
+        "sessions are ended through GuestService.disconnect_session, whose "
+        "terminator already dispatches by vendor (RouterOS 8728 or the "
+        "controller). A router with no NAS row is recorded as skipped."
+    ),
+    "app/domains/isp_partner/service_control.py::IspServiceControl.view": (
+        "Names the routers in a suspend/resume step list for display. The "
+        "`online` flag shows the stored routers.status as-is; no health "
+        "judgement is made and nothing is dispatched from this read."
+    ),
+    "app/domains/isp_partner/repository.py::IspRepository.list_routers": (
+        "The ISP's router inventory page (GET /isp/routers): every router of "
+        "the ISP's customers, controller-managed included, because a router "
+        "missing from the inventory is its own lie. Each row carries its "
+        "`vendor`; `views.cloud_link` answers `unknown` (never `down`) for a "
+        "row that is not agent-managed. Nothing is dispatched from the list; "
+        "every device action goes through a by-id twin that calls the "
+        "original handler, which gates on vendor itself."
+    ),
+    "app/domains/isp_partner/repository.py::IspRepository.routers_for_organizations": (
+        "Counts and per-customer tiles for the ISP overview, customer, "
+        "location and report views. The overview's offline/pending "
+        "attention items skip non-agent-managed rows (`is_agent_managed_row`) "
+        "so a controller is never reported as broken hardware; the remaining "
+        "consumers count `routers.status` as stored, exactly like the "
+        "customer dashboard does. No device work is done from this read."
+    ),
+    "app/domains/isp_partner/platform_repository.py::IspPlatformRepository.counts": (
+        "Master's ISP partner list/detail tiles (GET /platform/isp-partners): "
+        "routers_total and routers_online per ISP, counting `routers.status` "
+        "as stored over the ISP's customers -- the same rows and the same "
+        "rule as the ISP's own overview (`IspRepository.routers_for_"
+        "organizations`), so Master and the ISP never show different numbers. "
+        "Display only: no alert, attention item or device work is derived "
+        "from it."
+    ),
+    "app/domains/isp_partner/logs_repository.py::IspLogsRepository.list_events": (
+        "NetLogs across an ISP's customers: an outer join from "
+        "device_log_events to routers only to label each line with its "
+        "router name. The rows are log lines that already exist; no health "
+        "or online judgement is made, and nothing is dispatched."
+    ),
+    # -- isp_partner round 2 (CI-INTEG 2026-11-01, each call site read) ------
+    "app/domains/isp_partner/automation.py::_device_statuses": (
+        "J14 Telegram router UP/DOWN. Loads every online/offline router of the "
+        "ISP's customers and then skips each row `is_controller_managed_row` "
+        "says is run through a vendor controller: its status is not a "
+        "heartbeat, so an UP/DOWN message for it would call a working venue "
+        "broken. Row-aware on purpose (a mislabelled MikroTik with agent "
+        "evidence still alerts), which the vendor-label SQL gate cannot do; "
+        "per-ISP rosters are small."
+    ),
+    "app/domains/isp_partner/incidents_service.py::IspIncidentsService.health": (
+        "INCIDENTS-1 network-health headline. Loads the ISP's routers and "
+        "counts up/down only over agent-managed rows (row-aware "
+        "`is_controller_managed_row`); controller-managed venues are returned "
+        "as `routers_controller_managed` and kept out of health_percent, so "
+        "an Omada / Aruba venue never reads as down."
+    ),
+    "app/domains/isp_partner/compliance_service.py::IspComplianceService.nat_feed": (
+        "J4 NAT-feed banner, one row per router of the ISP's customers -- every "
+        "router is listed because CERT-In retention is per venue. A "
+        "controller-managed row gets the non-alerting state `not_applicable` "
+        "(our NAT export is a RouterOS feature), never `router_offline` or "
+        "`not_configured`, so it cannot raise the banner."
+    ),
+    "app/domains/isp_partner/netmon_router.py::_routers": (
+        "NETMON-2 all-routers traffic cards: the ISP's whole router list on "
+        "purpose (a venue missing from the page is its own lie). A "
+        "controller-managed row with no traffic series gets the reason "
+        "`controller_managed` instead of not_set_up / offline (see "
+        "`netmon.readability`); nothing is polled or dispatched from here."
+    ),
+    "app/domains/isp_partner/netmon_router.py::_hotspot": (
+        "NETMON-2 live / completed hotspot sessions: an outer join from "
+        "guest_sessions to routers only to label each existing session with "
+        "its router name. Controller venues' guest sessions are real sessions "
+        "and belong in the list; no device state is judged."
+    ),
+    "app/domains/isp_partner/netmon_router.py::_pppoe": (
+        "NETMON-2 PPPoE sessions: outer join to routers for the NAS name of "
+        "sessions our RADIUS recorded. PPPoE only exists on agent-managed "
+        "MikroTiks; the join judges nothing."
+    ),
+    (
+        "app/domains/isp_partner/subscriber360_service.py::"
+        "IspSubscriber360Service._live_view"
+    ): (
+        "Subscriber 360 live bar: router names for the subscriber's existing "
+        "active sessions. Display only; Disconnect goes through "
+        "GuestService.disconnect_session, which gates on vendor itself."
+    ),
+    "app/domains/isp_partner/workbench_router.py::_hotspot_live": (
+        "SUB360-2 workbench live bar: names the router of each active hotspot "
+        "session. A controller venue's session is a real session; the "
+        "disconnect path (GuestService.disconnect_session) gates on vendor."
+    ),
+    "app/domains/isp_partner/workbench_router.py::_pppoe_live": (
+        "SUB360-2 workbench PPPoE sessions: NAS name join for sessions our "
+        "RADIUS recorded (agent-managed MikroTiks only). Display only."
+    ),
+    "app/domains/isp_partner/compliance_service.py::IspComplianceService.routers_of": (
+        "Identity lookups over the ISP's routers: CGNAT lookup matches a "
+        "public IP to its router, LEA trace labels routers by name, and the "
+        "IPDR retention card lists oldest NAT/session row per router. Every "
+        "venue is subject to retention, controller-managed included, so a "
+        "missing row there would hide a real compliance gap. No health "
+        "judgement, nothing dispatched."
+    ),
+    (
+        "app/domains/isp_partner/compliance_service.py::"
+        "IspComplianceService.session_rows"
+    ): (
+        "J12 session dump / IPDR rows: outer join from guest_sessions to "
+        "routers for the NAS name column. Statutory record of sessions that "
+        "happened, every vendor included."
+    ),
+    "app/domains/isp_partner/compliance_service.py::IspComplianceService.trai_pmr": (
+        "TRAI PMR: count of NAS routers registered before the period end. A "
+        "controller-managed venue (Aruba is NAS-only) is a NAS for this "
+        "return, so it is counted; the count says nothing about liveness."
+    ),
+    "app/domains/isp_partner/logs_repository.py::IspLogsRepository.top_routers": (
+        "The NetLogs summary's busiest-routers table: a count of existing "
+        "log lines grouped by router, joined to routers for the name. Same "
+        "shape as device_logs' customer summary; no device state is judged."
+    ),
     # -- traffic_flow (NetFlow/IPFIX) ---------------------------------------
     "app/domains/traffic_flow/service.py::TrafficFlowRepository.exporter_router_map": (
         "Attribution of a received flow window: joins wireguard_peers to "

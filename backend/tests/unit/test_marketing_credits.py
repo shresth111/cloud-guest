@@ -1005,6 +1005,8 @@ def test_the_credit_route_table() -> None:
         (method, r.path)
         for r in _app().routes
         if "credits" in getattr(r, "path", "")
+        # ISP venue twins/views (ADDENDUM_04 F1): ISP guards, not customer routes.
+        and "/isp/venue/" not in getattr(r, "path", "")
         for method in r.methods - {"HEAD", "OPTIONS"}
     )
     expected = sorted(

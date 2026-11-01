@@ -1024,6 +1024,16 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # Inert unless CLOUDGUEST_TRAFFIC_FLOW_ENABLED is true. See
         # app.domains.traffic_flow.tasks.
         "traffic-flow-pull-sweep",
+        # ISP Partner (exception E7): re-kicks suspended customers' live
+        # sessions on routers that were unreachable, and the daily billing
+        # run. Both no-op while ISP_PARTNER_ENABLED is off. See
+        # app.domains.isp_partner.tasks.
+        "isp-service-retry",
+        "isp-billing-daily",
+        # ISP Partner JAZE-2: FUP / night boost / access-rule sweep, every
+        # minute. No-op unless ISP_PARTNER_ENFORCEMENT_ENABLED is on. Added to
+        # the beat schedule on integ without this pin (GAP-SWEEP).
+        "isp-enforcement-sweep",
     }
 
 

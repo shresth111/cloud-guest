@@ -1291,7 +1291,12 @@ class TestAuthorization:
         assert "/platform/traffic-flow/geo" in paths
         # Exactly one other: the customer venue route (TestCustomerGeo).
         assert [
-            p for p in paths if p.endswith("/geo") and not p.startswith("/platform/")
+            p
+            for p in paths
+            if p.endswith("/geo")
+            and not p.startswith("/platform/")
+            # ISP venue twin (ADDENDUM_04 B6): same handler, ISP guards.
+            and not p.startswith("/isp/venue/")
         ] == ["/traffic-flow/locations/{location_id}/geo"]
 
     def test_scope_and_range_are_query_parameters_not_a_body(self) -> None:

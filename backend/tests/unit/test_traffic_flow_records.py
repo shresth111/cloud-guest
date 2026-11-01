@@ -1374,7 +1374,11 @@ class TestRoutes:
 
         paths = {r.path for r in api_v1_router.routes}
         assert {
-            p for p in paths if p.rstrip("/").endswith(("/flows", "/flows/export"))
+            p
+            for p in paths
+            if p.rstrip("/").endswith(("/flows", "/flows/export"))
+            # ISP venue twin (ADDENDUM_04 F2): same handler, ISP guards.
+            and not p.startswith("/isp/venue/")
         } == {
             "/platform/traffic-flow/flows",
             "/platform/traffic-flow/flows/export",

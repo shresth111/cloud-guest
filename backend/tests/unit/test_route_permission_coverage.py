@@ -130,6 +130,36 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Initiates a reset -- must work for a locked-out user."
     ),
     ("POST", "/api/v1/auth/reset-password"): "Completed via a single-use reset token.",
+    ("GET", "/api/v1/isp/public/portal-support"): (
+        "Guest portal footer: the ISP's published support phone/email for a "
+        "location of one of its customers (QA-021). Read-only, no other "
+        "fields, 404 for non-ISP locations, flag-gated, rate limited per IP."
+    ),
+    ("GET", "/api/v1/isp/public/comms/whatsapp/{path_token}"): (
+        "Meta webhook subscribe check (COMMS-2): Meta calls it without a user. "
+        "Guarded by a 256-bit per-ISP path token plus the per-ISP verify token "
+        "(constant-time compare); it only echoes hub.challenge, 403 otherwise; "
+        "behind ISP_COMMS_HUB_ENABLED (default off)."
+    ),
+    ("POST", "/api/v1/isp/public/comms/whatsapp/{path_token}"): (
+        "Meta webhook status callbacks (COMMS-2): no user. Guarded by the "
+        "per-ISP path token AND the X-Hub-Signature-256 HMAC of the raw body "
+        "with the ISP's Meta app secret (403 when missing or wrong); it only "
+        "records delivery receipts for message ids that ISP sent; behind "
+        "ISP_COMMS_HUB_ENABLED (default off)."
+    ),
+    ("GET", "/api/v1/isp/public/pay/{token}"): (
+        "ISP invoice pay page (JAZE-4) -- the guard is the link itself: a "
+        "72-bit random token (secrets.token_urlsafe), 30-day expiry, dead once "
+        "deleted or the ISP is not active; read-only (ISP name, invoice no., "
+        "amounts, UPI/bank, payer first name only), 404 for any bad token, "
+        "behind ISP_WHATSAPP_AUTOMATION_ENABLED (default off), rate limited "
+        "per IP."
+    ),
+    ("POST", "/api/v1/isp/auth/forgot-password"): (
+        "ISP partner console forgot password -- must work for a locked-out "
+        "user; flag-gated, rate limited per IP and per email, one response."
+    ),
     ("POST", "/api/v1/auth/verify-email"): (
         "Completed via a single-use verification token."
     ),
@@ -239,6 +269,16 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ),
     ("POST", "/api/v1/radius/authorize"): "FreeRADIUS -- CurrentNas shared secret.",
     ("POST", "/api/v1/radius/accounting"): "FreeRADIUS -- CurrentNas shared secret.",
+    ("POST", "/api/v1/isp/internal/pppoe/authorize"): (
+        "FreeRADIUS X2 PPPoE (JAZE-6) -- CurrentNas shared secret plus "
+        "RequirePppoeRestCaller: box-only ISP_PPPOE_REST_SECRET header "
+        "(constant-time; empty secret refuses all) and refused when proxied "
+        "(X-Forwarded-For/X-Real-IP); behind ISP_PPPOE_ENABLED (default off)."
+    ),
+    ("POST", "/api/v1/isp/internal/pppoe/accounting"): (
+        "FreeRADIUS X2 PPPoE accounting (JAZE-6) -- same two guards as "
+        "authorize (CurrentNas + RequirePppoeRestCaller) and the same flag."
+    ),
     ("POST", "/api/v1/internal/device-logs/ingest"): (
         "Syslog collector (Vector) -- no platform user exists. Authenticated "
         "by the X-Device-Logs-Secret shared secret (constant-time compare, "
@@ -319,6 +359,13 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/me/data-masking"): (
         "Self-service -- CurrentUser only; flips the caller's own "
         "data-masking preference, gated by the OTP step-up above."
+    ),
+    # -- TR-069 edge auth (ISP partner): nginx auth_request only ---------
+    ("GET", "/api/v1/internal/tr069/acs-auth"): (
+        "nginx auth_request subrequest for CPEs reaching the ACS. A CPE has "
+        "no platform identity; it presents HTTP Basic checked against "
+        "tr069_acs_credentials. The route 404s unless the X-Wyfy-Acs-Gate "
+        "shared secret matches (constant-time) and both feature flags are on."
     ),
     # -- WebFig reverse proxy: an <iframe src> navigation cannot carry a
     # Bearer header, so these cannot sit behind CurrentUser/

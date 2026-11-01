@@ -307,6 +307,25 @@ LOCATION_SCOPED: dict[str, str] = {
 PENDING: dict[str, str] = {}
 
 EXEMPT: dict[str, str] = {
+    "isp_partner": (
+        "ISP partner (/isp). `isp_service_actions.location_id` records which "
+        "venue a suspend step's 'Service paused' portal page belongs to. "
+        "Every route pins its isp_* key to ScopeType.ORGANIZATION on the ISP "
+        "org (held only by the isp-* roles, never at LOCATION scope), the only "
+        "input is an IspScope-resolved customer id, and staff confinement is "
+        "by customer (isp_staff_customer_scopes), not by location. There is "
+        "no location-confined caller to protect against."
+    ),
+    "tr069": (
+        "TR-069 control plane (ISP partner). `tr069_devices.location_id` is an "
+        "optional placement and `tr069_location_settings.location_id` keys a "
+        "per-venue switch. Every route is under /isp/tr069, pins tr069.* to "
+        "ScopeType.ORGANIZATION on the ISP org (keys held only by the isp-* "
+        "roles, never at LOCATION scope), and resolves every location/device "
+        "id through isp_partner.scoping.IspScope, which checks the owning "
+        "customer against the ISP and the caller's customer confinement. "
+        "There is no location-confined caller to protect against."
+    ),
     "ipdr": (
         "IPDR. `ipdr_day_files.location_id` says which venue an archived day "
         "belongs to. Both routes pin `ipdr.read` / `ipdr.export` to "
@@ -566,6 +585,21 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # correct because the caller is a guest acting on their own session, not a
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
+    # ISP partner JAZE-6 (GAP-SWEEP classified): FreeRADIUS -> API only.
+    ("POST", "/api/v1/isp/internal/pppoe/authorize"): (
+        "PPPoE Authorize from the box FreeRADIUS X2 site. No user and no roles: "
+        "the caller is a NAS, authenticated by CurrentNas (NAS shared secret) "
+        "plus the ISP_PPPOE_REST_SECRET header, and refused (404) when the "
+        "request came through nginx. The subscriber is resolved from the "
+        "PPPoE username within the NAS's own ISP; there is no staff "
+        "confinement to derive. 404 while ISP_PPPOE_ENABLED is off."
+    ),
+    ("POST", "/api/v1/isp/internal/pppoe/accounting"): (
+        "PPPoE Accounting from the same FreeRADIUS site, same NAS secret + "
+        "rest-secret header + no-proxy rule as authorize. It only records "
+        "byte/session totals for the NAS's own sessions; no staff caller, so "
+        "no confinement applies."
+    ),
     ("GET", "/api/v1/captive-portal/resolve"): (
         "The guest portal render. Pre-login by definition; the caller holds no "
         "roles, and `resolve_portal_config` resolves by organization+location "

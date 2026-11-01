@@ -1,0 +1,5 @@
+[{"_id":"00259E-HG8245-ABCD","_lastInform":"2026-10-22T05:50:00.000Z","_deviceId":{"_Manufacturer":"Huawei","_OUI":"00259E","_ProductClass":"HG8245","_SerialNumber":"ABCD"},
+"InternetGatewayDevice":{"DeviceInfo":{"Manufacturer":{"_value":"Huawei"},"ModelName":{"_value":"HG8245H"},"SoftwareVersion":{"_value":"V3R017"}},
+ "ManagementServer":{"Username":{"_value":"isp-deadbeef"}},
+ "WANDevice":{"1":{"WANConnectionDevice":{"1":{"WANPPPConnection":{"1":{"ExternalIPAddress":{"_value":"198.51.100.4"},"Username":{"_value":"sub001"},"Password":{"_value":"ppp-leak"}}}}}}},
+ "LANDevice":{"1":{"Hosts":{"HostNumberOfEntries":{"_value":"3"}},"WLANConfiguration":{"1":{"SSID":{"_value":"Home"},"Enable":{"_value":"1"},"TotalAssociations":{"_value":"2"},"KeyPassphrase":{"_value":"wlan-leak"},"PreSharedKey":{"1":{"KeyPassphrase":{"_value":"psk-leak"}}}}}}}}}]

@@ -1,0 +1,6 @@
+# /etc/nginx/wyfy/acs-gate.conf  (root:root, mode 0600; nginx's master reads
+# it as root at load time). NEVER commit the real file.
+#
+# The value must equal TR069_EDGE_SHARED_SECRET in the api's env file.
+# Generate once:  openssl rand -hex 32
+proxy_set_header X-Wyfy-Acs-Gate "REPLACE_WITH_TR069_EDGE_SHARED_SECRET";

@@ -1,0 +1,156 @@
+# GenieACS for the ISP partner TR-069 control plane (TASKS FS-4).
+#
+# STAGING ONLY until the founder signs off (STATUS Q5). Never run this on the
+# prod box (i-0cf9b79511abe6000) without that sign-off.
+#
+# Runs as its OWN compose project ("wyfy-acs"), attached to the box stack's
+# existing network `deploy_default` as an external network. Why not merge it
+# into ~/deploy/docker-compose.yml with a second -f:
+#   * the deploy pipeline (deploy/remote-deploy.sh) runs `docker compose up
+#     -d --no-deps <svc>` in ~/deploy with the box file only. A separate project
+#     means no deploy can ever recreate, stop or "orphan-clean" these containers,
+#     and no ACS command can ever recreate api/postgres by accident;
+#   * the box compose stays byte-for-byte as it is (memory: the box runs its
+#     own compose, not the repo copy).
+# Compose registers each service name as a DNS alias on every network the
+# service joins, so `api` (project "deploy") still resolves `genieacs-nbi`.
+#
+#   cd ~/deploy/acs && docker compose -p wyfy-acs -f docker-compose.acs.yml up -d
+#
+# Ports:
+#   7547 CWMP  -> published on 127.0.0.1 only; nginx :443 is the sole way in.
+#   7557 NBI   -> NOT published. Only containers on deploy_default reach it.
+#   27017 mongo-> NOT published.
+#   7567 FS    -> genieacs-fs is behind the "fs" profile; not started in P1.
+#   3000 UI    -> no UI container in P1. For ad-hoc ops use, see README.
+#
+# Memory (staging box is a t3.medium: 3.8 GiB, ~1 GiB available, no swap on
+# 2026-10-22): limits below sum to 896 MiB; idle use is far lower. Read
+# README "Headroom" before the first `up`.
+
+name: wyfy-acs
+
+x-genieacs-common: &genieacs-common
+  # Built once, by genieacs-cwmp below. Every service sharing a `build:` for
+  # the same tag races on Docker 27+ with the containerd snapshotter
+  # ("image ... already exists"), seen on Ubuntu 24.04 docker.io 2026-10-22.
+  image: wyfy/genieacs:1.2.16
+  restart: unless-stopped
+  depends_on:
+    mongo-acs:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  mongo-acs:
+    image: mongo:7.0
+    # Cap the WiredTiger cache; by default it takes 50% of (RAM - 1 GiB),
+    # which on this box would fight the api for memory.
+    command: ["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - acs-mongo:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    mem_limit: 512m
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # no `ports:` on purpose, and only on the private network: no other
+    # container on the box (api, celery, minio...) can reach this mongod.
+    networks: [acs-internal]
+
+  genieacs-cwmp:
+    <<: *genieacs-common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GENIEACS_VERSION: "1.2.16"
+    command: ["genieacs-cwmp"]
+    environment:
+      GENIEACS_MONGODB_CONNECTION_URL: mongodb://mongo-acs/genieacs
+      GENIEACS_EXT_DIR: /opt/genieacs/ext
+      GENIEACS_CWMP_INTERFACE: 0.0.0.0
+      GENIEACS_CWMP_PORT: "7547"
+      # One worker: the default forks one per CPU, doubling memory for no
+      # gain at Phase-1 device counts.
+      GENIEACS_CWMP_WORKER_PROCESSES: "1"
+      # Trust the RFC 7239 `Forwarded` header nginx sets, but only from the
+      # docker bridge range (nginx on the host reaches the container through
+      # the bridge gateway). Gives GenieACS the CPE's real address and the
+      # https scheme.
+      GENIEACS_FORWARDED_HEADER: 172.16.0.0/12
+      GENIEACS_CWMP_ACCESS_LOG_FILE: /dev/stdout
+      GENIEACS_CWMP_LOG_FILE: /dev/stdout
+    ports:
+      - "127.0.0.1:7547:7547"
+    healthcheck:
+      # GET is answered with 405 by design; any HTTP answer means "listening".
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:7547/',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    mem_limit: 256m
+    networks: [default, acs-internal]
+
+  genieacs-nbi:
+    <<: *genieacs-common
+    command: ["genieacs-nbi"]
+    environment:
+      GENIEACS_MONGODB_CONNECTION_URL: mongodb://mongo-acs/genieacs
+      GENIEACS_EXT_DIR: /opt/genieacs/ext
+      GENIEACS_NBI_INTERFACE: 0.0.0.0
+      GENIEACS_NBI_PORT: "7557"
+      GENIEACS_NBI_WORKER_PROCESSES: "1"
+      GENIEACS_NBI_ACCESS_LOG_FILE: /dev/stdout
+      GENIEACS_NBI_LOG_FILE: /dev/stdout
+    # NOT published. The NBI has no authentication of its own; the docker
+    # network is its only boundary. The backend reaches it as
+    # TR069_NBI_URL=http://genieacs-nbi:7557.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:7557/devices/?projection=_id&limit=1',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    mem_limit: 128m
+    networks: [default, acs-internal]
+
+  genieacs-fs:
+    # Firmware/file server. Phase 2 (PRD §8). Defined so the image and env are
+    # reviewed once; it never starts without `--profile fs`.
+    <<: *genieacs-common
+    profiles: ["fs"]
+    command: ["genieacs-fs"]
+    environment:
+      GENIEACS_MONGODB_CONNECTION_URL: mongodb://mongo-acs/genieacs
+      GENIEACS_FS_INTERFACE: 0.0.0.0
+      GENIEACS_FS_PORT: "7567"
+      GENIEACS_FS_WORKER_PROCESSES: "1"
+    mem_limit: 128m
+    networks: [acs-internal]
+
+networks:
+  # The box stack's network (compose project "deploy"). Must already exist;
+  # `docker network ls` shows it as deploy_default on staging (2026-10-22).
+  default:
+    name: deploy_default
+    external: true
+  # Private to this project: mongo-acs <-> genieacs-* only.
+  acs-internal:
+    internal: true
+
+volumes:
+  acs-mongo:

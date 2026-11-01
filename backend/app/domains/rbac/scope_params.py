@@ -93,7 +93,9 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "channel_partner_id",
         "config_id",
         "conversation_id",
+        "coupon_batch_id",
         "coupon_id",
+        "cpe_id",
         "delivery_id",
         "demo_request_id",
         "device_id",
@@ -108,12 +110,18 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         # re-verifies organization_id AND location on every by-id path.
         "integration_id",
         "invoice_id",
+        "isp_customer_id",
+        "isp_location_id",
+        "isp_partner_id",
+        "isp_router_id",
+        "isp_user_id",
         "job_id",
         "license_id",
         "link_id",
         "member_id",
         "nas_id",
         "other_version_id",
+        "package_id",
         "payment_id",
         "payment_method_id",
         "permission_group_id",
@@ -132,6 +140,8 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "series_id",
         "session_id",
         "snapshot_id",
+        "speed_group_id",
+        "subscriber_id",
         "subscription_id",
         "target_id",
         "target_version_id",
@@ -142,6 +152,75 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "user_id",
         "variable_id",
         "version_id",
+        "zone_id",
+        # -- ISP partner console (SCOPE-FIX 2026-11-01) -----------------------
+        # Every /isp route runs RequirePermission against the ISP organization
+        # (the header) and RequireIspPartner; the handler then loads the row
+        # by id and rejects it unless isp_organization_id is the caller's ISP
+        # and its customer passes IspScope.assert_customer (confinement). None
+        # of these names a scope dimension RBAC could compare, which is why
+        # isp_customer_id / isp_location_id / isp_router_id above are listed
+        # here too rather than aliased.
+        #
+        # J16 Apps: ISP-wide records (isp_organization_id check; the write
+        # routes need isp_apps.manage, which only the unconfinable owner/admin
+        # roles hold) ...
+        "announcement_id",
+        "discount_id",
+        "item_id",
+        "type_id",
+        "vendor_id",
+        # Inventory stock location (warehouse / office / technician bag) --
+        # NOT a venue location; deliberately not spelled location_id.
+        "stock_location_id",
+        # ... and customer-bound ones (isp org + assert_customer, a
+        # customer-less task/lead is visible to unconfined staff only).
+        "checkout_id",
+        "lead_id",
+        "task_id",
+        "unit_id",
+        # A list filter on staff; the list itself stays confined.
+        "assignee_user_id",
+        # Child rows reached through a scoped subscriber_id in the same path
+        # (row.subscriber_id must equal the resolved subscriber).
+        "binding_id",
+        "document_id",
+        # Fiber plant: isp org + customer visibility (shared plant visible to
+        # all; another customer's node 404s for a confined caller).
+        "fiber_node_id",
+        "parent_id",
+        # JAZE-4 finance: products are ISP-wide; a lease resolves its customer
+        # through IspScope.
+        "lease_id",
+        "product_id",
+        # PPPoE session: isp org + assert_customer before the kick.
+        "pppoe_session_id",
+        # FRANCHISE-2: zone charges and settlements are ISP-wide rows (zones
+        # never belong to a customer); the handler 404s unless
+        # isp_organization_id is the caller's ISP.
+        "charge_id",
+        "settlement_id",
+        # /finance/contacts/{subject_kind}/{subject_id}: a customer org id OR
+        # a subscriber id depending on subject_kind. Not aliased: as an
+        # ORGANIZATION alias the permission check would run against the
+        # customer org, where ISP staff hold no role (every call would 403),
+        # and for subject_kind=subscriber it would compare a subscriber id as
+        # if it were an org. The handler validates it explicitly instead:
+        # IspScope.assert_customer (customer) or subscriber_in_scope
+        # (subscriber), before any read or write.
+        "subject_id",
+        # COLLECTIONS-1: a promise resolves its party (subscriber via
+        # subscriber_in_scope, else IspScope.assert_customer) before any read
+        # or write; a handover is ISP-wide (isp org check) and visible to its
+        # collector, or to owner/admin when its payments are in their scope.
+        "promise_id",
+        "handover_id",
+        # QUEUED-RENEWAL: reached only under a scoped subscriber_id in the same
+        # path; the row must belong to that subscriber and this ISP.
+        "queue_id",
+        # REFERRAL-1: isp org check, and both subscribers' customers must be
+        # visible to the caller (IspScope via child_ids) or it is a 404.
+        "referral_id",
     }
 )
 

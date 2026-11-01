@@ -1,0 +1,131 @@
+# /etc/freeradius/3.0/sites-available/wyfy-isp-pppoe  (symlink into sites-enabled/)
+#
+# Exception X2 (founder-approved): a NEW virtual server on its own ports for
+# PPPoE subscribers of ISP customers. sites-available/default is untouched;
+# client{} stanzas come from the global clients.conf the radius-agent already
+# writes, so every registered NAS works here with the same secret.
+#
+# TEST BOX ONLY (wyfy-isp-test). Listens on all addresses; the box firewall
+# (wyfy-test-hub-firewall) must allow 1912/1913 only on wg0 + lo.
+
+server wyfy-isp-pppoe {
+	listen {
+		type = auth
+		ipaddr = *
+		port = 1912
+	}
+	listen {
+		type = acct
+		ipaddr = *
+		port = 1913
+	}
+
+	authorize {
+		filter_username
+		preprocess
+
+		update control {
+			REST-HTTP-Header += "X-RADIUS-NAS-Identifier: %{client:shortname}"
+			REST-HTTP-Header += "X-RADIUS-Shared-Secret: %{client:backend_secret}"
+			REST-HTTP-Header += "X-Wyfy-Pppoe-Rest-Secret: __PPPOE_REST_SECRET__"
+		}
+		rest_isp_pppoe
+
+		#  The API either set control:Auth-Type := Reject, or returned
+		#  control:Cleartext-Password. In the second case these modules see
+		#  which challenge the client used and set Auth-Type themselves; they
+		#  leave an Auth-Type that is already set (Reject) alone.
+		if (ok || updated) {
+			chap
+			mschap
+			pap
+		}
+		else {
+			reject
+		}
+	}
+
+	authenticate {
+		Auth-Type PAP {
+			pap
+		}
+		Auth-Type CHAP {
+			chap
+		}
+		Auth-Type MS-CHAP {
+			mschap
+		}
+		#  ENFORCE-3: rlm_mschap sets "Auth-Type := mschap" (its instance
+		#  name). sites-enabled/default lists a bare "mschap" in its own
+		#  authenticate section, which creates "mschap" as a SEPARATE
+		#  Auth-Type value, so in this server "Found Auth-Type = mschap" had
+		#  no handler and every MS-CHAPv2 login was rejected (RouterOS E=691,
+		#  seen on the CHR). This bare entry handles it. The API returns
+		#  Cleartext-Password, which mschap hashes itself: no NT-hash storage.
+		mschap
+	}
+
+	post-auth {
+		#  RouterOS drops replies without a real Message-Authenticator
+		#  (confirmed on the hotspot path 2026-08-18).
+		update reply {
+			Message-Authenticator := 0x00
+		}
+		Post-Auth-Type REJECT {
+			update reply {
+				Message-Authenticator := 0x00
+			}
+			attr_filter.access_reject
+		}
+	}
+
+	preacct {
+		preprocess
+		acct_unique
+	}
+
+	accounting {
+		#  Written first, so a backend outage is replayable from disk.
+		detail
+
+		if (!&Acct-Input-Octets) {
+			update request { Acct-Input-Octets := 0 }
+		}
+		if (!&Acct-Output-Octets) {
+			update request { Acct-Output-Octets := 0 }
+		}
+		if (!&Acct-Input-Gigawords) {
+			update request { Acct-Input-Gigawords := 0 }
+		}
+		if (!&Acct-Output-Gigawords) {
+			update request { Acct-Output-Gigawords := 0 }
+		}
+		if (!&Acct-Session-Id) {
+			update request { Acct-Session-Id := "" }
+		}
+		if (!&User-Name) {
+			update request { User-Name := "" }
+		}
+		update control {
+			Tmp-String-0 := "%{tolower:%{Acct-Status-Type}}"
+			Tmp-String-1 := "%{%{Acct-Terminate-Cause}:-}"
+			Tmp-String-2 := "%{%{Framed-IP-Address}:-}"
+			Tmp-String-3 := "%{%{NAS-Port-Id}:-}"
+			Tmp-String-4 := "%{%{Framed-IPv6-Prefix}:-}"
+			Tmp-String-5 := "%{%{Delegated-IPv6-Prefix}:-}"
+			Tmp-Integer64-0 := "%{expr:(%{Acct-Input-Gigawords} * 4294967296) + %{Acct-Input-Octets}}"
+			Tmp-Integer64-1 := "%{expr:(%{Acct-Output-Gigawords} * 4294967296) + %{Acct-Output-Octets}}"
+			REST-HTTP-Header := "X-RADIUS-NAS-Identifier: %{client:shortname}"
+			REST-HTTP-Header += "X-RADIUS-Shared-Secret: %{client:backend_secret}"
+			REST-HTTP-Header += "X-Wyfy-Pppoe-Rest-Secret: __PPPOE_REST_SECRET__"
+		}
+
+		rest_isp_pppoe {
+			invalid = 1
+			reject = 1
+		}
+		if (!(ok || updated)) {
+			ok
+		}
+	}
+}
