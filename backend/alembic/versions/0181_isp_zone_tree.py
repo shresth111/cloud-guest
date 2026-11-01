@@ -71,6 +71,10 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
+    # The BaseModel columns are indexed on every other table (the lane
+    # migrations' _base_indexes); without these the model drifts.
+    for col in ("created_at", "deleted_at", "is_deleted", "created_by", "updated_by"):
+        op.create_index(f"ix_isp_zone_nodes_{col}", "isp_zone_nodes", [col])
     op.create_index(
         "uq_isp_zone_nodes_zone",
         "isp_zone_nodes",
