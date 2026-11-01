@@ -54,6 +54,17 @@ class IspPartnerSettings(BaseSettings):
             "exactly the package speed group's."
         ),
     )
+    hotspot_gate_budget_ms: int = Field(
+        default=200,
+        ge=20,
+        le=2000,
+        description=(
+            "ISP_PARTNER_HOTSPOT_GATE_BUDGET_MS. ENFORCE-4: the most the "
+            "hotspot RADIUS Authorize waits for the JAZE-2 gate. Past it the "
+            "login goes ahead (fail-open) and the gate's own queries are "
+            "capped by the same statement_timeout."
+        ),
+    )
     enforcement_live_mode: str = Field(
         default="next_auth",
         pattern="^(next_auth|reauth)$",

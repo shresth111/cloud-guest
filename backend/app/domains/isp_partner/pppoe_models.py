@@ -123,11 +123,21 @@ class IspPppoeSession(BaseModel):
     terminate_cause: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
+        # ENFORCE-4: unique only among OPEN sessions. RouterOS restarts its
+        # Acct-Session-Id counter after a reboot, so a new session may reuse
+        # the id of a closed one; that must be a new row (IPDR keeps the old).
         Index(
-            "uq_isp_pppoe_sessions_nas_acct",
+            "uq_isp_pppoe_sessions_nas_acct_active",
             "nas_client_id",
             "acct_session_id",
             unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index(
+            "ix_isp_pppoe_sessions_nas_acct_started",
+            "nas_client_id",
+            "acct_session_id",
+            "started_at",
         ),
         Index("ix_isp_pppoe_sessions_isp_started", "isp_organization_id", "started_at"),
         Index("ix_isp_pppoe_sessions_subscriber", "subscriber_id", "status"),
