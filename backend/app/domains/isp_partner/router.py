@@ -1027,6 +1027,11 @@ def _include_lanes() -> None:
     from .staticip_router import staticip_router
 
     isp_partner_router.include_router(staticip_router)
+
+    # DIR-2: directory export + bulk renew/status/move, behind ISP_DIR2_ENABLED.
+    from .directory_bulk_router import directory_bulk_router
+
+    isp_partner_router.include_router(directory_bulk_router)
     isp_partner_router.include_router(billing_router)
     # ADDENDUM_05 JAZE-1 (J1/J2/J11/J19). Mounted BEFORE plans_router:
     # its literal paths (/subscribers/directory, /typeahead, /onboard) must
