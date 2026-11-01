@@ -135,6 +135,19 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "location of one of its customers (QA-021). Read-only, no other "
         "fields, 404 for non-ISP locations, flag-gated, rate limited per IP."
     ),
+    ("GET", "/api/v1/isp/public/comms/whatsapp/{path_token}"): (
+        "Meta webhook subscribe check (COMMS-2): Meta calls it without a user. "
+        "Guarded by a 256-bit per-ISP path token plus the per-ISP verify token "
+        "(constant-time compare); it only echoes hub.challenge, 403 otherwise; "
+        "behind ISP_COMMS_HUB_ENABLED (default off)."
+    ),
+    ("POST", "/api/v1/isp/public/comms/whatsapp/{path_token}"): (
+        "Meta webhook status callbacks (COMMS-2): no user. Guarded by the "
+        "per-ISP path token AND the X-Hub-Signature-256 HMAC of the raw body "
+        "with the ISP's Meta app secret (403 when missing or wrong); it only "
+        "records delivery receipts for message ids that ISP sent; behind "
+        "ISP_COMMS_HUB_ENABLED (default off)."
+    ),
     ("GET", "/api/v1/isp/public/pay/{token}"): (
         "ISP invoice pay page (JAZE-4) -- the guard is the link itself: a "
         "72-bit random token (secrets.token_urlsafe), 30-day expiry, dead once "
