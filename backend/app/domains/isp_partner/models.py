@@ -123,6 +123,8 @@ class IspStaffCustomerScope(BaseModel):
 # No-op unless ISP_PARTNER_ENFORCEMENT_ENABLED is on.
 # ENFORCE-2: registers the JAZE-2 hotspot gate into hotspot_hooks (the one call
 # the hotspot RADIUS Authorize makes). No-op unless the enforcement flag is on.
+# B6/F1-F3 tables: registered so alembic autogenerate/check sees them.
+from . import addon_models as _addon_models  # noqa: E402,F401
 from . import audit_ip as _audit_ip_hook  # noqa: E402,F401  (AUDIT-LOG)
 from . import customer_discount as _customer_discount_hook  # noqa: E402,F401  (SMALL-2)
 from . import discount_wire as _discount_wire_hook  # noqa: E402,F401  (DISCOUNT-WIRE)

@@ -1,3 +1,5 @@
+import os
+import re
 from logging.config import fileConfig
 
 from sqlalchemy import Connection, engine_from_config, inspect, pool, text
@@ -190,6 +192,38 @@ def _prepare_version_table(connection: Connection) -> None:
         )
 
 
+# Opt-in lock safety for a release whose migrations touch busy tables (the
+# ISP partner release: ~36 new foreign keys onto `organizations`, plus
+# `routers`, `users`, `locations`, `radius_nas_clients`, `dhcp_pools`; each
+# CREATE TABLE ... REFERENCES takes SHARE ROW EXCLUSIVE on the parent).
+#
+# * ALEMBIC_LOCK_TIMEOUT, e.g. "5s": `SET lock_timeout` on the migration
+#   connection. A migration that waits longer for a lock fails cleanly
+#   instead of stalling router heartbeats and organization writes. Retry it.
+# * ALEMBIC_TRANSACTION_PER_MIGRATION=true: commit after each revision, so
+#   parent-table locks are held for one revision, not the whole run, and a
+#   retry resumes from the last committed revision.
+#
+# Both unset (the default): behaviour is exactly what it always was.
+_LOCK_TIMEOUT_RE = re.compile(r"^\d{1,6}(ms|s|min)?$")
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lock_timeout_from_env() -> str | None:
+    raw = os.environ.get("ALEMBIC_LOCK_TIMEOUT", "").strip()
+    if not raw:
+        return None
+    if not _LOCK_TIMEOUT_RE.match(raw):
+        raise RuntimeError(
+            f"ALEMBIC_LOCK_TIMEOUT={raw!r} is not a PostgreSQL duration "
+            "like 5s, 500ms or 1min"
+        )
+    return raw
+
+
 def run_migrations_online() -> None:
     configuration = config.get_section(config.config_ini_section, {})
     url = str(settings.database_url).replace("+asyncpg", "")
@@ -205,11 +239,20 @@ def run_migrations_online() -> None:
         connection.commit()
 
     with connectable.connect() as connection:
+        lock_timeout = _lock_timeout_from_env()
+        if lock_timeout is not None and connection.dialect.name == "postgresql":
+            # Session-level, so it holds for every migration transaction
+            # below. A DDL statement that cannot get its lock within this
+            # time fails (and its transaction rolls back) instead of queueing
+            # every writer of that table behind it.
+            connection.execute(text(f"SET lock_timeout = '{lock_timeout}'"))
+            connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
             compare_server_default=True,
+            transaction_per_migration=_env_flag("ALEMBIC_TRANSACTION_PER_MIGRATION"),
         )
 
         with context.begin_transaction():
