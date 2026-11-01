@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -172,42 +172,98 @@ class IspQueuedRenewalService:
             "items": await self.views(rows),
         }
 
-    async def list_pending(self, isp: Any, page: int, page_size: int) -> dict:
+    async def list_pending(  # noqa: PLR0913
+        self,
+        isp: Any,
+        page: int,
+        page_size: int,
+        *,
+        status: str = "pending",
+        q: str | None = None,
+        package_id: uuid.UUID | None = None,
+        starts_within_days: int | None = None,
+    ) -> dict:
+        """ISP-wide list. Defaults to ``status=pending`` (the original
+        contract); P3-SWEEP added the filters and the ``subscriber`` block.
+
+        Scope: customers from ``child_ids()`` (confinement, ZONE-1 customer
+        narrowing) AND an inner join on ``isp_subscribers``, whose ORM selects
+        carry the ZONE-1 subscriber criterion (own zone, else the customer's
+        zone) plus the explicit ``subscriber_zone_clause``. Only narrows."""
+        from sqlalchemy import func, or_
+
+        from .zones_scope import subscriber_zone_clause
+
         children = await isp.child_ids()
-        rows: list = []
-        if children:
-            rows = list(
-                (
-                    await self.session.execute(
-                        select(IspQueuedRenewal)
-                        .where(
-                            IspQueuedRenewal.isp_organization_id == isp.isp_org_id,
-                            IspQueuedRenewal.customer_organization_id.in_(children),
-                            IspQueuedRenewal.status == "pending",
-                            IspQueuedRenewal.is_deleted.is_(False),
-                        )
-                        .order_by(IspQueuedRenewal.starts_at)
-                    )
+        empty = {"items": [], "total": 0, "page": page, "page_size": page_size}
+        if not children:
+            return empty
+        conds = [
+            IspQueuedRenewal.isp_organization_id == isp.isp_org_id,
+            IspQueuedRenewal.customer_organization_id.in_(children),
+            IspQueuedRenewal.is_deleted.is_(False),
+            IspSubscriber.is_deleted.is_(False),
+        ]
+        if status != "all":
+            conds.append(IspQueuedRenewal.status == status)
+        if package_id is not None:
+            conds.append(IspQueuedRenewal.package_id == package_id)
+        if starts_within_days is not None:
+            conds.append(
+                IspQueuedRenewal.starts_at
+                <= self.now() + timedelta(days=starts_within_days)
+            )
+        if q:
+            like = f"%{q.strip()}%"
+            conds.append(
+                or_(
+                    IspSubscriber.identifier.ilike(like),
+                    IspSubscriber.display_name.ilike(like),
+                    IspSubscriber.first_name.ilike(like),
+                    IspSubscriber.last_name.ilike(like),
+                    IspSubscriber.phone.ilike(like),
                 )
-                .scalars()
-                .all()
             )
-        # zone scope: only subscribers the caller can read in this request
-        if rows:
-            seen = set(
-                (
-                    await self.session.execute(
-                        select(IspSubscriber.id).where(
-                            IspSubscriber.id.in_([r.subscriber_id for r in rows])
-                        )
-                    )
-                ).scalars()
+        zone = subscriber_zone_clause(self.session, IspQueuedRenewal.subscriber_id)
+        if zone is not None:
+            conds.append(zone)
+        base = (
+            select(IspQueuedRenewal, IspSubscriber)
+            .join(IspSubscriber, IspSubscriber.id == IspQueuedRenewal.subscriber_id)
+            .where(*conds)
+        )
+        total = (
+            await self.session.execute(
+                select(func.count()).select_from(base.subquery())
             )
-            rows = [r for r in rows if r.subscriber_id in seen]
-        start = (page - 1) * page_size
+        ).scalar_one()
+        order = (
+            IspQueuedRenewal.starts_at.asc()
+            if status == "pending"
+            else IspQueuedRenewal.created_at.desc()
+        )
+        pairs = (
+            await self.session.execute(
+                base.order_by(order, IspQueuedRenewal.id)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).all()
+        views = await self.views([r for r, _ in pairs])
+        for v, (_, sub) in zip(views, pairs, strict=True):
+            name = (
+                sub.display_name
+                or " ".join(p for p in (sub.first_name, sub.last_name) if p)
+                or None
+            )
+            v["subscriber"] = {
+                "id": str(sub.id),
+                "identifier": sub.identifier,
+                "name": name,
+            }
         return {
-            "items": await self.views(rows[start : start + page_size]),
-            "total": len(rows),
+            "items": views,
+            "total": int(total),
             "page": page,
             "page_size": page_size,
         }

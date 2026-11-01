@@ -268,6 +268,49 @@ def _invoice_criteria(scope: ZoneScope) -> Any:
     )
 
 
+def subscriber_zone_clause(session: Any, subscriber_col: Any) -> Any:
+    """P3-SWEEP: the ZONE-1 subscriber rule for a table keyed by subscriber
+    (collections, incidents, referrals, queued renewals, static IPs, revenue).
+
+    ``None`` when the request has no zone scope (nothing to add). Otherwise a
+    criterion "the row's subscriber is in the zone": the subscriber's own
+    ``zone_id`` is in the subtree, or it has none and its customer's profile
+    zone is. It is ANDed onto a query that is already confined by customer,
+    so it can only narrow. A NULL subscriber column never matches it; callers
+    with customer-level rows (no subscriber) decide for themselves."""
+    scope = current_scope(session)
+    if scope is None:
+        return None
+    from .plans_models import IspSubscriber
+
+    return subscriber_col.in_(
+        select(IspSubscriber.id).where(_subscriber_criteria(scope))
+    )
+
+
+async def zone_visible_subscribers(session: Any, ids: Any) -> set[uuid.UUID] | None:
+    """P3-SWEEP: which of ``ids`` pass the ZONE-1 subscriber rule in this
+    request. ``None`` = no zone scope (every id passes). For services that
+    build their rows in Python after a customer-level query."""
+    scope = current_scope(session)
+    if scope is None:
+        return None
+    wanted = {i for i in ids if i is not None}
+    if not wanted:
+        return set()
+    from .plans_models import IspSubscriber
+
+    return set(
+        (
+            await session.execute(
+                select(IspSubscriber.id).where(
+                    IspSubscriber.id.in_(wanted), _subscriber_criteria(scope)
+                )
+            )
+        ).scalars()
+    )
+
+
 @event.listens_for(Session, "do_orm_execute")
 def _zone_criteria(state: Any) -> None:
     scope = state.session.info.get(_INFO_KEY)
@@ -310,7 +353,9 @@ __all__ = [
     "lock_tree",
     "narrow",
     "parent_map",
+    "subscriber_zone_clause",
     "subtree_ids",
     "unscoped",
+    "zone_visible_subscribers",
     "zone_rows",
 ]
