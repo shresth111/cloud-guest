@@ -236,15 +236,28 @@ class AnnouncementService:
             .scalars()
             .all()
         )
-        return [self._view(r) for r in rows], total
+        visible = await self._visible_ids(isp)
+        return [self._view(r, visible) for r in rows], total
 
-    def _view(self, r: Any) -> dict:
+    @staticmethod
+    async def _visible_ids(isp: Any) -> set[str] | None:
+        """None for an unconfined caller; else the customer ids (as stored,
+        str) they cover. SCOPE-FIX: a confined caller never sees the id of a
+        customer outside their list in ``customer_ids``."""
+        if isp.confined_customer_ids is None:
+            return None
+        return {str(c) for c in await isp.child_ids()}
+
+    def _view(self, r: Any, visible: set[str] | None = None) -> dict:
+        ids = r.customer_ids
+        if visible is not None and ids:
+            ids = [c for c in ids if str(c) in visible]
         return {
             "id": r.id,
             "title": r.title,
             "body": r.body,
             "audience": r.audience,
-            "customer_ids": r.customer_ids,
+            "customer_ids": ids,
             "send_email": r.send_email,
             "status": r.status,
             "sent_at": r.sent_at,
@@ -254,7 +267,7 @@ class AnnouncementService:
 
     async def detail(self, isp: Any, announcement_id: uuid.UUID) -> dict:
         a = await self._get(isp, announcement_id)
-        view = self._view(a)
+        view = self._view(a, await self._visible_ids(isp))
         visible = set(await isp.child_ids())
         recipients = (
             (
