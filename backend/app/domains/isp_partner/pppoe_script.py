@@ -10,7 +10,8 @@ gives the same router (RouterOS 6.x and 7.x syntax).
 What it writes:
   /ip pool                 wyfy-pppoe-pool (the subscriber address range)
   /ppp profile             wyfy-pppoe (local address, pool, DNS, interface-list LAN,
-                           only-one=yes, change-tcp-mss)
+                           only-one=yes (no when the ISP sells multi-device
+                           PPPoE packages and enforcement is on), change-tcp-mss)
   /ppp aaa                 use-radius=yes accounting=yes interim-update
   /radius                  service=ppp -> hub tunnel IP, ports 1912/1913 (X2),
                            the router's existing NAS secret, the tunnel source
@@ -86,6 +87,12 @@ class PppoeScriptParams:
     auth_port: int
     acct_port: int
     interim_seconds: int
+    #: ENFORCE-3: ``only-one=no`` lets the router accept a second session of
+    #: the same username, so a package's "max devices" above 1 can work; our
+    #: RADIUS concurrency gate then enforces the limit. True (``only-one=yes``)
+    #: is the JAZE-6 default and what every setup gets while the enforcement
+    #: flag is off.
+    only_one: bool = True
 
     def validated(self) -> PppoeScriptParams:
         local = _ip(self.local_address)
@@ -113,6 +120,7 @@ class PppoeScriptParams:
             auth_port=self.auth_port,
             acct_port=self.acct_port,
             interim_seconds=self.interim_seconds,
+            only_one=bool(self.only_one),
         )
 
 
@@ -131,7 +139,7 @@ def render_pppoe_script(params: PppoeScriptParams) -> str:
         # router's own services answer subscribers under the existing input
         # rules that trust LAN)
         f"/ppp profile remove [find where name={ros_quote(PROFILE_NAME)}]",
-        f"/ppp profile add name={ros_quote(PROFILE_NAME)} local-address={p.local_address} remote-address={ros_quote(POOL_NAME)} dns-server={dns} only-one=yes change-tcp-mss=yes use-encryption=default comment={c}",
+        f"/ppp profile add name={ros_quote(PROFILE_NAME)} local-address={p.local_address} remote-address={ros_quote(POOL_NAME)} dns-server={dns} only-one={"yes" if p.only_one else "no"} change-tcp-mss=yes use-encryption=default comment={c}",
         f':if ([:len [/interface list find where name="LAN"]] > 0) do={{ /ppp profile set [find where name={ros_quote(PROFILE_NAME)}] interface-list=LAN }}',
         # AAA through our RADIUS
         f"/ppp aaa set use-radius=yes accounting=yes interim-update={interim}",

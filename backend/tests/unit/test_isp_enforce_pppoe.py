@@ -142,3 +142,33 @@ def test_priority_needs_zero_burst_fields():
 def test_reasons_fit_reply_message():
     for r in (ep.R_MAC, ep.R_IP, ep.R_CONCURRENCY):
         assert len(r) <= 32
+
+
+def test_pppoe_script_only_one_token():
+    """ENFORCE-3: the default render is JAZE-6's (only-one=yes); only_one
+    False changes that one token and nothing else."""
+    from dataclasses import replace
+
+    from app.domains.isp_partner.pppoe_script import (
+        PppoeScriptParams,
+        render_pppoe_script,
+    )
+
+    p = PppoeScriptParams(
+        interface="ether2",
+        local_address="10.78.0.1",
+        pool_range="10.78.0.10-10.78.0.100",
+        pool_cidr="10.78.0.0/24",
+        dns_servers=(),
+        hub_tunnel_ip="10.66.0.1",
+        router_tunnel_ip="10.66.0.5",
+        nas_secret="s3cret",
+        auth_port=1912,
+        acct_port=1913,
+        interim_seconds=300,
+    )
+    default = render_pppoe_script(p)
+    assert default == render_pppoe_script(replace(p, only_one=True))
+    assert default.count(" only-one=yes ") == 1
+    multi = render_pppoe_script(replace(p, only_one=False))
+    assert multi == default.replace(" only-one=yes ", " only-one=no ")
