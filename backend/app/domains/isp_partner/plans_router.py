@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
+from app.domains.ipdr.formatting import csv_safe
 from app.domains.queue_management.dependencies import get_queue_management_service
 from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import get_access_validator, get_rbac_repository
@@ -647,14 +648,20 @@ async def export_coupons(
         view = svc.coupon_view(serial, v)
         w.writerow(
             [
-                serial,
-                v.code,
-                meta["package_name"],
-                meta["speed"],
-                meta["validity_days"],
-                view["status"],
-                view["expires_at"] or "",
-                view["redeemed_by"] or "",
+                # BE-REVIEW R5: the redeemed identifier is guest-entered and
+                # the package name ISP-entered; same formula guard as every
+                # other ISP export.
+                csv_safe(x)
+                for x in (
+                    serial,
+                    v.code,
+                    meta["package_name"],
+                    meta["speed"],
+                    meta["validity_days"],
+                    view["status"],
+                    view["expires_at"] or "",
+                    view["redeemed_by"] or "",
+                )
             ]
         )
     await svc.sync_subscribers(isp)

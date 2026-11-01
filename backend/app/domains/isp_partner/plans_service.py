@@ -1216,7 +1216,15 @@ class IspPlansService:
     # ------------------------------------------------------------------
     async def sync_subscribers(self, isp: IspContext, *, force: bool = False) -> int:
         """Derive subscribers from redeemed ISP coupons (no hook into old
-        code). Idempotent; throttled to once a minute per ISP."""
+        code). Idempotent; throttled to once a minute per ISP. Runs outside
+        the request's zone filter (BE-REVIEW R3): it must see every
+        subscriber of the ISP or it re-creates the hidden ones."""
+        from .zones_scope import unscoped
+
+        with unscoped(self.session):
+            return await self._sync_subscribers(isp, force=force)
+
+    async def _sync_subscribers(self, isp: IspContext, *, force: bool) -> int:
         from app.domains.guest.models import Guest
         from app.domains.voucher.models import Voucher
 
@@ -1666,15 +1674,18 @@ class IspPlansService:
             raise IspPackageDisabledError()
         await self.materialize(isp, package, customer.id)
         start = data.get("valid_from") or self._clock()
-        existing = (
-            await self.session.execute(
-                select(IspSubscriber).where(
-                    IspSubscriber.customer_organization_id == customer.id,
-                    IspSubscriber.identifier == data["identifier"].strip(),
-                    IspSubscriber.is_deleted.is_(False),
+        from .zones_scope import unscoped
+
+        with unscoped(self.session):  # R3: a hidden duplicate is still a 409
+            existing = (
+                await self.session.execute(
+                    select(IspSubscriber).where(
+                        IspSubscriber.customer_organization_id == customer.id,
+                        IspSubscriber.identifier == data["identifier"].strip(),
+                        IspSubscriber.is_deleted.is_(False),
+                    )
                 )
-            )
-        ).scalar_one_or_none()
+            ).scalar_one_or_none()
         if existing is not None:
             raise IspNameTakenError("A subscriber with that identifier already exists")
         contact = await self._contact_fields(isp, data)

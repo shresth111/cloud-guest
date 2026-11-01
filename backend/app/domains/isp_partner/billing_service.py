@@ -249,6 +249,22 @@ class IspBillingService:
             raise IspInvoiceNotFoundError() from None
         return inv
 
+    async def _lock_invoice(self, inv: IspInvoice) -> IspInvoice:
+        """BE-REVIEW R1: ``SELECT ... FOR UPDATE`` the invoice and reload its
+        money columns before any read-modify-write of ``paid_paise`` /
+        ``credit_noted_paise`` / ``status``. Without it two payments (or a
+        payment and a credit note) read the same balance and the second
+        overwrites the first. Pending changes are flushed first so the
+        reload never discards them."""
+        await self.session.flush()
+        await self.session.execute(
+            select(IspInvoice)
+            .where(IspInvoice.id == inv.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return inv
+
     async def _payment(self, isp: IspContext, payment_id: uuid.UUID) -> IspPayment:
         pay = await self.session.get(IspPayment, payment_id)
         if pay is None or pay.is_deleted or pay.isp_organization_id != isp.isp_org_id:
@@ -472,14 +488,19 @@ class IspBillingService:
     ) -> IspInvoice | None:
         if not source_key:
             return None
-        return (
-            await self.session.execute(
-                select(IspInvoice).where(
-                    IspInvoice.isp_organization_id == isp.isp_org_id,
-                    IspInvoice.source_key == source_key,
+        from .zones_scope import unscoped
+
+        # R3: idempotency is ISP-wide; a zone filter must not hide the
+        # first document (that turned a replay into a unique-index 500).
+        with unscoped(self.session):
+            return (
+                await self.session.execute(
+                    select(IspInvoice).where(
+                        IspInvoice.isp_organization_id == isp.isp_org_id,
+                        IspInvoice.source_key == source_key,
+                    )
                 )
-            )
-        ).scalar_one_or_none()
+            ).scalar_one_or_none()
 
     def _check_issue_date(self, isp: IspContext, issue_date: date | None) -> date:
         today = self.today(isp)
@@ -747,6 +768,7 @@ class IspBillingService:
         """Advances/overpayments (``unallocated_paise``) auto-apply on issue."""
         if inv.bill_to_kind == "zone":
             return  # FINISH: a zone pays through its wallet, never an advance
+        await self._lock_invoice(inv)  # R1: collections applies to old bills
         credits = (
             (
                 await self.session.execute(
@@ -920,10 +942,16 @@ class IspBillingService:
         *,
         amount_paise: int | None,
         reason: str,
+        settles: bool = False,
     ) -> IspInvoice:
+        """``settles=True`` (BE-REVIEW R2): the note is a reward/discount that
+        pays the bill down, not a cancellation. A note that covers the whole
+        unpaid bill then leaves it PAID (settled by credit) instead of the
+        void rule's CANCELLED."""
         inv = await self._invoice(isp, invoice_id)
         if inv.doc_type != "invoice":
             raise IspInvoiceNotFoundError()
+        await self._lock_invoice(inv)
         if inv.status == "cancelled":
             raise IspInvoiceCancelledError()
         balance = balance_of(inv)
@@ -982,6 +1010,8 @@ class IspBillingService:
         self.session.add(note)
         inv.credit_noted_paise += amount
         inv.status = status_for(inv)
+        if settles and inv.status == "cancelled":
+            inv.status = "paid"
         if inv.status == "cancelled":
             inv.cancelled_reason = reason
         await self.session.flush()
@@ -1076,6 +1106,7 @@ class IspBillingService:
                 )
             ):
                 raise IspInvoiceNotFoundError()
+            await self._lock_invoice(inv)
             if inv.status == "cancelled":
                 raise IspInvoiceCancelledError()
             if balance_of(inv) == 0:
@@ -1147,6 +1178,12 @@ class IspBillingService:
         self, isp: IspContext, payment_id: uuid.UUID, *, reason: str
     ) -> IspPayment:
         pay = await self._payment(isp, payment_id)
+        await self.session.execute(  # R1: two voids never both reverse
+            select(IspPayment)
+            .where(IspPayment.id == pay.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if pay.status == "voided":
             return pay
         allocations = (
@@ -1162,7 +1199,9 @@ class IspBillingService:
             .all()
         )
         for alloc in allocations:
-            inv = await self.session.get(IspInvoice, alloc.invoice_id)
+            inv = await self._lock_invoice(
+                await self.session.get(IspInvoice, alloc.invoice_id)
+            )
             inv.paid_paise -= alloc.amount_paise
             inv.status = status_for(inv)
             alloc.mark_deleted()
