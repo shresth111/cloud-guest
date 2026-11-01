@@ -135,6 +135,14 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "location of one of its customers (QA-021). Read-only, no other "
         "fields, 404 for non-ISP locations, flag-gated, rate limited per IP."
     ),
+    ("GET", "/api/v1/isp/public/pay/{token}"): (
+        "ISP invoice pay page (JAZE-4) -- the guard is the link itself: a "
+        "72-bit random token (secrets.token_urlsafe), 30-day expiry, dead once "
+        "deleted or the ISP is not active; read-only (ISP name, invoice no., "
+        "amounts, UPI/bank, payer first name only), 404 for any bad token, "
+        "behind ISP_WHATSAPP_AUTOMATION_ENABLED (default off), rate limited "
+        "per IP."
+    ),
     ("POST", "/api/v1/isp/auth/forgot-password"): (
         "ISP partner console forgot password -- must work for a locked-out "
         "user; flag-gated, rate limited per IP and per email, one response."
@@ -248,6 +256,16 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ),
     ("POST", "/api/v1/radius/authorize"): "FreeRADIUS -- CurrentNas shared secret.",
     ("POST", "/api/v1/radius/accounting"): "FreeRADIUS -- CurrentNas shared secret.",
+    ("POST", "/api/v1/isp/internal/pppoe/authorize"): (
+        "FreeRADIUS X2 PPPoE (JAZE-6) -- CurrentNas shared secret plus "
+        "RequirePppoeRestCaller: box-only ISP_PPPOE_REST_SECRET header "
+        "(constant-time; empty secret refuses all) and refused when proxied "
+        "(X-Forwarded-For/X-Real-IP); behind ISP_PPPOE_ENABLED (default off)."
+    ),
+    ("POST", "/api/v1/isp/internal/pppoe/accounting"): (
+        "FreeRADIUS X2 PPPoE accounting (JAZE-6) -- same two guards as "
+        "authorize (CurrentNas + RequirePppoeRestCaller) and the same flag."
+    ),
     ("POST", "/api/v1/internal/device-logs/ingest"): (
         "Syslog collector (Vector) -- no platform user exists. Authenticated "
         "by the X-Device-Logs-Secret shared secret (constant-time compare, "

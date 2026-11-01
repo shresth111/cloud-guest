@@ -15,11 +15,15 @@ technician confined to another customer (404).
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from fastapi import Request
+
+_UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("ISP_TEST_PG_DSN"), reason="set ISP_TEST_PG_DSN to run"
@@ -140,9 +144,17 @@ async def test_finance_end_to_end(monkeypatch) -> None:  # noqa: ANN001
 
     app = create_app()
     state = {"user": users["A"]}
-    app.dependency_overrides[CurrentUser] = lambda: AuthUser(
-        id=str(state["user"]), email="o@example.com"
-    )
+
+    def _current_user(request: Request) -> AuthUser:
+        # A call made with ISP B's org header runs as ISP B's own owner, so
+        # the isolation checks below exercise the finance lookups (404), not
+        # the RBAC membership guard (an A user naming org B is a 403 for any
+        # id, existing or not).
+        org = request.headers.get("X-Organization-Id")
+        uid = users["B"] if org == str(isps["B"]) else state["user"]
+        return AuthUser(id=str(uid), email="o@example.com")
+
+    app.dependency_overrides[CurrentUser] = _current_user
     ha = {"X-Organization-Id": str(isps["A"])}
     hb = {"X-Organization-Id": str(isps["B"])}
     async with httpx.AsyncClient(
@@ -240,11 +252,10 @@ async def test_finance_end_to_end(monkeypatch) -> None:  # noqa: ANN001
             f"/api/v1/isp/finance/invoices/{inv_id}/thermal.pdf", headers=ha
         )
         assert th.status_code == 200 and th.content[:4] == b"%PDF"
-        assert (
-            await c.get(
-                f"/api/v1/isp/finance/invoices/{inv_id}/thermal.pdf", headers=hb
-            )
-        ).status_code == 404
+        other = await c.get(
+            f"/api/v1/isp/finance/invoices/{inv_id}/thermal.pdf", headers=hb
+        )
+        assert other.status_code == 404, other.text
 
         # -- products + package billing + price preview -------------------
         r = await c.post("/api/v1/isp/finance/products/standard", headers=ha)
@@ -284,7 +295,14 @@ async def test_finance_end_to_end(monkeypatch) -> None:  # noqa: ANN001
         pkg = (
             await c.post(
                 "/api/v1/isp/packages",
-                json={"speed_group_id": gid, "type": "prepaid", "price_paise": 14900},
+                # Packages default to GST-inclusive; pin exclusive so the
+                # preview is base + 18% (17582).
+                json={
+                    "speed_group_id": gid,
+                    "type": "prepaid",
+                    "price_paise": 14900,
+                    "price_includes_gst": False,
+                },
                 headers=ha,
             )
         ).json()["data"]["id"]
@@ -613,6 +631,7 @@ async def test_finance_end_to_end(monkeypatch) -> None:  # noqa: ANN001
             headers={**ha, "Idempotency-Key": uuid.uuid4().hex},
         )
         assert r.status_code == 201, r.text
+        pay_id = r.json()["data"]["id"]
         before = len(sent)
         for _ in range(2):
             async with SessionLocal() as s:
@@ -701,3 +720,53 @@ async def test_finance_end_to_end(monkeypatch) -> None:  # noqa: ANN001
         # ISP B sees none of A's messages
         logb = (await c.get("/api/v1/isp/finance/messages", headers=hb)).json()["data"]
         assert logb["total"] == 0
+
+        # -- every finance route that takes an id: ISP B's own owner, A's
+        # real ids -> 404 (never 403), and nothing of A's changes.
+        def _items(d):  # noqa: ANN001, ANN202
+            return d["items"] if isinstance(d, dict) else d
+
+        prod_id = _items(
+            (await c.get("/api/v1/isp/finance/products", headers=ha)).json()["data"]
+        )[0]["id"]
+        f = "/api/v1/isp/finance"
+        probes = [
+            ("PATCH", f"{f}/products/{prod_id}", {"name": "hijack"}),
+            ("GET", f"{f}/packages/{pkg}/billing", None),
+            (
+                "PUT",
+                f"{f}/packages/{pkg}/billing",
+                {
+                    "plan_kind": "prepaid",
+                    "chargeable_unit": "months",
+                    "chargeable_count": 1,
+                },
+            ),
+            ("POST", f"{f}/static-ip-leases/{lease}/end", {}),
+            ("GET", f"{f}/contacts/customer/{cust}", None),
+            ("PUT", f"{f}/contacts/customer/{cust}", {"alternate_name": "x"}),
+            ("POST", f"{f}/invoices/{inv_id}/email", {"send_to": "primary"}),
+            ("GET", f"{f}/invoices/{inv_id}/thermal.pdf", None),
+            ("GET", f"{f}/payments/{pay_id}/thermal.pdf", None),
+            ("GET", f"{f}/zones/{zone}", None),
+            ("PUT", f"{f}/zones/{zone}/profile", {"contact_name": "x"}),
+            (
+                "POST",
+                f"{f}/zones/{zone}/entries",
+                {"entry_kind": "add", "amount_paise": 100, "mode": "cash"},
+            ),
+            ("POST", f"{f}/invoices/{inv_id}/pay-link", None),
+        ]
+        for method, path, body in probes:
+            r = await c.request(method, path, json=body, headers=hb)
+            assert r.status_code == 404, (method, path, r.status_code, r.text)
+            # a random id answers the same: the response says nothing
+            fake = await c.request(
+                method,
+                re.sub(_UUID_RE, str(uuid.uuid4()), path, count=1),
+                json=body,
+                headers=hb,
+            )
+            assert fake.status_code == 404, (method, path, fake.text)
+        prods = _items((await c.get(f"{f}/products", headers=ha)).json()["data"])
+        assert all(p["name"] != "hijack" for p in prods)
