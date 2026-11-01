@@ -262,8 +262,8 @@ from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.captive_portal.validators import (
     compute_terms_version,
     is_open_now,
-    validate_review_url,
     seconds_until_closing,
+    validate_review_url,
 )
 from app.domains.guest_access.exceptions import (
     GuestAccessDeniedError,
