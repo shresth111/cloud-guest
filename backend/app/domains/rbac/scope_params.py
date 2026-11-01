@@ -206,6 +206,12 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         # IspScope.assert_customer (customer) or subscriber_in_scope
         # (subscriber), before any read or write.
         "subject_id",
+        # COLLECTIONS-1: a promise resolves its party (subscriber via
+        # subscriber_in_scope, else IspScope.assert_customer) before any read
+        # or write; a handover is ISP-wide (isp org check) and visible to its
+        # collector, or to owner/admin when its payments are in their scope.
+        "promise_id",
+        "handover_id",
     }
 )
 

@@ -1156,5 +1156,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(caf_router)
 
+    # COLLECTIONS-1: /isp/collections, behind ISP_COLLECTIONS_ENABLED.
+    from .collections_router import collections_router
+
+    isp_partner_router.include_router(collections_router)
+
 
 _include_lanes()
