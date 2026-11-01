@@ -1036,5 +1036,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(portal_support_router)
 
+    # J16 Apps (ADDENDUM_05, JAZE-5): /isp/apps/*, behind ISP_APPS_ENABLED.
+    from .apps_router import apps_router
+
+    isp_partner_router.include_router(apps_router)
+
 
 _include_lanes()
