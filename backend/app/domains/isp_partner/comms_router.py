@@ -41,7 +41,7 @@ from app.database.session import get_db_session
 
 from . import comms_logic as logic
 from .comms_models import IspCommsWebhook, IspMessageReceipt, IspMessageTemplate
-from .constants import ISP_BILLING_EXPORT, ISP_BILLING_MANAGE, ISP_BILLING_READ
+from .constants import ISP_BILLING_EXPORT, ISP_BILLING_MANAGE
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import IspBadRequestError, _err
 from .finance_models import IspMessageLog
@@ -302,7 +302,9 @@ async def _log_rows(
     return out
 
 
-@comms_router.get("/comms/logs", dependencies=_ON + isp_guards(ISP_BILLING_READ))
+# RBAC-FIX (founder 2026-11-01): logs and templates carry recipient
+# phone/email and content -> owner/admin/billing (isp_billing.export).
+@comms_router.get("/comms/logs", dependencies=_ON + isp_guards(ISP_BILLING_EXPORT))
 async def comms_logs(
     request: Request,
     q: _LogQuery = Depends(_log_query),
@@ -641,7 +643,7 @@ async def _templates(db: AsyncSession, isp_org_id: uuid.UUID) -> dict[tuple, Any
     }
 
 
-@comms_router.get("/comms/templates", dependencies=_ON + isp_guards(ISP_BILLING_READ))
+@comms_router.get("/comms/templates", dependencies=_ON + isp_guards(ISP_BILLING_EXPORT))
 async def list_templates(
     request: Request,
     isp: IspContext = Depends(RequireIspPartner),
@@ -761,7 +763,7 @@ async def put_template(
 
 @comms_router.post(
     "/comms/templates/{event}/{channel}/preview",
-    dependencies=_ON + isp_guards(ISP_BILLING_READ),
+    dependencies=_ON + isp_guards(ISP_BILLING_EXPORT),
 )
 async def preview_template(
     request: Request,

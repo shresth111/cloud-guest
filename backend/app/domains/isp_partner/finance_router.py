@@ -34,6 +34,7 @@ from . import automation as auto
 from .billing_router import _file, _pdf_for
 from .constants import (
     ISP_BILLING_EXECUTE,
+    ISP_BILLING_EXPORT,
     ISP_BILLING_MANAGE,
     ISP_BILLING_READ,
     ISP_INVOICES_EXECUTE,
@@ -835,7 +836,9 @@ async def telegram_test(
     return ok(request, out, "Telegram test")
 
 
-@finance_router.get("/finance/messages", dependencies=isp_guards(ISP_BILLING_READ))
+# RBAC-FIX (founder 2026-11-01): the message log carries recipient phone/email
+# and content -> owner/admin/billing (isp_billing.export), like COMMS-2 logs.
+@finance_router.get("/finance/messages", dependencies=isp_guards(ISP_BILLING_EXPORT))
 async def message_log(
     request: Request,
     channel: Literal["email", "whatsapp", "telegram"] | None = None,

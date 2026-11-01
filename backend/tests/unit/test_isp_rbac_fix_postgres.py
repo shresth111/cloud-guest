@@ -11,7 +11,7 @@ check, not a "feature off" 404.
 | CAF detail+PDF  |  Y     Y    N   Y*   Y       N      |
 | KYC read        |  Y     Y    N   Y*   Y       N      |
 | LEA trace, retention | Y Y   N   N    N       N      |
-| COMMS logs/templates | Y Y   N   N    Y       Y (pending decision) |
+| COMMS logs/templates | Y Y   N   N    Y       N      |
 | COMMS logs CSV  |  Y     Y    N   N    Y       N      |
 | COMMS webhook   |  Y     Y    N   N    N       N      |
 
@@ -41,10 +41,10 @@ ALLOW = {
     # IPDR-2 LEA trace + retention (isp_ipdr.export / isp_ipdr.read)
     "lea": {"owner", "admin"},
     "retention": {"owner", "admin"},
-    # COMMS-2 as built: logs/templates read on isp_billing.read, so billing
-    # AND viewer read them (PENDING founder decision, flagged 2026-11-01);
-    # CSV on isp_billing.export; webhook config on isp_billing.manage.
-    "comms_logs": {"owner", "admin", "billing", "viewer"},
+    # COMMS-2 (founder 2026-11-01): logs/templates carry recipient phone,
+    # email and content -> isp_billing.export, so viewer is 403; webhook
+    # config stays isp_billing.manage.
+    "comms_logs": {"owner", "admin", "billing"},
     "comms_export": {"owner", "admin", "billing"},
     "comms_webhook": {"owner", "admin"},
 }

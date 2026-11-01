@@ -1022,6 +1022,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(gst_router)
     isp_partner_router.include_router(bill2_router)
+
+    # STATICIP-2: /isp/static-ips ledger + release, behind ISP_STATICIP2_ENABLED.
+    from .staticip_router import staticip_router
+
+    isp_partner_router.include_router(staticip_router)
     isp_partner_router.include_router(billing_router)
     # ADDENDUM_05 JAZE-1 (J1/J2/J11/J19). Mounted BEFORE plans_router:
     # its literal paths (/subscribers/directory, /typeahead, /onboard) must

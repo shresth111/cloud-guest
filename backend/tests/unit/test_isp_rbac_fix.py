@@ -26,6 +26,11 @@ EXPECTED_KEY = {
     ("GET", "/caf/leads/{lead_id}"): KYC,
     ("GET", "/caf/search"): KYC,
     ("POST", "/caf/export"): KYC,
+    # COMMS-2 reads carry recipient phone/email + content (founder 2026-11-01)
+    ("GET", "/comms/logs"): "isp_billing.export",
+    ("GET", "/finance/messages"): "isp_billing.export",
+    ("GET", "/comms/templates"): "isp_billing.export",
+    ("POST", "/comms/templates/{event}/{channel}/preview"): "isp_billing.export",
 }
 
 
