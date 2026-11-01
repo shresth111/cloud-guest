@@ -166,6 +166,12 @@ EXPECTED["isp-noc"] |= _APPS - {"isp_apps.manage"}
 EXPECTED["isp-technician"] |= {"isp_apps.read", "isp_apps.create", "isp_apps.update"}
 EXPECTED["isp-viewer"] |= {"isp_apps.read", "isp_apps.export"}
 EXPECTED["isp-billing"] |= {"isp_apps.read", "isp_apps.create", "isp_apps.export"}
+# RBAC-FIX (founder 2026-11-01): disconnect = owner/admin/noc/technician;
+# kyc (CAF/KYC detail + PDFs) = owner/admin/billing/technician.
+EXPECTED["isp-owner"] |= {"isp_subscribers.disconnect", "isp_subscribers.kyc"}
+EXPECTED["isp-noc"] |= {"isp_subscribers.disconnect"}
+EXPECTED["isp-technician"] |= {"isp_subscribers.disconnect", "isp_subscribers.kyc"}
+EXPECTED["isp-billing"] |= {"isp_subscribers.kyc"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -272,7 +278,7 @@ async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
     assert summary.permission_groups_created == 18  # +1 J16 isp_apps
-    assert summary.permissions_created == 68  # +5 isp_apps, +1 isp_subscribers.manage
+    assert summary.permissions_created == 70  # +2 RBAC-FIX disconnect, kyc
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED

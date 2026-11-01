@@ -39,11 +39,11 @@ from app.database.session import get_db_session
 from .apps_export import csv_response
 from .bill2_config import RequireBill2Enabled
 from .billing_models import IspInvoice, IspInvoiceLine
+from .constants import ISP_BILLING_EXPORT  # RBAC-FIX
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 
 __all__ = ["B2CL_THRESHOLD_PAISE", "build_gstr1", "gst_router", "state_label"]
 
-ISP_INVOICES_EXPORT = "isp_invoices.export"
 B2CL_THRESHOLD_PAISE = 1_00_000_00  # Rs 1,00,000 (CBIC 12/2024, from 1 Aug 2024)
 _SLABS = (0, 5, 12, 18, 28)
 SECTIONS = ("b2b", "b2cl", "b2cs", "cdnr", "cdnur", "hsn")
@@ -356,7 +356,7 @@ gst_router = APIRouter(
 )
 
 
-@gst_router.get("/gstr1", dependencies=isp_guards(ISP_INVOICES_EXPORT))
+@gst_router.get("/gstr1", dependencies=isp_guards(ISP_BILLING_EXPORT))
 async def gstr1_export(
     month: str = Query(pattern=r"^\d{4}-\d{2}$"),
     section: Literal["all", "b2b", "b2cl", "b2cs", "cdnr", "cdnur", "hsn"] = "all",

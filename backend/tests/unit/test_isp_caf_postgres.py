@@ -319,11 +319,12 @@ async def test_caf_workbench_end_to_end() -> None:  # noqa: PLR0915
         assert (
             await c.get(f"{api}/caf/subscribers/{s2}", headers=ha)
         ).status_code == 404
-        # the technician role holds no isp_partner.export: the PDF is refused
-        # before any lookup, identically for an in-scope and an out-of-scope id
-        for sid in (s1, s2):
-            r = await c.get(f"{api}/caf/subscribers/{sid}/caf.pdf", headers=ha)
-            assert r.status_code == 403, (sid, r.text)
+        # RBAC-FIX R3: the technician holds isp_subscribers.kyc, so it reads
+        # the CAF PDF of its own customers; outside them it is 404
+        r = await c.get(f"{api}/caf/subscribers/{s1}/caf.pdf", headers=ha)
+        assert r.status_code == 200, r.text
+        r = await c.get(f"{api}/caf/subscribers/{s2}/caf.pdf", headers=ha)
+        assert r.status_code == 404, r.text
         r = await c.put(
             f"{api}/caf/subscribers/{s2}/extras", json={"plot_no": "x"}, headers=ha
         )

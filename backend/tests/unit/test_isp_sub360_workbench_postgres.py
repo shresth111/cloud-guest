@@ -12,7 +12,8 @@ unchanged, including the RFO rule on close-after-raising, and the open
 count; a precise disconnect by MAC and by session; and authz: a technician
 confined to another customer and another ISP get 404 on the workbench, its
 disconnect, the ticket create and the existing JAZE-1/JAZE-6 disconnects,
-without any session being touched.
+without any session being touched; isp-billing gets 403 on every disconnect
+(RBAC-FIX R1).
 """
 
 from __future__ import annotations
@@ -397,11 +398,8 @@ async def test_workbench_ticket_and_disconnect_authz() -> None:  # noqa: PLR0915
                 headers=ha,
             )
             assert r.status_code == 404, r.text
-            # a confined role that CAN disconnect (isp-billing) still gets 404
-            as_("Bi")
-            assert (
-                await c.get(f"{api}/subscribers/{sid}/workbench", headers=ha)
-            ).status_code == 404
+            # RBAC-FIX R1: the confined technician now holds
+            # isp_subscribers.disconnect, so outside its customer it is 404
             for body in (None, {"mac": mac1}, {"session_id": s1}):
                 r = await c.post(
                     f"{api}/subscribers/{sid}/workbench/disconnect",
@@ -413,6 +411,24 @@ async def test_workbench_ticket_and_disconnect_authz() -> None:  # noqa: PLR0915
             for path in (f"{sid}/disconnect", f"{sid}/pppoe/disconnect"):
                 r = await c.post(f"{api}/subscribers/{path}", headers=ha)
                 assert r.status_code == 404, (path, r.text)
+            # isp-billing no longer has a disconnect key (RBAC-FIX R1): 403 on
+            # every disconnect route; the workbench read stays scope-404
+            as_("Bi")
+            assert (
+                await c.get(f"{api}/subscribers/{sid}/workbench", headers=ha)
+            ).status_code == 404
+            for body in (None, {"mac": mac1}, {"session_id": s1}):
+                r = await c.post(
+                    f"{api}/subscribers/{sid}/workbench/disconnect",
+                    json=body,
+                    headers=ha,
+                )
+                assert r.status_code == 403, (body, r.text)
+            r = await c.post(f"{api}/subscribers/{sid}/disconnect", headers=ha)
+            assert r.status_code == 403, r.text
+            # PPPoE is behind its own flag (off here): 404 before the key check
+            r = await c.post(f"{api}/subscribers/{sid}/pppoe/disconnect", headers=ha)
+            assert r.status_code in (403, 404), r.text
 
             # authz: another ISP -> 404 ---------------------------------------------
             as_("B")

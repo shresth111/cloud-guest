@@ -34,10 +34,10 @@ from .caf_models import APPLICANT_CATEGORIES
 from .caf_service import EXPORT_MAX, IspCafService, RequireIspCafEnabled
 from .compliance_logic import ID_TYPES
 from .constants import (
-    ISP_PARTNER_EXPORT,
     ISP_PARTNER_MANAGE,
     ISP_PARTNER_READ,
     ISP_PARTNER_UPDATE,
+    ISP_SUBSCRIBERS_KYC,  # RBAC-FIX
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import IspBadRequestError, IspError
@@ -155,7 +155,7 @@ async def caf_options(
     )
 
 
-@caf_router.get("/search", dependencies=isp_guards(ISP_PARTNER_READ))
+@caf_router.get("/search", dependencies=isp_guards(ISP_SUBSCRIBERS_KYC))
 async def caf_search(
     request: Request,
     q: str = Query(min_length=2, max_length=100),
@@ -233,7 +233,7 @@ async def caf_search(
 
 
 @caf_router.get(
-    "/subscribers/{subscriber_id}", dependencies=isp_guards(ISP_PARTNER_READ)
+    "/subscribers/{subscriber_id}", dependencies=isp_guards(ISP_SUBSCRIBERS_KYC)
 )
 async def caf_subscriber(
     request: Request,
@@ -281,7 +281,7 @@ async def caf_subscriber_number(
 
 
 @caf_router.get(
-    "/subscribers/{subscriber_id}/caf.pdf", dependencies=isp_guards(ISP_PARTNER_EXPORT)
+    "/subscribers/{subscriber_id}/caf.pdf", dependencies=isp_guards(ISP_SUBSCRIBERS_KYC)
 )
 async def caf_subscriber_pdf(
     subscriber_id: uuid.UUID,
@@ -297,7 +297,7 @@ async def caf_subscriber_pdf(
 # -- lead -------------------------------------------------------------------------
 
 
-@caf_router.get("/leads/{lead_id}", dependencies=isp_guards(ISP_PARTNER_READ))
+@caf_router.get("/leads/{lead_id}", dependencies=isp_guards(ISP_SUBSCRIBERS_KYC))
 async def caf_lead(
     request: Request,
     lead_id: uuid.UUID,
@@ -350,7 +350,7 @@ async def caf_lead_convert(
 # -- bulk export ----------------------------------------------------------------
 
 
-@caf_router.post("/export", dependencies=isp_guards(ISP_PARTNER_EXPORT))
+@caf_router.post("/export", dependencies=isp_guards(ISP_SUBSCRIBERS_KYC))
 async def caf_export(
     payload: ExportBody,
     isp: IspContext = Depends(RequireIspPartner),
