@@ -1306,6 +1306,9 @@ class IspBillingService:
             "created_at": iso(inv.created_at),
             "invoice_date": iso(inv.issue_date),
             "due_date": iso(inv.due_date),
+            # QA #16: the billing period (a multi-cycle renewal spans N cycles)
+            "period_start": iso(getattr(inv, "period_start", None)),
+            "period_end": iso(getattr(inv, "period_end", None)),
             "bill_to_kind": inv.bill_to_kind,
             "subscriber": subscriber if is_sub else None,
             "customer": None
@@ -1539,6 +1542,9 @@ class IspBillingService:
                 "total_paise": li.total_paise,
                 "period_from": iso(li.period_from),
                 "period_to": iso(li.period_to),
+                # QA #16: same dates under the invoice's key names
+                "period_start": iso(li.period_from),
+                "period_end": iso(li.period_to),
                 "package_id": str(li.package_id) if li.package_id else None,
             }
             for li in lines
