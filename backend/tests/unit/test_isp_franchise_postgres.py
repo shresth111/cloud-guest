@@ -164,7 +164,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
                 items = data["items"] if isinstance(data, dict) else data
                 return {i["id"] for i in items}
 
-            # setup ----------------------------------------------------------------
+            # setup --------------------
             flags = (
                 "ISP_FRANCHISE_ENABLED",
                 "ISP_ZONE_AUTODEBIT_ENABLED",
@@ -269,7 +269,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
             assert (await wallet(z1))["balance_paise"] == 50000
             assert await autodebits(z1) == []
 
-            # percent plan: ISP keeps 70 % ------------------------------------------
+            # percent plan: ISP keeps 70 % --------------------
             await call("PUT", f"/franchise/zones/{z1}/share", {"mode": "percent"})
             inv = (await renew(s1, f"k1-{tag}"))["invoice"]
             debit = inv["total_paise"] * 7000 // 10000
@@ -294,7 +294,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
             kinds = [a.kind for a in await autodebits(z1)]
             assert kinds == ["debit", "reversal"]
 
-            # wholesale plan ---------------------------------------------------------
+            # wholesale plan --------------------
             await call(
                 "PUT",
                 f"/franchise/zones/{z1}/share",
@@ -347,7 +347,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
             os.environ["ISP_ZONE_AUTODEBIT_ENABLED"] = "true"
             clear()
 
-            # zone without a plan stays untouched ---------------------------------
+            # zone without a plan stays untouched --------------------
             await renew(s2, f"m1-{tag}")
             assert await autodebits(z2) == []
 
@@ -365,7 +365,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
             assert inv["number"] not in nums and len(rev["items"]) == 4
             assert rev["totals"]["auto_net_paise"] == 110000
 
-            # recurring charges --------------------------------------------------------
+            # recurring charges --------------------
             ch = await call(
                 "POST",
                 f"/franchise/zones/{z1}/charges",
@@ -382,7 +382,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
             assert (await wallet(z1))["balance_paise"] == -65000
             await call("PATCH", f"/franchise/charges/{ch['id']}", {"active": False})
 
-            # settlement ----------------------------------------------------------------
+            # settlement --------------------
             st = await call(
                 "POST",
                 f"/franchise/zones/{z1}/settlements",
@@ -413,7 +413,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
                 ).scalar_one()
             assert plan.below_min_since is not None and plan.alerted_at is None
 
-            # another ISP sees none of it ---------------------------------------------
+            # another ISP sees none of it --------------------
             as_("B")
             for method, path in (
                 ("PUT", f"/franchise/zones/{z1}/share"),
