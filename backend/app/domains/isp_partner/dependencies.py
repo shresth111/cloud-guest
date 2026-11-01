@@ -106,6 +106,7 @@ async def RequireIspPartner(
     user: AuthUser = Depends(CurrentUser),
     rbac_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     repository: IspRepository = Depends(get_isp_repository),
+    request: Request = None,  # type: ignore[assignment]  # ZONE-1 scope_zone_id
 ) -> IspContext:
     user_id = uuid.UUID(str(user.id))
     assignments = await RoleResolver(rbac_repository).get_active_assignments(user_id)
@@ -154,7 +155,7 @@ async def RequireIspPartner(
         scope_ids = await repository.confined_customer_ids(isp_org_id, user_id)
         confined = frozenset(scope_ids) if scope_ids else None
 
-    return IspContext(
+    ctx = IspContext(
         isp_org_id=isp_org_id,
         user_id=user_id,
         role_slug=chosen.role.slug,
@@ -164,6 +165,11 @@ async def RequireIspPartner(
         profile=profile,
         repository=repository,
     )
+    # ZONE-1: optional ``scope_zone_id`` narrows (never widens) the context;
+    # a no-op unless ISP_ZONES_ENABLED is on and the param is sent.
+    from .zones_scope import apply_zone_scope
+
+    return await apply_zone_scope(ctx, request)
 
 
 def isp_guards(permission_key: str) -> list[Any]:
