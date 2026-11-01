@@ -543,7 +543,26 @@ class IspSubscriber360Service:
             timeline=await self.timeline(s),
         )
         base["auth"].update(await auth_slots(self.session, s.id))
+        # LEFTOVERS 4.3: the PPPoE badge from the subscriber's own credential
+        # (read only; PPPoE on and an active, non-deleted credential).
+        base["auth"]["pppoe"] = await self._pppoe_badge(s.id)
         return base
+
+    async def _pppoe_badge(self, subscriber_id: uuid.UUID) -> bool:
+        from .pppoe_config import get_isp_pppoe_settings
+        from .pppoe_models import IspPppoeCredential as C
+
+        if not get_isp_pppoe_settings().enabled:
+            return False
+        return (
+            await self.session.execute(
+                select(C.id).where(
+                    C.subscriber_id == subscriber_id,
+                    C.status == "active",
+                    C.is_deleted.is_(False),
+                )
+            )
+        ).first() is not None
 
     # ------------------------------------------------------------------
     # actions (J1)
