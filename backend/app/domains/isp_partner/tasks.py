@@ -284,6 +284,16 @@ async def _retry_steps(redis: Any, summary: dict) -> None:
         summary,
     )
 
+    # 7. SMALL-3 win-back saves (no network; one ISP per transaction inside,
+    #    flag ISP_REVENUE_HUB_ENABLED; a failure never blocks the pass).
+    try:
+        from .winback_service import run_winback_saves
+
+        summary["winback_saved"] = (await run_winback_saves()).get("saved", 0)
+    except Exception:  # noqa: BLE001 -- logged, the pass goes on
+        summary["errors"] = summary.get("errors", 0) + 1
+        logger.exception("isp_winback_saves_failed")
+
 
 class _SystemContext:
     """An ``IspContext`` for the daily job: no human actor, no confinement."""

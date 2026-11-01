@@ -50,6 +50,7 @@ from .exceptions import (
     IspSellerGstinInvalidError,
     IspZoneInUseError,
     IspZoneNotFoundError,
+    _err,
 )
 from .gst import (
     INVOICE_PREFIX,
@@ -97,6 +98,24 @@ SETTINGS_FIELDS = (
     "coupon_invoice_on_activation",
     "reminder_days_before_expiry",
     "invoice_footer",
+)
+# SMALL-3 fix: plan columns that may never be null (PUT /billing/customers/{id}/plan)
+PLAN_NOT_NULL = (
+    "plan_name",
+    "amount_paise",
+    "price_includes_gst",
+    "billing_cycle",
+    "anchor_day",
+    "next_invoice_date",
+    "gst_applicable",
+    "active",
+)
+DEFAULT_PLAN_CYCLE = "monthly"
+IspPlanFieldRequiredError = _err(
+    "IspPlanFieldRequiredError",
+    "ISP_PLAN_FIELD_REQUIRED",
+    422,
+    "Required plan field missing",
 )
 PLAN_FIELDS = (
     "plan_name",
@@ -353,6 +372,20 @@ class IspBillingService:
         if data.get("buyer_gstin") and not gstin_valid(data["buyer_gstin"]):
             raise IspBuyerGstinInvalidError()
         row = await self.plan(isp, isp_customer_id)
+        # SMALL-3 fix: a NOT NULL plan field sent as null, or missing when the
+        # plan is first created, was a 500 (IntegrityError). Now: an omitted
+        # field keeps its current value; explicit null -> 422; a new plan
+        # takes billing_cycle 'monthly' and needs plan_name + amount_paise.
+        nulls = sorted(k for k in PLAN_NOT_NULL if k in data and data[k] is None)
+        if row is None:
+            data = {**data}
+            if data.get("billing_cycle") is None and "billing_cycle" not in nulls:
+                data["billing_cycle"] = DEFAULT_PLAN_CYCLE
+            nulls += sorted(k for k in ("plan_name", "amount_paise") if k not in data)
+        if nulls:
+            raise IspPlanFieldRequiredError(
+                f"These plan fields are required: {', '.join(nulls)}"
+            )
         if row is None:
             row = IspCustomerBilling(
                 customer_organization_id=isp_customer_id,
