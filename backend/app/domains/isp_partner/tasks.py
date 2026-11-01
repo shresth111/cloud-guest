@@ -163,6 +163,15 @@ async def _retry_async() -> dict[str, int]:
                     await run_queued_renewals(session)
             except Exception:  # noqa: BLE001
                 logger.exception("isp_queued_renewals_failed")
+            # REFERRAL-1: earn on the referred subscriber's first paid bill,
+            # credit the referrer's next bill (off unless ISP_REFERRALS_ENABLED).
+            try:
+                from .referrals_service import run_referrals
+
+                async with session.begin_nested():
+                    await run_referrals(session)
+            except Exception:  # noqa: BLE001
+                logger.exception("isp_referrals_failed")
             # APPS-2: scheduled announcements + helpdesk escalations.
             try:
                 from .apps2_tasks import run_apps_frequent

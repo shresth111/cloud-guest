@@ -396,3 +396,35 @@ ROLES = tuple(
     for r in ROLES
 )
 ROLES_BY_SLUG = {r.slug: r for r in ROLES}
+
+
+# -- REFERRAL-1: referral credits (/isp/referrals, behind
+# ISP_REFERRALS_ENABLED). "manage" = the per-ISP reward settings.
+_REFERRAL_GRANTS: dict[str, str] = {
+    IspRole.OWNER.value: "read create manage",
+    IspRole.ADMIN.value: "read create manage",
+    IspRole.NOC.value: "read",
+    IspRole.TECHNICIAN.value: "read create",
+    IspRole.BILLING.value: "read create",
+    IspRole.VIEWER.value: "read",
+}
+PERMISSION_GROUPS = (
+    *PERMISSION_GROUPS,
+    IspPermissionGroup(
+        key="isp_referrals",
+        name="ISP Referrals",
+        actions=("read", "create", "manage"),
+        sort_order=1020,
+    ),
+)
+ROLES = tuple(
+    IspRoleDefinition(
+        slug=r.slug,
+        name=r.name,
+        description=r.description,
+        permission_keys=r.permission_keys
+        + _keys(isp_referrals=_REFERRAL_GRANTS[r.slug]),
+    )
+    for r in ROLES
+)
+ROLES_BY_SLUG = {r.slug: r for r in ROLES}

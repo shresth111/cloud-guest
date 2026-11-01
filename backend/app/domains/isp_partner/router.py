@@ -1176,5 +1176,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(queued_renewal_router)
 
+    # REFERRAL-1: /isp/referrals, behind ISP_REFERRALS_ENABLED.
+    from .referrals_router import referrals_router
+
+    isp_partner_router.include_router(referrals_router)
+
 
 _include_lanes()
