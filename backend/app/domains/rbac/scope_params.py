@@ -150,6 +150,57 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "variable_id",
         "version_id",
         "zone_id",
+        # -- ISP partner console (SCOPE-FIX 2026-11-01) -----------------------
+        # Every /isp route runs RequirePermission against the ISP organization
+        # (the header) and RequireIspPartner; the handler then loads the row
+        # by id and rejects it unless isp_organization_id is the caller's ISP
+        # and its customer passes IspScope.assert_customer (confinement). None
+        # of these names a scope dimension RBAC could compare, which is why
+        # isp_customer_id / isp_location_id / isp_router_id above are listed
+        # here too rather than aliased.
+        #
+        # J16 Apps: ISP-wide records (isp_organization_id check; the write
+        # routes need isp_apps.manage, which only the unconfinable owner/admin
+        # roles hold) ...
+        "announcement_id",
+        "discount_id",
+        "item_id",
+        "type_id",
+        "vendor_id",
+        # Inventory stock location (warehouse / office / technician bag) --
+        # NOT a venue location; deliberately not spelled location_id.
+        "stock_location_id",
+        # ... and customer-bound ones (isp org + assert_customer, a
+        # customer-less task/lead is visible to unconfined staff only).
+        "checkout_id",
+        "lead_id",
+        "task_id",
+        "unit_id",
+        # A list filter on staff; the list itself stays confined.
+        "assignee_user_id",
+        # Child rows reached through a scoped subscriber_id in the same path
+        # (row.subscriber_id must equal the resolved subscriber).
+        "binding_id",
+        "document_id",
+        # Fiber plant: isp org + customer visibility (shared plant visible to
+        # all; another customer's node 404s for a confined caller).
+        "fiber_node_id",
+        "parent_id",
+        # JAZE-4 finance: products are ISP-wide; a lease resolves its customer
+        # through IspScope.
+        "lease_id",
+        "product_id",
+        # PPPoE session: isp org + assert_customer before the kick.
+        "pppoe_session_id",
+        # /finance/contacts/{subject_kind}/{subject_id}: a customer org id OR
+        # a subscriber id depending on subject_kind. Not aliased: as an
+        # ORGANIZATION alias the permission check would run against the
+        # customer org, where ISP staff hold no role (every call would 403),
+        # and for subject_kind=subscriber it would compare a subscriber id as
+        # if it were an org. The handler validates it explicitly instead:
+        # IspScope.assert_customer (customer) or subscriber_in_scope
+        # (subscriber), before any read or write.
+        "subject_id",
     }
 )
 

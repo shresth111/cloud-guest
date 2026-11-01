@@ -803,6 +803,13 @@ class Apps2Service:
                 or d.isp_organization_id != isp.isp_org_id
             ):
                 raise IspAppsNotFoundError("TR-069 device not found")
+            if d.customer_organization_id is not None:
+                # SCOPE-FIX: a confined caller may not link a device of a
+                # customer outside their list (same 404 as a foreign id).
+                try:
+                    await IspScope.assert_customer(isp, d.customer_organization_id)
+                except Exception:  # noqa: BLE001
+                    raise IspAppsNotFoundError("TR-069 device not found") from None
             if (
                 u.customer_organization_id is not None
                 and d.customer_organization_id is not None
