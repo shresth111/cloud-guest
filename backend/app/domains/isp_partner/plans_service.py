@@ -1788,7 +1788,12 @@ class IspPlansService:
         package = await self.package(isp, data["package_id"])
         if package.status != "active":
             raise IspPackageDisabledError()
-        if package.price_paise <= 0:
+        # ADDENDUM_05 J2: a per-subscriber override price (set only by the
+        # Subscriber 360 renew path; absent everywhere else = unchanged).
+        price_paise = data.get("price_override_paise")
+        if price_paise is None:
+            price_paise = package.price_paise
+        if price_paise <= 0:
             # no invoice => nothing to key idempotency on; free extensions
             # go through PATCH valid_until instead
             raise IspPackageNeedsPriceError()
@@ -1820,7 +1825,7 @@ class IspPlansService:
             lines=[
                 {
                     "description": package.name,
-                    "amount_paise": package.price_paise,
+                    "amount_paise": price_paise,
                     "price_includes_gst": package.price_includes_gst,
                     "period_from": _local_date(start, tz),
                     "period_to": _local_date(end, tz),
