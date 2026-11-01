@@ -14,8 +14,8 @@ rows are never touched.
 
 Downgrade drops both.
 
-Revision ID: 0145_create_aruba_access_points
-Revises: 0144_create_location_speed_gateways
+Revision ID: 0176_create_aruba_access_points
+Revises: 0175_create_location_speed_gateways
 Create Date: 2026-10-04
 """
 
@@ -26,8 +26,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0145_create_aruba_access_points"
-down_revision = "0144_create_location_speed_gateways"
+revision = "0176_create_aruba_access_points"
+down_revision = "0175_create_location_speed_gateways"
 branch_labels = None
 depends_on = None
 

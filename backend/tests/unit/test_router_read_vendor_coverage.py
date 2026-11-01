@@ -311,6 +311,7 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "The public address of routers that already exported flow records, "
         "for the IPDR's derived Translated IP. Rows are decided by "
         "traffic_flow_records; nothing is polled, pushed or judged."
+    ),
     # -- network integration ------------------------------------------------
     "app/domains/network_integration/client_hooks.py::location_has_nas_only_access_points": (  # noqa: E501
         "A vendor question, not a fleet count: it asks whether this location "

@@ -8,8 +8,8 @@ rows behaves exactly as before (see ``app.domains.guest.ssid_tiers``).
 
 Downgrade drops the table.
 
-Revision ID: 0143_create_location_ssid_tiers
-Revises: 0142_create_instant_on_poller_tables
+Revision ID: 0174_create_location_ssid_tiers
+Revises: 0173_login_funnel_stage_tracking
 Create Date: 2026-10-03
 """
 
@@ -18,8 +18,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0143_create_location_ssid_tiers"
-down_revision = "0142_create_instant_on_poller_tables"
+revision = "0174_create_location_ssid_tiers"
+down_revision = "0173_login_funnel_stage_tracking"
 branch_labels = None
 depends_on = None
 

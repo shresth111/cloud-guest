@@ -4,8 +4,8 @@ Adds nullable ``radius_nas_clients.last_request_at`` / ``last_accounting_at``,
 stamped only by the shared Aruba listener. Every existing row stays NULL;
 nothing about MikroTik or Omada NAS rows changes.
 
-Revision ID: 0146_add_radius_nas_last_activity
-Revises: 0145_create_aruba_access_points
+Revision ID: 0177_add_radius_nas_last_activity
+Revises: 0176_create_aruba_access_points
 Create Date: 2026-10-04
 """
 
@@ -13,8 +13,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0146_add_radius_nas_last_activity"
-down_revision = "0145_create_aruba_access_points"
+revision = "0177_add_radius_nas_last_activity"
+down_revision = "0176_create_aruba_access_points"
 branch_labels = None
 depends_on = None
 
