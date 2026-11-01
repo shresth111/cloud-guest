@@ -119,6 +119,9 @@ class IspStaffCustomerScope(BaseModel):
 # FRANCHISE-2: registers the renewal auto-debit before_flush listener in every
 # process that loads the models (API and Celery). No-op unless
 # ISP_ZONE_AUTODEBIT_ENABLED is on.
+# ENFORCE-1: registers the JAZE-2 PPPoE gate + rate resolver into pppoe_hooks.
+# No-op unless ISP_PARTNER_ENFORCEMENT_ENABLED is on.
+from . import enforcement_pppoe as _enforcement_pppoe_hooks  # noqa: E402,F401
 from . import franchise_service as _franchise_hook  # noqa: E402,F401
 from .apps2_models import *  # noqa: E402,F403  (APPS-2)
 from .apps_models import *  # noqa: E402,F403  (J16 Apps)

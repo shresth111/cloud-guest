@@ -434,6 +434,25 @@ async def compute_usage(
                 )
             )
         ).one()
+    # ENFORCE-1: PPPoE sessions count too (JAZE-6 stores cumulative totals,
+    # max() of every interim/stop, so a retransmitted or missing interim never
+    # double counts; a session's final total arrives with its Stop record).
+    from .pppoe_models import IspPppoeSession
+
+    p_down, p_up = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(IspPppoeSession.bytes_downloaded), 0),
+                func.coalesce(func.sum(IspPppoeSession.bytes_uploaded), 0),
+            ).where(
+                IspPppoeSession.subscriber_id == subscriber.id,
+                IspPppoeSession.is_deleted.is_(False),
+                IspPppoeSession.started_at >= start,
+                IspPppoeSession.started_at < end,
+            )
+        )
+    ).one()
+    down, up = int(down) + int(p_down), int(up) + int(p_up)
     row.used_down_bytes, row.used_up_bytes = int(down), int(up)
     row.last_computed_at = now
     was = bool(row.throttled)

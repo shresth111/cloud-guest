@@ -813,3 +813,47 @@ async def delete_ip_binding(
 
 
 __all__ = ["enforcement_router"]
+
+
+# --------------------------------------------------------------------------
+# ENFORCE-1: accounting interims for the partner setup script
+# --------------------------------------------------------------------------
+
+#: Appended to the partner router setup script (FE ``setup-extra-chunks``),
+#: before the TR-069 step. FUP counts only what the router reports; RouterOS
+#: hotspot profiles default to ``received`` (wait for a RADIUS interval), so
+#: this pins 5 minutes on every RADIUS-enabled hotspot profile of THIS router.
+#: PPPoE gets the same interval from the JAZE-6 PPPoE script (``/ppp aaa``).
+ACCOUNTING_CHUNK = (
+    "# Wyfy Guest: report usage to RADIUS every 5 minutes (needed for data limits)\n"
+    "/ip hotspot profile set [find use-radius=yes] radius-interim-update=5m\n"
+)
+
+
+@enforcement_router.get(
+    "/routers/{isp_router_id}/enforcement-script",
+    dependencies=isp_guards("isp_partner.read"),
+)
+async def enforcement_setup_chunk(
+    request: Request,
+    isp_router_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+) -> dict:
+    """The accounting-interval chunk for this router's setup script. 404
+    while ``ISP_PARTNER_ENFORCEMENT_ENABLED`` is off, so the script is
+    byte-identical to today's until enforcement is switched on."""
+    if not get_isp_partner_settings().enforcement_enabled:
+        from .exceptions import _err
+
+        raise _err(
+            "IspEnforcementOffError", "ISP_ENFORCEMENT_DISABLED", 404, "Not Found"
+        )()
+    await IspScope.assert_router(isp, isp_router_id)
+    return ok(
+        request,
+        {
+            "label": "Usage reporting every 5 minutes (for data limits)",
+            "script": ACCOUNTING_CHUNK,
+        },
+        "Enforcement setup chunk",
+    )
