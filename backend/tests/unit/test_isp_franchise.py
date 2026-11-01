@@ -99,7 +99,7 @@ def test_routes_guarded_and_flag_gated() -> None:
         names = {getattr(d, "__name__", type(d).__name__) for d in deps}
         assert RequireFranchiseEnabled in deps, r.path
         assert {"RequireIspPartner", "RejectLocationRouterHeaders"} <= names, r.path
-    assert len(franchise_router.routes) == 10
+    assert len(franchise_router.routes) == 11  # + FINISH settlement invoice
 
 
 def test_hook_is_registered_by_the_models_module() -> None:
