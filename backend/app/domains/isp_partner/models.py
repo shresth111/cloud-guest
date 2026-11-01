@@ -116,6 +116,10 @@ class IspStaffCustomerScope(BaseModel):
 
 # Registered on the same metadata via this module, which alembic/env.py
 # already imports (E2), so 1b needs no further registration line.
+# FRANCHISE-2: registers the renewal auto-debit before_flush listener in every
+# process that loads the models (API and Celery). No-op unless
+# ISP_ZONE_AUTODEBIT_ENABLED is on.
+from . import franchise_service as _franchise_hook  # noqa: E402,F401
 from .apps2_models import *  # noqa: E402,F403  (APPS-2)
 from .apps_models import *  # noqa: E402,F403  (J16 Apps)
 from .bill2_models import *  # noqa: E402,F403  (BILL-2)
@@ -132,6 +136,7 @@ from .compliance_models import *  # noqa: E402,F403
 from .enforcement_models import *  # noqa: E402,F403
 from .fiber_models import *  # noqa: E402,F403  (J22 fiber registry)
 from .finance_models import *  # noqa: E402,F403  (JAZE-4)
+from .franchise_models import *  # noqa: E402,F403  (FRANCHISE-2)
 from .package_meta_models import *  # noqa: E402,F403  (PKG-2)
 from .plans_models import *  # noqa: E402,F403
 from .pppoe_models import *  # noqa: E402,F403
