@@ -3,8 +3,8 @@
 Additive: three new ISP-owned tables. ``isp_message_log`` (JAZE-4) is not
 altered. ``downgrade`` drops exactly these three.
 
-Revision ID: 0184_isp_comms_hub
-Revises: 0183_isp_zone_branding
+Revision ID: 0185_isp_comms_hub
+Revises: 0184_isp_apps_2
 Create Date: 2026-11-01
 """
 
@@ -15,8 +15,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0184_isp_comms_hub"
-down_revision = "0183_isp_zone_branding"
+revision = "0185_isp_comms_hub"
+down_revision = "0184_isp_apps_2"
 branch_labels = None
 depends_on = None
 
