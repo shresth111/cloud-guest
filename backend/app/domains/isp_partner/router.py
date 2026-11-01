@@ -1007,6 +1007,13 @@ def _include_lanes() -> None:
     from .plans_router import plans_router
 
     isp_partner_router.include_router(plans_router)
+    # JAZE-2 (ADDENDUM_05 J3/J8/J13/J20/J21): package policy, FUP, MAC/IP
+    # bindings, static IP, router health, TR-069 tiles.
+    from .enforcement_router import enforcement_router
+    from .network_router import network_router
+
+    isp_partner_router.include_router(enforcement_router)
+    isp_partner_router.include_router(network_router)
     # Phase 2c: the venue twins (the customer dashboard's own feature set,
     # ISP-gated). One table row per endpoint -- see ``twins.py``.
     mount_twins(isp_partner_router, ALL_TWINS)

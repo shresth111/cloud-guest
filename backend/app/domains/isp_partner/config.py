@@ -45,6 +45,25 @@ class IspPartnerSettings(BaseSettings):
         default="https://network.wyfyguest.com",
         description="ISP_PARTNER_LOGIN_URL, shown with a new ISP user's password.",
     )
+    enforcement_enabled: bool = Field(
+        default=False,
+        description=(
+            "ISP_PARTNER_ENFORCEMENT_ENABLED (JAZE-2). Off by default: package "
+            "FUP / night boost / MAC, IP, concurrency and timeout rules are "
+            "stored and shown but never applied, and the RADIUS rate is "
+            "exactly the package speed group's."
+        ),
+    )
+    enforcement_live_mode: str = Field(
+        default="next_auth",
+        pattern="^(next_auth|reauth)$",
+        description=(
+            "ISP_PARTNER_ENFORCEMENT_LIVE_MODE. next_auth: a speed change (FUP "
+            "throttle, boost window) applies at the session's next RADIUS "
+            "authorize. reauth: the sweep ends the live session so the router "
+            "re-authorizes it at once (CoA does not work on this estate)."
+        ),
+    )
 
 
 @lru_cache(maxsize=1)

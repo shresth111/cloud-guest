@@ -99,17 +99,18 @@ class IspRateLimitLookup:
         if row is None:
             return False, None
         batch, voucher = row
+        subscriber = None
         if voucher.redeemed_identifier:
-            sub = (
+            subscriber = (
                 await session.execute(
-                    select(IspSubscriber.status).where(
+                    select(IspSubscriber).where(
                         IspSubscriber.customer_organization_id == organization_id,
                         IspSubscriber.identifier == voucher.redeemed_identifier,
                         IspSubscriber.is_deleted.is_(False),
                     )
                 )
             ).scalar_one_or_none()
-            if sub == "disabled":
+            if subscriber is not None and subscriber.status == "disabled":
                 return False, None
         profile = (
             (
@@ -135,6 +136,18 @@ class IspRateLimitLookup:
         )
         if profile is None:
             return False, None
+        # JAZE-2: FUP fallback / night boost / queue priority (no-op while
+        # ISP_PARTNER_ENFORCEMENT_ENABLED is off or the package has no policy).
+        from .enforcement import effective_rate_override
+
+        overridden, rate = await effective_rate_override(
+            session,
+            package_id=batch.package_id,
+            subscriber=subscriber,
+            organization_id=organization_id,
+        )
+        if overridden:
+            return True, rate
         if not profile.download_rate_kbps and not profile.upload_rate_kbps:
             return True, None  # 0/0 = unlimited, matching existing semantics
         return True, format_mikrotik_rate_limit(profile)

@@ -29,6 +29,7 @@ logger = get_logger(__name__)
 
 TASK_ISP_SERVICE_RETRY = "app.domains.isp_partner.tasks.retry_pending_service_actions"
 TASK_ISP_BILLING_DAILY = "app.domains.isp_partner.tasks.run_isp_billing_daily"
+TASK_ISP_ENFORCEMENT_SWEEP = "app.domains.isp_partner.tasks.run_isp_enforcement_sweep"
 
 
 def _build_services(session: Any, redis: Any) -> dict[str, Any]:
@@ -290,9 +291,48 @@ def run_isp_billing_daily() -> dict[str, int]:
     return summary
 
 
+async def _enforcement_async() -> dict[str, int]:
+    """JAZE-2 minute sweep (enforcement_sweep.py). Does nothing unless both
+    ISP_PARTNER_ENABLED and ISP_PARTNER_ENFORCEMENT_ENABLED are on."""
+    from app.database.redis import create_redis_client
+    from app.database.session import SessionLocal
+
+    from .enforcement_sweep import run_sweep
+
+    settings = get_isp_partner_settings()
+    if not (settings.enabled and settings.enforcement_enabled):
+        return {"skipped": 1}
+    redis = create_redis_client()
+    try:
+        async with SessionLocal() as session:
+            guest_service = _build_services(session, redis)["control"].guest_service
+
+            async def _disconnect(session_id, organization_id, reason):  # noqa: ANN001, ANN202
+                return await guest_service.disconnect_session(
+                    session_id=session_id,
+                    requesting_organization_id=organization_id,
+                    reason=f"isp_enforcement:{reason}",
+                )
+
+            summary = await run_sweep(session, disconnect=_disconnect)
+            await session.commit()
+            return summary
+    finally:
+        await redis.aclose()
+
+
+@celery_app.task(name=TASK_ISP_ENFORCEMENT_SWEEP)
+def run_isp_enforcement_sweep() -> dict[str, int]:
+    summary = run_celery_task(_enforcement_async())
+    logger.info("isp_enforcement_sweep_completed", extra={"isp": summary})
+    return summary
+
+
 __all__ = [
     "TASK_ISP_BILLING_DAILY",
+    "TASK_ISP_ENFORCEMENT_SWEEP",
     "TASK_ISP_SERVICE_RETRY",
     "retry_pending_service_actions",
     "run_isp_billing_daily",
+    "run_isp_enforcement_sweep",
 ]
