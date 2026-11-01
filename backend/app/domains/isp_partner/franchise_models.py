@@ -153,8 +153,11 @@ class IspZoneSettlement(BaseModel):
     snapshot: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+    #: FINISH (0188): the GST tax invoice issued for this settlement.
+    invoice_id: Mapped[uuid.UUID | None] = _fk("isp_invoices.id", nullable=True)
 
     __table_args__ = (
+        Index("ix_isp_zone_settlements_invoice", "invoice_id"),
         Index(
             "uq_isp_zone_settlements_number",
             "isp_organization_id",

@@ -237,6 +237,12 @@ class IspBillingService:
         inv = await self.session.get(IspInvoice, invoice_id)
         if inv is None or inv.is_deleted or inv.isp_organization_id != isp.isp_org_id:
             raise IspInvoiceNotFoundError()
+        if inv.bill_to_kind == "zone":
+            # FINISH: a zone's tax invoice is ISP-wide (no customer); a
+            # confined or zone-scoped caller does not see it.
+            if isp.confined_customer_ids is not None:
+                raise IspInvoiceNotFoundError()
+            return inv
         try:
             await IspScope.assert_customer(isp, inv.customer_organization_id)
         except IspCustomerNotFoundError:
@@ -739,6 +745,8 @@ class IspBillingService:
 
     async def _apply_credit(self, isp: IspContext, inv: IspInvoice) -> None:
         """Advances/overpayments (``unallocated_paise``) auto-apply on issue."""
+        if inv.bill_to_kind == "zone":
+            return  # FINISH: a zone pays through its wallet, never an advance
         credits = (
             (
                 await self.session.execute(
@@ -1281,6 +1289,7 @@ class IspBillingService:
         package: dict | None = None,
     ) -> dict:
         is_sub = inv.bill_to_kind == "subscriber"
+        is_zone = inv.bill_to_kind == "zone"
         if is_sub and subscriber is None:
             subscriber = {
                 "id": str(inv.subscriber_id),
@@ -1300,14 +1309,16 @@ class IspBillingService:
             "bill_to_kind": inv.bill_to_kind,
             "subscriber": subscriber if is_sub else None,
             "customer": None
-            if is_sub
+            if is_sub or is_zone
             else {
                 "isp_customer_id": str(inv.customer_organization_id),
                 "name": customer_name or inv.bill_to_name,
                 "contact_phone": contact_phone,
             },
             # subscriber rows: the venue (ISP customer) the subscriber is at
-            "isp_customer_id": str(inv.customer_organization_id),
+            "isp_customer_id": str(inv.customer_organization_id)
+            if inv.customer_organization_id
+            else None,
             "customer_name": customer_name or inv.bill_to_name,
             "overdue": overdue,
             "zone": zone,
@@ -1490,11 +1501,21 @@ class IspBillingService:
             .scalars()
             .all()
         )
-        customer = await isp.repository.get_organization(inv.customer_organization_id)
-        overdue_ids = {
-            i.id
-            for i in await self.overdue_invoices(isp, [inv.customer_organization_id])
-        }
+        customer = (
+            await isp.repository.get_organization(inv.customer_organization_id)
+            if inv.customer_organization_id
+            else None
+        )
+        overdue_ids = (
+            {
+                i.id
+                for i in await self.overdue_invoices(
+                    isp, [inv.customer_organization_id]
+                )
+            }
+            if inv.customer_organization_id
+            else set()
+        )
         subs, packages = await self.row_extras([inv])
         view = self.invoice_row(
             inv,
