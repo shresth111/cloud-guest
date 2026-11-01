@@ -256,6 +256,7 @@ class IspQueuedRenewalService:
                 "payment": data.get("payment"),
                 "po_number": data.get("po_number"),
                 "idempotency_key": key,
+                "discount_code": data.get("discount_code"),
             },
         )
         # the only change against a plain renew: today's plan keeps running

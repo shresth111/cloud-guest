@@ -681,6 +681,21 @@ class IspBillingService:
         intra = pos == settings.state_code
         taxes: list[LineTax] = []
         for line in lines:
+            if line.get("discount_paise"):
+                # DISCOUNT-WIRE: a pre-tax reduction (GST on gross - discount)
+                from .discount_wire import line_tax_after_discount
+
+                taxes.append(
+                    line_tax_after_discount(
+                        int(line["amount_paise"]) * int(line.get("quantity", 1)),
+                        int(line["discount_paise"]),
+                        includes_gst=bool(line.get("price_includes_gst", False)),
+                        gst_applied=gst_applied,
+                        rate_bp=settings.gst_rate_bp,
+                        intra_state=intra,
+                    )
+                )
+                continue
             taxes.append(
                 compute_line(
                     int(line["amount_paise"]) * int(line.get("quantity", 1)),
@@ -755,6 +770,8 @@ class IspBillingService:
                     period_from=line.get("period_from"),
                     period_to=line.get("period_to"),
                     package_id=line.get("package_id"),
+                    discount_paise=int(line.get("discount_paise") or 0),
+                    discount_label=line.get("discount_label"),
                 )
             )
         await self.session.flush()
@@ -1584,6 +1601,9 @@ class IspBillingService:
                 # QA #16: same dates under the invoice's key names
                 "period_start": iso(li.period_from),
                 "period_end": iso(li.period_to),
+                # DISCOUNT-WIRE: pre-tax discount on this line (0 = none)
+                "discount_paise": li.discount_paise,
+                "discount_label": li.discount_label,
                 "package_id": str(li.package_id) if li.package_id else None,
             }
             for li in lines

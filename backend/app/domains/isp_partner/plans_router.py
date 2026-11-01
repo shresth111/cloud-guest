@@ -197,6 +197,8 @@ class RechargeRequest(_Body):
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=64)
     # BILL-2: renew for N cycles in one invoice (ISP_BILL2_ENABLED; 1 = as before).
     cycles: int = Field(default=1, ge=1, le=12)
+    # DISCOUNT-WIRE: a JAZE-5 code (ISP_DISCOUNT_APPLY_ENABLED; else 422).
+    discount_code: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 # ---------------------------------------------------------------------------

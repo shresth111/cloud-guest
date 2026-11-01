@@ -184,6 +184,9 @@ class BillingChoice(_Body):
     issue_invoice: bool = False
     paid_now: bool = False
     payment: OnboardPayment | None = None
+    # DISCOUNT-WIRE: a JAZE-5 code on the first invoice
+    # (ISP_DISCOUNT_APPLY_ENABLED; else 422, step "invoice").
+    discount_code: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class OnboardingRequest(_Body):
@@ -552,25 +555,35 @@ async def _first_invoice(
     end = s.valid_until
     start = end - timedelta(days=package.validity_days)
     billing = plans._billing()
+    line = {
+        "description": package.name,
+        "amount_paise": int(price),
+        "price_includes_gst": package.price_includes_gst,
+        "period_from": _local_date(start, tz),
+        "period_to": _local_date(end, tz),
+        "package_id": package.id,
+    }
+    quote = None
+    if req.discount_code:
+        from .discount_wire import apply_to_line
+
+        quote = await apply_to_line(
+            plans.session, isp, billing, line, req.discount_code, package_id=package.id
+        )
     inv = await billing.issue_subscriber_invoice(
         isp,
         s,
-        lines=[
-            {
-                "description": package.name,
-                "amount_paise": int(price),
-                "price_includes_gst": package.price_includes_gst,
-                "period_from": _local_date(start, tz),
-                "period_to": _local_date(end, tz),
-                "package_id": package.id,
-            }
-        ],
+        lines=[line],
         invoice_kind="recharge",
         period_start=_local_date(start, tz),
         period_end=_local_date(end, tz),
         description=package.name,
         source_key=f"onboard:{s.id}",
     )
+    if quote is not None:
+        from .discount_wire import record as record_discount
+
+        await record_discount(plans.session, quote, inv, s)
     payment = None
     if req.paid_now and billing_balance(inv) > 0:
         payment = await billing.record_payment(

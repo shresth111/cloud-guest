@@ -184,7 +184,18 @@ def render_invoice_pdf(
         )
         body.append(
             [
-                Paragraph(escape(str(li["description"] or "")), styles["Normal"]),
+                Paragraph(
+                    escape(str(li["description"] or ""))
+                    + (
+                        # DISCOUNT-WIRE: the pre-tax discount, printed on its line
+                        "<br/>Less "
+                        + escape(str(li.get("discount_label") or "discount"))
+                        + f": -{rupees(li['discount_paise'])}"
+                        if li.get("discount_paise")
+                        else ""
+                    ),
+                    styles["Normal"],
+                ),
                 li["sac_code"],
                 period,
                 rupees(li["taxable_paise"]),
