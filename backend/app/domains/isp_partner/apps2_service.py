@@ -775,6 +775,17 @@ class Apps2Service:
             self.session.add(loc)
         else:
             loc = await self._location(isp, location_id)
+            # P3-SWEEP (edit UI): an explicit null on a required column was a
+            # NOT NULL 500, and an edit could leave a technician bag without
+            # the technician who carries it. Both are refused as 422.
+            for k in ("name", "kind", "active"):
+                if k in data and data[k] is None:
+                    raise IspAppsInvalidError(f"The location {k} cannot be empty")
+            holder = data.get("holder_user_id", loc.holder_user_id)
+            if data.get("kind", loc.kind) == "technician_bag" and not holder:
+                raise IspAppsInvalidError(
+                    "A technician bag needs the technician who carries it"
+                )
             for k, val in data.items():
                 setattr(loc, k, val)
             loc.updated_by = isp.user_id
