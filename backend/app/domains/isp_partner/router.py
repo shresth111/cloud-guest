@@ -1096,6 +1096,10 @@ def _include_lanes() -> None:
     from .apps_router import apps_router
 
     isp_partner_router.include_router(apps_router)
+    # APPS-2 (ADDENDUM_06): escalation, approvals, vendors/locations, timers.
+    from .apps2_router import apps2_router
+
+    isp_partner_router.include_router(apps2_router)
 
     # JAZE-6 Phase 2b: PPPoE on our RADIUS (behind ISP_PPPOE_ENABLED too).
     from .pppoe_router import pppoe_internal_router, pppoe_router

@@ -125,6 +125,10 @@ class LeadService:
                 target,
                 dropped_reason=data.get("dropped_reason") or lead.dropped_reason,
             )
+            if target != lead.status:
+                from .apps2_service import lead_status_changed
+
+                await lead_status_changed(self.session, lead, before=lead.status)
             lead.status = target
         await self.session.flush()
         return await self.detail(isp, lead.id)
@@ -204,26 +208,9 @@ class LeadService:
         page: int,
         page_size: int,
     ) -> tuple[list[dict], int]:
-        conds: list[Any] = [
-            IspLead.isp_organization_id == isp.isp_org_id,
-            IspLead.is_deleted.is_(False),
-        ]
-        if isp_customer_id is not None:
-            await IspScope.assert_customer(isp, isp_customer_id)
-            conds.append(IspLead.customer_organization_id == isp_customer_id)
-        else:
-            customers = await isp.child_ids()
-            if isp.confined_customer_ids is None:
-                conds.append(
-                    or_(
-                        IspLead.customer_organization_id.in_(customers),
-                        IspLead.customer_organization_id.is_(None),
-                    )
-                )
-            else:
-                if not customers:
-                    return [], 0
-                conds.append(IspLead.customer_organization_id.in_(customers))
+        conds = await self._scope_conds(isp, isp_customer_id)
+        if conds is None:
+            return [], 0
         if status:
             conds.append(IspLead.status == status)
         if assignee_user_id is not None:
@@ -261,19 +248,43 @@ class LeadService:
         )
         return await self.views(rows), total
 
+    async def _scope_conds(
+        self, isp: Any, isp_customer_id: uuid.UUID | None = None
+    ) -> list[Any] | None:
+        """Visibility for lead lists (None = the caller sees no lead)."""
+        conds: list[Any] = [
+            IspLead.isp_organization_id == isp.isp_org_id,
+            IspLead.is_deleted.is_(False),
+        ]
+        if isp_customer_id is not None:
+            await IspScope.assert_customer(isp, isp_customer_id)
+            conds.append(IspLead.customer_organization_id == isp_customer_id)
+            return conds
+        customers = await isp.child_ids()
+        if isp.confined_customer_ids is None:
+            conds.append(
+                or_(
+                    IspLead.customer_organization_id.in_(customers),
+                    IspLead.customer_organization_id.is_(None),
+                )
+            )
+        else:
+            if not customers:
+                return None
+            conds.append(IspLead.customer_organization_id.in_(customers))
+        return conds
+
     async def funnel(self, isp: Any) -> dict[str, int]:
-        items, _ = await self.list(
-            isp,
-            status=None,
-            isp_customer_id=None,
-            assignee_user_id=None,
-            search=None,
-            page=1,
-            page_size=100000,
-        )
+        """APPS-2: one GROUP BY (it used to load every lead to count them)."""
         out = {s.value: 0 for s in LeadStatus}
-        for i in items:
-            out[i["status"]] += 1
+        conds = await self._scope_conds(isp)
+        if conds is None:
+            return out
+        rows = await self.session.execute(
+            select(IspLead.status, func.count()).where(*conds).group_by(IspLead.status)
+        )
+        for status_value, n in rows.all():
+            out[status_value] = int(n)
         return out
 
     async def detail(self, isp: Any, lead_id: uuid.UUID) -> dict:
@@ -292,8 +303,11 @@ class LeadService:
         return view
 
     async def views(self, rows: list[Any]) -> list[dict]:
+        from .apps2_service import lead_sla_views
+
         users = await user_names(self.session, {r.assignee_user_id for r in rows})
         orgs = await org_names(self.session, {r.customer_organization_id for r in rows})
+        sla = await lead_sla_views(self.session, rows)  # APPS-2 timers
         return [
             {
                 "id": r.id,
@@ -318,6 +332,7 @@ class LeadService:
                 "converted_subscriber_id": r.converted_subscriber_id,
                 "converted_at": r.converted_at,
                 "created_at": r.created_at,
+                "sla": sla.get(r.id),
             }
             for r in rows
         ]

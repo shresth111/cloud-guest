@@ -191,6 +191,8 @@ def _ctx(monkeypatch: pytest.MonkeyPatch, *, perms: set[str], pppoe_on: bool = T
         return perms
 
     monkeypatch.setattr(m, "_held", held)
+    # Apps off by default here; the APPS-2 install-task cases switch it on
+    monkeypatch.setattr(m, "_apps_on", lambda: False)
     monkeypatch.setattr(
         m, "get_isp_pppoe_settings", lambda: SimpleNamespace(enabled=pppoe_on)
     )
@@ -338,3 +340,62 @@ async def test_free_package_skips_invoice(monkeypatch: pytest.MonkeyPatch) -> No
     inv = next(s for s in out["data"]["steps"] if s["step"] == "invoice")
     assert inv["status"] == "skipped" and "free" in inv["detail"]
     assert out["data"]["invoice"] is None
+
+
+# --- APPS-2: the install task ---------------------------------------------------
+
+
+async def test_install_task_created_when_apps_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.domains.isp_partner import apps_tasks
+
+    svc, isp, db, audit = _ctx(monkeypatch, perms=ALL)
+    monkeypatch.setattr(m, "_apps_on", lambda: True)
+    svc.plans.sub.first_name, svc.plans.sub.last_name = "Asha", None
+    svc.plans.sub.identifier, svc.plans.sub.address = "flat-101", "12 Lane"
+    seen: list[dict] = []
+
+    async def create(self, isp, data, **kw):  # noqa: ANN001, ANN202
+        seen.append(data)
+        return {
+            "id": "t1",
+            "status": "unclaimed",
+            "subscriber_id": str(data["subscriber_id"]),
+        }
+
+    monkeypatch.setattr(apps_tasks.FieldTaskService, "create", create)
+    out = (await _call(svc, isp, db, audit, {"subscriber": _sub()}))["data"]
+    assert out["task"]["status"] == "unclaimed"
+    assert seen[0]["kind"] == "install" and seen[0]["subscriber_id"] == svc.plans.sub.id
+    assert next(s for s in out["steps"] if s["step"] == "task")["status"] == "done"
+    assert db.commits == 1
+
+
+async def test_install_task_failure_rolls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.domains.isp_partner import apps_tasks
+
+    svc, isp, db, audit = _ctx(monkeypatch, perms=ALL)
+    monkeypatch.setattr(m, "_apps_on", lambda: True)
+    svc.plans.sub.first_name = svc.plans.sub.last_name = None
+    svc.plans.sub.identifier, svc.plans.sub.address = "flat-101", None
+
+    async def boom(self, isp, data, **kw):  # noqa: ANN001, ANN202
+        raise IspBadRequestError("task store down")
+
+    monkeypatch.setattr(apps_tasks.FieldTaskService, "create", boom)
+    with pytest.raises(m.IspOnboardStepError) as ei:
+        await _call(svc, isp, db, audit, {"subscriber": _sub()})
+    assert ei.value.data["step"] == "task" and db.commits == 0
+
+
+async def test_install_task_skipped_on_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc, isp, db, audit = _ctx(monkeypatch, perms=ALL)
+    monkeypatch.setattr(m, "_apps_on", lambda: True)
+    out = (
+        await _call(
+            svc, isp, db, audit, {"subscriber": _sub(), "create_install_task": False}
+        )
+    )["data"]
+    assert out["task"] is None
+    assert next(s for s in out["steps"] if s["step"] == "task")["status"] == "skipped"

@@ -105,6 +105,12 @@ def get_onboard_settings() -> IspOnboardSettings:
     return IspOnboardSettings()
 
 
+def _apps_on() -> bool:
+    from .apps_common import get_isp_apps_settings
+
+    return get_isp_apps_settings().enabled
+
+
 class IspOnboardStepError(IspError):
     """One onboarding step failed; the whole transaction is rolled back.
     Keeps the original status, message and ``data`` (so ``data.code`` maps
@@ -188,6 +194,9 @@ class OnboardingRequest(_Body):
     kyc: dict[str, Any] | None = None
     caf: CafChoice | None = None
     billing: BillingChoice | None = None
+    #: APPS-2 (founder-approved): an unclaimed install task for the new
+    #: subscriber, same transaction. Skipped silently while Apps is off.
+    create_install_task: bool = True
 
     @field_validator("macs")
     @classmethod
@@ -238,6 +247,7 @@ async def onboarding_options(
                 "pppoe": get_isp_pppoe_settings().enabled,
                 "static_ip": True,
                 "static_queue_push": get_onboard_settings().static_queue_push,
+                "install_task": _apps_on(),
                 "kyc": True,
                 "invoice_email": get_finance_settings().finance_extras_enabled,
             },
@@ -364,7 +374,26 @@ async def onboard(  # noqa: PLR0912, PLR0913, PLR0915 -- one step per lane
                 if payment_row is not None:
                     done("payment", payment_row.get("receipt_number"))
 
-        # 6. static IPs (JAZE-2) last: the only step that may touch a router
+        # 6. install task (APPS-2): DB-only, before the router step
+        task_view = None
+        if payload.create_install_task and _apps_on():
+            current = "task"
+            from .apps_tasks import FieldTaskService
+
+            name = " ".join(x for x in (s.first_name, s.last_name) if x) or s.identifier
+            task_view = await FieldTaskService(db).create(
+                isp,
+                {
+                    "kind": "install",
+                    "title": f"Install for {name} (circuit {s.circuit_id})"[:200],
+                    "isp_customer_id": s.customer_organization_id,
+                    "subscriber_id": s.id,
+                    "address": s.address,
+                },
+            )
+            done("task", "unclaimed install task")
+
+        # 7. static IPs (JAZE-2) last: the only step that may touch a router
         ips, recorded = [], False
         if payload.static_ips:
             current = "static_ip"
@@ -431,6 +460,7 @@ async def onboard(  # noqa: PLR0912, PLR0913, PLR0915 -- one step per lane
         "caf",
         "invoice",
         "payment",
+        "task",
     )
     return ok(
         request,
@@ -444,6 +474,7 @@ async def onboard(  # noqa: PLR0912, PLR0913, PLR0915 -- one step per lane
             "invoice": invoice_row,
             "payment": payment_row,
             "static_queue_recorded": recorded,
+            "task": task_view,
             "steps": [
                 steps.get(k, {"step": k, "status": "skipped", "detail": None})
                 for k in order
