@@ -462,55 +462,100 @@ class IspReferralsService:
             )
 
 
-async def run_referrals(session: Any) -> dict:
-    """Every ISP with a pending or earned referral, each referral in a
-    SAVEPOINT. A no-op while ISP_REFERRALS_ENABLED is off."""
+REFERRAL_PAGE = 500
+
+
+def _actionable() -> Any:
+    """BE-HARDEN: only referrals that can move this pass. A pending one needs
+    a paid bill of the referred subscriber; an earned one needs an open bill
+    of the referrer issued after it was earned. Everything else stays where it
+    is without being read (it used to fill the 1000-row window forever)."""
+    from sqlalchemy import exists
+
+    paid_first = exists().where(
+        IspInvoice.subscriber_id == IspReferral.referred_subscriber_id,
+        IspInvoice.doc_type == "invoice",
+        IspInvoice.status == "paid",
+        IspInvoice.is_deleted.is_(False),
+    )
+    open_next = exists().where(
+        IspInvoice.subscriber_id == IspReferral.referrer_subscriber_id,
+        IspInvoice.doc_type == "invoice",
+        IspInvoice.status.in_(("issued", "partially_paid")),
+        IspInvoice.created_at >= IspReferral.earned_at,
+        IspInvoice.is_deleted.is_(False),
+    )
+    return or_(
+        and_(IspReferral.status == "pending", paid_first),
+        and_(IspReferral.status == "earned", open_next),
+    )
+
+
+async def run_referrals(session: Any, *, commit_each: bool = False) -> dict:
+    """Every actionable referral, each in a SAVEPOINT, read in keyset pages
+    of ``(created_at, id)`` so nothing is ever starved (BE-HARDEN; was the
+    1000 oldest pending/earned rows, every pass). ``commit_each`` commits per
+    page (the 120 s pass gives this step its own session). A no-op while
+    ISP_REFERRALS_ENABLED is off."""
+    from sqlalchemy import tuple_
+
     from app.domains.rbac.repository import RBACRepository
 
     from .repository import IspRepository
     from .tasks import _SystemContext
 
-    out = {"referrals": 0, "errors": 0}
+    out = {"referrals": 0, "errors": 0, "pages": 0}
     if not get_referrals_settings().referrals_enabled:
         return out
-    rows = (
-        (
-            await session.execute(
-                select(IspReferral)
-                .where(
-                    IspReferral.status.in_(("pending", "earned")),
-                    IspReferral.is_deleted.is_(False),
-                )
-                .order_by(IspReferral.created_at)
-                .limit(1000)
-                .with_for_update(skip_locked=True)
-            )
-        )
-        .scalars()
-        .all()
-    )
     repo = IspRepository(session)
     ctx: dict = {}
     svc = IspReferralsService(session=session, audit=RBACRepository(session))
-    for r in rows:
-        try:
-            if r.isp_organization_id not in ctx:
-                org = await repo.get_organization(r.isp_organization_id)
-                prof = await repo.get_profile(r.isp_organization_id)
-                ctx[r.isp_organization_id] = (
-                    _SystemContext(org, prof, repo)
-                    if org is not None and prof is not None
-                    else None
-                )
-            isp = ctx[r.isp_organization_id]
-            if isp is None:
-                continue
-            async with session.begin_nested():
-                await svc.evaluate(isp, r)
-            out["referrals"] += 1
-        except Exception:  # noqa: BLE001 -- one referral never blocks the rest
-            out["errors"] += 1
-            logger.exception("isp_referral_failed", extra={"referral": str(r.id)})
+    cursor: tuple | None = None
+    while True:
+        q = (
+            select(IspReferral)
+            .where(
+                IspReferral.status.in_(("pending", "earned")),
+                IspReferral.is_deleted.is_(False),
+                _actionable(),
+            )
+            .order_by(IspReferral.created_at, IspReferral.id)
+            .limit(REFERRAL_PAGE)
+            .with_for_update(skip_locked=True)
+        )
+        if cursor is not None:
+            q = q.where(
+                tuple_(IspReferral.created_at, IspReferral.id) > tuple_(*cursor)
+            )
+        rows = list((await session.execute(q)).scalars().all())
+        if not rows:
+            break
+        out["pages"] += 1
+        cursor = (rows[-1].created_at, rows[-1].id)
+        for r in rows:
+            rid = r.id
+            try:
+                if r.isp_organization_id not in ctx:
+                    org = await repo.get_organization(r.isp_organization_id)
+                    prof = await repo.get_profile(r.isp_organization_id)
+                    ctx[r.isp_organization_id] = (
+                        _SystemContext(org, prof, repo)
+                        if org is not None and prof is not None
+                        else None
+                    )
+                isp = ctx[r.isp_organization_id]
+                if isp is None:
+                    continue
+                async with session.begin_nested():
+                    await svc.evaluate(isp, r)
+                out["referrals"] += 1
+            except Exception:  # noqa: BLE001 -- one referral never blocks the rest
+                out["errors"] += 1
+                logger.exception("isp_referral_failed", extra={"referral": str(rid)})
+        if commit_each:
+            await session.commit()
+        if len(rows) < REFERRAL_PAGE:
+            break
     return out
 
 

@@ -16,7 +16,8 @@ edited. For each:
   ``reduce`` entry (reference = invoice number);
 * credit note against it -> ``reversal`` of the same share of the debit as
   the note is of the invoice (an ``add`` entry); a cancellation reverses
-  what is left.
+  up to the share of the bill's UNPAID part (founder 2026-11-01), never the
+  share of what was paid.
 ``isp_zone_autodebits`` is unique per (document, kind): a retried request
 never debits twice. The zone row is locked like JAZE-4 ``_lock_zone``.
 """
@@ -77,6 +78,20 @@ def reversal_amount(
         return 0
     want = (int(debit_paise) * int(note_paise)) // int(invoice_total_paise)
     return max(0, min(want, int(debit_paise) - int(already_reversed)))
+
+
+def cancel_reversal_target(
+    debit_paise: int, *, invoice_total_paise: int, paid_paise: int
+) -> int:
+    """How much of a debit a CANCELLED bill gives back in total: the share of
+    its unpaid part (founder 2026-11-01). Share 30 %, a Rs 1,000 bill with
+    Rs 400 paid: debit 300, target 300 x 600 / 1000 = 180; 120 stays."""
+    if invoice_total_paise <= 0 or debit_paise <= 0:
+        return 0
+    unpaid = max(0, int(invoice_total_paise) - max(0, int(paid_paise)))
+    return min(
+        int(debit_paise), (int(debit_paise) * unpaid) // int(invoice_total_paise)
+    )
 
 
 def standing(balance: int, min_balance: int) -> str:
@@ -338,7 +353,15 @@ def _zone_autodebit(session: Session, _ctx: Any, _instances: Any) -> None:
             debit = _existing(session, inv.id, "debit")
             if debit is None:
                 continue
-            left = debit.amount_paise - _reversed_so_far(session, inv.id)
+            # Founder 2026-11-01 (LANE_NOTES [COORD]): a cancelled bill gives
+            # back the zone's share of its UNPAID part only; the share of what
+            # was actually paid stays debited. Credit notes already reversed
+            # their own proportion, so only the gap up to that target is left.
+            left = cancel_reversal_target(
+                debit.amount_paise,
+                invoice_total_paise=inv.total_paise or 0,
+                paid_paise=inv.paid_paise or 0,
+            ) - _reversed_so_far(session, inv.id)
             _reverse(
                 session,
                 document=inv,

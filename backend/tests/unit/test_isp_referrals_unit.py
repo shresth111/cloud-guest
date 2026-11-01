@@ -32,4 +32,8 @@ async def test_pass_is_a_no_op_with_the_flag_off(monkeypatch) -> None:  # noqa: 
         async def execute(self, *a, **k):  # noqa: ANN002, ANN003, ANN202
             raise AssertionError("must not touch the database")
 
-    assert await svc.run_referrals(_NoSession()) == {"referrals": 0, "errors": 0}
+    assert await svc.run_referrals(_NoSession()) == {
+        "referrals": 0,
+        "errors": 0,
+        "pages": 0,
+    }

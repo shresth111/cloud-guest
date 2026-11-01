@@ -770,6 +770,11 @@ class IspSubscriber360Service:
         self, isp: IspContext, subscriber_id: uuid.UUID, data: dict
     ) -> dict:
         s = await self.plans.subscriber(isp, subscriber_id)
+        # BE-HARDEN: lock + reload BEFORE the "before" snapshot and the replay
+        # lookup. They used to be read before recharge took the lock, so two
+        # concurrent renewals both recorded the same valid_until_before and
+        # reverting the second rolled back past the first paid renewal.
+        await self._lock_subscriber(s)
         p = await self.profile(s)
         if p is not None and p.block_kind:
             raise IspSubscriberBlockedError()
@@ -819,6 +824,18 @@ class IspSubscriber360Service:
                 await self.session.flush()
         return result
 
+    async def _lock_subscriber(self, s: IspSubscriber) -> IspSubscriber:
+        """``SELECT ... FOR UPDATE`` the subscriber and reload it, so every
+        value read after this is the committed one under the lock."""
+        await self.session.flush()
+        await self.session.execute(
+            select(IspSubscriber)
+            .where(IspSubscriber.id == s.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return s
+
     async def _last_renewal(self, s: IspSubscriber) -> IspSubscriberEvent | None:
         e = (
             await self.session.execute(
@@ -840,9 +857,7 @@ class IspSubscriber360Service:
         self, isp: IspContext, subscriber_id: uuid.UUID, *, reason: str
     ) -> dict:
         s = await self.plans.subscriber(isp, subscriber_id)
-        await self.session.execute(
-            select(IspSubscriber.id).where(IspSubscriber.id == s.id).with_for_update()
-        )
+        await self._lock_subscriber(s)  # BE-HARDEN: lock AND reload
         e = await self._last_renewal(s)
         if e is None:
             raise IspNothingToRevertError()
@@ -1078,7 +1093,6 @@ class IspSubscriber360Service:
         page: int,
         page_size: int,
     ) -> dict:
-        await self.plans.sync_subscribers(isp)
         await self.activate_due(isp)
         if isp_customer_id is not None:
             await IspScope.assert_customer(isp, isp_customer_id)

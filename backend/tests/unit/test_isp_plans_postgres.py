@@ -298,9 +298,11 @@ async def test_plans_coupons_subscribers_end_to_end() -> None:  # noqa: PLR0915
                     },
                 )
                 await s.commit()
-            from app.domains.isp_partner import plans_service
 
-            plans_service._last_sync.clear()  # the 60 s sync throttle (spec)
+            # BE-HARDEN: GETs no longer sync; the background pass or "sync now" does
+            assert (
+                await c.post("/api/v1/isp/subscribers/sync", headers=ha)
+            ).status_code == 200
             subs = (await c.get("/api/v1/isp/subscribers", headers=ha)).json()["data"]
             assert subs["total"] == 1
             sub = subs["items"][0]

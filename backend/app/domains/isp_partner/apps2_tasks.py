@@ -14,6 +14,8 @@ from typing import Any
 
 from sqlalchemy import select
 
+from .finance_tasks import _step  # BE-HARDEN isolated step
+
 __all__ = ["run_apps_frequent"]
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,11 @@ def _notifications(session: Any) -> Any:
 
 
 async def run_apps_frequent(
-    session: Any, *, now: datetime | None = None, telegram: Any = None
+    session: Any,
+    *,
+    now: datetime | None = None,
+    telegram: Any = None,
+    commit_each: bool = False,
 ) -> dict[str, int]:
     from .apps2_models import IspTicketEscalationRule
     from .apps2_service import Apps2Service
@@ -98,8 +104,13 @@ async def run_apps_frequent(
         summary["isps"] += 1
         for ann_id in [a for a, i in due.items() if i == isp_id]:
             try:
-                async with session.begin_nested():
-                    await AnnouncementService(session, notifications).send(isp, ann_id)
+                await _step(
+                    session,
+                    commit_each,
+                    lambda ann_id=ann_id, isp=isp: AnnouncementService(
+                        session, notifications
+                    ).send(isp, ann_id),
+                )
                 summary["announcements"] += 1
             except Exception:  # noqa: BLE001 -- e.g. no customer left to send to
                 summary["errors"] += 1
@@ -109,10 +120,13 @@ async def run_apps_frequent(
                 )
         if isp_id in rule_isps:
             try:
-                async with session.begin_nested():
-                    summary["escalations"] += await Apps2Service(
-                        session
-                    ).run_escalations(isp, now=now, telegram=telegram)
+                summary["escalations"] += await _step(
+                    session,
+                    commit_each,
+                    lambda isp=isp: Apps2Service(session).run_escalations(
+                        isp, now=now, telegram=telegram
+                    ),
+                )
             except Exception:  # noqa: BLE001
                 summary["errors"] += 1
                 logger.exception(
