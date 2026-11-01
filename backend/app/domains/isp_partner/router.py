@@ -1075,6 +1075,10 @@ def _include_lanes() -> None:
     from .integrations_router import integrations_router
 
     isp_partner_router.include_router(integrations_router)
+    # REVENUE-HUB + CHURN-RISK: read-only /isp/revenue/* (ISP_REVENUE_HUB_ENABLED).
+    from .revenue_router import revenue_router
+
+    isp_partner_router.include_router(revenue_router)
     # ADDENDUM_04 F1-F3 (coordinator defaults, per-ISP settings): wallet,
     # messaging settings, the ISP-level sender, the venue credits view.
     from .parity_settings import isp_parity_router
