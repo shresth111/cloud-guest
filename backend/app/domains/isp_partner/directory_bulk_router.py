@@ -111,6 +111,8 @@ class _Selection(_Body):
 class BulkRenewRequest(_Selection):
     package_id: uuid.UUID | None = None
     cycles: int = Field(default=1, ge=1, le=12)
+    # SMALL-1: optional DISCOUNT-WIRE code, quoted per subscriber
+    discount_code: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class BulkStatusRequest(_Selection):
@@ -237,6 +239,7 @@ async def _run(
     *,
     skip,  # noqa: ANN001 -- (s, p) -> reason | None
     apply,  # noqa: ANN001 -- async (sid) -> Any
+    extra_skip=None,  # noqa: ANN001 -- SMALL-1: async (s, p) -> reason | None
 ) -> dict:
     ids = await _selected_ids(svc, isp, body)
     eligible: list[uuid.UUID] = []
@@ -247,6 +250,8 @@ async def _run(
             skipped.append({"id": str(sid), "reason": "not_found"})
             continue
         reason = skip(*loaded)
+        if not reason and extra_skip is not None:
+            reason = await extra_skip(*loaded)
         if reason:
             skipped.append({"id": str(sid), "reason": reason})
         else:
@@ -290,6 +295,25 @@ async def bulk_renew(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspSubscriber360Service = Depends(get_subscriber360_service),
 ) -> dict:
+    plan = None
+    extra_skip = None
+    if payload.discount_code:
+        from . import bulk_discount
+
+        plan = await bulk_discount.start(svc, isp, payload.discount_code)
+
+        async def extra_skip(s: Any, p: Any) -> str | None:
+            return await bulk_discount.check(
+                plan,
+                svc,
+                isp,
+                s,
+                p,
+                package_id=payload.package_id,
+                cycles=payload.cycles,
+                bulk_key=payload.bulk_key,
+            )
+
     async def apply(sid: uuid.UUID) -> Any:
         data: dict[str, Any] = {
             "paid_now": False,
@@ -299,9 +323,15 @@ async def bulk_renew(
             data["package_id"] = payload.package_id
         if payload.cycles > 1:
             data["cycles"] = payload.cycles
+        if payload.discount_code:
+            data["discount_code"] = payload.discount_code
         return await svc.renew(isp, sid, data)
 
-    res = await _run(svc, isp, payload, skip=renew_skip, apply=apply)
+    res = await _run(
+        svc, isp, payload, skip=renew_skip, apply=apply, extra_skip=extra_skip
+    )
+    if plan is not None:
+        res["discount"] = plan.summary()
     return ok(request, res, "Bulk renew" + (" (dry run)" if payload.dry_run else ""))
 
 
