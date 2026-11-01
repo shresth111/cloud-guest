@@ -236,6 +236,7 @@ def render_invoice_pdf(
                     )
                 ),
             ]
+    story += _extras_block(seller, styles, is_note=is_note)
     if seller.get("invoice_footer"):
         story.append(Paragraph(_e(seller["invoice_footer"]), styles["Normal"]))
     story += [
@@ -244,6 +245,58 @@ def render_invoice_pdf(
     ]
     doc.build(story)
     return buf.getvalue()
+
+
+def _extras_block(seller: dict, styles: Any, *, is_note: bool) -> list[Any]:
+    """JAZE-4: bank remittance details, the zone operator and the ISP's
+    contact/licence fields, from ``finance_service.seller_extras``. Nothing
+    is added when those keys are absent, so an ISP without a template gets
+    the same PDF as before."""
+    out: list[Any] = []
+    contact = [
+        f"{label}: {_e(seller[key])}"
+        for key, label in (
+            ("care_phone", "Customer care"),
+            ("care_email", "Email"),
+            ("website", "Website"),
+            ("pan", "PAN"),
+            ("licence_number", "Licence no."),
+        )
+        if seller.get(key)
+    ]
+    op = seller.get("operator") or {}
+    if op.get("name") or op.get("phone"):
+        contact.append(
+            "Operator: "
+            + _e(" ".join(p for p in (op.get("name"), op.get("phone")) if p))
+        )
+    if contact:
+        out += [
+            Spacer(1, 0.3 * cm),
+            Paragraph(" &nbsp; ".join(contact), styles["Normal"]),
+        ]
+    bank = seller.get("bank") or {}
+    if bank and not is_note:
+        lines = [
+            f"{label}: {_e(bank[key])}"
+            for key, label in (
+                ("account_name", "Account name"),
+                ("name", "Bank"),
+                ("account_number", "A/c no."),
+                ("ifsc", "IFSC"),
+                ("branch", "Branch"),
+            )
+            if bank.get(key)
+        ]
+        if lines:
+            out += [
+                Spacer(1, 0.3 * cm),
+                Paragraph("<b>Pay by bank transfer</b>", styles["Normal"]),
+                Paragraph("<br/>".join(lines), styles["Normal"]),
+            ]
+    if seller.get("terms"):
+        out += [Spacer(1, 0.2 * cm), Paragraph(_e(seller["terms"]), styles["Normal"])]
+    return out
 
 
 def render_receipt_pdf(

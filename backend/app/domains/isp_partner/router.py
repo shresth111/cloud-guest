@@ -1036,5 +1036,12 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(portal_support_router)
 
+    # JAZE-4 (ADDENDUM_05): finance + communications, each group behind its
+    # own flag (finance_config.py), all default OFF.
+    from .finance_router import finance_router, public_pay_router
+
+    isp_partner_router.include_router(finance_router)
+    isp_partner_router.include_router(public_pay_router)
+
 
 _include_lanes()

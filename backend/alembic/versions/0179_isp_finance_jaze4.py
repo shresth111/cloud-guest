@@ -303,6 +303,9 @@ def upgrade() -> None:
             server_default="false",
             nullable=False,
         ),
+        sa.Column(
+            "whatsapp_opt_in", sa.Boolean(), server_default="false", nullable=False
+        ),
         sa.Column("id", sa.UUID(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
@@ -331,6 +334,7 @@ def upgrade() -> None:
         sa.Column(
             "whatsapp_enabled", sa.Boolean(), server_default="false", nullable=False
         ),
+        sa.Column("whatsapp_enabled_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "whatsapp_templates",
             postgresql.JSONB(astext_type=sa.Text()),

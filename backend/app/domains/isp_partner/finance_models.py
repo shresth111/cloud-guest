@@ -227,6 +227,10 @@ class IspBillingContact(BaseModel):
     exclude_from_reminders: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    #: WhatsApp needs an explicit opt-in (Meta policy); default off.
+    whatsapp_opt_in: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     __table_args__ = (
         Index(
@@ -246,6 +250,10 @@ class IspAutomationSettings(BaseModel):
     isp_organization_id: Mapped[uuid.UUID] = _fk("organizations.id")
     whatsapp_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
+    )
+    #: Sweeps never message about events older than this (no backfill).
+    whatsapp_enabled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     #: {trigger: {"template_name": str, "language": str}}
     whatsapp_templates: Mapped[dict[str, Any]] = mapped_column(

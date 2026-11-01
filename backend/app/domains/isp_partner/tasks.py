@@ -146,6 +146,13 @@ async def _retry_async() -> dict[str, int]:
                     logger.exception(
                         "isp_service_retry_failed", extra={"customer": str(customer_id)}
                     )
+            # JAZE-4: WhatsApp receipts/renewals + Telegram alerts (own flags).
+            try:
+                from .finance_tasks import run_finance_frequent
+
+                await run_finance_frequent(session)
+            except Exception:  # noqa: BLE001 -- never blocks the retry pass
+                logger.exception("isp_finance_frequent_failed")
             await session.commit()
     finally:
         await redis.aclose()
@@ -218,6 +225,10 @@ async def _billing_daily_async() -> dict[str, int]:
                         ).sync_subscribers(isp, force=True)
                     async with session.begin_nested():
                         summary["invoices"] += len(await billing.generate_due(isp))
+                    # JAZE-4: lease invoices + WhatsApp reminders (own flags).
+                    from .finance_tasks import run_finance_daily
+
+                    await run_finance_daily(session, isp, billing.today(isp))
                     if (
                         settings.auto_suspend_enabled
                         and settings.auto_suspend_after_days

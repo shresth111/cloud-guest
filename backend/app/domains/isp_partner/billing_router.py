@@ -264,6 +264,13 @@ async def _pdf_for(
             IspInvoice, uuid.UUID(view["credit_note_for_invoice_id"])
         )
         against = orig.number if orig else None
+    # JAZE-4: bank/contact/operator fields (empty when no template is set).
+    from .finance_service import IspFinanceService
+
+    inv_row = await svc._invoice(isp, invoice_id)
+    settings = settings | await IspFinanceService(session=svc.session).seller_extras(
+        isp, inv_row
+    )
     content = render_invoice_pdf(
         view, seller=settings, isp_name=isp.organization.name, against=against
     )
