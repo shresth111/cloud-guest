@@ -1850,25 +1850,37 @@ class IspPlansService:
         start = max(now, s.valid_until) if s.valid_until else now
         end = start + timedelta(days=package.validity_days * cycles)
         tz = isp.organization.timezone or "Asia/Kolkata"
+        line = {
+            "description": (
+                package.name
+                if cycles == 1
+                else f"{package.name} x {cycles} "
+                f"({package.validity_days * cycles} days)"
+            ),
+            "amount_paise": price_paise,
+            "quantity": cycles,
+            "price_includes_gst": package.price_includes_gst,
+            "period_from": _local_date(start, tz),
+            "period_to": _local_date(end, tz),
+            "package_id": package.id,
+        }
+        quote = None
+        if data.get("discount_code"):
+            # DISCOUNT-WIRE: quoted before anything is written (422 on a bad code)
+            from .discount_wire import apply_to_line
+
+            quote = await apply_to_line(
+                self.session,
+                isp,
+                billing,
+                line,
+                data["discount_code"],
+                package_id=package.id,
+            )
         inv = await billing.issue_subscriber_invoice(
             isp,
             s,
-            lines=[
-                {
-                    "description": (
-                        package.name
-                        if cycles == 1
-                        else f"{package.name} x {cycles} "
-                        f"({package.validity_days * cycles} days)"
-                    ),
-                    "amount_paise": price_paise,
-                    "quantity": cycles,
-                    "price_includes_gst": package.price_includes_gst,
-                    "period_from": _local_date(start, tz),
-                    "period_to": _local_date(end, tz),
-                    "package_id": package.id,
-                }
-            ],
+            lines=[line],
             invoice_kind="recharge",
             period_start=_local_date(start, tz),
             period_end=_local_date(end, tz),
@@ -1876,6 +1888,10 @@ class IspPlansService:
             po_number=data.get("po_number"),
             source_key=source_key,
         )
+        if quote is not None:
+            from .discount_wire import record as record_discount
+
+            await record_discount(self.session, quote, inv, s)
         s.valid_until = end
         s.package_id = package.id
         s.speed_group_id = package.speed_group_id

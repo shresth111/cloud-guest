@@ -1119,6 +1119,10 @@ def _include_lanes() -> None:
     from .revenue_router import revenue_router
 
     isp_partner_router.include_router(revenue_router)
+    # DISCOUNT-WIRE: FE probe for the discount hook (ISP_DISCOUNT_APPLY_ENABLED).
+    from .discount_wire_router import discount_wire_router
+
+    isp_partner_router.include_router(discount_wire_router)
     # ADDENDUM_04 F1-F3 (coordinator defaults, per-ISP settings): wallet,
     # messaging settings, the ISP-level sender, the venue credits view.
     from .parity_settings import isp_parity_router

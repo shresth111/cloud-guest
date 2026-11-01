@@ -258,7 +258,11 @@ class DiscountService:
             (
                 await self.session.execute(
                     select(IspDiscountRedemption)
-                    .where(IspDiscountRedemption.discount_id == d.id)
+                    .where(
+                        IspDiscountRedemption.discount_id == d.id,
+                        # DISCOUNT-WIRE: a cancelled invoice gives its use back
+                        IspDiscountRedemption.is_deleted.is_(False),
+                    )
                     .order_by(IspDiscountRedemption.at.desc())
                 )
             )

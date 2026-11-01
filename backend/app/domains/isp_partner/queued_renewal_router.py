@@ -52,6 +52,8 @@ class QueueRenewalRequest(_Body):
     payment: RechargePayment | None = None
     po_number: str | None = Field(default=None, max_length=40)
     idempotency_key: str = Field(min_length=8, max_length=64)
+    # DISCOUNT-WIRE: a JAZE-5 code (ISP_DISCOUNT_APPLY_ENABLED; else 422).
+    discount_code: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class QueueCancelRequest(_Body):

@@ -376,6 +376,12 @@ class IspInvoiceLine(BaseModel):
     package_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("isp_packages.id"), nullable=True
     )
+    #: DISCOUNT-WIRE: pre-tax discount taken off this line's taxable value
+    #: (``taxable_paise`` is already net of it); 0 = no discount.
+    discount_paise: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    discount_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
     __table_args__ = (Index("ix_isp_invoice_lines_invoice", "invoice_id"),)
 
