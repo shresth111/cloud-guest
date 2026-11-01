@@ -122,8 +122,10 @@ from .billing_models import BILLING_TABLES  # noqa: E402,F401
 
 # JAZE-2 (ADDENDUM_05 J3/J8): package policy, usage, MAC/IP bindings.
 from .enforcement_models import *  # noqa: E402,F403
+from .fiber_models import *  # noqa: E402,F403  (J22 fiber registry)
 from .finance_models import *  # noqa: E402,F403  (JAZE-4)
 from .plans_models import *  # noqa: E402,F403
+from .pppoe_models import *  # noqa: E402,F403
 from .subscriber360_models import *  # noqa: E402,F403
 # JAZE-3 (ADDENDUM_05 J6/J17): compliance tables, same registration path.
 from .compliance_models import *  # noqa: E402,F403
