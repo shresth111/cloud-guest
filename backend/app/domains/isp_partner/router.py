@@ -1079,6 +1079,11 @@ def _include_lanes() -> None:
     from .compliance_router import compliance_router
 
     isp_partner_router.include_router(compliance_router)
+    # IPDR-2: LEA reverse-IP trace, retention card, field coverage
+    # (ISP_IPDR_LEA_ENABLED).
+    from .ipdr_lea_router import ipdr_lea_router
+
+    isp_partner_router.include_router(ipdr_lea_router)
 
     # JAZE-4 (ADDENDUM_05): finance + communications, each group behind its
     # own flag (finance_config.py), all default OFF.
