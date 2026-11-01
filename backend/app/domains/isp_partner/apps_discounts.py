@@ -120,11 +120,18 @@ async def record_redemption(
     session: Any,
     quote: DiscountQuote,
     *,
-    isp_org_id: uuid.UUID,
     customer_org_id: uuid.UUID,
     invoice_id: uuid.UUID | None = None,
     subscriber_id: uuid.UUID | None = None,
+    isp_org_id: uuid.UUID | None = None,
 ) -> IspDiscountRedemption:
+    """Count one use of ``quote``'s code. Idempotent per ``invoice_id``.
+
+    Matches the LANE_NOTES contract for JAZE-4
+    (``record_redemption(session, quote, *, invoice_id, subscriber_id=None,
+    customer_org_id)``). ``isp_org_id`` is optional: when given it must own
+    the code; when omitted it is taken from the code itself.
+    """
     d = (
         await session.execute(
             select(IspDiscountCode)
@@ -132,8 +139,9 @@ async def record_redemption(
             .with_for_update()
         )
     ).scalar_one()
-    if d.isp_organization_id != isp_org_id:
+    if isp_org_id is not None and d.isp_organization_id != isp_org_id:
         raise IspAppsNotFoundError("Discount not found")
+    isp_org_id = d.isp_organization_id
     if invoice_id is not None:
         existing = (
             await session.execute(
