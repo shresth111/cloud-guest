@@ -157,6 +157,13 @@ EXPECTED["isp-billing"] |= {
     "isp_support.read",
     "isp_support.create",
 }
+# J16 Apps (ADDENDUM_05, JAZE-5).
+_APPS = {f"isp_apps.{a}" for a in "read create update manage export".split()}
+EXPECTED["isp-owner"] |= _APPS
+EXPECTED["isp-noc"] |= _APPS - {"isp_apps.manage"}
+EXPECTED["isp-technician"] |= {"isp_apps.read", "isp_apps.create", "isp_apps.update"}
+EXPECTED["isp-viewer"] |= {"isp_apps.read", "isp_apps.export"}
+EXPECTED["isp-billing"] |= {"isp_apps.read", "isp_apps.create", "isp_apps.export"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -262,8 +269,8 @@ async def test_seeding_never_changes_a_pre_existing_role(repo) -> None:
 async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
-    assert summary.permission_groups_created == 17  # +5 ADDENDUM_04 §4
-    assert summary.permissions_created == 62  # +15 ADDENDUM_04 §4
+    assert summary.permission_groups_created == 18  # +1 J16 isp_apps
+    assert summary.permissions_created == 67  # +5 J16 isp_apps
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED

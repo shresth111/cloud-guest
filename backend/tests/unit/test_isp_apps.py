@@ -36,7 +36,14 @@ from app.domains.isp_partner.apps_leads import check_lead_status
 from app.domains.isp_partner.apps_tasks import FieldTaskService, check_task_transition
 from app.domains.isp_partner.exceptions import IspCustomerNotFoundError
 from app.domains.isp_partner.rbac_roles import ROLES_BY_SLUG, all_permission_keys
-from tests.unit.isp_partner_fixtures import CUST_A1, CUST_B1, ISP_A, ISP_B, context, estate
+from tests.unit.isp_partner_fixtures import (
+    CUST_A1,
+    CUST_B1,
+    ISP_A,
+    ISP_B,
+    context,
+    estate,
+)
 
 T0 = datetime(2026, 11, 1, 6, 0, tzinfo=UTC)
 
@@ -88,14 +95,25 @@ def test_transitions_and_reopen_clear_resolution() -> None:
 def test_summary_counts_rfo_tat_and_breaches() -> None:
     a, b = uuid.uuid4(), uuid.uuid4()
     rows = [
-        _ticket(type_id=a, rfo_reason="fiber_cut", resolved_at=T0 + timedelta(minutes=60)),
-        _ticket(type_id=a, rfo_reason="fiber_cut", resolved_at=T0 + timedelta(minutes=300)),
+        _ticket(
+            type_id=a, rfo_reason="fiber_cut", resolved_at=T0 + timedelta(minutes=60)
+        ),
+        _ticket(
+            type_id=a, rfo_reason="fiber_cut", resolved_at=T0 + timedelta(minutes=300)
+        ),
         _ticket(type_id=b, rfo_reason="cpe_fault", resolved_at=None),
     ]
-    out = summarise(rows, {a: "No connection", b: "Slow speed"}, now=T0 + timedelta(hours=10))
+    out = summarise(
+        rows, {a: "No connection", b: "Slow speed"}, now=T0 + timedelta(hours=10)
+    )
     assert out["by_rfo"]["fiber_cut"] == 2 and out["by_rfo"]["cpe_fault"] == 1
     assert out["by_rfo"]["upstream"] == 0
-    assert out["overall"] == {"count": 3, "resolved": 2, "avg_tat_minutes": 180.0, "breached": 2}
+    assert out["overall"] == {
+        "count": 3,
+        "resolved": 2,
+        "avg_tat_minutes": 180.0,
+        "breached": 2,
+    }
     first = out["by_type"][0]
     assert first["type_name"] == "No connection" and first["count"] == 2
 
@@ -123,8 +141,16 @@ def _code(**kw):
 
 def test_percent_discount_rounds_half_up_and_caps() -> None:
     assert quote_discount(_code(), gross_paise=59_905).amount_paise == 5_991  # 5990.5
-    assert quote_discount(_code(max_discount_paise=2_000), gross_paise=59_905).amount_paise == 2_000
-    assert quote_discount(_code(kind="flat", value=90_000), gross_paise=50_000).amount_paise == 50_000
+    assert (
+        quote_discount(_code(max_discount_paise=2_000), gross_paise=59_905).amount_paise
+        == 2_000
+    )
+    assert (
+        quote_discount(
+            _code(kind="flat", value=90_000), gross_paise=50_000
+        ).amount_paise
+        == 50_000
+    )
 
 
 @pytest.mark.parametrize(
@@ -145,7 +171,9 @@ def test_discount_rules_refuse(kw, gross) -> None:
 
 def test_discount_package_allow_list_accepts_listed_package() -> None:
     pkg = uuid.uuid4()
-    q = quote_discount(_code(package_ids=[str(pkg)]), gross_paise=10_000, package_id=pkg)
+    q = quote_discount(
+        _code(package_ids=[str(pkg)]), gross_paise=10_000, package_id=pkg
+    )
     assert q.amount_paise == 1_000
 
 
@@ -186,7 +214,9 @@ def test_unit_and_task_and_lead_transitions() -> None:
 
 
 def test_whatsapp_link_adds_country_code() -> None:
-    assert whatsapp_link("98765 43210", "hi").startswith("https://wa.me/919876543210?text=hi")
+    assert whatsapp_link("98765 43210", "hi").startswith(
+        "https://wa.me/919876543210?text=hi"
+    )
     assert whatsapp_link("12", "hi") is None
     assert whatsapp_link(None, "hi") is None
 
@@ -204,7 +234,9 @@ async def test_ticket_list_with_no_customers_is_empty_without_a_query() -> None:
     isp = context(estate(), confined=set())
     items, total = await HelpdeskService(_NoQueryDb()).list_tickets(isp)
     assert (items, total) == ([], 0)
-    stats = await HelpdeskService(_NoQueryDb()).stats(isp, isp_customer_id=None, since=None, until=None)
+    stats = await HelpdeskService(_NoQueryDb()).stats(
+        isp, isp_customer_id=None, since=None, until=None
+    )
     assert stats["overall"]["count"] == 0
 
 
@@ -233,7 +265,10 @@ class _SubDb:
 
 def _sub(isp_org, customer):
     return SimpleNamespace(
-        id=uuid.uuid4(), is_deleted=False, isp_organization_id=isp_org, customer_organization_id=customer
+        id=uuid.uuid4(),
+        is_deleted=False,
+        isp_organization_id=isp_org,
+        customer_organization_id=customer,
     )
 
 
@@ -253,7 +288,9 @@ async def test_assignee_must_be_isp_staff_covering_the_customer() -> None:
     staff = uuid.uuid4()
 
     async def roles(_isp, user_id=None):
-        return [(None, SimpleNamespace(slug="isp-technician"))] if user_id == staff else []
+        return (
+            [(None, SimpleNamespace(slug="isp-technician"))] if user_id == staff else []
+        )
 
     async def scope(_isp, _user):
         return [CUST_A1]
@@ -273,12 +310,25 @@ async def test_assignee_must_be_isp_staff_covering_the_customer() -> None:
 # -- RBAC + flag -----------------------------------------------------------------
 def test_apps_keys_are_seeded_and_granted() -> None:
     keys = set(all_permission_keys())
-    assert {"isp_apps.read", "isp_apps.create", "isp_apps.update", "isp_apps.manage"} <= keys
+    assert {
+        "isp_apps.read",
+        "isp_apps.create",
+        "isp_apps.update",
+        "isp_apps.manage",
+        "isp_apps.export",
+    } <= keys
     assert "isp_apps.manage" in ROLES_BY_SLUG["isp-owner"].permission_keys
     assert "isp_apps.manage" not in ROLES_BY_SLUG["isp-technician"].permission_keys
     assert "isp_apps.update" in ROLES_BY_SLUG["isp-technician"].permission_keys
-    viewer = {k for k in ROLES_BY_SLUG["isp-viewer"].permission_keys if k.startswith("isp_apps.")}
-    assert viewer == {"isp_apps.read"}
+    viewer = {
+        k
+        for k in ROLES_BY_SLUG["isp-viewer"].permission_keys
+        if k.startswith("isp_apps.")
+    }
+    assert viewer == {"isp_apps.read", "isp_apps.export"}
+    assert "isp_apps.export" not in ROLES_BY_SLUG["isp-technician"].permission_keys
+    for slug in ("isp-owner", "isp-admin", "isp-noc", "isp-billing"):
+        assert "isp_apps.export" in ROLES_BY_SLUG[slug].permission_keys
 
 
 async def test_apps_flag_defaults_off() -> None:
@@ -289,3 +339,62 @@ async def test_apps_flag_defaults_off() -> None:
     with pytest.raises(HTTPException) as exc:
         await common.RequireIspAppsEnabled()
     assert exc.value.status_code == 404
+
+
+# -- exports + the JAZE-4 discount hook contract ---------------------------------
+def test_csv_export_guards_formulas_and_formats_times() -> None:
+    from app.domains.isp_partner.apps_export import TICKET_COLUMNS, render_csv
+
+    row = {
+        "number": "T-000001",
+        "opened_at": T0,
+        "subject": "=HYPERLINK(1)",
+        "customer_name": "-neg",
+        "tat_minutes": 42,
+        "assignee_name": None,
+    }
+    lines = render_csv(TICKET_COLUMNS, [row]).decode().splitlines()
+    assert lines[0].startswith("Number,Opened,Customer,Subscriber,Type,Subject")
+    assert "'=HYPERLINK(1)" in lines[1]
+    assert "'-neg" in lines[1]
+    assert T0.isoformat() in lines[1]
+    assert ",42," in lines[1]
+
+
+def test_export_routes_sit_before_the_id_routes() -> None:
+    """``/tickets/export.csv`` must not be swallowed by ``/tickets/{ticket_id}``."""
+    from app.domains.isp_partner.apps_common import APPS_EXPORT
+    from app.domains.isp_partner.apps_router import apps_router
+
+    paths = [r.path for r in apps_router.routes]
+    for export, item in (
+        ("/apps/tickets/export.csv", "/apps/tickets/{ticket_id}"),
+        ("/apps/tasks/export.csv", "/apps/tasks/{task_id}"),
+        ("/apps/leads/export.csv", "/apps/leads/{lead_id}"),
+        ("/apps/inventory/units/export.csv", "/apps/inventory/units/{unit_id}"),
+    ):
+        assert paths.index(export) < paths.index(item), export
+    assert APPS_EXPORT == "isp_apps.export"
+
+
+def test_record_redemption_matches_the_lane_contract() -> None:
+    """LANE_NOTES [JAZE-5] promised JAZE-4
+    ``record_redemption(session, quote, *, invoice_id, subscriber_id=None,
+    customer_org_id)``: those keywords alone must bind."""
+    import inspect
+
+    from app.domains.isp_partner.apps_discounts import (
+        DiscountQuote,
+        evaluate_discount,
+        record_redemption,
+    )
+
+    sig = inspect.signature(record_redemption)
+    sig.bind(
+        object(),
+        DiscountQuote(uuid.uuid4(), "X", 1, "x"),
+        invoice_id=uuid.uuid4(),
+        customer_org_id=uuid.uuid4(),
+    )
+    ev = inspect.signature(evaluate_discount)
+    ev.bind(object(), uuid.uuid4(), "CODE", gross_paise=100, package_id=None, at=None)

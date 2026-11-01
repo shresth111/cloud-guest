@@ -51,6 +51,7 @@ APPS_READ = "isp_apps.read"
 APPS_CREATE = "isp_apps.create"
 APPS_UPDATE = "isp_apps.update"
 APPS_MANAGE = "isp_apps.manage"
+APPS_EXPORT = "isp_apps.export"
 
 
 # -- enums ---------------------------------------------------------------------

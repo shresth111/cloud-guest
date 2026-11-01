@@ -299,19 +299,19 @@ ROLES_BY_SLUG: dict[str, IspRoleDefinition] = {r.slug: r for r in ROLES}
 # discount codes, inventory, leads. Appended as new rows only; the routes
 # are additionally behind ISP_APPS_ENABLED (default off).
 _APPS_GRANTS: dict[str, str] = {
-    IspRole.OWNER.value: "read create update manage",
-    IspRole.ADMIN.value: "read create update manage",
-    IspRole.NOC.value: "read create update",
+    IspRole.OWNER.value: "read create update manage export",
+    IspRole.ADMIN.value: "read create update manage export",
+    IspRole.NOC.value: "read create update export",
     IspRole.TECHNICIAN.value: "read create update",
-    IspRole.BILLING.value: "read create",
-    IspRole.VIEWER.value: "read",
+    IspRole.BILLING.value: "read create export",
+    IspRole.VIEWER.value: "read export",
 }
 PERMISSION_GROUPS = (
     *PERMISSION_GROUPS,
     IspPermissionGroup(
         key="isp_apps",
         name="ISP Apps",
-        actions=("read", "create", "update", "manage"),
+        actions=("read", "create", "update", "manage", "export"),
         sort_order=1017,
     ),
 )

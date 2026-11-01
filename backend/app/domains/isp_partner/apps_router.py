@@ -15,7 +15,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Query, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,7 @@ from app.domains.notification.dependencies import get_notification_service
 from .apps_announcements import AnnouncementService
 from .apps_common import (
     APPS_CREATE,
+    APPS_EXPORT,
     APPS_MANAGE,
     APPS_READ,
     APPS_UPDATE,
@@ -43,6 +44,15 @@ from .apps_common import (
     pattern,
 )
 from .apps_discounts import DiscountService, evaluate_discount
+from .apps_export import (
+    LEAD_COLUMNS,
+    MAX_EXPORT_ROWS,
+    TASK_COLUMNS,
+    TICKET_COLUMNS,
+    UNIT_COLUMNS,
+    csv_response,
+    render_csv,
+)
 from .apps_helpdesk import HelpdeskService
 from .apps_inventory import InventoryService
 from .apps_leads import LeadService
@@ -225,6 +235,41 @@ async def ticket_stats(
     )
 
 
+@apps_router.get("/tickets/export.csv", dependencies=isp_guards(APPS_EXPORT))
+async def export_tickets(
+    isp_customer_id: uuid.UUID | None = Query(default=None),
+    subscriber_id: uuid.UUID | None = Query(default=None),
+    status: str | None = Query(
+        default=None, pattern="^(open|in_progress|on_hold|resolved|closed)$"
+    ),
+    assignee_user_id: uuid.UUID | None = Query(default=None),
+    type_id: uuid.UUID | None = Query(default=None),
+    rfo_reason: str | None = Query(default=None, pattern=pattern(RfoReason)),
+    sla_state: str | None = Query(default=None, pattern="^(within|breached|no_sla)$"),
+    since: date | None = Query(default=None),
+    until: date | None = Query(default=None),
+    search: str | None = Query(default=None, max_length=100),
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: HelpdeskService = Depends(_helpdesk),
+) -> Response:
+    items, _ = await svc.list_tickets(
+        isp,
+        isp_customer_id=isp_customer_id,
+        subscriber_id=subscriber_id,
+        status=status,
+        assignee_user_id=assignee_user_id,
+        type_id=type_id,
+        rfo_reason=rfo_reason,
+        sla=sla_state,
+        since=since,
+        until=until,
+        search=search,
+        page=1,
+        page_size=MAX_EXPORT_ROWS,
+    )
+    return csv_response(render_csv(TICKET_COLUMNS, items), "tickets.csv")
+
+
 @apps_router.post("/tickets", status_code=201, dependencies=isp_guards(APPS_CREATE))
 async def create_ticket(
     request: Request,
@@ -339,6 +384,32 @@ async def list_tasks(
         page_size=page_size,
     )
     return ok(request, make_page(items, total, page, page_size), "Tasks")
+
+
+@apps_router.get("/tasks/export.csv", dependencies=isp_guards(APPS_EXPORT))
+async def export_tasks(
+    isp_customer_id: uuid.UUID | None = Query(default=None),
+    status: str | None = Query(default=None, pattern=pattern(TaskStatus)),
+    kind: str | None = Query(default=None, pattern=pattern(TaskKind)),
+    assignee_user_id: uuid.UUID | None = Query(default=None),
+    since: date | None = Query(default=None),
+    until: date | None = Query(default=None),
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: FieldTaskService = Depends(_tasks),
+) -> Response:
+    items, _ = await svc.list(
+        isp,
+        isp_customer_id=isp_customer_id,
+        status=status,
+        kind=kind,
+        assignee_user_id=assignee_user_id,
+        mine=False,
+        since=since,
+        until=until,
+        page=1,
+        page_size=MAX_EXPORT_ROWS,
+    )
+    return csv_response(render_csv(TASK_COLUMNS, items), "field-tasks.csv")
 
 
 @apps_router.post("/tasks", status_code=201, dependencies=isp_guards(APPS_CREATE))
@@ -719,6 +790,29 @@ async def list_units(
     return ok(request, make_page(items, total, page, page_size), "Units")
 
 
+@apps_router.get("/inventory/units/export.csv", dependencies=isp_guards(APPS_EXPORT))
+async def export_units(
+    item_id: uuid.UUID | None = Query(default=None),
+    state: str | None = Query(default=None, pattern=pattern(UnitState)),
+    isp_customer_id: uuid.UUID | None = Query(default=None),
+    subscriber_id: uuid.UUID | None = Query(default=None),
+    search: str | None = Query(default=None, max_length=64),
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: InventoryService = Depends(_inventory),
+) -> Response:
+    items, _ = await svc.list_units(
+        isp,
+        item_id=item_id,
+        state=state,
+        isp_customer_id=isp_customer_id,
+        subscriber_id=subscriber_id,
+        search=search,
+        page=1,
+        page_size=MAX_EXPORT_ROWS,
+    )
+    return csv_response(render_csv(UNIT_COLUMNS, items), "inventory-units.csv")
+
+
 @apps_router.post(
     "/inventory/units", status_code=201, dependencies=isp_guards(APPS_CREATE)
 )
@@ -847,6 +941,27 @@ async def list_leads(
         page_size=page_size,
     )
     return ok(request, make_page(items, total, page, page_size), "Leads")
+
+
+@apps_router.get("/leads/export.csv", dependencies=isp_guards(APPS_EXPORT))
+async def export_leads(
+    status: str | None = Query(default=None, pattern=pattern(LeadStatus)),
+    isp_customer_id: uuid.UUID | None = Query(default=None),
+    assignee_user_id: uuid.UUID | None = Query(default=None),
+    search: str | None = Query(default=None, max_length=100),
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: LeadService = Depends(_leads),
+) -> Response:
+    items, _ = await svc.list(
+        isp,
+        status=status,
+        isp_customer_id=isp_customer_id,
+        assignee_user_id=assignee_user_id,
+        search=search,
+        page=1,
+        page_size=MAX_EXPORT_ROWS,
+    )
+    return csv_response(render_csv(LEAD_COLUMNS, items), "leads.csv")
 
 
 @apps_router.get("/leads/funnel", dependencies=isp_guards(APPS_READ))
