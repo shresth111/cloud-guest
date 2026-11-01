@@ -92,6 +92,18 @@ async def run_finance_daily(session: Any, isp: Any, today: Any) -> dict[str, int
             logger.exception(
                 "isp_lease_billing_failed", extra={"isp": str(isp.isp_org_id)}
             )
+    # FRANCHISE-2: recurring zone charges + min-balance alerts (own flag).
+    from .franchise_service import get_franchise_settings, run_franchise_daily
+
+    if get_franchise_settings().franchise_enabled:
+        try:
+            async with session.begin_nested():
+                out |= await run_franchise_daily(session, isp, today)
+        except Exception:  # noqa: BLE001
+            out["errors"] += 1
+            logger.exception(
+                "isp_franchise_daily_failed", extra={"isp": str(isp.isp_org_id)}
+            )
     if cfg.whatsapp_automation_enabled:
         try:
             async with session.begin_nested():
