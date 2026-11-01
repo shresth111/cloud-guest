@@ -11,8 +11,8 @@ No pre-ISP table is touched. ``downgrade`` drops exactly these.
 integ/isp-test: re-point ``down_revision`` onto the current integ head before
 merging (lane rule), so the chain keeps one head.
 
-Revision ID: 0179_isp_pppoe
-Revises: 0178_merge_integ_parity_settings
+Revision ID: 0190_isp_pppoe
+Revises: 0189_isp_apps
 Create Date: 2026-11-01
 """
 
@@ -23,8 +23,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0179_isp_pppoe"
-down_revision = "0179_isp_apps"
+revision = "0190_isp_pppoe"
+down_revision = "0189_isp_apps"
 branch_labels = None
 depends_on = None
 

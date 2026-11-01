@@ -1,12 +1,11 @@
-"""ISP ADDENDUM_04 §2: per-ISP add-on allowance (Master-set).
+"""COMMS-2b: rendered WhatsApp parameters per sent message.
 
-Additive: creates ``isp_addon_allowances`` only. No existing table is altered
-and no row is written; with no rows every ISP gets the policy default
-(``ISP_PARTNER_ADDON_DEFAULT_ALLOWANCE=none``). ``downgrade`` drops the table.
+Additive: one new table keyed by ``isp_message_log.id``; the JAZE-4 log is
+not altered. ``downgrade`` drops exactly this table.
 
-Revision ID: 0176_isp_addon_allowances
-Revises: 0175_isp_subscriber_invoices
-Create Date: 2026-10-23
+Revision ID: 0199_isp_comms_2b
+Revises: 0198_isp_franchise
+Create Date: 2026-11-01
 """
 
 from __future__ import annotations
@@ -16,13 +15,12 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0176_isp_addon_allowances"
-down_revision = "0175_isp_subscriber_invoices"
+revision = "0199_isp_comms_2b"
+down_revision = "0198_isp_franchise"
 branch_labels = None
 depends_on = None
 
-_TABLE = "isp_addon_allowances"
-_BASE_INDEXED = ("created_at", "deleted_at", "is_deleted", "created_by", "updated_by")
+_T = "isp_message_contents"
 
 
 def _uuid(name: str, *args: object, **kw: object) -> sa.Column:
@@ -31,7 +29,7 @@ def _uuid(name: str, *args: object, **kw: object) -> sa.Column:
 
 def upgrade() -> None:
     op.create_table(
-        _TABLE,
+        _T,
         _uuid("id", primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column(
             "created_at",
@@ -57,26 +55,24 @@ def upgrade() -> None:
             sa.ForeignKey("organizations.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("feature_key", sa.String(64), nullable=False),
+        _uuid(
+            "message_log_id",
+            sa.ForeignKey("isp_message_log.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("template_name", sa.String(512), nullable=True),
+        sa.Column("language", sa.String(15), nullable=True),
         sa.Column(
-            "enabled", sa.Boolean(), nullable=False, server_default=sa.text("false")
-        ),
-        sa.Column("max_customers", sa.Integer(), nullable=True),
-        sa.CheckConstraint(
-            "max_customers IS NULL OR max_customers >= 0",
-            name="ck_isp_addon_allowances_max_customers",
+            "parameters",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'[]'::jsonb"),
         ),
     )
-    for column in _BASE_INDEXED:
-        op.create_index(f"ix_{_TABLE}_{column}", _TABLE, [column])
-    op.create_index(
-        "uq_isp_addon_allowances_isp_key",
-        _TABLE,
-        ["isp_organization_id", "feature_key"],
-        unique=True,
-        postgresql_where=sa.text("deleted_at IS NULL"),
-    )
+    for col in ("created_at", "deleted_at", "is_deleted", "created_by", "updated_by"):
+        op.create_index(f"ix_{_T}_{col}", _T, [col])
+    op.create_index("uq_isp_message_contents_log", _T, ["message_log_id"], unique=True)
 
 
 def downgrade() -> None:
-    op.drop_table(_TABLE)
+    op.drop_table(_T)

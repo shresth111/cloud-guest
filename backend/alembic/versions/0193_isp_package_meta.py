@@ -3,8 +3,8 @@
 Additive: one new table ``isp_package_meta``; ``isp_packages`` is not
 altered. ``downgrade`` drops exactly this table.
 
-Revision ID: 0182_isp_package_meta
-Revises: 0181_isp_zone_tree
+Revision ID: 0193_isp_package_meta
+Revises: 0192_isp_zone_tree
 Create Date: 2026-11-01
 """
 
@@ -15,8 +15,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0182_isp_package_meta"
-down_revision = "0181_isp_zone_tree"
+revision = "0193_isp_package_meta"
+down_revision = "0192_isp_zone_tree"
 branch_labels = None
 depends_on = None
 

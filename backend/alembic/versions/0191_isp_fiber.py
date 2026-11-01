@@ -12,8 +12,8 @@ Chained on this lane's own ``0179_isp_pppoe`` so the lane has one head.
 integ/isp-test: re-point ``0179_isp_pppoe.down_revision`` onto the integ head
 before merging (lane rule); this file follows it unchanged.
 
-Revision ID: 0180_isp_fiber
-Revises: 0179_isp_pppoe
+Revision ID: 0191_isp_fiber
+Revises: 0190_isp_pppoe
 Create Date: 2026-11-01
 """
 
@@ -24,8 +24,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0180_isp_fiber"
-down_revision = "0179_isp_pppoe"
+revision = "0191_isp_fiber"
+down_revision = "0190_isp_pppoe"
 branch_labels = None
 depends_on = None
 

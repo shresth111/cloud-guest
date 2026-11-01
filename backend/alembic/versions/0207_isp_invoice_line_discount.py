@@ -5,8 +5,8 @@ Two nullable-safe columns on the ISP-owned ``isp_invoice_lines``:
 already net of it; default 0 = no discount, so every existing row reads as
 before) and ``discount_label`` ("Discount SAVE10 (10% off)"). No backfill.
 
-Revision ID: 0195_isp_invoice_line_discount
-Revises: 0194_isp_coupon_sync_state
+Revision ID: 0207_isp_invoice_line_discount
+Revises: 0206_isp_coupon_sync_state
 Create Date: 2026-11-01
 """
 
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0195_isp_invoice_line_discount"
-down_revision = "0194_isp_coupon_sync_state"
+revision = "0207_isp_invoice_line_discount"
+down_revision = "0206_isp_coupon_sync_state"
 branch_labels = None
 depends_on = None
 

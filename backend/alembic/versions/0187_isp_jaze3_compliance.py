@@ -11,8 +11,8 @@ Additive, ISP-owned tables only:
 
 No pre-ISP table is touched. ``downgrade`` drops exactly these.
 
-Revision ID: 0179_isp_jaze3_compliance
-Revises: 0178_merge_integ_parity_settings
+Revision ID: 0187_isp_jaze3_compliance
+Revises: 0186_isp_jaze2_enforcement
 Create Date: 2026-11-01
 """
 
@@ -23,8 +23,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0179_isp_jaze3_compliance"
-down_revision = "0179_isp_jaze2_enforcement"
+revision = "0187_isp_jaze3_compliance"
+down_revision = "0186_isp_jaze2_enforcement"
 branch_labels = None
 depends_on = None
 

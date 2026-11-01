@@ -14,8 +14,8 @@ one), then restores the 0172 index and drops the column. CPEs configured
 with a location credential stop authenticating after a downgrade. Their
 script has to be regenerated with the customer credential.
 
-Revision ID: 0176_tr069_location_credentials
-Revises: 0175_isp_subscriber_invoices
+Revision ID: 0182_tr069_location_credentials
+Revises: 0181_isp_subscriber_invoices
 Create Date: 2026-10-23
 """
 
@@ -26,8 +26,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0176_tr069_location_credentials"
-down_revision = "0175_isp_subscriber_invoices"
+revision = "0182_tr069_location_credentials"
+down_revision = "0181_isp_subscriber_invoices"
 branch_labels = None
 depends_on = None
 

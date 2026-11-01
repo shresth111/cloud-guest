@@ -11,8 +11,8 @@ partial unique index over ``status = 'active'``, plus a plain index on
 message) once two rows share an id on one NAS, rather than delete session
 history (IPDR).
 
-Revision ID: 0193_isp_pppoe_session_reuse
-Revises: 0192_isp_referrals
+Revision ID: 0205_isp_pppoe_session_reuse
+Revises: 0204_isp_referrals
 Create Date: 2026-11-01
 """
 
@@ -22,8 +22,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0193_isp_pppoe_session_reuse"
-down_revision = "0192_isp_referrals"
+revision = "0205_isp_pppoe_session_reuse"
+down_revision = "0204_isp_referrals"
 branch_labels = None
 depends_on = None
 

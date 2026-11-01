@@ -6,8 +6,8 @@ Additive: one new table keyed by ``zone_id``; ``isp_zones`` is not altered.
 ``down_revision`` is the integ/isp-test head (0180_isp_fiber after the JAZE
 lanes were chained into one line); re-point it if integ moves first.
 
-Revision ID: 0181_isp_zone_tree
-Revises: 0180_isp_fiber
+Revision ID: 0192_isp_zone_tree
+Revises: 0191_isp_fiber
 Create Date: 2026-11-01
 """
 
@@ -18,8 +18,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0181_isp_zone_tree"
-down_revision = "0180_isp_fiber"
+revision = "0192_isp_zone_tree"
+down_revision = "0191_isp_fiber"
 branch_labels = None
 depends_on = None
 

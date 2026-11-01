@@ -7,8 +7,8 @@ exactly these.
 Before merging into integ/isp-test, re-point ``down_revision`` onto the
 current integ head (lane rule, LANE_NOTES).
 
-Revision ID: 0179_isp_jaze2_enforcement
-Revises: 0178_merge_integ_parity_settings
+Revision ID: 0186_isp_jaze2_enforcement
+Revises: 0185_isp_subscriber_360
 Create Date: 2026-11-01
 """
 
@@ -19,8 +19,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0179_isp_jaze2_enforcement"
-down_revision = "0179_isp_subscriber_360"
+revision = "0186_isp_jaze2_enforcement"
+down_revision = "0185_isp_subscriber_360"
 branch_labels = None
 depends_on = None
 

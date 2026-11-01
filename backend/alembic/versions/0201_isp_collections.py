@@ -3,8 +3,8 @@
 Additive: four new ISP-owned tables. ``isp_invoices`` / ``isp_payments`` are
 not altered. ``downgrade`` drops exactly these four.
 
-Revision ID: 0189_isp_collections
-Revises: 0188_isp_zone_invoices
+Revision ID: 0201_isp_collections
+Revises: 0200_isp_zone_invoices
 Create Date: 2026-11-01
 """
 
@@ -15,8 +15,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0189_isp_collections"
-down_revision = "0188_isp_zone_invoices"
+revision = "0201_isp_collections"
+down_revision = "0200_isp_zone_invoices"
 branch_labels = None
 depends_on = None
 

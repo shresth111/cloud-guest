@@ -3,8 +3,8 @@
 New ISP-owned tables only; no existing table is altered. ``downgrade`` drops
 exactly these two.
 
-Revision ID: 0183_isp_caf_workbench
-Revises: 0182_isp_package_meta
+Revision ID: 0194_isp_caf_workbench
+Revises: 0193_isp_package_meta
 
 (Renumbered from 0182 at the integ merge onto PKG-2's 0182; never deployed.)
 Create Date: 2026-11-01
@@ -17,8 +17,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0183_isp_caf_workbench"
-down_revision = "0182_isp_package_meta"
+revision = "0194_isp_caf_workbench"
+down_revision = "0193_isp_package_meta"
 branch_labels = None
 depends_on = None
 

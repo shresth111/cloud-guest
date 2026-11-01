@@ -4,8 +4,8 @@ J14, J15, J23, security deposits).
 Additive only: twelve new ISP-owned tables. No pre-ISP table is touched.
 ``downgrade`` drops exactly these.
 
-Revision ID: 0179_isp_finance_jaze4
-Revises: 0178_merge_integ_parity_settings
+Revision ID: 0188_isp_finance_jaze4
+Revises: 0187_isp_jaze3_compliance
 Create Date: 2026-11-01
 """
 
@@ -16,8 +16,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0179_isp_finance_jaze4"
-down_revision = "0179_isp_jaze3_compliance"
+revision = "0188_isp_finance_jaze4"
+down_revision = "0187_isp_jaze3_compliance"
 branch_labels = None
 depends_on = None
 

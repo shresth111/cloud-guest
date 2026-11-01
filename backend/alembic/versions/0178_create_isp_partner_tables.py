@@ -6,8 +6,8 @@ Additive only. Creates ``isp_partner_profiles``, ``isp_customer_profiles``,
 no row is written, no enum or constraint on an existing table changes; every
 foreign key lives on a new table. ``downgrade`` drops exactly these seven.
 
-Revision ID: 0172_create_isp_partner_tables
-Revises: 0171_create_monitored_device_health
+Revision ID: 0178_create_isp_partner_tables
+Revises: 0177_add_radius_nas_last_activity
 Create Date: 2026-10-22
 """
 
@@ -18,8 +18,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0172_create_isp_partner_tables"
-down_revision = "0171_create_monitored_device_health"
+revision = "0178_create_isp_partner_tables"
+down_revision = "0177_add_radius_nas_last_activity"
 branch_labels = None
 depends_on = None
 

@@ -6,8 +6,8 @@ table isp_customer_profiles (ADDENDUM_03 §10 allows columns on our own
 tables). No pre-ISP table is altered; every FK lives on our tables.
 downgrade drops exactly these and the one column.
 
-Revision ID: 0173_isp_service_and_billing
-Revises: 0172_create_isp_partner_tables
+Revision ID: 0179_isp_service_and_billing
+Revises: 0178_create_isp_partner_tables
 Create Date: 2026-10-22
 """
 
@@ -18,8 +18,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0173_isp_service_and_billing"
-down_revision = "0172_create_isp_partner_tables"
+revision = "0179_isp_service_and_billing"
+down_revision = "0178_create_isp_partner_tables"
 branch_labels = None
 depends_on = None
 

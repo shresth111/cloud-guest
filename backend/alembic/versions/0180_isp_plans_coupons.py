@@ -5,8 +5,8 @@ voucher_batches / vouchers / guests, which are not altered. Rows this
 feature creates in those existing tables (per ISP customer org) are left in
 place on downgrade (manual cleanup SQL in ADDENDUM_02 §6).
 
-Revision ID: 0174_isp_plans_coupons
-Revises: 0173_isp_service_and_billing
+Revision ID: 0180_isp_plans_coupons
+Revises: 0179_isp_service_and_billing
 Create Date: 2026-10-22
 """
 
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0174_isp_plans_coupons"
-down_revision = "0173_isp_service_and_billing"
+revision = "0180_isp_plans_coupons"
+down_revision = "0179_isp_service_and_billing"
 branch_labels = None
 depends_on = None
 

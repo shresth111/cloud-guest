@@ -8,8 +8,8 @@ Additive, ISP-owned tables only:
 
 No pre-existing table is touched. ``downgrade`` drops exactly these.
 
-Revision ID: 0179_isp_subscriber_360
-Revises: 0178_merge_integ_parity_settings
+Revision ID: 0185_isp_subscriber_360
+Revises: 0184_isp_parity_settings
 Create Date: 2026-11-01
 """
 
@@ -20,8 +20,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0179_isp_subscriber_360"
-down_revision = "0178_merge_integ_parity_settings"
+revision = "0185_isp_subscriber_360"
+down_revision = "0184_isp_parity_settings"
 branch_labels = None
 depends_on = None
 

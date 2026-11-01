@@ -9,8 +9,8 @@
 ``downgrade`` restores the old check (it fails while zone invoices exist, by
 design) and drops the link column.
 
-Revision ID: 0188_isp_zone_invoices
-Revises: 0187_isp_comms_2b
+Revision ID: 0200_isp_zone_invoices
+Revises: 0199_isp_comms_2b
 Create Date: 2026-11-01
 """
 
@@ -21,8 +21,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0188_isp_zone_invoices"
-down_revision = "0187_isp_comms_2b"
+revision = "0200_isp_zone_invoices"
+down_revision = "0199_isp_comms_2b"
 branch_labels = None
 depends_on = None
 

@@ -17,8 +17,8 @@ Additive and confined to the ISP partner domain's OWN tables (created by
 Downgrade refuses while any subscriber invoice exists (the old check
 constraint could not be restored without deleting GST documents).
 
-Revision ID: 0175_isp_subscriber_invoices
-Revises: 0174_isp_plans_coupons
+Revision ID: 0181_isp_subscriber_invoices
+Revises: 0180_isp_plans_coupons
 Create Date: 2026-10-22
 """
 
@@ -29,8 +29,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0175_isp_subscriber_invoices"
-down_revision = "0174_isp_plans_coupons"
+revision = "0181_isp_subscriber_invoices"
+down_revision = "0180_isp_plans_coupons"
 branch_labels = None
 depends_on = None
 

@@ -10,8 +10,8 @@ Additive, ISP-owned tables only:
 
 No pre-ISP table is touched. ``downgrade`` drops exactly these.
 
-Revision ID: 0177_isp_parity_settings
-Revises: 0176_isp_addon_allowances
+Revision ID: 0184_isp_parity_settings
+Revises: 0183_isp_addon_allowances
 Create Date: 2026-10-23
 """
 
@@ -22,8 +22,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0177_isp_parity_settings"
-down_revision = "0176_isp_addon_allowances"
+revision = "0184_isp_parity_settings"
+down_revision = "0183_isp_addon_allowances"
 branch_labels = None
 depends_on = None
 

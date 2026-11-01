@@ -4,8 +4,8 @@ charges, settlements.
 Additive: four new ISP-owned tables. JAZE-4's zone tables are not altered.
 ``downgrade`` drops exactly these four.
 
-Revision ID: 0186_isp_franchise
-Revises: 0185_isp_comms_hub
+Revision ID: 0198_isp_franchise
+Revises: 0197_isp_comms_hub
 Create Date: 2026-11-01
 """
 
@@ -16,8 +16,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0186_isp_franchise"
-down_revision = "0185_isp_comms_hub"
+revision = "0198_isp_franchise"
+down_revision = "0197_isp_comms_hub"
 branch_labels = None
 depends_on = None
 

@@ -2,8 +2,8 @@
 
 Additive: two new ISP-owned tables. ``downgrade`` drops exactly these.
 
-Revision ID: 0192_isp_referrals
-Revises: 0191_isp_queued_renewals
+Revision ID: 0204_isp_referrals
+Revises: 0203_isp_queued_renewals
 Create Date: 2026-11-01
 """
 
@@ -14,8 +14,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0192_isp_referrals"
-down_revision = "0191_isp_queued_renewals"
+revision = "0204_isp_referrals"
+down_revision = "0203_isp_queued_renewals"
 branch_labels = None
 depends_on = None
 

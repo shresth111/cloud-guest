@@ -5,8 +5,8 @@ per-ISP Apps settings, scheduled announcements.
 Additive: nine new tables plus one nullable column
 (``isp_announcements.scheduled_at``). ``downgrade`` drops exactly these.
 
-Revision ID: 0184_isp_apps_2
-Revises: 0183_isp_zone_branding
+Revision ID: 0196_isp_apps_2
+Revises: 0195_isp_zone_branding
 Create Date: 2026-11-01
 """
 
@@ -17,8 +17,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0184_isp_apps_2"
-down_revision = "0183_isp_zone_branding"
+revision = "0196_isp_apps_2"
+down_revision = "0195_isp_zone_branding"
 branch_labels = None
 depends_on = None
 

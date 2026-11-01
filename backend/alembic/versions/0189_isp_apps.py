@@ -4,8 +4,8 @@ discount codes, light inventory, leads.
 Additive only: thirteen new ``isp_*`` tables. No pre-existing table is
 touched. ``downgrade`` drops exactly these.
 
-Revision ID: 0179_isp_apps
-Revises: 0178_merge_integ_parity_settings
+Revision ID: 0189_isp_apps
+Revises: 0188_isp_finance_jaze4
 Create Date: 2026-11-01
 """
 
@@ -16,8 +16,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0179_isp_apps"
-down_revision = "0179_isp_finance_jaze4"
+revision = "0189_isp_apps"
+down_revision = "0188_isp_finance_jaze4"
 branch_labels = None
 depends_on = None
 
