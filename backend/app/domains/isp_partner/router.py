@@ -1004,6 +1004,12 @@ def _include_lanes() -> None:
     from .dashboard_router import dashboard_router
 
     isp_partner_router.include_router(dashboard_router)
+
+    # PKG-2: package type + connection type (/isp/package-meta), behind
+    # ISP_PACKAGE_META_ENABLED.
+    from .package_meta_router import package_meta_router
+
+    isp_partner_router.include_router(package_meta_router)
     isp_partner_router.include_router(billing_router)
     # ADDENDUM_05 JAZE-1 (J1/J2/J11/J19). Mounted BEFORE plans_router:
     # its literal paths (/subscribers/directory, /typeahead, /onboard) must
