@@ -1000,6 +1000,10 @@ def _include_lanes() -> None:
     from .zones_router import zones_router
 
     isp_partner_router.include_router(zones_router)
+    # DASH-1: subscriber operations dashboard (ISP_DASHBOARD_ENABLED).
+    from .dashboard_router import dashboard_router
+
+    isp_partner_router.include_router(dashboard_router)
     isp_partner_router.include_router(billing_router)
     # ADDENDUM_05 JAZE-1 (J1/J2/J11/J19). Mounted BEFORE plans_router:
     # its literal paths (/subscribers/directory, /typeahead, /onboard) must
