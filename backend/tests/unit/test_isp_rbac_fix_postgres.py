@@ -10,6 +10,10 @@ check, not a "feature off" 404.
 | GSTR-1          |  Y     Y    N   N    Y       N      |
 | CAF detail+PDF  |  Y     Y    N   Y*   Y       N      |
 | KYC read        |  Y     Y    N   Y*   Y       N      |
+| LEA trace, retention | Y Y   N   N    N       N      |
+| COMMS logs/templates | Y Y   N   N    Y       Y (pending decision) |
+| COMMS logs CSV  |  Y     Y    N   N    Y       N      |
+| COMMS webhook   |  Y     Y    N   N    N       N      |
 
 Y = not 401/403/404, N = 403, * = only for its own customer (404 outside).
 """
@@ -34,6 +38,15 @@ ALLOW = {
     "gstr1": {"owner", "admin", "billing"},
     "caf": {"owner", "admin", "technician", "billing"},
     "kyc": {"owner", "admin", "technician", "billing"},
+    # IPDR-2 LEA trace + retention (isp_ipdr.export / isp_ipdr.read)
+    "lea": {"owner", "admin"},
+    "retention": {"owner", "admin"},
+    # COMMS-2 as built: logs/templates read on isp_billing.read, so billing
+    # AND viewer read them (PENDING founder decision, flagged 2026-11-01);
+    # CSV on isp_billing.export; webhook config on isp_billing.manage.
+    "comms_logs": {"owner", "admin", "billing", "viewer"},
+    "comms_export": {"owner", "admin", "billing"},
+    "comms_webhook": {"owner", "admin"},
 }
 
 
@@ -44,7 +57,13 @@ async def test_rbac_fix_role_matrix(monkeypatch) -> None:  # noqa: ANN001
     from app.database.session import SessionLocal, engine
     from app.domains.auth.models import AuthUser, User
     from app.domains.billing.models import Plan
-    from app.domains.isp_partner import bill2_config, caf_service, workbench_router
+    from app.domains.isp_partner import (
+        bill2_config,
+        caf_service,
+        comms_router,
+        ipdr_lea_router,
+        workbench_router,
+    )
     from app.domains.isp_partner.models import IspPartnerProfile, IspStaffCustomerScope
     from app.domains.isp_partner.seed import seed_isp_partner_rbac
     from app.domains.organization.models import Organization, OrganizationMember
@@ -68,6 +87,16 @@ async def test_rbac_fix_role_matrix(monkeypatch) -> None:  # noqa: ANN001
         workbench_router,
         "get_workbench_settings",
         lambda: workbench_router.IspWorkbenchSettings(sub360_workbench_enabled=True),
+    )
+    monkeypatch.setattr(
+        ipdr_lea_router,
+        "get_ipdr_lea_settings",
+        lambda: ipdr_lea_router.IspIpdrLeaSettings(ipdr_lea_enabled=True),
+    )
+    monkeypatch.setattr(
+        comms_router,
+        "get_comms_settings",
+        lambda: comms_router.IspCommsSettings(comms_hub_enabled=True),
     )
     tag = uuid.uuid4().hex[:8]
     try:
@@ -234,6 +263,25 @@ async def test_rbac_fix_role_matrix(monkeypatch) -> None:  # noqa: ANN001
                     ("GET", f"/api/v1/isp/caf/subscribers/{sub}/caf.pdf", None),
                 ],
                 "kyc": [("GET", f"/api/v1/isp/compliance/subscribers/{sub}/kyc", None)],
+                "lea": [
+                    (
+                        "POST",
+                        "/api/v1/isp/compliance/lea-trace",
+                        {
+                            "public_ip": "203.0.113.5",
+                            "at": datetime.now(UTC).isoformat(),
+                            "lea_reference": "LEA/2026/001",
+                            "reason": "RBAC matrix test",
+                        },
+                    )
+                ],
+                "retention": [("GET", "/api/v1/isp/compliance/retention", None)],
+                "comms_logs": [
+                    ("GET", "/api/v1/isp/comms/logs", None),
+                    ("GET", "/api/v1/isp/comms/templates", None),
+                ],
+                "comms_export": [("GET", "/api/v1/isp/comms/logs/export.csv", None)],
+                "comms_webhook": [("GET", "/api/v1/isp/comms/webhook", None)],
             }
 
         failures: list[str] = []
