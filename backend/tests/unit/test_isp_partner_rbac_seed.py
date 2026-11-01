@@ -196,6 +196,8 @@ EXPECTED["isp-noc"] |= {"isp_referrals.read"}
 EXPECTED["isp-technician"] |= {"isp_referrals.read", "isp_referrals.create"}
 EXPECTED["isp-billing"] |= {"isp_referrals.read", "isp_referrals.create"}
 EXPECTED["isp-viewer"] |= {"isp_referrals.read"}
+# AUDIT-LOG: owner/admin only
+EXPECTED["isp-owner"] |= {"isp_audit.read", "isp_audit.export"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -301,8 +303,8 @@ async def test_seeding_never_changes_a_pre_existing_role(repo) -> None:
 async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
-    assert summary.permission_groups_created == 21  # +1 REFERRAL-1
-    assert summary.permissions_created == 81  # +3 isp_referrals.*
+    assert summary.permission_groups_created == 22  # +1 AUDIT-LOG
+    assert summary.permissions_created == 83  # +2 isp_audit.*
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED
