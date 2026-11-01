@@ -1036,5 +1036,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(portal_support_router)
 
+    # JAZE-6 Phase 2b: PPPoE on our RADIUS (behind ISP_PPPOE_ENABLED too).
+    from .pppoe_router import pppoe_internal_router, pppoe_router
+
+    isp_partner_router.include_router(pppoe_router)
+    isp_partner_router.include_router(pppoe_internal_router)
+
 
 _include_lanes()

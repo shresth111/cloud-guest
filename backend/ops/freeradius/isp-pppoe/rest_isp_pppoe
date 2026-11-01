@@ -1,0 +1,48 @@
+# /etc/freeradius/3.0/mods-available/rest_isp_pppoe   (symlink into mods-enabled/)
+#
+# Exception X2 (founder-approved, ADDENDUM_02 §5): a SECOND rlm_rest instance,
+# used only by the new `wyfy-isp-pppoe` virtual server on its own ports.
+# The existing `rest` module and sites-available/default are NOT touched.
+#
+# TEST BOX ONLY (wyfy-isp-test). Never apply to the prod hub.
+#
+# __PPPOE_REST_SECRET__ must equal ISP_PPPOE_REST_SECRET in the box's
+# backend.env. It is the gate that keeps the authorize reply (which carries
+# the subscriber's password, needed for CHAP/MS-CHAPv2) away from anyone who
+# merely holds a router's NAS secret.
+
+rest rest_isp_pppoe {
+	tls {
+	}
+
+	connect_uri = "http://127.0.0.1:8000/api/v1"
+
+	authorize {
+		uri = "${..connect_uri}/isp/internal/pppoe/authorize"
+		method = 'post'
+		body = 'json'
+		data = "{\"username\": \"%{User-Name}\", \"calling_station_id\": \"%{Calling-Station-Id}\", \"nas_port_id\": \"%{NAS-Port-Id}\"}"
+		tls = ${..tls}
+	}
+
+	#  Flat scratch attributes only (README.md bug #2 of the main rest.conf):
+	#  every value is computed by unlang in the virtual server first.
+	accounting {
+		uri = "${..connect_uri}/isp/internal/pppoe/accounting"
+		method = 'post'
+		body = 'json'
+		data = "{\"status_type\": \"%{control:Tmp-String-0}\", \"username\": \"%{User-Name}\", \"calling_station_id\": \"%{Calling-Station-Id}\", \"session_id\": \"%{Acct-Session-Id}\", \"bytes_uploaded_total\": %{control:Tmp-Integer64-0}, \"bytes_downloaded_total\": %{control:Tmp-Integer64-1}, \"disconnect_reason\": \"%{control:Tmp-String-1}\", \"framed_ip\": \"%{control:Tmp-String-2}\", \"nas_port_id\": \"%{control:Tmp-String-3}\", \"framed_ipv6_prefix\": \"%{control:Tmp-String-4}\", \"delegated_ipv6_prefix\": \"%{control:Tmp-String-5}\"}"
+		tls = ${..tls}
+	}
+
+	pool {
+		start = 2
+		min = 2
+		max = 10
+		spare = 2
+		uses = 0
+		retry_delay = 30
+		lifetime = 0
+		idle_timeout = 60
+	}
+}

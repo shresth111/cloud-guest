@@ -49,6 +49,13 @@ _PUBLIC_AUTH_ROUTES = {("POST", "/api/v1/isp/auth/forgot-password")}
 #: (isp_partner.portal_support_router). Public and read-only, pinned below.
 _PUBLIC_PORTAL = "/api/v1/isp/public/"
 _PUBLIC_PORTAL_ROUTES = {("GET", "/api/v1/isp/public/portal-support")}
+#: JAZE-6: FreeRADIUS-only PPPoE endpoints (isp_partner.pppoe_router). NAS
+#: shared-secret + ISP_PPPOE_REST_SECRET, no user. Pinned below.
+_PPPOE_INTERNAL = "/api/v1/isp/internal/pppoe/"
+_PPPOE_INTERNAL_ROUTES = {
+    ("POST", "/api/v1/isp/internal/pppoe/authorize"),
+    ("POST", "/api/v1/isp/internal/pppoe/accounting"),
+}
 
 
 @lru_cache(maxsize=1)
@@ -67,7 +74,9 @@ def _isp_routes(app=None):
             continue
         if not endpoint.__module__.startswith(_OUR_MODULES):
             continue
-        if route.path.startswith((_INTERNAL, _PLATFORM, _PUBLIC_AUTH, _PUBLIC_PORTAL)):
+        if route.path.startswith(
+            (_INTERNAL, _PLATFORM, _PUBLIC_AUTH, _PUBLIC_PORTAL, _PPPOE_INTERNAL)
+        ):
             continue
         out.append(route)
     return out
@@ -404,3 +413,23 @@ def test_the_public_isp_portal_surface_is_exactly_portal_support() -> None:
         assert RequireIspFeatureEnabled in calls
         assert RequireOrganization not in calls
         assert RequireIspPartner not in calls
+
+
+def test_the_pppoe_internal_surface_is_exactly_authorize_and_accounting() -> None:
+    """JAZE-6: the only /isp routes without the user guard stack are the two
+    FreeRADIUS calls, and both carry the NAS auth + the REST-secret gate."""
+    from app.domains.guest.dependencies import CurrentNas
+    from app.domains.isp_partner.pppoe_router import RequirePppoeRestCaller
+
+    routes = [
+        r
+        for r in _app().routes
+        if getattr(r, "methods", None) and r.path.startswith(_PPPOE_INTERNAL)
+    ]
+    assert {(m, r.path) for r in routes for m in r.methods} == _PPPOE_INTERNAL_ROUTES
+    for r in routes:
+        assert r.endpoint.__module__ == "app.domains.isp_partner.pppoe_router"
+        calls = [d.dependency for d in r.dependencies]
+        assert RequirePppoeRestCaller in calls
+        params = [d.call for d in r.dependant.dependencies]
+        assert CurrentNas in params
