@@ -578,7 +578,13 @@ PATHS = [
         "GET",
         "/api/v1/isp/compliance/cgnat-lookup?public_ip=203.0.113.80&at=2026-10-24T20:15:30",
     ),
-    ("GET", f"/api/v1/isp/compliance/subscribers/{uuid.uuid4()}/kyc"),
+    # A fixed id (CI-INTEG): a uuid4() here gave the parametrize ids a new
+    # value per process, so pytest-xdist workers collected different tests.
+    (
+        "GET",
+        "/api/v1/isp/compliance/subscribers/"
+        "3c2ec864-1e5f-4a10-b84e-690a2219defb/kyc",
+    ),
 ]
 
 

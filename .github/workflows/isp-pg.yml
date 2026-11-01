@@ -30,9 +30,12 @@ on:
 permissions:
   contents: read
 
+# Not cancel-in-progress: integ takes many pushes an hour and a cancelled
+# run reports nothing. A running run finishes; only the newest waiting one
+# is kept.
 concurrency:
   group: isp-pg-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 defaults:
   run:
