@@ -24,8 +24,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.masking import mask_email, mask_mobile
+from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.captive_portal import router as portal_routes
 from app.domains.captive_portal.dependencies import get_captive_portal_service
@@ -616,6 +618,7 @@ async def twin_allocate_tunnel(
     isp: IspContext = Depends(RequireIspPartner),
     service: WireGuardService = Depends(get_wireguard_service),
     audit: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """``force=true`` destroys a live peer on the hub and is refused (422)."""
     if force:
@@ -630,8 +633,45 @@ async def twin_allocate_tunnel(
         requesting_organization_id=target.organization_id,
         service=service,
     )
+    await _fill_management_ip(db, target.id)
     await _audit_setup(audit, isp, target, "cloud_link", rotate=rotate)
     return result
+
+
+async def _fill_management_ip(db: AsyncSession, router_id: uuid.UUID) -> None:
+    """ENFORCE-3: a partner router's management address is the tunnel peer
+    IP this platform dials back into. It used to stay empty until the setup
+    script's heartbeat reported it, so a router configured any other way
+    (found on the CHR) could never be reached for a PPPoE kick or any other
+    8728 call. Fill it here, from the peer just allocated, only while it is
+    empty: the heartbeat still overwrites it with what the device reports."""
+    from sqlalchemy import select
+
+    from app.domains.router.models import Router
+    from app.domains.wireguard.models import WireGuardPeer
+
+    router = await db.get(Router, router_id)
+    if router is None or router.management_ip_address:
+        return
+    peer = (
+        (
+            await db.execute(
+                select(WireGuardPeer)
+                .where(
+                    WireGuardPeer.router_id == router_id,
+                    WireGuardPeer.is_deleted.is_(False),
+                    WireGuardPeer.revoked_at.is_(None),
+                )
+                .order_by(WireGuardPeer.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if peer is None or not peer.tunnel_ip_address:
+        return
+    router.management_ip_address = peer.tunnel_ip_address.split("/")[0]
+    await db.flush()
 
 
 @core.post(

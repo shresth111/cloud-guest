@@ -850,6 +850,8 @@ class IspPppoeService:
         from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
         from app.domains.wireguard.validators import hub_reserved_ip
 
+        from .enforcement_pppoe import pppoe_multi_session_isp
+
         settings = get_isp_pppoe_settings()
         router = await IspScope.assert_router(isp, isp_router_id)
         peer = (
@@ -902,6 +904,11 @@ class IspPppoeService:
                     auth_port=settings.auth_port,
                     acct_port=settings.acct_port,
                     interim_seconds=settings.interim_interval_seconds,
+                    # ENFORCE-3: only-one=no only while enforcement is on and
+                    # this ISP sells a package allowing more than one device.
+                    only_one=not await pppoe_multi_session_isp(
+                        self.session, isp.isp_org_id
+                    ),
                 )
             )
         except ValueError as exc:

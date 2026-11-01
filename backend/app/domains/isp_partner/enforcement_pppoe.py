@@ -61,6 +61,45 @@ async def _policy(ctx: PppoeAuthorizeContext) -> Any:
     return await _policy_for_package(ctx.session, sub.package_id)
 
 
+async def pppoe_multi_session_isp(session: Any, isp_id: uuid.UUID) -> bool:
+    """ENFORCE-3: does this ISP sell a package allowing more than one device
+    online, with enforcement on? Then its PPPoE profile is written with
+    ``only-one=no`` and this gate enforces the device limit instead of the
+    router, defaulting to 1 for packages without a limit (what the router's
+    ``only-one=yes`` gave them before)."""
+    if not _on():
+        return False
+    from .enforcement_models import IspPackagePolicy as P
+
+    return (
+        await session.execute(
+            select(P.id)
+            .where(
+                P.isp_organization_id == isp_id,
+                P.is_deleted.is_(False),
+                P.max_simultaneous > 1,
+            )
+            .limit(1)
+        )
+    ).first() is not None
+
+
+async def _live_pppoe_other_devices(ctx: PppoeAuthorizeContext) -> int:
+    from .pppoe_models import IspPppoeSession as P
+
+    q = select(func.count()).where(
+        P.subscriber_id == ctx.subscriber.id,
+        P.status == "active",
+        P.is_deleted.is_(False),
+    )
+    if ctx.calling_station_id:
+        q = q.where(
+            (P.calling_station_id.is_(None))
+            | (func.upper(P.calling_station_id) != ctx.calling_station_id.upper())
+        )
+    return int((await ctx.session.execute(q)).scalar_one())
+
+
 async def _bound_macs(session: Any, subscriber_id: uuid.UUID) -> list[str]:
     from .enforcement_models import IspSubscriberMacBinding as M
 
@@ -157,6 +196,16 @@ async def jaze2_pppoe_gate(ctx: PppoeAuthorizeContext) -> PppoeGateResult | None
     if not _on():
         return None
     policy = await _policy(ctx)
+    # ENFORCE-3: on an ISP whose routers run only-one=no, a package without
+    # a device limit keeps the router's old one-session rule.
+    if (
+        (policy is None or not policy.max_simultaneous)
+        and ctx.subscriber is not None
+        and await pppoe_multi_session_isp(ctx.session, ctx.isp_organization_id)
+        and await _live_pppoe_other_devices(ctx) >= 1
+    ):
+        await _event(ctx, "concurrency", "1 live, limit 1 (default)")
+        return PppoeGateResult(allow=False, reason=R_CONCURRENCY)
     if policy is None:
         return None
     from .enforcement import norm_mac
@@ -280,5 +329,6 @@ __all__ = [
     "R_MAC",
     "jaze2_pppoe_gate",
     "jaze2_pppoe_rate",
+    "pppoe_multi_session_isp",
     "timeout_reply",
 ]
