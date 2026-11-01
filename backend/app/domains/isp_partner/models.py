@@ -127,6 +127,7 @@ from .compliance_models import *  # noqa: E402,F403
 from .enforcement_models import *  # noqa: E402,F403
 from .fiber_models import *  # noqa: E402,F403  (J22 fiber registry)
 from .finance_models import *  # noqa: E402,F403  (JAZE-4)
+from .package_meta_models import *  # noqa: E402,F403  (PKG-2)
 from .plans_models import *  # noqa: E402,F403
 from .pppoe_models import *  # noqa: E402,F403
 from .subscriber360_models import *  # noqa: E402,F403
