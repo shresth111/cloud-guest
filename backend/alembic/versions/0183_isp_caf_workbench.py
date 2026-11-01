@@ -4,7 +4,9 @@ New ISP-owned tables only; no existing table is altered. ``downgrade`` drops
 exactly these two.
 
 Revision ID: 0183_isp_caf_workbench
-Revises: 0182_isp_package_meta (PKG-2; renumbered from 0182 at the integ merge, never deployed)
+Revises: 0182_isp_package_meta
+
+(Renumbered from 0182 at the integ merge onto PKG-2's 0182; never deployed.)
 Create Date: 2026-11-01
 """
 
