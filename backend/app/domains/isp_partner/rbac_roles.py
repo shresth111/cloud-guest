@@ -294,3 +294,35 @@ ROLES: tuple[IspRoleDefinition, ...] = (
 )
 
 ROLES_BY_SLUG: dict[str, IspRoleDefinition] = {r.slug: r for r in ROLES}
+
+
+# -- J16 Apps (ADDENDUM_05, JAZE-5): helpdesk, field tasks, announcements,
+# discount codes, inventory, leads. Appended as new rows only; the routes
+# are additionally behind ISP_APPS_ENABLED (default off).
+_APPS_GRANTS: dict[str, str] = {
+    IspRole.OWNER.value: "read create update manage export",
+    IspRole.ADMIN.value: "read create update manage export",
+    IspRole.NOC.value: "read create update export",
+    IspRole.TECHNICIAN.value: "read create update",
+    IspRole.BILLING.value: "read create export",
+    IspRole.VIEWER.value: "read export",
+}
+PERMISSION_GROUPS = (
+    *PERMISSION_GROUPS,
+    IspPermissionGroup(
+        key="isp_apps",
+        name="ISP Apps",
+        actions=("read", "create", "update", "manage", "export"),
+        sort_order=1017,
+    ),
+)
+ROLES = tuple(
+    IspRoleDefinition(
+        slug=r.slug,
+        name=r.name,
+        description=r.description,
+        permission_keys=r.permission_keys + _keys(isp_apps=_APPS_GRANTS[r.slug]),
+    )
+    for r in ROLES
+)
+ROLES_BY_SLUG = {r.slug: r for r in ROLES}
