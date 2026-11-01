@@ -55,6 +55,14 @@ server wyfy-isp-pppoe {
 		Auth-Type MS-CHAP {
 			mschap
 		}
+		#  ENFORCE-3: rlm_mschap sets "Auth-Type := mschap" (its instance
+		#  name). sites-enabled/default lists a bare "mschap" in its own
+		#  authenticate section, which creates "mschap" as a SEPARATE
+		#  Auth-Type value, so in this server "Found Auth-Type = mschap" had
+		#  no handler and every MS-CHAPv2 login was rejected (RouterOS E=691,
+		#  seen on the CHR). This bare entry handles it. The API returns
+		#  Cleartext-Password, which mschap hashes itself: no NT-hash storage.
+		mschap
 	}
 
 	post-auth {
