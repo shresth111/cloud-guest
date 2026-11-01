@@ -265,9 +265,14 @@ async def _log_rows(
     order = {"sent": 1, "delivered": 2, "read": 3, "failed": 4}
     for lst in receipts.values():
         lst.sort(key=lambda x: (x["occurred_at"], order.get(x["status"], 9)))
+    from .comms2b import contents_for
+
+    # COMMS-2b: the template + parameters actually sent, when recorded.
+    contents = await contents_for(db, isp.isp_org_id, [r.id for r in rows])
     out = []
     for r in rows:
         rs = receipts.get(r.provider_message_id or "", [])
+        sent = contents.get(r.id)
         life = logic.lifecycle(r.status, rs)
         if q.status and life["status"] != q.status:
             continue
@@ -278,7 +283,10 @@ async def _log_rows(
                 "channel": r.channel,
                 "event": r.trigger,
                 "recipient": r.recipient_masked,
-                "content": r.summary,
+                "content": _content(sent) if sent is not None else r.summary,
+                "summary": r.summary,
+                "template_name": sent.template_name if sent is not None else None,
+                "parameters": list(sent.parameters) if sent is not None else None,
                 "status": life["status"],
                 "status_at_ist": _ist(life["status_at"]),
                 "error": life["receipt_error"] or r.error,
@@ -300,6 +308,14 @@ async def _log_rows(
             }
         )
     return out
+
+
+def _content(sent: Any) -> str:
+    vals = " | ".join(
+        f"{p.get('variable') or p.get('position')}: {p.get('value')}"
+        for p in (sent.parameters or [])
+    )
+    return f"{sent.template_name} · {vals}" if vals else str(sent.template_name)
 
 
 # RBAC-FIX (founder 2026-11-01): logs and templates carry recipient

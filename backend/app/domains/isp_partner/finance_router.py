@@ -485,6 +485,9 @@ async def put_contact(
 class EmailInvoiceRequest(_Body):
     send_to: Literal["primary", "alternate", "both"] = "primary"
     message: str | None = Field(default=None, max_length=1000)
+    #: COMMS-2b: "own" sends through the ISP's own verified SMTP/SES sender
+    #: (offered only when it exists, see GET /finance/email-senders).
+    sender: Literal["platform", "own"] = "platform"
 
 
 @finance_router.post(
@@ -506,7 +509,18 @@ async def email_invoice(
     from app.domains.notification.repository import NotificationRepository
     from app.domains.notification.service import NotificationService
 
+    from .comms2b import own_email_row, own_sender_with_attachment
+
     inv = await svc.billing._invoice(isp, invoice_id)
+    own_row = None
+    if payload.sender == "own":
+        own_row = await own_email_row(svc.session, isp.isp_org_id)
+        if own_row is None:
+            from .finance_service import IspFinanceValidationError
+
+            raise IspFinanceValidationError(
+                "Your own email sender is not set up and verified", field="sender"
+            )
     recipients = await svc.invoice_recipients(isp, inv, payload.send_to)
     content, filename = await _pdf_for(isp, svc.billing, invoice_id)
     key = f"isp-invoices/{isp.isp_org_id}/{inv.id}/{uuid.uuid4()}.pdf"
@@ -526,6 +540,37 @@ async def email_invoice(
     )
     outbox = NotificationService(NotificationRepository(svc.session))
     queued = []
+    if own_row is not None:
+        failed = await _email_via_own(
+            svc,
+            isp,
+            inv,
+            own_row,
+            own_sender_with_attachment(own_row, content, filename),
+            recipients,
+            body,
+            payload.send_to,
+        )
+        await svc._audit(
+            isp,
+            "isp_invoice_emailed",
+            inv.id,
+            inv.customer_organization_id,
+            send_to=payload.send_to,
+            sender="own",
+        )
+        await svc.session.commit()
+        return ok(
+            request,
+            {
+                "queued": [],
+                "sent": [auto.mask_email(t) for t in recipients if t not in failed],
+                "failed": [auto.mask_email(t) for t in failed],
+                "send_to": payload.send_to,
+                "sender": "own",
+            },
+            "Invoice emailed",
+        )
     for to in recipients:
         delivery = await outbox.enqueue(
             event_type=NotificationEventType.SUBSCRIPTION_RENEWAL_REMINDER,
@@ -563,6 +608,64 @@ async def email_invoice(
     return ok(
         request, {"queued": queued, "send_to": payload.send_to}, "Invoice emailed"
     )
+
+
+async def _email_via_own(
+    svc: IspFinanceService,
+    isp: IspContext,
+    inv: Any,
+    row: Any,
+    sender: Any,
+    recipients: list[str],
+    body: str,
+    send_to: str,
+) -> set[str]:
+    """COMMS-2b: send now through the ISP's own sender; one log row per
+    recipient (sent / failed, provider errors scrubbed of config values)."""
+    from app.domains.marketing.providers import decrypt_config, scrub
+    from app.domains.marketing.senders import SendError
+
+    config = decrypt_config(row.config_encrypted)
+    failed: set[str] = set()
+    for to in recipients:
+        common = dict(
+            channel="email",
+            trigger="invoice_email",
+            recipient_masked=auto.mask_email(to),
+            customer_organization_id=inv.customer_organization_id,
+            subscriber_id=inv.subscriber_id,
+            invoice_id=inv.id,
+            summary=f"Invoice {inv.number} ({send_to}, own sender)",
+        )
+        try:
+            res = await sender.send(
+                to,
+                subject=f"{isp.organization.name}: invoice {inv.number}",
+                html_body=body,
+                from_name=isp.organization.name,
+                headers={},
+            )
+            svc.session.add(
+                auto.log_row(
+                    isp.isp_org_id,
+                    status="sent",
+                    provider_message_id=(res.message_id or None)
+                    and str(res.message_id)[:128],
+                    **common,
+                )
+            )
+        except SendError as exc:
+            failed.add(to)
+            svc.session.add(
+                auto.log_row(
+                    isp.isp_org_id,
+                    status="failed",
+                    error=scrub(str(exc), config) or exc.__class__.__name__,
+                    **common,
+                )
+            )
+    await svc.session.flush()
+    return failed
 
 
 @finance_router.get(

@@ -58,7 +58,7 @@ EVENTS: dict[str, dict[str, Any]] = {
     },
     "overdue": {
         "label": "Overdue outstanding",
-        "trigger": None,
+        "trigger": "overdue",
         "vars": ["name", "invoice_number", "balance", "pay_link"],
     },
     "unpaid_invoice": {
@@ -78,7 +78,7 @@ EVENTS: dict[str, dict[str, Any]] = {
     },
     "welcome": {
         "label": "Welcome",
-        "trigger": None,
+        "trigger": "welcome",
         "vars": ["name", "username", "package"],
     },
 }
