@@ -117,6 +117,7 @@ class IspStaffCustomerScope(BaseModel):
 # Registered on the same metadata via this module, which alembic/env.py
 # already imports (E2), so 1b needs no further registration line.
 from .apps_models import *  # noqa: E402,F403  (J16 Apps)
+from .bill2_models import *  # noqa: E402,F403  (BILL-2)
 from .billing_models import *  # noqa: E402,F403
 from .billing_models import BILLING_TABLES  # noqa: E402,F401
 

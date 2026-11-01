@@ -271,6 +271,14 @@ async def _pdf_for(
     settings = settings | await IspFinanceService(session=svc.session).seller_extras(
         isp, inv_row
     )
+    # BILL-2 (flag off -> not called, PDF unchanged): account + dues block,
+    # zone invoice name / bank.
+    from .bill2_config import get_bill2_settings
+
+    if get_bill2_settings().enabled:
+        from .billing_extras import pdf_extras
+
+        settings = settings | await pdf_extras(svc.session, isp, inv_row)
     content = render_invoice_pdf(
         view, seller=settings, isp_name=isp.organization.name, against=against
     )

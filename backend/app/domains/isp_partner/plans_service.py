@@ -34,6 +34,12 @@ from .plans_models import (
 from .scoping import IspScope
 from .subscriber_identity import subscriber_identifier
 
+IspRenewCyclesOffError = _err(
+    "IspRenewCyclesOffError",
+    "ISP_RENEW_CYCLES_OFF",
+    422,
+    "Renewing for more than one cycle is not switched on for this account",
+)
 IspGroupInUseError = _err(
     "IspGroupInUseError",
     "ISP_GROUP_IN_USE",
@@ -1814,18 +1820,31 @@ class IspPlansService:
                 and not (payment.get("reference") or "").strip()
             ):
                 raise IspPaymentReferenceRequiredError()
+        # BILL-2: N cycles in one invoice. 1 is the old behaviour exactly.
+        cycles = int(data.get("cycles") or 1)
+        if cycles > 1:
+            from .bill2_config import MAX_CYCLES, get_bill2_settings
+
+            if not get_bill2_settings().enabled or cycles > MAX_CYCLES:
+                raise IspRenewCyclesOffError()
         await self.materialize(isp, package, s.customer_organization_id)
         now = self._clock()
         start = max(now, s.valid_until) if s.valid_until else now
-        end = start + timedelta(days=package.validity_days)
+        end = start + timedelta(days=package.validity_days * cycles)
         tz = isp.organization.timezone or "Asia/Kolkata"
         inv = await billing.issue_subscriber_invoice(
             isp,
             s,
             lines=[
                 {
-                    "description": package.name,
+                    "description": (
+                        package.name
+                        if cycles == 1
+                        else f"{package.name} x {cycles} "
+                        f"({package.validity_days * cycles} days)"
+                    ),
                     "amount_paise": price_paise,
+                    "quantity": cycles,
                     "price_includes_gst": package.price_includes_gst,
                     "period_from": _local_date(start, tz),
                     "period_to": _local_date(end, tz),
@@ -1835,7 +1854,7 @@ class IspPlansService:
             invoice_kind="recharge",
             period_start=_local_date(start, tz),
             period_end=_local_date(end, tz),
-            description=package.name,
+            description=package.name if cycles == 1 else f"{package.name} x {cycles}",
             po_number=data.get("po_number"),
             source_key=source_key,
         )
