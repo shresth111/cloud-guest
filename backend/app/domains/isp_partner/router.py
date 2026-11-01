@@ -1103,6 +1103,10 @@ def _include_lanes() -> None:
     from .finance_router import finance_router, public_pay_router
 
     isp_partner_router.include_router(finance_router)
+    # COMMS-2b: the manual invoice email's sender list.
+    from .comms2b_router import comms2b_router
+
+    isp_partner_router.include_router(comms2b_router)
     isp_partner_router.include_router(public_pay_router)
     # COMMS-2: logs, delivery receipts (Meta webhook), template library
     # (ISP_COMMS_HUB_ENABLED).

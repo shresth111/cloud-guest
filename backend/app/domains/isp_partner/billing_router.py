@@ -1051,12 +1051,33 @@ async def _remind(
         )
         + "</p>"
     )
+    subject = f"{isp.organization.name}: invoice {inv.number} due"
+    # COMMS-2b: the ISP's enabled "unpaid invoice" email template, if any;
+    # otherwise the text above, unchanged.
+    from .automation import pay_link_for
+    from .comms2b import email_template
+    from .comms_router import get_comms_settings
+
+    async def _values() -> dict[str, str]:
+        return {
+            "name": customer.name,
+            "invoice_number": inv.number,
+            "balance": f"Rs {balance_of(inv) / 100:,.2f}",
+            "pay_link": await pay_link_for(svc.session, isp.isp_org_id, inv.id),
+        }
+
+    if get_comms_settings().comms_hub_enabled:
+        tpl = await email_template(
+            svc.session, isp.isp_org_id, "unpaid_invoice", _values
+        )
+        if tpl is not None:
+            subject, body = tpl
     outbox = NotificationService(NotificationRepository(svc.session))
     await outbox.enqueue(
         event_type=NotificationEventType.SUBSCRIPTION_RENEWAL_REMINDER,
         channel=NotificationChannelType.EMAIL,
         recipient=customer.contact_email,
-        subject=f"{isp.organization.name}: invoice {inv.number} due",
+        subject=subject,
         body=body,
         organization_id=isp.isp_org_id,
     )

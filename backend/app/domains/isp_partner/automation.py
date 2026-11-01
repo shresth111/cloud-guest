@@ -12,6 +12,15 @@ ISP's own approved templates, mapped per trigger in
 * ``unpaid``:     {{1}} name, {{2}} invoice no., {{3}} balance, {{4}} pay link
 * ``receipt``:    {{1}} name, {{2}} receipt no., {{3}} amount, {{4}} date
 * ``renewal``:    {{1}} name, {{2}} invoice no., {{3}} valid until
+* ``overdue``:    {{1}} name, {{2}} invoice no., {{3}} balance, {{4}} pay link
+* ``welcome``:    {{1}} name, {{2}} username, {{3}} plan name
+
+``overdue`` and ``welcome`` (COMMS-2b) only run once a template is mapped for
+them, and an unmapped one is not logged as skipped (an ISP that never turns
+them on gets no new log rows). ``overdue`` is daily (at most once per invoice
+per IST day); ``welcome`` rides the 120 s sweep, once per subscriber, for
+subscribers created after automation was switched on -- by ONBOARD-1 or the
+plain subscriber create alike, since both create the subscriber row.
 
 Recipients must have opted in (subscriber ``reminder_opt_in.whatsapp``, or the
 customer's billing contact ``whatsapp_opt_in``), and nobody marked
@@ -57,7 +66,9 @@ from .finance_models import (
 
 logger = get_logger(__name__)
 
-TRIGGERS = ("pre_expiry", "unpaid", "receipt", "renewal")
+TRIGGERS = ("pre_expiry", "unpaid", "receipt", "renewal", "overdue", "welcome")
+#: COMMS-2b triggers: silent (no "skipped" row) while no template is mapped.
+OPT_IN_TRIGGERS = ("overdue", "welcome")
 PAY_LINK_TTL = timedelta(days=30)
 TELEGRAM_API = "https://api.telegram.org"
 _IST = ZoneInfo("Asia/Kolkata")
@@ -471,6 +482,8 @@ class _WhatsappRun:
         if await _already(self.session, self.isp_org_id, dedupe_key):
             return
         tpl = (self.settings.whatsapp_templates or {}).get(trigger)
+        if not tpl and trigger in OPT_IN_TRIGGERS:
+            return
         to = e164_in(phone)
         base = dict(
             channel="whatsapp",
@@ -504,22 +517,33 @@ class _WhatsappRun:
                 language=tpl.get("language") or "en",
                 parameters=[str(p)[:200] for p in params],
             )
-            self.session.add(
-                log_row(
-                    self.isp_org_id,
-                    status="sent",
-                    provider_message_id=result.message_id,
-                    **base,
-                )  # noqa: E501
+            row = log_row(
+                self.isp_org_id,
+                status="sent",
+                provider_message_id=result.message_id,
+                **base,
             )
             self.sent += 1
         except SendError as exc:
             # A transient failure keeps no dedupe key, so the next sweep retries.
             keep = base | ({"dedupe_key": None} if not exc.permanent else {})
-            self.session.add(
-                log_row(self.isp_org_id, status="failed", error=str(exc), **keep)
-            )
+            row = log_row(self.isp_org_id, status="failed", error=str(exc), **keep)
             self.failed += 1
+        self.session.add(row)
+        await self.session.flush()
+        # COMMS-2b: what was actually sent, beside the log row.
+        from .comms2b import parameter_rows
+        from .comms2b_models import IspMessageContent
+
+        self.session.add(
+            IspMessageContent(
+                isp_organization_id=self.isp_org_id,
+                message_log_id=row.id,
+                template_name=tpl["template_name"],
+                language=tpl.get("language") or "en",
+                parameters=parameter_rows(trigger, params),
+            )
+        )
         await self.session.flush()
 
 
@@ -681,7 +705,53 @@ async def run_whatsapp_events(session: Any, isp_org_id: uuid.UUID) -> dict:
             subscriber_id=inv.subscriber_id,
             invoice_id=inv.id,
         )
+    if (st.whatsapp_templates or {}).get("welcome"):
+        await _welcome(session, run, flags, isp_org_id, since)
     return {"sent": run.sent, "skipped": run.skipped, "failed": run.failed}
+
+
+async def _welcome(
+    session: Any, run: _WhatsappRun, flags: dict, isp_org_id: uuid.UUID, since: Any
+) -> None:
+    """COMMS-2b: one welcome per subscriber created since ``since`` (ONBOARD-1
+    and the plain create both insert the subscriber row)."""
+    from .plans_models import IspPackage, IspSubscriber
+    from .pppoe_models import IspPppoeCredential
+
+    subs = (
+        (
+            await session.execute(
+                select(IspSubscriber).where(
+                    IspSubscriber.isp_organization_id == isp_org_id,
+                    IspSubscriber.is_deleted.is_(False),
+                    IspSubscriber.created_at >= since,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for s in subs:
+        if not _may_message(flags, "subscriber", s):
+            continue
+        pkg = await session.get(IspPackage, s.package_id) if s.package_id else None
+        username = (
+            await session.execute(
+                select(IspPppoeCredential.username).where(
+                    IspPppoeCredential.subscriber_id == s.id,
+                    IspPppoeCredential.is_deleted.is_(False),
+                )
+            )
+        ).scalars().first() or s.identifier
+        await run.send(
+            "welcome",
+            s.phone,
+            [_sub_name(s), username, pkg.name if pkg else "your plan"],
+            dedupe_key=f"welcome:{s.id}",
+            summary=f"Welcome {_sub_name(s)}",
+            customer_id=s.customer_organization_id,
+            subscriber_id=s.id,
+        )
 
 
 async def run_whatsapp_daily(session: Any, isp_org_id: uuid.UUID, today: date) -> dict:
@@ -774,7 +844,50 @@ async def run_whatsapp_daily(session: Any, isp_org_id: uuid.UUID, today: date) -
             subscriber_id=inv.subscriber_id,
             invoice_id=inv.id,
         )
+    if (st.whatsapp_templates or {}).get("overdue"):
+        await _overdue(session, run, flags, isp_org_id, today)
     return {"sent": run.sent, "skipped": run.skipped, "failed": run.failed}
+
+
+async def _overdue(
+    session: Any, run: _WhatsappRun, flags: dict, isp_org_id: uuid.UUID, today: date
+) -> None:
+    """COMMS-2b: every invoice past its due date with a balance, at most once
+    per invoice per IST day (dedupe ``overdue:{invoice}:{day}``)."""
+    invs = (
+        (
+            await session.execute(
+                select(IspInvoice).where(
+                    IspInvoice.isp_organization_id == isp_org_id,
+                    IspInvoice.doc_type == "invoice",
+                    IspInvoice.status.in_(("issued", "partially_paid")),
+                    IspInvoice.due_date < today,
+                    IspInvoice.is_deleted.is_(False),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for inv in invs:
+        bal = balance_of(inv)
+        if bal <= 0:
+            continue
+        rec = await _recipient(session, inv)
+        if rec is None or not _may_message(flags, *rec):
+            continue
+        kind, subj = rec
+        link = await pay_link_for(session, isp_org_id, inv.id)
+        await run.send(
+            "overdue",
+            _phone(kind, subj),
+            [_name(kind, subj), inv.number, _rs(bal), link],
+            dedupe_key=f"overdue:{inv.id}:{today.isoformat()}",
+            summary=f"Overdue {inv.number} {_rs(bal)}",
+            customer_id=inv.customer_organization_id,
+            subscriber_id=inv.subscriber_id,
+            invoice_id=inv.id,
+        )
 
 
 # ---------------------------------------------------------------------------
