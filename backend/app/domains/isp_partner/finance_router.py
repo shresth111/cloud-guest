@@ -51,7 +51,7 @@ from .finance_config import (
     RequireZoneLedger,
 )
 from .finance_service import IspFinanceService
-from .http import ok
+from .http import ok, request_id
 from .views import page as make_page
 
 ISP_PLANS_READ = "isp_plans.read"
@@ -939,6 +939,7 @@ async def public_pay(
                 success=False,
                 message="Too many requests",
                 data={"code": "RATE_LIMITED"},
+                request_id=request_id(request),
             ),
             headers={"Retry-After": str(retry)},
         )  # noqa: E501
@@ -950,6 +951,7 @@ async def public_pay(
                 success=False,
                 message="This payment link is not valid or has expired",
                 data={"code": "ISP_PAY_LINK_NOT_FOUND"},
+                request_id=request_id(request),
             ),
         )  # noqa: E501
     await db.commit()
