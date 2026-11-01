@@ -154,6 +154,15 @@ async def _retry_async() -> dict[str, int]:
                 await run_finance_frequent(session)
             except Exception:  # noqa: BLE001 -- never blocks the retry pass
                 logger.exception("isp_finance_frequent_failed")
+            # QUEUED-RENEWAL: switch plans whose queued start has passed (off
+            # unless ISP_QUEUED_RENEWAL_ENABLED); never blocks the retry pass.
+            try:
+                from .queued_renewal_service import run_queued_renewals
+
+                async with session.begin_nested():
+                    await run_queued_renewals(session)
+            except Exception:  # noqa: BLE001
+                logger.exception("isp_queued_renewals_failed")
             # APPS-2: scheduled announcements + helpdesk escalations.
             try:
                 from .apps2_tasks import run_apps_frequent

@@ -1170,5 +1170,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(incidents_router)
 
+    # QUEUED-RENEWAL: next plan starts when the current one ends
+    # (ISP_QUEUED_RENEWAL_ENABLED).
+    from .queued_renewal_router import queued_renewal_router
+
+    isp_partner_router.include_router(queued_renewal_router)
+
 
 _include_lanes()
