@@ -463,11 +463,20 @@ class IspFiberService:
     async def route(self, isp: Any, node_id: uuid.UUID) -> list[dict]:
         """Root-first path from the top of the plant down to ``node_id``."""
         n = await self._node(isp, node_id)
+        visible = await self._visible(isp)
         path = [n]
         seen = {n.id}
         while path[-1].parent_id is not None and len(path) < MAX_ROUTE_DEPTH:
             p = await self.session.get(IspFiberNode, path[-1].parent_id)
-            if p is None or p.id in seen or p.isp_organization_id != isp.isp_org_id:
+            # SCOPE-FIX: stop at a node the caller may not see (another
+            # customer's plant for a confined caller) rather than leak it.
+            if (
+                p is None
+                or p.is_deleted
+                or p.id in seen
+                or p.isp_organization_id != isp.isp_org_id
+                or not self._sees(p, visible)
+            ):
                 break
             seen.add(p.id)
             path.append(p)
