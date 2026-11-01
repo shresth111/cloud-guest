@@ -430,7 +430,7 @@ async def test_franchise_end_to_end() -> None:  # noqa: PLR0915
             assert (await call("GET", "/franchise/zones", h=hb))["items"] == []
             as_("A")
 
-            # flag off -> 404 -----------------------------------------------------------
+            # flag off -> 404 --------------------
             os.environ.pop("ISP_FRANCHISE_ENABLED")
             clear()
             r = await c.get(f"{api}/franchise/zones", headers=ha)
