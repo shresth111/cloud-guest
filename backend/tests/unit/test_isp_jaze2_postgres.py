@@ -136,51 +136,113 @@ async def test_jaze2_end_to_end() -> None:  # noqa: PLR0915
                 assert r.status_code in (200, 201), (path, r.text)
                 return r.json()["data"]
 
-            cust = (await post("/customers", {"name": f"Cafe {tag}",
-                                              "contact_email": f"c{tag}@example.com"}))["id"]
-            loc = (await post(f"/customers/{cust}/locations", {
-                "name": "Main", "address_line1": "1", "city": "c",
-                "state_province": "s", "postal_code": "1"}))["id"]
-            rtr = (await post(f"/locations/{loc}/routers", {
-                "name": "hEX", "serial_number": f"SN{tag}",
-                "mac_address": "02:00:" + ":".join(tag[i:i+2] for i in (0, 2, 4, 6)), "model": "hEX"}))["id"]
-            g100 = (await post("/speed-groups", {"name": "100M", "download_kbps": 102400,
-                                                 "upload_kbps": 102400}))["id"]
-            g2 = (await post("/speed-groups", {"name": "2M", "download_kbps": 2048,
-                                               "upload_kbps": 2048}))["id"]
-            g200 = (await post("/speed-groups", {"name": "200M", "download_kbps": 204800,
-                                                 "upload_kbps": 204800}))["id"]
-            pkg = (await post("/packages", {"speed_group_id": g100, "type": "prepaid",
-                                            "price_paise": 50000}))["id"]
-            sub = (await post("/subscribers", {"isp_customer_id": cust,
-                                               "identifier": f"user{tag}",
-                                               "package_id": pkg}))["id"]
+            cust = (
+                await post(
+                    "/customers",
+                    {"name": f"Cafe {tag}", "contact_email": f"c{tag}@example.com"},
+                )
+            )["id"]
+            loc = (
+                await post(
+                    f"/customers/{cust}/locations",
+                    {
+                        "name": "Main",
+                        "address_line1": "1",
+                        "city": "c",
+                        "state_province": "s",
+                        "postal_code": "1",
+                    },
+                )
+            )["id"]
+            rtr = (
+                await post(
+                    f"/locations/{loc}/routers",
+                    {
+                        "name": "hEX",
+                        "serial_number": f"SN{tag}",
+                        "mac_address": "02:00:"
+                        + ":".join(tag[i : i + 2] for i in (0, 2, 4, 6)),
+                        "model": "hEX",
+                    },
+                )
+            )["id"]
+            g100 = (
+                await post(
+                    "/speed-groups",
+                    {"name": "100M", "download_kbps": 102400, "upload_kbps": 102400},
+                )
+            )["id"]
+            g2 = (
+                await post(
+                    "/speed-groups",
+                    {"name": "2M", "download_kbps": 2048, "upload_kbps": 2048},
+                )
+            )["id"]
+            g200 = (
+                await post(
+                    "/speed-groups",
+                    {"name": "200M", "download_kbps": 204800, "upload_kbps": 204800},
+                )
+            )["id"]
+            pkg = (
+                await post(
+                    "/packages",
+                    {"speed_group_id": g100, "type": "prepaid", "price_paise": 50000},
+                )
+            )["id"]
+            sub = (
+                await post(
+                    "/subscribers",
+                    {
+                        "isp_customer_id": cust,
+                        "identifier": f"user{tag}",
+                        "package_id": pkg,
+                    },
+                )
+            )["id"]
 
             # policy validation + save -------------------------------------
-            r = await c.put(f"/api/v1/isp/packages/{pkg}/policy",
-                            json={"fup_fallback_speed_group_id": g2}, headers=ha)
+            r = await c.put(
+                f"/api/v1/isp/packages/{pkg}/policy",
+                json={"fup_fallback_speed_group_id": g2},
+                headers=ha,
+            )
             assert r.status_code == 422, r.text
-            r = await c.put(f"/api/v1/isp/packages/{pkg}/policy",
-                            json={"boost_speed_group_id": g200}, headers=ha)
+            r = await c.put(
+                f"/api/v1/isp/packages/{pkg}/policy",
+                json={"boost_speed_group_id": g200},
+                headers=ha,
+            )
             assert r.status_code == 422, r.text
-            r = await c.put(f"/api/v1/isp/packages/{pkg}/policy", json={
-                "fup_limit_mb": 1024, "fup_reset": "month",
-                "fup_fallback_speed_group_id": g2,
-                "mac_bind_count": 1, "max_simultaneous": 1,
-            }, headers=ha)
+            r = await c.put(
+                f"/api/v1/isp/packages/{pkg}/policy",
+                json={
+                    "fup_limit_mb": 1024,
+                    "fup_reset": "month",
+                    "fup_fallback_speed_group_id": g2,
+                    "mac_bind_count": 1,
+                    "max_simultaneous": 1,
+                },
+                headers=ha,
+            )
             assert r.status_code == 200, r.text
-            pol = (await c.get(f"/api/v1/isp/packages/{pkg}/policy", headers=ha)).json()["data"]
+            pol = (
+                await c.get(f"/api/v1/isp/packages/{pkg}/policy", headers=ha)
+            ).json()["data"]
             assert pol["configured"] and pol["fup_limit_mb"] == 1024
             assert pol["fup_fallback_speed_group_name"] == "2M"
 
             # isolation -----------------------------------------------------
-            for path in (f"/packages/{pkg}/policy", f"/subscribers/{sub}/fup",
-                         f"/subscribers/{sub}/mac-bindings",
-                         f"/subscribers/{sub}/ip-bindings",
-                         f"/subscribers/{sub}/enforcement-events",
-                         f"/locations/{loc}/ip-pools",
-                         f"/routers/{rtr}/sessions/active",
-                         f"/routers/{rtr}/health/history"):
+            for path in (
+                f"/packages/{pkg}/policy",
+                f"/subscribers/{sub}/fup",
+                f"/subscribers/{sub}/mac-bindings",
+                f"/subscribers/{sub}/ip-bindings",
+                f"/subscribers/{sub}/enforcement-events",
+                f"/locations/{loc}/ip-pools",
+                f"/routers/{rtr}/sessions/active",
+                f"/routers/{rtr}/health/history",
+            ):
                 state["user"] = users["B"]
                 r = await c.get(f"/api/v1/isp{path}", headers=hb)
                 state["user"] = users["A"]
@@ -189,23 +251,44 @@ async def test_jaze2_end_to_end() -> None:  # noqa: PLR0915
             # guest + two live sessions, 1.2 GB used this month ------------
             now = datetime.now(UTC)
             async with SessionLocal() as s:
-                guest = Guest(organization_id=uuid.UUID(cust), location_id=uuid.UUID(loc),
-                              identifier=f"user{tag}")
+                guest = Guest(
+                    organization_id=uuid.UUID(cust),
+                    location_id=uuid.UUID(loc),
+                    identifier=f"user{tag}",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                )
                 s.add(guest)
                 await s.flush()
-                d1 = GuestDevice(guest_id=guest.id, mac_address=f"AA:00:00:00:{tag[:2]}:01")
-                d2 = GuestDevice(guest_id=guest.id, mac_address=f"AA:00:00:00:{tag[:2]}:02")
+                d1 = GuestDevice(
+                    guest_id=guest.id,
+                    mac_address=f"AA:00:00:00:{tag[:2]}:01",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                )
+                d2 = GuestDevice(
+                    guest_id=guest.id,
+                    mac_address=f"AA:00:00:00:{tag[:2]}:02",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                )
                 s.add_all([d1, d2])
                 await s.flush()
                 sess = []
                 for i, d in enumerate((d1, d2)):
                     gs = GuestSession(
-                        guest_id=guest.id, device_id=d.id, router_id=uuid.UUID(rtr),
-                        location_id=uuid.UUID(loc), organization_id=uuid.UUID(cust),
-                        auth_method="voucher", status="active",
+                        guest_id=guest.id,
+                        device_id=d.id,
+                        router_id=uuid.UUID(rtr),
+                        location_id=uuid.UUID(loc),
+                        organization_id=uuid.UUID(cust),
+                        auth_method="voucher",
+                        status="active",
                         started_at=now - timedelta(minutes=30 - i * 10),
-                        last_activity_at=now, ip_address=f"10.5.50.{10 + i}",
-                        bytes_downloaded=int(0.6 * GB), bytes_uploaded=10,
+                        last_activity_at=now,
+                        ip_address=f"10.5.50.{10 + i}",
+                        bytes_downloaded=int(0.6 * GB),
+                        bytes_uploaded=10,
                     )
                     s.add(gs)
                     sess.append(gs)
@@ -229,23 +312,30 @@ async def test_jaze2_end_to_end() -> None:  # noqa: PLR0915
             # then re-authorized because the throttle flipped.
             assert (s2, "mac_reject") in ended and (s1, "reauth") in ended, ended
 
-            fup = (await c.get(f"/api/v1/isp/subscribers/{sub}/fup", headers=ha)).json()["data"]
+            fup = (
+                await c.get(f"/api/v1/isp/subscribers/{sub}/fup", headers=ha)
+            ).json()["data"]
             assert fup["throttled"] and fup["used_bytes"] >= int(1.2 * GB)
             assert fup["fallback_speed_group"]["name"] == "2M"
 
             async with SessionLocal() as s:
                 srow = await s.get(IspSubscriber, uuid.UUID(sub))
                 over, rate = await effective_rate_override(
-                    s, package_id=uuid.UUID(pkg), subscriber=srow,
+                    s,
+                    package_id=uuid.UUID(pkg),
+                    subscriber=srow,
                     organization_id=uuid.UUID(cust),
                 )
             assert over and rate == "2048k/2048k"
 
-            macs = (await c.get(f"/api/v1/isp/subscribers/{sub}/mac-bindings",
-                                headers=ha)).json()["data"]
+            macs = (
+                await c.get(f"/api/v1/isp/subscribers/{sub}/mac-bindings", headers=ha)
+            ).json()["data"]
             assert [m["source"] for m in macs] == ["auto"]
-            r = await c.delete(f"/api/v1/isp/subscribers/{sub}/mac-bindings/{macs[0]['id']}",
-                               headers=ha)
+            r = await c.delete(
+                f"/api/v1/isp/subscribers/{sub}/mac-bindings/{macs[0]['id']}",
+                headers=ha,
+            )
             assert r.status_code == 200
 
             fup = await post(f"/subscribers/{sub}/fup/topup", {"mb": 1024})
@@ -253,53 +343,102 @@ async def test_jaze2_end_to_end() -> None:  # noqa: PLR0915
             fup = await post(f"/subscribers/{sub}/fup/reset", {})
             assert fup["throttled"] is False
 
-            ev = (await c.get(f"/api/v1/isp/subscribers/{sub}/enforcement-events",
-                              headers=ha)).json()["data"]
+            ev = (
+                await c.get(
+                    f"/api/v1/isp/subscribers/{sub}/enforcement-events", headers=ha
+                )
+            ).json()["data"]
             kinds = {e["kind"] for e in ev}
-            assert {"fup_throttle", "mac_bound", "mac_reject", "reauth",
-                    "fup_topup", "fup_reset"} <= kinds, kinds
+            assert {
+                "fup_throttle",
+                "mac_bound",
+                "mac_reject",
+                "reauth",
+                "fup_topup",
+                "fup_reset",
+            } <= kinds, kinds
 
             # sessions list masks nothing ISP-entered, shows circuit --------
-            act = (await c.get(f"/api/v1/isp/routers/{rtr}/sessions/active",
-                               headers=ha)).json()["data"]["sessions"]
+            act = (
+                await c.get(f"/api/v1/isp/routers/{rtr}/sessions/active", headers=ha)
+            ).json()["data"]["sessions"]
             assert {a["subscriber_id"] for a in act} == {sub}
 
             # static IP -----------------------------------------------------
             async with SessionLocal() as s:
-                pool = DhcpPool(router_id=uuid.UUID(rtr), organization_id=uuid.UUID(cust),
-                                location_id=uuid.UUID(loc), name="lan",
-                                address_range_start="10.5.50.1",
-                                address_range_end="10.5.50.3",
-                                gateway_ip_address="10.5.50.1")
+                pool = DhcpPool(
+                    router_id=uuid.UUID(rtr),
+                    organization_id=uuid.UUID(cust),
+                    location_id=uuid.UUID(loc),
+                    name="lan",
+                    address_range_start="10.5.50.1",
+                    address_range_end="10.5.50.3",
+                    gateway_ip_address="10.5.50.1",
+                )
                 s.add(pool)
                 await s.commit()
                 pool_id = str(pool.id)
-            nf = (await c.get(f"/api/v1/isp/locations/{loc}/ip-pools/{pool_id}/next-free",
-                              headers=ha)).json()["data"]
+            nf = (
+                await c.get(
+                    f"/api/v1/isp/locations/{loc}/ip-pools/{pool_id}/next-free",
+                    headers=ha,
+                )
+            ).json()["data"]
             assert nf["ip"] == "10.5.50.2"
-            b1 = await post(f"/subscribers/{sub}/ip-bindings", {
-                "isp_location_id": loc, "pool_id": pool_id, "mac": "aa-bb-cc-dd-ee-ff"})
+            b1 = await post(
+                f"/subscribers/{sub}/ip-bindings",
+                {
+                    "isp_location_id": loc,
+                    "pool_id": pool_id,
+                    "mac": "aa-bb-cc-dd-ee-ff",
+                },
+            )
             assert b1["ip"] == "10.5.50.2" and b1["mac"] == "AA:BB:CC:DD:EE:FF"
-            r = await c.post(f"/api/v1/isp/subscribers/{sub}/ip-bindings", json={
-                "isp_location_id": loc, "pool_id": pool_id, "ip": "10.5.50.2"}, headers=ha)
+            r = await c.post(
+                f"/api/v1/isp/subscribers/{sub}/ip-bindings",
+                json={"isp_location_id": loc, "pool_id": pool_id, "ip": "10.5.50.2"},
+                headers=ha,
+            )
             assert r.status_code == 409, r.text
-            r = await c.post(f"/api/v1/isp/subscribers/{sub}/ip-bindings", json={
-                "isp_location_id": loc, "pool_id": pool_id, "ip": "10.5.50.9"}, headers=ha)
+            r = await c.post(
+                f"/api/v1/isp/subscribers/{sub}/ip-bindings",
+                json={"isp_location_id": loc, "pool_id": pool_id, "ip": "10.5.50.9"},
+                headers=ha,
+            )
             assert r.status_code == 422, r.text
-            await post(f"/subscribers/{sub}/ip-bindings", {
-                "isp_location_id": loc, "pool_id": pool_id})
-            r = await c.get(f"/api/v1/isp/locations/{loc}/ip-pools/{pool_id}/next-free",
-                            headers=ha)
-            assert r.status_code == 409 and r.json()["data"]["code"] == "ISP_IP_POOL_EXHAUSTED"
-            pools = (await c.get(f"/api/v1/isp/locations/{loc}/ip-pools",
-                                 headers=ha)).json()["data"]
+            await post(
+                f"/subscribers/{sub}/ip-bindings",
+                {"isp_location_id": loc, "pool_id": pool_id},
+            )
+            r = await c.get(
+                f"/api/v1/isp/locations/{loc}/ip-pools/{pool_id}/next-free", headers=ha
+            )
+            assert (
+                r.status_code == 409
+                and r.json()["data"]["code"] == "ISP_IP_POOL_EXHAUSTED"
+            )
+            pools = (
+                await c.get(f"/api/v1/isp/locations/{loc}/ip-pools", headers=ha)
+            ).json()["data"]
             assert pools[0]["pinned"] == 2 and pools[0]["size"] == 3
 
             # router health: no credentials yet -> honest not_set_up ---------
-            live = (await c.get(f"/api/v1/isp/routers/{rtr}/health/live",
-                                headers=ha)).json()["data"]
+            live = (
+                await c.get(f"/api/v1/isp/routers/{rtr}/health/live", headers=ha)
+            ).json()["data"]
             assert live["reachable"] is False and live["reason"] == "not_set_up"
-            tiles = (await c.get("/api/v1/isp/tr069/summary", headers=ha)).json()["data"]
+            tiles = (await c.get("/api/v1/isp/tr069/summary", headers=ha)).json()[
+                "data"
+            ]
             assert tiles["total"] == 0
+
+            # Subscriber 360 auth slots (JAZE-1 calls this from view_360) -----
+            from app.domains.isp_partner.enforcement import auth_slots
+
+            async with SessionLocal() as s:
+                slots = await auth_slots(s, uuid.UUID(sub))
+            assert slots["mac_bound"] is False  # the auto MAC was cleared above
+            assert slots["static_ip"] == "10.5.50.2"
+            assert slots["static_ips"] == ["10.5.50.2", "10.5.50.3"]
     finally:
         await engine.dispose()

@@ -502,3 +502,51 @@ def fup_view(row: Any, policy: Any, groups: dict[uuid.UUID, str]) -> dict[str, A
         if row.last_computed_at
         else None,
     }
+
+
+async def auth_slots(session: Any, subscriber_id: uuid.UUID) -> dict[str, Any]:
+    """Fill JAZE-1's Subscriber 360 ``auth.mac_bound`` / ``auth.static_ip``.
+
+    One line in ``view_360``: ``base["auth"].update(await auth_slots(self.session,
+    s.id))``. The caller has already resolved ``s`` through
+    ``IspPlansService.subscriber()`` (ISP + confinement), so no extra scoping here.
+    ``mac_bound`` is True when at least one MAC is bound; ``static_ip`` is the
+    oldest live pinned IP (or None). ``mac_bindings`` / ``static_ips`` carry the
+    full lists for a tooltip.
+    """
+    from .enforcement_models import IspSubscriberIpBinding, IspSubscriberMacBinding
+
+    macs = (
+        (
+            await session.execute(
+                select(IspSubscriberMacBinding.mac)
+                .where(
+                    IspSubscriberMacBinding.subscriber_id == subscriber_id,
+                    IspSubscriberMacBinding.is_deleted.is_(False),
+                )
+                .order_by(IspSubscriberMacBinding.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ips = (
+        (
+            await session.execute(
+                select(IspSubscriberIpBinding.ip)
+                .where(
+                    IspSubscriberIpBinding.subscriber_id == subscriber_id,
+                    IspSubscriberIpBinding.is_deleted.is_(False),
+                )
+                .order_by(IspSubscriberIpBinding.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "mac_bound": bool(macs),
+        "static_ip": ips[0] if ips else None,
+        "mac_bindings": list(macs),
+        "static_ips": list(ips),
+    }
