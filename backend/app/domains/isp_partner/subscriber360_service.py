@@ -32,6 +32,7 @@ from sqlalchemy import and_, func, or_, select, true
 from .billing_models import IspCustomerServiceState, IspInvoice, IspPayment
 from .constants import IspRole
 from .dependencies import IspContext
+from .enforcement import auth_slots
 from .exceptions import _err
 from .plans_models import IspPackage, IspSpeedGroup, IspSubscriber
 from .plans_service import (
@@ -541,6 +542,7 @@ class IspSubscriber360Service:
             can_revert=last_renewal is not None,
             timeline=await self.timeline(s),
         )
+        base["auth"].update(await auth_slots(self.session, s.id))
         return base
 
     # ------------------------------------------------------------------

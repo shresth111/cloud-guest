@@ -24,7 +24,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "0179_isp_jaze3_compliance"
-down_revision = "0178_merge_integ_parity_settings"
+down_revision = "0179_isp_jaze2_enforcement"
 branch_labels = None
 depends_on = None
 

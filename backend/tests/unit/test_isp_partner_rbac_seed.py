@@ -272,7 +272,7 @@ async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
     assert summary.permission_groups_created == 18  # +1 J16 isp_apps
-    assert summary.permissions_created == 67  # +5 J16 isp_apps
+    assert summary.permissions_created == 68  # +5 isp_apps, +1 isp_subscribers.manage
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED
