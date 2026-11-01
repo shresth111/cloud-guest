@@ -193,6 +193,19 @@ class IspCollectionsService:
             IspCollectionPromise.customer_organization_id.in_(customer_ids),
             IspCollectionPromise.is_deleted.is_(False),
         )
+        # P3-SWEEP: in a zone-scoped request a promise follows its
+        # subscriber's own zone (customer-level promises: the customer's
+        # zone), like ZONE-1 does for invoices. Only narrows; no zone scope
+        # (incl. the daily Celery pass) = unchanged.
+        from .zones_scope import party_zone_clause
+
+        zone = party_zone_clause(
+            self.session,
+            IspCollectionPromise.subscriber_id,
+            IspCollectionPromise.customer_organization_id,
+        )
+        if zone is not None:
+            q = q.where(zone)
         if statuses:
             q = q.where(IspCollectionPromise.status.in_(statuses))
         return list((await self.session.execute(q)).scalars().all())

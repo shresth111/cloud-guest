@@ -291,7 +291,13 @@ class IspIncidentsService:
         t = await self.target(isp, kind, **ids)
         found = await self.compute_affected(isp, t)
         visible = set(await isp.child_ids())
-        mine = [f for f in found if f["customer_id"] in visible]
+        zone_ok = await self._zone_ok([f["subscriber_id"] for f in found])
+        mine = [
+            f
+            for f in found
+            if f["customer_id"] in visible
+            and (zone_ok is None or f["subscriber_id"] in zone_ok)
+        ]
         subs = await self._subs([f["subscriber_id"] for f in mine[:20]])
         return {
             "scope_label": t["label"],
@@ -442,6 +448,25 @@ class IspIncidentsService:
             out.setdefault(r.incident_id, []).append(r)
         return out
 
+    async def _zone_ok(self, subscriber_ids: list) -> set | None:
+        """P3-SWEEP: affected subscribers that pass the ZONE-1 subscriber rule
+        (own zone, else the customer's zone) in a zone-scoped request; None
+        when there is no zone scope. Only ever narrows."""
+        from .zones_scope import zone_visible_subscribers
+
+        return await zone_visible_subscribers(self.session, subscriber_ids)
+
+    async def _mine(self, rows: list, visible: set) -> list:
+        """Affected rows the caller may see: customer confinement (as before)
+        AND, in a zone-scoped request, the subscriber's own zone."""
+        zone_ok = await self._zone_ok([r.subscriber_id for r in rows])
+        return [
+            r
+            for r in rows
+            if r.customer_organization_id in visible
+            and (zone_ok is None or r.subscriber_id in zone_ok)
+        ]
+
     async def _visible(
         self, isp: Any, inc: IspIncident, affected: list, visible: set
     ) -> bool:
@@ -453,7 +478,7 @@ class IspIncidentsService:
             return True  # shared plant: every unconfined staff member sees it
         if isp.confined_customer_ids is None:
             return True
-        return any(a.customer_organization_id in visible for a in affected)
+        return bool(await self._mine(affected, visible))
 
     async def incident(self, isp: Any, incident_id: uuid.UUID) -> IspIncident:
         inc = await self.session.get(IspIncident, incident_id)
@@ -540,13 +565,7 @@ class IspIncidentsService:
         for inc in rows:
             a = affected.get(inc.id, [])
             if await self._visible(isp, inc, a, visible):
-                items.append(
-                    self._view(
-                        isp,
-                        inc,
-                        sum(1 for x in a if x.customer_organization_id in visible),
-                    )
-                )
+                items.append(self._view(isp, inc, len(await self._mine(a, visible))))
         resolved = [i for i in items if i["status"] == "resolved"]
         start = (page - 1) * page_size
         return {
@@ -571,11 +590,9 @@ class IspIncidentsService:
     async def detail(self, isp: Any, incident_id: uuid.UUID) -> dict:
         inc = await self.incident(isp, incident_id)
         visible = set(await isp.child_ids())
-        rows = [
-            r
-            for r in (await self._affected_rows([inc.id])).get(inc.id, [])
-            if r.customer_organization_id in visible
-        ]
+        rows = await self._mine(
+            (await self._affected_rows([inc.id])).get(inc.id, []), visible
+        )
         subs = await self._subs([r.subscriber_id for r in rows])
         events = (
             (
@@ -731,11 +748,9 @@ class IspIncidentsService:
         if inc.status != "resolved":
             raise IspIncidentStateError("Resolve the incident before granting grace")
         visible = set(await isp.child_ids())
-        rows = [
-            r
-            for r in (await self._affected_rows([inc.id])).get(inc.id, [])
-            if r.customer_organization_id in visible
-        ]
+        rows = await self._mine(
+            (await self._affected_rows([inc.id])).get(inc.id, []), visible
+        )
         subs = await self._subs([r.subscriber_id for r in rows])
         plan: list[tuple[Any, str | None]] = []
         for r in rows:
@@ -842,11 +857,9 @@ class IspIncidentsService:
             raise IspIncidentStateError("The incident is already resolved")
         run, reasons = await self.channel(isp, kind)
         visible = set(await isp.child_ids())
-        rows = [
-            r
-            for r in (await self._affected_rows([inc.id])).get(inc.id, [])
-            if r.customer_organization_id in visible
-        ]
+        rows = await self._mine(
+            (await self._affected_rows([inc.id])).get(inc.id, []), visible
+        )
         subs = await self._subs([r.subscriber_id for r in rows])
         flags = await _contact_flags(self.session, isp.isp_org_id)
         col = "outage_message" if kind == "outage" else "restored_message"
