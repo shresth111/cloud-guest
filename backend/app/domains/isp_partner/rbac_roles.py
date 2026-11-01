@@ -428,3 +428,33 @@ ROLES = tuple(
     for r in ROLES
 )
 ROLES_BY_SLUG = {r.slug: r for r in ROLES}
+
+
+# -- AUDIT-LOG: ISP-wide staff activity (/isp/audit-log, behind
+# ISP_AUDIT_LOG_ENABLED). Owner/admin only.
+_AUDIT_GRANTS: dict[str, str] = {
+    IspRole.OWNER.value: "read export",
+    IspRole.ADMIN.value: "read export",
+}
+PERMISSION_GROUPS = (
+    *PERMISSION_GROUPS,
+    IspPermissionGroup(
+        key="isp_audit",
+        name="ISP Audit Log",
+        actions=("read", "export"),
+        sort_order=1021,
+    ),
+)
+ROLES = tuple(
+    IspRoleDefinition(
+        slug=r.slug,
+        name=r.name,
+        description=r.description,
+        permission_keys=r.permission_keys
+        + (
+            _keys(isp_audit=_AUDIT_GRANTS[r.slug]) if r.slug in _AUDIT_GRANTS else ()
+        ),
+    )
+    for r in ROLES
+)
+ROLES_BY_SLUG = {r.slug: r for r in ROLES}

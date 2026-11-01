@@ -51,6 +51,7 @@ from app.domains.rbac.dependencies import (
 from app.domains.rbac.enums import ScopeType
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
+from .audit_ip import isp_request_ip_scope
 from .constants import ISP_ROLE_SLUGS, UNCONFINABLE_ROLES, IspProfileStatus
 from .exceptions import (
     IspPartnerRequiredError,
@@ -107,6 +108,8 @@ async def RequireIspPartner(
     rbac_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     repository: IspRepository = Depends(get_isp_repository),
     request: Request = None,  # type: ignore[assignment]  # ZONE-1 scope_zone_id
+    # AUDIT-LOG: request IP on this request's audit rows; set + always reset.
+    _audit_ip: None = Depends(isp_request_ip_scope),
 ) -> IspContext:
     user_id = uuid.UUID(str(user.id))
     assignments = await RoleResolver(rbac_repository).get_active_assignments(user_id)

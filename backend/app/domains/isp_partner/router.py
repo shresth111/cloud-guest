@@ -1221,5 +1221,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(referrals_router)
 
+    # AUDIT-LOG: /isp/audit-log, owner/admin only (ISP_AUDIT_LOG_ENABLED).
+    from .audit_log_router import audit_log_router
+
+    isp_partner_router.include_router(audit_log_router)
+
 
 _include_lanes()

@@ -123,6 +123,7 @@ class IspStaffCustomerScope(BaseModel):
 # No-op unless ISP_PARTNER_ENFORCEMENT_ENABLED is on.
 # ENFORCE-2: registers the JAZE-2 hotspot gate into hotspot_hooks (the one call
 # the hotspot RADIUS Authorize makes). No-op unless the enforcement flag is on.
+from . import audit_ip as _audit_ip_hook  # noqa: E402,F401  (AUDIT-LOG)
 from . import enforcement_hotspot as _enforcement_hotspot_hooks  # noqa: E402,F401
 from . import enforcement_pppoe as _enforcement_pppoe_hooks  # noqa: E402,F401
 from . import franchise_service as _franchise_hook  # noqa: E402,F401
