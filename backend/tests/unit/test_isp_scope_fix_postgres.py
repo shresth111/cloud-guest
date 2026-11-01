@@ -284,7 +284,8 @@ async def test_path_ids_are_resolved_inside_isp_and_customer_scope() -> None:
                     isp_organization_id=isp_a,
                     title="a",
                     body="b",
-                    audience="all",
+                    audience="selected",
+                    customer_ids=[str(a1), str(a2)],
                     status="draft",
                 ),
                 "vendor": A2.IspInventoryVendor(isp_organization_id=isp_a, name="V"),
@@ -511,6 +512,19 @@ async def test_path_ids_are_resolved_inside_isp_and_customer_scope() -> None:
             )
             == 404
         )
+
+        # -- fix 3: a confined caller sees only their customers' ids ---------
+        aurl = f"{api}/apps/announcements/{ids['announcement']}"
+        state["user"] = users["Tech"]
+        r = await c.get(aurl, headers=ha)
+        assert r.status_code == 200, r.text
+        assert r.json()["data"]["customer_ids"] == [str(a1)]
+        assert str(a2) not in r.text
+        r = await c.get(f"{api}/apps/announcements", headers=ha)
+        assert str(a2) not in r.text and str(a1) in r.text
+        state["user"] = users["A"]
+        r = await c.get(aurl, headers=ha)
+        assert sorted(r.json()["data"]["customer_ids"]) == sorted([str(a1), str(a2)])
 
         # -- fix 1: the fiber route stops at another customer's node ----------
         state["user"] = users["Tech"]
