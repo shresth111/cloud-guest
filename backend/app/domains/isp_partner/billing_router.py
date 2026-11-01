@@ -124,6 +124,8 @@ class SimpleInvoiceRequest(_Body):
     description: str = Field(min_length=1, max_length=255)
     amount_paise: int = Field(gt=0)
     due_date: date | None = None
+    # SMALL-2: optional DISCOUNT-WIRE code (pre-tax; flag ISP_DISCOUNT_APPLY_ENABLED)
+    discount_code: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class InvoiceLineIn(_Body):
@@ -156,6 +158,8 @@ class ManualInvoiceRequest(_Body):
     lines: list[InvoiceLineIn] = Field(min_length=1, max_length=50)
     po_number: str | None = Field(default=None, max_length=40)
     buyer_gstin: str | None = Field(default=None, max_length=15)
+    # SMALL-2: optional DISCOUNT-WIRE code, quoted on the whole invoice
+    discount_code: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class ReasonRequest(_Body):
@@ -433,23 +437,41 @@ async def billing_create_invoice(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspBillingService = Depends(get_billing_service),
 ) -> dict:
+    lines = [
+        {
+            "description": payload.description,
+            "amount_paise": payload.amount_paise,
+            "period_from": payload.period_start,
+            "period_to": payload.period_end,
+        }
+    ]
+    quote = None
+    if payload.discount_code:
+        from . import customer_discount
+
+        await svc._customer(isp, payload.isp_customer_id)  # 404 before the quote
+        quote = await customer_discount.apply_to_lines(
+            svc.session,
+            isp,
+            svc,
+            lines,
+            payload.discount_code,
+            customer_id=payload.isp_customer_id,
+        )
     inv = await svc.issue_invoice(
         isp,
         payload.isp_customer_id,
-        lines=[
-            {
-                "description": payload.description,
-                "amount_paise": payload.amount_paise,
-                "period_from": payload.period_start,
-                "period_to": payload.period_end,
-            }
-        ],
+        lines=lines,
         invoice_kind="manual",
         due_date=payload.due_date,
         period_start=payload.period_start,
         period_end=payload.period_end,
         description=payload.description,
     )
+    if quote is not None:
+        from . import customer_discount
+
+        await customer_discount.record(svc.session, quote, inv)
     return ok(request, (await _rows(isp, svc, [inv]))[0], "Invoice issued")
 
 
@@ -781,11 +803,34 @@ async def create_manual_invoice(
         "po_number": payload.po_number,
         "buyer_gstin": payload.buyer_gstin,
     }
+    sub = None
     if bill_to.kind == "subscriber":
         sub = await svc.subscriber_in_scope(isp, bill_to.subscriber_id)
+    elif payload.discount_code:
+        await svc._customer(isp, bill_to.isp_customer_id)  # 404 before a quote
+    quote = None
+    if payload.discount_code:
+        # SMALL-2: quoted before anything is written (422 on a bad code)
+        from . import customer_discount
+
+        st = await svc.settings(isp)
+        quote = await customer_discount.apply_to_lines(
+            svc.session,
+            isp,
+            svc,
+            common["lines"],
+            payload.discount_code,
+            customer_id=None if sub is not None else bill_to.isp_customer_id,
+            gst_applied=bool(st.gst_enabled) if sub is not None else None,
+        )
+    if sub is not None:
         inv = await svc.issue_subscriber_invoice(isp, sub, **common)
     else:
         inv = await svc.issue_invoice(isp, bill_to.isp_customer_id, **common)
+    if quote is not None:
+        from . import customer_discount
+
+        await customer_discount.record(svc.session, quote, inv, subscriber=sub)
     return ok(request, await svc.invoice_detail(isp, inv.id), "Invoice issued")
 
 

@@ -282,3 +282,20 @@ async def subscriber(
             who=who,
         )
     )["id"]
+
+
+async def confine(w: World, user_key: str, customer_ids: list[str]) -> None:
+    """Confine an ISP A staff user to these customers (IspStaffCustomerScope)."""
+    from app.database.session import SessionLocal
+    from app.domains.isp_partner.models import IspStaffCustomerScope
+
+    async with SessionLocal() as s:
+        for cid in customer_ids:
+            s.add(
+                IspStaffCustomerScope(
+                    isp_organization_id=w.isps["A"],
+                    user_id=w.users[user_key],
+                    customer_organization_id=uuid.UUID(str(cid)),
+                )
+            )
+        await s.commit()
