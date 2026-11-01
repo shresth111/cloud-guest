@@ -106,6 +106,8 @@ def test_events_cover_the_addendum_and_match_jaze4_triggers() -> None:
         "payment_receipt",
         "renewal",
         "welcome",
+        "outage",  # INCIDENTS-1
+        "restored",  # INCIDENTS-1
     }
     wired = {e["trigger"] for e in logic.EVENTS.values() if e["trigger"]}
     assert wired == set(TRIGGERS)

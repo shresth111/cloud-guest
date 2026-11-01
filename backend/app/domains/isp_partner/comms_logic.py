@@ -81,6 +81,17 @@ EVENTS: dict[str, dict[str, Any]] = {
         "trigger": "welcome",
         "vars": ["name", "username", "package"],
     },
+    # INCIDENTS-1: sent from an incident's broadcast only.
+    "outage": {
+        "label": "Outage notice",
+        "trigger": "outage",
+        "vars": ["name", "area", "since"],
+    },
+    "restored": {
+        "label": "Service restored",
+        "trigger": "restored",
+        "vars": ["name", "area", "restored_at"],
+    },
 }
 
 SAMPLE: dict[str, str] = {
@@ -94,6 +105,9 @@ SAMPLE: dict[str, str] = {
     "paid_on": "01-Nov-2026",
     "valid_until": "01-Dec-2026",
     "username": "user123",
+    "area": "Zone Sector 12",
+    "since": "01 Nov 2026, 14:05",
+    "restored_at": "01 Nov 2026, 16:40",
 }
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")

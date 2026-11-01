@@ -363,3 +363,36 @@ ROLES = tuple(
     for r in ROLES
 )
 ROLES_BY_SLUG = {r.slug: r for r in ROLES}
+
+
+# -- INCIDENTS-1: outage incidents (/isp/incidents, behind
+# ISP_INCIDENTS_ENABLED). "execute" = broadcast + bulk grace (grace also needs
+# isp_subscribers.update); "export" = affected CSV with phone numbers.
+_INCIDENT_GRANTS: dict[str, str] = {
+    IspRole.OWNER.value: "read manage execute export",
+    IspRole.ADMIN.value: "read manage execute export",
+    IspRole.NOC.value: "read manage execute export",
+    IspRole.TECHNICIAN.value: "read manage",
+    IspRole.BILLING.value: "read export",
+    IspRole.VIEWER.value: "read",
+}
+PERMISSION_GROUPS = (
+    *PERMISSION_GROUPS,
+    IspPermissionGroup(
+        key="isp_incidents",
+        name="ISP Incidents",
+        actions=("read", "manage", "execute", "export"),
+        sort_order=1019,
+    ),
+)
+ROLES = tuple(
+    IspRoleDefinition(
+        slug=r.slug,
+        name=r.name,
+        description=r.description,
+        permission_keys=r.permission_keys
+        + _keys(isp_incidents=_INCIDENT_GRANTS[r.slug]),
+    )
+    for r in ROLES
+)
+ROLES_BY_SLUG = {r.slug: r for r in ROLES}
