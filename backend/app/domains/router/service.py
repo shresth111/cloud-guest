@@ -640,10 +640,27 @@ class RouterService:
         kept in the audit metadata) so the AP's real serial can be recorded
         on the new row. A decommissioned row of any other vendor is not
         touched; that is refused with the same 409 as a live one.
+
+        A *live* NAS-only holder whose location has been deleted is an
+        orphan, not a duplicate: archiving a location soft-deletes the
+        location but leaves its fleet rows live, so the AP's serial stayed
+        held by a row nobody can open (prod, 2026-11-01: an AP21 test
+        location deleted 2026-10-02 blocked the same AP at a new venue with
+        "A router with serial number ... already exists"). Such a row is
+        decommissioned first (audited) and then released like any other
+        decommissioned NAS-only row. It cannot authenticate anyone already:
+        the shared listener resolves a NAS only through a live fleet row.
         """
         holders = await self.repository.routers_holding_identity(
             serial_number=serial_number, mac_address=mac_address
         )
+        for holder in holders:
+            if (
+                not holder.is_deleted
+                and is_nas_only(holder)
+                and await self._location_is_deleted(holder.location_id)
+            ):
+                await self._decommission_orphan(actor_user_id, holder)
         for holder in holders:
             if not holder.is_deleted or not is_nas_only(holder):
                 if holder.serial_number == serial_number:
@@ -673,6 +690,37 @@ class RouterService:
                     "released_mac_address": old_mac,
                 },
             )
+
+    async def _location_is_deleted(self, location_id: uuid.UUID) -> bool:
+        """True only when the location row exists and is soft-deleted. A
+        location that cannot be read at all is not treated as deleted: the
+        holder then stays a conflict, which is the old, safe answer."""
+        try:
+            location = await self.location_lookup.get_location(
+                location_id, requesting_organization_id=None, include_deleted=True
+            )
+        except CloudGuestError:
+            return False
+        return bool(location.is_deleted)
+
+    async def _decommission_orphan(
+        self, actor_user_id: uuid.UUID | None, router: Router
+    ) -> None:
+        updated = await self.repository.update_router(
+            router,
+            {"status": RouterStatus.DECOMMISSIONED.value, "updated_by": actor_user_id},
+        )
+        updated = await self.repository.soft_delete_router(updated)
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_DECOMMISSIONED,
+            router=updated,
+            description=(
+                f"Instant On row '{updated.name}' decommissioned: its location "
+                "was deleted and a new row needs its serial/MAC"
+            ),
+            metadata={"reason": "orphaned_by_deleted_location"},
+        )
 
     async def update_router(
         self,
