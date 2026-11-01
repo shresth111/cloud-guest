@@ -1086,6 +1086,12 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(finance_router)
     isp_partner_router.include_router(public_pay_router)
+    # COMMS-2: logs, delivery receipts (Meta webhook), template library
+    # (ISP_COMMS_HUB_ENABLED).
+    from .comms_router import comms_public_router, comms_router
+
+    isp_partner_router.include_router(comms_router)
+    isp_partner_router.include_router(comms_public_router)
 
     # J16 Apps (ADDENDUM_05, JAZE-5): /isp/apps/*, behind ISP_APPS_ENABLED.
     from .apps_router import apps_router

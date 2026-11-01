@@ -52,12 +52,18 @@ _PUBLIC_PORTAL_ROUTES = {
     ("GET", "/api/v1/isp/public/portal-support"),
     # JAZE-4: the pay-link page (also behind ISP_WHATSAPP_AUTOMATION_ENABLED).
     ("GET", "/api/v1/isp/public/pay/{token}"),
+    # COMMS-2: Meta webhook (signed POST, verify-token GET; ISP_COMMS_HUB_ENABLED).
+    ("GET", "/api/v1/isp/public/comms/whatsapp/{path_token}"),
+    ("POST", "/api/v1/isp/public/comms/whatsapp/{path_token}"),
 }
 _PUBLIC_PORTAL_MODULES = {
     "/api/v1/isp/public/portal-support": (
         "app.domains.isp_partner.portal_support_router"
     ),
     "/api/v1/isp/public/pay/{token}": "app.domains.isp_partner.finance_router",
+    "/api/v1/isp/public/comms/whatsapp/{path_token}": (
+        "app.domains.isp_partner.comms_router"
+    ),
 }
 #: JAZE-6: FreeRADIUS-only PPPoE endpoints (isp_partner.pppoe_router). NAS
 #: shared-secret + ISP_PPPOE_REST_SECRET, no user. Pinned below.
@@ -426,6 +432,10 @@ def test_the_public_isp_portal_surface_is_exactly_portal_support() -> None:
             )
 
             assert RequireWhatsappAutomation in calls
+        if "/comms/whatsapp/" in r.path:
+            from app.domains.isp_partner.comms_router import RequireCommsEnabled
+
+            assert RequireCommsEnabled in calls
         assert RequireIspFeatureEnabled in calls
         assert RequireOrganization not in calls
         assert RequireIspPartner not in calls

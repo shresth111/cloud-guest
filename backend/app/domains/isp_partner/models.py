@@ -121,6 +121,7 @@ from .bill2_models import *  # noqa: E402,F403  (BILL-2)
 from .billing_models import *  # noqa: E402,F403
 from .billing_models import BILLING_TABLES  # noqa: E402,F401
 from .caf_models import *  # noqa: E402,F403  (CAF-2 workbench)
+from .comms_models import *  # noqa: E402,F403  (COMMS-2)
 
 # JAZE-3 (ADDENDUM_05 J6/J17): compliance tables, same registration path.
 from .compliance_models import *  # noqa: E402,F403
