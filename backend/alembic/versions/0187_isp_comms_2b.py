@@ -3,8 +3,8 @@
 Additive: one new table keyed by ``isp_message_log.id``; the JAZE-4 log is
 not altered. ``downgrade`` drops exactly this table.
 
-Revision ID: 0186_isp_comms_2b
-Revises: 0185_isp_comms_hub
+Revision ID: 0187_isp_comms_2b
+Revises: 0186_isp_franchise
 Create Date: 2026-11-01
 """
 
@@ -15,8 +15,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0186_isp_comms_2b"
-down_revision = "0185_isp_comms_hub"
+revision = "0187_isp_comms_2b"
+down_revision = "0186_isp_franchise"
 branch_labels = None
 depends_on = None
 
