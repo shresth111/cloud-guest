@@ -9764,6 +9764,34 @@ class RadiusService:
                     extra={**decision_extra, "event_session_id": str(session.id)},
                 )
                 session = None
+        # ENFORCE-2 (founder-approved exception, LANE_NOTES [COORD]
+        # 2026-11-01): ISP-partner package rules (MAC, static IP, devices
+        # online, session/idle time). The one call into isp_partner: it
+        # returns None -- without a query -- unless
+        # ISP_PARTNER_ENFORCEMENT_ENABLED is on, and None for any session
+        # that is not an ISP-partner subscriber's. A refusal is the same
+        # plain reject as every other one above.
+        isp_verdict = None
+        if session is not None:
+            from app.domains.isp_partner.hotspot_hooks import run_hotspot_gates
+
+            isp_verdict = await run_hotspot_gates(
+                db=getattr(self.repository, "session", None),
+                guest_session=session,
+                router=router,
+                calling_station_id=calling_station_id,
+            )
+            if isp_verdict is not None and not isp_verdict.allow:
+                logger.info(
+                    "radius_authorize_isp_package_rule_refused",
+                    extra={
+                        **decision_extra,
+                        "event_session_id": str(session.id),
+                        "event_reason": isp_verdict.reason,
+                    },
+                )
+                session = None
+                reject_reason = f"ISP package rule: {isp_verdict.reason}"
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -9802,7 +9830,7 @@ class RadiusService:
             reason=None,
             calling_station_id=calling_station_id,
         )
-        return RadiusAuthorizeResult(
+        accepted = RadiusAuthorizeResult(
             authorized=True,
             # REMAINING time, not the full allowance again.
             #
@@ -9853,6 +9881,11 @@ class RadiusService:
             bandwidth_max_down_bps=bandwidth[0],
             bandwidth_max_up_bps=bandwidth[1],
         )
+        # ENFORCE-2: identity (the very same object) unless an ISP package
+        # rule shortens Session-Timeout / Idle-Timeout. Never lengthens.
+        from app.domains.isp_partner.hotspot_hooks import apply_hotspot_verdict
+
+        return apply_hotspot_verdict(isp_verdict, accepted)
 
     async def _record_radius_decision(
         self,
