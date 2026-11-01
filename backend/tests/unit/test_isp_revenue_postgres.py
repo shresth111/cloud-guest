@@ -45,11 +45,13 @@ _TZ = ZoneInfo("Asia/Kolkata")
 
 def _clear() -> None:
     from app.domains.isp_partner.apps_common import get_isp_apps_settings
+    from app.domains.isp_partner.dashboard_router import get_dashboard_settings
     from app.domains.isp_partner.finance_config import get_finance_settings
     from app.domains.isp_partner.revenue_router import get_revenue_settings
     from app.domains.isp_partner.zones_config import get_zones_settings
 
     for fn in (
+        get_dashboard_settings,
         get_isp_apps_settings,
         get_finance_settings,
         get_revenue_settings,
@@ -66,6 +68,7 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
     from app.domains.auth.models import AuthUser, User
     from app.domains.billing.models import Plan
     from app.domains.isp_partner.billing_models import IspInvoice
+    from app.domains.isp_partner.compliance_models import IspSubscriberKyc
     from app.domains.isp_partner.enforcement_models import IspEnforcementEvent
     from app.domains.isp_partner.finance_models import IspZoneLedgerEntry
     from app.domains.isp_partner.models import (
@@ -82,7 +85,12 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
     from app.domains.rbac.seed import seed_rbac
     from app.main import create_app
 
-    for k in ("ISP_APPS_ENABLED", "ISP_ZONES_ENABLED", "ISP_ZONE_LEDGER_ENABLED"):
+    for k in (
+        "ISP_APPS_ENABLED",
+        "ISP_ZONES_ENABLED",
+        "ISP_ZONE_LEDGER_ENABLED",
+        "ISP_DASHBOARD_ENABLED",
+    ):
         monkeypatch.setenv(k, "true")
     monkeypatch.setenv("ISP_REVENUE_HUB_ENABLED", "false")
     _clear()
@@ -257,6 +265,16 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
             s4 = await sub(4, c2, p1, None)
             s5 = await sub(5, c1, p1, z1)
             s6 = await sub(6, c1, p1, None)  # package removed below (no package)
+            # ACTIVE-ALIGN: the Overview's "pending" (KYC open / activation later)
+            s7 = await sub(7, c1, p1, z1)
+            s8 = await sub(8, c1, p1, z2)
+            soon = (datetime.now(UTC) + timedelta(days=5)).isoformat()
+            r = await c.put(
+                f"/api/v1/isp/subscribers/{s8}/profile",
+                json={"activation_at": soon},
+                headers=h,
+            )
+            assert r.status_code == 200, r.text
             # s2 renews at its override price (360), paid; s1 recharged twice, unpaid
             await c.put(
                 f"/api/v1/isp/subscribers/{s2}/profile",
@@ -350,6 +368,14 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
                 )
             )
             s.add(
+                IspSubscriberKyc(
+                    isp_organization_id=orgs["A"],
+                    subscriber_id=uuid.UUID(s7),
+                    applicant_type="individual",
+                    address_proof_same_as_id=True,
+                )
+            )
+            s.add(
                 IspStaffCustomerScope(
                     isp_organization_id=orgs["A"],
                     user_id=users["Abilling"],
@@ -398,7 +424,8 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
                 k["churned"],
                 k["other"],
                 k["total"],
-            ) == (3, 1, 1, 1, 6), k
+            ) == (3, 1, 1, 1, 8), k
+            assert k["pending"] == 2, k  # s7 KYC open, s8 activation later
             assert (
                 k["mrr_paise"] == 80000
                 and k["unpriced"] == 1
@@ -408,7 +435,7 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
             assert k["collected_paise"] == 106200 and k["collection_rate"] == round(
                 106200 / 224200, 4
             ), k
-            assert k["new"] == 4 and k["dues_paise"] == 118000, k
+            assert k["new"] == 6 and k["dues_paise"] == 118000, k
             ag = d["ageing"]
             assert ag["d31_60"] == {"invoices": 1, "amount_paise": 59000}, ag
             assert ag["d0_30"] == {"invoices": 1, "amount_paise": 59000}, ag
@@ -457,6 +484,7 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
             month = f"{today.year:04d}-{today.month:02d}"
             tiles = {
                 "active": k["active"],
+                "pending": k["pending"],
                 "expired": k["expired"],
                 "churned": k["churned"],
                 "other": k["other"],
@@ -586,6 +614,19 @@ async def test_revenue_hub_and_churn_risk(monkeypatch) -> None:  # noqa: ANN001,
             assert (
                 await c.get("/api/v1/isp/revenue/churn-risk", headers=h)
             ).status_code == 403
+
+            # ---- ACTIVE-ALIGN: Overview (DASH-1) and Revenue agree on the same
+            #      data and filters, for the owner and a confined user
+            async def parity(params: dict) -> None:
+                ov = (await get("/dashboard/subscribers", params))["tiles"]
+                rv = (await get("/revenue/summary", params))["kpis"]
+                for key in ("active", "pending", "expired", "churned"):
+                    assert ov[key] == rv[key], (params, key, ov[key], rv[key])
+
+            for user in ("Aowner", "Abilling"):
+                state["user"] = users[user]
+                for params in ({}, {"package_id": p1}, {"scope_zone_id": z2}):
+                    await parity(params)
 
             # ---- ISP B sees nothing of A
             state["user"] = users["Bowner"]
