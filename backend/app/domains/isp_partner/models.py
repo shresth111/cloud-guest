@@ -123,5 +123,7 @@ from .billing_models import BILLING_TABLES  # noqa: E402,F401
 from .enforcement_models import *  # noqa: E402,F403
 from .plans_models import *  # noqa: E402,F403
 from .subscriber360_models import *  # noqa: E402,F403
+# JAZE-3 (ADDENDUM_05 J6/J17): compliance tables, same registration path.
+from .compliance_models import *  # noqa: E402,F403
 
 __all__ = ["IspCustomerProfile", "IspPartnerProfile", "IspStaffCustomerScope"]
