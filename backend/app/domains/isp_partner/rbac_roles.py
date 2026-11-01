@@ -329,3 +329,37 @@ ROLES = tuple(
     for r in ROLES
 )
 ROLES_BY_SLUG = {r.slug: r for r in ROLES}
+
+
+# -- COLLECTIONS-1: collections workbench (/isp/collections, behind
+# ISP_COLLECTIONS_ENABLED). "collect" = record cash in the field + own
+# handover; "approve" = decide another collector's handover (owner/admin, who
+# are never confined).
+_COLLECTIONS_GRANTS: dict[str, str] = {
+    IspRole.OWNER.value: "read update collect approve",
+    IspRole.ADMIN.value: "read update collect approve",
+    IspRole.NOC.value: "read",
+    IspRole.TECHNICIAN.value: "read update collect",
+    IspRole.BILLING.value: "read update collect",
+    IspRole.VIEWER.value: "read",
+}
+PERMISSION_GROUPS = (
+    *PERMISSION_GROUPS,
+    IspPermissionGroup(
+        key="isp_collections",
+        name="ISP Collections",
+        actions=("read", "update", "collect", "approve"),
+        sort_order=1018,
+    ),
+)
+ROLES = tuple(
+    IspRoleDefinition(
+        slug=r.slug,
+        name=r.name,
+        description=r.description,
+        permission_keys=r.permission_keys
+        + _keys(isp_collections=_COLLECTIONS_GRANTS[r.slug]),
+    )
+    for r in ROLES
+)
+ROLES_BY_SLUG = {r.slug: r for r in ROLES}

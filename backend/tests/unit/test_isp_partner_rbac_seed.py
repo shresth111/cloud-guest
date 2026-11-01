@@ -172,6 +172,13 @@ EXPECTED["isp-owner"] |= {"isp_subscribers.disconnect", "isp_subscribers.kyc"}
 EXPECTED["isp-noc"] |= {"isp_subscribers.disconnect"}
 EXPECTED["isp-technician"] |= {"isp_subscribers.disconnect", "isp_subscribers.kyc"}
 EXPECTED["isp-billing"] |= {"isp_subscribers.kyc"}
+# COLLECTIONS-1: approve (cash handovers) = owner/admin only.
+_COLL = {f"isp_collections.{a}" for a in "read update collect approve".split()}
+EXPECTED["isp-owner"] |= _COLL
+EXPECTED["isp-noc"] |= {"isp_collections.read"}
+EXPECTED["isp-technician"] |= _COLL - {"isp_collections.approve"}
+EXPECTED["isp-billing"] |= _COLL - {"isp_collections.approve"}
+EXPECTED["isp-viewer"] |= {"isp_collections.read"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -277,8 +284,8 @@ async def test_seeding_never_changes_a_pre_existing_role(repo) -> None:
 async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
-    assert summary.permission_groups_created == 18  # +1 J16 isp_apps
-    assert summary.permissions_created == 70  # +2 RBAC-FIX disconnect, kyc
+    assert summary.permission_groups_created == 19  # +1 COLLECTIONS-1
+    assert summary.permissions_created == 74  # +4 isp_collections.*
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED

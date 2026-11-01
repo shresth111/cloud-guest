@@ -289,6 +289,17 @@ async def _billing_daily_async() -> dict[str, int]:
                     logger.exception(
                         "isp_billing_daily_failed", extra={"isp": str(org.id)}
                     )
+                # COLLECTIONS-1: promises kept/broken + follow-up tasks (off
+                # unless ISP_COLLECTIONS_ENABLED); never fails the day.
+                try:
+                    from .collections_tasks import run_collections_daily
+
+                    async with session.begin_nested():
+                        await run_collections_daily(session, isp)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "isp_collections_daily_failed", extra={"isp": str(org.id)}
+                    )
                 # JAZE-3 J17: monthly compliance emails (off unless
                 # ISP_COMPLIANCE_SCHEDULES_ENABLED); never fails the day.
                 try:
