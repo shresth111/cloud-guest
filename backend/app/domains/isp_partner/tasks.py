@@ -485,6 +485,21 @@ async def _billing_daily_one(isp_id: uuid.UUID, redis: Any, summary: dict) -> No
         await _own_tx("isp_report_schedules", _reports, summary, isp=isp_id) or 0
     )
 
+    # 6. SMALL-4 revenue snapshot (MRR history), own transaction + savepoint;
+    #    ISP_REVENUE_HUB_ENABLED off = nothing written.
+    async def _snapshot(session: Any) -> int:
+        from .revenue_snapshot import take_snapshot
+
+        isp = await _system_ctx(session, isp_id)
+        if isp is None:
+            return 0
+        async with session.begin_nested():
+            return int(await take_snapshot(session, isp) is not None)
+
+    summary["revenue_snapshots"] = summary.get("revenue_snapshots", 0) + int(
+        await _own_tx("isp_revenue_snapshot", _snapshot, summary, isp=isp_id) or 0
+    )
+
 
 @celery_app.task(name=TASK_ISP_SERVICE_RETRY)
 def retry_pending_service_actions() -> dict[str, int]:
