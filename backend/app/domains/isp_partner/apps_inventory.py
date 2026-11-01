@@ -370,8 +370,20 @@ class InventoryService:
         search: str | None,
         page: int,
         page_size: int,
+        location_id: uuid.UUID | None = None,
     ) -> tuple[list[dict], int]:
         conds = await self._unit_visibility(isp)
+        if location_id is not None:  # APPS-2 stock location
+            from .apps2_models import IspInventoryUnitMeta
+
+            conds.append(
+                IspInventoryUnit.id.in_(
+                    select(IspInventoryUnitMeta.unit_id).where(
+                        IspInventoryUnitMeta.location_id == location_id,
+                        IspInventoryUnitMeta.is_deleted.is_(False),
+                    )
+                )
+            )
         if item_id is not None:
             conds.append(IspInventoryUnit.item_id == item_id)
         if state:
@@ -452,6 +464,9 @@ class InventoryService:
             ).scalars():
                 items[i.id] = i
         orgs = await org_names(self.session, {r.customer_organization_id for r in rows})
+        from .apps2_service import unit_meta_views
+
+        meta = await unit_meta_views(self.session, rows)  # APPS-2 links
         return [
             {
                 "id": r.id,
@@ -466,6 +481,7 @@ class InventoryService:
                 "subscriber_id": r.subscriber_id,
                 "state_changed_at": r.state_changed_at,
                 "note": r.note,
+                **meta.get(r.id, {}),
             }
             for r in rows
         ]

@@ -184,6 +184,8 @@ class IspAnnouncement(BaseModel):
     status: Mapped[str] = mapped_column(String(8), nullable=False)
     sent_at: Mapped[datetime | None] = _ts()
     sent_by_user_id: Mapped[uuid.UUID | None] = _fk("users.id", nullable=True)
+    #: APPS-2: a draft with this set is sent by the frequent beat pass
+    scheduled_at: Mapped[datetime | None] = _ts()
 
     __table_args__ = (Index("ix_isp_announcements_isp", "isp_organization_id"),)
 

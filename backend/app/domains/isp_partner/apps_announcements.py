@@ -42,6 +42,15 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _future(v: Any) -> Any:
+    """APPS-2: a schedule must be in the future (None = send by hand)."""
+    if v is None:
+        return None
+    if v <= _now():
+        raise IspAppsInvalidError("Pick a time in the future to schedule it")
+    return v
+
+
 def whatsapp_link(phone: str | None, text: str) -> str | None:
     """``wa.me`` wants digits only with the country code; a bare 10-digit
     Indian mobile gets ``91`` in front."""
@@ -103,6 +112,7 @@ class AnnouncementService:
             else [],
             send_email=data.get("send_email", True),
             status="draft",
+            scheduled_at=_future(data.get("scheduled_at")),
         )
         self.session.add(a)
         await self.session.flush()
@@ -115,6 +125,8 @@ class AnnouncementService:
         for k in ("title", "body", "audience", "send_email"):
             if k in data:
                 setattr(a, k, data[k])
+        if "scheduled_at" in data:  # APPS-2: None clears the schedule
+            a.scheduled_at = _future(data["scheduled_at"])
         if "customer_ids" in data:
             a.customer_ids = await self._check_customers(
                 isp, data["customer_ids"] or []
@@ -236,6 +248,7 @@ class AnnouncementService:
             "send_email": r.send_email,
             "status": r.status,
             "sent_at": r.sent_at,
+            "scheduled_at": r.scheduled_at,
             "created_at": r.created_at,
         }
 

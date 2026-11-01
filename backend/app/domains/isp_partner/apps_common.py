@@ -111,6 +111,8 @@ class TaskStatus(StrEnum):
     COMPLETED = "completed"
     REJECTED = "rejected"
     CANCELLED = "cancelled"
+    #: APPS-2: a supervisor signed a completed task off (apps2_service)
+    APPROVED = "approved"
 
 
 class UnitState(StrEnum):
@@ -178,6 +180,16 @@ class IspAppsConflictError(IspError):
     code = "ISP_APPS_CONFLICT"
     status_code_default = status.HTTP_409_CONFLICT
     default_message = "That already exists"
+
+
+class IspAppsCheckoutApprovalError(IspError):
+    """APPS-2: only an approver checks a unit out directly."""
+
+    code = "ISP_APPS_CHECKOUT_APPROVAL"
+    status_code_default = status.HTTP_409_CONFLICT
+    default_message = (
+        "Checking a unit out to a customer needs approval: request a checkout"
+    )
 
 
 class IspDiscountInvalidError(IspError):

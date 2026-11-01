@@ -294,8 +294,12 @@ class FieldTaskService:
         return (await self.views([await self._task(isp, task_id)]))[0]
 
     async def views(self, rows: list[Any]) -> list[dict]:
+        from .apps2_service import Apps2Service
+
         users = await user_names(self.session, {r.assignee_user_id for r in rows})
         orgs = await org_names(self.session, {r.customer_organization_id for r in rows})
+        # APPS-2: the latest supervisor decision on a completed task
+        approvals = await Apps2Service(self.session).approvals_for({r.id for r in rows})
         return [
             {
                 "id": r.id,
@@ -319,6 +323,7 @@ class FieldTaskService:
                 "completion_note": r.completion_note,
                 "rejected_reason": r.rejected_reason,
                 "created_at": r.created_at,
+                "approval": approvals.get(r.id),
             }
             for r in rows
         ]

@@ -294,15 +294,12 @@ async def test_onboarding_is_one_transaction() -> None:  # noqa: PLR0915
         assert r.status_code == 201, r.text
         out = r.json()["data"]
         done = [x["step"] for x in out["steps"] if x["status"] == "done"]
-        assert done == [
-            "subscriber",
-            "pppoe",
-            "mac",
-            "kyc",
-            "caf",
-            "invoice",
-            "payment",
-        ]
+        from app.domains.isp_partner.apps_common import get_isp_apps_settings
+
+        expected = ["subscriber", "pppoe", "mac", "kyc", "caf", "invoice", "payment"]
+        if get_isp_apps_settings().enabled:  # APPS-2 install task (default on)
+            expected.append("task")
+        assert done == expected
         assert out["subscriber"]["circuit_id"] == circuit0 + 1
         assert out["subscriber"]["welcome"]["whatsapp_share_url"].startswith(
             "https://wa.me/91"

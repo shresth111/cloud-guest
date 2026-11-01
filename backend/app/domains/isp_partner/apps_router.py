@@ -21,6 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
 from app.domains.notification.dependencies import get_notification_service
+from app.domains.rbac.authorization import AccessValidator
+from app.domains.rbac.dependencies import get_access_validator
 
 from .apps_announcements import AnnouncementService
 from .apps_common import (
@@ -29,6 +31,7 @@ from .apps_common import (
     APPS_MANAGE,
     APPS_READ,
     APPS_UPDATE,
+    IspAppsCheckoutApprovalError,
     IspAppsInvalidError,
     ItemCategory,
     LeadSource,
@@ -392,6 +395,7 @@ async def export_tasks(
     status: str | None = Query(default=None, pattern=pattern(TaskStatus)),
     kind: str | None = Query(default=None, pattern=pattern(TaskKind)),
     assignee_user_id: uuid.UUID | None = Query(default=None),
+    mine: bool = Query(default=False),
     since: date | None = Query(default=None),
     until: date | None = Query(default=None),
     isp: IspContext = Depends(RequireIspPartner),
@@ -403,7 +407,7 @@ async def export_tasks(
         status=status,
         kind=kind,
         assignee_user_id=assignee_user_id,
-        mine=False,
+        mine=mine,  # APPS-2: the export honours "Mine" like the list does
         since=since,
         until=until,
         page=1,
@@ -471,6 +475,8 @@ class IspAppsAnnouncementRequest(_Body):
     audience: str = Field(default="all", pattern="^(all|selected)$")
     customer_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     send_email: bool = True
+    #: APPS-2: send automatically at this time (the frequent beat pass)
+    scheduled_at: datetime | None = None
 
 
 class IspAppsAnnouncementPatch(_Body):
@@ -479,6 +485,7 @@ class IspAppsAnnouncementPatch(_Body):
     audience: str | None = Field(default=None, pattern="^(all|selected)$")
     customer_ids: list[uuid.UUID] | None = Field(default=None, max_length=500)
     send_email: bool | None = None
+    scheduled_at: datetime | None = None
 
 
 def _announcements(
@@ -772,6 +779,7 @@ async def list_units(
     isp_customer_id: uuid.UUID | None = Query(default=None),
     subscriber_id: uuid.UUID | None = Query(default=None),
     search: str | None = Query(default=None, max_length=64),
+    stock_location_id: uuid.UUID | None = Query(default=None),
     page: int = _Page,
     page_size: int = _PageSize,
     isp: IspContext = Depends(RequireIspPartner),
@@ -786,6 +794,7 @@ async def list_units(
         search=search,
         page=page,
         page_size=page_size,
+        location_id=stock_location_id,
     )
     return ok(request, make_page(items, total, page, page_size), "Units")
 
@@ -861,7 +870,16 @@ async def move_unit(
     payload: IspAppsUnitMoveRequest,
     isp: IspContext = Depends(RequireIspPartner),
     svc: InventoryService = Depends(_inventory),
+    av: AccessValidator = Depends(get_access_validator),
 ) -> dict:
+    # APPS-2: checking a unit out to a customer needs a manager's approval.
+    # Approvers (isp_apps.manage) may still move it directly; everyone else
+    # files POST /inventory/units/{id}/checkout and waits for approval.
+    if payload.state == UnitState.ASSIGNED:
+        from .router import effective_isp_permissions
+
+        if APPS_MANAGE not in await effective_isp_permissions(isp, av):
+            raise IspAppsCheckoutApprovalError()
     return ok(
         request, await svc.move_unit(isp, unit_id, payload.model_dump()), "Unit updated"
     )

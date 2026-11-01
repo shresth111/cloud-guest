@@ -154,6 +154,13 @@ async def _retry_async() -> dict[str, int]:
                 await run_finance_frequent(session)
             except Exception:  # noqa: BLE001 -- never blocks the retry pass
                 logger.exception("isp_finance_frequent_failed")
+            # APPS-2: scheduled announcements + helpdesk escalations.
+            try:
+                from .apps2_tasks import run_apps_frequent
+
+                await run_apps_frequent(session)
+            except Exception:  # noqa: BLE001 -- never blocks the retry pass
+                logger.exception("isp_apps_frequent_failed")
             await session.commit()
     finally:
         await redis.aclose()
