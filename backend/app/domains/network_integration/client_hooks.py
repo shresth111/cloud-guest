@@ -476,13 +476,22 @@ def build_controller_device_blocker(session: AsyncSession):
             resolves nothing, decrypts nothing, calls nothing, and the
             caller stops here.
             """
-            return (
+            if (
                 await _resolve(
                     session,
                     location_id=location_id,
                     organization_id=organization_id,
                 )
                 is not None
+            ):
+                return True
+            # Aruba Instant On: no controller integration row, but Instant
+            # On's cloud can block a device -- only when cloud control is
+            # switched on for this venue (``instant_on_control``'s gates).
+            from .instant_on_control import instant_on_control_present
+
+            return await instant_on_control_present(
+                session, location_id=location_id, organization_id=organization_id
             )
 
         @staticmethod
@@ -492,6 +501,15 @@ def build_controller_device_blocker(session: AsyncSession):
             organization_id: uuid.UUID | None,
             client_mac: str,
         ) -> ControllerBlockOutcome:
+            instant_on = await _instant_on_device_action(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="block",
+            )
+            if instant_on is not None:
+                return instant_on
             return await _client_block_action(
                 session,
                 location_id=location_id,
@@ -507,7 +525,13 @@ def build_controller_device_blocker(session: AsyncSession):
             organization_id: uuid.UUID | None,
             client_mac: str,
         ) -> ControllerReleaseOutcome:
-            outcome = await _client_block_action(
+            outcome = await _instant_on_device_action(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="unblock",
+            ) or await _client_block_action(
                 session,
                 location_id=location_id,
                 organization_id=organization_id,
@@ -531,6 +555,51 @@ def build_controller_device_blocker(session: AsyncSession):
             )
 
     return _DeviceBlocker()
+
+
+async def _instant_on_device_action(
+    session: AsyncSession,
+    *,
+    location_id: uuid.UUID,
+    organization_id: uuid.UUID | None,
+    client_mac: str,
+    action: str,
+) -> ControllerBlockOutcome | None:
+    """Instant On's half of a device block/unblock, or ``None`` when this
+    venue has no Instant On cloud control (the caller then takes the Omada
+    path exactly as before). Only consulted when no Omada controller
+    resolves for the location, so an Omada venue never reaches Instant On."""
+    if (
+        await _resolve(
+            session, location_id=location_id, organization_id=organization_id
+        )
+        is not None
+    ):
+        return None
+    from .instant_on_control import (
+        instant_on_block_device,
+        instant_on_release_device,
+    )
+
+    call = instant_on_block_device if action == "block" else instant_on_release_device
+    outcome = await call(
+        session,
+        location_id=location_id,
+        organization_id=organization_id,
+        client_mac=client_mac,
+    )
+    if outcome.status == "unavailable":
+        return None
+    return ControllerBlockOutcome(
+        location_id=location_id,
+        mac_address=client_mac,
+        status=(
+            BlockEnforcementStatus.ENFORCED.value
+            if outcome.status == "enforced"
+            else BlockEnforcementStatus.FAILED.value
+        ),
+        error_message=outcome.error_message,
+    )
 
 
 async def _client_block_action(
@@ -758,7 +827,29 @@ def build_controller_session_terminator(session: AsyncSession):
             return
         await _release_rate_limit(session, resolved, client_mac=normalized)
 
+    async def end_nas_only(
+        *,
+        router_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+    ) -> bool:
+        """End a session on a NAS-only access point (Aruba Instant On)
+        through Instant On's cloud, when cloud control is switched on for
+        that router. ``False`` (never raises) means "could not" -- and is
+        what every gate closed answers, so the default is the old NAS-only
+        behaviour. Hung on the function for the reason
+        ``release_rate_limit`` is."""
+        from .instant_on_control import end_nas_only_session
+
+        return await end_nas_only_session(
+            session,
+            router_id=router_id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+        )
+
     terminate.release_rate_limit = release_rate_limit  # type: ignore[attr-defined]
+    terminate.end_nas_only = end_nas_only  # type: ignore[attr-defined]
     return terminate
 
 
@@ -895,6 +986,68 @@ def _connection_config(
     )
 
 
+def _activity_window_minutes() -> int:
+    """``VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES``, imported at call time for
+    the reason this module's own docstring gives about the direction of the
+    guest edge."""
+    from app.domains.guest.constants import (  # noqa: PLC0415
+        VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
+    )
+
+    return VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES
+
+
+async def _activity_was_reported(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID,
+) -> bool:
+    """Has anything moved ``last_activity_at`` at this venue inside the
+    reporting window? The observation half of
+    ``build_controller_activity_reporting_lookup`` -- see its docstring."""
+    from app.domains.guest.repository import GuestRepository  # noqa: PLC0415
+
+    since = datetime.now(UTC) - timedelta(minutes=_activity_window_minutes())
+    return await GuestRepository(session).venue_activity_was_reported_since(
+        organization_id=organization_id,
+        location_id=location_id,
+        since=since,
+    )
+
+
+async def location_has_nas_only_access_points(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID,
+) -> bool:
+    """Whether a live fleet row at this location is a NAS-only vendor
+    (``vendor_capabilities.NAS_ONLY_VENDORS`` -- Aruba Instant On).
+
+    One indexed read, asked only for a venue with no controller integration
+    and memoized per venue per sweep run by the caller. Module-level so a
+    test can stand it in without a database."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.domains.router.models import Router  # noqa: PLC0415
+    from app.domains.router.vendor_capabilities import (  # noqa: PLC0415
+        NAS_ONLY_VENDORS,
+    )
+
+    statement = (
+        select(Router.id)
+        .where(
+            Router.organization_id == organization_id,
+            Router.location_id == location_id,
+            Router.vendor.in_(sorted(NAS_ONLY_VENDORS)),
+            Router.is_deleted.is_(False),
+        )
+        .limit(1)
+    )
+    return (await session.execute(statement)).first() is not None
+
+
 def build_controller_activity_reporting_lookup(session: AsyncSession):
     """Whether a venue can report that its guests are still using the
     network, bound to ``session``.
@@ -1007,7 +1160,27 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
                 location_id=location_id, organization_id=organization_id
             )
             if integration is None:
-                return True
+                if not await location_has_nas_only_access_points(
+                    session,
+                    organization_id=organization_id,
+                    location_id=location_id,
+                ):
+                    return True
+                # A NAS-only venue (Aruba Instant On) has no integration row
+                # either, but it is NOT the MikroTik premise: whether its
+                # access points send Interim-Updates at all is unmeasured
+                # (Instant On exposes no interim setting; Aruba spec check
+                # V3). Without them ``last_activity_at`` never moves, so the
+                # idle rule would expire every guest at the idle timeout
+                # while they are still online -- and nothing can reconnect
+                # or disconnect them there, so the Guests screen would lie.
+                # Observe the column instead of assuming it, exactly as an
+                # Open API controller venue is observed below.
+                return await _activity_was_reported(
+                    session,
+                    organization_id=organization_id,
+                    location_id=location_id,
+                )
             credentials: dict[str, str] = {}
             if integration.credentials_encrypted:
                 try:
@@ -1033,21 +1206,9 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
                 # Question 1: this venue can never report. No observation
                 # needed, and none would be meaningful.
                 return False
-            # Question 2: it can -- but is it? Imported here rather than at
-            # module scope for the reason this module's own docstring gives
-            # about the direction of the guest edge.
-            from app.domains.guest.constants import (  # noqa: PLC0415
-                VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
-            )
-            from app.domains.guest.repository import GuestRepository  # noqa: PLC0415
-
-            since = datetime.now(UTC) - timedelta(
-                minutes=VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES
-            )
-            reported = await GuestRepository(session).venue_activity_was_reported_since(
-                organization_id=organization_id,
-                location_id=location_id,
-                since=since,
+            # Question 2: it can -- but is it?
+            reported = await _activity_was_reported(
+                session, organization_id=organization_id, location_id=location_id
             )
             if not reported:
                 # Worth a line: the capability says this controller can be
@@ -1060,9 +1221,52 @@ def build_controller_activity_reporting_lookup(session: AsyncSession):
                     extra={
                         "integration_id": str(integration.id),
                         "location_id": str(location_id),
-                        "window_minutes": VENUE_ACTIVITY_REPORTING_WINDOW_MINUTES,
+                        "window_minutes": _activity_window_minutes(),
                     },
                 )
             return reported
 
     return _ActivityReporting()
+
+
+def build_instant_on_device_blocker(session: AsyncSession):  # noqa: ANN201
+    """The Aruba Instant On leg of a ``BLOCKLIST`` *device* rule
+    (``guest_access.device_blocking.RouterDeviceBlocker``, ``nas_only=``):
+    a persistent Instant On MAC block / release, each read back, for the
+    venue of one Instant On router row. Keyed on that row's own organization
+    and location, so the site written to is always the row's tenant's.
+    Answers ``unavailable`` (nothing sent) unless every cloud-control gate is
+    open for that router."""
+
+    class _InstantOnDeviceBlocker:
+        @staticmethod
+        async def _call(router, mac_address: str, action: str):  # noqa: ANN001, ANN205
+            from .instant_on_control import (
+                instant_on_block_device,
+                instant_on_release_device,
+            )
+
+            organization_id = getattr(router, "organization_id", None)
+            location_id = getattr(router, "location_id", None)
+            if organization_id is None or location_id is None:
+                return "unavailable", None
+            call = (
+                instant_on_block_device
+                if action == "block"
+                else instant_on_release_device
+            )
+            outcome = await call(
+                session,
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=mac_address,
+            )
+            return outcome.status, outcome.error_message
+
+        async def block(self, *, router, mac_address: str):  # noqa: ANN001, ANN201
+            return await self._call(router, mac_address, "block")
+
+        async def release(self, *, router, mac_address: str):  # noqa: ANN001, ANN201
+            return await self._call(router, mac_address, "unblock")
+
+    return _InstantOnDeviceBlocker()

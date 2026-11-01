@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
@@ -673,3 +674,90 @@ class InstantOnAccountToken(BaseModel):
 
     def __repr__(self) -> str:
         return f"<InstantOnAccountToken(auth_state={self.auth_state})>"
+
+
+# ---------------------------------------------------------------------------
+# Aruba Instant On: the access points of one NAS-only site
+# ---------------------------------------------------------------------------
+#
+# One Instant On SITE is one Wyfy location and ONE NAS-only fleet ``Router``
+# (the NAS-Identifier owner; ``guest_sessions.router_id`` points at it). The
+# site's RADIUS profile is site-wide, so every AP in it sends the same
+# NAS-Identifier and its own MAC at the front of ``Called-Station-Id``. This
+# table is the list of AP MACs the shared listener accepts for that router,
+# beside the router's own ``mac_address`` (the "primary" AP).
+#
+# Deliberately a child table rather than one fleet row per AP: a second
+# ``routers`` row would flow through every fleet query MikroTik and Omada
+# also run (counts, liveness, alerts, the Master fleet).
+
+
+class ArubaAccessPointSource(StrEnum):
+    PRIMARY = "primary"  # the router row's own mac_address (backfill)
+    INSTANT_ON = "instant_on"  # the owner's Instant On inventory (poller)
+    DISCOVERED = "discovered"  # seen in a RADIUS packet, not yet approved
+    MANUAL = "manual"  # added by Master
+
+
+class ArubaAccessPointStatus(StrEnum):
+    APPROVED = "approved"  # the shared listener accepts this MAC
+    PENDING = "pending"  # seen, refused, waiting for Master
+    REJECTED = "rejected"  # Master said no; still refused
+
+
+class ArubaAccessPoint(BaseModel):
+    """One access point of an Instant On site. Only ``approved`` rows admit
+    guests; a MAC is never approved automatically from a RADIUS packet (a
+    Called-Station-Id is not proof of anything).
+
+    ``organization_id``/``location_id`` are copied from the router when the
+    row is written, never from a request body, so a customer read can put
+    the tenant and the venue in its WHERE clause.
+    """
+
+    __tablename__ = "aruba_access_points"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Canonical ``AA:BB:CC:DD:EE:FF``.
+    mac: Mapped[str] = mapped_column(String(17), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    serial: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    first_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Last RADIUS packet carrying this AP's MAC (throttled write).
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_aruba_access_points_organization_id", "organization_id"),
+        Index("ix_aruba_access_points_location_id", "location_id"),
+        Index(
+            "uq_aruba_access_points_router_mac",
+            "router_id",
+            "mac",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ArubaAccessPoint(mac={self.mac}, status={self.status})>"

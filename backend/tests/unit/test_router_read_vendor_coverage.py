@@ -312,6 +312,15 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "for the IPDR's derived Translated IP. Rows are decided by "
         "traffic_flow_records; nothing is polled, pushed or judged."
     ),
+    # -- network integration ------------------------------------------------
+    "app/domains/network_integration/client_hooks.py::location_has_nas_only_access_points": (  # noqa: E501
+        "A vendor question, not a fleet count: it asks whether this location "
+        "has a live NAS-only row (Aruba Instant On), filtering on "
+        "`vendor IN NAS_ONLY_VENDORS` itself. Narrowing it to agent-managed "
+        "rows would remove exactly the rows it exists to find. Its answer "
+        "only decides whether the idle sweep observes `last_activity_at` "
+        "instead of assuming it moves; it feeds no device work."
+    ),
     # -- security -----------------------------------------------------------
     "app/domains/security/repository.py::SecurityRepository.fleet_counts": (
         "Narrowing happened upstream and this method cannot undo it: every "
@@ -588,6 +597,13 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "name is a better label for it than a bare id, and a vendor filter "
         "would make an Omada venue's own controller show as an unlabelled "
         "uuid. Read-only, every row genuinely belongs."
+    ),
+    "app/domains/network_integration/aruba_access_points.py::"
+    "ArubaAccessPointService._aruba_routers_at": (
+        "The customer per-AP read: the NAS-only (Aruba Instant On) rows of one "
+        "location, filtered by `vendor IN NAS_ONLY_VENDORS` plus the caller's "
+        "organization. `agent_managed_only` would make it empty by "
+        "definition. Read-only; never device work."
     ),
     "app/domains/network_integration/instant_on_repository.py::"
     "InstantOnRepository.get_live_site_by_site_id": (

@@ -66,6 +66,8 @@ from app.domains.monitoring.service import (
 from app.domains.monitoring.service import (
     NotificationService as AlertNotificationService,
 )
+from app.domains.network_integration.dependencies import get_instant_on_read_service
+from app.domains.network_integration.instant_on_service import InstantOnReadService
 from app.domains.notification.dependencies import get_notification_service
 from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
@@ -109,6 +111,9 @@ def get_location_provisioning_service(
         get_alert_notification_service
     ),
     settings: Settings = Depends(get_settings),
+    # The Add Customer wizard's Aruba Instant On option writes the site
+    # mapping through it (the same service #328's route uses); same session.
+    instant_on_service: InstantOnReadService = Depends(get_instant_on_read_service),
 ) -> LocationProvisioningService:
     async def _default_alerting(
         *, organization_id: uuid.UUID, contact_email: str | None
@@ -137,6 +142,7 @@ def get_location_provisioning_service(
         login_url_base=settings.frontend_base_url,
         notification_service=notification_service,
         default_alerting=_default_alerting,
+        instant_on_service=instant_on_service,
     )
 
 

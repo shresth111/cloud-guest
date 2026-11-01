@@ -65,6 +65,7 @@ from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction, ScopeType
 
+from .access_tier import AccessTier, access_tier_from_rules
 from .constants import (
     PLATFORM_DEFAULT_RULES,
     PolicyAssignmentTargetType,
@@ -84,6 +85,7 @@ from .exceptions import (
     PolicyAssignmentGuestAlreadyMappedError,
     PolicyAssignmentNotFoundError,
     PolicyAssignmentRequiresPublishedVersionError,
+    PolicyAssignmentTargetGuestNotFoundError,
     PolicyAssignmentTargetRoleNotFoundError,
     PolicyAssignmentTargetUserNotFoundError,
     PolicyNotFoundError,
@@ -176,6 +178,17 @@ class RoleLookupProtocol(Protocol):
     async def get_role_by_id(
         self, role_id: uuid.UUID, *, include_deleted: bool = False
     ) -> object | None: ...
+
+
+class GuestLookupProtocol(Protocol):
+    """The single method this module needs to check that a ``guest``-targeted
+    :class:`~.models.PolicyAssignment` names a guest owned by the policy's
+    organization -- satisfied by ``PolicyRepository.get_guest_organization_id``
+    (a column-only read of ``guests``, no import of the ``guest`` domain)."""
+
+    async def get_guest_organization_id(
+        self, guest_id: uuid.UUID
+    ) -> uuid.UUID | None: ...
 
 
 # ============================================================================
@@ -280,6 +293,7 @@ class PolicyService:
         audit_writer: AuditLogWriter | None = None,
         user_lookup: UserLookupProtocol | None = None,
         role_lookup: RoleLookupProtocol | None = None,
+        guest_lookup: GuestLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
@@ -287,6 +301,7 @@ class PolicyService:
         self.audit_writer = audit_writer
         self.user_lookup = user_lookup
         self.role_lookup = role_lookup
+        self.guest_lookup = guest_lookup
         self.resolver = PolicyResolver()
 
     # ========================================================================
@@ -539,15 +554,41 @@ class PolicyService:
         if policy.current_version_id is None:
             raise PolicyAssignmentRequiresPublishedVersionError(policy.id)
 
+        # Tenant ownership of everything the request BODY names (scope_id,
+        # target_id). ``get_policy`` above only proves the caller may see the
+        # policy; it does not stop an org from pointing its policy (or a
+        # platform policy it can read) at another org's guest, location or
+        # organization, or at every org via a GLOBAL untargeted row. The owner
+        # is the policy's organization; for a platform policy it is the
+        # caller's (an org caller may use a platform policy only inside its
+        # own tenant). A platform caller on a platform policy is unrestricted.
+        owner_organization_id = (
+            policy.organization_id
+            if policy.organization_id is not None
+            else requesting_organization_id
+        )
+
         validate_assignment_scope(scope_type=scope_type, scope_id=scope_id)
+        validate_assignment_target(target_type=target_type, target_id=target_id)
+        if (
+            scope_type == ScopeType.GLOBAL.value
+            and target_type == PolicyAssignmentTargetType.NONE.value
+            and owner_organization_id is not None
+        ):
+            # GLOBAL + untargeted is a resolution candidate for every
+            # organization on the platform.
+            raise CrossOrganizationPolicyAccessError()
         if scope_type == ScopeType.ORGANIZATION.value and scope_id is not None:
             await self.organization_lookup.get_organization(scope_id)
+            if owner_organization_id is not None and not await self._is_owned_by(
+                scope_id, owner_organization_id
+            ):
+                raise CrossOrganizationPolicyAccessError()
         elif scope_type == ScopeType.LOCATION.value and scope_id is not None:
             await self.location_lookup.get_location(
-                scope_id, requesting_organization_id=requesting_organization_id
+                scope_id, requesting_organization_id=owner_organization_id
             )
 
-        validate_assignment_target(target_type=target_type, target_id=target_id)
         if (
             target_type == PolicyAssignmentTargetType.USER.value
             and target_id is not None
@@ -564,6 +605,32 @@ class PolicyService:
             role = await self.role_lookup.get_role_by_id(target_id)
             if role is None:
                 raise PolicyAssignmentTargetRoleNotFoundError(target_id)
+            role_organization_id = getattr(role, "organization_id", None)
+            if (
+                owner_organization_id is not None
+                and role_organization_id is not None
+                and not await self._is_owned_by(
+                    role_organization_id, owner_organization_id
+                )
+            ):
+                # Same 404 as an unknown role: never confirm a foreign one.
+                raise PolicyAssignmentTargetRoleNotFoundError(target_id)
+        elif (
+            target_type == PolicyAssignmentTargetType.GUEST.value
+            and target_id is not None
+            and self.guest_lookup is not None
+        ):
+            guest_organization_id = await self.guest_lookup.get_guest_organization_id(
+                target_id
+            )
+            if guest_organization_id is None or (
+                owner_organization_id is not None
+                and not await self._is_owned_by(
+                    guest_organization_id, owner_organization_id
+                )
+            ):
+                # Unknown and foreign guest read the same (404).
+                raise PolicyAssignmentTargetGuestNotFoundError(target_id)
 
         # One-guest-one-group: a GUEST-targeted assignment on a BANDWIDTH
         # policy is Group Policies' "Map users" step naming one specific
@@ -586,6 +653,9 @@ class PolicyService:
                 target_type=PolicyAssignmentTargetType.GUEST.value,
                 target_id=target_id,
                 exclude_policy_id=policy.id,
+                # Per organization: another tenant's row must neither block
+                # this mapping nor be disclosed in the 409.
+                organization_id=policy.organization_id,
             )
             if existing is not None:
                 raise PolicyAssignmentGuestAlreadyMappedError(
@@ -666,6 +736,7 @@ class PolicyService:
             policy_type=PolicyType.BANDWIDTH.value,
             target_type=PolicyAssignmentTargetType.GUEST.value,
             target_id=guest_id,
+            organization_id=requesting_organization_id,
         )
         if assignment is None or requesting_organization_id is None:
             return assignment
@@ -819,10 +890,16 @@ class PolicyService:
         # ``organization_id is None`` -- a platform/GLOBAL caller (who passed
         # the GLOBAL-scope permission gate) may resolve for any location, and
         # ``get_location`` itself no-ops on a ``None`` requesting org.
+        tenant_organization_id = organization_id
         if location_id is not None and organization_id is not None:
             await self.location_lookup.get_location(
                 location_id, requesting_organization_id=organization_id
             )
+        elif location_id is not None:
+            # Platform caller resolving for a location: that location's
+            # organization is the tenant the foreign-candidate filter uses.
+            location = await self.location_lookup.get_location(location_id)
+            tenant_organization_id = getattr(location, "organization_id", None)
 
         candidates = await self.repository.list_candidate_assignments(
             policy_type=policy_type.value,
@@ -831,6 +908,9 @@ class PolicyService:
             user_id=user_id,
             role_ids=role_ids,
             guest_id=guest_id,
+        )
+        candidates = await self._drop_foreign_candidates(
+            candidates, tenant_organization_id=tenant_organization_id
         )
         winner = self.resolver.resolve(candidates=candidates)
         if winner is None:
@@ -877,9 +957,144 @@ class PolicyService:
             guest_id=guest_id,
         )
 
+    async def resolve_access_tier(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None,
+    ) -> AccessTier | None:
+        """The Access Tier ``guest_id`` is mapped into at ``location_id``, or
+        ``None`` -- see ``access_tier.py`` for what a tier carries and the
+        precedence its fields follow.
+
+        A tier is the guest's active **GUEST-targeted** ``BANDWIDTH``
+        assignment whose WHERE scope covers this location (the dashboard's
+        "Map guests" step writes ``scope_type=location``). Mapping a tier to
+        a location for everyone (``target_type=none``) is the venue-wide
+        speed and is deliberately not a tier here.
+
+        **Organization-scoped, unconditionally.** A guest-targeted assignment
+        whose policy belongs to a different organization is skipped (and
+        logged), never applied: ``target_id`` is not validated against the
+        guest's organization at write time (see
+        ``constants.PolicyAssignmentTargetType.GUEST``), so the read is where
+        this has to hold. A platform policy (``organization_id IS NULL``) is
+        allowed, like every other platform-wide resolution candidate.
+
+        Read-only and additive: ``resolve_effective_policy`` is untouched,
+        so nothing that already resolves a policy changes behaviour. Callers
+        decide where a tier is enforced (today: Aruba Instant On only)."""
+        if guest_id is None or organization_id is None:
+            return None
+        candidates = await self.repository.list_candidate_assignments(
+            policy_type=PolicyType.BANDWIDTH.value,
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        mapped = [
+            a
+            for a in candidates
+            if a.target_type == PolicyAssignmentTargetType.GUEST.value
+            and a.target_id == guest_id
+        ]
+        for assignment in sorted(mapped, key=_resolution_key, reverse=True):
+            policy = await self.repository.get_policy_by_id(assignment.policy_id)
+            if policy is None or policy.current_version_id is None:
+                continue
+            if (
+                policy.organization_id is not None
+                and policy.organization_id != organization_id
+            ):
+                logger.warning(
+                    "access_tier_foreign_organization_ignored",
+                    extra={
+                        "assignment_id": str(assignment.id),
+                        "policy_id": str(policy.id),
+                        "guest_id": str(guest_id),
+                        "organization_id": str(organization_id),
+                    },
+                )
+                continue
+            version = await self.repository.get_version_by_id(
+                policy.current_version_id
+            )
+            if version is None:
+                continue
+            return access_tier_from_rules(
+                policy.id, dict(version.rules or {}), name=policy.name
+            )
+        return None
+
     # ========================================================================
     # Internal helpers
     # ========================================================================
+
+    async def _is_owned_by(
+        self, target_organization_id: uuid.UUID, owner_organization_id: uuid.UUID
+    ) -> bool:
+        """``target_organization_id`` is the owner itself or a direct MSP child
+        of it -- the same rule as
+        ``app.domains.organization.scoping.enforce_target_organization``."""
+        if target_organization_id == owner_organization_id:
+            return True
+        try:
+            target = await self.organization_lookup.get_organization(
+                target_organization_id
+            )
+        except Exception:  # unknown org -> not owned
+            return False
+        return (
+            getattr(target, "parent_organization_id", None) == owner_organization_id
+        )
+
+    async def _drop_foreign_candidates(
+        self,
+        candidates: list[PolicyAssignment],
+        *,
+        tenant_organization_id: uuid.UUID | None,
+    ) -> list[PolicyAssignment]:
+        """Defense in depth for rows the write-side checks never saw (written
+        before they existed, or by a path that bypassed them): a candidate
+        whose policy belongs to an organization other than the tenant being
+        resolved for (or its MSP parent) is ignored and logged. Platform
+        policies (``organization_id IS NULL``) are always kept. With no
+        tenant known (platform caller, no location) nothing is filtered."""
+        if tenant_organization_id is None or not candidates:
+            return candidates
+        parent_id: uuid.UUID | None = None
+        parent_loaded = False
+        kept: list[PolicyAssignment] = []
+        for assignment in candidates:
+            policy = await self.repository.get_policy_by_id(assignment.policy_id)
+            policy_org = policy.organization_id if policy is not None else None
+            if policy_org is None or policy_org == tenant_organization_id:
+                kept.append(assignment)
+                continue
+            if not parent_loaded:
+                parent_loaded = True
+                try:
+                    tenant = await self.organization_lookup.get_organization(
+                        tenant_organization_id
+                    )
+                    parent_id = getattr(tenant, "parent_organization_id", None)
+                except Exception:
+                    parent_id = None
+            if parent_id is not None and policy_org == parent_id:
+                kept.append(assignment)
+                continue
+            logger.warning(
+                "policy_assignment_foreign_organization_ignored",
+                extra={
+                    "assignment_id": str(assignment.id),
+                    "policy_id": str(assignment.policy_id),
+                    "policy_organization_id": str(policy_org),
+                    "organization_id": str(tenant_organization_id),
+                    "target_type": assignment.target_type,
+                },
+            )
+        return kept
 
     def _enforce_read_scope(
         self,
@@ -925,5 +1140,6 @@ __all__ = [
     "ResolvedPolicy",
     "OrganizationLookupProtocol",
     "LocationLookupProtocol",
+    "GuestLookupProtocol",
     "AuditLogWriter",
 ]

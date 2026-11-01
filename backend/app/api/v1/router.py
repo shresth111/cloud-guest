@@ -46,11 +46,20 @@ from app.domains.feature_entitlement.router import router as feature_entitlement
 from app.domains.firewall.router import router as firewall_router
 from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
+from app.domains.guest.router import (
+    aruba_shared_platform_router as guest_aruba_shared_platform_router,
+)
 from app.domains.guest.router import guest_router
 from app.domains.guest.router import nas_cross_reference_router as guest_nas_xref_router
 from app.domains.guest.router import nas_platform_router as guest_nas_platform_router
 from app.domains.guest.router import nas_router as guest_nas_router
 from app.domains.guest.router import radius_router as guest_radius_router
+from app.domains.guest.ssid_tier_router import (
+    ssid_tier_guest_router as guest_ssid_tier_guest_router,
+)
+from app.domains.guest.ssid_tier_router import (
+    ssid_tier_router as guest_ssid_tier_router,
+)
 from app.domains.guest_access.router import router as guest_access_router
 from app.domains.guest_teams.router import admin_router as guest_teams_admin_router
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
@@ -77,6 +86,12 @@ from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
+from app.domains.network_integration.aruba_ap_router import (
+    aruba_ap_customer_router as network_integration_aruba_ap_customer_router,
+)
+from app.domains.network_integration.aruba_ap_router import (
+    aruba_ap_platform_router as network_integration_aruba_ap_platform_router,
+)
 from app.domains.network_integration.customer_router import (
     customer_router as network_integration_customer_router,
 )
@@ -100,6 +115,12 @@ from app.domains.port_forwarding.router import router as port_forwarding_router
 from app.domains.provisioning_engine.router import router as provisioning_engine_router
 from app.domains.qos.router import router as qos_router
 from app.domains.queue_management.router import router as queue_management_router
+from app.domains.queue_management.speed_gateway_router import (
+    speed_gateway_customer_router as queue_speed_gateway_customer_router,
+)
+from app.domains.queue_management.speed_gateway_router import (
+    speed_gateway_platform_router as queue_speed_gateway_platform_router,
+)
 from app.domains.quotation.router import router as quotation_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.readiness.router import router as readiness_router
@@ -212,6 +233,9 @@ api_v1_router.include_router(guest_radius_router)
 api_v1_router.include_router(guest_nas_router)
 api_v1_router.include_router(guest_nas_xref_router)
 api_v1_router.include_router(guest_nas_platform_router)
+api_v1_router.include_router(guest_aruba_shared_platform_router)
+api_v1_router.include_router(guest_ssid_tier_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(guest_ssid_tier_guest_router)
 api_v1_router.include_router(guest_analytics_router)
 api_v1_router.include_router(guest_access_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_teams_guest_router)
@@ -274,6 +298,14 @@ api_v1_router.include_router(traffic_flow_geo_customer_router)
 # Findings for the same venue page: same three guards, read-only, computed
 # on read (no table, no notification).
 api_v1_router.include_router(traffic_flow_findings_customer_router)
+api_v1_router.include_router(network_integration_aruba_ap_customer_router)
+api_v1_router.include_router(network_integration_aruba_ap_platform_router)
+# Aruba AP + MikroTik gateway hybrid: Master links a venue MikroTik as an
+# Instant On access point's speed gateway (GLOBAL, platform DB only); the
+# customer reads one boolean. Queue writes happen in the worker, behind
+# CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED.
+api_v1_router.include_router(queue_speed_gateway_customer_router)
+api_v1_router.include_router(queue_speed_gateway_platform_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 # Cloudflare Gateway category filtering: the provider-backed half of the same

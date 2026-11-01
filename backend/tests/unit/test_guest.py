@@ -297,6 +297,12 @@ class FakeVoucherService:
     async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
         return self.plan_queue_profiles.get(plan_id)
 
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None:
+        for voucher, _batch in self.vouchers.values():
+            if voucher.id == voucher_id:
+                return voucher
+        return None
+
 
 @dataclass
 class FakeCaptivePortalService:
@@ -9233,6 +9239,10 @@ class TestNasSecretRotationIsPlatformOnly:
         endpoint is for."""
         paths = sorted(r.path for r in self._routes_requiring("radius.execute"))
         assert paths == [
+            # Rotating the shared Aruba listener's secret changes the
+            # credential of every venue on that listener: the same key, the
+            # same platform namespace, pinned GLOBAL.
+            "/api/v1/platform/radius/aruba-shared/rotate",
             "/api/v1/platform/radius/nas/{nas_id}/activate",
             "/api/v1/platform/radius/nas/{nas_id}/disable",
             "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret",

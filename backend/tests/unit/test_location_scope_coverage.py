@@ -717,6 +717,15 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "that device ended within LAST_ENDED_SESSION_WINDOW_MINUTES, which is "
         "strictly less than `/session/active` already discloses for a live one."
     ),
+    ("GET", "/api/v1/guest/session/trusted-device"): (
+        "Trusted Devices at an Aruba Instant On venue, asked by the portal after "
+        "`/guest/session/active` answers no, unauthenticated for the same reason: "
+        "the device has no session and no roles yet, so there is no confinement to "
+        "derive. It creates nothing and returns only `mac:<the MAC sent>` or null; "
+        "the device is admitted solely by RADIUS Authorize on the MAC the AP "
+        "reports. The most it discloses is whether a MAC is trusted at the "
+        "router's venue, less than `/session/active` discloses for a live session."
+    ),
     ("POST", "/api/v1/guest/session/disconnect"): (
         "A guest acting on their own session, before or during login. They hold no "
         "roles, so there is no confinement to derive; the anonymous-tolerant "
@@ -734,6 +743,22 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "-- the router itself is the caller. It has no RBAC grants and therefore no "
         "location confinement, and it must never 401: this is the path every guest's "
         "traffic authorises through."
+    ),
+    ("POST", "/api/v1/radius/aruba-shared/authorize"): (
+        "The shared Aruba Instant On listener (UDP 1912/1913). Authenticated by the "
+        "platform-wide Aruba shared secret (constant-time, `resolve_shared_nas`), "
+        "then bound to one ACTIVE aruba_instant_on NAS by the packet's "
+        "NAS-Identifier AND its AP MAC. Same reasoning as `/radius/authorize`: the "
+        "AP is the caller, it has no RBAC grants, and a refusal is an Access-Reject "
+        "(or a logged 401 for accounting), never a user-session 401."
+    ),
+    ("POST", "/api/v1/radius/aruba-shared/accounting"): (
+        "The shared Aruba Instant On listener (UDP 1912/1913). Authenticated by the "
+        "platform-wide Aruba shared secret (constant-time, `resolve_shared_nas`), "
+        "then bound to one ACTIVE aruba_instant_on NAS by the packet's "
+        "NAS-Identifier AND its AP MAC. Same reasoning as `/radius/authorize`: the "
+        "AP is the caller, it has no RBAC grants, and a refusal is an Access-Reject "
+        "(or a logged 401 for accounting), never a user-session 401."
     ),
     ("GET", "/api/v1/agent/authorized-macs"): (
         "Authenticated by the router agent's own credential (`CurrentAgent`), not by a "

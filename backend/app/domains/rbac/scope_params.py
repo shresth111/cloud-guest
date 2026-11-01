@@ -79,6 +79,9 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "actor_user_id",
         "agent_id",
         "alert_id",
+        # Aruba access-point registry row; Master-only routes (GLOBAL-pinned),
+        # always looked up together with the path router_id.
+        "ap_id",
         "api_key_id",
         "asset_id",
         "assignment_id",

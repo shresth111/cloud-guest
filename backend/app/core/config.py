@@ -1,3 +1,4 @@
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -380,6 +381,26 @@ class Settings(BaseSettings):
             "Override via CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS."
         ),
     )
+    hub_radius_aruba_shared_agent_url: str = Field(
+        default="",
+        description=(
+            "Absolute URL of the hub agent's shared-Aruba-listener endpoint "
+            "(radius_agent.py `POST /radius/shared-client`). Empty means this "
+            "deployment has no shared Aruba listener: the Master panel shows "
+            "that as a gap and rotation is refused. Same agent secret as "
+            "hub_radius_agent_url. Override via "
+            "CLOUDGUEST_HUB_RADIUS_ARUBA_SHARED_AGENT_URL."
+        ),
+    )
+    aruba_shared_radius_auth_port: int = Field(
+        default=1912,
+        description="UDP port of the shared Aruba listener's auth side, as "
+        "typed into Instant On's RADIUS profile.",
+    )
+    aruba_shared_radius_acct_port: int = Field(
+        default=1913,
+        description="UDP port of the shared Aruba listener's accounting side.",
+    )
     hub_radius_agent_secret: str = Field(
         default="",
         description=(
@@ -388,6 +409,85 @@ class Settings(BaseSettings):
             "and fail-closed rules."
         ),
     )
+    instant_on_ssid_tier_push_enabled: bool = Field(
+        default=False,
+        description=(
+            "Speed tiers by WiFi network: allow POST /locations/{id}/ssid-tiers"
+            "/instant-on-sync (Master only) to write each mapped SSID's "
+            "per-client speed cap to Aruba Instant On through the cloud-control "
+            "client. OFF by default; the cloud-control gates "
+            "(CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_*) must ALSO be on for the "
+            "venue. While off, the endpoint returns the manual Instant On steps."
+        ),
+    )
+    radius_bandwidth_attribute_router_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated router UUIDs of NAS-only access points (Aruba "
+            "Instant On) whose RADIUS Access-Accept should carry "
+            "WISPr-Bandwidth-Max-Down/-Up (vendor 14122, bits/s) from the "
+            "guest's resolved BANDWIDTH policy. An EXPERIMENT GATE, not a "
+            "feature flag: no Aruba documentation says Instant On honours "
+            "these attributes, so they are only sent to the routers named "
+            "here while a hardware measurement decides. Empty (the default) "
+            "sends nothing to anyone. Ignored for every non-NAS-only router, "
+            "so MikroTik and Omada replies are unaffected whatever it holds. "
+            "Deliberately an environment setting and not a routers.settings "
+            "key: routers.settings is writable by a venue owner through "
+            "PUT /routers/{id}. A plain comma-separated string rather than "
+            "list[str] for the reason platform_alert_emails gives; validated "
+            "at startup so a typo stops the process instead of silently "
+            "matching nothing. Override via "
+            "CLOUDGUEST_RADIUS_BANDWIDTH_ATTRIBUTE_ROUTER_IDS."
+        ),
+    )
+
+    aruba_hybrid_speed_gateway_enabled: bool = Field(
+        default=False,
+        description=(
+            "Aruba AP + MikroTik gateway hybrid: when true, a guest "
+            "authorized by a NAS-only access point (Aruba Instant On) at a "
+            "location whose Master-linked speed gateway is a Wyfy-managed "
+            "MikroTik gets a per-guest /queue simple on that MikroTik, keyed "
+            "on the guest's IP (RADIUS Framed-IP-Address, else the portal's "
+            "recorded IP), and loses it again when the session ends. False "
+            "(the default) means no queue is written or removed anywhere, "
+            "whatever links exist. MikroTik-only and Omada venues are never "
+            "touched by it. See app.domains.queue_management.speed_gateway. "
+            "Override via CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED."
+        ),
+    )
+
+    @field_validator("radius_bandwidth_attribute_router_ids")
+    @classmethod
+    def _normalize_radius_bandwidth_attribute_router_ids(cls, value: str) -> str:
+        """Lower-cased canonical UUIDs, de-duplicated, order-preserving --
+        naming the offending token on a typo."""
+        ids: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            try:
+                normalized = str(uuid.UUID(candidate))
+            except ValueError as exc:
+                raise ValueError(
+                    "radius_bandwidth_attribute_router_ids: "
+                    f"{candidate!r} is not a UUID"
+                ) from exc
+            if normalized not in ids:
+                ids.append(normalized)
+        return ",".join(ids)
+
+    @property
+    def radius_bandwidth_attribute_router_id_set(self) -> frozenset[uuid.UUID]:
+        """``radius_bandwidth_attribute_router_ids`` parsed, for
+        ``RadiusService``'s constructor."""
+        return frozenset(
+            uuid.UUID(token)
+            for token in self.radius_bandwidth_attribute_router_ids.split(",")
+            if token
+        )
     # ------------------------------------------------------------------
     # Traffic flow (NetFlow v9 / IPFIX) -- app.domains.traffic_flow.
     # Design: ~/wyfy-ops/netflow/DESIGN.md. Off by default, so a deploy
@@ -2720,6 +2820,125 @@ class Settings(BaseSettings):
         ),
     )
     instant_on_max_sites_per_run: int = Field(default=200, ge=1, le=5000)
+    # ------------------------------------------------------------------
+    # Aruba Instant On CLOUD CONTROL (writes through the unofficial portal
+    # API): block/unblock a guest device, "disconnect" = block + timed
+    # unblock, and the guest SSID's per-client speed cap. See
+    # app/domains/network_integration/instant_on_control.py and
+    # wyfy-ops/aruba-ap21/INSTANT_ON_CLOUD_CONTROL.md. OFF by default and
+    # gated twice: the global switch AND the router allowlist below.
+    # ------------------------------------------------------------------
+    instant_on_cloud_control_enabled: bool = Field(
+        default=False,
+        description=(
+            "Global switch for writes to Instant On. False (the default) "
+            "means no Instant On write is ever attempted, whatever the "
+            "allowlist holds, and NAS-only venues behave exactly as before "
+            "(no mid-session disconnect). Override via "
+            "CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_ENABLED."
+        ),
+    )
+    instant_on_cloud_control_router_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated router UUIDs (NAS-only Aruba Instant On fleet "
+            "rows) that may be written to. Environment-only for the reason "
+            "radius_bandwidth_attribute_router_ids gives. Override via "
+            "CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_ROUTER_IDS."
+        ),
+    )
+    instant_on_control_secret_arn: str = Field(
+        default="",
+        description=(
+            "ARN of the Secrets Manager secret ({\"username\", \"password\"}) "
+            "of the Instant On service account used for WRITES. It must be "
+            "invited to the venue's site with a management role that can "
+            "write (not Viewer). Kept separate from the poller's Viewer "
+            "account on purpose. Override via "
+            "CLOUDGUEST_INSTANT_ON_CONTROL_SECRET_ARN."
+        ),
+    )
+    instant_on_control_secret_arns_by_router: str = Field(
+        default="",
+        description=(
+            "Optional per-venue override: comma-separated "
+            "'<router uuid>=<secret arn>' pairs, so each venue can use its "
+            "own service account (own token row, own blast radius). A router "
+            "not named here uses instant_on_control_secret_arn. Override via "
+            "CLOUDGUEST_INSTANT_ON_CONTROL_SECRET_ARNS_BY_ROUTER."
+        ),
+    )
+    instant_on_disconnect_hold_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=600,
+        description=(
+            "How long a 'disconnect' keeps the device on Instant On's "
+            "blocked list before the timed unblock. Long enough for the AP "
+            "to drop the client, short enough that the guest's next attempt "
+            "lands on the portal (which then decides)."
+        ),
+    )
+
+    @field_validator("instant_on_cloud_control_router_ids")
+    @classmethod
+    def _normalize_instant_on_cloud_control_router_ids(cls, value: str) -> str:
+        ids: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            try:
+                normalized = str(uuid.UUID(candidate))
+            except ValueError as exc:
+                raise ValueError(
+                    "instant_on_cloud_control_router_ids: "
+                    f"{candidate!r} is not a UUID"
+                ) from exc
+            if normalized not in ids:
+                ids.append(normalized)
+        return ",".join(ids)
+
+    @field_validator("instant_on_control_secret_arns_by_router")
+    @classmethod
+    def _validate_instant_on_control_secret_arns_by_router(cls, value: str) -> str:
+        pairs: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            router, sep, arn = candidate.partition("=")
+            if not sep or not arn.strip().startswith("arn:"):
+                raise ValueError(
+                    "instant_on_control_secret_arns_by_router: each entry must "
+                    "be '<router uuid>=<secret arn>'"
+                )
+            try:
+                normalized = str(uuid.UUID(router.strip()))
+            except ValueError as exc:
+                raise ValueError(
+                    "instant_on_control_secret_arns_by_router: "
+                    f"{router.strip()!r} is not a UUID"
+                ) from exc
+            pairs.append(f"{normalized}={arn.strip()}")
+        return ",".join(pairs)
+
+    @property
+    def instant_on_cloud_control_router_id_set(self) -> frozenset[uuid.UUID]:
+        return frozenset(
+            uuid.UUID(token)
+            for token in self.instant_on_cloud_control_router_ids.split(",")
+            if token
+        )
+
+    def instant_on_control_secret_arn_for(self, router_id: uuid.UUID) -> str:
+        """The write account for this router: its own override, else the
+        default write account. Empty means not configured."""
+        for pair in self.instant_on_control_secret_arns_by_router.split(","):
+            router, _, arn = pair.partition("=")
+            if router and router == str(router_id):
+                return arn
+        return self.instant_on_control_secret_arn
     omada_allow_private_controller_urls: bool = Field(
         default=False,
         description=(
