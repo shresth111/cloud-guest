@@ -1040,6 +1040,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(enforcement_router)
     isp_partner_router.include_router(network_router)
+    # NETMON-2: all-routers traffic + sessions (ISP_NETMON_ENABLED).
+    from .netmon_router import netmon_router
+
+    isp_partner_router.include_router(netmon_router)
     # Phase 2c: the venue twins (the customer dashboard's own feature set,
     # ISP-gated). One table row per endpoint -- see ``twins.py``.
     mount_twins(isp_partner_router, ALL_TWINS)
