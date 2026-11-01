@@ -34,6 +34,7 @@ from .hotspot_hooks import (
     HotspotAuthorizeContext,
     HotspotGateResult,
     register_hotspot_gate,
+    register_hotspot_timeout_hook,
 )
 
 R_HARD = "hard_timeout"
@@ -274,7 +275,26 @@ async def jaze2_hotspot_gate(ctx: HotspotAuthorizeContext) -> HotspotGateResult 
     )
 
 
+async def jaze2_hotspot_timeout(db: Any, gs: Any, now: Any, budget_ms: int) -> None:
+    """ENFORCE-4: the gate missed its time budget and the login went ahead
+    unchecked. One ``gate_timeout`` event per subscriber per minute."""
+    sub = await _subscriber(db, gs)
+    if sub is None:
+        return
+    ctx = HotspotAuthorizeContext(
+        db=db, now=now, guest_session=gs, router=None, calling_station_id=None
+    )
+    await _event(
+        ctx,
+        sub,
+        "gate_timeout",
+        f"checks took over {budget_ms} ms; login allowed",
+        dedupe=True,
+    )
+
+
 register_hotspot_gate(jaze2_hotspot_gate)
+register_hotspot_timeout_hook(jaze2_hotspot_timeout)
 
 __all__ = [
     "R_CONCURRENCY",
@@ -283,4 +303,5 @@ __all__ = [
     "R_MAC",
     "R_NO_IP",
     "jaze2_hotspot_gate",
+    "jaze2_hotspot_timeout",
 ]

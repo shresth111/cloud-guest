@@ -47,8 +47,43 @@ class _Nested:
 
 
 class _Db:
+    """Fake gate session (ENFORCE-4: the gate opens its own session)."""
+
+    def __init__(self) -> None:
+        self.committed = 0
+        self.rolled_back = 0
+
     def begin_nested(self):  # noqa: ANN201
         return _Nested()
+
+    async def execute(self, *_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        return None
+
+    async def get(self, _model, ident):  # noqa: ANN001, ANN202
+        return SimpleNamespace(id=ident, organization_id=None)
+
+    async def commit(self) -> None:
+        self.committed += 1
+
+    async def rollback(self) -> None:
+        self.rolled_back += 1
+
+    async def __aenter__(self):  # noqa: ANN204
+        return self
+
+    async def __aexit__(self, *a):  # noqa: ANN002, ANN204
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _gate_sessions(monkeypatch):
+    db = _Db()
+    monkeypatch.setattr(hh, "_session_factory", lambda: db)
+    saved = list(hh._timeout_hooks)
+    hh._timeout_hooks.clear()
+    yield db
+    hh._timeout_hooks.clear()
+    hh._timeout_hooks.extend(saved)
 
 
 def _gs(org=None):  # noqa: ANN001, ANN202
@@ -186,3 +221,95 @@ def test_reasons_short():
 
     for r in (eh.R_HARD, eh.R_MAC, eh.R_NO_IP, eh.R_IP, eh.R_CONCURRENCY):
         assert len(r) <= 32
+
+
+def _isp_org_cached():  # noqa: ANN202
+    import time
+
+    org = uuid.uuid4()
+    _isp_customer_cache[org] = (True, time.monotonic() + 60)
+    return org
+
+
+async def test_slow_gate_cannot_hold_a_login_past_the_budget(
+    monkeypatch, _gate_sessions
+):
+    """ENFORCE-4: a gate stuck for 0.6 s; the Authorize gets None (fail-open)
+    within the budget, and the late verdict is thrown away (rolled back,
+    timeout hook told)."""
+    import asyncio
+    import time
+
+    monkeypatch.setenv("ISP_PARTNER_ENFORCEMENT_ENABLED", "true")
+    monkeypatch.setenv("ISP_PARTNER_HOTSPOT_GATE_BUDGET_MS", "150")
+    get_isp_partner_settings.cache_clear()
+    told = []
+
+    async def slow(_ctx):  # noqa: ANN001, ANN202
+        await asyncio.sleep(0.6)
+        return hh.HotspotGateResult(allow=False, reason="mac_not_bound")
+
+    async def hook(db, gs, now, budget):  # noqa: ANN001, ANN202
+        told.append(budget)
+
+    hh.register_hotspot_gate(slow)
+    hh.register_hotspot_timeout_hook(hook)
+    t0 = time.monotonic()
+    out = await hh.run_hotspot_gates(
+        db=_Db(),
+        guest_session=_gs(_isp_org_cached()),
+        router=None,
+        calling_station_id=None,
+    )
+    took = time.monotonic() - t0
+    assert out is None
+    assert took < 0.15 + 0.08, took
+    await asyncio.sleep(0.7)  # let the background task finish
+    assert told == [150]
+    assert _gate_sessions.rolled_back == 1  # its refusal is never kept
+
+
+async def test_fast_gate_is_unaffected_by_the_budget(monkeypatch, _gate_sessions):
+    monkeypatch.setenv("ISP_PARTNER_ENFORCEMENT_ENABLED", "true")
+    get_isp_partner_settings.cache_clear()
+
+    async def refuse(_ctx):  # noqa: ANN001, ANN202
+        return hh.HotspotGateResult(allow=False, reason="concurrency")
+
+    hh.register_hotspot_gate(refuse)
+    out = await hh.run_hotspot_gates(
+        db=_Db(),
+        guest_session=_gs(_isp_org_cached()),
+        router=None,
+        calling_station_id=None,
+    )
+    assert out is not None and out.reason == "concurrency"
+    assert _gate_sessions.committed == 1 and _gate_sessions.rolled_back == 0
+
+
+async def test_regular_tenant_flag_on_no_task_no_session(monkeypatch):
+    """A regular tenant's org cached as not-ISP: no gate task, no DB session
+    (the factory would fail the test), nothing awaited."""
+    import time
+
+    monkeypatch.setenv("ISP_PARTNER_ENFORCEMENT_ENABLED", "true")
+    get_isp_partner_settings.cache_clear()
+
+    def boom():  # noqa: ANN202
+        raise AssertionError("gate session opened for a regular tenant")
+
+    monkeypatch.setattr(hh, "_session_factory", boom)
+    hh.register_hotspot_gate(_allow)
+    org = uuid.uuid4()
+    _isp_customer_cache[org] = (False, time.monotonic() + 60)
+    tasks_before = len(asyncio_all_tasks())
+    out = await hh.run_hotspot_gates(
+        db=_Boom(), guest_session=_gs(org), router=None, calling_station_id=None
+    )
+    assert out is None and len(asyncio_all_tasks()) == tasks_before
+
+
+def asyncio_all_tasks():  # noqa: ANN201
+    import asyncio
+
+    return asyncio.all_tasks()

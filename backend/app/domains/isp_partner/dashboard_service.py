@@ -68,6 +68,30 @@ def period_bounds(
     return d0, d1, start, end
 
 
+async def kyc_pending_ids(session: Any, ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Subscribers (of ``ids``) whose JAZE-3 KYC row is not verified yet or has
+    no installation date: DASH-1's "pending" input to ``bucket_of``. Shared
+    with REVENUE-HUB so both screens count "active" the same way."""
+    from .compliance_models import IspSubscriberKyc
+
+    if not ids:
+        return set()
+    return set(
+        (
+            await session.execute(
+                select(IspSubscriberKyc.subscriber_id).where(
+                    IspSubscriberKyc.subscriber_id.in_(ids),
+                    IspSubscriberKyc.is_deleted.is_(False),
+                    or_(
+                        IspSubscriberKyc.verified_at.is_(None),
+                        IspSubscriberKyc.installed_at.is_(None),
+                    ),
+                )
+            )
+        ).scalars()
+    )
+
+
 class IspDashboardService:
     def __init__(self, session: Any, *, clock: Any = None) -> None:
         self.session = session
@@ -80,7 +104,6 @@ class IspDashboardService:
         from app.domains.guest.constants import GuestSessionStatus
         from app.domains.guest.models import GuestSession
 
-        from .compliance_models import IspSubscriberKyc
         from .compliance_service import compliance_settings
         from .plans_models import IspPackage, IspSubscriber
         from .pppoe_config import get_isp_pppoe_settings
@@ -165,22 +188,7 @@ class IspDashboardService:
         suspended = await IspSubscriber360Service._suspended_customers(
             SimpleNamespace(session=self.session), customers
         )
-        kyc_pending: set[uuid.UUID] = set()
-        if ids:
-            kyc_pending = set(
-                (
-                    await self.session.execute(
-                        select(IspSubscriberKyc.subscriber_id).where(
-                            IspSubscriberKyc.subscriber_id.in_(ids),
-                            IspSubscriberKyc.is_deleted.is_(False),
-                            or_(
-                                IspSubscriberKyc.verified_at.is_(None),
-                                IspSubscriberKyc.installed_at.is_(None),
-                            ),
-                        )
-                    )
-                ).scalars()
-            )
+        kyc_pending = await kyc_pending_ids(self.session, ids)
 
         # online: live hotspot sessions (and PPPoE when its flag is on)
         hs = select(GuestSession.guest_id).where(
@@ -373,4 +381,10 @@ class IspDashboardService:
         }
 
 
-__all__ = ["PERIODS", "Filters", "IspDashboardService", "period_bounds"]
+__all__ = [
+    "PERIODS",
+    "Filters",
+    "IspDashboardService",
+    "kyc_pending_ids",
+    "period_bounds",
+]

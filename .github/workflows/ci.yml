@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # integ/** (CI-INTEG 2026-11-01): integration branches are merged by
+    # direct pushes, not PRs, so without this nothing ever ran on them.
+    branches: [main, "integ/**"]
     paths:
       - "backend/**"
       - ".github/workflows/ci.yml"
@@ -221,7 +223,9 @@ jobs:
     # `always()` so the job is not skipped along with everything else, then an
     # explicit failure test so a cancelled run stays silent. `failure()` alone
     # would be nearly right; this says what it means.
-    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    # Not for integ/** pushes (CI-INTEG): those are test-stack integration
+    # branches; their status is read with `gh run list`, not from Slack.
+    if: ${{ always() && contains(needs.*.result, 'failure') && !startsWith(github.ref, 'refs/heads/integ/') }}
     runs-on: ubuntu-latest
     # Belt and braces. The action is written never to exit non-zero, but this
     # workflow is also called by cd.yml via workflow_call, where a failing job

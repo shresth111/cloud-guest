@@ -1024,6 +1024,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # app.domains.isp_partner.tasks.
         "isp-service-retry",
         "isp-billing-daily",
+        # ISP Partner JAZE-2: FUP / night boost / access-rule sweep, every
+        # minute. No-op unless ISP_PARTNER_ENFORCEMENT_ENABLED is on. Added to
+        # the beat schedule on integ without this pin (GAP-SWEEP).
+        "isp-enforcement-sweep",
     }
 
 

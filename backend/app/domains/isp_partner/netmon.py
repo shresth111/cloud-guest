@@ -80,8 +80,22 @@ def readability(
     snmp_last_poll_status: str | None,
     has_series: bool,
     now: datetime,
+    controller_managed: bool = False,
 ) -> tuple[bool, str | None, str | None]:
-    """(readable, reason, hint)."""
+    """(readable, reason, hint).
+
+    ``controller_managed`` (CI-INTEG): an Omada / Aruba Instant On venue is run
+    through its vendor controller; there is no setup script to run and no
+    traffic reading of ours to expect, so it gets its own reason instead of
+    "not set up" / "offline"."""
+    if controller_managed and not has_series:
+        return (
+            False,
+            "controller_managed",
+            "This venue's network is run through its vendor controller (Omada or "
+            "Aruba Instant On). WAN traffic is not read from it here; use the "
+            "vendor's own controller for traffic graphs.",
+        )
     if status in ("pending_provisioning", "provisioning") or last_seen_at is None:
         return (
             False,

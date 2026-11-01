@@ -984,22 +984,29 @@ class IspIncidentsService:
     # ------------------------------------------------------------------
     async def health(self, isp: Any) -> dict:
         from app.domains.router.models import Router
+        from app.domains.router.vendor_capabilities import is_controller_managed_row
 
         children = await isp.child_ids()
         counts: dict[str, int] = {}
+        controller = 0
         if children:
-            counts = dict(
-                (
-                    await self.session.execute(
-                        select(Router.status, func.count())
-                        .where(
-                            Router.organization_id.in_(children),
-                            Router.is_deleted.is_(False),
-                        )
-                        .group_by(Router.status)
+            # Whole rows, not a GROUP BY: whether a row is controller-managed
+            # is decided from its evidence (is_controller_managed_row), which
+            # SQL on the vendor label alone cannot do. Small per ISP.
+            for r in (
+                await self.session.execute(
+                    select(Router).where(
+                        Router.organization_id.in_(children),
+                        Router.is_deleted.is_(False),
                     )
-                ).all()
-            )
+                )
+            ).scalars():
+                if is_controller_managed_row(r):
+                    # CI-INTEG: an Omada / Aruba controller row has no agent,
+                    # so its stored status says nothing about the venue.
+                    controller += 1
+                    continue
+                counts[r.status] = counts.get(r.status, 0) + 1
         up = int(counts.get("online", 0))
         down = int(counts.get("offline", 0))
         total = sum(int(v) for v in counts.values())
@@ -1018,11 +1025,13 @@ class IspIncidentsService:
             "routers_up": up,
             "routers_down": down,
             "routers_not_reporting": total - up - down,
+            "routers_controller_managed": controller,
             "health_percent": round(100 * up / (up + down), 1) if up + down else None,
             "basis": (
                 "Routers online / (online + offline), from each router's last "
                 "status. Routers that never reported (pending setup) are not "
-                "counted."
+                "counted. Venues run through a vendor controller (Omada, Aruba "
+                "Instant On) are listed apart and not counted either."
             ),
             "open_incidents": open_["summary"]["open"],
             "as_of": _iso(self.now()),
