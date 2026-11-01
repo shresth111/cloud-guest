@@ -1101,5 +1101,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(onboarding_router)
 
+    # CAF-2: CAF workbench (/isp/caf), behind ISP_CAF_WORKBENCH_ENABLED.
+    from .caf_router import caf_router
+
+    isp_partner_router.include_router(caf_router)
+
 
 _include_lanes()
