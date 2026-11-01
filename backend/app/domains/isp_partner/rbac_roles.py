@@ -86,7 +86,8 @@ PERMISSION_GROUPS: tuple[IspPermissionGroup, ...] = (
     IspPermissionGroup(
         key="isp_subscribers",
         name="ISP Subscribers",
-        actions=("read", "update"),
+        # "manage" (ADDENDUM_05 J11/J19): move, permanent block, plan sync.
+        actions=("read", "update", "manage"),
         sort_order=1009,
     ),
     # Phase 2c: the venue twins. One group covers the customer network/QoS
@@ -175,7 +176,7 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_zones="read manage",
             isp_plans="read create update delete",
             isp_coupons="read create export update",
-            isp_subscribers="read update",
+            isp_subscribers="read update manage",
             isp_network="read create update delete execute",
             isp_access="read create update delete execute",
             isp_engage="read create update delete manage",
@@ -199,7 +200,7 @@ ROLES: tuple[IspRoleDefinition, ...] = (
             isp_zones="read manage",
             isp_plans="read create update delete",
             isp_coupons="read create export update",
-            isp_subscribers="read update",
+            isp_subscribers="read update manage",
             isp_network="read create update delete execute",
             isp_access="read create update delete execute",
             isp_engage="read create update delete manage",

@@ -997,6 +997,12 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(service_router)
     isp_partner_router.include_router(billing_router)
+    # ADDENDUM_05 JAZE-1 (J1/J2/J11/J19). Mounted BEFORE plans_router:
+    # its literal paths (/subscribers/directory, /typeahead, /onboard) must
+    # win over plans_router's /subscribers/{subscriber_id}.
+    from .subscriber360_router import subscriber360_router
+
+    isp_partner_router.include_router(subscriber360_router)
     # Phase 2a (ADDENDUM_02)
     from .plans_router import plans_router
 

@@ -78,6 +78,8 @@ _COUPONS = {f"isp_coupons.{a}" for a in "read create export update".split()}
 EXPECTED["isp-owner"] |= (
     _PLANS | _COUPONS | {"isp_subscribers.read", "isp_subscribers.update"}
 )
+# ADDENDUM_05 JAZE-1: move / permanent block / plan sync (owner + admin).
+EXPECTED["isp-owner"] |= {"isp_subscribers.manage"}
 EXPECTED["isp-billing"] |= {
     "isp_plans.read",
     "isp_subscribers.read",
