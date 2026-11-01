@@ -215,6 +215,9 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         # QUEUED-RENEWAL: reached only under a scoped subscriber_id in the same
         # path; the row must belong to that subscriber and this ISP.
         "queue_id",
+        # REFERRAL-1: isp org check, and both subscribers' customers must be
+        # visible to the caller (IspScope via child_ids) or it is a 404.
+        "referral_id",
     }
 )
 

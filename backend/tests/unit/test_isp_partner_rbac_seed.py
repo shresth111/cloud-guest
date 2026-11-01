@@ -186,6 +186,16 @@ EXPECTED["isp-noc"] |= _INC
 EXPECTED["isp-technician"] |= {"isp_incidents.read", "isp_incidents.manage"}
 EXPECTED["isp-billing"] |= {"isp_incidents.read", "isp_incidents.export"}
 EXPECTED["isp-viewer"] |= {"isp_incidents.read"}
+# REFERRAL-1
+EXPECTED["isp-owner"] |= {
+    "isp_referrals.read",
+    "isp_referrals.create",
+    "isp_referrals.manage",
+}
+EXPECTED["isp-noc"] |= {"isp_referrals.read"}
+EXPECTED["isp-technician"] |= {"isp_referrals.read", "isp_referrals.create"}
+EXPECTED["isp-billing"] |= {"isp_referrals.read", "isp_referrals.create"}
+EXPECTED["isp-viewer"] |= {"isp_referrals.read"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
 
 
@@ -291,8 +301,8 @@ async def test_seeding_never_changes_a_pre_existing_role(repo) -> None:
 async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     await _existing_platform(repo)
     summary = await isp_seed.seed_isp_partner_rbac(repo)
-    assert summary.permission_groups_created == 20  # +1 INCIDENTS-1
-    assert summary.permissions_created == 78  # +4 isp_incidents.*
+    assert summary.permission_groups_created == 21  # +1 REFERRAL-1
+    assert summary.permissions_created == 81  # +3 isp_referrals.*
     assert summary.roles_created == 6
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED
