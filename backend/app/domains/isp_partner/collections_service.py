@@ -1057,8 +1057,13 @@ class IspCollectionsService:
         promises = await self._party_promises(isp, party)
         open_ = [p for p in promises if p.status == L.PROMISE_OPEN]
         overdue = await self._overdue_for_party(isp, party)
+        # P3-SWEEP (Subscriber 360 card): everything still owed, due or not.
+        open_paise = sum(
+            balance_of(i) for i in await self._open_invoices(isp, [party[0]], party)
+        )
         return {
             "items": out[:limit],
+            "open_paise": open_paise,
             "promises": await self.promise_views(
                 isp, sorted(promises, key=lambda p: p.created_at, reverse=True)[:20]
             ),
