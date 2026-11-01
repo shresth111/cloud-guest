@@ -32,6 +32,7 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .constants import AccessRuleType
 from .dependencies import get_guest_access_service
@@ -299,7 +300,16 @@ async def enforce_guest_rule(
     "/rules/{rule_id}/deactivate",
     response_model=ApiResponse[GuestAccessRuleResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("guest_access.update"))],
+    # Explicit LOCATION, not inferred: the check level must not be the
+    # caller's choice of headers. A venue-scoped caller (front-desk staff)
+    # names its venue in ``X-Location-Id`` and is checked there; an
+    # organization or platform grant satisfies a LOCATION check as before.
+    # Which venue the RULE is at is the service's question
+    # (``get_guest_rule``/``get_device_rule`` + org-wide refusal), answered
+    # from the caller's grants, never from the header.
+    dependencies=[
+        Depends(RequirePermission("guest_access.update", scope=ScopeType.LOCATION))
+    ],
 )
 async def deactivate_guest_rule(
     request: Request,
@@ -482,7 +492,16 @@ async def enforce_device_rule(
     "/device-rules/{rule_id}/deactivate",
     response_model=ApiResponse[DeviceAccessRuleResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("guest_access.update"))],
+    # Explicit LOCATION, not inferred: the check level must not be the
+    # caller's choice of headers. A venue-scoped caller (front-desk staff)
+    # names its venue in ``X-Location-Id`` and is checked there; an
+    # organization or platform grant satisfies a LOCATION check as before.
+    # Which venue the RULE is at is the service's question
+    # (``get_guest_rule``/``get_device_rule`` + org-wide refusal), answered
+    # from the caller's grants, never from the header.
+    dependencies=[
+        Depends(RequirePermission("guest_access.update", scope=ScopeType.LOCATION))
+    ],
 )
 async def deactivate_device_rule(
     request: Request,

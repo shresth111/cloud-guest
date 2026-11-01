@@ -894,6 +894,7 @@ class GuestAccessService:
         rule = await self.get_guest_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        self._enforce_write_on_existing_rule(rule)
         rule_type = AccessRuleType(rule.rule_type)
         if rule_type is not AccessRuleType.BLOCKLIST or self.block_enforcer is None:
             # A whitelist/VIP/temporary rule grants access -- there is no
@@ -1089,6 +1090,30 @@ class GuestAccessService:
         )
         return rule
 
+    def _enforce_write_on_existing_rule(self, rule: object) -> None:
+        """May this caller change a rule it has already been allowed to read?
+
+        ``get_guest_rule``/``get_device_rule`` answer the READ question, and
+        ``enforce_entity_location`` deliberately lets every caller read an
+        organization-wide rule (``location_id IS NULL``): it applies at their
+        venue too. Unblocking, re-enforcing or deleting that rule is not a
+        read. It lifts (or re-applies) a ban at **every** venue of the
+        organization, which is the same organization-level act
+        ``_enforce_write_location`` already refuses a confined caller when it
+        *creates* such a rule. Without this, front-desk staff at one venue --
+        who may unblock a guest at their own venue -- could lift a ban the
+        owner placed across all of them.
+
+        A caller not confined to sites (``caller_location_scope is None``:
+        organization or platform roles) is unaffected. A rule at a site is
+        already pinned to the caller's sites by the getter.
+        """
+        if (
+            self.caller_location_scope is not None
+            and getattr(rule, "location_id", None) is None
+        ):
+            raise OrganizationWideRuleScopeError()
+
     def _confined_location_filter(self, location_id: uuid.UUID | None) -> object:
         """The ``location_id`` filter a rule listing applies for this caller.
 
@@ -1148,6 +1173,7 @@ class GuestAccessService:
         rule = await self.get_guest_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        self._enforce_write_on_existing_rule(rule)
         # Before the rule stops applying, not after. An unblock that only
         # flipped ``is_active`` would let the person sign in again and leave
         # their phone unable to associate -- a guest who is un-blocked
@@ -1184,6 +1210,7 @@ class GuestAccessService:
         rule = await self.get_guest_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        self._enforce_write_on_existing_rule(rule)
         # Same ordering as ``deactivate_guest_rule``, and here it is not
         # merely tidy: the open blocks are found by ``rule_id``, and a rule
         # that has been removed is a rule nobody can start a release from.
@@ -1687,6 +1714,7 @@ class GuestAccessService:
         rule = await self.get_device_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        self._enforce_write_on_existing_rule(rule)
         if (
             AccessRuleType(rule.rule_type) is AccessRuleType.BLOCKLIST
             and rule.is_active
@@ -1811,6 +1839,7 @@ class GuestAccessService:
         rule = await self.get_device_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        self._enforce_write_on_existing_rule(rule)
         # Before the rule stops applying -- see ``_release_router_blocks``.
         await self._release_router_blocks(rule)
         updated = await self.repository.update_device_rule(
@@ -1830,6 +1859,7 @@ class GuestAccessService:
         rule = await self.get_device_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
+        self._enforce_write_on_existing_rule(rule)
         await self._release_router_blocks(rule)
         await self.repository.delete_device_rule(rule)
         event = AccessRuleDeleted(rule_id=rule.id)
