@@ -270,6 +270,19 @@ async def _billing_daily_async() -> dict[str, int]:
                     logger.exception(
                         "isp_billing_daily_failed", extra={"isp": str(org.id)}
                     )
+                # JAZE-3 J17: monthly compliance emails (off unless
+                # ISP_COMPLIANCE_SCHEDULES_ENABLED); never fails the day.
+                try:
+                    from .compliance_tasks import run_report_schedules
+
+                    async with session.begin_nested():
+                        summary["reports"] = summary.get(
+                            "reports", 0
+                        ) + await run_report_schedules(session, isp)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "isp_report_schedules_failed", extra={"isp": str(org.id)}
+                    )
             await session.commit()
     finally:
         await redis.aclose()

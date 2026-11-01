@@ -1036,5 +1036,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(portal_support_router)
 
+    # JAZE-3 (ADDENDUM_05 J4/J5/J6/J12/J17/J18): compliance + reports.
+    from .compliance_router import compliance_router
+
+    isp_partner_router.include_router(compliance_router)
+
 
 _include_lanes()
