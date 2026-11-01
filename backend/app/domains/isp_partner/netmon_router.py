@@ -313,8 +313,9 @@ async def _hotspot(
                 else None,
                 "bytes_down": int(gs.bytes_downloaded or 0),
                 "bytes_up": int(gs.bytes_uploaded or 0),
-                # Hotspot sessions store no end reason.
-                "end_reason": None,
+                # LEFTOVERS: the guest domain's own recorded reason (RADIUS
+                # Acct-Stop / timeout / block sweeps), None while live.
+                "end_reason": gs.disconnect_reason if end else None,
                 "_sort": end or gs.started_at,
             }
         )

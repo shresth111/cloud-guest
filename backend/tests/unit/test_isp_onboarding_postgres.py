@@ -317,3 +317,49 @@ async def test_onboarding_is_one_transaction() -> None:  # noqa: PLR0915
         now = await counts(ident)
         assert now["subscribers"] == 1 and now["audit"] == after_other["audit"] + 1
         assert now["invoices"] == after_other["invoices"] + 1
+
+        # ---- LEFTOVERS: 360 PPPoE badge from the credential ---------------------
+        assert out["subscriber"]["auth"]["pppoe"] is True
+        if not get_isp_apps_settings().enabled:
+            return
+
+        # ---- LEFTOVERS: onboard from an Apps lead (converted, same tx) ---------
+        r = await c.post(
+            f"{api}/apps/leads",
+            json={
+                "name": "Lead Person",
+                "phone": "9876500009",
+                "isp_customer_id": cust,
+            },
+            headers=h,
+        )
+        assert r.status_code == 201, r.text
+        lead_id = r.json()["data"]["id"]
+        from_lead = {
+            "subscriber": {
+                "isp_customer_id": cust,
+                "identifier": f"lead-{tag}",
+                "package_id": pid,
+                "first_name": "Lead",
+            },
+            "lead_id": lead_id,
+        }
+        bad_lead = {**from_lead, "lead_id": str(uuid.uuid4())}
+        r = await c.post(f"{api}/onboarding", json=bad_lead, headers=h)
+        assert r.status_code == 404, r.text  # unknown / foreign lead
+        r = await c.post(f"{api}/onboarding", json=from_lead, headers=h)
+        assert r.status_code == 201, r.text
+        new_sub = r.json()["data"]["subscriber"]["id"]
+        assert any(
+            x["step"] == "lead" and x["status"] == "done"
+            for x in r.json()["data"]["steps"]
+        )
+        lead = (await c.get(f"{api}/apps/leads/{lead_id}", headers=h)).json()["data"]
+        assert lead["status"] == "converted"
+        assert str(lead.get("converted_subscriber_id")) == str(new_sub)
+        again = {
+            **from_lead,
+            "subscriber": {**from_lead["subscriber"], "identifier": f"lead2-{tag}"},
+        }
+        r = await c.post(f"{api}/onboarding", json=again, headers=h)
+        assert r.status_code == 422 and r.json()["data"]["step"] == "lead", r.text

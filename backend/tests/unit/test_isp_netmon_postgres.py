@@ -300,6 +300,7 @@ async def test_netmon_end_to_end() -> None:  # noqa: PLR0915
                 done2 = sess(
                     devs[2], guest2, "c2", active=False, ip="10.6.0.9", ago_h=5
                 )
+                done1.disconnect_reason = "session-timeout"  # LEFTOVERS end reason
                 s.add_all([live, done1, done2])
                 (await s.get(IspSubscriber, uuid.UUID(sid))).guest_id = guest.id
                 await s.commit()
@@ -364,6 +365,12 @@ async def test_netmon_end_to_end() -> None:  # noqa: PLR0915
                 ids["done1"]
             }
             assert await done("ip=10.6.0.9") == {ids["done2"]}
+            reasons = {
+                i["session_id"]: i["end_reason"]
+                for i in (await call("GET", "/netmon/sessions/completed"))["items"]
+            }
+            assert reasons[ids["done1"]] == "session-timeout"
+            assert reasons[ids["done2"]] is None  # nothing recorded -> nothing shown
             assert await done(f"subscriber_id={sid}") == {ids["done1"]}
             assert await done("search=guest") == {ids["done2"]}
             assert await done("date_from=2020-01-01&date_to=2020-01-05") == set()

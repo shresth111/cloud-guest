@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -197,6 +197,10 @@ class OnboardingRequest(_Body):
     #: APPS-2 (founder-approved): an unclaimed install task for the new
     #: subscriber, same transaction. Skipped silently while Apps is off.
     create_install_task: bool = True
+    #: LEFTOVERS (APPS-2 #4): the Apps lead this subscriber comes from. The
+    #: console prefills from it; here it is marked converted in the same
+    #: transaction. Skipped while Apps is off.
+    lead_id: uuid.UUID | None = None
 
     @field_validator("macs")
     @classmethod
@@ -292,6 +296,23 @@ async def onboard(  # noqa: PLR0912, PLR0913, PLR0915 -- one step per lane
 
     def done(step: str, detail: str | None = None) -> None:
         steps[step] = {"step": step, "status": "done", "detail": detail}
+
+    lead = None
+    if payload.lead_id is not None and _apps_on():
+        from .apps_common import IspAppsInvalidError, LeadStatus
+        from .apps_leads import LeadService
+
+        lead = await LeadService(db)._lead(isp, payload.lead_id)  # scoped: 404
+        if lead.status in (LeadStatus.CONVERTED, LeadStatus.DROPPED):
+            raise IspOnboardStepError(
+                "lead", IspAppsInvalidError(f"A {lead.status} lead cannot be onboarded")
+            )
+        cust = payload.subscriber.isp_customer_id
+        if lead.customer_organization_id and cust != lead.customer_organization_id:
+            raise IspOnboardStepError(
+                "lead",
+                IspAppsInvalidError("The lead belongs to another customer"),
+            )
 
     try:
         # 1. subscriber + profile (JAZE-1)
@@ -393,6 +414,26 @@ async def onboard(  # noqa: PLR0912, PLR0913, PLR0915 -- one step per lane
             )
             done("task", "unclaimed install task")
 
+        # 6b. the lead it came from (APPS-2 #4): converted, same transaction
+        if lead is not None:
+            current = "lead"
+            from .apps_common import LeadStatus
+
+            lead.status = LeadStatus.CONVERTED.value
+            lead.converted_subscriber_id = s.id
+            lead.converted_at = datetime.now(UTC)
+            if lead.customer_organization_id is None:
+                lead.customer_organization_id = s.customer_organization_id
+            lead.updated_by = isp.user_id
+            await db.flush()
+            done("lead", f"lead #{lead.number} converted")
+        elif payload.lead_id is not None:
+            steps["lead"] = {
+                "step": "lead",
+                "status": "skipped",
+                "detail": "Apps is off",
+            }
+
         # 7. static IPs (JAZE-2) last: the only step that may touch a router
         ips, recorded = [], False
         if payload.static_ips:
@@ -461,6 +502,7 @@ async def onboard(  # noqa: PLR0912, PLR0913, PLR0915 -- one step per lane
         "invoice",
         "payment",
         "task",
+        "lead",
     )
     return ok(
         request,
