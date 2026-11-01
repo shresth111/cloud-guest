@@ -90,6 +90,16 @@ class RiskRules:
 RULES = RiskRules()
 
 DEFINITIONS: dict[str, str] = {
+    "dso": (
+        "Days sales outstanding: open subscriber dues / subscriber invoices "
+        "billed in the last 90 days (GST included, less credit notes) x 90. "
+        "Empty when nothing was billed."
+    ),
+    "mrr_history": (
+        "Past months use the last daily snapshot taken in that month (whole "
+        "ISP only). Without one, the month in progress shows today's MRR and "
+        "older months show that month's billed value as a stand-in."
+    ),
     "active": (
         "The Overview's Active: JAZE-1 state active or grace with KYC and "
         "installation done. MRR and ARPU are taken over them."

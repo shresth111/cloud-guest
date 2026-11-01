@@ -154,6 +154,7 @@ from .plans_models import *  # noqa: E402,F403
 from .pppoe_models import *  # noqa: E402,F403
 from .queued_renewal_models import *  # noqa: E402,F403  (QUEUED-RENEWAL)
 from .referrals_models import *  # noqa: E402,F403  (REFERRAL-1)
+from .revenue_snapshot_models import *  # noqa: E402,F403  (SMALL-4)
 from .subscriber360_models import *  # noqa: E402,F403
 from .winback_models import *  # noqa: E402,F403  (SMALL-3)
 from .zones_models import *  # noqa: E402,F403  (ZONE-1 zone tree)

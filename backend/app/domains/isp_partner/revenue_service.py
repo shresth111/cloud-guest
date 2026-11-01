@@ -370,12 +370,39 @@ class IspRevenueService:
             )
         current = trend[-1]
 
+        # SMALL-4: MRR history from daily snapshots (whole-ISP views only)
+        from . import revenue_snapshot as snap
+        from .zones_scope import current_scope
+
+        whole_isp = (
+            isp.confined_customer_ids is None
+            and current_scope(self.session) is None
+            and f.zone_id is None
+            and not f.no_zone
+            and f.package_id is None
+        )
+        snap.apply_to_trend(
+            trend,
+            await snap.month_snapshots(self.session, isp.isp_org_id, first, month)
+            if whole_isp
+            else None,
+            live_mrr=mrr,
+            live_arpu=mrr // active if active else None,
+            live_active=active,
+        )
+        sales_90d = sum(
+            x["net"]
+            for x in await self._invoice_months(isp, f, b, snap.sales_since(b["today"]))
+        )
+
         # dues ageing
         ageing = {k: {"invoices": 0, "amount_paise": 0} for k in logic.AGEING}
         for inv, _zone in open_invs:
             k = logic.ageing_bucket(inv.due_date, b["today"])
             ageing[k]["invoices"] += 1
             ageing[k]["amount_paise"] += balance_of(inv)
+
+        dso = snap.dso(sum(v["amount_paise"] for v in ageing.values()), sales_90d)
 
         # zone leaderboard
         zones: dict[uuid.UUID | None, dict[str, Any]] = {}
@@ -492,6 +519,14 @@ class IspRevenueService:
                 "uncollected_paise": current["net_billed_paise"]
                 - current["collected_paise"],
                 "dues_paise": sum(v["amount_paise"] for v in ageing.values()),
+                # SMALL-4: DSO over the trailing 90 days (see revenue_snapshot)
+                "sales_90d_paise": sales_90d,
+                "dso_days": float(dso) if dso is not None else None,
+            },
+            "today": b["today"].isoformat(),
+            "mrr_history": {
+                "snapshots_used": whole_isp,
+                "dso_window_days": snap.DSO_DAYS,
             },
             "ageing": ageing,
             "trend": trend,
