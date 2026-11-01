@@ -89,22 +89,16 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                 "isp-viewer",
                 "isp-billing",
             }
-            assert all(
-                key.split(".")[0]
-                in {
-                    "isp_partner",
-                    "isp_logs",
-                    "isp_ipdr",
-                    "tr069",
-                    "isp_billing",
-                    "isp_invoices",
-                    "isp_zones",
-                    "isp_plans",
-                    "isp_coupons",
-                    "isp_subscribers",
-                }
-                for _, key in isp_rows
-            )
+            # ISP roles hold only keys from the ISP permission groups. The
+            # list grew lane by lane (isp_engage ... isp_audit), so it is read
+            # from rbac_roles instead of being restated here (CI-INTEG: the
+            # Phase 1 list had gone stale and this failed once CI ran it).
+            from app.domains.isp_partner.rbac_roles import PERMISSION_GROUPS
+
+            isp_groups = {g.key for g in PERMISSION_GROUPS}
+            assert {"isp_partner", "tr069", "isp_subscribers"} <= isp_groups
+            stray = {key for _, key in isp_rows if key.split(".")[0] not in isp_groups}
+            assert not stray, stray
             again = await seed_isp_partner_rbac(RBACRepository(s))
             assert again.roles_created == again.role_permissions_created == 0
             await seed_rbac(s)  # the existing seeder afterwards
