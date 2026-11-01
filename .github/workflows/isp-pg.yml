@@ -1,0 +1,104 @@
+name: ISP PostgreSQL tests
+
+# CI-INTEG (2026-11-01). The ISP partner tests that need a real PostgreSQL +
+# Redis (tests/unit/test_isp*_postgres.py, plus test_isp_pppoe.py and
+# test_isp_service_control.py) skip in ci.yml, which has no database. They are
+# the only proof of cross-ISP isolation, confinement, zone scope and the
+# money paths, so they run here: one file per pytest process, each on a fresh
+# database cloned from one template migrated to `alembic upgrade head`
+# (backend/scripts/run_isp_pg_tests.py).
+#
+# Deliberately a separate workflow, not a job in ci.yml:
+#   * cd.yml calls ci.yml through workflow_call; nothing here can change what
+#     a deploy waits for or which permissions it asks for.
+#   * It is not a required check on main (founder decision 2026-11-01): it
+#     reports on PRs and on integ pushes, it does not block merges yet.
+
+on:
+  push:
+    branches: ["integ/**"]
+    paths:
+      - "backend/**"
+      - ".github/workflows/isp-pg.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/isp-pg.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isp-pg-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  isp-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ISP_PG_ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      ISP_PG_REDIS_URL: redis://localhost:6379/0
+      # Object store for the invoice-email / PDF upload steps (moto, below).
+      CLOUDGUEST_S3_ENDPOINT_URL: http://127.0.0.1:5005
+      CLOUDGUEST_S3_BUCKET_NAME: cloudguest
+      CLOUDGUEST_S3_ACCESS_KEY_ID: testing
+      CLOUDGUEST_S3_SECRET_ACCESS_KEY: testing
+      CLOUDGUEST_S3_REGION: us-east-1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip install "moto[server]==5.0.*"
+
+      - name: Start S3 stand-in (moto)
+        run: |
+          nohup moto_server -H 127.0.0.1 -p 5005 > /tmp/moto.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:5005/moto-api/ >/dev/null && exit 0
+            sleep 1
+          done
+          cat /tmp/moto.log; exit 1
+
+      - name: ISP PostgreSQL tests (one file per process)
+        run: python scripts/run_isp_pg_tests.py
