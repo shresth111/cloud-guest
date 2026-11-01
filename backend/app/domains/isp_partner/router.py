@@ -1014,6 +1014,14 @@ def _include_lanes() -> None:
     from .workbench_router import workbench_router
 
     isp_partner_router.include_router(workbench_router)
+
+    # BILL-2: GSTR-1 export (/isp/gst) + zone invoice branding, behind
+    # ISP_BILL2_ENABLED.
+    from .bill2_router import bill2_router
+    from .billing_gst import gst_router
+
+    isp_partner_router.include_router(gst_router)
+    isp_partner_router.include_router(bill2_router)
     isp_partner_router.include_router(billing_router)
     # ADDENDUM_05 JAZE-1 (J1/J2/J11/J19). Mounted BEFORE plans_router:
     # its literal paths (/subscribers/directory, /typeahead, /onboard) must

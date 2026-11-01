@@ -129,6 +129,13 @@ def render_invoice_pdf(
     ]
     if against:
         story.append(Paragraph(f"Against invoice {against}", styles["Normal"]))
+    bill2 = seller.get("bill2") or {}
+    if bill2.get("billed_through"):
+        story.append(
+            Paragraph(
+                f"Billed through: {_e(bill2['billed_through'])}", styles["Normal"]
+            )
+        )
     story += [
         Spacer(1, 0.3 * cm),
         Paragraph(
@@ -147,6 +154,7 @@ def render_invoice_pdf(
         ),
         Spacer(1, 0.3 * cm),
     ]
+    story += _account_block(bill2.get("account") or {}, styles)
     header = [
         "Description",
         "SAC",
@@ -218,6 +226,17 @@ def render_invoice_pdf(
                 styles["Normal"],
             )
         )
+        dues = bill2.get("dues")
+        if dues and dues.get("previous_balance_paise"):
+            story.append(
+                Paragraph(
+                    "Previous balance: "
+                    f"{rupees(dues['previous_balance_paise'])} &nbsp; "
+                    f"This invoice: {rupees(dues['this_invoice_paise'])} &nbsp; "
+                    f"<b>Total due: {rupees(dues['total_due_paise'])}</b>",
+                    styles["Normal"],
+                )
+            )
         modes = sorted({p["mode"] for p in view.get("payments", [])})
         if modes:
             story.append(
@@ -245,6 +264,28 @@ def render_invoice_pdf(
     ]
     doc.build(story)
     return buf.getvalue()
+
+
+_ACCOUNT_LABELS = (
+    ("customer_id", "Customer ID"),
+    ("circuit_id", "Circuit ID"),
+    ("billing_period", "Billing period"),
+    ("next_bill_date", "Next bill date"),
+    ("static_ip", "Static IP"),
+    ("install_address", "Installation address"),
+)
+
+
+def _account_block(account: dict, styles: Any) -> list[Any]:
+    """BILL-2: only rendered when ``seller["bill2"]`` is present (flag on)."""
+    cells = [
+        f"<b>{label}:</b> {_e(account[key])}"
+        for key, label in _ACCOUNT_LABELS
+        if account.get(key) not in (None, "")
+    ]
+    if not cells:
+        return []
+    return [Paragraph(" &nbsp; ".join(cells), styles["Normal"]), Spacer(1, 0.3 * cm)]
 
 
 def _extras_block(seller: dict, styles: Any, *, is_note: bool) -> list[Any]:
