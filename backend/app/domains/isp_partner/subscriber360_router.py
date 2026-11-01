@@ -21,7 +21,11 @@ from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import get_access_validator
 from app.domains.rbac.exceptions import PermissionDeniedError
 
-from .constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from .constants import (
+    DEFAULT_PAGE_SIZE,
+    ISP_SUBSCRIBERS_DISCONNECT,  # RBAC-FIX
+    MAX_PAGE_SIZE,
+)
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .http import ok
 from .plans_router import (
@@ -277,7 +281,8 @@ async def onboard_subscriber(
 
 
 @subscriber360_router.post(
-    "/subscribers/{subscriber_id}/disconnect", dependencies=isp_guards(SUBS_UPDATE)
+    "/subscribers/{subscriber_id}/disconnect",
+    dependencies=isp_guards(ISP_SUBSCRIBERS_DISCONNECT),
 )
 async def disconnect_subscriber(
     request: Request,

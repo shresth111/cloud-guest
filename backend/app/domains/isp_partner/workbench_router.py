@@ -30,10 +30,11 @@ from app.domains.guest.dependencies import get_guest_service
 from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import get_access_validator, get_rbac_repository
 
+from .constants import ISP_SUBSCRIBERS_DISCONNECT  # RBAC-FIX
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import _err
 from .http import ok
-from .plans_router import SUBS_READ, SUBS_UPDATE, get_plans_service
+from .plans_router import SUBS_READ, get_plans_service
 from .plans_service import IspPlansService
 
 
@@ -384,7 +385,7 @@ async def get_workbench(
 
 @workbench_router.post(
     "/subscribers/{subscriber_id}/workbench/disconnect",
-    dependencies=_ON + isp_guards(SUBS_UPDATE),
+    dependencies=_ON + isp_guards(ISP_SUBSCRIBERS_DISCONNECT),
 )
 async def workbench_disconnect(
     request: Request,

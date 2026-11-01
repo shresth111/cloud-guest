@@ -167,3 +167,7 @@ ISP_MONITOR_UPDATE = "isp_monitor.update"
 #: Support: ISP -> Wyfy support tickets.
 ISP_SUPPORT_READ = "isp_support.read"
 ISP_SUPPORT_CREATE = "isp_support.create"
+
+# RBAC-FIX (founder 2026-11-01, QA R1/R3).
+ISP_SUBSCRIBERS_DISCONNECT = "isp_subscribers.disconnect"
+ISP_SUBSCRIBERS_KYC = "isp_subscribers.kyc"

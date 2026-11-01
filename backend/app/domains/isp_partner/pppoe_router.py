@@ -24,7 +24,12 @@ from app.database.session import get_db_session
 from app.domains.guest.dependencies import CurrentNas
 from app.domains.rbac.dependencies import get_rbac_repository
 
-from .constants import ISP_PARTNER_EXECUTE, ISP_PARTNER_READ, SETUP_SCRIPT_ROLES
+from .constants import (
+    ISP_PARTNER_EXECUTE,
+    ISP_PARTNER_READ,
+    ISP_SUBSCRIBERS_DISCONNECT,  # RBAC-FIX
+    SETUP_SCRIPT_ROLES,
+)
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import IspSetupNotAllowedError
 from .http import ok
@@ -190,7 +195,7 @@ async def enable_pppoe(
 
 @pppoe_router.post(
     "/subscribers/{subscriber_id}/pppoe/disconnect",
-    dependencies=isp_guards(SUBS_UPDATE),
+    dependencies=isp_guards(ISP_SUBSCRIBERS_DISCONNECT),
 )
 async def disconnect_pppoe_subscriber(
     request: Request,
@@ -226,7 +231,7 @@ async def list_pppoe_sessions(
 
 @pppoe_router.post(
     "/pppoe/sessions/{pppoe_session_id}/disconnect",
-    dependencies=isp_guards(SUBS_UPDATE),
+    dependencies=isp_guards(ISP_SUBSCRIBERS_DISCONNECT),
 )
 async def disconnect_pppoe_session(
     request: Request,

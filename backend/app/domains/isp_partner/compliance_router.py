@@ -64,6 +64,7 @@ from .constants import (
     ISP_PARTNER_MANAGE,
     ISP_PARTNER_READ,
     ISP_PARTNER_UPDATE,
+    ISP_SUBSCRIBERS_KYC,  # RBAC-FIX
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import IspBadRequestError
@@ -665,7 +666,7 @@ async def _documents(db: AsyncSession, subscriber_id: uuid.UUID) -> list[Any]:
 
 
 @compliance_router.get(
-    "/subscribers/{subscriber_id}/kyc", dependencies=isp_guards(ISP_PARTNER_READ)
+    "/subscribers/{subscriber_id}/kyc", dependencies=isp_guards(ISP_SUBSCRIBERS_KYC)
 )
 async def get_kyc(
     request: Request,
@@ -802,7 +803,7 @@ async def _document(db, sub, document_id) -> IspSubscriberDocument:
 
 @compliance_router.get(
     "/subscribers/{subscriber_id}/documents/{document_id}",
-    dependencies=isp_guards(ISP_PARTNER_EXPORT),
+    dependencies=isp_guards(ISP_SUBSCRIBERS_KYC),
 )
 async def download_document(
     subscriber_id: uuid.UUID,
@@ -904,7 +905,7 @@ async def assign_caf(
 
 
 @compliance_router.get(
-    "/subscribers/{subscriber_id}/caf.pdf", dependencies=isp_guards(ISP_PARTNER_EXPORT)
+    "/subscribers/{subscriber_id}/caf.pdf", dependencies=isp_guards(ISP_SUBSCRIBERS_KYC)
 )
 async def caf_pdf(
     subscriber_id: uuid.UUID,
