@@ -1042,5 +1042,10 @@ def _include_lanes() -> None:
     isp_partner_router.include_router(pppoe_router)
     isp_partner_router.include_router(pppoe_internal_router)
 
+    # JAZE-6 J22: /isp/fiber/*, behind ISP_FIBER_ENABLED.
+    from .fiber_router import fiber_router
+
+    isp_partner_router.include_router(fiber_router)
+
 
 _include_lanes()

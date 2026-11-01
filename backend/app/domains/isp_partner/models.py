@@ -118,6 +118,7 @@ class IspStaffCustomerScope(BaseModel):
 # already imports (E2), so 1b needs no further registration line.
 from .billing_models import *  # noqa: E402,F403
 from .billing_models import BILLING_TABLES  # noqa: E402,F401
+from .fiber_models import *  # noqa: E402,F403  (J22 fiber registry)
 from .plans_models import *  # noqa: E402,F403
 from .pppoe_models import *  # noqa: E402,F403
 
