@@ -598,6 +598,82 @@ async def test_enforce_hotspot_end_to_end() -> None:  # noqa: PLR0915
                 ).scalar_one()
             assert linked == g_v_id
 
+            # ENFORCE-4: time budget ---------------------------------------------
+            import asyncio
+            import statistics
+            import time
+
+            from app.domains.isp_partner import hotspot_hooks as hh
+
+            async def timed(who: str, user: str, mac: str) -> tuple[float, dict]:
+                t0 = time.perf_counter()
+                r = await auth(who, user, mac)
+                return time.perf_counter() - t0, r
+
+            # (a) regular tenant: same latency with the flag on and off
+            lat = {}
+            for on in (False, True):
+                if on:
+                    os.environ["ISP_PARTNER_ENFORCEMENT_ENABLED"] = "true"
+                else:
+                    os.environ.pop("ISP_PARTNER_ENFORCEMENT_ENABLED", None)
+                clear()
+                await timed("r", f"reg{tag}@e.com", m_reg)  # warm up
+                lat[on] = statistics.median(
+                    [(await timed("r", f"reg{tag}@e.com", m_reg))[0] for _ in range(15)]
+                )
+            print("regular tenant authorize median s (off, on):", lat[False], lat[True])
+            assert lat[True] <= lat[False] * 1.5 + 0.02, lat
+
+            # (b) a gate stuck for 2 s cannot hold an ISP login past the budget
+            os.environ["ISP_PARTNER_ENFORCEMENT_ENABLED"] = "true"
+            os.environ["ISP_PARTNER_HOTSPOT_GATE_BUDGET_MS"] = "200"
+            clear()
+            await policy()
+
+            async def stuck(_ctx):  # noqa: ANN001, ANN202
+                await asyncio.sleep(2)
+                return hh.HotspotGateResult(allow=False, reason="concurrency")
+
+            conc_before = [
+                e["kind"]
+                for e in await call(
+                    "GET", f"/subscribers/{sid}/enforcement-events?limit=200"
+                )
+            ].count("concurrency")
+            register_hotspot_gate(stuck)
+            took, r = await timed("i", f"isp{tag}@e.com", m2)
+            assert r["control:Auth-Type"] == "Accept", r  # fail-open
+            print("ISP login with a stuck gate took", took, "s")
+            assert took < 0.2 + 0.4, took
+            await asyncio.sleep(2.3)  # the gate finishes in the background
+            ev = await call("GET", f"/subscribers/{sid}/enforcement-events?limit=200")
+            kinds = [e["kind"] for e in ev]
+            assert "gate_timeout" in kinds, kinds
+            # the stuck gate's late refusal was thrown away, not recorded
+            assert kinds.count("concurrency") == conc_before, kinds
+            n_before = kinds.count("gate_timeout")
+            await timed("i", f"isp{tag}@e.com", m2)
+            await asyncio.sleep(2.3)
+            ev = await call("GET", f"/subscribers/{sid}/enforcement-events?limit=200")
+            assert [e["kind"] for e in ev].count("gate_timeout") == n_before  # 1/min
+            hh._gates.remove(stuck)
+
+            # (c) a gate whose query hangs is cut by statement_timeout: fails
+            # open fast, the next login is not affected
+            from sqlalchemy import text as _text
+
+            async def slow_sql(ctx):  # noqa: ANN001, ANN202
+                await ctx.db.execute(_text("SELECT pg_sleep(3)"))
+                return hh.HotspotGateResult(allow=False, reason="concurrency")
+
+            register_hotspot_gate(slow_sql)
+            took, r = await timed("i", f"isp{tag}@e.com", m2)
+            assert r["control:Auth-Type"] == "Accept" and took < 0.6, (took, r)
+            hh._gates.remove(slow_sql)
+            os.environ.pop("ISP_PARTNER_HOTSPOT_GATE_BUDGET_MS")
+            clear()
+
             # flag OFF again: old behaviour for the subscriber too ------------------
             flag(False)
             await policy(mac_bind_count=1, max_simultaneous=1, hard_timeout_s=300)
@@ -605,7 +681,11 @@ async def test_enforce_hotspot_end_to_end() -> None:  # noqa: PLR0915
             assert r["control:Auth-Type"] == "Accept" and r["Idle-Timeout"] == 1800, r
             assert r["Session-Timeout"] > 3600
     finally:
-        for k in ("ISP_PPPOE_ENABLED", "ISP_PARTNER_ENFORCEMENT_ENABLED"):
+        for k in (
+            "ISP_PPPOE_ENABLED",
+            "ISP_PARTNER_ENFORCEMENT_ENABLED",
+            "ISP_PARTNER_HOTSPOT_GATE_BUDGET_MS",
+        ):
             os.environ.pop(k, None)
         clear()
         await engine.dispose()

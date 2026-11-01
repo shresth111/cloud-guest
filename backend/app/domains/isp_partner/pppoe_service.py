@@ -23,7 +23,7 @@ import re
 import secrets
 import string
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, or_, select, update
@@ -121,6 +121,10 @@ AUDIT_SCRIPT = "isp_pppoe_script_generated"
 #: Reject reason codes (stored in last_auth_result, shown on the 360 page).
 R_DISABLED_FEATURE = "feature_off"
 R_NOT_ISP = "not_isp_nas"
+
+#: ENFORCE-4: a Stop/interim for an id whose session closed within this many
+#: seconds is a late retransmit of that session, not a new one.
+LATE_PACKET_WINDOW_S = 90
 R_ISP_SUSPENDED = "isp_suspended"
 R_CUSTOMER_SUSPENDED = "customer_suspended"
 R_UNKNOWN = "unknown_user"
@@ -417,18 +421,45 @@ class IspPppoeService:
         if isp_org is None:
             return {"status": "ignored", "reason": "not an ISP NAS"}
         now = self._clock()
+        # ENFORCE-4 (BE review F5): match the OPEN session with this id. A
+        # router reboot restarts RouterOS's Acct-Session-Id counter, so the
+        # same id can belong to an older, closed session; a Start then must
+        # open a new row, never revive or overwrite the old one (IPDR).
         row = (
             (
                 await self.session.execute(
-                    select(IspPppoeSession).where(
+                    select(IspPppoeSession)
+                    .where(
                         IspPppoeSession.nas_client_id == nas_client.id,
                         IspPppoeSession.acct_session_id == acct_id,
+                        IspPppoeSession.status == "active",
                     )
+                    .order_by(IspPppoeSession.started_at.desc())
                 )
             )
             .scalars()
             .first()
         )
+        if row is None and status_type != "start":
+            # A Stop or interim retransmitted just after the session closed
+            # (Accounting-On, or the Stop itself) belongs to that session.
+            row = (
+                (
+                    await self.session.execute(
+                        select(IspPppoeSession)
+                        .where(
+                            IspPppoeSession.nas_client_id == nas_client.id,
+                            IspPppoeSession.acct_session_id == acct_id,
+                            IspPppoeSession.status == "closed",
+                            IspPppoeSession.stopped_at
+                            >= now - timedelta(seconds=LATE_PACKET_WINDOW_S),
+                        )
+                        .order_by(IspPppoeSession.stopped_at.desc())
+                    )
+                )
+                .scalars()
+                .first()
+            )
         if row is None:
             cred = (
                 (
@@ -479,12 +510,18 @@ class IspPppoeService:
             _int(row.bytes_downloaded), _int(payload.get("bytes_downloaded_total"))
         )
         row.last_update_at = now
-        if status_type == "stop":
+        if status_type == "stop" and row.status != "closed":
             row.status = "closed"
             row.stopped_at = now
             row.terminate_cause = (
                 str(payload.get("disconnect_reason") or "").strip() or None
             )
+        elif status_type == "stop":
+            # late retransmit of a session already closed (by Accounting-On or
+            # an earlier Stop): keep its close time, record the real cause
+            reason = str(payload.get("disconnect_reason") or "").strip()
+            if reason and row.terminate_cause in (None, "accounting-on"):
+                row.terminate_cause = reason[:64]
         elif row.status != "closed":
             row.status = "active"
         await self.session.flush()
