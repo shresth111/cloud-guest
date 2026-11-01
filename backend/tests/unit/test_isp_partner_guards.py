@@ -48,7 +48,17 @@ _PUBLIC_AUTH_ROUTES = {("POST", "/api/v1/isp/auth/forgot-password")}
 #: QA-021: the guest portal footer's ISP support contact
 #: (isp_partner.portal_support_router). Public and read-only, pinned below.
 _PUBLIC_PORTAL = "/api/v1/isp/public/"
-_PUBLIC_PORTAL_ROUTES = {("GET", "/api/v1/isp/public/portal-support")}
+_PUBLIC_PORTAL_ROUTES = {
+    ("GET", "/api/v1/isp/public/portal-support"),
+    # JAZE-4: the pay-link page (also behind ISP_WHATSAPP_AUTOMATION_ENABLED).
+    ("GET", "/api/v1/isp/public/pay/{token}"),
+}
+_PUBLIC_PORTAL_MODULES = {
+    "/api/v1/isp/public/portal-support": (
+        "app.domains.isp_partner.portal_support_router"
+    ),
+    "/api/v1/isp/public/pay/{token}": "app.domains.isp_partner.finance_router",
+}
 
 
 @lru_cache(maxsize=1)
@@ -399,8 +409,14 @@ def test_the_public_isp_portal_surface_is_exactly_portal_support() -> None:
     ]
     assert {(m, r.path) for r in public for m in r.methods} == _PUBLIC_PORTAL_ROUTES
     for r in public:
-        assert r.endpoint.__module__ == "app.domains.isp_partner.portal_support_router"
+        assert r.endpoint.__module__ == _PUBLIC_PORTAL_MODULES[r.path]
         calls = [d.dependency for d in r.dependencies]
+        if r.path.endswith("/pay/{token}"):
+            from app.domains.isp_partner.finance_config import (
+                RequireWhatsappAutomation,
+            )
+
+            assert RequireWhatsappAutomation in calls
         assert RequireIspFeatureEnabled in calls
         assert RequireOrganization not in calls
         assert RequireIspPartner not in calls

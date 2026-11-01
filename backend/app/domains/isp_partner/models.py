@@ -121,6 +121,7 @@ from .billing_models import BILLING_TABLES  # noqa: E402,F401
 
 # JAZE-2 (ADDENDUM_05 J3/J8): package policy, usage, MAC/IP bindings.
 from .enforcement_models import *  # noqa: E402,F403
+from .finance_models import *  # noqa: E402,F403  (JAZE-4)
 from .plans_models import *  # noqa: E402,F403
 from .subscriber360_models import *  # noqa: E402,F403
 # JAZE-3 (ADDENDUM_05 J6/J17): compliance tables, same registration path.
