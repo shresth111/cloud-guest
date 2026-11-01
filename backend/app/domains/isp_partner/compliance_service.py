@@ -24,6 +24,7 @@ from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_controller_managed_row
 from app.domains.traffic_flow.flow_record_models import TrafficFlowRecord
 from app.domains.traffic_flow.models import RouterTrafficFlowExport
 
@@ -207,22 +208,20 @@ class IspComplianceService:
         stale_after = timedelta(minutes=settings.nat_feed_stale_minutes)
         if not ids:
             return _feed_payload([], now, stale_after)
+        # Whole rows (CI-INTEG): is_controller_managed_row needs the vendor
+        # and the agent-evidence columns, not only the label.
         routers = (
-            await self.session.execute(
-                select(
-                    Router.id,
-                    Router.name,
-                    Router.status,
-                    Router.organization_id,
-                    Router.location_id,
-                    Router.public_ip_address,
-                    Router.last_seen_at,
-                ).where(
-                    Router.organization_id.in_(ids),
-                    Router.is_deleted.is_(False),
+            (
+                await self.session.execute(
+                    select(Router).where(
+                        Router.organization_id.in_(ids),
+                        Router.is_deleted.is_(False),
+                    )
                 )
             )
-        ).all()
+            .scalars()
+            .all()
+        )
         router_ids = [r.id for r in routers]
         last_nat: dict[uuid.UUID, datetime] = {}
         last_flow: dict[uuid.UUID, datetime] = {}
@@ -269,6 +268,7 @@ class IspComplianceService:
                 router_online=r.status == RouterStatus.ONLINE.value,
                 now=now,
                 stale_after=stale_after,
+                controller_managed=is_controller_managed_row(r),
             )
             items.append(
                 {

@@ -131,6 +131,7 @@ async def traffic(
     isp: IspContext = Depends(RequireIspPartner),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    from app.domains.router.vendor_capabilities import is_controller_managed_row
     from app.domains.router_provisioning.models import RouterHealthSnapshot as H
 
     now = datetime.now(UTC)
@@ -165,6 +166,7 @@ async def traffic(
             snmp_last_poll_status=getattr(r, "snmp_last_poll_status", None),
             has_series=bool(points),
             now=now,
+            controller_managed=is_controller_managed_row(r),
         )
         cards.append(
             {

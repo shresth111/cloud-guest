@@ -111,6 +111,10 @@ FEED_STALE = "stale"
 FEED_NEVER = "never_received"
 FEED_NOT_CONFIGURED = "not_configured"
 FEED_ROUTER_OFFLINE = "router_offline"
+#: CI-INTEG: a venue run through a vendor controller (Omada / Aruba Instant
+#: On). Our NAT export is a RouterOS feature, so there is no feed to expect
+#: from it and nothing for the ISP to fix in this console. Never alerting.
+FEED_NOT_APPLICABLE = "not_applicable"
 #: States that raise the banner.
 FEED_ALERTING = frozenset({FEED_STALE, FEED_NEVER, FEED_NOT_CONFIGURED})
 
@@ -122,6 +126,7 @@ def nat_feed_state(
     router_online: bool,
     now: datetime,
     stale_after: timedelta,
+    controller_managed: bool = False,
 ) -> str:
     """Whether NAT translations from one router are reaching us.
 
@@ -131,6 +136,8 @@ def nat_feed_state(
     counts as ``ok`` (the status poll may lag)."""
     if last_nat_at is not None and now - last_nat_at <= stale_after:
         return FEED_OK
+    if controller_managed:
+        return FEED_NOT_APPLICABLE
     if not router_online:
         return FEED_ROUTER_OFFLINE
     if not export_configured:

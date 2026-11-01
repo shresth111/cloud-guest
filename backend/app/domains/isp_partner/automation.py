@@ -969,8 +969,16 @@ async def telegram_test(session: Any, isp: Any) -> dict:
 async def _device_statuses(
     session: Any, child_ids: list[uuid.UUID], include_aps: bool
 ) -> list[tuple[str, uuid.UUID, str, str, uuid.UUID]]:  # noqa: E501
-    """(kind, id, name, up|down, customer org id); unknown/pending skipped."""
+    """(kind, id, name, up|down, customer org id); unknown/pending skipped.
+
+    Controller-managed routers (Omada / Aruba Instant On rows with no agent
+    evidence) are skipped too (CI-INTEG): their ``routers.status`` is not a
+    liveness signal -- no agent heartbeats them -- so an UP/DOWN Telegram for
+    one would describe a working venue as broken hardware. Row-aware
+    (``is_controller_managed_row``), so a MikroTik mislabelled as Omada that
+    has ever checked in still alerts."""
     from app.domains.router.models import Router
+    from app.domains.router.vendor_capabilities import is_controller_managed_row
 
     out: list = []
     if not child_ids:
@@ -989,6 +997,8 @@ async def _device_statuses(
         .all()
     )
     for r in routers:
+        if is_controller_managed_row(r):
+            continue
         out.append(
             (
                 "router",
