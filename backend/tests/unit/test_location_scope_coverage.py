@@ -585,6 +585,21 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # correct because the caller is a guest acting on their own session, not a
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
+    # ISP partner JAZE-6 (GAP-SWEEP classified): FreeRADIUS -> API only.
+    ("POST", "/api/v1/isp/internal/pppoe/authorize"): (
+        "PPPoE Authorize from the box FreeRADIUS X2 site. No user and no roles: "
+        "the caller is a NAS, authenticated by CurrentNas (NAS shared secret) "
+        "plus the ISP_PPPOE_REST_SECRET header, and refused (404) when the "
+        "request came through nginx. The subscriber is resolved from the "
+        "PPPoE username within the NAS's own ISP; there is no staff "
+        "confinement to derive. 404 while ISP_PPPOE_ENABLED is off."
+    ),
+    ("POST", "/api/v1/isp/internal/pppoe/accounting"): (
+        "PPPoE Accounting from the same FreeRADIUS site, same NAS secret + "
+        "rest-secret header + no-proxy rule as authorize. It only records "
+        "byte/session totals for the NAS's own sessions; no staff caller, so "
+        "no confinement applies."
+    ),
     ("GET", "/api/v1/captive-portal/resolve"): (
         "The guest portal render. Pre-login by definition; the caller holds no "
         "roles, and `resolve_portal_config` resolves by organization+location "
