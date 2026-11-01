@@ -11,6 +11,7 @@ nothing. Idempotent: no live row is a clean no-op.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 
 __all__ = ["PppDisconnectOutcome", "PppoeDeviceError", "end_ppp_sessions"]
@@ -77,10 +78,8 @@ def _end_sync(
     except (LibRouterosError, OSError, KeyError) as exc:
         raise PppoeDeviceError(f"ppp active on {host}: {exc}") from exc
     finally:
-        try:
+        with contextlib.suppress(Exception):  # best-effort close
             api.close()
-        except Exception:  # noqa: BLE001 -- best-effort close
-            pass
 
 
 async def end_ppp_sessions(

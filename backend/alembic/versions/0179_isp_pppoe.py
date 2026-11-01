@@ -71,7 +71,9 @@ def upgrade() -> None:
         *_base(),
         _uuid("isp_organization_id", sa.ForeignKey("organizations.id"), nullable=False),
         _uuid(
-            "customer_organization_id", sa.ForeignKey("organizations.id"), nullable=False
+            "customer_organization_id",
+            sa.ForeignKey("organizations.id"),
+            nullable=False,
         ),
         _uuid("subscriber_id", sa.ForeignKey("isp_subscribers.id"), nullable=False),
         sa.Column("username", sa.String(64), nullable=False),
@@ -111,13 +113,17 @@ def upgrade() -> None:
         *_base(),
         _uuid("isp_organization_id", sa.ForeignKey("organizations.id"), nullable=False),
         _uuid(
-            "customer_organization_id", sa.ForeignKey("organizations.id"), nullable=False
+            "customer_organization_id",
+            sa.ForeignKey("organizations.id"),
+            nullable=False,
         ),
         _uuid("location_id", sa.ForeignKey("locations.id"), nullable=True),
         _uuid("router_id", sa.ForeignKey("routers.id"), nullable=True),
         _uuid("nas_client_id", sa.ForeignKey("radius_nas_clients.id"), nullable=False),
         _uuid("subscriber_id", sa.ForeignKey("isp_subscribers.id"), nullable=True),
-        _uuid("credential_id", sa.ForeignKey("isp_pppoe_credentials.id"), nullable=True),
+        _uuid(
+            "credential_id", sa.ForeignKey("isp_pppoe_credentials.id"), nullable=True
+        ),
         sa.Column("username", sa.String(64), nullable=False),
         sa.Column("acct_session_id", sa.String(128), nullable=False),
         sa.Column("calling_station_id", sa.String(64), nullable=True),
@@ -129,8 +135,12 @@ def upgrade() -> None:
         sa.Column("last_update_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("stopped_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("status", sa.String(10), nullable=False),
-        sa.Column("bytes_uploaded", sa.BigInteger(), nullable=False, server_default="0"),
-        sa.Column("bytes_downloaded", sa.BigInteger(), nullable=False, server_default="0"),
+        sa.Column(
+            "bytes_uploaded", sa.BigInteger(), nullable=False, server_default="0"
+        ),
+        sa.Column(
+            "bytes_downloaded", sa.BigInteger(), nullable=False, server_default="0"
+        ),
         sa.Column("terminate_cause", sa.String(64), nullable=True),
     )
     _base_indexes("isp_pppoe_sessions")
@@ -146,7 +156,9 @@ def upgrade() -> None:
         ["isp_organization_id", "started_at"],
     )
     op.create_index(
-        "ix_isp_pppoe_sessions_subscriber", "isp_pppoe_sessions", ["subscriber_id", "status"]
+        "ix_isp_pppoe_sessions_subscriber",
+        "isp_pppoe_sessions",
+        ["subscriber_id", "status"],
     )
     op.create_index(
         "ix_isp_pppoe_sessions_framed_ip",

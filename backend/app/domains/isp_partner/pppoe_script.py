@@ -39,7 +39,9 @@ def ros_quote(value: str) -> str:
     """A RouterOS double-quoted string literal. Newlines are refused."""
     if "\n" in value or "\r" in value:
         raise ValueError("newline in RouterOS value")
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+    return (
+        '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+    )
 
 
 def _ip(value: str) -> str:

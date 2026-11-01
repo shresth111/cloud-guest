@@ -101,11 +101,11 @@ class IspPppoeSession(BaseModel):
     calling_station_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     framed_ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     framed_ipv6_prefix: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    delegated_ipv6_prefix: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    delegated_ipv6_prefix: Mapped[str | None] = mapped_column(String(64), nullable=True)
     nas_port_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     last_update_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -132,7 +132,11 @@ class IspPppoeSession(BaseModel):
         Index("ix_isp_pppoe_sessions_isp_started", "isp_organization_id", "started_at"),
         Index("ix_isp_pppoe_sessions_subscriber", "subscriber_id", "status"),
         Index("ix_isp_pppoe_sessions_framed_ip", "framed_ip_address", "started_at"),
-        Index("ix_isp_pppoe_sessions_customer_status", "customer_organization_id", "status"),
+        Index(
+            "ix_isp_pppoe_sessions_customer_status",
+            "customer_organization_id",
+            "status",
+        ),
     )
 
 

@@ -89,7 +89,9 @@ class PppoeAccountingBody(BaseModel):
     nas_port_id: str | None = Field(default=None, max_length=64)
 
 
-@pppoe_internal_router.post("/authorize", dependencies=[Depends(RequirePppoeRestCaller)])
+@pppoe_internal_router.post(
+    "/authorize", dependencies=[Depends(RequirePppoeRestCaller)]
+)
 async def pppoe_authorize(
     payload: PppoeAuthorizeBody,
     nas_client=Depends(CurrentNas),  # noqa: B008
@@ -104,7 +106,9 @@ async def pppoe_authorize(
     )
 
 
-@pppoe_internal_router.post("/accounting", dependencies=[Depends(RequirePppoeRestCaller)])
+@pppoe_internal_router.post(
+    "/accounting", dependencies=[Depends(RequirePppoeRestCaller)]
+)
 async def pppoe_accounting(
     payload: PppoeAccountingBody,
     nas_client=Depends(CurrentNas),  # noqa: B008

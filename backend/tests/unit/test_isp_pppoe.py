@@ -46,7 +46,16 @@ class _Sess:
 
 
 class FakeSvc(IspPppoeService):
-    def __init__(self, *, isp=ISP, isp_active=True, suspended=False, cred=None, sub=None, rate=None):
+    def __init__(
+        self,
+        *,
+        isp=ISP,
+        isp_active=True,
+        suspended=False,
+        cred=None,
+        sub=None,
+        rate=None,
+    ):
         super().__init__(session=_Sess(), clock=lambda: NOW)
         self._isp, self._active, self._susp = isp, isp_active, suspended
         self._cred, self._sub, self._rate = cred, sub, rate
@@ -62,7 +71,11 @@ class FakeSvc(IspPppoeService):
 
     async def _find_credential(self, customer_org, isp_org, uname):
         c = self._cred
-        if c is None or c.username_lower != uname or customer_org != c.customer_organization_id:
+        if (
+            c is None
+            or c.username_lower != uname
+            or customer_org != c.customer_organization_id
+        ):
             return None
         return c
 
@@ -74,7 +87,9 @@ class FakeSvc(IspPppoeService):
 
 
 def _nas(org=CUST):
-    return SimpleNamespace(id=uuid.uuid4(), organization_id=org, location_id=None, router_id=None)
+    return SimpleNamespace(
+        id=uuid.uuid4(), organization_id=org, location_id=None, router_id=None
+    )
 
 
 def _cred(**kw):
@@ -99,7 +114,12 @@ def _cred(**kw):
 
 
 def _sub(**kw):
-    base = dict(id=uuid.uuid4(), is_deleted=False, status="active", valid_until=NOW + timedelta(days=10))
+    base = dict(
+        id=uuid.uuid4(),
+        is_deleted=False,
+        status="active",
+        valid_until=NOW + timedelta(days=10),
+    )
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -112,7 +132,9 @@ def _hooks():
 
 
 async def _auth(svc, username="ravi01", nas=None, mac="aa-bb-cc-dd-ee-ff"):
-    return await svc.authorize(nas_client=nas or _nas(), username=username, calling_station_id=mac)
+    return await svc.authorize(
+        nas_client=nas or _nas(), username=username, calling_station_id=mac
+    )
 
 
 async def test_flag_off_rejects(monkeypatch):
@@ -159,7 +181,9 @@ async def test_disabled_login_expired_and_disabled_subscriber(monkeypatch):
     assert r["reply:Reply-Message"] == "wyfy:login_disabled"
     r = await _auth(FakeSvc(cred=_cred(), sub=_sub(status="disabled")))
     assert r["reply:Reply-Message"] == "wyfy:subscriber_disabled"
-    r = await _auth(FakeSvc(cred=_cred(), sub=_sub(valid_until=NOW - timedelta(seconds=1))))
+    r = await _auth(
+        FakeSvc(cred=_cred(), sub=_sub(valid_until=NOW - timedelta(seconds=1)))
+    )
     assert r["reply:Reply-Message"] == "wyfy:expired"
 
 
@@ -172,13 +196,17 @@ async def test_non_isp_nas_and_other_customer_are_rejected(monkeypatch):
 
 async def test_session_timeout_capped_by_validity(monkeypatch):
     _settings(monkeypatch)
-    r = await _auth(FakeSvc(cred=_cred(), sub=_sub(valid_until=NOW + timedelta(minutes=30))))
+    r = await _auth(
+        FakeSvc(cred=_cred(), sub=_sub(valid_until=NOW + timedelta(minutes=30)))
+    )
     assert r["reply:Session-Timeout"] == 1800
 
 
 async def test_static_ip_wins_over_pool(monkeypatch):
     _settings(monkeypatch)
-    r = await _auth(FakeSvc(cred=_cred(static_ip="100.64.1.9", ip_pool_name="p2"), sub=_sub()))
+    r = await _auth(
+        FakeSvc(cred=_cred(static_ip="100.64.1.9", ip_pool_name="p2"), sub=_sub())
+    )
     assert r["reply:Framed-IP-Address"] == "100.64.1.9"
     assert "reply:Framed-Pool" not in r
 
@@ -209,7 +237,9 @@ async def test_rate_resolver_can_swap_the_rate(monkeypatch):
     async def fup(ctx, base):
         return SpeedGroupRate(download_kbps=2000, upload_kbps=2000)
 
-    r = await _auth(FakeSvc(cred=_cred(), sub=_sub(), rate=SpeedGroupRate(100000, 100000)))
+    r = await _auth(
+        FakeSvc(cred=_cred(), sub=_sub(), rate=SpeedGroupRate(100000, 100000))
+    )
     assert r["reply:Mikrotik-Rate-Limit"] == "2000k/2000k"
 
 
@@ -256,14 +286,21 @@ def _params(**kw):
 def test_script_shape_and_quoting():
     text = render_pppoe_script(_params())
     assert (
-        '/radius add service=ppp address=10.66.0.1 src-address=10.66.0.2 secret="se\\"c\\$ret" '
+        "/radius add service=ppp address=10.66.0.1 src-address=10.66.0.2 "
+        'secret="se\\"c\\$ret" '
         "authentication-port=1912 accounting-port=1913" in text
     )
     assert "/ppp aaa set use-radius=yes accounting=yes interim-update=5m" in text
     assert "authentication=pap,chap,mschap2 one-session-per-host=yes" in text
     assert "dns-server=100.64.0.1" in text
     # Idempotent: every add is preceded by a remove of the same object.
-    for obj in ("/ip pool", "/ppp profile", "/radius", "/interface pppoe-server server", "/ip firewall nat"):
+    for obj in (
+        "/ip pool",
+        "/ppp profile",
+        "/radius",
+        "/interface pppoe-server server",
+        "/ip firewall nat",
+    ):
         assert f"{obj} remove" in text
     # Never touches the hotspot or the existing hotspot RADIUS entry.
     assert "hotspot" not in text
