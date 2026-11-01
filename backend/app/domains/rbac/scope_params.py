@@ -212,6 +212,9 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         # collector, or to owner/admin when its payments are in their scope.
         "promise_id",
         "handover_id",
+        # QUEUED-RENEWAL: reached only under a scoped subscriber_id in the same
+        # path; the row must belong to that subscriber and this ISP.
+        "queue_id",
     }
 )
 

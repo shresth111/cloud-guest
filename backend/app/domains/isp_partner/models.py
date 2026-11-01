@@ -148,6 +148,7 @@ from .incidents_models import *  # noqa: E402,F403  (INCIDENTS-1)
 from .package_meta_models import *  # noqa: E402,F403  (PKG-2)
 from .plans_models import *  # noqa: E402,F403
 from .pppoe_models import *  # noqa: E402,F403
+from .queued_renewal_models import *  # noqa: E402,F403  (QUEUED-RENEWAL)
 from .subscriber360_models import *  # noqa: E402,F403
 from .zones_models import *  # noqa: E402,F403  (ZONE-1 zone tree)
 
