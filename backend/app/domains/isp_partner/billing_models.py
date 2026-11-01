@@ -347,7 +347,9 @@ class IspInvoice(BaseModel):
         Index("ix_isp_invoices_subscriber", "subscriber_id"),
         CheckConstraint(
             "bill_to_kind = 'customer' AND customer_organization_id IS NOT NULL"
-            " OR bill_to_kind = 'subscriber' AND subscriber_id IS NOT NULL",
+            " OR bill_to_kind = 'subscriber' AND subscriber_id IS NOT NULL"
+            # FINISH (0188): a zone billed through the invoice engine.
+            " OR bill_to_kind = 'zone' AND zone_id IS NOT NULL",
             name="bill_to",
         ),
     )

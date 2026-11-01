@@ -61,7 +61,9 @@ async def _previous_balance(session: Any, inv: Any) -> int:
     if inv.doc_type != "invoice":
         return 0
     same_bill_to = (
-        IspInvoice.subscriber_id == inv.subscriber_id
+        and_(IspInvoice.bill_to_kind == "zone", IspInvoice.zone_id == inv.zone_id)
+        if inv.bill_to_kind == "zone"
+        else IspInvoice.subscriber_id == inv.subscriber_id
         if inv.subscriber_id is not None
         else and_(
             IspInvoice.subscriber_id.is_(None),
@@ -151,7 +153,9 @@ async def pdf_extras(session: Any, isp: Any, inv: Any) -> dict[str, Any]:
             },
         }
     }
-    if inv.zone_id is not None:
+    # FINISH: on a zone's own tax invoice the zone is the buyer, so its
+    # "billed through" name and its bank / UPI are not printed.
+    if inv.zone_id is not None and inv.bill_to_kind != "zone":
         b = await zone_branding_row(session, isp.isp_org_id, inv.zone_id)
         if b is not None:
             zone = await session.get(IspZone, inv.zone_id)

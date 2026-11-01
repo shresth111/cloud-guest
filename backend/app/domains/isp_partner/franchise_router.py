@@ -420,8 +420,15 @@ async def run_charges(
 # --------------------------------------------------------------------------
 
 
-def _settlement_view(s: Any, zone_name: str | None = None) -> dict:
+def _settlement_view(s: Any, zone_name: str | None = None, invoice: Any = None) -> dict:
+    from .zone_invoices import invoice_brief
+
     return {
+        # FINISH: the GST tax invoice issued for this settlement (or None:
+        # nothing billed, billing not set up, or a settlement from before
+        # 0188 not invoiced yet -- POST .../invoice issues it).
+        "invoice": invoice_brief(invoice),
+        "invoice_id": str(s.invoice_id) if getattr(s, "invoice_id", None) else None,
         "id": str(s.id),
         "zone_id": str(s.zone_id),
         "zone_name": zone_name,
@@ -575,9 +582,60 @@ async def create_settlement(
     )
     db.add(s)
     await db.flush()
-    view = _settlement_view(s, z.name)
+    inv = await _settlement_invoice(db, isp, s, required=False)
+    if inv is not None:  # the settlement shows the invoice's own tax split
+        s.taxable_paise, s.cgst_paise = inv.taxable_paise, inv.cgst_paise
+        s.sgst_paise, s.igst_paise = inv.sgst_paise, inv.igst_paise
+        await db.flush()
+    view = _settlement_view(s, z.name, inv)
     await db.commit()
     return ok(request, view, "Settlement issued")
+
+
+async def _settlement_invoice(
+    db: AsyncSession, isp: IspContext, s: Any, *, required: bool
+) -> Any:
+    """FINISH: the settlement's tax invoice through the regular engine. With
+    ``required=False`` (on create) a missing billing setup leaves the
+    settlement un-invoiced, exactly as before 0188."""
+    from .billing_service import IspBillingService
+    from .exceptions import IspBillingNotConfiguredError
+    from .zone_invoices import invoice_for_settlement
+
+    billing = IspBillingService(session=db)
+    if not required and await billing.settings(isp, required=False) is None:
+        return None
+    try:
+        return await invoice_for_settlement(billing, isp, s)
+    except IspBillingNotConfiguredError:
+        if required:
+            raise
+        return None
+
+
+@franchise_router.post(
+    "/settlements/{settlement_id}/invoice",
+    dependencies=_ON + isp_guards(ISP_ZONES_MANAGE),
+)
+async def invoice_settlement(
+    request: Request,
+    settlement_id: uuid.UUID,
+    isp: IspContext = Depends(RequireIspPartner),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """FINISH: issue (once) the GST tax invoice for a settlement -- the path
+    for ZS settlements issued before 0188. Idempotent."""
+    from .franchise_models import IspZoneSettlement
+
+    s = await db.get(IspZoneSettlement, settlement_id)
+    if s is None or s.is_deleted or s.isp_organization_id != isp.isp_org_id:
+        raise IspZoneNotFoundError("Settlement not found")
+    z = await _zone(db, isp, s.zone_id)
+    await db.run_sync(lambda ss: fs._lock(ss, z.id))
+    inv = await _settlement_invoice(db, isp, s, required=True)
+    view = _settlement_view(s, z.name, inv)
+    await db.commit()
+    return ok(request, view, "Settlement invoiced" if inv else "Nothing billed")
 
 
 @franchise_router.get(
@@ -602,7 +660,25 @@ async def list_settlements(
             .order_by(IspZoneSettlement.created_at.desc())
         )
     ).scalars()
-    return ok(request, [_settlement_view(s, z.name) for s in rows], "Settlements")
+    rows = list(rows)
+    from .billing_models import IspInvoice
+
+    inv_ids = [s.invoice_id for s in rows if s.invoice_id]
+    invs = (
+        {
+            i.id: i
+            for i in (
+                await db.execute(select(IspInvoice).where(IspInvoice.id.in_(inv_ids)))
+            ).scalars()
+        }
+        if inv_ids
+        else {}
+    )
+    return ok(
+        request,
+        [_settlement_view(s, z.name, invs.get(s.invoice_id)) for s in rows],
+        "Settlements",
+    )
 
 
 @franchise_router.get(

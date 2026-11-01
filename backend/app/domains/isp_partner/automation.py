@@ -581,6 +581,8 @@ def _may_message(flags: dict, kind: str, subject: Any) -> bool:
 
 
 async def _recipient(session: Any, inv: IspInvoice) -> tuple[str, Any] | None:
+    if inv.bill_to_kind == "zone":
+        return None  # FINISH: zones are not messaged by the reminder runs
     from app.domains.organization.models import Organization
 
     from .plans_models import IspSubscriber

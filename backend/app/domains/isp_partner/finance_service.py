@@ -205,6 +205,8 @@ class IspFinanceService:
                     out[f] = getattr(row, f)
         show_op = row is None or row.show_zone_operator
         zone_id = getattr(invoice, "zone_id", None) if invoice is not None else None
+        if getattr(invoice, "bill_to_kind", None) == "zone":
+            zone_id = None  # FINISH: the zone is the buyer, not the operator
         if show_op and zone_id is not None:
             prof = await self._zone_profile_row(isp, zone_id)
             if prof is not None and (prof.operator_name or prof.operator_phone):
@@ -901,6 +903,12 @@ class IspFinanceService:
     async def invoice_recipients(
         self, isp: IspContext, inv: IspInvoice, send_to: str
     ) -> list[str]:
+        if inv.bill_to_kind == "zone":
+            # FINISH: the zone profile's email (no billing-contact row)
+            prof = await self._zone_profile_row(isp, inv.zone_id)
+            if prof is None or not prof.email or send_to == "alternate":
+                raise IspNoRecipientError()
+            return [prof.email]
         if inv.bill_to_kind == "subscriber" and inv.subscriber_id:
             kind, sid = "subscriber", inv.subscriber_id
         else:
