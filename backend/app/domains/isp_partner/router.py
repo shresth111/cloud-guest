@@ -1104,6 +1104,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(finance_router)
     isp_partner_router.include_router(public_pay_router)
+    # FRANCHISE-2: zone share plans, wallet view, charges, settlements
+    # (ISP_FRANCHISE_ENABLED).
+    from .franchise_router import franchise_router
+
+    isp_partner_router.include_router(franchise_router)
     # COMMS-2: logs, delivery receipts (Meta webhook), template library
     # (ISP_COMMS_HUB_ENABLED).
     from .comms_router import comms_public_router, comms_router
