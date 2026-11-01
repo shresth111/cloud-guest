@@ -1010,6 +1010,10 @@ def _include_lanes() -> None:
     from .package_meta_router import package_meta_router
 
     isp_partner_router.include_router(package_meta_router)
+    # SUB360-2: Subscriber 360 workbench (ISP_SUB360_WORKBENCH_ENABLED).
+    from .workbench_router import workbench_router
+
+    isp_partner_router.include_router(workbench_router)
     isp_partner_router.include_router(billing_router)
     # ADDENDUM_05 JAZE-1 (J1/J2/J11/J19). Mounted BEFORE plans_router:
     # its literal paths (/subscribers/directory, /typeahead, /onboard) must
