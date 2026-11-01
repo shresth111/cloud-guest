@@ -192,6 +192,11 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "product_id",
         # PPPoE session: isp org + assert_customer before the kick.
         "pppoe_session_id",
+        # FRANCHISE-2: zone charges and settlements are ISP-wide rows (zones
+        # never belong to a customer); the handler 404s unless
+        # isp_organization_id is the caller's ISP.
+        "charge_id",
+        "settlement_id",
         # /finance/contacts/{subject_kind}/{subject_id}: a customer org id OR
         # a subscriber id depending on subject_kind. Not aliased: as an
         # ORGANIZATION alias the permission check would run against the
