@@ -55,6 +55,7 @@ async def test_enforce_hotspot_end_to_end() -> None:  # noqa: PLR0915
     from app.domains.location.models import Location
     from app.domains.router.crypto import encrypt_secret
     from app.domains.router.models import Router
+    from app.domains.voucher.models import Voucher
 
     def clear() -> None:
         get_isp_partner_settings.cache_clear()
@@ -536,6 +537,66 @@ async def test_enforce_hotspot_end_to_end() -> None:  # noqa: PLR0915
             await policy(hard_timeout_s=3600)
             r = await auth("i", f"isp{tag}@e.com", m2)
             assert 2900 < r["Session-Timeout"] <= 3000, r  # 3600 - 600 elapsed
+
+            # a hand-made subscriber whose guest logs in with an ISP coupon is
+            # linked to that guest at its first login (sweep + FUP read by
+            # guest_id) -------------------------------------------------------
+            await call(
+                "POST",
+                "/coupon-batches",
+                {
+                    "package_id": pkg,
+                    "isp_customer_id": cust,
+                    "isp_location_id": loc,
+                    "quantity": 1,
+                },
+            )
+            sid2 = (
+                await call(
+                    "POST",
+                    "/subscribers",
+                    {
+                        "isp_customer_id": cust,
+                        "identifier": f"v{tag}",
+                        "package_id": pkg,
+                    },
+                )
+            )["id"]
+            async with SessionLocal() as s:
+                v = (
+                    await s.execute(
+                        select(Voucher).where(
+                            Voucher.organization_id == uuid.UUID(cust)
+                        )
+                    )
+                ).scalar_one()
+                v.redeemed_identifier = f"v{tag}"
+                g_v = guest(uuid.UUID(cust), f"v{tag}")
+                s.add(g_v)
+                await s.flush()
+                s.add(
+                    gsess(
+                        g_v,
+                        uuid.UUID(rtr),
+                        uuid.UUID(cust),
+                        uuid.UUID(loc),
+                        voucher_id=v.id,
+                        idle_timeout_minutes=30,
+                    )
+                )
+                await s.commit()
+                g_v_id = g_v.id
+            r = await auth("i", f"v{tag}", "AE:E2:" + hexmac)
+            assert r["control:Auth-Type"] == "Accept", r
+            async with SessionLocal() as s:
+                linked = (
+                    await s.execute(
+                        select(IspSubscriber.guest_id).where(
+                            IspSubscriber.id == uuid.UUID(sid2)
+                        )
+                    )
+                ).scalar_one()
+            assert linked == g_v_id
 
             # flag OFF again: old behaviour for the subscriber too ------------------
             flag(False)
