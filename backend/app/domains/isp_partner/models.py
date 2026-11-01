@@ -121,6 +121,9 @@ class IspStaffCustomerScope(BaseModel):
 # ISP_ZONE_AUTODEBIT_ENABLED is on.
 # ENFORCE-1: registers the JAZE-2 PPPoE gate + rate resolver into pppoe_hooks.
 # No-op unless ISP_PARTNER_ENFORCEMENT_ENABLED is on.
+# ENFORCE-2: registers the JAZE-2 hotspot gate into hotspot_hooks (the one call
+# the hotspot RADIUS Authorize makes). No-op unless the enforcement flag is on.
+from . import enforcement_hotspot as _enforcement_hotspot_hooks  # noqa: E402,F401
 from . import enforcement_pppoe as _enforcement_pppoe_hooks  # noqa: E402,F401
 from . import franchise_service as _franchise_hook  # noqa: E402,F401
 from .apps2_models import *  # noqa: E402,F403  (APPS-2)
