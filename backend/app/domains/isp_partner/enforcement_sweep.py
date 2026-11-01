@@ -129,6 +129,7 @@ async def run_sweep(
     disconnect: Disconnect,
     now: datetime | None = None,
     live_mode: str | None = None,
+    pppoe_kick: Any = None,
 ) -> dict[str, int]:
     from .enforcement_models import IspPackagePolicy, IspSubscriberMacBinding
     from .plans_models import IspPackage, IspSubscriber
@@ -201,6 +202,7 @@ async def run_sweep(
                         disconnect=disconnect,
                         summary=summary,
                         mac_model=IspSubscriberMacBinding,
+                        pppoe_kick=pppoe_kick,
                     )
             except Exception as exc:  # noqa: BLE001
                 summary["errors"] += 1
@@ -224,6 +226,7 @@ async def _sweep_one(
     disconnect: Disconnect,
     summary: dict[str, int],
     mac_model: Any,
+    pppoe_kick: Any = None,
 ) -> None:
     if policy.validity_starts == "first_login":
         await _first_login_validity(session, sub, package, now)
@@ -262,6 +265,8 @@ async def _sweep_one(
             kind="boost_on" if policy.boost_state_active else "boost_off",
             now=now,
         )
+    if reauth and live_mode == "reauth":
+        await _pppoe_reauth(session, sub, now=now, summary=summary, kick=pppoe_kick)
     live = await _live_sessions(session, sub)
     if not live:
         return
@@ -314,3 +319,47 @@ async def _sweep_one(
                 session_id=s.session_id,
                 now=now,
             )
+
+
+async def _pppoe_reauth(
+    session: Any, sub: Any, *, now: datetime, summary: dict[str, int], kick: Any
+) -> None:
+    """ENFORCE-1: a speed change (FUP flip, boost edge) reaches a live PPPoE
+    session only through a re-authorize, as on the hotspot path. Ends each
+    live PPPoE session (JAZE-6 ``_kick``) so the router dials in again and
+    gets the new Mikrotik-Rate-Limit. A no-op while PPPoE is off."""
+    from .pppoe_config import get_isp_pppoe_settings
+    from .pppoe_models import IspPppoeSession
+
+    if not get_isp_pppoe_settings().enabled:
+        return
+    rows = (
+        (
+            await session.execute(
+                select(IspPppoeSession).where(
+                    IspPppoeSession.subscriber_id == sub.id,
+                    IspPppoeSession.status == "active",
+                    IspPppoeSession.is_deleted.is_(False),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return
+    if kick is None:
+        from .pppoe_service import IspPppoeService
+
+        kick = IspPppoeService(session=session)._kick
+    for row in rows:
+        await kick(row)
+        summary["ended"] += 1
+        await record_event(
+            session,
+            isp_id=sub.isp_organization_id,
+            subscriber_id=sub.id,
+            kind="reauth",
+            detail="pppoe: speed change",
+            now=now,
+        )

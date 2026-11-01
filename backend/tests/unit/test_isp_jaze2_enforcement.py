@@ -441,6 +441,7 @@ _NEW_PATHS = {
     "/api/v1/isp/routers/{isp_router_id}/health/live",
     "/api/v1/isp/routers/{isp_router_id}/health/history",
     "/api/v1/isp/routers/{isp_router_id}/sessions/active",
+    "/api/v1/isp/routers/{isp_router_id}/enforcement-script",
     "/api/v1/isp/tr069/summary",
     "/api/v1/isp/tr069/devices/{cpe_id}/optical",
 }
