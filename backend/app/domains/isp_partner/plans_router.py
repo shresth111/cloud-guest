@@ -257,7 +257,6 @@ async def list_groups(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspPlansService = Depends(get_plans_service),
 ) -> dict:
-    await svc.sync_subscribers(isp)
     items, total = await svc.list_groups(
         isp, status=status, search=search, page=page, page_size=page_size
     )
@@ -392,7 +391,6 @@ async def list_packages(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspPlansService = Depends(get_plans_service),
 ) -> dict:
-    await svc.sync_subscribers(isp)
     items, total = await svc.list_packages(
         isp,
         speed_group_id=speed_group_id,
@@ -664,7 +662,6 @@ async def export_coupons(
                 )
             ]
         )
-    await svc.sync_subscribers(isp)
     name = f"coupons-{batch.serial_prefix}-{batch.batch_seq:04d}.csv"
     return Response(
         content=buf.getvalue().encode(),
@@ -773,6 +770,20 @@ async def create_subscriber(
 ) -> dict:
     s = await svc.create_subscriber(isp, payload.model_dump(exclude_unset=True))
     return ok(request, await svc.subscriber_detail(isp, s.id), "Subscriber created")
+
+
+@plans_router.post("/subscribers/sync", dependencies=isp_guards(SUBS_UPDATE))
+async def sync_coupon_subscribers_now(
+    request: Request,
+    isp: IspContext = Depends(RequireIspPartner),
+    svc: IspPlansService = Depends(get_plans_service),
+) -> dict:
+    """BE-HARDEN "sync now": apply coupon redemptions past the watermark at
+    once instead of waiting for the 120 s pass. Single-flight per ISP: while
+    another run holds the ISP, this returns ``applied: 0``."""
+    applied = await svc.sync_subscribers(isp)
+    await svc.session.commit()
+    return ok(request, {"applied": applied}, "Coupon subscribers synced")
 
 
 @plans_router.get("/subscribers/{subscriber_id}", dependencies=isp_guards(SUBS_READ))

@@ -243,14 +243,6 @@ async def _rows(isp: IspContext, svc: IspBillingService, invoices: list) -> list
     return out
 
 
-async def _sync_coupon_activations(isp: IspContext, svc: IspBillingService) -> None:
-    """Coupon activations become invoices through the same throttled
-    subscriber sync (ADDENDUM_03 §7); run it before listing so they show."""
-    from .plans_service import IspPlansService
-
-    await IspPlansService(session=svc.session, audit=svc.audit).sync_subscribers(isp)
-
-
 async def _pdf_for(
     isp: IspContext, svc: IspBillingService, invoice_id: uuid.UUID
 ) -> tuple[bytes, str]:
@@ -748,7 +740,6 @@ async def list_invoices(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspBillingService = Depends(get_billing_service),
 ) -> dict:
-    await _sync_coupon_activations(isp, svc)
     filters = {
         "isp_customer_id": isp_customer_id,
         "status": status,

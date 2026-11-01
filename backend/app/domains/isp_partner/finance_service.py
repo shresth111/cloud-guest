@@ -45,6 +45,45 @@ PINCODE_RE = re.compile(r"^[1-9][0-9]{5}$")
 TDS_194H_THRESHOLD_PAISE = 20_000_00
 
 
+def lease_period(
+    active_since: date,
+    start: date,
+    monthly_paise: int,
+    *,
+    active_until: date | None = None,
+) -> tuple[date, int]:
+    """BE-HARDEN: ``(period_end, amount_paise)`` of the lease period that
+    starts on ``start``.
+
+    Periods run anniversary to anniversary on ``active_since``'s day of month.
+    Each anniversary is counted from ``active_since`` itself, never from the
+    previous period, so a short month cannot drift the day. A lease from
+    31 Jan bills 31 Jan-27 Feb, 28 Feb-30 Mar, 31 Mar-29 Apr, 30 Apr-30 May.
+    The old rule stayed on the 28th forever.
+
+    A full period bills the monthly amount. A partial one bills pro rata:
+    days billed over the length of that anniversary period, rounded half up
+    to the paisa. A period is partial when it is the last one, cut short by
+    ``active_until``, or when it starts off-anniversary (a row billed under
+    the old rule).
+    """
+    from .gst import round_half_up
+
+    anchor = active_since.day
+    k = 0
+    lo = active_since
+    hi = add_months(active_since, 1, anchor)
+    while hi <= start:
+        k += 1
+        lo, hi = hi, add_months(active_since, k + 1, anchor)
+    full_end = hi - timedelta(days=1)
+    end = min(full_end, active_until) if active_until else full_end
+    if start == lo and end == full_end:
+        return end, int(monthly_paise)
+    days = (end - start).days + 1
+    return end, round_half_up(int(monthly_paise) * days, (hi - lo).days)
+
+
 class IspFinanceNotFoundError(IspError):
     code = "ISP_FINANCE_NOT_FOUND"
     status_code_default = 404
@@ -658,13 +697,16 @@ class IspFinanceService:
                     guard = 0
                     while start <= min(today, end_cap) and guard < 24:
                         guard += 1
-                        period_end = add_months(start, 1) - timedelta(days=1)
-                        if lease.active_until and period_end > lease.active_until:
-                            period_end = lease.active_until
+                        period_end, amount = lease_period(
+                            lease.active_since,
+                            start,
+                            lease.monthly_amount_paise,
+                            active_until=lease.active_until,
+                        )
                         line = {
                             "description": f"Static IP {lease.ip_address}",
                             "sac_code": settings.sac_code,
-                            "amount_paise": lease.monthly_amount_paise,
+                            "amount_paise": amount,
                             "price_includes_gst": lease.price_includes_gst,
                             "period_from": start,
                             "period_to": period_end,

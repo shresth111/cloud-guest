@@ -23,7 +23,26 @@ from .finance_config import get_finance_settings
 logger = get_logger(__name__)
 
 
-async def run_finance_frequent(session: Any) -> dict[str, int]:
+async def _step(session: Any, commit_each: bool, fn: Any) -> Any:
+    """One isolated step. ``commit_each`` (BE-HARDEN, the caller owns a
+    dedicated session): commit on success / roll back on failure, so nothing
+    this step locked is held while a later step calls out. Otherwise the old
+    SAVEPOINT inside the caller's transaction."""
+    if not commit_each:
+        async with session.begin_nested():
+            return await fn()
+    try:
+        out = await fn()
+        await session.commit()
+        return out
+    except Exception:
+        await session.rollback()
+        raise
+
+
+async def run_finance_frequent(
+    session: Any, *, commit_each: bool = False
+) -> dict[str, int]:
     from .automation import run_telegram, run_whatsapp_events
     from .finance_models import IspAutomationSettings
     from .models import IspPartnerProfile
@@ -58,13 +77,22 @@ async def run_finance_frequent(session: Any) -> dict[str, int]:
         out["isps"] += 1
         for step in ("whatsapp", "telegram"):
             try:
-                async with session.begin_nested():
-                    if step == "whatsapp":
-                        await run_whatsapp_events(session, isp_id)
-                    else:
-                        await run_telegram(
+                if step == "whatsapp":
+                    await _step(
+                        session,
+                        commit_each,
+                        lambda isp_id=isp_id: run_whatsapp_events(
+                            session, isp_id, commit_each=commit_each
+                        ),
+                    )
+                else:
+
+                    async def _tg(isp_id=isp_id) -> Any:  # noqa: ANN001
+                        return await run_telegram(
                             session, isp_id, await repo.child_ids(isp_id)
                         )
+
+                    await _step(session, commit_each, _tg)
             except Exception:  # noqa: BLE001 -- one ISP never blocks the rest
                 out["errors"] += 1
                 logger.exception(
@@ -74,7 +102,9 @@ async def run_finance_frequent(session: Any) -> dict[str, int]:
     return out
 
 
-async def run_finance_daily(session: Any, isp: Any, today: Any) -> dict[str, int]:
+async def run_finance_daily(
+    session: Any, isp: Any, today: Any, *, commit_each: bool = False
+) -> dict[str, int]:
     from .automation import run_whatsapp_daily
     from .finance_service import IspFinanceService
 
@@ -82,11 +112,14 @@ async def run_finance_daily(session: Any, isp: Any, today: Any) -> dict[str, int
     out = {"lease_invoices": 0, "errors": 0}
     if cfg.finance_extras_enabled:
         try:
-            async with session.begin_nested():
-                res = await IspFinanceService(session=session).bill_leases(
+            res = await _step(
+                session,
+                commit_each,
+                lambda: IspFinanceService(session=session).bill_leases(
                     isp, as_of=today
-                )
-                out["lease_invoices"] = res["invoices_issued"]
+                ),
+            )
+            out["lease_invoices"] = res["invoices_issued"]
         except Exception:  # noqa: BLE001
             out["errors"] += 1
             logger.exception(
@@ -97,8 +130,9 @@ async def run_finance_daily(session: Any, isp: Any, today: Any) -> dict[str, int
 
     if get_franchise_settings().franchise_enabled:
         try:
-            async with session.begin_nested():
-                out |= await run_franchise_daily(session, isp, today)
+            out |= await _step(
+                session, commit_each, lambda: run_franchise_daily(session, isp, today)
+            )
         except Exception:  # noqa: BLE001
             out["errors"] += 1
             logger.exception(
@@ -106,8 +140,13 @@ async def run_finance_daily(session: Any, isp: Any, today: Any) -> dict[str, int
             )
     if cfg.whatsapp_automation_enabled:
         try:
-            async with session.begin_nested():
-                await run_whatsapp_daily(session, isp.isp_org_id, today)
+            await _step(
+                session,
+                commit_each,
+                lambda: run_whatsapp_daily(
+                    session, isp.isp_org_id, today, commit_each=commit_each
+                ),
+            )
         except Exception:  # noqa: BLE001
             out["errors"] += 1
             logger.exception(

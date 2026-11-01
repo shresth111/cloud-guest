@@ -398,8 +398,8 @@ async def test_r3_zone_scoped_list_does_not_duplicate_hidden_coupon_subscribers(
     from sqlalchemy import func, select, update
 
     from app.database.session import SessionLocal
-    from app.domains.isp_partner import plans_service
     from app.domains.isp_partner.billing_models import IspZone
+    from app.domains.isp_partner.coupon_sync import IspCouponSyncState
     from app.domains.isp_partner.models import IspCustomerProfile
     from app.domains.isp_partner.plans_models import IspSubscriber
     from app.domains.isp_partner.zones_config import get_zones_settings
@@ -444,13 +444,17 @@ async def test_r3_zone_scoped_list_does_not_duplicate_hidden_coupon_subscribers(
                 v.redeemed_at = datetime.now(UTC) - timedelta(minutes=5)
                 v.expires_at = datetime.now(UTC) + timedelta(days=30)
                 await s.commit()
-            plans_service._last_sync.clear()
-            await b["call"](
-                "GET", "/subscribers"
-            )  # unscoped: creates the c2 subscriber
-            plans_service._last_sync.clear()
-            r = await c.get(
-                f"{API}/subscribers",
+            # BE-HARDEN: the sync no longer runs in GETs; "sync now" does it
+            await b["call"]("POST", "/subscribers/sync")  # creates the c2 one
+            async with SessionLocal() as s:  # make the next run re-read it
+                await s.execute(
+                    update(IspCouponSyncState)
+                    .where(IspCouponSyncState.isp_organization_id == w["isp"])
+                    .values(watermark_at=None)
+                )
+                await s.commit()
+            r = await c.post(
+                f"{API}/subscribers/sync",
                 params={"scope_zone_id": str(zone_a)},
                 headers=w["h"],
             )

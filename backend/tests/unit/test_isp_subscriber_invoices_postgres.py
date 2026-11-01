@@ -35,7 +35,6 @@ async def test_subscriber_invoices_end_to_end() -> None:  # noqa: PLR0915
     from app.database.session import SessionLocal, engine
     from app.domains.auth.models import AuthUser, User
     from app.domains.billing.models import Plan
-    from app.domains.isp_partner import plans_service
     from app.domains.isp_partner.models import IspPartnerProfile
     from app.domains.isp_partner.seed import seed_isp_partner_rbac
     from app.domains.organization.models import Organization, OrganizationMember
@@ -136,7 +135,9 @@ async def test_subscriber_invoices_end_to_end() -> None:  # noqa: PLR0915
             )
 
             async def sync_invoices(**params):
-                plans_service._last_sync.clear()  # the 60 s throttle
+                # BE-HARDEN: GETs no longer sync; "sync now" does
+                rs = await c.post("/api/v1/isp/subscribers/sync", headers=ha)
+                assert rs.status_code == 200, rs.text
                 r = await c.get(
                     "/api/v1/isp/invoices",
                     params={"bill_to_kind": "subscriber", "page_size": 100, **params},

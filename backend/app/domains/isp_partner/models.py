@@ -139,6 +139,7 @@ from .comms_models import *  # noqa: E402,F403  (COMMS-2)
 
 # JAZE-3 (ADDENDUM_05 J6/J17): compliance tables, same registration path.
 from .compliance_models import *  # noqa: E402,F403
+from .coupon_sync import *  # noqa: E402,F403  (BE-HARDEN coupon sync watermark)
 
 # JAZE-2 (ADDENDUM_05 J3/J8): package policy, usage, MAC/IP bindings.
 from .enforcement_models import *  # noqa: E402,F403

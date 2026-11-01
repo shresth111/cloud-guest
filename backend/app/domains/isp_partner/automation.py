@@ -474,6 +474,10 @@ class _WhatsappRun:
         self.sent = 0
         self.skipped = 0
         self.failed = 0
+        #: BE-HARDEN: commit after every message (the caller owns the
+        #: session, no SAVEPOINT open), so a sent message's dedupe row is
+        #: durable before the next network call and nothing is held across it.
+        self.commit_each = False
 
     async def send(
         self,
@@ -556,6 +560,8 @@ class _WhatsappRun:
             )
         )
         await self.session.flush()
+        if self.commit_each:
+            await self.session.commit()
 
 
 def _sub_name(sub: Any) -> str:
@@ -617,7 +623,9 @@ def _name(kind: str, subject: Any) -> str:
     return _sub_name(subject) if kind == "subscriber" else subject.name
 
 
-async def run_whatsapp_events(session: Any, isp_org_id: uuid.UUID) -> dict:
+async def run_whatsapp_events(
+    session: Any, isp_org_id: uuid.UUID, *, commit_each: bool = False
+) -> dict:
     """Receipts and renewal confirmations (near real time: 120 s task)."""
     cfg = get_finance_settings()
     st = await automation_settings(session, isp_org_id)
@@ -632,6 +640,7 @@ async def run_whatsapp_events(session: Any, isp_org_id: uuid.UUID) -> dict:
     if sender is None:
         return {"skipped": "no verified WhatsApp sender"}
     run = _WhatsappRun(session, isp_org_id, st, sender)
+    run.commit_each = commit_each
     flags = await _contact_flags(session, isp_org_id)
     since = max(st.whatsapp_enabled_at, datetime.now(UTC) - timedelta(days=1))
     pays = (
@@ -767,7 +776,9 @@ async def _welcome(
         )
 
 
-async def run_whatsapp_daily(session: Any, isp_org_id: uuid.UUID, today: date) -> dict:
+async def run_whatsapp_daily(
+    session: Any, isp_org_id: uuid.UUID, today: date, *, commit_each: bool = False
+) -> dict:
     """Pre-expiry reminders and unpaid-invoice reminders (daily run)."""
     from .plans_models import IspPackage, IspSubscriber
 
@@ -784,6 +795,7 @@ async def run_whatsapp_daily(session: Any, isp_org_id: uuid.UUID, today: date) -
     if sender is None:
         return {"skipped": "no verified WhatsApp sender"}
     run = _WhatsappRun(session, isp_org_id, st, sender)
+    run.commit_each = commit_each
     flags = await _contact_flags(session, isp_org_id)
     target = today + timedelta(days=st.pre_expiry_days)
     start = datetime.combine(target, datetime.min.time(), tzinfo=UTC) - timedelta(

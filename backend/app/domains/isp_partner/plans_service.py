@@ -14,7 +14,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 
 from app.common.masking import mask_identifier
 
@@ -111,7 +111,7 @@ COUPON_STATUS = {
 }
 VOUCHER_BATCH_MAX = 1000
 KBPS_PER_MBPS = 1024
-SYNC_MIN_INTERVAL = timedelta(seconds=60)
+#: kept for tests that clear it; the sync is no longer throttled per process
 _last_sync: dict[uuid.UUID, datetime] = {}
 
 
@@ -1216,45 +1216,23 @@ class IspPlansService:
     # ------------------------------------------------------------------
     async def sync_subscribers(self, isp: IspContext, *, force: bool = False) -> int:
         """Derive subscribers from redeemed ISP coupons (no hook into old
-        code). Idempotent; throttled to once a minute per ISP. Runs outside
-        the request's zone filter (BE-REVIEW R3): it must see every
-        subscriber of the ISP or it re-creates the hidden ones."""
-        from .zones_scope import unscoped
+        code). BE-HARDEN: incremental from a per-ISP watermark, single-flight
+        per ISP, and never called from a GET (see ``coupon_sync``). ``force``
+        is kept for callers; every call now runs."""
+        from .coupon_sync import sync_coupon_subscribers
 
-        with unscoped(self.session):
-            return await self._sync_subscribers(isp, force=force)
+        return await sync_coupon_subscribers(self, isp)
 
-    async def _sync_subscribers(self, isp: IspContext, *, force: bool) -> int:
+    async def _apply_coupon_rows(self, isp: IspContext, rows: list) -> int:
+        """Create or top up the subscribers for one page of ``(Voucher,
+        IspCouponBatch)`` redemptions, oldest first, then invoice the
+        activations. Re-applying a row is a no-op."""
+        from sqlalchemy import tuple_
+
         from app.domains.guest.models import Guest
         from app.domains.voucher.models import Voucher
 
-        now = self._clock()
-        last = _last_sync.get(isp.isp_org_id)
-        if not force and last and now - last < SYNC_MIN_INTERVAL:
-            return 0
-        _last_sync[isp.isp_org_id] = now
-        rows = (
-            await self.session.execute(
-                select(Voucher, IspCouponBatch)
-                .join(
-                    IspCouponBatchPart,
-                    IspCouponBatchPart.voucher_batch_id == Voucher.batch_id,
-                )
-                .join(
-                    IspCouponBatch,
-                    IspCouponBatch.id == IspCouponBatchPart.coupon_batch_id,
-                )
-                .where(
-                    IspCouponBatch.isp_organization_id == isp.isp_org_id,
-                    Voucher.redeemed_at.is_not(None),
-                    Voucher.redeemed_identifier.is_not(None),
-                    Voucher.organization_id == IspCouponBatch.customer_organization_id,
-                )
-                .order_by(Voucher.redeemed_at)
-            )
-        ).all()
-        if not rows:
-            return 0
+        keys = {(b.customer_organization_id, v.redeemed_identifier) for v, b in rows}
         existing = {
             (s.customer_organization_id, s.identifier): s
             for s in (
@@ -1262,16 +1240,34 @@ class IspPlansService:
                     select(IspSubscriber).where(
                         IspSubscriber.isp_organization_id == isp.isp_org_id,
                         IspSubscriber.is_deleted.is_(False),
+                        tuple_(
+                            IspSubscriber.customer_organization_id,
+                            IspSubscriber.identifier,
+                        ).in_(list(keys)),
                     )
                 )
             )
             .scalars()
             .all()
         }
-        last_redeemed = {}
-        for s in existing.values():
-            if s.last_voucher_id:
-                last_redeemed[s.id] = None
+        voucher_time = {v.id: v.redeemed_at for v, _ in rows}
+        prior_ids = {
+            s.last_voucher_id
+            for s in existing.values()
+            if s.last_voucher_id and s.last_voucher_id not in voucher_time
+        }
+        if prior_ids:
+            voucher_time.update(
+                dict(
+                    (
+                        await self.session.execute(
+                            select(Voucher.id, Voucher.redeemed_at).where(
+                                Voucher.id.in_(prior_ids)
+                            )
+                        )
+                    ).all()
+                )
+            )
         packages = {
             p.id: p
             for p in (
@@ -1285,7 +1281,6 @@ class IspPlansService:
             .all()
         }
         changed = 0
-        voucher_time = {v.id: v.redeemed_at for v, _ in rows}
         for v, batch in rows:
             key = (batch.customer_organization_id, v.redeemed_identifier)
             sub = existing.get(key)
@@ -1333,9 +1328,6 @@ class IspPlansService:
                 if sub.status != "disabled":
                     sub.status = "active"
                 changed += 1
-        for sub in existing.values():
-            if sub.status == "active" and sub.valid_until and sub.valid_until < now:
-                sub.status = "expired"
         await self.session.flush()
         await self._invoice_activations(isp, rows, existing, packages)
         return changed
@@ -1447,6 +1439,7 @@ class IspPlansService:
         from app.domains.guest.models import Guest
         from app.domains.organization.models import Organization
 
+        now = self._clock()
         orgs = await isp.repository.names(
             Organization, [s.customer_organization_id for s in subs]
         )
@@ -1517,7 +1510,11 @@ class IspPlansService:
                 if s.speed_group_id in groups
                 else None,
                 "valid_until": _iso(s.valid_until),
-                "status": s.status,
+                # BE-HARDEN: the expiry flip runs in the background; never
+                # show a lapsed row as active in between.
+                "status": "expired"
+                if s.status == "active" and s.valid_until and s.valid_until < now
+                else s.status,
                 "source": s.source,
                 "last_seen_at": _iso(seen.get(s.guest_id)) if s.guest_id else None,
                 "circuit_id": s.circuit_id,
@@ -1542,7 +1539,6 @@ class IspPlansService:
         page=1,
         page_size=25,
     ) -> tuple[list[dict], int]:
-        await self.sync_subscribers(isp)
         if isp_customer_id is not None:
             await IspScope.assert_customer(isp, isp_customer_id)
             ids = [isp_customer_id]
@@ -1560,7 +1556,18 @@ class IspPlansService:
         if package_id:
             cond.append(IspSubscriber.package_id == package_id)
         if status:
-            cond.append(IspSubscriber.status == status)
+            now = self._clock()
+            lapsed = and_(
+                IspSubscriber.status == "active",
+                IspSubscriber.valid_until.is_not(None),
+                IspSubscriber.valid_until < now,
+            )
+            if status == "active":
+                cond.append(and_(IspSubscriber.status == "active", ~lapsed))
+            elif status == "expired":
+                cond.append(or_(IspSubscriber.status == "expired", lapsed))
+            else:
+                cond.append(IspSubscriber.status == status)
         if search:
             pattern = f"%{search.strip()}%"
             terms = [
