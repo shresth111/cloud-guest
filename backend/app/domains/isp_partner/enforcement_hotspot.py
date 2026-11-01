@@ -84,6 +84,14 @@ async def _subscriber(db: Any, gs: Any) -> Any:
                     )
                 )
             ).scalar_one_or_none()
+            # A subscriber the ISP created by hand is never linked to its
+            # guest (sync_subscribers links only the ones it creates), so the
+            # JAZE-2 sweep and FUP usage, which read sessions by guest_id,
+            # never saw its hotspot sessions (found on the CHR, ENFORCE-2).
+            # Link it here, once, to the guest that just logged in with its
+            # identifier in this same customer org.
+            if sub is not None and sub.guest_id is None and gs.guest_id is not None:
+                sub.guest_id = gs.guest_id
     return sub
 
 
