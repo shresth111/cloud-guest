@@ -1884,6 +1884,15 @@ class QueueAssignmentProtocol(Protocol):
     ) -> object: ...
 
 
+class NasOnlyUsageCutDispatcherProtocol(Protocol):
+    """Publishes the cloud cut of a NAS-only session over its data cap, off the
+    accounting request. Must return quickly and never raise."""
+
+    async def __call__(
+        self, *, router_id: uuid.UUID | None, session_id: uuid.UUID, reason: str
+    ) -> None: ...
+
+
 class HotspotGateDispatcherProtocol(Protocol):
     """Publishes "open this session's hotspot gate on its router" to the
     background worker. Satisfied by ``tasks.enqueue_hotspot_gate_open``,
@@ -2444,6 +2453,27 @@ async def issue_live_disconnect(
     )
     await _record(True)
     return True
+
+
+async def expire_nas_only_session_over_cap(
+    repository: Any, session: GuestSession, *, reason: str, now: datetime
+) -> GuestSession:
+    """Close a NAS-only session whose device Instant On has confirmed removing.
+    Only ever called after that confirmation: see ``record_usage``."""
+    updated = await repository.update_session(
+        session,
+        {
+            "status": GuestSessionStatus.EXPIRED.value,
+            "ended_at": now,
+            "disconnect_reason": reason,
+            "disconnect_enforced": True,
+        },
+    )
+    logger.info(
+        "guest_usage_cap_reached_nas_only_session_ended_via_cloud",
+        extra={"session_id": str(updated.id), "reason": reason},
+    )
+    return updated
 
 
 def _removals_reported(outcome: object) -> int | None:
@@ -3046,6 +3076,7 @@ class GuestService:
         queue_assignment_hook: QueueAssignmentProtocol | None = None,
         queue_assignment_dispatcher: QueueAssignmentDispatcherProtocol | None = None,
         hotspot_gate_dispatcher: HotspotGateDispatcherProtocol | None = None,
+        nas_only_usage_cut_dispatcher: NasOnlyUsageCutDispatcherProtocol | None = None,
         session_end_hook: LiveSessionTerminatorProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
@@ -3068,6 +3099,7 @@ class GuestService:
         self.queue_assignment_hook = queue_assignment_hook
         self.queue_assignment_dispatcher = queue_assignment_dispatcher
         self.hotspot_gate_dispatcher = hotspot_gate_dispatcher
+        self.nas_only_usage_cut_dispatcher = nas_only_usage_cut_dispatcher
         self.session_end_hook = session_end_hook
         self.policy_lookup = policy_lookup
         # Request-scoped memo for _resolve_session_policy_rules -- see its
@@ -6696,19 +6728,23 @@ class GuestService:
                 if session_cap_reached
                 else f"fup_data_quota_exceeded_{violated_fup_period}"
             )
-            if await self._end_nas_only_session_via_cloud(updated):
-                updated = await self.repository.update_session(
-                    updated,
-                    {
-                        "status": GuestSessionStatus.EXPIRED.value,
-                        "ended_at": now,
-                        "disconnect_reason": reason,
-                        "disconnect_enforced": True,
-                    },
+            #
+            # On the accounting request this is published to the worker
+            # instead of called: rlm_rest waits seconds, an Instant On call can
+            # take 15, and a request that overruns gets no Accounting-Response
+            # (the AP retransmits) while holding a FreeRADIUS worker thread
+            # that MikroTik venues' packets also need. The row stays ACTIVE
+            # until the worker has Instant On's confirmation, and a failed cut
+            # is tried again at the next interim that is still over the cap.
+            if self.nas_only_usage_cut_dispatcher is not None:
+                await self.nas_only_usage_cut_dispatcher(
+                    router_id=updated.router_id,
+                    session_id=updated.id,
+                    reason=reason,
                 )
-                logger.info(
-                    "guest_usage_cap_reached_nas_only_session_ended_via_cloud",
-                    extra={"session_id": str(updated.id), "reason": reason},
+            elif await self._end_nas_only_session_via_cloud(updated):
+                updated = await expire_nas_only_session_over_cap(
+                    self.repository, updated, reason=reason, now=now
                 )
                 return updated
             logger.info(

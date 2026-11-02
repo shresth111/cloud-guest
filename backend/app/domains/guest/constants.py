@@ -690,6 +690,10 @@ ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS = 30
 # Opening the hotspot gate at sign-in -- see ``hotspot_gate``'s module
 # docstring for the measurement and the design.
 # ============================================================================
+#: Takes a NAS-only guest over their data cap off the venue through Instant On
+#: cloud control, from the worker. Not from the accounting request: rlm_rest
+#: gives that request far less time than an Instant On call can take.
+TASK_ENFORCE_NAS_ONLY_USAGE_CUT = "app.domains.guest.tasks.enforce_nas_only_usage_cut"
 TASK_OPEN_HOTSPOT_GATE = "app.domains.guest.tasks.open_hotspot_gate"
 
 # Few and close together. A retry exists for two things only: the sign-in
@@ -993,6 +997,7 @@ __all__ = [
     "TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP",
     "OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
     "TASK_ASSIGN_GUEST_QUEUE",
+    "TASK_ENFORCE_NAS_ONLY_USAGE_CUT",
     "TASK_OPEN_HOTSPOT_GATE",
     "OPEN_HOTSPOT_GATE_MAX_RETRIES",
     "OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS",
