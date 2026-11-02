@@ -10131,11 +10131,27 @@ class RadiusService:
         )
 
         if bytes_uploaded_total is not None or bytes_downloaded_total is not None:
+            # NAS-only: a Stop total is never below what is recorded. The AP's
+            # counters restart on a reconnect onto a reused session, and the
+            # shared listener sends 0 for a Stop without octets; either would
+            # erase the usage the logs already hold.
+            router = await self.router_lookup.get_router(
+                nas_client.router_id, include_deleted=True
+            )
+            keep_recorded = is_nas_only(router)
             update_data: dict[str, object] = {}
             if bytes_uploaded_total is not None:
-                update_data["bytes_uploaded"] = bytes_uploaded_total
+                update_data["bytes_uploaded"] = (
+                    max(bytes_uploaded_total, session.bytes_uploaded)
+                    if keep_recorded
+                    else bytes_uploaded_total
+                )
             if bytes_downloaded_total is not None:
-                update_data["bytes_downloaded"] = bytes_downloaded_total
+                update_data["bytes_downloaded"] = (
+                    max(bytes_downloaded_total, session.bytes_downloaded)
+                    if keep_recorded
+                    else bytes_downloaded_total
+                )
             session = await self.repository.update_session(session, update_data)
 
         if not session.is_active():
@@ -10236,7 +10252,10 @@ class RadiusService:
         guest = await self.repository.get_guest_by_identifier(
             router.organization_id, normalize_identifier(username)
         )
-        if guest is not None and not guest.is_blocked:
+        # A blocked guest at a NAS-only venue is still on the AP until the session
+        # ends: blocking only sets a flag, and authorize refuses them next time.
+        # Their usage and Stop are still facts about their session row.
+        if guest is not None and (not guest.is_blocked or is_nas_only(router)):
             candidate = await self.repository.get_latest_session_for_guest(guest.id)
             if candidate is not None and candidate.router_id == router.id:
                 by_device = await self._session_for_calling_station(
