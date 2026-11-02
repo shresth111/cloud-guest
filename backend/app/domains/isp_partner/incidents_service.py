@@ -55,6 +55,8 @@ RFO_LABEL = {
     "cpe_fault": "Customer device fault",
     "upstream": "Upstream provider",
     "other": "Other",
+    # SMALL-5: set only by the auto-incident job (not offered to staff)
+    "auto_restored": "Power/link restored – auto",
 }
 NO_MATCH = uuid.UUID(int=0)
 

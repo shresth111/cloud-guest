@@ -284,6 +284,28 @@ async def _retry_steps(redis: Any, summary: dict) -> None:
         summary,
     )
 
+    # 7. SMALL-3 win-back saves (no network; one ISP per transaction inside,
+    #    flag ISP_REVENUE_HUB_ENABLED; a failure never blocks the pass).
+    try:
+        from .winback_service import run_winback_saves
+
+        summary["winback_saved"] = (await run_winback_saves()).get("saved", 0)
+    except Exception:  # noqa: BLE001 -- logged, the pass goes on
+        summary["errors"] = summary.get("errors", 0) + 1
+        logger.exception("isp_winback_saves_failed")
+
+    # 8. SMALL-5 auto incidents from router DOWN/UP (no network; one ISP per
+    #    transaction inside; ISP_INCIDENTS_ENABLED + the per-ISP switch).
+    try:
+        from .incident_auto import run_incident_auto
+
+        res = await run_incident_auto()
+        summary["incidents_auto_opened"] = res.get("opened", 0)
+        summary["incidents_auto_resolved"] = res.get("resolved", 0)
+    except Exception:  # noqa: BLE001 -- logged, the pass goes on
+        summary["errors"] = summary.get("errors", 0) + 1
+        logger.exception("isp_incident_auto_failed")
+
 
 class _SystemContext:
     """An ``IspContext`` for the daily job: no human actor, no confinement."""
@@ -473,6 +495,21 @@ async def _billing_daily_one(isp_id: uuid.UUID, redis: Any, summary: dict) -> No
 
     summary["reports"] = summary.get("reports", 0) + int(
         await _own_tx("isp_report_schedules", _reports, summary, isp=isp_id) or 0
+    )
+
+    # 6. SMALL-4 revenue snapshot (MRR history), own transaction + savepoint;
+    #    ISP_REVENUE_HUB_ENABLED off = nothing written.
+    async def _snapshot(session: Any) -> int:
+        from .revenue_snapshot import take_snapshot
+
+        isp = await _system_ctx(session, isp_id)
+        if isp is None:
+            return 0
+        async with session.begin_nested():
+            return int(await take_snapshot(session, isp) is not None)
+
+    summary["revenue_snapshots"] = summary.get("revenue_snapshots", 0) + int(
+        await _own_tx("isp_revenue_snapshot", _snapshot, summary, isp=isp_id) or 0
     )
 
 

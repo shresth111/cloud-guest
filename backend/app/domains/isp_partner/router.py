@@ -1119,6 +1119,10 @@ def _include_lanes() -> None:
     from .revenue_router import revenue_router
 
     isp_partner_router.include_router(revenue_router)
+    # SMALL-3: win-back action log + save rate (same flag as CHURN-RISK).
+    from .winback_router import winback_router
+
+    isp_partner_router.include_router(winback_router)
     # DISCOUNT-WIRE: FE probe for the discount hook (ISP_DISCOUNT_APPLY_ENABLED).
     from .discount_wire_router import discount_wire_router
 
@@ -1213,6 +1217,11 @@ def _include_lanes() -> None:
     from .incidents_router import incidents_router
 
     isp_partner_router.include_router(incidents_router)
+
+    # SMALL-5: auto incidents from router DOWN (/isp/incident-auto, same flag).
+    from .incident_auto_router import incident_auto_router
+
+    isp_partner_router.include_router(incident_auto_router)
 
     # QUEUED-RENEWAL: next plan starts when the current one ends
     # (ISP_QUEUED_RENEWAL_ENABLED).
