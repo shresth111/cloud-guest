@@ -242,7 +242,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from redis.asyncio import Redis
 
@@ -1958,6 +1958,77 @@ AccessTierForGuestLookup = Callable[
 ]
 
 
+#: A guest known to be NAS-only whose connected time can't be read right now:
+#: charge nothing this tick. Falling back to midnight would use up their day.
+SKIP_TIME_ACCRUAL: Final = "skip_time_accrual"
+
+#: ``guest_id -> started_at | SKIP_TIME_ACCRUAL | None``. ``None`` means this
+#: guest accrues as before. Built by ``nas_only_connected_since_lookup``;
+#: injected into the FUP time-accrual sweep.
+ConnectedSinceLookup = Callable[[uuid.UUID], Awaitable[datetime | str | None]]
+
+
+def nas_only_connected_since_lookup(
+    repository: GuestRepositoryProtocol,
+    router_lookup: RouterLookupProtocol,
+) -> ConnectedSinceLookup:
+    """The earliest ``started_at`` of a guest's ACTIVE sessions when all of them
+    run on NAS-only (Aruba Instant On) routers. Build one per sweep.
+
+    ``SKIP_TIME_ACCRUAL`` only with positive evidence of NAS-only: an
+    Accounting-Stop landed after the sweep listed a guest whose latest session
+    is NAS-only, or a NAS-only guest has another session whose vendor can't be
+    read. Every other case is ``None``, the old behaviour, so another vendor can
+    never be skipped.
+
+    A router read earlier in this sweep is remembered. A failed read of a router
+    not yet seen leaves the vendor unknown, and the answer is ``None``, including
+    for a NAS-only guest: nothing else says which vendor it is, and skipping
+    would change other vendors. Never raises."""
+    vendor_is_nas_only: dict[uuid.UUID, bool] = {}
+
+    async def is_on_nas_only_router(session: GuestSession) -> bool | None:
+        router_id = session.router_id
+        if router_id is None:
+            return False
+        if router_id not in vendor_is_nas_only:
+            try:
+                router = await router_lookup.get_router(
+                    router_id, include_deleted=True
+                )
+            except Exception as exc:  # noqa: BLE001 -- see docstring
+                logger.warning(
+                    "connected_since_vendor_unknown",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                return None
+            vendor_is_nas_only[router_id] = is_nas_only(router)
+        return vendor_is_nas_only[router_id]
+
+    async def lookup(guest_id: uuid.UUID) -> datetime | str | None:
+        try:
+            sessions = await repository.list_active_sessions_for_guest(guest_id)
+            if not sessions:
+                latest = await repository.get_latest_session_for_guest(guest_id)
+                if latest is not None and await is_on_nas_only_router(latest):
+                    return SKIP_TIME_ACCRUAL
+                return None
+        except Exception as exc:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                "connected_since_sweep_lookup_failed",
+                extra={"guest_id": str(guest_id), "error": str(exc)},
+            )
+            return None
+        answers = [await is_on_nas_only_router(session) for session in sessions]
+        if False in answers or True not in answers:
+            return None
+        if None in answers:
+            return SKIP_TIME_ACCRUAL
+        return min(session.started_at for session in sessions)
+
+    return lookup
+
+
 def aruba_access_tier_lookup(
     repository: GuestRepositoryProtocol,
     router_lookup: RouterLookupProtocol,
@@ -2009,6 +2080,7 @@ async def run_fup_time_accrual(
     now: datetime,
     terminator: LiveSessionTerminatorProtocol | None = None,
     access_tier_lookup: AccessTierForGuestLookup | None = None,
+    connected_since_lookup: ConnectedSinceLookup | None = None,
 ) -> dict[str, int]:
     """Guest-level FUP time-quota accrual + enforcement, pulled out to
     module scope for the exact same reason ``enforce_session_timeouts``
@@ -2109,6 +2181,13 @@ async def run_fup_time_accrual(
                 )
         if not any(time_limits.values()):
             continue
+        connected_since = (
+            await connected_since_lookup(guest_id)
+            if connected_since_lookup is not None
+            else None
+        )
+        if connected_since == SKIP_TIME_ACCRUAL:
+            continue
         violated_period: str | None = None
         for period_type, limit_minutes in time_limits.items():
             usage = await get_or_reset_quota_usage(
@@ -2120,6 +2199,11 @@ async def run_fup_time_accrual(
                 now=now,
             )
             accrue_from = usage.last_accrued_at or usage.period_start
+            # Aruba Instant On only (the lookup answers None elsewhere): count
+            # time connected, not time since midnight or since their last
+            # visit, either of which uses up the allowance at the first sweep.
+            if isinstance(connected_since, datetime):
+                accrue_from = max(accrue_from, connected_since)
             elapsed_minutes = max(0, int((now - accrue_from).total_seconds() // 60))
             if elapsed_minutes > 0:
                 usage = await repository.update_quota_usage(
@@ -10524,6 +10608,7 @@ class GuestAnalyticsService:
 
 
 __all__ = [
+    "nas_only_connected_since_lookup",
     "GuestService",
     "RadiusService",
     "GuestAnalyticsService",
