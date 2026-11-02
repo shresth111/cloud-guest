@@ -372,6 +372,7 @@ class VoucherService:
         has_manage_permission: bool,
         plan_id: uuid.UUID | None = None,
         series_id: uuid.UUID | None = None,
+        session_timeout_minutes: int | None = None,
     ) -> VoucherBatch:
         validate_quantity(quantity)
         validate_code_length(code_length)
@@ -408,6 +409,7 @@ class VoucherService:
             code_length=code_length,
             code_prefix=code_prefix,
             validity_minutes=validity_minutes,
+            session_timeout_minutes=session_timeout_minutes,
             batch_expires_at=batch_expires_at,
             max_uses_per_voucher=max_uses_per_voucher,
             data_limit_mb=data_limit_mb,
