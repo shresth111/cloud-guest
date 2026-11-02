@@ -579,6 +579,13 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "`agent_managed_only` would make it find nothing, by definition."
     ),
     "app/domains/network_integration/instant_on_repository.py::"
+    "InstantOnRepository.list_sites": (
+        "Joins `routers` only to drop `instant_on_sites` rows whose fleet router "
+        "was deleted, for the Master site list. An Instant On site row exists "
+        "only for a NAS-only router, so this never loads a MikroTik or Omada "
+        "one. `agent_managed_only` would make it find nothing, by definition."
+    ),
+    "app/domains/network_integration/instant_on_repository.py::"
     "InstantOnRepository.list_pollable_sites": (
         "Joins `routers` only to narrow `instant_on_sites` to rows whose fleet "
         "router is live AND `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant "
