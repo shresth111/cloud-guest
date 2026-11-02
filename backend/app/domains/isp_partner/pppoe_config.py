@@ -45,8 +45,8 @@ class IspPppoeSettings(BaseSettings):
         ),
     )
     #: The X2 virtual server's ports on the hub (box-only file).
-    auth_port: int = Field(default=1912)
-    acct_port: int = Field(default=1913)
+    auth_port: int = Field(default=1922)
+    acct_port: int = Field(default=1923)
     #: RouterOS defaults written by the setup-script step; the ISP can
     #: override per router when generating.
     default_local_address: str = Field(default="100.64.0.1")

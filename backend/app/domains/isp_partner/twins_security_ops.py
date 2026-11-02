@@ -65,6 +65,7 @@ from app.domains.content_filtering.schemas import (
     ContentFilterRuleCreateRequest,
     ContentFilterRuleUpdateRequest,
 )
+from app.domains.dhcp.dependencies import get_dhcp_service
 from app.domains.dns_filtering import router as dns_filter_routes
 from app.domains.dns_filtering.dependencies import get_dns_filtering_service
 from app.domains.dns_filtering.schemas import (
@@ -705,7 +706,11 @@ SECURITY_OPS_TWINS: tuple[TwinSpec, ...] = (
             BodyId("location_id", "force_location"),
             BodyId("router_id", "router"),
         ),
-        deps={"service": get_monitored_hardware_service},
+        deps={
+            "service": get_monitored_hardware_service,
+            # Main's static lease for registered hardware (#461).
+            "dhcp_service": get_dhcp_service,
+        },
         inject=_ORG_ACTOR,
         status_code=201,
     ),

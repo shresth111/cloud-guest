@@ -111,6 +111,7 @@ class Fakes:
                 reason=None,
                 last_contacted_at=None,
                 vendor_claim_is_contradicted=False,
+                last_radius_at=None,
             )
             for r in routers
         }

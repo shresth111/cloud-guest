@@ -228,6 +228,8 @@ MAINSYNC_TWINS: tuple[TwinSpec, ...] = (
         path="/venue/guest-sessions/{session_id}/terminate",
         permission_key=ISP_ACCESS_EXECUTE,
         handler=guest_routes.terminate_guest_session,
+        # The original route is exempt from the lapsed-licence write check.
+        paid_write=False,
         # F2: the original returns this as a plain, unmasked str.
         redact_fields=("guest_identifier",),
         target="header_location",

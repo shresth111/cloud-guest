@@ -763,6 +763,8 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
             _PageSize,
             Param("start_date", "query", datetime | None, None),
             Param("end_date", "query", datetime | None, None),
+            # Main's per-AP filter (Aruba multi-AP guest list).
+            Param("ap_mac", "query", str | None, None),
         ),
         extras=(_RouterQuery,),
         deps={"service": get_guest_service},
@@ -908,6 +910,11 @@ VENUE_TWINS: tuple[TwinSpec, ...] = (
         inject={
             "organization_id": ("org",),
             "location_id": ("location",),
+            # Main's guest-funnel parameters: a console read is not a guest
+            # opening the portal, so it never records an impression.
+            "record_impression": ("const", None),
+            "router_id": ("const", None),
+            "device_mac": ("const", None),
         },
     ),
     # -- Access Rules (policies) ---------------------------------------------
