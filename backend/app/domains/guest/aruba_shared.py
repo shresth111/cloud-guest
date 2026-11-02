@@ -88,6 +88,11 @@ CALLED_STATION_ID_HEADER = "X-RADIUS-Called-Station-Id"
 
 #: The only NAS-Identifier shape the shared listener resolves: what
 #: ``register_public_radius_nas`` / ``register_shared_radius_nas`` mint.
+#: Deliberately not widened to ``cg-<8hex>``, the shape every MikroTik NAS
+#: carries: every Aruba customer holds this listener's RADIUS secret, and this
+#: is what stops their packets even reaching a lookup of another vendor's NAS.
+#: A row with any other identifier is reported, not resolved: see
+#: ``shared_listener_accepts_identifier``.
 ARUBA_NAS_IDENTIFIER_RE = re.compile(r"^cg-aruba-[0-9a-f]{8}$")
 
 #: Domain-separation label of the backend-secret derivation. Must match
@@ -493,6 +498,13 @@ def would_be_nas_identifier(router_id: uuid.UUID) -> str:
     return f"cg-aruba-{str(router_id)[:8]}"
 
 
+def shared_listener_accepts_identifier(nas_identifier: str | None) -> bool:
+    """Would ``resolve_shared_nas`` accept this identifier's shape? For anything
+    that shows ops an identifier to type into Instant On: a row the listener
+    would refuse must not be presented as ready."""
+    return bool(ARUBA_NAS_IDENTIFIER_RE.match((nas_identifier or "").strip()))
+
+
 __all__ = [
     "ARUBA_NAS_IDENTIFIER_RE",
     "ApRegistry",
@@ -514,5 +526,6 @@ __all__ = [
     "recorded_ap_mac",
     "resolve_shared_nas",
     "rotate_shared_secret",
+    "shared_listener_accepts_identifier",
     "would_be_nas_identifier",
 ]

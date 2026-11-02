@@ -815,6 +815,113 @@ class TestMasterRoutes:
         }
         assert SECRET not in json.dumps(data)
 
+    async def test_view_does_not_present_an_identifier_the_resolver_refuses(
+        self, monkeypatch
+    ) -> None:  # noqa: ANN001
+        """Live failure: a bare ``cg-<8hex>`` row showed gaps=[] and
+        available=true, while the AP's every Access-Request was rejected as
+        ``nas_identifier_malformed``."""
+        from app.domains.guest import router as guest_router
+
+        monkeypatch.setattr(
+            guest_router, "_aruba_shared_store", lambda s: _store_with(SECRET)
+        )
+        monkeypatch.setattr(
+            guest_router,
+            "get_settings",
+            lambda: SimpleNamespace(
+                hub_radius_aruba_shared_agent_url="http://agent/radius/shared-client",
+                hub_radius_public_address="13.207.123.212",
+                aruba_shared_radius_auth_port=1912,
+                aruba_shared_radius_acct_port=1913,
+            ),
+        )
+        router = _router()
+        bad = _nas(router, ident="cg-9e6069de")
+        assert (
+            await _reason(nas_id=bad.nas_identifier)
+            == SharedRejectReason.NAS_IDENTIFIER_MALFORMED
+        )
+        view = await guest_router._shared_listener_view(
+            FakeRadiusService(router, bad), router, bad
+        )
+        assert view.gaps == ["nas_identifier_not_accepted"]
+        assert view.available is False
+        good = await guest_router._shared_listener_view(
+            FakeRadiusService(router, None), router, _nas(router)
+        )
+        assert good.gaps == [] and good.available is True
+
+    async def test_register_shared_refuses_an_existing_unresolvable_identifier(
+        self,
+    ) -> None:
+        from app.domains.guest import router as guest_router
+        from app.domains.guest.exceptions import PublicNasRegistrationRefusedError
+
+        router = _router()
+        registered: list[dict] = []
+
+        class Svc(FakeRadiusService):
+            async def list_nas_clients(self, **_: Any):  # noqa: ANN202
+                return [_nas(router, ident="cg-9e6069de")], None
+
+            async def register_nas(self, **kw: Any):  # noqa: ANN202
+                registered.append(kw)
+                raise AssertionError("an existing row is never re-registered")
+
+        with pytest.raises(PublicNasRegistrationRefusedError) as exc:
+            await guest_router.register_shared_radius_nas(
+                _http({}),
+                router.id,
+                user=SimpleNamespace(id=str(uuid.uuid4())),
+                service=Svc(router, None),
+            )
+        assert NAS_ID in exc.value.message and "cg-9e6069de" in exc.value.message
+        assert registered == []
+
+    @pytest.mark.parametrize(
+        ("vendor", "expected"),
+        [("aruba_instant_on", NAS_ID), ("mikrotik", "cg-9e6069de")],
+    )
+    async def test_register_external_mints_the_shape_the_vendor_needs(
+        self, monkeypatch, vendor: str, expected: str
+    ) -> None:  # noqa: ANN001
+        """The generic path is the one that minted the bad row. MikroTik keeps
+        its identifier byte for byte: its hub stanzas are keyed on it."""
+        from app.domains.guest import router as guest_router
+
+        router = _router(vendor=vendor)
+        registered: list[dict] = []
+
+        class Stop(Exception):
+            pass
+
+        class Svc(FakeRadiusService):
+            async def list_nas_clients(self, **_: Any):  # noqa: ANN202
+                return [], None
+
+            async def register_nas(self, **kw: Any):  # noqa: ANN202
+                registered.append(kw)
+                raise Stop  # the identifier is all this test is about
+
+        class Peers:
+            async def get_peer(self, **_: Any):  # noqa: ANN202
+                return SimpleNamespace(tunnel_ip_address="10.20.0.8")
+
+        with pytest.raises(Stop):
+            await guest_router.register_external_radius_nas(
+                _http({}),
+                router.id,
+                user=SimpleNamespace(id=str(uuid.uuid4())),
+                requesting_organization_id=None,
+                service=Svc(router, None),
+                wireguard_service=Peers(),
+            )
+        assert registered[0]["nas_identifier"] == expected
+        # An Aruba row minted here must be one the shared listener resolves.
+        if vendor == "aruba_instant_on":
+            assert aruba_shared.shared_listener_accepts_identifier(expected)
+
 
 @pytest.mark.parametrize(
     ("mac", "placeholder"),

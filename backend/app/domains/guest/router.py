@@ -84,6 +84,7 @@ from .aruba_shared import (
     recorded_ap_mac,
     resolve_shared_nas,
     rotate_shared_secret,
+    shared_listener_accepts_identifier,
     would_be_nas_identifier,
 )
 from .constants import (
@@ -2374,10 +2375,19 @@ async def register_external_radius_nas(
             result.shared_secret,
         )
 
+    # A NAS-only row gets the shape the shared Aruba listener resolves: its
+    # resolver refuses a bare `cg-<8hex>` before looking anything up.
+    from app.domains.router.vendor_capabilities import is_nas_only
+
+    router_row = await service.router_lookup.get_router(router_id)
     result = await service.register_nas(
         actor_user_id=uuid.UUID(user.id),
         router_id=router_id,
-        nas_identifier=f"cg-{str(router_id)[:8]}",
+        nas_identifier=(
+            would_be_nas_identifier(router_id)
+            if is_nas_only(router_row)
+            else f"cg-{str(router_id)[:8]}"
+        ),
         requesting_organization_id=requesting_organization_id,
     )
 
@@ -2848,6 +2858,8 @@ async def _shared_listener_view(
         gaps.append("hub_not_confirmed")
     if nas_client is None:
         gaps.append("nas_not_registered")
+    elif not shared_listener_accepts_identifier(nas_client.nas_identifier):
+        gaps.append("nas_identifier_not_accepted")
     ap_mac = recorded_ap_mac(router)
     # ``routers.mac_address`` is NOT NULL: a site added without its AP's MAC
     # carries a minted, locally administered one. Say so, rather than show
@@ -2985,8 +2997,13 @@ async def register_shared_radius_nas(
     covers it, and the backend binds it to the device's AP MAC.
 
     Idempotent: a device that already has a NAS row (registered by public
-    IP, say) keeps it -- its identifier works on both listeners at once.
-    Refused unless the device has a recorded AP MAC: without one there is
+    IP, say) keeps it, and a ``cg-aruba-<8hex>`` identifier works on both
+    listeners at once. Any other identifier (a bare ``cg-<8hex>`` from the
+    generic path) is refused: the shared listener rejects it as malformed,
+    so calling that device ready would leave every guest with a Wyfy session
+    and no internet.
+
+    Also refused unless the device has a recorded AP MAC: without one there is
     nothing to bind the packets to. The minted, locally administered MAC a
     site added without one carries (``routers.mac_address`` is NOT NULL)
     counts as none -- no real AP would ever present it.
@@ -3010,6 +3027,15 @@ async def register_shared_radius_nas(
         requesting_organization_id=None, router_id=router_id, page=1, page_size=1
     )
     nas_client = existing[0] if existing else None
+    if nas_client is not None and not shared_listener_accepts_identifier(
+        nas_client.nas_identifier
+    ):
+        raise PublicNasRegistrationRefusedError(
+            f"This device's NAS-Identifier {nas_client.nas_identifier} is not "
+            "one the shared Aruba listener accepts, so every sign-in would be "
+            f"rejected. It needs to be {would_be_nas_identifier(router_id)}, "
+            "here and in Instant On."
+        )
     if nas_client is None:
         registration = await service.register_nas(
             actor_user_id=uuid.UUID(user.id),
