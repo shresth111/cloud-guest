@@ -866,6 +866,7 @@ class MarketingService:
             if audience.not_seen_for_days
             else None,
             require_name=audience.require_name,
+            guest_ids=audience.guest_ids,
         )
 
     async def evaluate_audience(
@@ -909,6 +910,14 @@ class MarketingService:
         preview = {
             "channel": channel.value,
             "matched_guests": counts.matched,
+            # Picked by hand but outside these filters, or not this
+            # organization's. Counted the same either way, so it says nothing
+            # about whether an id exists elsewhere.
+            "selected_outside_filters": (
+                len(set(audience.guest_ids)) - counts.matched
+                if audience.guest_ids
+                else 0
+            ),
             "reachable": len(reachable),
             "excluded": excluded,
             "capped": len(reachable) > limit,
@@ -933,6 +942,45 @@ class MarketingService:
             scope.organization_id, audience.channel
         )
         return preview
+
+    async def audience_candidates(
+        self,
+        scope: CallerScope,
+        audience: AudienceFilter,
+        *,
+        search: str | None,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        """The guests who could really be messaged under this filter, masked,
+        most recently seen first. The same evaluation as a send, so nobody
+        without consent is ever offered for picking."""
+        _, reachable = await self.evaluate_audience(
+            scope, audience.model_copy(update={"guest_ids": None})
+        )
+        needle = (search or "").strip().casefold()
+        if needle:
+            reachable = [
+                (candidate, address)
+                for candidate, address in reachable
+                if needle in (candidate.display_name or "").casefold()
+            ]
+        start = (page - 1) * page_size
+        return {
+            "items": [
+                {
+                    "guest_id": str(candidate.guest_id),
+                    "display_name": candidate.display_name,
+                    "masked_address": mask_address(audience.channel, address),
+                    "last_seen_at": utc_iso(candidate.last_seen_at),
+                    "total_visit_count": candidate.total_visit_count,
+                }
+                for candidate, address in reachable[start : start + page_size]
+            ],
+            "total": len(reachable),
+            "page": page,
+            "page_size": page_size,
+        }
 
     async def _credit_estimate(
         self, organization_id: uuid.UUID, channel: Channel
@@ -3008,6 +3056,29 @@ class MarketingService:
                 )
                 failed += 1
                 await self._settle_credits(campaign)
+                continue
+            except Exception:  # noqa: BLE001
+                # One campaign that cannot start must not stop every other
+                # due campaign, on this beat and on all the later ones, with
+                # nothing on screen. It fails visibly instead.
+                logger.exception(
+                    "marketing_dispatch_campaign_failed",
+                    extra={"campaign_id": str(campaign_id)},
+                )
+                await self.repository.rollback()
+                stuck = await self.repository.get_campaign_for_worker(campaign_id)
+                if stuck is not None and await self.repository.update_campaign_cas(
+                    stuck,
+                    expected_status=stuck.status,
+                    data={
+                        "status": CampaignStatus.FAILED.value,
+                        "completed_at": now,
+                        "last_error": "dispatch_failed",
+                    },
+                ):
+                    await self._settle_credits(stuck)
+                await self.repository.commit()
+                failed += 1
                 continue
             await self.repository.commit()
             self._enqueue(campaign.id, 0)

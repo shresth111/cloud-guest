@@ -60,6 +60,7 @@ class AudienceCriteria:
     max_visits: int | None
     last_seen_before: datetime | None
     require_name: bool
+    guest_ids: list[uuid.UUID] | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,9 @@ class MarketingRepository:
 
     async def commit(self) -> None:
         await self.session.commit()
+
+    async def rollback(self) -> None:
+        await self.session.rollback()
 
     async def flush(self) -> None:
         await self.session.flush()
@@ -460,6 +464,8 @@ class MarketingRepository:
             Guest.organization_id == criteria.organization_id,
             Guest.is_deleted.is_(False),
         )
+        if criteria.guest_ids is not None:
+            statement = statement.where(Guest.id.in_(criteria.guest_ids))
         if (
             criteria.location_ids is not None
             or criteria.visited_from is not None
