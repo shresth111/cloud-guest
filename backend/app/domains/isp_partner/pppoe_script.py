@@ -13,7 +13,7 @@ What it writes:
                            only-one=yes (no when the ISP sells multi-device
                            PPPoE packages and enforcement is on), change-tcp-mss)
   /ppp aaa                 use-radius=yes accounting=yes interim-update
-  /radius                  service=ppp -> hub tunnel IP, ports 1912/1913 (X2),
+  /radius                  service=ppp -> hub tunnel IP, ports 1922/1923 (X2),
                            the router's existing NAS secret, the tunnel source
   /interface pppoe-server  server on the chosen interface, chap/mschap2/pap,
                            one-session-per-host

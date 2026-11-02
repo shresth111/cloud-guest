@@ -163,8 +163,8 @@ def test_pppoe_script_only_one_token():
         hub_tunnel_ip="10.66.0.1",
         router_tunnel_ip="10.66.0.5",
         nas_secret="s3cret",
-        auth_port=1912,
-        acct_port=1913,
+        auth_port=1922,
+        acct_port=1923,
         interim_seconds=300,
     )
     default = render_pppoe_script(p)

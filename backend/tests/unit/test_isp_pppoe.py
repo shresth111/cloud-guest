@@ -275,8 +275,8 @@ def _params(**kw):
         hub_tunnel_ip="10.66.0.1",
         router_tunnel_ip="10.66.0.2",
         nas_secret='se"c$ret',
-        auth_port=1912,
-        acct_port=1913,
+        auth_port=1922,
+        acct_port=1923,
         interim_seconds=300,
     )
     base.update(kw)
@@ -288,7 +288,7 @@ def test_script_shape_and_quoting():
     assert (
         "/radius add service=ppp address=10.66.0.1 src-address=10.66.0.2 "
         'secret="se\\"c\\$ret" '
-        "authentication-port=1912 accounting-port=1913" in text
+        "authentication-port=1922 accounting-port=1923" in text
     )
     assert "/ppp aaa set use-radius=yes accounting=yes interim-update=5m" in text
     assert "authentication=pap,chap,mschap2 one-session-per-host=yes" in text

@@ -1,8 +1,9 @@
 # ISP PPPoE on our RADIUS: X2 virtual server (TEST BOX ONLY)
 
 This is exception X2, approved by the founder in ADDENDUM_02 §5. It adds a new
-FreeRADIUS virtual server on its own ports (auth 1912, acct 1913) for PPPoE
-subscribers of ISP customers.
+FreeRADIUS virtual server on its own ports (auth 1922, acct 1923) for PPPoE
+subscribers of ISP customers. (1912/1913 belong to the shared Aruba Instant On
+listener, `sites-aruba-shared.conf`; founder moved X2 off them 2026-11-02.)
 
 What it leaves alone:
 - `sites-available/default`
@@ -28,10 +29,10 @@ sudo sed "s/__PPPOE_REST_SECRET__/$SECRET/" wyfy-isp-pppoe | sudo install -m 064
 sudo ln -sf ../mods-available/rest_isp_pppoe /etc/freeradius/3.0/mods-enabled/rest_isp_pppoe
 sudo ln -sf ../sites-available/wyfy-isp-pppoe /etc/freeradius/3.0/sites-enabled/wyfy-isp-pppoe
 sudo radiusd -XC          # must say "Configuration appears to be OK"
-# firewall: allow 1912/1913 on wg0 + lo only, the same as 1812/1813.
+# firewall: allow 1922/1923 on wg0 + lo only, the same as 1812/1813.
 # Add these to wyfy-test-hub-firewall.service's rules; do not open them in the SG.
-sudo iptables -I INPUT -i wg0 -p udp -m multiport --dports 1912,1913 -j ACCEPT
-sudo iptables -I INPUT -i lo  -p udp -m multiport --dports 1912,1913 -j ACCEPT
+sudo iptables -I INPUT -i wg0 -p udp -m multiport --dports 1922,1923 -j ACCEPT
+sudo iptables -I INPUT -i lo  -p udp -m multiport --dports 1922,1923 -j ACCEPT
 # backend.env
 echo "ISP_PPPOE_ENABLED=true" | sudo tee -a /home/ubuntu/deploy/backend.env
 echo "ISP_PPPOE_REST_SECRET=$SECRET" | sudo tee -a /home/ubuntu/deploy/backend.env
@@ -53,12 +54,12 @@ sudo systemctl restart freeradius
    password, which is shown once.
 2. From the e2e router's netns (tunnel IP + NAS secret in
    `/root/hub-verify-*.json`), test the three auth types:
-   - `radtest -t pap  <user> <pw> 10.66.0.1:1912 0 <nas-secret>` → Access-Accept with `Mikrotik-Rate-Limit`
+   - `radtest -t pap  <user> <pw> 10.66.0.1:1922 0 <nas-secret>` → Access-Accept with `Mikrotik-Rate-Limit`
    - `radtest -t chap ...` → Accept
    - `radtest -t mschap ...` → Accept
    - a wrong password → Reject
    - `Reply-Message wyfy:<reason>` for each reject case
-3. Send `radclient` Accounting Start, Interim and Stop to `:1913`. Each
+3. Send `radclient` Accounting Start, Interim and Stop to `:1923`. Each
    should produce or update an `isp_pppoe_sessions` row, and the bytes should
    show under `GET /isp/pppoe/sessions`.
 4. The default server must not change: a hotspot authorize on 1812 still
