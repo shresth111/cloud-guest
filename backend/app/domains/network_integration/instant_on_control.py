@@ -475,6 +475,8 @@ class VenueGuestNetworkSpeed:
     #: A network-wide limit set in the Instant On app. Not a per-device cap, so
     #: "no limit" would be false, and writing would silently replace it.
     other_mode_limit: bool = False
+    network_download_mbps: int | None = None
+    network_upload_mbps: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,7 +493,7 @@ class VenueGuestSpeed:
     * ``failed`` -- Instant On answered, but not with what was asked
       (``reason`` is the error code, e.g. ``write_not_confirmed``).
 
-    Carries no network secret: only the six fields above per network, so
+    Carries no network secret: only the eight fields above per network, so
     the PSK and RADIUS secret that ``networksSummary`` returns can never
     reach a response or a log through this type.
     """
@@ -511,6 +513,8 @@ def _network_speed(limit: Any) -> VenueGuestNetworkSpeed:
         download_mbps=limit.download_mbps,
         upload_mbps=limit.upload_mbps,
         other_mode_limit=limit.other_mode_limit,
+        network_download_mbps=limit.network_download_mbps,
+        network_upload_mbps=limit.network_upload_mbps,
     )
 
 

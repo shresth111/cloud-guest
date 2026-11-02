@@ -203,6 +203,8 @@ def _venue_speed_payload(result: Any) -> dict[str, Any]:
             "download_mbps": n.download_mbps,
             "upload_mbps": n.upload_mbps,
             "other_mode_limit": n.other_mode_limit,
+            "network_download_mbps": n.network_download_mbps,
+            "network_upload_mbps": n.network_upload_mbps,
         }
 
     return InstantOnVenueGuestSpeedResponse(

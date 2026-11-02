@@ -817,7 +817,11 @@ class TestVenueGuestSpeed:
         self, monkeypatch
     ) -> None:  # noqa: ANN001
         site = FakeSite()
-        self._hold(site, down=50, up=50, mode="perNetwork")
+        self._hold(site, down=1000, up=1000, mode="perNetwork")
+        site.network["qos"].update(
+            perNetworkDownstreamBandwidthLimitInMbps=50,
+            perNetworkUpstreamBandwidthLimitInMbps=20,
+        )
         self._wire(monkeypatch, site)
         result = await self._set(10, 10)
         assert result.status == "failed"
@@ -825,6 +829,8 @@ class TestVenueGuestSpeed:
         assert site.writes() == []
         held = result.networks[0]
         assert held.other_mode_limit is True and held.enabled is False
+        assert (held.network_download_mbps, held.network_upload_mbps) == (50, 20)
+        assert (held.download_mbps, held.upload_mbps) == (None, None)
 
     async def test_a_per_client_network_is_not_flagged(self, monkeypatch) -> None:  # noqa: ANN001
         site = FakeSite()
@@ -845,4 +851,6 @@ class TestVenueGuestSpeed:
             "download_mbps",
             "upload_mbps",
             "other_mode_limit",
+            "network_download_mbps",
+            "network_upload_mbps",
         }

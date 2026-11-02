@@ -151,9 +151,13 @@ class GuestNetworkRateLimit:
     #: ``type == "guest"`` or the guest portal is on for it (measured fields).
     is_guest: bool = False
     #: A limit is on, but in a mode other than ``perClient`` (the portal's
-    #: "Usage Controlled By: Network"). Its value lives in fields not captured
-    #: yet, so ``enabled`` and the speeds above cannot describe it.
+    #: "Usage Controlled By: Network"). Its value is
+    #: a network total, so ``enabled`` and the speeds above cannot describe it.
     other_mode_limit: bool = False
+    #: ``qos.perNetworkDownstream/UpstreamBandwidthLimitInMbps``, read only.
+    #: Per SSID, not per venue. Nothing here writes this mode.
+    network_download_mbps: int | None = None
+    network_upload_mbps: int | None = None
 
     @classmethod
     def from_network(cls, network: dict[str, Any]) -> GuestNetworkRateLimit:
@@ -180,7 +184,32 @@ class GuestNetworkRateLimit:
                 network.get("type") == "guest" or network.get("isGuestPortalEnabled")
             ),
             other_mode_limit=enabled and not per_client,
+            network_download_mbps=_network_total(
+                qos,
+                enabled,
+                "isDownloadBandwidthLimitEnabled",
+                "perNetworkDownstreamBandwidthLimitInMbps",
+            ),
+            network_upload_mbps=_network_total(
+                qos,
+                enabled,
+                "isUploadBandwidthLimitEnabled",
+                "perNetworkUpstreamBandwidthLimitInMbps",
+            ),
         )
+
+
+def _network_total(
+    qos: dict[str, Any], enabled: bool, flag: str, field: str
+) -> int | None:
+    if (
+        not enabled
+        or qos.get("bandwidthLimitMode") != "perNetwork"
+        or not qos.get(flag)
+    ):
+        return None
+    value = qos.get(field)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _utcnow() -> datetime:

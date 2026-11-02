@@ -257,10 +257,12 @@ class InstantOnVenueGuestNetwork(BaseModel):
     download_mbps: int | None = None
     upload_mbps: int | None = None
     other_mode_limit: bool = False
+    network_download_mbps: int | None = None
+    network_upload_mbps: int | None = None
 
 
 class InstantOnVenueGuestSpeedResponse(BaseModel):
-    """Never carries a network secret: six fields per network, nothing else."""
+    """Never carries a network secret: eight fields per network, nothing else."""
 
     source: Literal["instant_on"] = "instant_on"
     status: Literal["ok", "applied", "unavailable", "failed"]
