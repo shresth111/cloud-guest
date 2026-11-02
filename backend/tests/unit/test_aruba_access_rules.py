@@ -22,6 +22,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -385,6 +386,11 @@ class TestTimeoutsReachTheAccessPoint:
 # ============================================================================
 
 
+class _BrokenRouterLookup:
+    async def get_router(self, *_: object, **__: object) -> None:
+        raise RuntimeError("boom")
+
+
 class TestDailyTimeAccrualStart:
     """The sweep is what writes ``minutes_used``. Accruing from midnight, or from
     the guest's last visit, used up the allowance at the first sweep."""
@@ -496,24 +502,83 @@ class TestDailyTimeAccrualStart:
 
         assert await self._minutes_or_zero(fx, result.guest.id) == 0
 
-    async def test_a_lookup_failure_never_charges_from_midnight(self) -> None:
+    async def test_a_failed_read_of_a_known_aruba_router_never_charges_from_midnight(
+        self,
+    ) -> None:
         fx = _fixture(policy_lookup=self._lookup())
         result = await _sign_in(fx)
+        real = fx.guest_service.router_lookup
 
-        class Broken:
-            async def get_router(self, *_: object, **__: object) -> None:
-                raise RuntimeError("boom")
+        class FailsAfterFirstRead:
+            calls = 0
+
+            async def get_router(self, *args: object, **kwargs: object):  # noqa: ANN201
+                FailsAfterFirstRead.calls += 1
+                if FailsAfterFirstRead.calls > 1:
+                    raise RuntimeError("boom")
+                return await real.get_router(*args, **kwargs)
+
+        since = nas_only_connected_since_lookup(fx.repository, FailsAfterFirstRead())
+        await since(result.guest.id)
 
         await run_fup_time_accrual(
             fx.repository,
             self._lookup(),
             now=result.session.started_at + timedelta(minutes=10),
-            connected_since_lookup=nas_only_connected_since_lookup(
-                fx.repository, Broken()
-            ),
+            connected_since_lookup=since,
         )
 
-        assert await self._minutes_or_zero(fx, result.guest.id) == 0
+        assert await self._minutes_or_zero(fx, result.guest.id) == 10
+
+    async def test_an_unknown_vendor_keeps_the_old_count_even_at_aruba(self) -> None:
+        """Known limit, on purpose: with the only vendor read failing, nothing
+        says this is Aruba, and skipping would change other vendors."""
+        fx = _fixture(policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+        since = nas_only_connected_since_lookup(fx.repository, _BrokenRouterLookup())
+
+        assert await since(result.guest.id) is None
+
+    @pytest.mark.parametrize("vendor", ["mikrotik", "tplink_omada"])
+    @pytest.mark.parametrize("break_", ["router", "sessions"])
+    async def test_other_vendors_are_never_skipped_when_a_read_fails(
+        self, vendor: str, break_: str
+    ) -> None:
+        fx = _fixture(vendor=vendor, policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+        started = result.session.started_at
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=started,
+        )
+        await fx.repository.update_quota_usage(
+            usage, {"last_accrued_at": started - timedelta(hours=3)}
+        )
+        routers = fx.guest_service.router_lookup
+
+        async def boom(*_: object, **__: object) -> None:
+            raise RuntimeError("boom")
+
+        if break_ == "router":
+            routers = _BrokenRouterLookup()
+        since = nas_only_connected_since_lookup(fx.repository, routers)
+        if break_ == "sessions":
+            # Only the lookup's read fails; the sweep's own reads must still work.
+            answer_repo = SimpleNamespace(list_active_sessions_for_guest=boom)
+            since = nas_only_connected_since_lookup(answer_repo, routers)
+
+        await run_fup_time_accrual(
+            fx.repository,
+            self._lookup(),
+            now=started + timedelta(minutes=10),
+            connected_since_lookup=since,
+        )
+
+        assert await self._minutes(fx, result.guest.id) == 190
 
     @pytest.mark.parametrize("vendor", ["mikrotik", "tplink_omada"])
     async def test_other_vendors_keep_their_count_through_the_same_race(

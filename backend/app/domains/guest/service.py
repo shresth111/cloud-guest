@@ -1958,14 +1958,13 @@ AccessTierForGuestLookup = Callable[
 ]
 
 
-#: A NAS-only guest whose connected time can't be read right now: charge nothing
-#: this tick. Time connected only ever under-counts this way, while falling back
-#: to midnight would use up their whole day.
+#: A guest known to be NAS-only whose connected time can't be read right now:
+#: charge nothing this tick. Falling back to midnight would use up their day.
 SKIP_TIME_ACCRUAL: Final = "skip_time_accrual"
 
 #: ``guest_id -> started_at | SKIP_TIME_ACCRUAL | None``. ``None`` means this
-#: guest is not NAS-only and accrues as before. Built by
-#: ``nas_only_connected_since_lookup``; injected into the FUP time-accrual sweep.
+#: guest accrues as before. Built by ``nas_only_connected_since_lookup``;
+#: injected into the FUP time-accrual sweep.
 ConnectedSinceLookup = Callable[[uuid.UUID], Awaitable[datetime | str | None]]
 
 
@@ -1974,38 +1973,58 @@ def nas_only_connected_since_lookup(
     router_lookup: RouterLookupProtocol,
 ) -> ConnectedSinceLookup:
     """The earliest ``started_at`` of a guest's ACTIVE sessions when all of them
-    run on NAS-only (Aruba Instant On) routers. ``None`` for anyone else,
-    including a guest also online on another vendor, so those guests accrue
-    exactly as before.
+    run on NAS-only (Aruba Instant On) routers. Build one per sweep.
 
-    ``SKIP_TIME_ACCRUAL`` when the answer is unavailable: an Accounting-Stop
-    landed after the sweep listed a guest whose latest session is NAS-only, or
-    the lookup failed. Never raises."""
+    ``SKIP_TIME_ACCRUAL`` only with positive evidence of NAS-only: an
+    Accounting-Stop landed after the sweep listed a guest whose latest session
+    is NAS-only, or a NAS-only guest has another session whose vendor can't be
+    read. Every other case is ``None``, the old behaviour, so another vendor can
+    never be skipped.
 
-    async def is_on_nas_only_router(session: GuestSession) -> bool:
-        if session.router_id is None:
+    A router read earlier in this sweep is remembered. A failed read of a router
+    not yet seen leaves the vendor unknown, and the answer is ``None``, including
+    for a NAS-only guest: nothing else says which vendor it is, and skipping
+    would change other vendors. Never raises."""
+    vendor_is_nas_only: dict[uuid.UUID, bool] = {}
+
+    async def is_on_nas_only_router(session: GuestSession) -> bool | None:
+        router_id = session.router_id
+        if router_id is None:
             return False
-        router = await router_lookup.get_router(session.router_id, include_deleted=True)
-        return is_nas_only(router)
+        if router_id not in vendor_is_nas_only:
+            try:
+                router = await router_lookup.get_router(
+                    router_id, include_deleted=True
+                )
+            except Exception as exc:  # noqa: BLE001 -- see docstring
+                logger.warning(
+                    "connected_since_vendor_unknown",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                return None
+            vendor_is_nas_only[router_id] = is_nas_only(router)
+        return vendor_is_nas_only[router_id]
 
     async def lookup(guest_id: uuid.UUID) -> datetime | str | None:
         try:
             sessions = await repository.list_active_sessions_for_guest(guest_id)
             if not sessions:
                 latest = await repository.get_latest_session_for_guest(guest_id)
-                if latest is None or await is_on_nas_only_router(latest):
+                if latest is not None and await is_on_nas_only_router(latest):
                     return SKIP_TIME_ACCRUAL
                 return None
-            for session in sessions:
-                if not await is_on_nas_only_router(session):
-                    return None
-            return min(session.started_at for session in sessions)
         except Exception as exc:  # noqa: BLE001 -- see docstring
             logger.warning(
                 "connected_since_sweep_lookup_failed",
                 extra={"guest_id": str(guest_id), "error": str(exc)},
             )
+            return None
+        answers = [await is_on_nas_only_router(session) for session in sessions]
+        if False in answers or True not in answers:
+            return None
+        if None in answers:
             return SKIP_TIME_ACCRUAL
+        return min(session.started_at for session in sessions)
 
     return lookup
 
