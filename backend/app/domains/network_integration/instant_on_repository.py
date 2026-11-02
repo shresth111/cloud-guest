@@ -119,9 +119,18 @@ class InstantOnRepository:
         return (await self.session.execute(statement)).scalars().first()
 
     async def list_sites(self, *, limit: int) -> list[InstantOnSite]:
+        """Sites whose fleet router still exists. Deleting a router leaves its
+        site row behind, so without the join a re-added AP lists twice, the
+        dead row first, under the same Instant On site id."""
+        from app.domains.router.models import Router
+
         statement = (
             select(InstantOnSite)
-            .where(InstantOnSite.is_deleted.is_(False))
+            .join(Router, Router.id == InstantOnSite.router_id)
+            .where(
+                InstantOnSite.is_deleted.is_(False),
+                Router.is_deleted.is_(False),
+            )
             .order_by(InstantOnSite.created_at.asc())
             .limit(limit)
         )
