@@ -103,6 +103,7 @@ from .service import (
     enforce_open_hours_online_guests,
     enforce_session_timeouts,
     enforce_whitelist_only_online_guests,
+    nas_only_connected_since_lookup,
     reconcile_sessions_with_router_presence,
     refresh_session_activity_from_router,
     run_fup_time_accrual,
@@ -226,6 +227,9 @@ async def _run_fup_time_accrual_sweep_async() -> dict[str, int]:
                 # Access Tier daily limits, Aruba Instant On only.
                 access_tier_lookup=aruba_access_tier_lookup(
                     repository, _build_router_lookup(session), policy_service
+                ),
+                connected_since_lookup=nas_only_connected_since_lookup(
+                    repository, _build_router_lookup(session)
                 ),
             )
             await session.commit()

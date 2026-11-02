@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -36,7 +36,11 @@ from app.domains.guest.exceptions import (
     GuestDeviceLimitExceededError,
     VenueClosedError,
 )
-from app.domains.guest.service import get_or_reset_quota_usage
+from app.domains.guest.service import (
+    get_or_reset_quota_usage,
+    nas_only_connected_since_lookup,
+    run_fup_time_accrual,
+)
 from app.domains.guest.validators import canonicalize_calling_station_id
 from app.domains.guest_access.exceptions import (
     GuestAccessDeniedError,
@@ -379,6 +383,107 @@ class TestTimeoutsReachTheAccessPoint:
 # ============================================================================
 # Max daily session (FUP time) -- sign-in AND Session-Timeout
 # ============================================================================
+
+
+class TestDailyTimeAccrualStart:
+    """The sweep is what writes ``minutes_used``. Accruing from midnight, or from
+    the guest's last visit, used up the allowance at the first sweep."""
+
+    def _lookup(self) -> _PolicyLookup:
+        return _PolicyLookup({PolicyType.FUP: {"daily_time_limit_minutes": 999_999}})
+
+    def _since(self, fx):  # noqa: ANN001, ANN202
+        return nas_only_connected_since_lookup(
+            fx.repository, fx.guest_service.router_lookup
+        )
+
+    async def _minutes(self, fx, guest_id) -> int:  # noqa: ANN001
+        usage = await fx.repository.get_quota_usage(
+            guest_id, QuotaPeriodType.DAILY.value
+        )
+        return usage.minutes_used
+
+    async def test_first_sweep_counts_from_sign_in_not_midnight(self) -> None:
+        fx = _fixture(policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+        later = result.session.started_at + timedelta(minutes=10)
+
+        await run_fup_time_accrual(
+            fx.repository,
+            self._lookup(),
+            now=later,
+            connected_since_lookup=self._since(fx),
+        )
+
+        assert await self._minutes(fx, result.guest.id) == 10
+
+    async def test_time_between_visits_is_not_counted(self) -> None:
+        fx = _fixture(policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+        started = result.session.started_at
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=started,
+        )
+        await fx.repository.update_quota_usage(
+            usage,
+            {"minutes_used": 5, "last_accrued_at": started - timedelta(hours=3)},
+        )
+
+        await run_fup_time_accrual(
+            fx.repository,
+            self._lookup(),
+            now=started + timedelta(minutes=10),
+            connected_since_lookup=self._since(fx),
+        )
+
+        assert await self._minutes(fx, result.guest.id) == 15
+
+    async def test_later_sweeps_count_from_the_last_sweep(self) -> None:
+        fx = _fixture(policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+        started = result.session.started_at
+        for minutes in (5, 10):
+            await run_fup_time_accrual(
+                fx.repository,
+                self._lookup(),
+                now=started + timedelta(minutes=minutes),
+                connected_since_lookup=self._since(fx),
+            )
+
+        assert await self._minutes(fx, result.guest.id) == 10
+
+    @pytest.mark.parametrize("vendor", ["mikrotik", "tplink_omada"])
+    async def test_other_vendors_accrue_exactly_as_before(self, vendor: str) -> None:
+        fx = _fixture(vendor=vendor, policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+        started = result.session.started_at
+        since = self._since(fx)
+        assert await since(result.guest.id) is None
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=started,
+        )
+        await fx.repository.update_quota_usage(
+            usage, {"last_accrued_at": started - timedelta(hours=3)}
+        )
+
+        await run_fup_time_accrual(
+            fx.repository,
+            self._lookup(),
+            now=started + timedelta(minutes=10),
+            connected_since_lookup=since,
+        )
+
+        assert await self._minutes(fx, result.guest.id) == 190
 
 
 class TestDailyTimeLimit:
