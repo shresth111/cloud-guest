@@ -2642,6 +2642,17 @@ FUP_TIME_LIMIT_RULE_KEYS: dict[QuotaPeriodType, str] = {
 }
 
 
+def _voucher_session_timeout_minutes(batch: VoucherBatch, router: Router) -> int:
+    """How long one voucher login lasts. A batch's own session timeout applies
+    at a NAS-only (Aruba Instant On) router only; every other vendor keeps the
+    validity, whatever the batch holds. ``_voucher_standing`` still caps the
+    result at the voucher's own expiry."""
+    per_login = getattr(batch, "session_timeout_minutes", None)
+    if per_login and is_nas_only(router):
+        return per_login
+    return batch.validity_minutes
+
+
 def _min_present(*values: int | None) -> int | None:
     """The smallest of ``values`` that is not ``None``, or ``None`` when all
     are. For combining RADIUS time allowances, where absent means "no limit"
@@ -3789,7 +3800,7 @@ class GuestService:
             data_limit_mb=_with_tier_session_data_limit(
                 batch.data_limit_mb, access_tier
             ),
-            session_timeout_minutes=batch.validity_minutes,
+            session_timeout_minutes=_voucher_session_timeout_minutes(batch, router),
             idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:

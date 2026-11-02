@@ -903,6 +903,57 @@ class TestSessionTimeoutIsTheCutOff:
         assert authz.authorized is True
         assert authz.session_timeout_seconds > 119 * 60
 
+    @staticmethod
+    def _batch_with_per_login_limit(fx):  # noqa: ANN001, ANN205
+        voucher, batch = fx.voucher_service.register(
+            "AP21VOUCHER", data_limit_mb=None, validity_minutes=10080
+        )
+        batch.session_timeout_minutes = 120
+        return voucher, batch
+
+    async def test_a_batch_session_timeout_is_the_per_login_cut_off(self) -> None:
+        """Voucher good for 7 days, 2 hours per login."""
+        fx = _fixture()
+        self._batch_with_per_login_limit(fx)
+        nas = await _register_nas(fx)
+        result = await _sign_in_voucher(fx)
+        assert result.session.session_timeout_minutes == 120
+
+        authz = await _authorize(fx, nas)
+
+        assert authz.authorized is True
+        assert 119 <= _minutes(authz.session_timeout_seconds) <= 120
+
+    async def test_voucher_expiry_still_beats_a_batch_session_timeout(self) -> None:
+        from datetime import timedelta
+
+        fx = _fixture()
+        voucher, _batch = self._batch_with_per_login_limit(fx)
+        nas = await _register_nas(fx)
+        await _sign_in_voucher(fx)
+        voucher.expires_at = datetime.now(UTC) + timedelta(minutes=20)
+
+        authz = await _authorize(fx, nas)
+
+        assert 19 <= _minutes(authz.session_timeout_seconds) <= 20
+
+    @pytest.mark.parametrize("vendor", ["mikrotik", "tplink_omada", "omada"])
+    async def test_other_vendors_ignore_a_batch_session_timeout(
+        self, vendor: str
+    ) -> None:
+        fx = _fixture(vendor=vendor)
+        self._batch_with_per_login_limit(fx)
+        result = await _sign_in_voucher(fx)
+        assert result.session.session_timeout_minutes == 10080
+
+    async def test_a_batch_without_one_keeps_the_validity_at_aruba(self) -> None:
+        fx = _fixture()
+        fx.voucher_service.register(
+            "AP21VOUCHER", data_limit_mb=None, validity_minutes=120
+        )
+        result = await _sign_in_voucher(fx)
+        assert result.session.session_timeout_minutes == 120
+
     async def test_no_time_left_is_a_reject_never_a_zero(self) -> None:
         fx = _fixture()
         nas = await _register_nas(fx)
