@@ -730,3 +730,119 @@ class TestRedisClientPerEventLoop:
         retried = control.release_transient_block_task.autoretry_for
         assert issubclass(RedisConnectionError, retried)
         assert issubclass(InstantOnError, retried)
+
+
+# ---------------------------------------------------------------------------
+# The customer's speed write against what the network already holds
+# ---------------------------------------------------------------------------
+
+
+class TestVenueGuestSpeed:
+    """A cap set in the Instant On app can be outside the presets, or in the
+    portal's "Usage Controlled By: Network" mode."""
+
+    @staticmethod
+    def _wire(monkeypatch, site: FakeSite) -> None:  # noqa: ANN001
+        from app.domains.network_integration import instant_on_control as control
+
+        target = control.ControlTarget(
+            router_id=ROUTER,
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            site_id=SITE,
+            secret_arn=ARN,
+        )
+
+        async def resolve(*_: object, **__: object) -> object:
+            return target
+
+        async def with_client(_t: object, _s: object, action):  # noqa: ANN001, ANN202
+            return await action(_client(site))
+
+        monkeypatch.setattr(control, "resolve_control_target", resolve)
+        monkeypatch.setattr(control, "_with_client", with_client)
+
+    @staticmethod
+    async def _set(down: int | None, up: int | None):  # noqa: ANN205
+        from app.domains.network_integration.instant_on_control import (
+            set_venue_guest_speed,
+        )
+
+        return await set_venue_guest_speed(
+            None,  # type: ignore[arg-type]
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            network_id=NET,
+            download_mbps=down,
+            upload_mbps=up,
+            settings=_settings(),
+        )
+
+    @staticmethod
+    def _hold(site: FakeSite, down: int, up: int, mode: str = "perClient") -> None:
+        site.network["qos"].update(
+            isBandwidthLimitEnabled=True,
+            bandwidthLimitMode=mode,
+            isDownloadBandwidthLimitEnabled=True,
+            isUploadBandwidthLimitEnabled=True,
+            perClientDownloadBandwidthLimitInMbps=down,
+            perClientUploadBandwidthLimitInMbps=up,
+        )
+
+    async def test_an_off_preset_cap_survives_changing_the_other_direction(
+        self, monkeypatch
+    ) -> None:  # noqa: ANN001
+        site = FakeSite()
+        self._hold(site, down=2, up=2)
+        self._wire(monkeypatch, site)
+        result = await self._set(2, 20)
+        assert result.status == "applied"
+        assert (result.applied.download_mbps, result.applied.upload_mbps) == (2, 20)
+
+    async def test_a_new_off_preset_value_is_refused_before_any_write(
+        self, monkeypatch
+    ) -> None:  # noqa: ANN001
+        site = FakeSite()
+        self._hold(site, down=2, up=2)
+        self._wire(monkeypatch, site)
+        with pytest.raises(ValueError):
+            await self._set(35, 2)
+        assert site.writes() == []
+
+    async def test_out_of_range_is_refused_before_any_instant_on_call(self) -> None:
+        with pytest.raises(ValueError):
+            await self._set(5000, None)
+
+    async def test_a_network_wide_limit_is_reported_and_not_overwritten(
+        self, monkeypatch
+    ) -> None:  # noqa: ANN001
+        site = FakeSite()
+        self._hold(site, down=50, up=50, mode="perNetwork")
+        self._wire(monkeypatch, site)
+        result = await self._set(10, 10)
+        assert result.status == "failed"
+        assert result.reason == "network_wide_limit_set"
+        assert site.writes() == []
+        held = result.networks[0]
+        assert held.other_mode_limit is True and held.enabled is False
+
+    async def test_a_per_client_network_is_not_flagged(self, monkeypatch) -> None:  # noqa: ANN001
+        site = FakeSite()
+        self._wire(monkeypatch, site)
+        result = await self._set(10, 10)
+        assert result.status == "applied"
+        assert result.applied.other_mode_limit is False
+
+    def test_a_network_secret_never_reaches_the_response_shape(self) -> None:
+        from app.domains.network_integration.instant_on_schemas import (
+            InstantOnVenueGuestNetwork,
+        )
+
+        assert set(InstantOnVenueGuestNetwork.model_fields) == {
+            "network_id",
+            "network_name",
+            "enabled",
+            "download_mbps",
+            "upload_mbps",
+            "other_mode_limit",
+        }

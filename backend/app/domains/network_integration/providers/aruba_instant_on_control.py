@@ -150,6 +150,10 @@ class GuestNetworkRateLimit:
     upload_mbps: int | None
     #: ``type == "guest"`` or the guest portal is on for it (measured fields).
     is_guest: bool = False
+    #: A limit is on, but in a mode other than ``perClient`` (the portal's
+    #: "Usage Controlled By: Network"). Its value lives in fields not captured
+    #: yet, so ``enabled`` and the speeds above cannot describe it.
+    other_mode_limit: bool = False
 
     @classmethod
     def from_network(cls, network: dict[str, Any]) -> GuestNetworkRateLimit:
@@ -175,6 +179,7 @@ class GuestNetworkRateLimit:
             is_guest=bool(
                 network.get("type") == "guest" or network.get("isGuestPortalEnabled")
             ),
+            other_mode_limit=enabled and not per_client,
         )
 
 

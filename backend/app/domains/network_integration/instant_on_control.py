@@ -472,6 +472,9 @@ class VenueGuestNetworkSpeed:
     enabled: bool
     download_mbps: int | None
     upload_mbps: int | None
+    #: A network-wide limit set in the Instant On app. Not a per-device cap, so
+    #: "no limit" would be false, and writing would silently replace it.
+    other_mode_limit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,7 +491,7 @@ class VenueGuestSpeed:
     * ``failed`` -- Instant On answered, but not with what was asked
       (``reason`` is the error code, e.g. ``write_not_confirmed``).
 
-    Carries no network secret: only the five fields above per network, so
+    Carries no network secret: only the six fields above per network, so
     the PSK and RADIUS secret that ``networksSummary`` returns can never
     reach a response or a log through this type.
     """
@@ -507,18 +510,29 @@ def _network_speed(limit: Any) -> VenueGuestNetworkSpeed:
         enabled=limit.enabled,
         download_mbps=limit.download_mbps,
         upload_mbps=limit.upload_mbps,
+        other_mode_limit=limit.other_mode_limit,
     )
 
 
-def _check_preset(value: int | None, what: str) -> int | None:
-    if value is None:
-        return None
+def _check_preset(
+    value: int | None, what: str, *, held: int | None = None
+) -> int | None:
+    """A preset, no limit, or the value this direction already holds: a speed set
+    in the Instant On app can be off the presets, and changing only the other
+    direction must be able to send it back unchanged."""
+    if value is None or value == held:
+        return value
     if isinstance(value, bool) or value not in GUEST_SPEED_PRESETS_MBPS:
         raise ValueError(
             f"{what} must be one of {', '.join(map(str, GUEST_SPEED_PRESETS_MBPS))} "
             "Mbps, or no limit"
         )
     return value
+
+
+def _check_range(value: int, what: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1000:
+        raise ValueError(f"{what} must be between 1 and 1000 Mbps")
 
 
 async def read_venue_guest_speed(
@@ -573,8 +587,12 @@ async def set_venue_guest_speed(
     (or the venue's staff network) is refused before any write. Success is
     the provider's read-back alone (``set_guest_network_rate_limit`` raises
     ``write_not_confirmed`` when Instant On did not keep the value)."""
-    down = _check_preset(download_mbps, "download")
-    up = _check_preset(upload_mbps, "upload")
+    # Off-preset values are only knowable once the network is read, in `apply`.
+    # Anything else is refused here, before any Instant On call.
+    if download_mbps is not None:
+        _check_range(download_mbps, "download")
+    if upload_mbps is not None:
+        _check_range(upload_mbps, "upload")
     settings = settings or get_settings()
     target = await resolve_control_target(
         session,
@@ -599,6 +617,19 @@ async def set_venue_guest_speed(
                 ),
                 networks=tuple(_network_speed(n) for n in guest.values()),
             )
+        current = guest[network_id]
+        if current.other_mode_limit:
+            return VenueGuestSpeed(
+                status="failed",
+                reason="network_wide_limit_set",
+                message=(
+                    "This guest WiFi network has a network-wide limit set in the "
+                    "Instant On app. Change it there."
+                ),
+                networks=tuple(_network_speed(n) for n in guest.values()),
+            )
+        down = _check_preset(download_mbps, "download", held=current.download_mbps)
+        up = _check_preset(upload_mbps, "upload", held=current.upload_mbps)
         after = await client.set_guest_network_rate_limit(
             target.site_id, network_id, download_mbps=down, upload_mbps=up
         )
@@ -623,8 +654,8 @@ async def set_venue_guest_speed(
             extra={
                 "router_id": str(target.router_id),
                 "network_id": network_id,
-                "download_mbps": down,
-                "upload_mbps": up,
+                "download_mbps": download_mbps,
+                "upload_mbps": upload_mbps,
                 "actor_user_id": str(actor_user_id) if actor_user_id else None,
             },
         )
