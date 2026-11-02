@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from fastapi import HTTPException, status
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .exceptions import IspFeatureDisabledError
 
 __all__ = ["Bill2Settings", "RequireBill2Enabled", "get_bill2_settings"]
 
@@ -34,4 +35,4 @@ def get_bill2_settings() -> Bill2Settings:
 
 async def RequireBill2Enabled() -> None:
     if not get_bill2_settings().enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()

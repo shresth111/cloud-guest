@@ -284,6 +284,7 @@ class IspQueuedRenewalService:
                 raise IspBadRequestError(
                     "This idempotency key was used for another subscriber",
                     field="idempotency_key",
+                    reason="ISP_IDEMPOTENCY_KEY_REUSED",
                 )
             return {"queued": (await self.views([prior]))[0], "repeat": True}
         await self.session.execute(
@@ -401,7 +402,9 @@ class IspQueuedRenewalService:
             select(IspSubscriber.id).where(IspSubscriber.id == s.id).with_for_update()
         )
         if q.status != "pending":
-            raise IspQueuedRenewalStateError(f"It is already {q.status}")
+            raise IspQueuedRenewalStateError(
+                f"It is already {q.status}", reason="ISP_STATUS_CHANGED"
+            )
         last = await self.s360._last_renewal(s)
         if last is None or last.id != q.renewal_event_id:
             raise IspQueuedRenewalStateError(

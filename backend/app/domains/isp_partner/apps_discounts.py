@@ -63,20 +63,36 @@ def quote_discount(
 ) -> DiscountQuote:
     at = at or datetime.now(UTC)
     if not d.active or getattr(d, "is_deleted", False):
-        raise IspDiscountInvalidError("This discount code is switched off")
+        raise IspDiscountInvalidError(
+            "This discount code is switched off", reason="ISP_DISCOUNT_OFF"
+        )
     if d.valid_from and at < d.valid_from:
-        raise IspDiscountInvalidError("This discount code is not valid yet")
+        raise IspDiscountInvalidError(
+            "This discount code is not valid yet", reason="ISP_DISCOUNT_NOT_STARTED"
+        )
     if d.valid_until and at > d.valid_until:
-        raise IspDiscountInvalidError("This discount code has expired")
+        raise IspDiscountInvalidError(
+            "This discount code has expired", reason="ISP_DISCOUNT_EXPIRED"
+        )
     if d.max_uses is not None and d.used_count >= d.max_uses:
-        raise IspDiscountInvalidError("This discount code has been used up")
+        raise IspDiscountInvalidError(
+            "This discount code has been used up", reason="ISP_DISCOUNT_USED_UP"
+        )
     if d.min_amount_paise is not None and gross_paise < d.min_amount_paise:
-        raise IspDiscountInvalidError("The bill is below this code's minimum amount")
+        raise IspDiscountInvalidError(
+            "The bill is below this code's minimum amount",
+            reason="ISP_DISCOUNT_BELOW_MINIMUM",
+        )
     allowed = {str(p) for p in d.package_ids or ()}
     if allowed and (package_id is None or str(package_id) not in allowed):
-        raise IspDiscountInvalidError("This code does not apply to this package")
+        raise IspDiscountInvalidError(
+            "This code does not apply to this package",
+            reason="ISP_DISCOUNT_WRONG_PACKAGE",
+        )
     if gross_paise <= 0:
-        raise IspDiscountInvalidError("Nothing to discount")
+        raise IspDiscountInvalidError(
+            "Nothing to discount", reason="ISP_DISCOUNT_NOTHING_TO_DISCOUNT"
+        )
     # percent: half-up rounding to the paisa
     amount = (gross_paise * d.value + 5000) // 10000 if d.kind == "percent" else d.value
     if d.max_discount_paise is not None:
@@ -112,7 +128,9 @@ async def evaluate_discount(
 ) -> DiscountQuote:
     d = await _by_code(session, isp_org_id, code)
     if d is None:
-        raise IspDiscountInvalidError("Unknown discount code")
+        raise IspDiscountInvalidError(
+            "Unknown discount code", reason="ISP_DISCOUNT_UNKNOWN"
+        )
     return quote_discount(d, gross_paise=gross_paise, package_id=package_id, at=at)
 
 
@@ -154,7 +172,9 @@ async def record_redemption(
         if existing is not None:
             return existing
     if d.max_uses is not None and d.used_count >= d.max_uses:
-        raise IspDiscountInvalidError("This discount code has been used up")
+        raise IspDiscountInvalidError(
+            "This discount code has been used up", reason="ISP_DISCOUNT_USED_UP"
+        )
     d.used_count += 1
     r = IspDiscountRedemption(
         discount_id=d.id,

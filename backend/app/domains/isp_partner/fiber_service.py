@@ -21,12 +21,12 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 
-from fastapi import HTTPException, status
+from fastapi import status
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import func, or_, select
 
-from .exceptions import IspError
+from .exceptions import IspError, IspFeatureDisabledError
 from .fiber_models import IspFiberNode, IspFiberPortAssignment
 from .plans_models import IspSubscriber
 from .scoping import IspScope
@@ -57,7 +57,7 @@ def get_isp_fiber_settings() -> IspFiberSettings:
 
 async def RequireIspFiberEnabled() -> None:
     if not get_isp_fiber_settings().enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()
 
 
 # -- errors --------------------------------------------------------------------

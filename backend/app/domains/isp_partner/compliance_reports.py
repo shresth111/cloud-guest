@@ -106,7 +106,9 @@ class IspComplianceReports:
         unmasked: bool,
     ) -> dict[str, Any]:
         if key not in CATALOGUE:
-            raise IspBadRequestError("Unknown report", field="key")
+            raise IspBadRequestError(
+                "Unknown report", field="key", reason="ISP_QUERY_INVALID"
+            )
         title, category, owner = CATALOGUE[key]
         base = {
             "key": key,

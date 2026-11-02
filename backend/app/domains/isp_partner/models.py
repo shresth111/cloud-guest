@@ -150,12 +150,14 @@ from .enforcement_models import *  # noqa: E402,F403
 from .fiber_models import *  # noqa: E402,F403  (J22 fiber registry)
 from .finance_models import *  # noqa: E402,F403  (JAZE-4)
 from .franchise_models import *  # noqa: E402,F403  (FRANCHISE-2)
+from .incident_auto_models import *  # noqa: E402,F403  (SMALL-5)
 from .incidents_models import *  # noqa: E402,F403  (INCIDENTS-1)
 from .package_meta_models import *  # noqa: E402,F403  (PKG-2)
 from .plans_models import *  # noqa: E402,F403
 from .pppoe_models import *  # noqa: E402,F403
 from .queued_renewal_models import *  # noqa: E402,F403  (QUEUED-RENEWAL)
 from .referrals_models import *  # noqa: E402,F403  (REFERRAL-1)
+from .revenue_snapshot_models import *  # noqa: E402,F403  (SMALL-4)
 from .subscriber360_models import *  # noqa: E402,F403
 from .winback_models import *  # noqa: E402,F403  (SMALL-3)
 from .zones_models import *  # noqa: E402,F403  (ZONE-1 zone tree)

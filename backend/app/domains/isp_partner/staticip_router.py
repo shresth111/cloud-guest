@@ -24,7 +24,7 @@ from datetime import UTC, date, datetime
 from functools import lru_cache
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import func, or_, select
@@ -45,6 +45,7 @@ from .constants import (
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .enforcement_models import IspSubscriberIpBinding
+from .exceptions import IspFeatureDisabledError
 from .finance_models import IspStaticIpLease
 from .finance_router import get_finance_service
 from .finance_service import IspFinanceService
@@ -74,7 +75,7 @@ def get_staticip2_settings() -> IspStaticIp2Settings:
 
 async def RequireStaticIp2Enabled() -> None:
     if not get_staticip2_settings().enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()
 
 
 staticip_router = APIRouter(

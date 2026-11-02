@@ -140,7 +140,10 @@ class LeadService:
             LeadStatus.DROPPED,
             LeadStatus.NOT_FEASIBLE,
         ):
-            raise IspAppsInvalidError(f"A {lead.status} lead cannot get an install")
+            raise IspAppsInvalidError(
+                f"A {lead.status} lead cannot get an install",
+                reason="ISP_STATUS_CHANGED",
+            )
         task = await FieldTaskService(self.session).create(
             isp,
             {
@@ -166,7 +169,9 @@ class LeadService:
     async def convert(self, isp: Any, lead_id: uuid.UUID, data: dict) -> dict:
         lead = await self._lead(isp, lead_id)
         if lead.status in (LeadStatus.CONVERTED, LeadStatus.DROPPED):
-            raise IspAppsInvalidError(f"A {lead.status} lead cannot be converted")
+            raise IspAppsInvalidError(
+                f"A {lead.status} lead cannot be converted", reason="ISP_STATUS_CHANGED"
+            )
         customer_id = data.get("isp_customer_id") or lead.customer_organization_id
         if customer_id is None:
             raise IspAppsInvalidError("Pick the customer this subscriber belongs to")

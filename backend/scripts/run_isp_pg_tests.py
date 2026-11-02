@@ -19,7 +19,9 @@ Usage (from ``backend/``)::
     ISP_PG_REDIS_URL=redis://localhost:6379/0 \\
     python scripts/run_isp_pg_tests.py [test file ...]
 
-Exit status is non-zero if any file failed. Never point it at a real
+``ISP_PG_SHARD=i/n`` (1-based) runs every n-th file starting at the i-th, so
+CI can split the files across a matrix. Exit status is non-zero if any file
+failed. Never point it at a real
 database: it creates and drops ``isppg_*`` databases on that server.
 """
 
@@ -142,7 +144,12 @@ def main(argv: list[str]) -> int:
         if not os.environ.get(var):
             print(f"{var} is not set", file=sys.stderr)
             return 2
+    shard = os.environ.get("ISP_PG_SHARD", "")  # "i/n", 1-based
     files = [Path(a).resolve() for a in argv] or discover()
+    if shard:
+        i, n = (int(x) for x in shard.split("/"))
+        files = files[i - 1 :: n]
+        print(f"shard {i}/{n}: {len(files)} files", flush=True)
     base = {
         **os.environ,
         **BASE_ENV,

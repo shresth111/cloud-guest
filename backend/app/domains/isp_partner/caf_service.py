@@ -24,7 +24,6 @@ from functools import lru_cache
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import HTTPException, status
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import select
@@ -34,7 +33,7 @@ from .caf_models import APPLICANT_CATEGORIES, IspCafExtras, IspCafProfile
 from .caf_pdf import fit_image, render_caf2_pdf
 from .compliance_models import IspSubscriberDocument, IspSubscriberKyc
 from .compliance_service import compliance_settings
-from .exceptions import IspBadRequestError
+from .exceptions import IspBadRequestError, IspFeatureDisabledError
 from .plans_models import IspPackage, IspSubscriber
 
 __all__ = [
@@ -80,7 +79,7 @@ def get_isp_caf_settings() -> IspCafSettings:
 
 async def RequireIspCafEnabled() -> None:
     if not get_isp_caf_settings().enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()
 
 
 def _iso(v: Any) -> Any:
@@ -287,6 +286,7 @@ class IspCafService:
             raise IspBadRequestError(
                 "Applicant type must be one of " + ", ".join(APPLICANT_CATEGORIES),
                 field="applicant_category",
+                reason="ISP_CHOICE_INVALID",
             )
         if cat and cat != "other":
             out["applicant_category_other"] = None
@@ -480,7 +480,12 @@ class IspCafService:
                     "Pick subscribers or a date range", field="since"
                 )
             if until < since or (until - since).days > 366:
-                raise IspBadRequestError("Range is 1 to 366 days", field="until")
+                raise IspBadRequestError(
+                    "Range is 1 to 366 days",
+                    field="until",
+                    reason="ISP_DATE_RANGE_INVALID",
+                    max_days=366,
+                )
             start = datetime.combine(since, time.min, IST)
             end = datetime.combine(until + timedelta(days=1), time.min, IST)
             subs = list(
@@ -510,7 +515,10 @@ class IspCafService:
             )
         if len(subs) > EXPORT_MAX:
             raise IspBadRequestError(
-                f"At most {EXPORT_MAX} CAFs per file; narrow the range", field="until"
+                f"At most {EXPORT_MAX} CAFs per file; narrow the range",
+                field="until",
+                reason="ISP_EXPORT_TOO_LARGE",
+                max_rows=EXPORT_MAX,
             )
         buf = io.BytesIO()
         skipped: list[str] = []

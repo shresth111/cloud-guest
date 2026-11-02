@@ -110,7 +110,9 @@ def _query(body: LeaTraceRequest) -> logic.LookupQuery:
     try:
         zone = ZoneInfo(body.tz)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise IspBadRequestError("Unknown time zone", field="tz") from exc
+        raise IspBadRequestError(
+            "Unknown time zone", field="tz", reason="ISP_QUERY_INVALID"
+        ) from exc
     try:
         ip = logic.normalize_ip(body.public_ip)
         dst = logic.normalize_ip(body.dst_ip) if body.dst_ip else None

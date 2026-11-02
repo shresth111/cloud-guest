@@ -189,7 +189,9 @@ def _lookup_query(
     try:
         zone = ZoneInfo(tz)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise IspBadRequestError("Unknown time zone", field="tz") from exc
+        raise IspBadRequestError(
+            "Unknown time zone", field="tz", reason="ISP_QUERY_INVALID"
+        ) from exc
     try:
         ip = logic.normalize_ip(public_ip)
         dst = logic.normalize_ip(dst_ip) if dst_ip else None
@@ -487,10 +489,15 @@ async def session_dump(
     since = since if since.tzinfo else since.replace(tzinfo=IST)
     until = until if until.tzinfo else until.replace(tzinfo=IST)
     if since >= until:
-        raise IspBadRequestError("since must be before until", field="since")
+        raise IspBadRequestError(
+            "since must be before until", field="since", reason="ISP_DATE_RANGE_ORDER"
+        )
     if until - since > timedelta(days=SESSION_DUMP_MAX_DAYS):
         raise IspBadRequestError(
-            f"A session dump covers at most {SESSION_DUMP_MAX_DAYS} days", field="until"
+            f"A session dump covers at most {SESSION_DUMP_MAX_DAYS} days",
+            field="until",
+            reason="ISP_DATE_RANGE_TOO_LONG",
+            max_days=SESSION_DUMP_MAX_DAYS,
         )
     if isp_customer_id is not None:
         await IspScope.assert_customer(isp, isp_customer_id)
@@ -627,7 +634,11 @@ async def put_settings(
             }[name]
             if not isinstance(value, int) or not limits[0] <= value <= limits[1]:
                 raise IspBadRequestError(
-                    f"{name} must be between {limits[0]} and {limits[1]}", field=name
+                    f"{name} must be between {limits[0]} and {limits[1]}",
+                    field=name,
+                    reason="ISP_VALUE_OUT_OF_RANGE",
+                    min=limits[0],
+                    max=limits[1],
                 )
         setattr(row, name, value)
     row.updated_by = isp.user_id
@@ -1189,10 +1200,16 @@ async def put_schedule(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     if report_key not in REPORT_SCHEDULE_KEYS:
-        raise IspBadRequestError("Unknown report", field="report_key")
+        raise IspBadRequestError(
+            "Unknown report", field="report_key", reason="ISP_QUERY_INVALID"
+        )
     day = body.get("day_of_month", 1)
     if not isinstance(day, int) or not 1 <= day <= 28:
-        raise IspBadRequestError("day_of_month is 1-28", field="day_of_month")
+        raise IspBadRequestError(
+            "day_of_month is 1-28",
+            field="day_of_month",
+            reason="ISP_DAY_OF_MONTH_RANGE",
+        )
     recipients = body.get("recipients") or []
     if (
         not isinstance(recipients, list)
@@ -1242,9 +1259,16 @@ def _report_range(
     since = since or (until - timedelta(days=30))
     since = since if since.tzinfo else since.replace(tzinfo=IST)
     if since >= until:
-        raise IspBadRequestError("since must be before until", field="since")
+        raise IspBadRequestError(
+            "since must be before until", field="since", reason="ISP_DATE_RANGE_ORDER"
+        )
     if until - since > timedelta(days=366):
-        raise IspBadRequestError("range is limited to 366 days", field="until")
+        raise IspBadRequestError(
+            "range is limited to 366 days",
+            field="until",
+            reason="ISP_DATE_RANGE_TOO_LONG",
+            max_days=366,
+        )
     return since, until
 
 
@@ -1265,7 +1289,9 @@ async def run_report(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     if report_key not in CATALOGUE:
-        raise IspBadRequestError("Unknown report", field="report_key")
+        raise IspBadRequestError(
+            "Unknown report", field="report_key", reason="ISP_QUERY_INVALID"
+        )
     s, u = _report_range(since, until)
     unmasked = await pii_unmasked_for(db, isp)
     data = await IspComplianceReports(db).run(
@@ -1286,7 +1312,9 @@ async def export_report(
     audit: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> Response:
     if report_key not in CATALOGUE:
-        raise IspBadRequestError("Unknown report", field="report_key")
+        raise IspBadRequestError(
+            "Unknown report", field="report_key", reason="ISP_QUERY_INVALID"
+        )
     s, u = _report_range(since, until)
     data = await IspComplianceReports(db).run(
         isp, report_key, since=s, until=u, unmasked=True

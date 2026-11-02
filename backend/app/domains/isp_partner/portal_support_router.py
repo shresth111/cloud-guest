@@ -135,6 +135,7 @@ async def portal_support(
             request,
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Too many requests -- please try again later",
+            data={"code": "RATE_LIMITED", "retry_after_seconds": retry_after},
             headers={"Retry-After": str(retry_after)},
         )
     contact = await support_contact_for_location(session, location)

@@ -13,7 +13,7 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Any
 
-from fastapi import HTTPException, status
+from fastapi import status
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import select
@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from .apps_models import IspAppsCounter
 from .constants import ISP_ROLE_SLUGS, UNCONFINABLE_ROLES
-from .exceptions import IspError
+from .exceptions import IspError, IspFeatureDisabledError
 from .plans_models import IspSubscriber
 from .scoping import IspScope
 
@@ -43,7 +43,7 @@ def get_isp_apps_settings() -> IspAppsSettings:
 
 async def RequireIspAppsEnabled() -> None:
     if not get_isp_apps_settings().enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()
 
 
 # -- permission keys -----------------------------------------------------------

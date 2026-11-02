@@ -3,7 +3,7 @@ code in ``data.code``. The TR-069 codes live in ``app.domains.tr069``."""
 
 from __future__ import annotations
 
-from fastapi import status
+from fastapi import HTTPException, status
 
 from app.common.exceptions import CloudGuestError
 
@@ -323,3 +323,50 @@ IspNoDuesError = _err(
     409,
     "This customer has no overdue invoices",
 )
+
+
+# -- ERROR-COPY: stable codes for answers that had none ----------------------
+#
+# Additive only. ``data.code`` keeps every existing value; where one code
+# covers many different situations (``ISP_BAD_REQUEST``, ``ISP_APPS_INVALID``,
+# ...), a raise site may add ``reason="ISP_..."`` (a stable sub-code in
+# ``data.reason``) so the partner console can word it. The inventory of
+# codes and reasons is ``backend/scripts/isp_error_codes.json``
+# (``python -m scripts.isp_error_inventory --write``).
+
+
+class _IspHttpCompatError(IspError, HTTPException):
+    """An ``IspError`` that is also an ``HTTPException``.
+
+    For sites that used to raise a bare ``HTTPException`` (callers and tests
+    catch that type): FastAPI picks the handler by MRO, so the
+    ``CloudGuestError`` handler answers, with the same status and message,
+    plus ``data.code`` and ``request_id``."""
+
+    def __init__(self, message: str | None = None, **data: object) -> None:
+        # Not IspError.__init__: CloudGuestError's super().__init__ would
+        # reach HTTPException.__init__ (next in the MRO) with the message.
+        self.message = message or self.default_message
+        self.status_code = self.status_code_default
+        self.data = {"code": self.code, **data}
+        self.detail = self.message
+        self.headers = None
+        Exception.__init__(self, self.message)
+
+
+class IspFeatureDisabledError(_IspHttpCompatError):
+    """A flag-gated ISP feature that is switched off. Same 404 "Not Found"
+    as before; now with a code, so the console can say what it means."""
+
+    code = "ISP_FEATURE_DISABLED"
+    status_code_default = status.HTTP_404_NOT_FOUND
+    default_message = "Not Found"
+
+
+class IspInvalidQueryError(_IspHttpCompatError):
+    """A 422 that used to be a bare ``HTTPException`` (no code). Same status
+    and message; ``data.code`` is ``ISP_BAD_REQUEST`` like its siblings."""
+
+    code = "ISP_BAD_REQUEST"
+    status_code_default = status.HTTP_422_UNPROCESSABLE_ENTITY
+    default_message = "Invalid request"
