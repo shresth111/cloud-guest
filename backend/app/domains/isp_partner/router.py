@@ -1218,6 +1218,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(incidents_router)
 
+    # SMALL-5: auto incidents from router DOWN (/isp/incident-auto, same flag).
+    from .incident_auto_router import incident_auto_router
+
+    isp_partner_router.include_router(incident_auto_router)
+
     # QUEUED-RENEWAL: next plan starts when the current one ends
     # (ISP_QUEUED_RENEWAL_ENABLED).
     from .queued_renewal_router import queued_renewal_router

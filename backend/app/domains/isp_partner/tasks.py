@@ -294,6 +294,18 @@ async def _retry_steps(redis: Any, summary: dict) -> None:
         summary["errors"] = summary.get("errors", 0) + 1
         logger.exception("isp_winback_saves_failed")
 
+    # 8. SMALL-5 auto incidents from router DOWN/UP (no network; one ISP per
+    #    transaction inside; ISP_INCIDENTS_ENABLED + the per-ISP switch).
+    try:
+        from .incident_auto import run_incident_auto
+
+        res = await run_incident_auto()
+        summary["incidents_auto_opened"] = res.get("opened", 0)
+        summary["incidents_auto_resolved"] = res.get("resolved", 0)
+    except Exception:  # noqa: BLE001 -- logged, the pass goes on
+        summary["errors"] = summary.get("errors", 0) + 1
+        logger.exception("isp_incident_auto_failed")
+
 
 class _SystemContext:
     """An ``IspContext`` for the daily job: no human actor, no confinement."""
