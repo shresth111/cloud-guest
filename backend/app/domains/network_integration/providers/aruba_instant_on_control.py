@@ -83,6 +83,7 @@ __all__ = [
     "MAX_BANDWIDTH_MBPS",
     "BlockResult",
     "GuestNetworkRateLimit",
+    "InstantOnNetworkWideLimitError",
     "InstantOnClientNotBlockableError",
     "InstantOnControlClient",
     "InstantOnNetworkNotFoundError",
@@ -110,6 +111,13 @@ class InstantOnClientNotBlockableError(InstantOnError):
     bulk-block copy)."""
 
     code = "not_blockable"
+
+
+class InstantOnNetworkWideLimitError(InstantOnError):
+    """The network has a limit in a mode other than ``perClient``. A rate-limit
+    write forces ``perClient``, which would silently replace it."""
+
+    code = "network_wide_limit_set"
 
 
 class InstantOnNetworkNotFoundError(InstantOnError):
@@ -150,6 +158,14 @@ class GuestNetworkRateLimit:
     upload_mbps: int | None
     #: ``type == "guest"`` or the guest portal is on for it (measured fields).
     is_guest: bool = False
+    #: A limit is on, but in a mode other than ``perClient`` (the portal's
+    #: "Usage Controlled By: Network"). Its value is
+    #: a network total, so ``enabled`` and the speeds above cannot describe it.
+    other_mode_limit: bool = False
+    #: ``qos.perNetworkDownstream/UpstreamBandwidthLimitInMbps``, read only.
+    #: Per SSID, not per venue. Nothing here writes this mode.
+    network_download_mbps: int | None = None
+    network_upload_mbps: int | None = None
 
     @classmethod
     def from_network(cls, network: dict[str, Any]) -> GuestNetworkRateLimit:
@@ -175,7 +191,33 @@ class GuestNetworkRateLimit:
             is_guest=bool(
                 network.get("type") == "guest" or network.get("isGuestPortalEnabled")
             ),
+            other_mode_limit=enabled and not per_client,
+            network_download_mbps=_network_total(
+                qos,
+                enabled,
+                "isDownloadBandwidthLimitEnabled",
+                "perNetworkDownstreamBandwidthLimitInMbps",
+            ),
+            network_upload_mbps=_network_total(
+                qos,
+                enabled,
+                "isUploadBandwidthLimitEnabled",
+                "perNetworkUpstreamBandwidthLimitInMbps",
+            ),
         )
+
+
+def _network_total(
+    qos: dict[str, Any], enabled: bool, flag: str, field: str
+) -> int | None:
+    if (
+        not enabled
+        or qos.get("bandwidthLimitMode") != "perNetwork"
+        or not qos.get(flag)
+    ):
+        return None
+    value = qos.get(field)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _utcnow() -> datetime:
@@ -364,6 +406,12 @@ class InstantOnControlClient:
         down = _check_mbps(download_mbps, "download")
         up = _check_mbps(upload_mbps, "upload")
         network = await self.get_network(site_id, network_id)
+        if GuestNetworkRateLimit.from_network(network).other_mode_limit:
+            raise InstantOnNetworkWideLimitError(
+                "This network has a network-wide limit set in the Instant On app. "
+                "Change it there.",
+                reason="network_wide_limit_set",
+            )
         body = copy.deepcopy(network)
         qos = body.get("qos")
         if not isinstance(qos, dict):
