@@ -59,13 +59,15 @@ def normalise_mac(mac: str | None) -> str | None:
         return None
     m = mac.strip().upper().replace("-", ":")
     if not _MAC_RE.match(m):
-        raise IspAppsInvalidError(f"Not a MAC address: {mac}")
+        raise IspAppsInvalidError(f"Not a MAC address: {mac}", reason="ISP_MAC_INVALID")
     return m
 
 
 def check_unit_transition(current: str, target: str) -> None:
     if target not in UNIT_TRANSITIONS.get(current, frozenset()):
-        raise IspAppsInvalidError(f"A {current} unit cannot move to {target}")
+        raise IspAppsInvalidError(
+            f"A {current} unit cannot move to {target}", reason="ISP_STATUS_CHANGED"
+        )
 
 
 def parse_import(text: str) -> tuple[list[dict], list[dict]]:

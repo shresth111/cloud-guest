@@ -61,7 +61,11 @@ async def report_export(
     """CSV: one section per file (``section=all`` is PDF only, else 422).
     PDF: every section through ``analytics.export.render_report``."""
     if format == "csv" and section == "all":
-        raise IspBadRequestError("CSV exports one section at a time", field="section")
+        raise IspBadRequestError(
+            "CSV exports one section at a time",
+            field="section",
+            reason="ISP_CSV_ONE_SECTION",
+        )
     report = await service.summary(
         isp, since=since, until=until, isp_customer_id=isp_customer_id
     )

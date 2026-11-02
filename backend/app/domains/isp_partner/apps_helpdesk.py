@@ -108,7 +108,9 @@ def check_transition(current: str, target: str) -> None:
     if current == target:
         return
     if target not in TRANSITIONS.get(current, frozenset()):
-        raise IspAppsInvalidError(f"A {current} ticket cannot move to {target}")
+        raise IspAppsInvalidError(
+            f"A {current} ticket cannot move to {target}", reason="ISP_STATUS_CHANGED"
+        )
 
 
 def needs_rfo(ticket_type: Any | None) -> bool:

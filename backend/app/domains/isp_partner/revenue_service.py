@@ -59,13 +59,19 @@ class IspRevenueService:
         try:
             month = logic.parse_month(f.month, today)
         except ValueError as exc:
-            raise IspBadRequestError("month is YYYY-MM") from exc
+            raise IspBadRequestError(
+                "month is YYYY-MM", reason="ISP_QUERY_INVALID"
+            ) from exc
         if month > logic.month_start(today):
-            raise IspBadRequestError("month cannot be in the future")
+            raise IspBadRequestError(
+                "month cannot be in the future", reason="ISP_MONTH_IN_FUTURE"
+            )
         if not 1 <= f.months <= 24:
-            raise IspBadRequestError("months is 1 to 24")
+            raise IspBadRequestError("months is 1 to 24", reason="ISP_QUERY_INVALID")
         if f.zone_id is not None and f.no_zone:
-            raise IspBadRequestError("Pick a zone or 'no zone', not both")
+            raise IspBadRequestError(
+                "Pick a zone or 'no zone', not both", reason="ISP_QUERY_INVALID"
+            )
         if f.zone_id is not None:
             z = await self.session.get(IspZone, f.zone_id)
             if z is None or z.is_deleted or z.isp_organization_id != isp.isp_org_id:
@@ -601,7 +607,7 @@ class IspRevenueService:
         from .subscriber_identity import subscriber_identifier
 
         if metric not in logic.LIST_METRICS:
-            raise IspBadRequestError("Unknown metric")
+            raise IspBadRequestError("Unknown metric", reason="ISP_QUERY_INVALID")
         b = await self._base(isp, f)
         month = b["month"]
         if metric in logic.SUBSCRIBER_METRICS:
@@ -932,7 +938,7 @@ class IspRevenueService:
         page_size: int,
     ) -> dict[str, Any]:
         if reason is not None and reason not in logic.RISK_REASONS:
-            raise IspBadRequestError("Unknown reason")
+            raise IspBadRequestError("Unknown reason", reason="ISP_QUERY_INVALID")
         _b, out, tickets_on = await self._risk_rows(isp, f)
         if reason:
             out = [(r, rs) for r, rs in out if any(x["code"] == reason for x in rs)]

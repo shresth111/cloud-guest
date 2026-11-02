@@ -664,13 +664,19 @@ class IspPppoeService:
                 static_ip = str(ipaddress.ip_address(str(static_ip).strip()))
             except ValueError:
                 raise IspPppoeScriptParamError(
-                    "static_ip is not an IP address"
+                    "static_ip is not an IP address",
+                    reason="ISP_IP_INVALID",
+                    field="static_ip",
                 ) from None
         pool = body.get("ip_pool_name", ...)
         if pool is not ... and pool:
             pool = str(pool).strip()
             if not re.match(r"^[A-Za-z0-9._-]{1,64}$", pool):
-                raise IspPppoeScriptParamError("ip_pool_name: letters, digits, . _ -")
+                raise IspPppoeScriptParamError(
+                    "ip_pool_name: letters, digits, . _ -",
+                    reason="ISP_PPPOE_POOL_NAME_INVALID",
+                    field="ip_pool_name",
+                )
 
         now = self._clock()
         if cred is None:

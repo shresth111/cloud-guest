@@ -195,7 +195,9 @@ class IspIncidentsService:
                 raise IspZoneNotFoundError()
             return {"zone_id": z.id, "customer_id": None, "label": f"Zone {z.name}"}
         raise IspBadRequestError(
-            "The id does not match the scope kind", field="scope_kind"
+            "The id does not match the scope kind",
+            field="scope_kind",
+            reason="ISP_QUERY_INVALID",
         )
 
     async def compute_affected(self, isp: Any, t: dict) -> list[dict]:
@@ -663,7 +665,8 @@ class IspIncidentsService:
         order = {s: i for i, s in enumerate(STATUSES)}
         if order[to] <= order[inc.status]:
             raise IspIncidentStateError(
-                f"An incident that is {inc.status} cannot move to {to}"
+                f"An incident that is {inc.status} cannot move to {to}",
+                reason="ISP_STATUS_CHANGED",
             )
         now = self.now()
         if to == "identified":

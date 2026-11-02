@@ -629,9 +629,18 @@ class IspComplianceService:
     # ------------------------------------------------------------------
     async def agr(self, isp: IspContext, *, since: date, until: date) -> dict[str, Any]:
         if since > until:
-            raise IspBadRequestError("since must not be after until", field="since")
+            raise IspBadRequestError(
+                "since must not be after until",
+                field="since",
+                reason="ISP_DATE_RANGE_ORDER",
+            )
         if (until - since).days > 400:
-            raise IspBadRequestError("range is limited to 400 days", field="until")
+            raise IspBadRequestError(
+                "range is limited to 400 days",
+                field="until",
+                reason="ISP_DATE_RANGE_TOO_LONG",
+                max_days=400,
+            )
         inv, line = IspInvoice, IspInvoiceLine
         rows = (
             await self.session.execute(

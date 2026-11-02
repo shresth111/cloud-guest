@@ -74,7 +74,11 @@ class IspAuditLogService:
     def _bounds(self, isp: Any, since: date | None, until: date | None) -> tuple:
         tz = ZoneInfo(isp.organization.timezone or "Asia/Kolkata")
         if since and until and until < since:
-            raise IspBadRequestError("The end date is before the start", field="until")
+            raise IspBadRequestError(
+                "The end date is before the start",
+                field="until",
+                reason="ISP_DATE_RANGE_ORDER",
+            )
         lo = datetime.combine(since, time.min, tzinfo=tz) if since else None
         hi = (
             datetime.combine(until + timedelta(days=1), time.min, tzinfo=tz)

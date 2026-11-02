@@ -126,7 +126,9 @@ def _log_query(
     date_to: date | None = None,
 ) -> _LogQuery:
     if date_from and date_to and date_to < date_from:
-        raise IspBadRequestError("date_to is before date_from")
+        raise IspBadRequestError(
+            "date_to is before date_from", reason="ISP_DATE_RANGE_ORDER"
+        )
     return _LogQuery(
         channel=channel,
         status=status,
@@ -687,9 +689,13 @@ async def list_templates(
 
 def _check(event: str, channel: str) -> None:
     if event not in logic.EVENTS:
-        raise IspBadRequestError("Unknown event", field="event")
+        raise IspBadRequestError(
+            "Unknown event", field="event", reason="ISP_QUERY_INVALID"
+        )
     if channel not in ("email", "whatsapp"):
-        raise IspBadRequestError("Channel is email or whatsapp", field="channel")
+        raise IspBadRequestError(
+            "Channel is email or whatsapp", field="channel", reason="ISP_QUERY_INVALID"
+        )
 
 
 @comms_router.put(

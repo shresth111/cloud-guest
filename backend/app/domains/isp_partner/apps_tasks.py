@@ -67,7 +67,9 @@ def check_task_transition(current: str, target: str) -> None:
     if current == target:
         return
     if target not in TASK_TRANSITIONS.get(current, frozenset()):
-        raise IspAppsInvalidError(f"A {current} task cannot move to {target}")
+        raise IspAppsInvalidError(
+            f"A {current} task cannot move to {target}", reason="ISP_STATUS_CHANGED"
+        )
 
 
 class FieldTaskService:

@@ -133,6 +133,7 @@ class IspCollectionsService:
             raise IspBadRequestError(
                 "Give exactly one of subscriber_id or isp_customer_id",
                 field="subscriber_id",
+                reason="ISP_TARGET_REQUIRED",
             )
         if subscriber_id is not None:
             s = await self.billing.subscriber_in_scope(isp, subscriber_id)
@@ -1116,6 +1117,7 @@ class IspCollectionsService:
                     raise IspBadRequestError(
                         "This Idempotency-Key was used for another payment",
                         field="idempotency_key",
+                        reason="ISP_IDEMPOTENCY_KEY_REUSED",
                     )
                 return await self._cash_view(isp, repeat, repeat=True)
         open_invoices = sorted(

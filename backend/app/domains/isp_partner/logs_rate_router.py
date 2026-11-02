@@ -80,20 +80,30 @@ def _window(
     if since is None and until is None:
         m = minutes or 15
         if m not in PRESET_MINUTES:
-            raise IspBadRequestError("minutes must be 5, 15 or 60")
+            raise IspBadRequestError(
+                "minutes must be 5, 15 or 60", reason="ISP_QUERY_INVALID"
+            )
         end = now.replace(microsecond=0) + timedelta(seconds=1)
         return end - timedelta(minutes=m), end
     if since is None or until is None:
-        raise IspBadRequestError("give both since and until, or neither")
+        raise IspBadRequestError(
+            "give both since and until, or neither", reason="ISP_DATE_RANGE_INCOMPLETE"
+        )
     since = since if since.tzinfo else since.replace(tzinfo=UTC)
     until = until if until.tzinfo else until.replace(tzinfo=UTC)
     since = since.replace(microsecond=0)
     if until.microsecond:
         until = until.replace(microsecond=0) + timedelta(seconds=1)
     if until <= since:
-        raise IspBadRequestError("until must be after since")
+        raise IspBadRequestError(
+            "until must be after since", reason="ISP_DATE_RANGE_ORDER"
+        )
     if until - since > MAX_WINDOW:
-        raise IspBadRequestError("a per-second chart covers at most 3 hours")
+        raise IspBadRequestError(
+            "a per-second chart covers at most 3 hours",
+            reason="ISP_TIME_RANGE_TOO_LONG",
+            max_hours=3,
+        )
     return since, until
 
 

@@ -395,7 +395,8 @@ class IspReferralsService:
         r = await self.referral(isp, referral_id)
         if r.status not in ("pending", "earned"):
             raise IspReferralInvalidError(
-                f"A referral that is {r.status} cannot be cancelled"
+                f"A referral that is {r.status} cannot be cancelled",
+                reason="ISP_STATUS_CHANGED",
             )
         r.reason = reason
         self._log(r, isp, "cancelled", reason)

@@ -257,7 +257,7 @@ async def isp_forgot_password(
             content=build_response(
                 success=False,
                 message="Too many requests -- please try again later",
-                data=None,
+                data={"code": "RATE_LIMITED", "retry_after_seconds": retry_after},
                 request_id=request_id(request),
             ),
             headers={"Retry-After": str(retry_after)},

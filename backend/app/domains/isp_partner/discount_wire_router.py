@@ -13,14 +13,13 @@ from app.database.session import get_db_session
 
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .discount_wire import get_discount_apply_settings
+from .exceptions import IspFeatureDisabledError
 from .http import ok
 
 
 async def RequireDiscountApplyEnabled() -> None:
-    from fastapi import HTTPException, status
-
     if not get_discount_apply_settings().discount_apply_enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()
 
 
 discount_wire_router = APIRouter(tags=["ISP Partner: discount codes on invoices"])

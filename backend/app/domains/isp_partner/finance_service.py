@@ -530,7 +530,8 @@ class IspFinanceService:
             return sub.customer_organization_id, sub
         if isp_customer_id is None:
             raise IspFinanceValidationError(
-                "isp_customer_id or subscriber_id is required"
+                "isp_customer_id or subscriber_id is required",
+                reason="ISP_TARGET_REQUIRED",
             )
         customer = await self.billing._customer(isp, isp_customer_id)
         return customer.id, None
