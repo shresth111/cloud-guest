@@ -854,3 +854,73 @@ class TestVenueGuestSpeed:
             "network_download_mbps",
             "network_upload_mbps",
         }
+
+    async def test_the_provider_write_refuses_a_network_wide_limit(self) -> None:
+        """The chokepoint for all three writers: it forces perClient, which would
+        silently replace the owner's network-wide limit."""
+        from app.domains.network_integration.providers.aruba_instant_on_control import (
+            InstantOnNetworkWideLimitError,
+        )
+
+        site = FakeSite()
+        self._hold(site, down=1000, up=1000, mode="perNetwork")
+        with pytest.raises(InstantOnNetworkWideLimitError) as refused:
+            await _client(site).set_guest_network_rate_limit(
+                SITE, NET, download_mbps=10, upload_mbps=10
+            )
+        assert refused.value.code == "network_wide_limit_set"
+        assert site.writes() == []
+
+    async def test_clearing_also_refuses_a_network_wide_limit(self) -> None:
+        from app.domains.network_integration.providers.aruba_instant_on_control import (
+            InstantOnNetworkWideLimitError,
+        )
+
+        site = FakeSite()
+        self._hold(site, down=1000, up=1000, mode="perNetwork")
+        with pytest.raises(InstantOnNetworkWideLimitError):
+            await _client(site).set_guest_network_rate_limit(
+                SITE, NET, download_mbps=None, upload_mbps=None
+            )
+        assert site.writes() == []
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    async def test_the_master_endpoint_reports_it_even_on_a_preview(
+        self, monkeypatch, dry_run: bool
+    ) -> None:  # noqa: ANN001
+        from types import SimpleNamespace
+
+        from app.domains.network_integration import instant_on_repository
+        from app.domains.network_integration import instant_on_router as routes
+        from app.domains.network_integration.instant_on_schemas import (
+            InstantOnGuestRateLimitRequest,
+        )
+
+        site = FakeSite()
+        self._hold(site, down=1000, up=1000, mode="perNetwork")
+
+        async def get_site(_self: object, _router_id: object) -> object:
+            return SimpleNamespace(organization_id=uuid.uuid4())
+
+        async def resolve(*_: object, **__: object) -> object:
+            return SimpleNamespace(site_id=SITE, secret_arn=ARN)
+
+        monkeypatch.setattr(
+            instant_on_repository.InstantOnRepository, "get_site_for_router", get_site
+        )
+        monkeypatch.setattr(control, "resolve_control_target", resolve)
+        monkeypatch.setattr(
+            control, "build_live_control_client", lambda *_a, **_k: _client(site)
+        )
+        response = await routes.set_instant_on_guest_rate_limit(
+            ROUTER,
+            InstantOnGuestRateLimitRequest(
+                network_id=NET, download_mbps=10, upload_mbps=10, dry_run=dry_run
+            ),
+            SimpleNamespace(state=SimpleNamespace(request_id="r"), headers={}),
+            user=SimpleNamespace(id=str(uuid.uuid4())),
+            db=None,
+        )
+        assert response["data"]["status"] == "failed"
+        assert response["data"]["reason"] == "network_wide_limit_set"
+        assert site.writes() == []

@@ -523,7 +523,20 @@ async def set_instant_on_guest_rate_limit(
                 before = await client.get_guest_network_rate_limit(
                     target.site_id, payload.network_id
                 )
-                if payload.dry_run:
+                if before.other_mode_limit:
+                    # Also on a preview: it must not promise a write that the
+                    # provider refuses.
+                    body = InstantOnGuestRateLimitResponse(
+                        status="failed",
+                        reason="network_wide_limit_set",
+                        message=(
+                            "This network has a network-wide limit set in the "
+                            "Instant On app. Change it there."
+                        ),
+                        before=_state(before),
+                        requested=requested,
+                    )
+                elif payload.dry_run:
                     body = InstantOnGuestRateLimitResponse(
                         status="preview", before=_state(before), requested=requested
                     )

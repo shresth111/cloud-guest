@@ -83,6 +83,7 @@ __all__ = [
     "MAX_BANDWIDTH_MBPS",
     "BlockResult",
     "GuestNetworkRateLimit",
+    "InstantOnNetworkWideLimitError",
     "InstantOnClientNotBlockableError",
     "InstantOnControlClient",
     "InstantOnNetworkNotFoundError",
@@ -110,6 +111,13 @@ class InstantOnClientNotBlockableError(InstantOnError):
     bulk-block copy)."""
 
     code = "not_blockable"
+
+
+class InstantOnNetworkWideLimitError(InstantOnError):
+    """The network has a limit in a mode other than ``perClient``. A rate-limit
+    write forces ``perClient``, which would silently replace it."""
+
+    code = "network_wide_limit_set"
 
 
 class InstantOnNetworkNotFoundError(InstantOnError):
@@ -398,6 +406,12 @@ class InstantOnControlClient:
         down = _check_mbps(download_mbps, "download")
         up = _check_mbps(upload_mbps, "upload")
         network = await self.get_network(site_id, network_id)
+        if GuestNetworkRateLimit.from_network(network).other_mode_limit:
+            raise InstantOnNetworkWideLimitError(
+                "This network has a network-wide limit set in the Instant On app. "
+                "Change it there.",
+                reason="network_wide_limit_set",
+            )
         body = copy.deepcopy(network)
         qos = body.get("qos")
         if not isinstance(qos, dict):
