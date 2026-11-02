@@ -242,7 +242,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from redis.asyncio import Redis
 
@@ -1958,10 +1958,15 @@ AccessTierForGuestLookup = Callable[
 ]
 
 
-#: ``guest_id -> datetime | None`` -- when a guest whose every ACTIVE session is
-#: on a NAS-only router connected, else ``None``. Built by
+#: A NAS-only guest whose connected time can't be read right now: charge nothing
+#: this tick. Time connected only ever under-counts this way, while falling back
+#: to midnight would use up their whole day.
+SKIP_TIME_ACCRUAL: Final = "skip_time_accrual"
+
+#: ``guest_id -> started_at | SKIP_TIME_ACCRUAL | None``. ``None`` means this
+#: guest is not NAS-only and accrues as before. Built by
 #: ``nas_only_connected_since_lookup``; injected into the FUP time-accrual sweep.
-ConnectedSinceLookup = Callable[[uuid.UUID], Awaitable[datetime | None]]
+ConnectedSinceLookup = Callable[[uuid.UUID], Awaitable[datetime | str | None]]
 
 
 def nas_only_connected_since_lookup(
@@ -1971,20 +1976,28 @@ def nas_only_connected_since_lookup(
     """The earliest ``started_at`` of a guest's ACTIVE sessions when all of them
     run on NAS-only (Aruba Instant On) routers. ``None`` for anyone else,
     including a guest also online on another vendor, so those guests accrue
-    exactly as before. Never raises (``None``)."""
+    exactly as before.
 
-    async def lookup(guest_id: uuid.UUID) -> datetime | None:
+    ``SKIP_TIME_ACCRUAL`` when the answer is unavailable: an Accounting-Stop
+    landed after the sweep listed a guest whose latest session is NAS-only, or
+    the lookup failed. Never raises."""
+
+    async def is_on_nas_only_router(session: GuestSession) -> bool:
+        if session.router_id is None:
+            return False
+        router = await router_lookup.get_router(session.router_id, include_deleted=True)
+        return is_nas_only(router)
+
+    async def lookup(guest_id: uuid.UUID) -> datetime | str | None:
         try:
             sessions = await repository.list_active_sessions_for_guest(guest_id)
             if not sessions:
+                latest = await repository.get_latest_session_for_guest(guest_id)
+                if latest is None or await is_on_nas_only_router(latest):
+                    return SKIP_TIME_ACCRUAL
                 return None
             for session in sessions:
-                if session.router_id is None:
-                    return None
-                router = await router_lookup.get_router(
-                    session.router_id, include_deleted=True
-                )
-                if not is_nas_only(router):
+                if not await is_on_nas_only_router(session):
                     return None
             return min(session.started_at for session in sessions)
         except Exception as exc:  # noqa: BLE001 -- see docstring
@@ -1992,7 +2005,7 @@ def nas_only_connected_since_lookup(
                 "connected_since_sweep_lookup_failed",
                 extra={"guest_id": str(guest_id), "error": str(exc)},
             )
-            return None
+            return SKIP_TIME_ACCRUAL
 
     return lookup
 
@@ -2154,6 +2167,8 @@ async def run_fup_time_accrual(
             if connected_since_lookup is not None
             else None
         )
+        if connected_since == SKIP_TIME_ACCRUAL:
+            continue
         violated_period: str | None = None
         for period_type, limit_minutes in time_limits.items():
             usage = await get_or_reset_quota_usage(
@@ -2168,7 +2183,7 @@ async def run_fup_time_accrual(
             # Aruba Instant On only (the lookup answers None elsewhere): count
             # time connected, not time since midnight or since their last
             # visit, either of which uses up the allowance at the first sweep.
-            if connected_since is not None:
+            if isinstance(connected_since, datetime):
                 accrue_from = max(accrue_from, connected_since)
             elapsed_minutes = max(0, int((now - accrue_from).total_seconds() // 60))
             if elapsed_minutes > 0:

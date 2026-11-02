@@ -397,6 +397,12 @@ class TestDailyTimeAccrualStart:
             fx.repository, fx.guest_service.router_lookup
         )
 
+    async def _minutes_or_zero(self, fx, guest_id) -> int:  # noqa: ANN001
+        usage = await fx.repository.get_quota_usage(
+            guest_id, QuotaPeriodType.DAILY.value
+        )
+        return usage.minutes_used if usage is not None else 0
+
     async def _minutes(self, fx, guest_id) -> int:  # noqa: ANN001
         usage = await fx.repository.get_quota_usage(
             guest_id, QuotaPeriodType.DAILY.value
@@ -456,6 +462,81 @@ class TestDailyTimeAccrualStart:
             )
 
         assert await self._minutes(fx, result.guest.id) == 10
+
+    async def _sweep_with_race(self, fx, result, since):  # noqa: ANN001, ANN202
+        """The sweep has listed the guest; then the AP's Accounting-Stop lands
+        before the lookup reads their sessions."""
+        now = result.session.started_at + timedelta(minutes=10)
+        pair = (await fx.repository.list_active_guest_org_pairs())[0]
+        await fx.repository.update_session(
+            result.session,
+            {"status": GuestSessionStatus.DISCONNECTED.value, "ended_at": now},
+        )
+        original = fx.repository.list_active_guest_org_pairs
+
+        async def stale_pairs():  # noqa: ANN202
+            return [pair]
+
+        fx.repository.list_active_guest_org_pairs = stale_pairs
+        try:
+            return await run_fup_time_accrual(
+                fx.repository,
+                self._lookup(),
+                now=now,
+                connected_since_lookup=since,
+            )
+        finally:
+            fx.repository.list_active_guest_org_pairs = original
+
+    async def test_a_stop_during_the_sweep_never_charges_from_midnight(self) -> None:
+        fx = _fixture(policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+
+        await self._sweep_with_race(fx, result, self._since(fx))
+
+        assert await self._minutes_or_zero(fx, result.guest.id) == 0
+
+    async def test_a_lookup_failure_never_charges_from_midnight(self) -> None:
+        fx = _fixture(policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+
+        class Broken:
+            async def get_router(self, *_: object, **__: object) -> None:
+                raise RuntimeError("boom")
+
+        await run_fup_time_accrual(
+            fx.repository,
+            self._lookup(),
+            now=result.session.started_at + timedelta(minutes=10),
+            connected_since_lookup=nas_only_connected_since_lookup(
+                fx.repository, Broken()
+            ),
+        )
+
+        assert await self._minutes_or_zero(fx, result.guest.id) == 0
+
+    @pytest.mark.parametrize("vendor", ["mikrotik", "tplink_omada"])
+    async def test_other_vendors_keep_their_count_through_the_same_race(
+        self, vendor: str
+    ) -> None:
+        fx = _fixture(vendor=vendor, policy_lookup=self._lookup())
+        result = await _sign_in(fx)
+        started = result.session.started_at
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=started,
+        )
+        await fx.repository.update_quota_usage(
+            usage, {"last_accrued_at": started - timedelta(hours=3)}
+        )
+
+        await self._sweep_with_race(fx, result, self._since(fx))
+
+        assert await self._minutes(fx, result.guest.id) == 190
 
     @pytest.mark.parametrize("vendor", ["mikrotik", "tplink_omada"])
     async def test_other_vendors_accrue_exactly_as_before(self, vendor: str) -> None:
