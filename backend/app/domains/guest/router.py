@@ -2234,6 +2234,23 @@ async def register_radius_nas(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
+    # The identifier here is free text. On a NAS-only device a shape the shared
+    # Aruba listener refuses leaves every guest with a Wyfy session and no
+    # internet, so it is refused before anything is written. Other vendors keep
+    # free text: their identifiers are not read by that listener.
+    from app.domains.router.vendor_capabilities import is_nas_only
+
+    router_row = await service.router_lookup.get_router(
+        payload.router_id, requesting_organization_id=requesting_organization_id
+    )
+    if is_nas_only(router_row) and not shared_listener_accepts_identifier(
+        payload.nas_identifier
+    ):
+        raise PublicNasRegistrationRefusedError(
+            f"NAS-Identifier {payload.nas_identifier} is not one the shared "
+            "Aruba listener accepts, so every sign-in would be rejected. Use "
+            f"{would_be_nas_identifier(payload.router_id)}."
+        )
     result = await service.register_nas(
         actor_user_id=uuid.UUID(user.id),
         router_id=payload.router_id,
