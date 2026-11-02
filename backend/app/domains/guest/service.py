@@ -2455,6 +2455,59 @@ async def issue_live_disconnect(
     return True
 
 
+async def nas_only_session_over_data_cap(
+    repository: Any,
+    policy_lookup: Any,
+    session: GuestSession,
+    *,
+    access_tier: AccessTier | None,
+    now: datetime,
+) -> bool:
+    """Is ``session`` still over a data cap right now? For the worker's cloud cut,
+    which can run well after the accounting packet that asked for it. The session's
+    own limit, then the guest's FUP data limits, as ``_enforce_fup_quota`` reads
+    them. Time quotas are not this cut's business. An unreadable policy answers
+    ``False``: the next interim still over the cap asks again."""
+    if is_quota_exceeded(session):
+        return True
+    try:
+        resolved = await policy_lookup.resolve_effective_policy(
+            policy_type=PolicyType.FUP,
+            organization_id=session.organization_id,
+            location_id=session.location_id,
+            guest_id=session.guest_id,
+        )
+        rules = _with_access_tier(PolicyType.FUP, resolved.rules, access_tier)
+        data_limits = {
+            QuotaPeriodType.DAILY: rules.get("daily_data_limit_mb"),
+            QuotaPeriodType.WEEKLY: rules.get("weekly_data_limit_mb"),
+            QuotaPeriodType.MONTHLY: rules.get("monthly_data_limit_mb"),
+        }
+        capped = [period for period, limit in data_limits.items() if limit is not None]
+        if not capped:
+            return False
+        usages = await get_or_reset_quota_usages(
+            repository,
+            guest_id=session.guest_id,
+            organization_id=session.organization_id,
+            period_types=capped,
+            tz_name=await repository.get_organization_timezone(session.organization_id),
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "guest_nas_only_usage_cut_cap_unreadable",
+            extra={"session_id": str(session.id), "error": str(exc)},
+        )
+        return False
+    return any(
+        is_fup_usage_exceeded(
+            used=usages[period].bytes_used, limit=data_limits[period] * BYTES_PER_MB
+        )
+        for period in capped
+    )
+
+
 async def expire_nas_only_session_over_cap(
     repository: Any, session: GuestSession, *, reason: str, now: datetime
 ) -> GuestSession:

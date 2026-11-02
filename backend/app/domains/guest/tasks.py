@@ -107,6 +107,7 @@ from .service import (
     enforce_session_timeouts,
     enforce_whitelist_only_online_guests,
     expire_nas_only_session_over_cap,
+    nas_only_session_over_data_cap,
     reconcile_sessions_with_router_presence,
     refresh_session_activity_from_router,
     run_fup_time_accrual,
@@ -1728,6 +1729,11 @@ async def enqueue_hotspot_gate_open(
         )
 
 
+#: How long the accounting request will wait to publish the cut. Well under what
+#: rlm_rest allows the request as a whole.
+NAS_ONLY_USAGE_CUT_PUBLISH_TIMEOUT_SECONDS = 1.0
+
+
 async def enqueue_nas_only_usage_cut(
     *, router_id: uuid.UUID | None, session_id: uuid.UUID, reason: str
 ) -> None:
@@ -1736,7 +1742,7 @@ async def enqueue_nas_only_usage_cut(
     router, and never raises: a broker hiccup must not cost the accounting
     packet its acknowledgement, and the next interim still over the cap tries
     again."""
-    from asyncio import to_thread
+    from asyncio import to_thread, wait_for
 
     from app.core.config import get_settings
     from app.domains.network_integration.instant_on_control import (
@@ -1748,11 +1754,15 @@ async def enqueue_nas_only_usage_cut(
 
     def _publish() -> None:
         enforce_nas_only_usage_cut.apply_async(
-            kwargs={"session_id": str(session_id), "reason": reason}
+            kwargs={"session_id": str(session_id), "reason": reason},
+            # Celery's default publish retries would outlast the request.
+            retry=False,
         )
 
     try:
-        await to_thread(_publish)
+        await wait_for(
+            to_thread(_publish), timeout=NAS_ONLY_USAGE_CUT_PUBLISH_TIMEOUT_SECONDS
+        )
     except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
         logger.warning(
             "guest_nas_only_usage_cut_enqueue_failed",
@@ -1763,41 +1773,58 @@ async def enqueue_nas_only_usage_cut(
 async def _enforce_nas_only_usage_cut_async(session_id: str, reason: str) -> str:
     """Ask Instant On to take the device off, and expire the row only once it
     has confirmed. Anything else leaves the session ACTIVE, as ``record_usage``
-    always has. A row that has already ended is left alone: interims can publish
-    this more than once before the first one lands."""
-    async with SessionLocal() as session:
-        try:
-            repository = GuestRepository(session)
-            row = await repository.get_session_by_id(uuid.UUID(session_id))
-            if row is None or row.status != GuestSessionStatus.ACTIVE.value:
-                return "not_active"
-            guest = await repository.get_guest_by_id(row.guest_id)
-            if guest is None:
-                return "no_guest"
-            terminator = _build_session_terminator(session, repository)
+    always has. This can run well after the packet that asked for it, so it first
+    checks the session is still ACTIVE (interims can publish more than once) and
+    still over a data cap (the owner may have raised the limit, or a period may
+    have reset). The block's redis client is per loop, so it is closed here."""
+    from app.domains.network_integration.instant_on_control import _close_loop_redis
+
+    try:
+        async with SessionLocal() as session:
             try:
-                outcome = await terminator.end_on_router(
-                    session=row,
-                    identifier=guest.identifier,
-                    organization_id=row.organization_id,
+                repository = GuestRepository(session)
+                row = await repository.get_session_by_id(uuid.UUID(session_id))
+                if row is None or row.status != GuestSessionStatus.ACTIVE.value:
+                    return "not_active"
+                guest = await repository.get_guest_by_id(row.guest_id)
+                if guest is None:
+                    return "no_guest"
+                now = datetime.now(UTC)
+                policy_service = _build_policy_service(session)
+                access_tier = await aruba_access_tier_lookup(
+                    repository, _build_router_lookup(session), policy_service
+                )(row.guest_id, row.organization_id, row.location_id)
+                if not await nas_only_session_over_data_cap(
+                    repository, policy_service, row, access_tier=access_tier, now=now
+                ):
+                    await session.commit()
+                    return "not_over_cap"
+                terminator = _build_session_terminator(session, repository)
+                try:
+                    outcome = await terminator.end_on_router(
+                        session=row,
+                        identifier=guest.identifier,
+                        organization_id=row.organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- "could not" stays ACTIVE
+                    logger.info(
+                        "guest_nas_only_usage_cut_not_delivered",
+                        extra={"session_id": session_id, "error": str(exc)},
+                    )
+                    return "not_delivered"
+                removed = _removals_reported(outcome)
+                if removed is None or removed < 1:
+                    return "not_delivered"
+                await expire_nas_only_session_over_cap(
+                    repository, row, reason=reason, now=now
                 )
-            except Exception as exc:  # noqa: BLE001 -- "could not" keeps it ACTIVE
-                logger.info(
-                    "guest_nas_only_usage_cut_not_delivered",
-                    extra={"session_id": session_id, "error": str(exc)},
-                )
-                return "not_delivered"
-            removed = _removals_reported(outcome)
-            if removed is None or removed < 1:
-                return "not_delivered"
-            await expire_nas_only_session_over_cap(
-                repository, row, reason=reason, now=datetime.now(UTC)
-            )
-            await session.commit()
-            return "ended"
-        except Exception:
-            await session.rollback()
-            raise
+                await session.commit()
+                return "ended"
+            except Exception:
+                await session.rollback()
+                raise
+    finally:
+        await _close_loop_redis()
 
 
 @celery_app.task(name=TASK_ENFORCE_NAS_ONLY_USAGE_CUT)
