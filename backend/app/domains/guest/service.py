@@ -6030,6 +6030,25 @@ class GuestService:
         )
         if guest is not None and guest.is_blocked:
             return None
+        # Everything else ``login_via_mac_whitelist`` would refuse on. A hint
+        # for a device RADIUS is about to reject sends the portal straight to
+        # the AP login, and the guest gets the AP's generic error with no
+        # sign-in form and no explanation.
+        resolved = await self.captive_portal_service.resolve_portal_config(
+            organization_id=router.organization_id, location_id=router.location_id
+        )
+        try:
+            self._require_venue_open(resolved.config)
+        except VenueClosedError:
+            return None
+        if self.access_control_hook is not None and await is_blocklisted(
+            self.access_control_hook,
+            organization_id=router.organization_id,
+            location_id=router.location_id,
+            identifier=None,
+            mac_address=normalized,
+        ):
+            return None
         return identifier
 
     # ========================================================================

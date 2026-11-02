@@ -14,7 +14,11 @@ import uuid
 from app.domains.guest.constants import GuestAuthMethod
 from app.domains.guest.validators import canonicalize_calling_station_id
 from app.domains.router.vendor_capabilities import ARUBA_INSTANT_ON_VENDOR
-from tests.unit.test_guest import FakeMacAuthorizationHook, make_fixture
+from tests.unit.test_guest import (
+    FakeAccessControlHook,
+    FakeMacAuthorizationHook,
+    make_fixture,
+)
 
 TRUSTED = "60:F4:45:0B:28:66"
 OTHER = "11:22:33:44:55:66"
@@ -97,6 +101,53 @@ class TestTrustedDeviceLoginIdentifier:
         fx = make_fixture(
             mac_authorization_hook=FakeMacAuthorizationHook(whitelisted={TRUSTED})
         )
+        assert (
+            await fx.guest_service.trusted_device_login_identifier(
+                router_id=fx.router.id, device_mac=TRUSTED
+            )
+            is None
+        )
+
+    async def test_a_device_blocked_by_a_rule_gets_nothing(self) -> None:
+        """RADIUS would refuse it, and the guest would get the AP's generic
+        error with no sign-in form to explain why."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(
+            mac_authorization_hook=FakeMacAuthorizationHook(whitelisted={TRUSTED}),
+            access_control_hook=hook,
+        )
+        fx.router.vendor = ARUBA_INSTANT_ON_VENDOR
+        assert (
+            await fx.guest_service.trusted_device_login_identifier(
+                router_id=fx.router.id, device_mac=TRUSTED
+            )
+            == f"mac:{TRUSTED}"
+        )
+        hook.deny(mac_address=TRUSTED)
+        assert (
+            await fx.guest_service.trusted_device_login_identifier(
+                router_id=fx.router.id, device_mac=TRUSTED
+            )
+            is None
+        )
+
+    async def test_a_closed_venue_gets_nothing(self) -> None:
+        fx = _aruba_fixture()
+        config = fx.captive_portal_service.configs_by_org[fx.organization_id]
+        config.business_hours_enabled = True
+        config.business_hours_timezone = "UTC"
+        config.business_hours_schedule = {
+            day: {"open": False}
+            for day in (
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+            )
+        }
         assert (
             await fx.guest_service.trusted_device_login_identifier(
                 router_id=fx.router.id, device_mac=TRUSTED

@@ -2789,8 +2789,6 @@ async def get_public_radius_nas_status(
             nas_client.hub_client_synced_ip is not None
             and nas_client.hub_client_synced_ip == nas_client.ip_address
         )
-        if not hub_confirmed:
-            gaps.append("hub_not_confirmed")
     radius_server = _radius_server_view()
     if radius_server is None:
         gaps.append("radius_server_address_not_configured")
@@ -2800,6 +2798,22 @@ async def get_public_radius_nas_status(
         if is_nas_only(router)
         else None
     )
+    # A row with no address has no hub stanza of its own to confirm: the shared
+    # listener's catch-all client serves it. Reporting that as
+    # "hub_not_confirmed" withheld the portal host and allowed domains from the
+    # panel, and told ops to register again, for a venue that was working. Its
+    # readiness is the listener's, and its ports are the listener's.
+    on_shared_listener = (
+        nas_client is not None
+        and nas_client.ip_address is None
+        and shared_listener is not None
+        and shared_listener.available
+    )
+    if on_shared_listener:
+        hub_confirmed = True
+        radius_server = _shared_radius_server_view() or radius_server
+    elif nas_client is not None and not hub_confirmed:
+        gaps.append("hub_not_confirmed")
     payload = PublicNasStatusResponse(
         shared_listener=shared_listener,
         router_id=str(router.id),
