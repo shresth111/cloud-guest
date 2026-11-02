@@ -43,8 +43,15 @@ defaults:
 
 jobs:
   isp-postgres:
+    # Three shards (every 3rd file each): ~44 files at ~95 s each (most of it
+    # building the app) did not fit one 90-minute job (run 41371952442).
+    name: isp-postgres (${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     services:
       postgres:
@@ -104,4 +111,6 @@ jobs:
           cat /tmp/moto.log; exit 1
 
       - name: ISP PostgreSQL tests (one file per process)
+        env:
+          ISP_PG_SHARD: ${{ matrix.shard }}/3
         run: python scripts/run_isp_pg_tests.py
