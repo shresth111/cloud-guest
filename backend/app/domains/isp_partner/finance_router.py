@@ -679,7 +679,9 @@ def thermal_width(
     parameter is not coerced from it (422 for every width), so the value is
     read as an int and checked here."""
     if width not in THERMAL_WIDTHS:
-        raise IspBadRequestError("Slip width is 58 or 80 mm", field="width")
+        raise IspBadRequestError(
+            "Slip width is 58 or 80 mm", field="width", reason="ISP_QUERY_INVALID"
+        )
     return width
 
 
@@ -807,7 +809,14 @@ async def zone_revenue(
             content=build_response(
                 success=False,
                 message="Range must be 0-400 days",
-                data={"code": "ISP_FINANCE_INVALID"},
+                data={
+                    "code": "ISP_FINANCE_INVALID",
+                    "reason": "ISP_DATE_RANGE_INVALID",
+                    "max_days": 400,
+                },
+                # ERROR-COPY: build_response needs request_id; without it
+                # this 422 was a TypeError, i.e. a 500 with no code.
+                request_id=request_id(request),
             ),
         )  # noqa: E501
     return ok(

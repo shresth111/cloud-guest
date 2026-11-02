@@ -118,16 +118,22 @@ def _clean(body: dict[str, Any]) -> dict[str, Any]:
         and out["applicant_type"] not in APPLICANT_TYPES
     ):
         raise IspBadRequestError(
-            "applicant_type is individual or organization", field="applicant_type"
+            "applicant_type is individual or organization",
+            field="applicant_type",
+            reason="ISP_CHOICE_INVALID",
         )
     if out.get("gender") is not None and out["gender"] not in GENDERS:
         raise IspBadRequestError(
-            "gender is male, female, other or undisclosed", field="gender"
+            "gender is male, female, other or undisclosed",
+            field="gender",
+            reason="ISP_CHOICE_INVALID",
         )
     for name in ("address_proof_type",):
         if out.get(name) is not None and out[name] not in logic.ID_TYPES:
             raise IspBadRequestError(
-                f"{name} must be one of {', '.join(logic.ID_TYPES)}", field=name
+                f"{name} must be one of {', '.join(logic.ID_TYPES)}",
+                field=name,
+                reason="ISP_CHOICE_INVALID",
             )
     pin = out.get("installation_pincode")
     if pin is not None and not (pin.isdigit() and len(pin) == 6):
@@ -137,14 +143,18 @@ def _clean(body: dict[str, Any]) -> dict[str, Any]:
             out["date_of_birth"] = date.fromisoformat(out["date_of_birth"])
         except ValueError as exc:
             raise IspBadRequestError(
-                "date_of_birth is YYYY-MM-DD", field="date_of_birth"
+                "date_of_birth is YYYY-MM-DD",
+                field="date_of_birth",
+                reason="ISP_DATE_FORMAT",
             ) from exc
     if "installed_at" in out and isinstance(out["installed_at"], str):
         try:
             out["installed_at"] = datetime.fromisoformat(out["installed_at"])
         except ValueError as exc:
             raise IspBadRequestError(
-                "installed_at is an ISO date-time", field="installed_at"
+                "installed_at is an ISO date-time",
+                field="installed_at",
+                reason="ISP_DATE_FORMAT",
             ) from exc
     if (
         out.get("address_proof_same_as_id") is None
@@ -184,6 +194,7 @@ async def upsert_kyc(
             raise IspBadRequestError(
                 f"id_proof_type must be one of {', '.join(logic.ID_TYPES)}",
                 field="id_proof_type",
+                reason="ISP_CHOICE_INVALID",
             )
         if "id_number" in body:
             if id_type is None:
@@ -287,7 +298,9 @@ def sniff_type(content: bytes) -> str | None:
 def validate_document(kind: str, content: bytes) -> str:
     if kind not in logic.DOCUMENT_KINDS:
         raise IspBadRequestError(
-            f"kind must be one of {', '.join(logic.DOCUMENT_KINDS)}", field="kind"
+            f"kind must be one of {', '.join(logic.DOCUMENT_KINDS)}",
+            field="kind",
+            reason="ISP_CHOICE_INVALID",
         )
     if not content:
         raise IspBadRequestError("The file is empty", field="file")

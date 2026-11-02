@@ -16,9 +16,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .exceptions import IspFeatureDisabledError
 
 
 class IspFinanceSettings(BaseSettings):
@@ -40,7 +42,8 @@ def get_finance_settings() -> IspFinanceSettings:
 
 
 def _off() -> HTTPException:
-    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    # ERROR-COPY: same 404 "Not Found", now with data.code.
+    return IspFeatureDisabledError()
 
 
 async def RequireFinanceExtras() -> None:

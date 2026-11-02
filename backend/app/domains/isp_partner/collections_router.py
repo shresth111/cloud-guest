@@ -303,7 +303,9 @@ async def cash_slip(
     if width not in (58, 80):
         from .exceptions import IspBadRequestError
 
-        raise IspBadRequestError("Slip width is 58 or 80 mm", field="width")
+        raise IspBadRequestError(
+            "Slip width is 58 or 80 mm", field="width", reason="ISP_QUERY_INVALID"
+        )
     pay = await svc.slip_payment(isp, payment_id)
     view = (await svc.billing.payment_rows(isp, [pay]))[0]
     seller = svc.billing.settings_view(await svc.billing.settings(isp)) or {}

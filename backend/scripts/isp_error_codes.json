@@ -1,0 +1,1856 @@
+{
+  "_generated_by": "backend/scripts/isp_error_inventory.py",
+  "codes": [
+    {
+      "code": "ISP_ADDON_LIMIT",
+      "kind": "code",
+      "status": 409,
+      "message": "You have switched this add-on on for as many customers as allowed.",
+      "sources": [
+        "app/domains/isp_partner/isp_addons.py"
+      ]
+    },
+    {
+      "code": "ISP_ADDON_NOT_ALLOWED",
+      "kind": "code",
+      "status": 403,
+      "message": "This add-on is not enabled for your ISP account. Ask Wyfy.",
+      "sources": [
+        "app/domains/isp_partner/isp_addons.py"
+      ]
+    },
+    {
+      "code": "ISP_ADDON_UNKNOWN",
+      "kind": "code",
+      "status": 404,
+      "message": "Not an add-on",
+      "sources": [
+        "app/domains/isp_partner/isp_addons.py"
+      ]
+    },
+    {
+      "code": "ISP_APPS_CHECKOUT_APPROVAL",
+      "kind": "code",
+      "status": 409,
+      "message": "Checking a unit out to a customer needs approval: request a checkout",
+      "sources": [
+        "app/domains/isp_partner/apps_common.py"
+      ]
+    },
+    {
+      "code": "ISP_APPS_CONFLICT",
+      "kind": "code",
+      "status": 409,
+      "message": "That already exists",
+      "sources": [
+        "app/domains/isp_partner/apps_common.py"
+      ]
+    },
+    {
+      "code": "ISP_APPS_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "That change is not allowed",
+      "sources": [
+        "app/domains/isp_partner/apps_common.py"
+      ]
+    },
+    {
+      "code": "ISP_APPS_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Not found",
+      "sources": [
+        "app/domains/isp_partner/apps_common.py"
+      ]
+    },
+    {
+      "code": "ISP_AUDIT_LOG_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/audit_log_config.py"
+      ]
+    },
+    {
+      "code": "ISP_AUTOMATION_ERROR",
+      "kind": "code",
+      "status": 422,
+      "message": "Automation is not set up",
+      "sources": [
+        "app/domains/isp_partner/automation.py"
+      ]
+    },
+    {
+      "code": "ISP_BAD_REQUEST",
+      "kind": "code",
+      "status": 422,
+      "message": "Invalid request",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_BILLING_NOT_CONFIGURED",
+      "kind": "code",
+      "status": 409,
+      "message": "Set up billing (legal name, state, prefixes) first",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_BINDING_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Binding not found",
+      "sources": [
+        "app/domains/isp_partner/enforcement_router.py"
+      ]
+    },
+    {
+      "code": "ISP_BULK_FILTER_TOO_BROAD",
+      "kind": "reason",
+      "status": 422,
+      "message": "The filter matches {…} subscribers; narrow it to {…} or fewer",
+      "sources": [
+        "app/domains/isp_partner/directory_bulk_router.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_BULK_TOO_LARGE",
+      "kind": "code",
+      "status": 422,
+      "message": "At most 500 invoices at once",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_BURST_INCOMPLETE",
+      "kind": "code",
+      "status": 422,
+      "message": "Burst needs all four values, above the base rate",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_BUYER_GSTIN_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "GSTIN is not valid",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_BYO_OVERRIDE_NOT_ENABLED",
+      "kind": "code",
+      "status": 403,
+      "message": "Per-customer senders are off for your account. Turn them on in Messaging settings first.",
+      "sources": [
+        "app/domains/isp_partner/parity_settings.py"
+      ]
+    },
+    {
+      "code": "ISP_CAF_LEADS_OFF",
+      "kind": "code",
+      "status": 404,
+      "message": "Leads are not switched on",
+      "sources": [
+        "app/domains/isp_partner/caf_router.py"
+      ]
+    },
+    {
+      "code": "ISP_CAF_NUMBER_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "That CAF number is already used by another subscriber",
+      "sources": [
+        "app/domains/isp_partner/compliance_kyc.py"
+      ]
+    },
+    {
+      "code": "ISP_CHOICE_INVALID",
+      "kind": "reason",
+      "status": 422,
+      "message": "applicant_type is individual or organization",
+      "sources": [
+        "app/domains/isp_partner/caf_service.py",
+        "app/domains/isp_partner/compliance_kyc.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_COLLECTIONS_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/collections_config.py"
+      ]
+    },
+    {
+      "code": "ISP_COLLECTION_HANDOVER_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Handover not found",
+      "sources": [
+        "app/domains/isp_partner/collections_config.py"
+      ]
+    },
+    {
+      "code": "ISP_COLLECTION_HANDOVER_STATE",
+      "kind": "code",
+      "status": 409,
+      "message": "This handover has already been decided",
+      "sources": [
+        "app/domains/isp_partner/collections_config.py"
+      ]
+    },
+    {
+      "code": "ISP_COLLECTION_NOTHING_TO_HAND_OVER",
+      "kind": "code",
+      "status": 422,
+      "message": "No cash recorded by you on that day is waiting for a handover",
+      "sources": [
+        "app/domains/isp_partner/collections_config.py"
+      ]
+    },
+    {
+      "code": "ISP_COLLECTION_PROMISE_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Promise not found",
+      "sources": [
+        "app/domains/isp_partner/collections_config.py"
+      ]
+    },
+    {
+      "code": "ISP_COLLECTION_SELF_APPROVAL",
+      "kind": "code",
+      "status": 409,
+      "message": "A collector cannot approve their own handover",
+      "sources": [
+        "app/domains/isp_partner/collections_config.py"
+      ]
+    },
+    {
+      "code": "ISP_COMMS_HUB_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/comms_router.py"
+      ]
+    },
+    {
+      "code": "ISP_CONFINEMENT_NOT_ALLOWED",
+      "kind": "code",
+      "status": 422,
+      "message": "Owners and admins cannot be confined to customers",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_COUPON_BATCH_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Coupon batch not found",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_COUPON_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Coupon not found",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_CREDIT_EXCEEDS_BALANCE",
+      "kind": "code",
+      "status": 422,
+      "message": "The credit note is larger than the invoice balance",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_CSV_ONE_SECTION",
+      "kind": "reason",
+      "status": 422,
+      "message": "CSV is one section per file: pick a section, or use xlsx",
+      "sources": [
+        "app/domains/isp_partner/billing_gst.py",
+        "app/domains/isp_partner/reports_router.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_CUSTOMER_LIMIT",
+      "kind": "code",
+      "status": 409,
+      "message": "This ISP has reached its customer limit",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_CUSTOMER_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Customer not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_CUSTOMER_REQUIRED",
+      "kind": "code",
+      "status": 422,
+      "message": "Choose a customer",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_CUSTOMER_SLUG_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "That slug is already taken",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_CUSTOMER_SUSPENDED",
+      "kind": "code",
+      "status": 409,
+      "message": "Not available while this customer is suspended",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_DASHBOARD_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/dashboard_router.py"
+      ]
+    },
+    {
+      "code": "ISP_DATE_FORMAT",
+      "kind": "reason",
+      "status": 422,
+      "message": "date_of_birth is YYYY-MM-DD",
+      "sources": [
+        "app/domains/isp_partner/compliance_kyc.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_DATE_RANGE_INCOMPLETE",
+      "kind": "reason",
+      "status": 422,
+      "message": "A custom period needs date_from and date_to",
+      "sources": [
+        "app/domains/isp_partner/dashboard_service.py",
+        "app/domains/isp_partner/logs_rate_router.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_DATE_RANGE_INVALID",
+      "kind": "reason",
+      "status": 422,
+      "message": "Range is 1 to 366 days",
+      "sources": [
+        "app/domains/isp_partner/caf_service.py",
+        "app/domains/isp_partner/dashboard_service.py",
+        "app/domains/isp_partner/finance_router.py",
+        "app/domains/isp_partner/franchise_router.py",
+        "app/domains/isp_partner/netmon_router.py",
+        "app/domains/isp_partner/zones_router.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST",
+        "ISP_FINANCE_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DATE_RANGE_ORDER",
+      "kind": "reason",
+      "status": 422,
+      "message": "until is before since",
+      "sources": [
+        "app/domains/isp_partner/apps_router.py",
+        "app/domains/isp_partner/audit_log_service.py",
+        "app/domains/isp_partner/comms_router.py",
+        "app/domains/isp_partner/compliance_router.py",
+        "app/domains/isp_partner/compliance_service.py",
+        "app/domains/isp_partner/logs_rate_router.py",
+        "app/domains/isp_partner/reports.py"
+      ],
+      "parents": [
+        "ISP_APPS_INVALID",
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_DATE_RANGE_TOO_LONG",
+      "kind": "reason",
+      "status": 422,
+      "message": "A session dump covers at most {…} days",
+      "sources": [
+        "app/domains/isp_partner/compliance_router.py",
+        "app/domains/isp_partner/compliance_service.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_DAY_OF_MONTH_RANGE",
+      "kind": "reason",
+      "status": 422,
+      "message": "day_of_month is 1-28",
+      "sources": [
+        "app/domains/isp_partner/compliance_router.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_DEPOSIT_EXCEEDS_BALANCE",
+      "kind": "code",
+      "status": 409,
+      "message": "A refund or forfeit cannot exceed the deposit held",
+      "sources": [
+        "app/domains/isp_partner/finance_service.py"
+      ]
+    },
+    {
+      "code": "ISP_DIAGNOSTICS_RATE_LIMITED",
+      "kind": "code",
+      "status": 429,
+      "message": "Too many diagnostics started in the last minute. Wait a moment and retry.",
+      "sources": [
+        "app/domains/isp_partner/twins_security_ops.py"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_APPLY_OFF",
+      "kind": "code",
+      "status": 422,
+      "message": "Discount codes cannot be applied to invoices yet",
+      "sources": [
+        "app/domains/isp_partner/discount_wire.py"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_BELOW_MINIMUM",
+      "kind": "reason",
+      "status": 422,
+      "message": "The bill is below this code's minimum amount",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_EXPIRED",
+      "kind": "reason",
+      "status": 422,
+      "message": "This discount code has expired",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py",
+        "app/domains/isp_partner/bulk_discount.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "This discount code cannot be used",
+      "sources": [
+        "app/domains/isp_partner/apps_common.py"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_NOTHING_TO_DISCOUNT",
+      "kind": "reason",
+      "status": 422,
+      "message": "Nothing to discount",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_NOT_STARTED",
+      "kind": "reason",
+      "status": 422,
+      "message": "This discount code is not valid yet",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py",
+        "app/domains/isp_partner/bulk_discount.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_OFF",
+      "kind": "reason",
+      "status": 422,
+      "message": "This discount code is switched off",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py",
+        "app/domains/isp_partner/bulk_discount.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_UNKNOWN",
+      "kind": "reason",
+      "status": 422,
+      "message": "Unknown discount code",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py",
+        "app/domains/isp_partner/bulk_discount.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_USED_UP",
+      "kind": "reason",
+      "status": 422,
+      "message": "This discount code has been used up",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DISCOUNT_WRONG_PACKAGE",
+      "kind": "reason",
+      "status": 422,
+      "message": "This code does not apply to this package",
+      "sources": [
+        "app/domains/isp_partner/apps_discounts.py"
+      ],
+      "parents": [
+        "ISP_DISCOUNT_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_DOCUMENT_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Document not found",
+      "sources": [
+        "app/domains/isp_partner/compliance_kyc.py"
+      ]
+    },
+    {
+      "code": "ISP_ENFORCEMENT_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/enforcement_router.py"
+      ]
+    },
+    {
+      "code": "ISP_ERROR",
+      "kind": "code",
+      "status": 400,
+      "message": "ISP partner request failed",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_EXPORT_TOO_LARGE",
+      "kind": "reason",
+      "status": 422,
+      "message": "At most {…} CAFs per file; narrow the range",
+      "sources": [
+        "app/domains/isp_partner/caf_service.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_EXTERNAL_REF_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "Another customer already uses that external reference",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_FEATURE_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_FIBER_CONFLICT",
+      "kind": "code",
+      "status": 409,
+      "message": "That is already in use",
+      "sources": [
+        "app/domains/isp_partner/fiber_service.py"
+      ]
+    },
+    {
+      "code": "ISP_FIBER_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "That change is not valid for this fiber node",
+      "sources": [
+        "app/domains/isp_partner/fiber_service.py"
+      ]
+    },
+    {
+      "code": "ISP_FIBER_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Fiber node not found",
+      "sources": [
+        "app/domains/isp_partner/fiber_service.py"
+      ]
+    },
+    {
+      "code": "ISP_FIELD_IMMUTABLE",
+      "kind": "code",
+      "status": 422,
+      "message": "That field cannot be changed",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py",
+        "app/domains/isp_partner/twin_body.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_FINANCE_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "Invalid value",
+      "sources": [
+        "app/domains/isp_partner/finance_router.py",
+        "app/domains/isp_partner/finance_service.py"
+      ]
+    },
+    {
+      "code": "ISP_FINANCE_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Not found",
+      "sources": [
+        "app/domains/isp_partner/finance_service.py"
+      ]
+    },
+    {
+      "code": "ISP_FORCE_NOT_ALLOWED",
+      "kind": "code",
+      "status": 422,
+      "message": "force=true is not available to ISP partners",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_FRANCHISE_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/franchise_router.py"
+      ]
+    },
+    {
+      "code": "ISP_FREEZE_NEEDS_VALIDITY",
+      "kind": "code",
+      "status": 409,
+      "message": "Only a subscriber with validity left can be frozen",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_GRACE_ACTIVE",
+      "kind": "code",
+      "status": 409,
+      "message": "A grace period is already running for this subscriber",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_GROUP_IN_USE",
+      "kind": "code",
+      "status": 409,
+      "message": "This speed group still has packages or subscribers",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_IDEMPOTENCY_KEY_REUSED",
+      "kind": "reason",
+      "status": 422,
+      "message": "This Idempotency-Key was used for another payment",
+      "sources": [
+        "app/domains/isp_partner/collections_service.py",
+        "app/domains/isp_partner/queued_renewal_service.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_INCIDENTS_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/incidents_config.py"
+      ]
+    },
+    {
+      "code": "ISP_INCIDENT_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Incident not found",
+      "sources": [
+        "app/domains/isp_partner/incidents_config.py"
+      ]
+    },
+    {
+      "code": "ISP_INCIDENT_STATE",
+      "kind": "code",
+      "status": 409,
+      "message": "That step does not fit the incident's current status",
+      "sources": [
+        "app/domains/isp_partner/incidents_config.py"
+      ]
+    },
+    {
+      "code": "ISP_INVOICE_CANCELLED",
+      "kind": "code",
+      "status": 409,
+      "message": "This invoice is cancelled",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_INVOICE_DATE_OUT_OF_RANGE",
+      "kind": "code",
+      "status": 422,
+      "message": "Invoice date must be within the last 7 days and in the current financial year",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_INVOICE_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Invoice not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_INVOICE_NUMBER_OVERFLOW",
+      "kind": "code",
+      "status": 500,
+      "message": "Invoice number would exceed 16 characters",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_INVOICE_PAID",
+      "kind": "code",
+      "status": 409,
+      "message": "This invoice is already paid",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_INVOICE_PREFIX_TOO_LONG",
+      "kind": "code",
+      "status": 422,
+      "message": "Prefix must be 1-4 characters A-Z or 0-9",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_INVOICE_VOID",
+      "kind": "code",
+      "status": 409,
+      "message": "This invoice is cancelled",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_IPDR_LEA_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/ipdr_lea_router.py"
+      ]
+    },
+    {
+      "code": "ISP_IP_INVALID",
+      "kind": "reason",
+      "status": 422,
+      "message": "static_ip is not an IP address",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ],
+      "parents": [
+        "ISP_PPPOE_SCRIPT_PARAM"
+      ]
+    },
+    {
+      "code": "ISP_IP_POOL_EXHAUSTED",
+      "kind": "code",
+      "status": 409,
+      "message": "No free address left in this pool",
+      "sources": [
+        "app/domains/isp_partner/enforcement_router.py"
+      ]
+    },
+    {
+      "code": "ISP_IP_POOL_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "IP pool not found",
+      "sources": [
+        "app/domains/isp_partner/enforcement_router.py"
+      ]
+    },
+    {
+      "code": "ISP_IP_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "That IP is already pinned to a subscriber at this location",
+      "sources": [
+        "app/domains/isp_partner/enforcement_router.py"
+      ]
+    },
+    {
+      "code": "ISP_LAST_OWNER",
+      "kind": "code",
+      "status": 409,
+      "message": "The last active ISP owner cannot be disabled or demoted",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_LEA_OWNER_ADMIN_ONLY",
+      "kind": "code",
+      "status": 403,
+      "message": "Only an ISP Owner or Admin can run a reverse-IP trace report",
+      "sources": [
+        "app/domains/isp_partner/ipdr_lea_router.py"
+      ]
+    },
+    {
+      "code": "ISP_LOCATION_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Location not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_MAC_INVALID",
+      "kind": "reason",
+      "status": 422,
+      "message": "Not a MAC address: {…}",
+      "sources": [
+        "app/domains/isp_partner/apps_inventory.py"
+      ],
+      "parents": [
+        "ISP_APPS_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_MONTH_FORMAT",
+      "kind": "reason",
+      "status": 422,
+      "message": "month must be YYYY-MM",
+      "sources": [
+        "app/domains/isp_partner/billing_gst.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_MONTH_IN_FUTURE",
+      "kind": "reason",
+      "status": 422,
+      "message": "month cannot be in the future",
+      "sources": [
+        "app/domains/isp_partner/revenue_service.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_MOVE_SAME_CUSTOMER",
+      "kind": "code",
+      "status": 409,
+      "message": "The subscriber is already with that customer",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_NAME_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "That name is already used",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_NETMON_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/netmon_router.py"
+      ]
+    },
+    {
+      "code": "ISP_NOTHING_TO_REVERT",
+      "kind": "code",
+      "status": 409,
+      "message": "There is no renewal to revert",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_NOT_AVAILABLE_YET",
+      "kind": "reason",
+      "status": 422,
+      "message": "assigning an access rule to one guest is not available from the partner console yet",
+      "sources": [
+        "app/domains/isp_partner/twin_body.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_NO_OVERDUE_INVOICES",
+      "kind": "code",
+      "status": 409,
+      "message": "This customer has no overdue invoices",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_NO_RECIPIENT",
+      "kind": "code",
+      "status": 422,
+      "message": "No email address on file for that choice",
+      "sources": [
+        "app/domains/isp_partner/finance_service.py"
+      ]
+    },
+    {
+      "code": "ISP_ONBOARD_STEP_FAILED",
+      "kind": "code",
+      "status": 400,
+      "message": "",
+      "sources": [
+        "app/domains/isp_partner/onboarding_router.py"
+      ]
+    },
+    {
+      "code": "ISP_OWNER_GRANT_REFUSED",
+      "kind": "code",
+      "status": 403,
+      "message": "Only the isp-owner role on an ISP organization can be granted here.",
+      "sources": [
+        "app/domains/isp_partner/platform_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PACKAGE_DISABLED",
+      "kind": "code",
+      "status": 409,
+      "message": "This package is disabled",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PACKAGE_IN_USE",
+      "kind": "code",
+      "status": 409,
+      "message": "This package is in use; disable it or duplicate it instead",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PACKAGE_NEEDS_PRICE",
+      "kind": "code",
+      "status": 409,
+      "message": "Set a price for this package first",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PACKAGE_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Package not found",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PARTNER_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "ISP partner not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_PARTNER_REQUIRED",
+      "kind": "code",
+      "status": 403,
+      "message": "This account is not an ISP partner account",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_PARTNER_SUSPENDED",
+      "kind": "code",
+      "status": 403,
+      "message": "This ISP partner account is suspended. Contact Wyfy support.",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_PAYMENT_MODE_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "Mode must be cash, upi, bank_transfer or online",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_PAYMENT_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Payment not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_PAYMENT_REFERENCE_REQUIRED",
+      "kind": "code",
+      "status": 422,
+      "message": "A reference (UTR) is required for UPI and bank transfers",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_PAY_LINK_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "",
+      "sources": [
+        "app/domains/isp_partner/finance_router.py"
+      ]
+    },
+    {
+      "code": "ISP_PERMANENT_BLOCK_OWNER_ONLY",
+      "kind": "code",
+      "status": 403,
+      "message": "Only an ISP owner or admin can lift a permanent block",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PII_MASKED",
+      "kind": "code",
+      "status": 403,
+      "message": "Connection records show guest addresses. Wyfy has not enabled unmasked records for your account, or your role is not owner/admin.",
+      "sources": [
+        "app/domains/isp_partner/twins_addons.py"
+      ]
+    },
+    {
+      "code": "ISP_PLAN_FIELD_REQUIRED",
+      "kind": "code",
+      "status": 422,
+      "message": "Required plan field missing",
+      "sources": [
+        "app/domains/isp_partner/billing_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PORTAL_CONFIG_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Captive portal config not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_PORTAL_SUPPORT_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "No support contact for this location",
+      "sources": [
+        "app/domains/isp_partner/portal_support_router.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_BAD_PASSWORD",
+      "kind": "code",
+      "status": 422,
+      "message": "Password: 8-64 printable characters, no spaces or quotes",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_BAD_USERNAME",
+      "kind": "code",
+      "status": 422,
+      "message": "Username: 3-64 characters, letters, digits and . _ @ - only",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_DEVICE_UNREACHABLE",
+      "kind": "code",
+      "status": 502,
+      "message": "Could not reach the router to end the session",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_NOT_CONFIGURED",
+      "kind": "code",
+      "status": 404,
+      "message": "This subscriber has no PPPoE login yet",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_POOL_NAME_INVALID",
+      "kind": "reason",
+      "status": 422,
+      "message": "ip_pool_name: letters, digits, . _ -",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ],
+      "parents": [
+        "ISP_PPPOE_SCRIPT_PARAM"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_ROUTER_NOT_READY",
+      "kind": "code",
+      "status": 409,
+      "message": "This router is not set up yet (no management tunnel or RADIUS NAS). Run the main setup script first.",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_SCRIPT_PARAM",
+      "kind": "code",
+      "status": 422,
+      "message": "Invalid script value",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_SESSION_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "PPPoE session not found",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PPPOE_USERNAME_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "That PPPoE username is already used by another subscriber of this ISP",
+      "sources": [
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_PROFILE_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "Invalid profile field",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_QUERY_INVALID",
+      "kind": "reason",
+      "status": 422,
+      "message": "Unknown trigger {…}",
+      "sources": [
+        "app/domains/isp_partner/automation.py",
+        "app/domains/isp_partner/collections_router.py",
+        "app/domains/isp_partner/comms_router.py",
+        "app/domains/isp_partner/compliance_reports.py",
+        "app/domains/isp_partner/compliance_router.py",
+        "app/domains/isp_partner/dashboard_service.py",
+        "app/domains/isp_partner/finance_router.py",
+        "app/domains/isp_partner/incidents_service.py",
+        "app/domains/isp_partner/ipdr_lea_router.py",
+        "app/domains/isp_partner/logs_rate_router.py",
+        "app/domains/isp_partner/reports.py",
+        "app/domains/isp_partner/revenue_service.py",
+        "app/domains/isp_partner/twin_body.py"
+      ],
+      "parents": [
+        "ISP_AUTOMATION_ERROR",
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_QUEUED_RENEWAL_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/queued_renewal_config.py"
+      ]
+    },
+    {
+      "code": "ISP_QUEUED_RENEWAL_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Queued renewal not found",
+      "sources": [
+        "app/domains/isp_partner/queued_renewal_config.py"
+      ]
+    },
+    {
+      "code": "ISP_QUEUED_RENEWAL_STATE",
+      "kind": "code",
+      "status": 409,
+      "message": "This queued renewal cannot change now",
+      "sources": [
+        "app/domains/isp_partner/queued_renewal_config.py"
+      ]
+    },
+    {
+      "code": "ISP_RANGE_TOO_LONG",
+      "kind": "code",
+      "status": 422,
+      "message": "The date range can be at most 92 days",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_REFERRALS_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/referrals_config.py"
+      ]
+    },
+    {
+      "code": "ISP_REFERRAL_INVALID",
+      "kind": "code",
+      "status": 409,
+      "message": "This referral is not allowed",
+      "sources": [
+        "app/domains/isp_partner/referrals_config.py"
+      ]
+    },
+    {
+      "code": "ISP_REFERRAL_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Referral not found",
+      "sources": [
+        "app/domains/isp_partner/referrals_config.py"
+      ]
+    },
+    {
+      "code": "ISP_RENEW_CYCLES_OFF",
+      "kind": "code",
+      "status": 422,
+      "message": "Renewing for more than one cycle is not switched on for this account",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_REVENUE_HUB_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/revenue_router.py"
+      ]
+    },
+    {
+      "code": "ISP_REVERT_PAID",
+      "kind": "code",
+      "status": 409,
+      "message": "That renewal has a payment recorded; void the payment first, then revert",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_ROLES_NOT_SEEDED",
+      "kind": "code",
+      "status": 503,
+      "message": "ISP roles are not seeded on this server. Run python -m app.domains.isp_partner.seed.",
+      "sources": [
+        "app/domains/isp_partner/platform_service.py"
+      ]
+    },
+    {
+      "code": "ISP_ROLE_ESCALATION",
+      "kind": "code",
+      "status": 403,
+      "message": "You cannot grant or change that role",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_ROLE_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "Role must be one of the ISP roles",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_ROLE_REQUIRED",
+      "kind": "code",
+      "status": 403,
+      "message": "An ISP role on this organization is required",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_ROUTER_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Router not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SCOPE_HEADERS_NOT_ALLOWED",
+      "kind": "code",
+      "status": 400,
+      "message": "X-Location-Id and X-Router-Id are not accepted on /isp",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SCOPE_VIOLATION",
+      "kind": "code",
+      "status": 500,
+      "message": "Internal scope check failed",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SELLER_GSTIN_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "Your GSTIN is not valid",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SENDER_IS_ISP_LEVEL",
+      "kind": "code",
+      "status": 403,
+      "message": "This customer uses your ISP-level sender. Change it under Messaging settings, or switch this customer to its own sender first.",
+      "sources": [
+        "app/domains/isp_partner/twins_marketing.py"
+      ]
+    },
+    {
+      "code": "ISP_SERVICE_TRANSITION_IN_PROGRESS",
+      "kind": "code",
+      "status": 409,
+      "message": "Another suspend or resume for this customer is running",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SLUG_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "That slug is already taken",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SMS_REMINDERS_UNAVAILABLE",
+      "kind": "code",
+      "status": 409,
+      "message": "SMS reminders are not available yet. Send an e-mail reminder instead.",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SPEED_GROUP_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Speed group not found",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_STATIC_IP_IN_USE",
+      "kind": "code",
+      "status": 409,
+      "message": "That IP already has an active lease",
+      "sources": [
+        "app/domains/isp_partner/finance_service.py"
+      ]
+    },
+    {
+      "code": "ISP_STATUS_CHANGED",
+      "kind": "reason",
+      "status": 422,
+      "message": "A {…} ticket cannot move to {…}",
+      "sources": [
+        "app/domains/isp_partner/apps_helpdesk.py",
+        "app/domains/isp_partner/apps_inventory.py",
+        "app/domains/isp_partner/apps_leads.py",
+        "app/domains/isp_partner/apps_tasks.py",
+        "app/domains/isp_partner/incidents_service.py",
+        "app/domains/isp_partner/queued_renewal_service.py",
+        "app/domains/isp_partner/referrals_service.py"
+      ],
+      "parents": [
+        "ISP_APPS_INVALID",
+        "ISP_INCIDENT_STATE",
+        "ISP_QUEUED_RENEWAL_STATE",
+        "ISP_REFERRAL_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_SUB360_WORKBENCH_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/workbench_router.py"
+      ]
+    },
+    {
+      "code": "ISP_SUBSCRIBER_BLOCKED",
+      "kind": "code",
+      "status": 409,
+      "message": "This subscriber is blocked; unblock first",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_SUBSCRIBER_DISABLED",
+      "kind": "code",
+      "status": 409,
+      "message": "This subscriber is disabled; enable them first",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py"
+      ]
+    },
+    {
+      "code": "ISP_SUBSCRIBER_FROZEN",
+      "kind": "code",
+      "status": 409,
+      "message": "This subscriber is frozen; unfreeze first",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_SUBSCRIBER_NOT_BLOCKED",
+      "kind": "code",
+      "status": 409,
+      "message": "This subscriber is not blocked",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_SUBSCRIBER_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Subscriber not found",
+      "sources": [
+        "app/domains/isp_partner/plans_service.py",
+        "app/domains/isp_partner/pppoe_service.py"
+      ]
+    },
+    {
+      "code": "ISP_SUBSCRIBER_NOT_FROZEN",
+      "kind": "code",
+      "status": 409,
+      "message": "This subscriber is not frozen",
+      "sources": [
+        "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_SUSPEND_REASON_INVALID",
+      "kind": "code",
+      "status": 422,
+      "message": "Reason must be non_payment, customer_request, abuse or other",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_TARGET_REQUIRED",
+      "kind": "reason",
+      "status": 422,
+      "message": "Give exactly one of subscriber_id or isp_customer_id",
+      "sources": [
+        "app/domains/isp_partner/collections_service.py",
+        "app/domains/isp_partner/finance_service.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST",
+        "ISP_FINANCE_INVALID"
+      ]
+    },
+    {
+      "code": "ISP_TIME_RANGE_TOO_LONG",
+      "kind": "reason",
+      "status": 422,
+      "message": "a per-second chart covers at most 3 hours",
+      "sources": [
+        "app/domains/isp_partner/logs_rate_router.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_USER_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "User not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_VALUE_OUT_OF_RANGE",
+      "kind": "reason",
+      "status": 422,
+      "message": "{…} must be between {…} and {…}",
+      "sources": [
+        "app/domains/isp_partner/compliance_router.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_VENDOR_NOT_SUPPORTED",
+      "kind": "code",
+      "status": 422,
+      "message": "Only MikroTik routers can be added in this release",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_VENUE_CONTEXT_MISSING",
+      "kind": "reason",
+      "status": 422,
+      "message": "{…} is required",
+      "sources": [
+        "app/domains/isp_partner/twins.py",
+        "app/domains/isp_partner/venue_headers.py"
+      ],
+      "parents": [
+        "ISP_BAD_REQUEST"
+      ]
+    },
+    {
+      "code": "ISP_WALLET_EMPTY",
+      "kind": "code",
+      "status": 402,
+      "message": "Your messaging credit wallet does not cover this send. Ask Wyfy to top it up.",
+      "sources": [
+        "app/domains/isp_partner/parity_settings.py"
+      ]
+    },
+    {
+      "code": "ISP_WA_SENDER_NOT_CONNECTED",
+      "kind": "code",
+      "status": 409,
+      "message": "Connect and verify your WhatsApp Business sender first",
+      "sources": [
+        "app/domains/isp_partner/comms_router.py"
+      ]
+    },
+    {
+      "code": "ISP_WA_TEMPLATE_NOT_APPROVED",
+      "kind": "code",
+      "status": 422,
+      "message": "That WhatsApp template is not approved in your WhatsApp Business account",
+      "sources": [
+        "app/domains/isp_partner/comms_router.py"
+      ]
+    },
+    {
+      "code": "ISP_WEBHOOK_REJECTED",
+      "kind": "code",
+      "status": 403,
+      "message": "Forbidden",
+      "sources": [
+        "app/domains/isp_partner/comms_router.py"
+      ]
+    },
+    {
+      "code": "ISP_ZONES_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/zones_config.py"
+      ]
+    },
+    {
+      "code": "ISP_ZONE_CREDIT_EXCEEDED",
+      "kind": "code",
+      "status": 409,
+      "message": "This debit would take the zone below its credit limit",
+      "sources": [
+        "app/domains/isp_partner/finance_service.py"
+      ]
+    },
+    {
+      "code": "ISP_ZONE_CYCLE",
+      "kind": "code",
+      "status": 409,
+      "message": "A zone cannot be placed under itself or one of its own sub-zones",
+      "sources": [
+        "app/domains/isp_partner/zones_config.py"
+      ]
+    },
+    {
+      "code": "ISP_ZONE_HAS_CHILDREN",
+      "kind": "code",
+      "status": 409,
+      "message": "Move or delete its sub-zones first",
+      "sources": [
+        "app/domains/isp_partner/zones_config.py"
+      ]
+    },
+    {
+      "code": "ISP_ZONE_IN_USE",
+      "kind": "code",
+      "status": 409,
+      "message": "The zone is still assigned",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_ZONE_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Zone not found",
+      "sources": [
+        "app/domains/isp_partner/bill2_router.py",
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "PLAN_NOT_FOUND",
+      "kind": "code",
+      "status": 422,
+      "message": "Plan not found",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py",
+        "app/domains/isp_partner/platform_service.py"
+      ]
+    },
+    {
+      "code": "RATE_LIMITED",
+      "kind": "code",
+      "status": 429,
+      "message": "Too many requests -- please try again later",
+      "sources": [
+        "app/domains/isp_partner/finance_router.py",
+        "app/domains/isp_partner/password_reset_router.py",
+        "app/domains/isp_partner/portal_support_router.py"
+      ]
+    },
+    {
+      "code": "TR069_ACS_UNAVAILABLE",
+      "kind": "code",
+      "status": 502,
+      "message": "The ACS could not be reached. Try again shortly.",
+      "sources": [
+        "app/domains/tr069/exceptions.py"
+      ]
+    },
+    {
+      "code": "TR069_DEVICE_NOT_FOUND",
+      "kind": "code",
+      "status": 404,
+      "message": "Device not found",
+      "sources": [
+        "app/domains/tr069/exceptions.py"
+      ]
+    },
+    {
+      "code": "TR069_DISABLED_FOR_CUSTOMER",
+      "kind": "code",
+      "status": 409,
+      "message": "TR-069 is disabled for this customer",
+      "sources": [
+        "app/domains/tr069/exceptions.py"
+      ]
+    },
+    {
+      "code": "TR069_DISABLED_FOR_LOCATION",
+      "kind": "code",
+      "status": 409,
+      "message": "TR-069 is disabled for this device's location",
+      "sources": [
+        "app/domains/tr069/exceptions.py"
+      ]
+    },
+    {
+      "code": "TR069_NOT_ENABLED",
+      "kind": "code",
+      "status": 503,
+      "message": "TR-069 management is not enabled on this platform yet",
+      "sources": [
+        "app/domains/tr069/exceptions.py"
+      ]
+    },
+    {
+      "code": "TR069_TASK_PENDING",
+      "kind": "code",
+      "status": 409,
+      "message": "A task of this kind is already queued for this device",
+      "sources": [
+        "app/domains/tr069/exceptions.py"
+      ]
+    },
+    {
+      "code": "USER_EMAIL_TAKEN",
+      "kind": "code",
+      "status": 409,
+      "message": "A user with that email already exists",
+      "sources": [
+        "app/domains/isp_partner/exceptions.py"
+      ]
+    }
+  ]
+}

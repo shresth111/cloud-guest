@@ -474,7 +474,11 @@ async def _completed(
     d1 = date_to or today
     d0 = date_from or (d1 - timedelta(days=6))
     if d1 < d0 or (d1 - d0).days > 92:
-        raise IspBadRequestError("The range is 1 to 93 days, start before end")
+        raise IspBadRequestError(
+            "The range is 1 to 93 days, start before end",
+            reason="ISP_DATE_RANGE_INVALID",
+            max_days=93,
+        )
     since = datetime.combine(d0, time.min, tzinfo=IST).astimezone(UTC)
     until = datetime.combine(d1 + timedelta(days=1), time.min, tzinfo=IST).astimezone(
         UTC

@@ -385,7 +385,9 @@ async def get_zone_totals(
     from .finance_service import IspFinanceService
 
     if date_to < date_from or (date_to - date_from).days > 400:
-        raise IspBadRequestError("Range must be 0-400 days")
+        raise IspBadRequestError(
+            "Range must be 0-400 days", reason="ISP_DATE_RANGE_INVALID", max_days=400
+        )
     fin = IspFinanceService(session=db)
     revenue = {
         r["zone_id"]: r

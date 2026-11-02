@@ -59,13 +59,21 @@ async def load_code(session: Any, isp: Any, code: str, *, at: datetime) -> Any:
         raise IspDiscountApplyOffError()
     d = await _by_code(session, isp.isp_org_id, code)
     if d is None:
-        raise IspDiscountInvalidError("Unknown discount code")
+        raise IspDiscountInvalidError(
+            "Unknown discount code", reason="ISP_DISCOUNT_UNKNOWN"
+        )
     if not d.active:
-        raise IspDiscountInvalidError("This discount code is switched off")
+        raise IspDiscountInvalidError(
+            "This discount code is switched off", reason="ISP_DISCOUNT_OFF"
+        )
     if d.valid_from and at < d.valid_from:
-        raise IspDiscountInvalidError("This discount code is not valid yet")
+        raise IspDiscountInvalidError(
+            "This discount code is not valid yet", reason="ISP_DISCOUNT_NOT_STARTED"
+        )
     if d.valid_until and at > d.valid_until:
-        raise IspDiscountInvalidError("This discount code has expired")
+        raise IspDiscountInvalidError(
+            "This discount code has expired", reason="ISP_DISCOUNT_EXPIRED"
+        )
     return d
 
 

@@ -49,7 +49,9 @@ def resolve_range(
     if since.tzinfo is None:
         since = since.replace(tzinfo=UTC)
     if since >= until:
-        raise IspBadRequestError("since must be before until", field="since")
+        raise IspBadRequestError(
+            "since must be before until", field="since", reason="ISP_DATE_RANGE_ORDER"
+        )
     if until - since > timedelta(days=REPORT_MAX_RANGE_DAYS):
         raise IspRangeTooLongError()
     return since, until
@@ -340,7 +342,9 @@ def _rows_for(section: str, report: dict) -> tuple[list[str], list[list[Any]]]:
             ]
             for m in report["tr069"]["by_model"]
         ]
-    raise IspBadRequestError("unknown section", field="section")
+    raise IspBadRequestError(
+        "unknown section", field="section", reason="ISP_QUERY_INVALID"
+    )
 
 
 def _safe(value: Any) -> str:

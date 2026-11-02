@@ -25,12 +25,16 @@ def _uuid(request: Request, header: str, *, required: bool) -> uuid.UUID | None:
     raw = request.headers.get(header)
     if not raw:
         if required:
-            raise IspBadRequestError(f"{header} is required")
+            raise IspBadRequestError(
+                f"{header} is required", reason="ISP_VENUE_CONTEXT_MISSING"
+            )
         return None
     try:
         return uuid.UUID(raw)
     except ValueError:
-        raise IspBadRequestError(f"{header} is not a valid id") from None
+        raise IspBadRequestError(
+            f"{header} is not a valid id", reason="ISP_VENUE_CONTEXT_MISSING"
+        ) from None
 
 
 async def resolve_venue_location(request: Request, isp: IspContext) -> Any:

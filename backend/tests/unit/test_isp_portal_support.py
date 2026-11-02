@@ -209,3 +209,18 @@ def test_route_is_flag_gated(client) -> None:
 def test_route_rejects_writes(client) -> None:
     r = client.client.post(PATH, params={"location": str(client.data.loc)})
     assert r.status_code == 405
+
+
+def test_route_429_carries_a_code(client, monkeypatch) -> None:
+    """ERROR-COPY: the rate-limit reply has data.code, like every ISP error."""
+
+    async def _limited(redis, ip):  # noqa: ANN001
+        return False, 30
+
+    monkeypatch.setattr(psr, "_ip_allowed", _limited)
+    r = client.client.get(PATH, params={"location": str(client.data.loc)})
+    assert r.status_code == 429
+    body = r.json()
+    assert body["data"]["code"] == "RATE_LIMITED"
+    assert body["data"]["retry_after_seconds"] == 30
+    assert "request_id" in body

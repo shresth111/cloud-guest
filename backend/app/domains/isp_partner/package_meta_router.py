@@ -14,7 +14,7 @@ import uuid
 from functools import lru_cache
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import select
@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.session import get_db_session
 
 from .dependencies import IspContext, RequireIspPartner, isp_guards
+from .exceptions import IspFeatureDisabledError
 from .http import ok
 from .package_meta_models import IspPackageMeta
 from .plans_models import IspPackage
@@ -51,7 +52,7 @@ def get_package_meta_settings() -> IspPackageMetaSettings:
 
 async def RequirePackageMetaEnabled() -> None:
     if not get_package_meta_settings().enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()
 
 
 package_meta_router = APIRouter(

@@ -175,7 +175,9 @@ async def put_settings(session: Any, isp: Any, data: dict) -> dict:
         for trig, spec in data["whatsapp_templates"].items():
             if trig not in TRIGGERS:
                 raise IspAutomationError(
-                    f"Unknown trigger {trig}", field="whatsapp_templates"
+                    f"Unknown trigger {trig}",
+                    field="whatsapp_templates",
+                    reason="ISP_QUERY_INVALID",
                 )
             if spec and spec.get("template_name"):
                 clean[trig] = {

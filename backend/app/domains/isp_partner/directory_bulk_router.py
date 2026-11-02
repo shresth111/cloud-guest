@@ -30,14 +30,14 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import select
 
 from .apps_export import csv_response, render_csv
 from .dependencies import IspContext, RequireIspPartner, isp_guards
-from .exceptions import IspError
+from .exceptions import IspError, IspFeatureDisabledError, IspInvalidQueryError
 from .http import ok
 from .subscriber360_models import IspSubscriberProfile
 from .subscriber360_router import get_subscriber360_service
@@ -69,7 +69,7 @@ def get_dir2_settings() -> IspDir2Settings:
 
 async def RequireDir2Enabled() -> None:
     if not get_dir2_settings().enabled:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise IspFeatureDisabledError()
 
 
 directory_bulk_router = APIRouter(
@@ -158,12 +158,12 @@ async def _selected_ids(
         return list(dict.fromkeys(body.subscriber_ids))
     rows, total = await _directory_rows(svc, isp, body.filter, MAX_BULK + 1)
     if total > MAX_BULK:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"The filter matches {total} subscribers; "
-                f"narrow it to {MAX_BULK} or fewer"
-            ),
+        raise IspInvalidQueryError(
+            f"The filter matches {total} subscribers; "
+            f"narrow it to {MAX_BULK} or fewer",
+            reason="ISP_BULK_FILTER_TOO_BROAD",
+            matched=total,
+            max=MAX_BULK,
         )
     return [uuid.UUID(str(r["id"])) for r in rows]
 

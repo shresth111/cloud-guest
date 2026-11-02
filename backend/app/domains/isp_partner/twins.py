@@ -243,13 +243,17 @@ def _scope_header(request: Request, header: str) -> uuid.UUID:
     if not raw:
         from .exceptions import IspBadRequestError
 
-        raise IspBadRequestError(f"{header} is required")
+        raise IspBadRequestError(
+            f"{header} is required", reason="ISP_VENUE_CONTEXT_MISSING"
+        )
     try:
         return uuid.UUID(raw)
     except ValueError:
         from .exceptions import IspBadRequestError
 
-        raise IspBadRequestError(f"{header} is not a valid id") from None
+        raise IspBadRequestError(
+            f"{header} is not a valid id", reason="ISP_VENUE_CONTEXT_MISSING"
+        ) from None
 
 
 async def _assert_row(isp: IspContext, target: Target, value: uuid.UUID):

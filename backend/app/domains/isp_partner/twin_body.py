@@ -91,7 +91,9 @@ def _uuid(value: Any) -> uuid.UUID | None:
     try:
         return uuid.UUID(str(value))
     except ValueError:
-        raise IspBadRequestError("an id in the request body is not valid") from None
+        raise IspBadRequestError(
+            "an id in the request body is not valid", reason="ISP_QUERY_INVALID"
+        ) from None
 
 
 async def _pinned_router(isp, raw: Any, org_id, location_id) -> uuid.UUID | None:
@@ -148,7 +150,8 @@ async def apply_body_ids(
         if spec.mode == "null_only":
             if raw not in (None, ""):
                 raise IspBadRequestError(
-                    f"{spec.field} cannot be set from the partner console"
+                    f"{spec.field} cannot be set from the partner console",
+                    reason="ISP_FIELD_IMMUTABLE",
                 )
             continue
         if spec.mode == "router":
@@ -169,17 +172,21 @@ async def apply_body_ids(
             elif kind == "router":
                 pinned = await _pinned_router(isp, raw, org_id, location_id)
                 if pinned is None:
-                    raise IspBadRequestError("scope_id is required for a router")
+                    raise IspBadRequestError(
+                        "scope_id is required for a router", reason="ISP_QUERY_INVALID"
+                    )
             else:
                 raise IspBadRequestError(
                     "an ISP can assign a policy to this customer, this location "
-                    "or one of its routers only"
+                    "or one of its routers only",
+                    reason="ISP_QUERY_INVALID",
                 )
         elif spec.mode == "policy_target":
             kind = str(getattr(payload, "target_type", "none")).lower()
             if kind in ("user", "role"):
                 raise IspBadRequestError(
-                    "an ISP customer has no users or roles to target"
+                    "an ISP customer has no users or roles to target",
+                    reason="ISP_QUERY_INVALID",
                 )
             if kind == "guest":
                 from .policy import get_isp_partner_policy
@@ -188,7 +195,8 @@ async def apply_body_ids(
                     # PR #357 (cross-org target check) is not on main yet.
                     raise IspBadRequestError(
                         "assigning an access rule to one guest is not available "
-                        "from the partner console yet"
+                        "from the partner console yet",
+                        reason="ISP_NOT_AVAILABLE_YET",
                     )
         else:  # pragma: no cover - a typo in the table, caught by tests
             raise AssertionError(f"unknown body id mode {spec.mode!r}")

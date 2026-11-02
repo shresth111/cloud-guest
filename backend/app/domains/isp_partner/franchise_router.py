@@ -104,7 +104,11 @@ def _plan_view(p: Any) -> dict | None:
 
 def _day_bounds(d0: date, d1: date) -> tuple[datetime, datetime]:
     if d1 < d0 or (d1 - d0).days > 400:
-        raise IspBadRequestError("Range must be 1 to 401 days, start before end")
+        raise IspBadRequestError(
+            "Range must be 1 to 401 days, start before end",
+            reason="ISP_DATE_RANGE_INVALID",
+            max_days=401,
+        )
     return (
         datetime.combine(d0, time.min, tzinfo=IST).astimezone(UTC),
         datetime.combine(d1 + timedelta(days=1), time.min, tzinfo=IST).astimezone(UTC),

@@ -30,7 +30,7 @@ from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +41,7 @@ from .bill2_config import RequireBill2Enabled
 from .billing_models import IspInvoice, IspInvoiceLine
 from .constants import ISP_BILLING_EXPORT  # RBAC-FIX
 from .dependencies import IspContext, RequireIspPartner, isp_guards
+from .exceptions import IspInvalidQueryError
 
 __all__ = ["B2CL_THRESHOLD_PAISE", "build_gstr1", "gst_router", "state_label"]
 
@@ -303,7 +304,9 @@ def month_bounds(month: str) -> tuple[date, date]:
     try:
         start = datetime.strptime(month, "%Y-%m").date()
     except ValueError:
-        raise HTTPException(status_code=422, detail="month must be YYYY-MM") from None
+        raise IspInvalidQueryError(
+            "month must be YYYY-MM", field="month", reason="ISP_MONTH_FORMAT"
+        ) from None
     nxt = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
     return start, nxt
 
@@ -371,9 +374,10 @@ async def gstr1_export(
     data = await gstr1_for(db, isp.isp_org_id, month)
     keys = SECTIONS if section == "all" else (section,)
     if format == "csv" and section == "all":
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="CSV is one section per file: pick a section, or use xlsx",
+        raise IspInvalidQueryError(
+            "CSV is one section per file: pick a section, or use xlsx",
+            field="section",
+            reason="ISP_CSV_ONE_SECTION",
         )
     if format == "json":
         body = {

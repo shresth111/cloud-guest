@@ -230,7 +230,9 @@ async def ticket_stats(
     svc: HelpdeskService = Depends(_helpdesk),
 ) -> dict:
     if since and until and until < since:
-        raise IspAppsInvalidError("until is before since")
+        raise IspAppsInvalidError(
+            "until is before since", reason="ISP_DATE_RANGE_ORDER"
+        )
     return ok(
         request,
         await svc.stats(isp, isp_customer_id=isp_customer_id, since=since, until=until),

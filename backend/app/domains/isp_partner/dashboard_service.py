@@ -55,12 +55,21 @@ def period_bounds(
         d0, d1 = today - timedelta(days=29), today
     elif f.period == "custom":
         if f.date_from is None or f.date_to is None:
-            raise IspBadRequestError("A custom period needs date_from and date_to")
+            raise IspBadRequestError(
+                "A custom period needs date_from and date_to",
+                reason="ISP_DATE_RANGE_INCOMPLETE",
+            )
         d0, d1 = f.date_from, f.date_to
     else:
-        raise IspBadRequestError("period is today, 7d, 30d or custom")
+        raise IspBadRequestError(
+            "period is today, 7d, 30d or custom", reason="ISP_QUERY_INVALID"
+        )
     if d1 < d0 or (d1 - d0).days > 400:
-        raise IspBadRequestError("The period must be 1 to 401 days, start before end")
+        raise IspBadRequestError(
+            "The period must be 1 to 401 days, start before end",
+            reason="ISP_DATE_RANGE_INVALID",
+            max_days=401,
+        )
     start = datetime.combine(d0, time.min, tzinfo=zone).astimezone(UTC)
     end = datetime.combine(d1 + timedelta(days=1), time.min, tzinfo=zone).astimezone(
         UTC
@@ -320,7 +329,7 @@ class IspDashboardService:
         from .subscriber_identity import subscriber_identifier
 
         if tile not in logic.TILE_KEYS:
-            raise IspBadRequestError("Unknown tile")
+            raise IspBadRequestError("Unknown tile", reason="ISP_QUERY_INVALID")
         data = await self._rows(isp, f)
         rows = [r for r in data["rows"] if logic.in_tile(tile, r)]
         rows.sort(key=lambda r: (r["sub"].circuit_id or 0, str(r["sub"].id)))
