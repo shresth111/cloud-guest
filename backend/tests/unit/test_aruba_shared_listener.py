@@ -922,6 +922,58 @@ class TestMasterRoutes:
         if vendor == "aruba_instant_on":
             assert aruba_shared.shared_listener_accepts_identifier(expected)
 
+    @pytest.mark.parametrize(
+        ("vendor", "ident", "refused"),
+        [
+            ("aruba_instant_on", "cg-9e6069de", True),
+            ("aruba_instant_on", NAS_ID, False),
+            ("mikrotik", "cg-9e6069de", False),
+        ],
+    )
+    async def test_admin_register_refuses_an_identifier_the_listener_rejects(
+        self, vendor: str, ident: str, refused: bool
+    ) -> None:
+        """``POST /radius/nas`` takes free text, the last path that could still
+        write a row every Aruba sign-in is rejected on."""
+        from app.domains.guest import router as guest_router
+        from app.domains.guest.exceptions import PublicNasRegistrationRefusedError
+        from app.domains.guest.schemas import RadiusNasRegisterRequest
+
+        router = _router(vendor=vendor)
+        registered: list[dict] = []
+
+        class Stop(Exception):
+            pass
+
+        class Lookup:
+            async def get_router(self, *_: Any, **__: Any):  # noqa: ANN202
+                return router
+
+        class Svc(FakeRadiusService):
+            router_lookup = Lookup()
+
+            async def register_nas(self, **kw: Any):  # noqa: ANN202
+                registered.append(kw)
+                raise Stop  # reaching the write is all this test is about
+
+        payload = RadiusNasRegisterRequest(router_id=router.id, nas_identifier=ident)
+        call = guest_router.register_radius_nas(
+            _http({}),
+            payload,
+            user=SimpleNamespace(id=str(uuid.uuid4())),
+            requesting_organization_id=None,
+            service=Svc(router, None),
+        )
+        if refused:
+            with pytest.raises(PublicNasRegistrationRefusedError) as exc:
+                await call
+            assert registered == []
+            assert aruba_shared.would_be_nas_identifier(router.id) in exc.value.message
+        else:
+            with pytest.raises(Stop):
+                await call
+            assert registered[0]["nas_identifier"] == ident
+
 
 @pytest.mark.parametrize(
     ("mac", "placeholder"),
