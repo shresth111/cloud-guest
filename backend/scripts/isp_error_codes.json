@@ -1154,6 +1154,15 @@
       ]
     },
     {
+      "code": "ISP_PLAN_FIELD_REQUIRED",
+      "kind": "code",
+      "status": 422,
+      "message": "Required plan field missing",
+      "sources": [
+        "app/domains/isp_partner/billing_service.py"
+      ]
+    },
+    {
       "code": "ISP_PORTAL_CONFIG_NOT_FOUND",
       "kind": "code",
       "status": 404,

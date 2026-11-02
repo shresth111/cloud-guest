@@ -384,7 +384,8 @@ class IspBillingService:
             nulls += sorted(k for k in ("plan_name", "amount_paise") if k not in data)
         if nulls:
             raise IspPlanFieldRequiredError(
-                f"These plan fields are required: {', '.join(nulls)}"
+                f"These plan fields are required: {', '.join(nulls)}",
+                field=nulls[0],  # ERROR-COPY: the console marks the field
             )
         if row is None:
             row = IspCustomerBilling(
