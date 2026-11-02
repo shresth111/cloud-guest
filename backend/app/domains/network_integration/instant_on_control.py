@@ -36,10 +36,13 @@ pre-existing NAS-only behaviour.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
+from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -141,7 +144,6 @@ def build_live_control_client(
     """Same token machinery as the poller (DB token row keyed by the ARN,
     Redis single-flight refresh, Secrets Manager credentials), for the write
     account named by ``secret_arn``."""
-    from app.database.redis import redis_client
     from app.database.session import SessionLocal
 
     from .instant_on_repository import DbInstantOnTokenStore, account_key_for
@@ -163,7 +165,7 @@ def build_live_control_client(
         http=http,
         store=DbInstantOnTokenStore(SessionLocal, account_key=account_key),
         lock=RedisRefreshLock(
-            redis_client, key=f"instant_on:token_refresh_lock:{account_key[:16]}"
+            _redis(), key=f"instant_on:token_refresh_lock:{account_key[:16]}"
         ),
         credentials=SecretsManagerCredentialSource(
             secret_arn=secret_arn, region_name=settings.instant_on_secrets_region
@@ -203,10 +205,32 @@ async def _with_client(target: ControlTarget, settings: Settings, action):  # no
         return await action(client)
 
 
-def _redis():  # noqa: ANN202
-    from app.database.redis import redis_client
+#: One Redis client per event loop. A connection belongs to the loop that opened
+#: it, and each Celery task runs in its own ``asyncio.run()``: sharing
+#: ``app.database.redis.redis_client`` across runs raises "Event loop is closed"
+#: on alternate calls, and a timed unblock that dies this way leaves the guest
+#: blocked in Instant On.
+_loop_redis_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = (
+    weakref.WeakKeyDictionary()
+)
 
-    return redis_client
+
+def _redis():  # noqa: ANN202
+    from app.database.redis import create_redis_client
+
+    loop = asyncio.get_running_loop()
+    client = _loop_redis_clients.get(loop)
+    if client is None:
+        client = create_redis_client()
+        _loop_redis_clients[loop] = client
+    return client
+
+
+async def _close_loop_redis() -> None:
+    """Close this loop's client before a short-lived loop ends."""
+    client = _loop_redis_clients.pop(asyncio.get_running_loop(), None)
+    if client is not None:
+        await client.aclose()
 
 
 def _schedule_release(
@@ -613,19 +637,23 @@ async def set_venue_guest_speed(
 async def _release_async(**kwargs: str) -> str:
     from app.database.session import SessionLocal
 
-    async with SessionLocal() as session:
-        return await release_transient_block(
-            session,
-            organization_id=uuid.UUID(kwargs["organization_id"]),
-            router_id=uuid.UUID(kwargs["router_id"]),
-            mac=kwargs["mac"],
-            token=kwargs["token"],
-        )
+    try:
+        async with SessionLocal() as session:
+            return await release_transient_block(
+                session,
+                organization_id=uuid.UUID(kwargs["organization_id"]),
+                router_id=uuid.UUID(kwargs["router_id"]),
+                mac=kwargs["mac"],
+                token=kwargs["token"],
+            )
+    finally:
+        await _close_loop_redis()
 
 
 @celery_app.task(
     name=TASK_INSTANT_ON_RELEASE_TRANSIENT_BLOCK,
-    autoretry_for=(InstantOnError,),
+    # Redis too: giving up on a passing outage would leave the guest blocked.
+    autoretry_for=(InstantOnError, RedisError),
     retry_backoff=30,
     max_retries=5,
 )

@@ -695,3 +695,38 @@ class TestListGuestNetworks:
             ("net-3", True, 50),
         ]
         assert site.writes() == []
+
+
+class TestRedisClientPerEventLoop:
+    """A shared client breaks across Celery's per-task ``asyncio.run()``."""
+
+    def test_each_event_loop_gets_its_own_client(self):
+        import asyncio
+
+        async def two_reads():
+            first, second = control._redis(), control._redis()
+            assert first is second
+            return first
+
+        assert asyncio.run(two_reads()) is not asyncio.run(two_reads())
+
+    def test_close_releases_the_clients_connections(self):
+        import asyncio
+
+        async def run():
+            client = control._redis()
+            await control._close_loop_redis()
+            assert control._redis() is not client
+
+        asyncio.run(run())
+
+    def test_release_task_retries_on_redis_errors(self):
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        from app.domains.network_integration.providers.aruba_instant_on_client import (
+            InstantOnError,
+        )
+
+        retried = control.release_transient_block_task.autoretry_for
+        assert issubclass(RedisConnectionError, retried)
+        assert issubclass(InstantOnError, retried)
