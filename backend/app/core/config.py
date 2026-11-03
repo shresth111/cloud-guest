@@ -442,6 +442,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    isp_upstream_probe_enabled: bool = Field(
+        default=False,
+        description=(
+            "ISP health: also ping public addresses beyond each line's first "
+            "hop, so an ISP outage behind a live modem reads as down. True "
+            "WRITES to MikroTik routers: the health sweep adds comment-tagged "
+            "/32 routes (cloudguest-isp-probe-*) on every router with two or "
+            "more enabled ISP links. False (the default) sends no probe and "
+            "writes nothing."
+        ),
+    )
     aruba_hybrid_speed_gateway_enabled: bool = Field(
         default=False,
         description=(

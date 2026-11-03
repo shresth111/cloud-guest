@@ -26,6 +26,7 @@ import logging
 
 from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
+from app.core.config import get_settings
 from app.database.redis import create_redis_client
 from app.database.session import SessionLocal
 from app.domains.location.repository import (
@@ -107,6 +108,7 @@ async def _run_isp_health_check_sweep_async() -> HealthCheckSweepSummary:
                     audit_writer=audit_writer,
                     device_adapter_resolver=get_isp_health_adapter,
                     redis=redis,
+                    upstream_probe_enabled=get_settings().isp_upstream_probe_enabled,
                 )
                 await session.commit()
                 return summary
