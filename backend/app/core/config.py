@@ -2868,6 +2868,23 @@ class Settings(BaseSettings):
             "CLOUDGUEST_INSTANT_ON_CONTROL_SECRET_ARNS_BY_ROUTER."
         ),
     )
+    instant_on_disconnect_check_enabled: bool = Field(
+        default=True,
+        description=(
+            "After a timed Instant On disconnect, read clientSummary a few times "
+            "and log instant_on_disconnect_check. Read-only evidence; never "
+            "affects the block or the unblock."
+        ),
+    )
+    instant_on_disconnect_check_max_per_hour: int = Field(
+        default=6,
+        ge=0,
+        le=60,
+        description=(
+            "How many disconnects per Instant On site per hour get those reads "
+            "(four reads each)."
+        ),
+    )
     instant_on_disconnect_hold_seconds: int = Field(
         default=30,
         ge=5,

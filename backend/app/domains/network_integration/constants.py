@@ -111,6 +111,7 @@ __all__ = [
     "INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_INSTANT_ON_POLL_SWEEP",
     "TASK_INSTANT_ON_RELEASE_TRANSIENT_BLOCK",
+    "TASK_INSTANT_ON_CHECK_DISCONNECTED_CLIENT",
 ]
 
 
@@ -1005,6 +1006,11 @@ INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS = 60.0
 # See ``app.domains.network_integration.instant_on_control``.
 TASK_INSTANT_ON_RELEASE_TRANSIENT_BLOCK = (
     "app.domains.network_integration.instant_on_control.release_transient_block_task"
+)
+# See ``app.domains.network_integration.instant_on_disconnect_check``.
+TASK_INSTANT_ON_CHECK_DISCONNECTED_CLIENT = (
+    "app.domains.network_integration.instant_on_disconnect_check"
+    ".check_disconnected_client_task"
 )
 
 # ============================================================================
