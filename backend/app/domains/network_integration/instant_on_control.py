@@ -304,6 +304,15 @@ async def end_nas_only_session(
                 "instant_on_disconnect_release_not_scheduled",
                 extra={"router_id": str(router_id)},
             )
+        try:
+            from . import instant_on_disconnect_check as check
+
+            await check.schedule_disconnect_checks(target, mac, _redis(), settings)
+        except Exception as error:  # noqa: BLE001 -- evidence only, never the disconnect
+            logger.warning(
+                "instant_on_disconnect_check_not_scheduled",
+                extra={"router_id": str(router_id), "error_type": type(error).__name__},
+            )
     logger.info(
         "instant_on_disconnect_enforced",
         extra={
