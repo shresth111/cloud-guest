@@ -6336,6 +6336,44 @@ class MikroTikAdapter:
         finally:
             api.close()
 
+    async def ensure_host_route(
+        self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
+    ) -> None:
+        """See the contract. Tested against RouterOS 7.16.2 (CHR)."""
+        await asyncio.to_thread(
+            self._ensure_host_route_sync, creds, dst_address, gateway, comment
+        )
+
+    def _ensure_host_route_sync(
+        self, creds: DeviceCredentials, dst_address: str, gateway: str, comment: str
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            menu = api.path("ip", "route")
+            try:
+                existing = [row for row in menu if row.get("comment") == comment]
+                if not existing:
+                    menu.add(
+                        **{
+                            "dst-address": f"{dst_address}/32",
+                            "gateway": gateway,
+                            "comment": comment,
+                        }
+                    )
+                # RouterOS v7 may qualify the address as "10.1.0.2%ether2".
+                elif str(existing[0].get("gateway") or "").split("%")[0] != gateway:
+                    menu.update(**{".id": existing[0][".id"], "gateway": gateway})
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_host_route: {exc}"
+                ) from exc
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"ensure_host_route: {_describe_exception(exc)}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
     async def ensure_wan_egress(
         self, creds: DeviceCredentials, *, interface: str
     ) -> None:

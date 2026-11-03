@@ -32,6 +32,7 @@ from app.domains.isp.constants import (
     MAX_RATE_INTERVAL_SECONDS,
     SPEED_TEST_DOWNLOAD_URL,
     SPEED_TEST_TIMEOUT_SECONDS,
+    UPSTREAM_PROBE_TARGETS,
     HealthStatus,
     HealthStatusSource,
     IspConnectionMode,
@@ -50,6 +51,7 @@ from app.domains.isp.exceptions import (
     CrossOrganizationIspLinkAccessError,
     IspAmbiguousDefaultRouteError,
     IspDeviceConnectionError,
+    IspDeviceOperationError,
     IspDeviceRouteMismatchError,
     IspFailoverNotApplicableError,
     IspFailoverTargetUnreachableError,
@@ -443,6 +445,8 @@ class FakeIspHealthAdapter:
     # DHCP/PPPoE target-resolution fakes -- see IspService.ping_link's own
     # per-connection-mode branching.
     dynamic_gateway: str | None = None
+    host_route_calls: list[dict[str, str]] = field(default_factory=list)
+    host_route_should_raise: Exception | None = None
     pppoe_status_by_interface: dict[str, bool] = field(default_factory=dict)
     # Traffic-load fakes -- see IspService.sample_link_traffic.
     traffic_counters_by_interface: dict[str, tuple[int, int]] = field(
@@ -538,6 +542,20 @@ class FakeIspHealthAdapter:
             )
             for route in self.default_routes
         ]
+
+    async def ensure_host_route(
+        self,
+        credentials: IspCredentials,
+        *,
+        dst_address: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        if self.host_route_should_raise is not None:
+            raise self.host_route_should_raise
+        self.host_route_calls.append(
+            {"dst_address": dst_address, "gateway": gateway, "comment": comment}
+        )
 
     async def ensure_wan_egress(
         self, credentials: IspCredentials, *, interface: str
@@ -2476,31 +2494,6 @@ class TestFailoverRefusesRatherThanGuesses:
 
         assert h.health_adapter.ops == []
 
-    async def test_a_backup_whose_route_is_not_active_refuses_before_writing(
-        self,
-    ) -> None:
-        """RouterOS marks a default route Inactive the instant its
-        `check-gateway` probe fails. Failing over onto it would add an
-        outage to an outage and make the dashboard lie twice."""
-        adapter = FakeIspHealthAdapter()
-        adapter.default_routes = [
-            adapter.default_routes[0],
-            dataclasses.replace(adapter.default_routes[1], active=False),
-        ]
-        h = make_harness(health_adapter=adapter)
-        router = h.router_lookup.add(_make_router())
-        await _create_primary(h, router)
-        backup = await _create_backup(h, router)
-
-        with pytest.raises(IspFailoverTargetUnreachableError):
-            await h.service.trigger_failover(
-                router.id, actor_user_id=None, reason="manual_test"
-            )
-
-        assert adapter.distance_calls == []
-        assert adapter.egress_calls == []
-        assert backup.failover_push_status == IspFailoverPushStatus.FAILED.value
-
     async def test_a_backup_whose_next_hop_does_not_answer_refuses(self) -> None:
         """`active` alone is not enough: a route can be freshly added and
         not yet probed. A real /tool/ping from the router to that route's
@@ -3433,5 +3426,138 @@ class TestLoadBalanceHasNoFailover:
             await run_health_check_sweep(
                 repository, lookup, device_adapter_resolver=lambda vendor: adapter
             )
+        assert primary.is_active_uplink is False
+        assert backup.is_active_uplink is True
+
+
+class TestFailbackOntoAHealthyNonPreferredRoute:
+    """Measured on RouterOS 7.16.2: a working route at a higher distance is not
+    flagged active. Every failback target is in exactly that state."""
+
+    @staticmethod
+    def _after_failover(adapter: FakeIspHealthAdapter) -> None:
+        primary, backup = adapter.default_routes
+        adapter.default_routes = [
+            dataclasses.replace(primary, distance=2, active=False),
+            dataclasses.replace(backup, distance=1, active=True),
+        ]
+
+    async def test_failback_goes_through(self) -> None:
+        repository, lookup, router, primary, backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        self._after_failover(adapter)
+        primary.is_active_uplink = False
+        backup.is_active_uplink = True
+        service = IspService(
+            repository, lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+        restored = await service.trigger_failback(router.id, actor_user_id=None)
+        assert restored.id == primary.id
+        assert restored.is_active_uplink is True
+        assert adapter.distance_calls == [{"ether1": 1, "ether2": 2}]
+
+    async def test_a_dead_next_hop_still_refuses(self) -> None:
+        repository, lookup, router, primary, backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        self._after_failover(adapter)
+        adapter.ping_results_by_target["192.168.1.1"] = _DEAD
+        primary.is_active_uplink = False
+        backup.is_active_uplink = True
+        service = IspService(
+            repository, lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+        with pytest.raises(IspFailoverTargetUnreachableError):
+            await service.trigger_failback(router.id, actor_user_id=None)
+        assert adapter.distance_calls == []
+
+
+class TestUpstreamProbe:
+    WAN1 = UPSTREAM_PROBE_TARGETS[0]
+    WAN2 = UPSTREAM_PROBE_TARGETS[1]
+
+    @staticmethod
+    async def _sweep(repository, lookup, adapter, *, enabled: bool = True):
+        return await run_health_check_sweep(
+            repository,
+            lookup,
+            device_adapter_resolver=lambda vendor: adapter,
+            upstream_probe_enabled=enabled,
+        )
+
+    async def test_off_by_default_sends_and_writes_nothing(self) -> None:
+        repository, lookup, _router, _primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        await run_health_check_sweep(
+            repository, lookup, device_adapter_resolver=lambda vendor: adapter
+        )
+        assert adapter.host_route_calls == []
+        assert sorted(call["target_ip"] for call in adapter.calls) == [
+            "192.168.1.1",
+            "192.168.2.1",
+        ]
+
+    async def test_isp_dead_behind_a_live_modem_reads_down_on_that_line(self) -> None:
+        repository, lookup, _router, primary, backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        for target in self.WAN1:
+            adapter.ping_results_by_target[target] = _DEAD
+        await self._sweep(repository, lookup, adapter)
+        assert primary.health_status == HealthStatus.UNHEALTHY.value
+        assert backup.health_status == HealthStatus.HEALTHY.value
+
+    async def test_each_line_pins_its_own_probes_to_its_own_gateway(self) -> None:
+        repository, lookup, _router, _primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        await self._sweep(repository, lookup, adapter)
+        assert {
+            call["dst_address"]: call["gateway"] for call in adapter.host_route_calls
+        } == {
+            **dict.fromkeys(self.WAN1, "192.168.1.1"),
+            **dict.fromkeys(self.WAN2, "192.168.2.1"),
+        }
+
+    async def test_one_probe_answering_is_enough(self) -> None:
+        repository, lookup, _router, primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        adapter.ping_results_by_target[self.WAN1[0]] = _DEAD
+        await self._sweep(repository, lookup, adapter)
+        assert primary.health_status == HealthStatus.HEALTHY.value
+
+    async def test_a_single_link_router_is_probed_with_no_route_write(self) -> None:
+        repository, lookup, _router, primary, backup = _two_wan_setup()
+        backup.is_enabled = False
+        adapter = FakeIspHealthAdapter(dynamic_gateway="192.168.1.1")
+        for target in self.WAN1:
+            adapter.ping_results_by_target[target] = _DEAD
+        await self._sweep(repository, lookup, adapter)
+        assert primary.health_status == HealthStatus.UNHEALTHY.value
+        assert adapter.host_route_calls == []
+
+    async def test_a_dead_first_hop_needs_no_probe(self) -> None:
+        repository, lookup, _router, primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        adapter.ping_results_by_target["192.168.1.1"] = _DEAD
+        await self._sweep(repository, lookup, adapter)
+        assert primary.health_status == HealthStatus.UNHEALTHY.value
+        assert not any(
+            call["dst_address"] in self.WAN1 for call in adapter.host_route_calls
+        )
+
+    async def test_a_failed_route_write_keeps_the_first_hop_reading(self) -> None:
+        repository, lookup, _router, primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        adapter.host_route_should_raise = IspDeviceOperationError(
+            "ensure_host_route", "refused"
+        )
+        await self._sweep(repository, lookup, adapter)
+        assert primary.health_status == HealthStatus.HEALTHY.value
+
+    async def test_failover_only_moves_traffic_off_a_dead_isp(self) -> None:
+        repository, lookup, _router, primary, backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        for target in self.WAN1:
+            adapter.ping_results_by_target[target] = _DEAD
+        for _ in range(3):
+            await self._sweep(repository, lookup, adapter)
         assert primary.is_active_uplink is False
         assert backup.is_active_uplink is True

@@ -205,6 +205,21 @@ DEFAULT_PACKET_LOSS_UNHEALTHY_THRESHOLD_PERCENT = 20.0
 # merely worth alerting on) -- only genuine UNHEALTHY readings accumulate.
 DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER = 3
 
+# Public addresses that say whether an ISP is passing traffic beyond its own
+# modem, one pair per enabled link in priority order. A pair, so one address
+# having a bad day cannot turn a working line red: only both failing counts.
+# On a multi-WAN router each is pinned to its line by a /32 route, which would
+# pin guests using it as a DNS server too, so the addresses venues commonly
+# configure (8.8.8.8, 1.1.1.1 and their partners) are deliberately absent.
+# A link past the end of this list keeps the first-hop reading alone.
+UPSTREAM_PROBE_TARGETS = (
+    ("208.67.222.222", "94.140.14.14"),
+    ("208.67.220.220", "94.140.15.15"),
+    ("76.76.2.0", "76.76.10.0"),
+)
+UPSTREAM_PROBE_PING_COUNT = 3
+UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX = "cloudguest-isp-probe-"
+
 # Real RouterOS /tool/ping parameters -- see device_adapters.py.
 ISP_PING_COUNT = 5
 ISP_PING_TIMEOUT_SECONDS = 10
@@ -354,4 +369,7 @@ __all__ = [
     "TASK_RUN_ISP_HEALTH_CHECK_SWEEP",
     "ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",
     "MAX_RATE_INTERVAL_SECONDS",
+    "UPSTREAM_PROBE_TARGETS",
+    "UPSTREAM_PROBE_PING_COUNT",
+    "UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX",
 ]

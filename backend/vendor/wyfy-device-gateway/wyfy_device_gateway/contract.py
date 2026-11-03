@@ -1757,6 +1757,15 @@ class DeviceGatewayAdapter(Protocol):
         """
         ...
 
+    async def ensure_host_route(
+        self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
+    ) -> None:
+        """Make sure one comment-tagged ``dst_address/32`` route leaves by
+        ``gateway``: added when missing, re-pointed when the gateway moved,
+        and no write at all when it is already right. Touches only the route
+        carrying ``comment``."""
+        ...
+
     async def ensure_wan_egress(
         self, creds: DeviceCredentials, *, interface: str
     ) -> None:

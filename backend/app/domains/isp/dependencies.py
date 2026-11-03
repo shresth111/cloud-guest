@@ -18,6 +18,7 @@ from fastapi import Depends
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings, get_settings
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
@@ -52,6 +53,7 @@ def get_isp_service(
     # app's own RateLimitMiddleware) already reuses, not a new client.
     redis: Redis = Depends(get_redis_client),
     caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    settings: Settings = Depends(get_settings),
 ) -> IspService:
     return IspService(
         repository,
@@ -59,6 +61,7 @@ def get_isp_service(
         audit_writer=audit_repository,
         redis=redis,
         caller_location_scope=caller_location_scope,
+        upstream_probe_enabled=settings.isp_upstream_probe_enabled,
     )
 
 

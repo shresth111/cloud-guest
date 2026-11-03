@@ -83,6 +83,9 @@ from .constants import (
     SPEED_TEST_MIN_INTERVAL_SECONDS,
     SPEED_TEST_TIMEOUT_SECONDS,
     UNHEALTHY_SINCE_LOOKBACK_LIMIT,
+    UPSTREAM_PROBE_PING_COUNT,
+    UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX,
+    UPSTREAM_PROBE_TARGETS,
     HealthStatus,
     HealthStatusSource,
     IspConnectionMode,
@@ -331,8 +334,11 @@ class IspService:
         device_adapter_resolver=get_isp_health_adapter,
         redis: _RedisProtocol | None = None,
         caller_location_scope: LocationScope = None,
+        upstream_probe_enabled: bool = False,
     ) -> None:
         self.repository = repository
+        # Settings.isp_upstream_probe_enabled. See _measure_beyond_first_hop.
+        self.upstream_probe_enabled = upstream_probe_enabled
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
@@ -1052,6 +1058,88 @@ class IspService:
         return outcome
 
     async def ping_link(self, link: IspLink) -> PingResult:
+        """One reading of this link: its first hop, then, when enabled and the
+        first hop answered, the internet beyond it."""
+        result = await self._ping_first_hop(link)
+        if not self.upstream_probe_enabled or result.received <= 0:
+            return result
+        return await self._measure_beyond_first_hop(link, result)
+
+    async def _measure_beyond_first_hop(
+        self, link: IspLink, first_hop: PingResult
+    ) -> PingResult:
+        """Turns a good first-hop reading into a failed one when the ISP behind
+        that hop is passing nothing. A modem answers from the venue during an
+        ISP outage, so the first hop alone reads healthy throughout.
+
+        On a multi-WAN router each probe address needs a /32 route, or the ping
+        would leave by whichever line is preferred and measure that one. One
+        enabled link has nowhere else to go and needs no write.
+
+        Any failure of the probe itself keeps the first-hop reading: not being
+        able to run this check is no evidence against the line.
+        """
+        siblings = await self.repository.list_links_for_router(link.router_id)
+        enabled = sorted(
+            (sibling for sibling in siblings if sibling.is_enabled),
+            key=lambda sibling: (sibling.priority, str(sibling.id)),
+        )
+        position = next(
+            (i for i, sibling in enumerate(enabled) if sibling.id == link.id), None
+        )
+        if position is None or position >= len(UPSTREAM_PROBE_TARGETS):
+            return first_hop
+        targets = UPSTREAM_PROBE_TARGETS[position]
+
+        router = await self.router_lookup.get_router(link.router_id)
+        credentials = self._resolve_device_credentials(router)
+        adapter = self._get_device_adapter(router.vendor)
+        try:
+            if len(enabled) > 1:
+                interface = link.routing_interface or link.interface
+                routes = await adapter.read_default_routes(credentials)
+                gateways = {
+                    route.gateway
+                    for route in routes
+                    if interface and route.interface == interface and route.gateway
+                }
+                if len(gateways) != 1:
+                    return first_hop
+                gateway = next(iter(gateways))
+                for target in targets:
+                    await adapter.ensure_host_route(
+                        credentials,
+                        dst_address=target,
+                        gateway=gateway,
+                        comment=f"{UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX}{target}",
+                    )
+            for target in targets:
+                probe = await adapter.ping(
+                    credentials,
+                    target_ip=target,
+                    count=UPSTREAM_PROBE_PING_COUNT,
+                    timeout_seconds=ISP_PING_TIMEOUT_SECONDS,
+                )
+                if probe.received > 0:
+                    return first_hop
+        except (IspDeviceConnectionError, IspDeviceOperationError) as exc:
+            logger.warning(
+                "isp_upstream_probe_unavailable",
+                extra={"isp_link_id": str(link.id), "error": str(exc)},
+            )
+            return first_hop
+        logger.warning(
+            "isp_upstream_probe_failed",
+            extra={"isp_link_id": str(link.id), "targets": list(targets)},
+        )
+        return PingResult(
+            sent=first_hop.sent,
+            received=0,
+            packet_loss_percentage=100.0,
+            avg_rtt_ms=None,
+        )
+
+    async def _ping_first_hop(self, link: IspLink) -> PingResult:
         """Resolves this link's own real health-check target and executes
         it -- the resolution strategy itself is driven entirely by the
         link's own ``connection_mode`` (never anything hardcoded to a
@@ -2022,29 +2110,17 @@ class IspService:
         -- once about the failover having worked and once about which
         uplink is live.
 
-        Two signals, both read from the device, neither of which is "the
-        route exists":
-
-        * RouterOS's own ``active`` flag on the target's default route.
-          It goes false the instant that route's ``check-gateway=ping``
-          probe fails, so it distinguishes a configured uplink from a
-          working one. ``disabled`` is checked separately because an
-          administratively-disabled route is a human decision, not a
-          fault, and deserves its own message.
-        * a real ``/tool/ping`` from the router to that route's own next
-          hop. This is the part ``active`` alone cannot give: a route can
-          be freshly added and not yet probed.
+        The check is a real ``/tool/ping`` from the router to the target route's
+        own next hop. ``disabled`` is checked first because an administratively-disabled
+        route is a human decision, not a fault, and deserves its own message.
 
         **What this does not prove**, stated plainly because the whole
         point of this method is not to repeat the mistake it exists to
         prevent: that the ISP beyond that next hop is passing traffic, and
         that a guest on the LAN can reach the internet through it. A
-        first-hop ICMP reply is the strongest evidence obtainable from the
-        router without sourcing a probe from the guest subnet out of this
-        specific uplink, which RouterOS cannot be asked to do while a
-        different route is still preferred. ``active=true``, "the route
-        exists" and "the address is still there" all pass on a router
-        forwarding zero packets.
+        first-hop ICMP reply says only that the modem answers. With
+        ``isp_upstream_probe_enabled`` the sweep has already measured beyond it,
+        and a line failing that check is not offered as a target.
         """
         route = next(route for route in routes if route.interface == interface)
         if route.disabled:
@@ -2052,12 +2128,11 @@ class IspService:
                 link.id,
                 "its default route is administratively disabled on the router",
             )
-        if not route.active:
-            raise IspFailoverTargetUnreachableError(
-                link.id,
-                "RouterOS does not currently consider its default route "
-                "active -- the route's own check-gateway probe is failing",
-            )
+        # No test of `route.active`. RouterOS flags only the preferred route
+        # active, so a working route at a higher distance is not active either
+        # (measured on 7.16.2, CHR), and this method only runs for a target
+        # that is not yet preferred. Testing it refused every failback onto a
+        # recovered primary. The ping below is what measures the line.
         if not route.gateway:
             raise IspFailoverTargetUnreachableError(
                 link.id,
@@ -2177,6 +2252,7 @@ async def run_health_check_sweep(
     audit_writer: AuditLogWriter | None = None,
     device_adapter_resolver=get_isp_health_adapter,
     redis: _RedisProtocol | None = None,
+    upstream_probe_enabled: bool = False,
 ) -> HealthCheckSweepSummary:
     """The platform-wide health-check sweep ``tasks.run_isp_health_check_sweep``
     (Celery Beat) drives -- pulled out to module scope for the identical
@@ -2196,6 +2272,7 @@ async def run_health_check_sweep(
         audit_writer=audit_writer,
         device_adapter_resolver=device_adapter_resolver,
         redis=redis,
+        upstream_probe_enabled=upstream_probe_enabled,
     )
     links = await repository.list_enabled_links_for_sweep()
     checked = 0
