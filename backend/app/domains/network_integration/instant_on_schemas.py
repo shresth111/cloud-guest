@@ -260,6 +260,25 @@ class InstantOnVenueGuestSpeedRequest(BaseModel):
     upload_mbps: int | None = Field(default=None, ge=1, le=1000)
 
 
+class InstantOnVenueNetworkTotalRequest(BaseModel):
+    """Customer: one total for one guest WiFi network, not the whole venue.
+    Previews unless ``dry_run`` is false. Both speeds ``None`` clears it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    network_id: str = Field(min_length=1, max_length=128)
+    download_mbps: int | None = Field(default=None, ge=1, le=1000)
+    upload_mbps: int | None = Field(default=None, ge=1, le=1000)
+    dry_run: bool = True
+
+
+class InstantOnNetworkTotalPreview(BaseModel):
+    network_id: str
+    download_mbps: int | None = None
+    upload_mbps: int | None = None
+    replaces_per_device: bool = False
+
+
 class InstantOnVenueGuestNetwork(BaseModel):
     network_id: str
     network_name: str | None = None
@@ -275,9 +294,11 @@ class InstantOnVenueGuestSpeedResponse(BaseModel):
     """Never carries a network secret: eight fields per network, nothing else."""
 
     source: Literal["instant_on"] = "instant_on"
-    status: Literal["ok", "applied", "unavailable", "failed"]
+    status: Literal["ok", "applied", "preview", "unavailable", "failed"]
     reason: str | None = None
     message: str | None = None
     presets_mbps: list[int]
+    network_total_write_enabled: bool = False
+    preview: InstantOnNetworkTotalPreview | None = None
     networks: list[InstantOnVenueGuestNetwork] = Field(default_factory=list)
     applied: InstantOnVenueGuestNetwork | None = None

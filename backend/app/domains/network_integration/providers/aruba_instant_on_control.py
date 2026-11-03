@@ -463,6 +463,69 @@ class InstantOnControlClient:
         )
         return after
 
+    async def set_guest_network_total_limit(
+        self,
+        site_id: str,
+        network_id: str,
+        *,
+        download_mbps: int | None,
+        upload_mbps: int | None,
+    ) -> GuestNetworkRateLimit:
+        """Set (or, with both ``None``, clear) one total for everything on this
+        network: the portal's "Usage Controlled By: Network". One mode per
+        network, so this replaces a per-client cap. The total is per SSID, not
+        per venue.
+
+        UNPROVEN: the field names come from reading a live network and the
+        portal's code. No such write has been sent yet, so success is the
+        read-back alone. Same whole-object ``PUT`` as the per-client write.
+        """
+        down = _check_mbps(download_mbps, "download")
+        up = _check_mbps(upload_mbps, "upload")
+        network = await self.get_network(site_id, network_id)
+        body = copy.deepcopy(network)
+        qos = body.get("qos")
+        if not isinstance(qos, dict):
+            raise InstantOnApiDriftError(
+                "Network has no qos object", reason="shape_network_qos"
+            )
+        enabled = down is not None or up is not None
+        qos["isBandwidthLimitEnabled"] = enabled
+        qos["isDownloadBandwidthLimitEnabled"] = down is not None
+        qos["isUploadBandwidthLimitEnabled"] = up is not None
+        body["isBandwidthLimitEnabled"] = enabled
+        if enabled:
+            qos["bandwidthLimitMode"] = "perNetwork"
+            body["bandwidthLimitMode"] = "perNetwork"
+        if down is not None:
+            qos["perNetworkDownstreamBandwidthLimitInMbps"] = down
+        if up is not None:
+            qos["perNetworkUpstreamBandwidthLimitInMbps"] = up
+
+        await self._write(
+            "PUT", site_id, f"networksSummary/{quote(network_id, safe='')}", body=body
+        )
+        after = await self.get_guest_network_rate_limit(site_id, network_id)
+        if (
+            after.other_mode_limit != enabled
+            or after.network_download_mbps != down
+            or after.network_upload_mbps != up
+        ):
+            raise InstantOnWriteNotConfirmedError(
+                "Instant On did not keep the requested network total",
+                reason="network_total_not_kept",
+            )
+        logger.info(
+            "instant_on_network_total_set",
+            extra={
+                "site_id": site_id,
+                "network_id": network_id,
+                "download_mbps": down,
+                "upload_mbps": up,
+            },
+        )
+        return after
+
     # -- transport -------------------------------------------------------------
 
     async def _write(
