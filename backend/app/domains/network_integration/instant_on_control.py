@@ -489,6 +489,17 @@ class VenueGuestNetworkSpeed:
 
 
 @dataclass(frozen=True, slots=True)
+class NetworkTotalPreview:
+    """What ``set_venue_network_total`` would do. Sends nothing."""
+
+    network_id: str
+    download_mbps: int | None
+    upload_mbps: int | None
+    #: The per-device cap this replaces: one mode per network.
+    replaces_per_device: bool
+
+
+@dataclass(frozen=True, slots=True)
 class VenueGuestSpeed:
     """What a venue owner's speed screen can say about the guest network.
 
@@ -497,6 +508,8 @@ class VenueGuestSpeed:
       network on the venue's site with its current cap.
     * ``applied`` -- a write landed AND the read-back shows the requested
       cap (``applied``). Never set on a 2xx alone.
+    * ``preview`` -- what a network-total write would do (``preview``). Nothing
+      was written.
     * ``unavailable`` -- a cloud-control gate is closed (``reason`` says
       ``cloud_control_not_enabled``); nothing was sent to Instant On.
     * ``failed`` -- Instant On answered, but not with what was asked
@@ -512,6 +525,7 @@ class VenueGuestSpeed:
     message: str | None = None
     networks: tuple[VenueGuestNetworkSpeed, ...] = ()
     applied: VenueGuestNetworkSpeed | None = None
+    preview: NetworkTotalPreview | None = None
 
 
 def _network_speed(limit: Any) -> VenueGuestNetworkSpeed:
@@ -664,6 +678,118 @@ async def set_venue_guest_speed(
     if result.status == "applied":
         logger.info(
             "instant_on_venue_guest_speed_applied",
+            extra={
+                "router_id": str(target.router_id),
+                "network_id": network_id,
+                "download_mbps": download_mbps,
+                "upload_mbps": upload_mbps,
+                "actor_user_id": str(actor_user_id) if actor_user_id else None,
+            },
+        )
+    return result
+
+
+async def set_venue_network_total(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None,
+    location_id: uuid.UUID,
+    network_id: str,
+    download_mbps: int | None,
+    upload_mbps: int | None,
+    dry_run: bool = True,
+    actor_user_id: uuid.UUID | None = None,
+    settings: Settings | None = None,
+) -> VenueGuestSpeed:
+    """Preview, or set, one total for one guest network (per SSID, not venue).
+    Previews by default. Off unless ``instant_on_network_total_write_enabled``
+    and the cloud-control gates are all open; refused before any call otherwise."""
+    if download_mbps is not None:
+        _check_range(download_mbps, "download")
+    if upload_mbps is not None:
+        _check_range(upload_mbps, "upload")
+    settings = settings or get_settings()
+    if not settings.instant_on_network_total_write_enabled:
+        return VenueGuestSpeed(status="unavailable", reason="network_total_not_enabled")
+    target = await resolve_control_target(
+        session,
+        organization_id=organization_id,
+        location_id=location_id,
+        settings=settings,
+    )
+    if target is None:
+        return VenueGuestSpeed(status="unavailable", reason="cloud_control_not_enabled")
+
+    async def apply(client: InstantOnControlClient) -> VenueGuestSpeed:
+        guest = {
+            n.network_id: n
+            for n in await client.list_guest_network_rate_limits(target.site_id)
+        }
+        networks = tuple(_network_speed(n) for n in guest.values())
+        if network_id not in guest:
+            return VenueGuestSpeed(
+                status="failed",
+                reason="network_not_found",
+                message=(
+                    "That guest WiFi network is not on this venue's Instant On site."
+                ),
+                networks=networks,
+            )
+        # Empty only means something when a total is there to remove. Otherwise
+        # it would clear a per-device cap and leave every guest uncapped.
+        if (
+            download_mbps is None
+            and upload_mbps is None
+            and not guest[network_id].other_mode_limit
+        ):
+            return VenueGuestSpeed(
+                status="failed",
+                reason="network_total_empty",
+                message="Enter a total for download, upload or both.",
+                networks=networks,
+            )
+        if dry_run:
+            return VenueGuestSpeed(
+                status="preview",
+                networks=networks,
+                preview=NetworkTotalPreview(
+                    network_id=network_id,
+                    download_mbps=download_mbps,
+                    upload_mbps=upload_mbps,
+                    replaces_per_device=guest[network_id].enabled,
+                ),
+            )
+        after = await client.set_guest_network_total_limit(
+            target.site_id,
+            network_id,
+            download_mbps=download_mbps,
+            upload_mbps=upload_mbps,
+        )
+        refreshed = await client.list_guest_network_rate_limits(target.site_id)
+        return VenueGuestSpeed(
+            status="applied",
+            networks=tuple(_network_speed(n) for n in refreshed),
+            applied=_network_speed(after),
+        )
+
+    try:
+        result = await _with_client(target, settings, apply)
+    except InstantOnError as error:
+        logger.warning(
+            "instant_on_network_total_failed",
+            extra={"router_id": str(target.router_id), "error_code": error.code},
+        )
+        # The two rollback outcomes say what is now in place; keep them apart.
+        reason = (
+            error.reason
+            if error.reason
+            in ("network_total_not_kept_restored", "network_total_state_unknown")
+            else error.code
+        )
+        return VenueGuestSpeed(status="failed", reason=reason, message=str(error))
+    if result.status == "applied":
+        logger.info(
+            "instant_on_network_total_applied",
             extra={
                 "router_id": str(target.router_id),
                 "network_id": network_id,

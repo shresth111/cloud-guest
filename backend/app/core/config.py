@@ -2838,6 +2838,16 @@ class Settings(BaseSettings):
             "CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_ENABLED."
         ),
     )
+    instant_on_network_total_write_enabled: bool = Field(
+        default=False,
+        description=(
+            "Lets a venue set a network-wide total speed on an Instant On guest "
+            "network, on top of the cloud-control gates. Off by default: this "
+            "write's body comes from a read of the portal, and no such write has "
+            "been sent yet. Override via "
+            "CLOUDGUEST_INSTANT_ON_NETWORK_TOTAL_WRITE_ENABLED."
+        ),
+    )
     instant_on_cloud_control_router_ids: str = Field(
         default="",
         description=(

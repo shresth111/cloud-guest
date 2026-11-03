@@ -154,6 +154,20 @@ class InstantOnAlert:
 
 
 @dataclass(frozen=True, slots=True)
+class InstantOnEvent:
+    """What happened on the site, per Instant On's event log. Client identity in
+    ``attributes``, ``source`` and ``account`` is deliberately not carried."""
+
+    event_id: str | None
+    event: str
+    state: str | None
+    category: str | None
+    occurred_at: str | None  # ISO-8601 UTC
+    device_name: str | None
+    network_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class InstantOnClientUsage:
     client_id: str | None
     client_name: str | None
@@ -350,6 +364,28 @@ def map_alert(element: dict[str, Any]) -> InstantOnAlert:
     )
 
 
+def map_event(element: dict[str, Any]) -> InstantOnEvent:
+    event = _str(element.get("event"))
+    if event is None:
+        raise InstantOnApiDriftError(
+            "event element has no event", reason="shape_events"
+        )
+    attributes = element.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+    return InstantOnEvent(
+        event_id=_str(element.get("id")),
+        event=event,
+        state=_str(element.get("state")),
+        category=_str(element.get("category")),
+        occurred_at=_timestamp(element.get("occurrenceTime")),
+        # Not attributes["device"]: the measured feed shows a guest's phone name
+        # with its MAC there. Stays out until a raw row proves otherwise.
+        device_name=None,
+        network_name=_str(attributes.get("network")),
+    )
+
+
 def map_client_usage(element: dict[str, Any]) -> InstantOnClientUsage:
     client_id = _str(element.get("clientId"))
     client_name = _str(element.get("clientName"))
@@ -406,6 +442,9 @@ class ArubaInstantOnProvider:
 
     async def read_alerts(self, site_id: str) -> list[InstantOnAlert]:
         return [map_alert(e) for e in await self._client.get_alerts(site_id)]
+
+    async def read_events(self, site_id: str) -> list[InstantOnEvent]:
+        return [map_event(e) for e in await self._client.get_events(site_id)]
 
     async def read_health(self, site_id: str) -> InstantOnHealth:
         return map_health(await self._client.get_system_health(site_id))

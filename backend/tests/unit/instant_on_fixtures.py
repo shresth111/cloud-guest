@@ -79,6 +79,27 @@ NETWORKS_SUMMARY = {
     ]
 }
 
+# Field names as measured on a live site, 2026-11-02. Values are invented.
+EVENTS = {
+    "elements": [
+        {
+            "kind": "event",
+            "id": "event-1",
+            "event": "clientCaptivePortalFailure",
+            "state": "info",
+            "category": "client",
+            "occurrenceTime": "2026-11-02T01:30:00Z",
+            "source": "client",
+            "type": "site",
+            "account": None,
+            "attributes": {
+                "network": "Guest WiFi",
+                "device": "Phone 12:34:56:78:9a:bc",
+            },
+        }
+    ]
+}
+
 ALERTS = {
     "elements": [
         {
@@ -123,6 +144,7 @@ RESOURCE_BODIES = {
     "clientSummary": CLIENT_SUMMARY,
     "networksSummary": NETWORKS_SUMMARY,
     "alerts": ALERTS,
+    "events": EVENTS,
     "systemHealth": SYSTEM_HEALTH,
     "usage": CLIENT_USAGE,
 }

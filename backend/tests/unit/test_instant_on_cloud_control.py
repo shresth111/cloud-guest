@@ -77,6 +77,11 @@ class FakeSite:
         self.write_status: int | None = None
         self.timeout_on_write = False
         self.requests: list[httpx.Request] = []
+        # Network total rollback: the first PUT lands wrong, reads fail after it,
+        # or the restoring PUT is refused.
+        self.mangle_next_total = False
+        self.fail_reads_after_write = False
+        self.refuse_second_write = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -88,8 +93,13 @@ class FakeSite:
                 raise httpx.ReadTimeout("lost", request=request)
             if self.write_status is not None:
                 return httpx.Response(self.write_status, json={})
+            if self.refuse_second_write and len(self.writes()) > 1:
+                return httpx.Response(400, json={})
             if not self.ignore_writes:
                 self._apply(request, path)
+            if self.mangle_next_total:
+                self.mangle_next_total = False
+                self.network["qos"]["perNetworkDownstreamBandwidthLimitInMbps"] = 1
             return httpx.Response(200, json={})
         if path == "blockedClients":
             return httpx.Response(
@@ -98,6 +108,8 @@ class FakeSite:
         if path == "clientSummary":
             return httpx.Response(200, json={"elements": self.clients, "metaData": {}})
         if path == "networksSummary":
+            if self.fail_reads_after_write and self.writes():
+                return httpx.Response(500, json={})
             return httpx.Response(200, json={"elements": [self.network]})
         return httpx.Response(404, json={})
 

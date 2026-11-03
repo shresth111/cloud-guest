@@ -444,7 +444,7 @@ class TestRoutes:
             instant_on_platform_router,
         )
 
-        assert len(instant_on_platform_router.routes) == 11
+        assert len(instant_on_platform_router.routes) == 12
         for route in instant_on_platform_router.routes:
             (closure,) = _permission_closures(route)
             assert closure[ScopeType] == ScopeType.GLOBAL, route.path
@@ -462,17 +462,20 @@ class TestRoutes:
             instant_on_customer_router,
         )
 
-        # 4 reads + the guest network speed (GET + PUT).
-        assert len(instant_on_customer_router.routes) == 6
+        # 5 reads + the guest network speed (GET + PUT) + the network total (PUT).
+        assert len(instant_on_customer_router.routes) == 8
         for route in instant_on_customer_router.routes:
             (closure,) = _permission_closures(route)
             assert closure[ScopeType] == ScopeType.ORGANIZATION
             if route.methods == {"PUT"}:
-                # The one write: the guest network's speed. Its body names an
-                # Instant On network, which is only ever looked up inside the
-                # site resolved from the caller's organization + location
-                # (``set_venue_guest_speed``), never read unscoped.
-                assert route.path.endswith("/instant-on/guest-speed")
+                # The two writes: the guest network's speed and its total. The
+                # body names an Instant On network, which is only ever looked up
+                # inside the site resolved from the caller's organization +
+                # location (``set_venue_guest_speed``,
+                # ``set_venue_network_total``), never read unscoped.
+                assert route.path.endswith(
+                    ("/instant-on/guest-speed", "/instant-on/network-total")
+                )
                 assert closure[str] == "bandwidth.update"
                 assert [p.name for p in route.dependant.path_params] == [
                     "location_id"

@@ -59,6 +59,7 @@ from .instant_on_schemas import (
     InstantOnClientItem,
     InstantOnClientUsageItem,
     InstantOnCustomerView,
+    InstantOnEventItem,
     InstantOnGuestNetworksResponse,
     InstantOnGuestRateLimitRequest,
     InstantOnGuestRateLimitResponse,
@@ -71,6 +72,7 @@ from .instant_on_schemas import (
     InstantOnSsidItem,
     InstantOnVenueGuestSpeedRequest,
     InstantOnVenueGuestSpeedResponse,
+    InstantOnVenueNetworkTotalRequest,
 )
 from .instant_on_service import InstantOnKind, InstantOnReadService, InstantOnView
 
@@ -101,6 +103,7 @@ _ITEM_MODELS: dict[InstantOnKind, type] = {
     InstantOnKind.ALERTS: InstantOnAlertItem,
     InstantOnKind.HEALTH: InstantOnHealthItem,
     InstantOnKind.CLIENT_USAGE: InstantOnClientUsageItem,
+    InstantOnKind.EVENTS: InstantOnEventItem,
 }
 
 _PATH_SEGMENT: dict[InstantOnKind, str] = {
@@ -110,6 +113,7 @@ _PATH_SEGMENT: dict[InstantOnKind, str] = {
     InstantOnKind.ALERTS: "alerts",
     InstantOnKind.HEALTH: "health",
     InstantOnKind.CLIENT_USAGE: "client-usage",
+    InstantOnKind.EVENTS: "events",
 }
 
 
@@ -177,6 +181,7 @@ for _kind in (
     InstantOnKind.CLIENTS,
     InstantOnKind.SSIDS,
     InstantOnKind.ALERTS,
+    InstantOnKind.EVENTS,
 ):
     instant_on_customer_router.add_api_route(
         f"/locations/{{location_id}}/instant-on/{_PATH_SEGMENT[_kind]}",
@@ -212,6 +217,17 @@ def _venue_speed_payload(result: Any) -> dict[str, Any]:
         reason=result.reason,
         message=result.message,
         presets_mbps=list(GUEST_SPEED_PRESETS_MBPS),
+        network_total_write_enabled=get_settings().instant_on_network_total_write_enabled,
+        preview=(
+            {
+                "network_id": result.preview.network_id,
+                "download_mbps": result.preview.download_mbps,
+                "upload_mbps": result.preview.upload_mbps,
+                "replaces_per_device": result.preview.replaces_per_device,
+            }
+            if result.preview is not None
+            else None
+        ),
         networks=[net(n) for n in result.networks],  # type: ignore[misc]
         applied=net(result.applied) if result.applied is not None else None,  # type: ignore[arg-type]
     ).model_dump(mode="json")
@@ -299,6 +315,57 @@ async def set_location_instant_on_guest_speed(
     return build_response(
         success=True,
         message="Guest network speed",
+        data=_venue_speed_payload(result),
+        request_id=_request_id(request),
+    )
+
+
+@instant_on_customer_router.put(
+    "/locations/{location_id}/instant-on/network-total",
+    response_model=ApiResponse[InstantOnVenueGuestSpeedResponse],
+    dependencies=[Depends(_CUSTOMER_SPEED_UPDATE)],
+)
+async def set_location_instant_on_network_total(
+    location_id: uuid.UUID,
+    payload: InstantOnVenueNetworkTotalRequest,
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """One total for one guest WiFi network (per SSID, not per venue). Previews
+    unless ``dry_run`` is false. Replaces a per-device cap: one mode per network.
+    Off unless ``instant_on_network_total_write_enabled`` and cloud control are on.
+    Applied only when Instant On's read-back shows the new total."""
+    from fastapi import HTTPException, status
+
+    from .instant_on_control import VenueGuestSpeed, set_venue_network_total
+
+    allowed = caller_location_scope is None or location_id in caller_location_scope
+    if not allowed:
+        result = VenueGuestSpeed(
+            status="unavailable", reason="cloud_control_not_enabled"
+        )
+    else:
+        try:
+            result = await set_venue_network_total(
+                db,
+                organization_id=requesting_organization_id,
+                location_id=location_id,
+                network_id=payload.network_id,
+                download_mbps=payload.download_mbps,
+                upload_mbps=payload.upload_mbps,
+                dry_run=payload.dry_run,
+                actor_user_id=uuid.UUID(str(user.id)),
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+    return build_response(
+        success=True,
+        message="Guest network total",
         data=_venue_speed_payload(result),
         request_id=_request_id(request),
     )
