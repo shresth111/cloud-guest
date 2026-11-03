@@ -19,6 +19,7 @@ __all__ = [
     "IspLinkNotFoundError",
     "CrossOrganizationIspLinkAccessError",
     "IspPrimaryLinkAlreadyExistsError",
+    "IspFailoverNotApplicableError",
     "IspNoBackupLinkAvailableError",
     "IspLinkDisabledError",
     "IspHealthCheckTargetUnavailableError",
@@ -109,6 +110,19 @@ class IspNoBackupLinkAvailableError(IspError):
     def __init__(self, router_id: uuid.UUID) -> None:
         super().__init__(
             f"Router '{router_id}' has no available backup ISP link to " "fail over to",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class IspFailoverNotApplicableError(IspError):
+    """A failover was requested on a load-balanced router. Both lines already
+    carry traffic and the router's own crossover routes cover a dead one, so
+    a platform-side failover would change nothing it claims to change."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' is load balancing across its ISP links, "
+            "so there is no failover to trigger",
             status_code=status.HTTP_409_CONFLICT,
         )
 

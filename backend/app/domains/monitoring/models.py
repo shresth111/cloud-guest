@@ -497,7 +497,8 @@ class Alert(BaseModel):
     #    -- ``router``, ``router_reachability``, ``isp_link``,
     #    ``rogue_dhcp_guard`` and the three controller targets keep
     #    de-duplicating on exactly the key they used before.
-    #  * The subject is polymorphic -- today a ``monitored_hardware.id`` --
+    #  * The subject is polymorphic -- a ``monitored_hardware.id`` or an
+    #    ``isp_links.id`` --
     #    so a constraint to that one table would both misstate the column and
     #    block the next target that needs a subject of its own.
     subject_id: Mapped[uuid.UUID | None] = mapped_column(

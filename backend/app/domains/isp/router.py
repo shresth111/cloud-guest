@@ -82,7 +82,10 @@ def _pagination_fields(meta: PaginationMeta) -> dict[str, int | bool]:
 
 
 def _link_response(
-    link: IspLink, *, unhealthy_since: datetime | None = None
+    link: IspLink,
+    *,
+    unhealthy_since: datetime | None = None,
+    wan_routing_mode: str | None = None,
 ) -> IspLinkResponse:
     return IspLinkResponse(
         id=str(link.id),
@@ -121,6 +124,7 @@ def _link_response(
         failover_push_status=link.failover_push_status,
         failover_push_error=link.failover_push_error,
         failover_pushed_at=link.failover_pushed_at,
+        wan_routing_mode=wan_routing_mode,
         created_at=link.created_at,
     )
 
@@ -273,9 +277,12 @@ async def list_isp_links(
         page=page,
         page_size=page_size,
     )
+    modes = await service.wan_routing_modes_for(links)
     items = [
         _link_response(
-            link, unhealthy_since=await service.compute_unhealthy_since(link)
+            link,
+            unhealthy_since=await service.compute_unhealthy_since(link),
+            wan_routing_mode=modes.get(link.router_id),
         )
         for link in links
     ]

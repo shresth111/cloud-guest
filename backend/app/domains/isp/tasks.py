@@ -130,6 +130,7 @@ def run_isp_health_check_sweep() -> dict[str, int]:
         # apart from "something went wrong once" at a glance -- see
         # HealthCheckSweepSummary.misconfigured.
         "misconfigured": summary.misconfigured,
+        "no_reading": summary.no_reading,
     }
     logger.info("isp_task_run_health_check_sweep_completed", extra=result)
     return result
