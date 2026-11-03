@@ -92,6 +92,7 @@ _KIND_ORDER: tuple[InstantOnKind, ...] = (
     InstantOnKind.SSIDS,
     InstantOnKind.ALERTS,
     InstantOnKind.CLIENT_USAGE,
+    InstantOnKind.EVENTS,
 )
 
 # A tick that lands a few seconds early must still count as due, or a
@@ -110,6 +111,8 @@ async def _read(
         records = await provider.read_networks(site_id)
     elif kind == InstantOnKind.ALERTS:
         records = await provider.read_alerts(site_id)
+    elif kind == InstantOnKind.EVENTS:
+        records = await provider.read_events(site_id)
     elif kind == InstantOnKind.HEALTH:
         records = [await provider.read_health(site_id)]
     else:

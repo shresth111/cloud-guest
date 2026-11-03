@@ -444,7 +444,7 @@ class TestRoutes:
             instant_on_platform_router,
         )
 
-        assert len(instant_on_platform_router.routes) == 11
+        assert len(instant_on_platform_router.routes) == 12
         for route in instant_on_platform_router.routes:
             (closure,) = _permission_closures(route)
             assert closure[ScopeType] == ScopeType.GLOBAL, route.path
@@ -462,8 +462,8 @@ class TestRoutes:
             instant_on_customer_router,
         )
 
-        # 4 reads + the guest network speed (GET + PUT).
-        assert len(instant_on_customer_router.routes) == 6
+        # 5 reads + the guest network speed (GET + PUT).
+        assert len(instant_on_customer_router.routes) == 7
         for route in instant_on_customer_router.routes:
             (closure,) = _permission_closures(route)
             assert closure[ScopeType] == ScopeType.ORGANIZATION

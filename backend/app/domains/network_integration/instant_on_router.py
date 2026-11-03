@@ -59,6 +59,7 @@ from .instant_on_schemas import (
     InstantOnClientItem,
     InstantOnClientUsageItem,
     InstantOnCustomerView,
+    InstantOnEventItem,
     InstantOnGuestNetworksResponse,
     InstantOnGuestRateLimitRequest,
     InstantOnGuestRateLimitResponse,
@@ -101,6 +102,7 @@ _ITEM_MODELS: dict[InstantOnKind, type] = {
     InstantOnKind.ALERTS: InstantOnAlertItem,
     InstantOnKind.HEALTH: InstantOnHealthItem,
     InstantOnKind.CLIENT_USAGE: InstantOnClientUsageItem,
+    InstantOnKind.EVENTS: InstantOnEventItem,
 }
 
 _PATH_SEGMENT: dict[InstantOnKind, str] = {
@@ -110,6 +112,7 @@ _PATH_SEGMENT: dict[InstantOnKind, str] = {
     InstantOnKind.ALERTS: "alerts",
     InstantOnKind.HEALTH: "health",
     InstantOnKind.CLIENT_USAGE: "client-usage",
+    InstantOnKind.EVENTS: "events",
 }
 
 
@@ -177,6 +180,7 @@ for _kind in (
     InstantOnKind.CLIENTS,
     InstantOnKind.SSIDS,
     InstantOnKind.ALERTS,
+    InstantOnKind.EVENTS,
 ):
     instant_on_customer_router.add_api_route(
         f"/locations/{{location_id}}/instant-on/{_PATH_SEGMENT[_kind]}",
