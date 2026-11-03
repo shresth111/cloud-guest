@@ -1757,6 +1757,22 @@ class DeviceGatewayAdapter(Protocol):
         """
         ...
 
+    async def ensure_line_watch(
+        self,
+        creds: DeviceCredentials,
+        *,
+        host: str,
+        fallback_host: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        """Make sure the router itself watches one internet line: a netwatch
+        on ``host`` that, when both ``host`` and ``fallback_host`` stop
+        answering, disables that line's static default routes in every table,
+        and enables them again when ``host`` returns. It never disables the
+        last usable line. Writes only when missing or different."""
+        ...
+
     async def ensure_host_route(
         self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
     ) -> None:

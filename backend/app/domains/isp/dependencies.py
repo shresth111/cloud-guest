@@ -62,6 +62,7 @@ def get_isp_service(
         redis=redis,
         caller_location_scope=caller_location_scope,
         upstream_probe_enabled=settings.isp_upstream_probe_enabled,
+        upstream_probe_router_ids=settings.isp_upstream_probe_router_id_set,
     )
 
 

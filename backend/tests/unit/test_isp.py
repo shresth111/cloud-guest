@@ -446,6 +446,7 @@ class FakeIspHealthAdapter:
     # per-connection-mode branching.
     dynamic_gateway: str | None = None
     host_route_calls: list[dict[str, str]] = field(default_factory=list)
+    line_watch_calls: list[dict[str, str]] = field(default_factory=list)
     host_route_should_raise: Exception | None = None
     pppoe_status_by_interface: dict[str, bool] = field(default_factory=dict)
     # Traffic-load fakes -- see IspService.sample_link_traffic.
@@ -542,6 +543,25 @@ class FakeIspHealthAdapter:
             )
             for route in self.default_routes
         ]
+
+    async def ensure_line_watch(
+        self,
+        credentials: IspCredentials,
+        *,
+        host: str,
+        fallback_host: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        self.ops.append("ensure_line_watch")
+        self.line_watch_calls.append(
+            {
+                "host": host,
+                "fallback_host": fallback_host,
+                "gateway": gateway,
+                "comment": comment,
+            }
+        )
 
     async def ensure_host_route(
         self,
@@ -3561,3 +3581,61 @@ class TestUpstreamProbe:
             await self._sweep(repository, lookup, adapter)
         assert primary.is_active_uplink is False
         assert backup.is_active_uplink is True
+
+
+class TestLineWatch:
+    @staticmethod
+    async def _sweep(repository, lookup, adapter, **kwargs):
+        return await run_health_check_sweep(
+            repository,
+            lookup,
+            device_adapter_resolver=lambda vendor: adapter,
+            upstream_probe_enabled=True,
+            **kwargs,
+        )
+
+    async def test_each_line_gets_a_watch_after_its_nat(self) -> None:
+        repository, lookup, _router, _primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        await self._sweep(repository, lookup, adapter)
+        assert {
+            call["gateway"]: (call["host"], call["fallback_host"])
+            for call in adapter.line_watch_calls
+        } == {
+            "192.168.1.1": UPSTREAM_PROBE_TARGETS[0],
+            "192.168.2.1": UPSTREAM_PROBE_TARGETS[1],
+        }
+        first_watch = adapter.ops.index("ensure_line_watch")
+        assert "ensure_wan_egress" in adapter.ops[:first_watch]
+
+    async def test_a_single_link_router_gets_no_watch(self) -> None:
+        repository, lookup, _router, _primary, backup = _two_wan_setup()
+        backup.is_enabled = False
+        adapter = FakeIspHealthAdapter(dynamic_gateway="192.168.1.1")
+        await self._sweep(repository, lookup, adapter)
+        assert adapter.line_watch_calls == []
+        assert adapter.egress_calls == []
+
+    async def test_the_allowlist_leaves_other_routers_untouched(self) -> None:
+        repository, lookup, _router, _primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        await self._sweep(
+            repository,
+            lookup,
+            adapter,
+            upstream_probe_router_ids=frozenset({str(uuid.uuid4())}),
+        )
+        assert adapter.line_watch_calls == []
+        assert adapter.host_route_calls == []
+        assert adapter.egress_calls == []
+
+    async def test_the_allowlist_includes_the_named_router(self) -> None:
+        repository, lookup, router, _primary, _backup = _two_wan_setup()
+        adapter = FakeIspHealthAdapter()
+        await self._sweep(
+            repository,
+            lookup,
+            adapter,
+            upstream_probe_router_ids=frozenset({str(router.id)}),
+        )
+        assert len(adapter.line_watch_calls) == 2

@@ -447,10 +447,18 @@ class Settings(BaseSettings):
         description=(
             "ISP health: also ping public addresses beyond each line's first "
             "hop, so an ISP outage behind a live modem reads as down. True "
-            "WRITES to MikroTik routers: the health sweep adds comment-tagged "
-            "/32 routes (cloudguest-isp-probe-*) on every router with two or "
-            "more enabled ISP links. False (the default) sends no probe and "
-            "writes nothing."
+            "WRITES to MikroTik routers with two or more enabled ISP links: the "
+            "health sweep adds /32 routes (cloudguest-isp-probe-*), masquerade "
+            "for each line, and a netwatch (cloudguest-line-watch-*) that "
+            "disables a dead line's default routes on the router. False (the "
+            "default) sends no probe and writes nothing."
+        ),
+    )
+    isp_upstream_probe_router_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated router ids isp_upstream_probe_enabled applies to, "
+            "for rolling it out one site at a time. Empty means every router."
         ),
     )
     aruba_hybrid_speed_gateway_enabled: bool = Field(
@@ -1898,6 +1906,14 @@ class Settings(BaseSettings):
             if normalized not in addresses:
                 addresses.append(normalized)
         return ",".join(addresses)
+
+    @property
+    def isp_upstream_probe_router_id_set(self) -> frozenset[str]:
+        return frozenset(
+            part.strip()
+            for part in self.isp_upstream_probe_router_ids.split(",")
+            if part.strip()
+        )
 
     @property
     def platform_alert_email_list(self) -> tuple[str, ...]:

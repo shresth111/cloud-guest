@@ -75,6 +75,7 @@ from .constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
     ISP_PING_COUNT,
     ISP_PING_TIMEOUT_SECONDS,
+    LINE_WATCH_COMMENT_PREFIX,
     MAX_RATE_INTERVAL_SECONDS,
     SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE,
     SPEED_TEST_ACTIVE_REDIS_TTL_SECONDS,
@@ -335,10 +336,13 @@ class IspService:
         redis: _RedisProtocol | None = None,
         caller_location_scope: LocationScope = None,
         upstream_probe_enabled: bool = False,
+        upstream_probe_router_ids: frozenset[str] = frozenset(),
     ) -> None:
         self.repository = repository
-        # Settings.isp_upstream_probe_enabled. See _measure_beyond_first_hop.
+        # Settings.isp_upstream_probe_enabled and its router allowlist. See
+        # _measure_beyond_first_hop.
         self.upstream_probe_enabled = upstream_probe_enabled
+        self.upstream_probe_router_ids = upstream_probe_router_ids
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
@@ -1063,6 +1067,9 @@ class IspService:
         result = await self._ping_first_hop(link)
         if not self.upstream_probe_enabled or result.received <= 0:
             return result
+        allowlist = self.upstream_probe_router_ids
+        if allowlist and str(link.router_id) not in allowlist:
+            return result
         return await self._measure_beyond_first_hop(link, result)
 
     async def _measure_beyond_first_hop(
@@ -1075,6 +1082,12 @@ class IspService:
         On a multi-WAN router each probe address needs a /32 route, or the ping
         would leave by whichever line is preferred and measure that one. One
         enabled link has nowhere else to go and needs no write.
+
+        A multi-WAN router also gets a line watch, which moves traffic off a
+        dead ISP on the router itself. This reading cannot do that: when the
+        dead line carries the management tunnel, this code cannot reach the
+        router until the watch has moved it. NAT for the line is ensured first,
+        because the watch can put guests on it with nobody watching.
 
         Any failure of the probe itself keeps the first-hop reading: not being
         able to run this check is no evidence against the line.
@@ -1113,6 +1126,14 @@ class IspService:
                         gateway=gateway,
                         comment=f"{UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX}{target}",
                     )
+                await adapter.ensure_wan_egress(credentials, interface=interface)
+                await adapter.ensure_line_watch(
+                    credentials,
+                    host=targets[0],
+                    fallback_host=targets[1],
+                    gateway=gateway,
+                    comment=f"{LINE_WATCH_COMMENT_PREFIX}{targets[0]}",
+                )
             for target in targets:
                 probe = await adapter.ping(
                     credentials,
@@ -1122,7 +1143,7 @@ class IspService:
                 )
                 if probe.received > 0:
                     return first_hop
-        except (IspDeviceConnectionError, IspDeviceOperationError) as exc:
+        except IspError as exc:
             logger.warning(
                 "isp_upstream_probe_unavailable",
                 extra={"isp_link_id": str(link.id), "error": str(exc)},
@@ -2253,6 +2274,7 @@ async def run_health_check_sweep(
     device_adapter_resolver=get_isp_health_adapter,
     redis: _RedisProtocol | None = None,
     upstream_probe_enabled: bool = False,
+    upstream_probe_router_ids: frozenset[str] = frozenset(),
 ) -> HealthCheckSweepSummary:
     """The platform-wide health-check sweep ``tasks.run_isp_health_check_sweep``
     (Celery Beat) drives -- pulled out to module scope for the identical
@@ -2273,6 +2295,7 @@ async def run_health_check_sweep(
         device_adapter_resolver=device_adapter_resolver,
         redis=redis,
         upstream_probe_enabled=upstream_probe_enabled,
+        upstream_probe_router_ids=upstream_probe_router_ids,
     )
     links = await repository.list_enabled_links_for_sweep()
     checked = 0

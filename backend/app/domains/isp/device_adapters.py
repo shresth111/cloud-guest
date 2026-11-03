@@ -366,6 +366,19 @@ class BaseIspHealthAdapter(Protocol):
         issues no write at all."""
         ...
 
+    async def ensure_line_watch(
+        self,
+        credentials: IspCredentials,
+        *,
+        host: str,
+        fallback_host: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        """Have the router itself take this line's routes out of service while
+        its ISP passes nothing, and restore them when it returns."""
+        ...
+
     async def ensure_host_route(
         self,
         credentials: IspCredentials,
@@ -551,6 +564,29 @@ class MikroTikIspHealthAdapter:
             raise IspDeviceOperationError(
                 "set_default_route_distances", exc.detail
             ) from exc
+
+    async def ensure_line_watch(
+        self,
+        credentials: IspCredentials,
+        *,
+        host: str,
+        fallback_host: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).ensure_line_watch(
+                creds,
+                host=host,
+                fallback_host=fallback_host,
+                gateway=gateway,
+                comment=comment,
+            )
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise IspDeviceOperationError("ensure_line_watch", exc.detail) from exc
 
     async def ensure_host_route(
         self,
