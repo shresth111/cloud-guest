@@ -145,7 +145,9 @@ class TestVenueGuestSpeedWrite:
                 upload_mbps=None,
                 settings=_settings(),
             )
-        assert site.requests == []
+        # An in-range value may read the network first, to see whether it's the
+        # cap already held. Nothing may be written.
+        assert {r.method for r in site.requests} <= {"GET"}
 
     async def test_a_network_not_on_the_site_or_not_guest_is_never_written(
         self,
