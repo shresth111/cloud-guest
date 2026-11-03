@@ -92,7 +92,10 @@ EVENTS = {
             "source": "client",
             "type": "site",
             "account": None,
-            "attributes": {"network": "Guest WiFi", "device": "AP21"},
+            "attributes": {
+                "network": "Guest WiFi",
+                "device": "Phone 12:34:56:78:9a:bc",
+            },
         }
     ]
 }

@@ -856,7 +856,7 @@ class TestMapping:
         )
         assert (event.event, event.device_name, event.network_name) == (
             "clientConnected",
-            "AP21",
+            None,
             "WYFY_ARUBA",
         )
         assert event.occurred_at == "2026-11-02T01:30:00+00:00"
@@ -957,3 +957,22 @@ class TestRedisRefreshLock:
             owner = redis.values["k"]
         assert "k" not in redis.values
         assert redis.evals == [("k", owner)]
+
+
+def test_an_events_device_attribute_never_leaves_the_mapper() -> None:
+    """The measured feed puts a guest's phone name and MAC here. Not sent to
+    customers until a raw row shows what this attribute really holds."""
+    event = map_event(
+        {
+            "id": "e1",
+            "event": "clientConnected",
+            "attributes": {
+                "network": "Guest",
+                "device": "Asha 12:34:56:78:9a:bc",
+            },
+        }
+    )
+    assert event.device_name is None
+    assert event.network_name == "Guest"
+    assert "Asha" not in repr(event)
+    assert "12:34" not in repr(event)

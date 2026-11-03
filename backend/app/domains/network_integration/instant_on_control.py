@@ -726,6 +726,19 @@ async def set_venue_network_total(
                 ),
                 networks=networks,
             )
+        # Empty only means something when a total is there to remove. Otherwise
+        # it would clear a per-device cap and leave every guest uncapped.
+        if (
+            download_mbps is None
+            and upload_mbps is None
+            and not guest[network_id].other_mode_limit
+        ):
+            return VenueGuestSpeed(
+                status="failed",
+                reason="network_total_empty",
+                message="Enter a total for download, upload or both.",
+                networks=networks,
+            )
         if dry_run:
             return VenueGuestSpeed(
                 status="preview",
@@ -757,7 +770,14 @@ async def set_venue_network_total(
             "instant_on_network_total_failed",
             extra={"router_id": str(target.router_id), "error_code": error.code},
         )
-        return VenueGuestSpeed(status="failed", reason=error.code, message=str(error))
+        # The two rollback outcomes say what is now in place; keep them apart.
+        reason = (
+            error.reason
+            if error.reason
+            in ("network_total_not_kept_restored", "network_total_state_unknown")
+            else error.code
+        )
+        return VenueGuestSpeed(status="failed", reason=reason, message=str(error))
     if result.status == "applied":
         logger.info(
             "instant_on_network_total_applied",

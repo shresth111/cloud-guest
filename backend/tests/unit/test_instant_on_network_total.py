@@ -122,7 +122,53 @@ async def test_a_write_instant_on_did_not_keep_is_failed(wired) -> None:  # noqa
     site.ignore_writes = True
     result = await _total(target)
     assert result.status == "failed"
-    assert result.reason == "write_not_confirmed"
+    # Nothing landed, and the read-back after the restore shows the original.
+    assert result.reason == "network_total_not_kept_restored"
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_an_empty_total_is_refused_unless_a_total_is_set(wired, dry_run) -> None:  # noqa: ANN001, F811
+    """Empty boxes must not silently clear a per-device cap and uncap every guest."""
+    site, _, _, target = wired
+    site.network["qos"].update(
+        isBandwidthLimitEnabled=True,
+        isDownloadBandwidthLimitEnabled=True,
+        perClientDownloadBandwidthLimitInMbps=10,
+    )
+    before = json.dumps(site.network, sort_keys=True)
+    result = await _total(target, down=None, up=None, dry_run=dry_run)
+    assert result.status == "failed"
+    assert result.reason == "network_total_empty"
+    assert site.writes() == []
+    assert json.dumps(site.network, sort_keys=True) == before
+
+
+async def test_a_wrong_write_is_rolled_back_and_says_so(wired) -> None:  # noqa: ANN001, F811
+    site, _, _, target = wired
+    before = json.loads(json.dumps(site.network))
+    site.mangle_next_total = True
+    result = await _total(target)
+    assert result.status == "failed"
+    assert result.reason == "network_total_not_kept_restored"
+    assert len(site.writes()) == 2
+    assert site.network == before
+
+
+async def test_a_refused_rollback_says_the_state_is_unknown(wired) -> None:  # noqa: ANN001, F811
+    site, _, _, target = wired
+    site.mangle_next_total = True
+    site.refuse_second_write = True
+    result = await _total(target)
+    assert result.status == "failed"
+    assert result.reason == "network_total_state_unknown"
+
+
+async def test_a_failed_read_back_never_claims_nothing_changed(wired) -> None:  # noqa: ANN001, F811
+    site, _, _, target = wired
+    site.fail_reads_after_write = True
+    result = await _total(target)
+    assert result.status == "failed"
+    assert result.reason == "network_total_state_unknown"
 
 
 async def test_clearing_lets_a_per_device_cap_be_set_again(wired) -> None:  # noqa: ANN001, F811

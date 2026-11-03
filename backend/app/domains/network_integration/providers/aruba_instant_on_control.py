@@ -505,16 +505,17 @@ class InstantOnControlClient:
         await self._write(
             "PUT", site_id, f"networksSummary/{quote(network_id, safe='')}", body=body
         )
-        after = await self.get_guest_network_rate_limit(site_id, network_id)
-        if (
-            after.other_mode_limit != enabled
-            or after.network_download_mbps != down
-            or after.network_upload_mbps != up
-        ):
-            raise InstantOnWriteNotConfirmedError(
-                "Instant On did not keep the requested network total",
-                reason="network_total_not_kept",
+        try:
+            after = await self.get_guest_network_rate_limit(site_id, network_id)
+            kept = (
+                after.other_mode_limit == enabled
+                and after.network_download_mbps == down
+                and after.network_upload_mbps == up
             )
+        except InstantOnError:
+            kept = False
+        if not kept:
+            raise await self._restore_after_network_total(site_id, network_id, network)
         logger.info(
             "instant_on_network_total_set",
             extra={
@@ -525,6 +526,40 @@ class InstantOnControlClient:
             },
         )
         return after
+
+    async def _restore_after_network_total(
+        self, site_id: str, network_id: str, original: dict[str, Any]
+    ) -> InstantOnWriteNotConfirmedError:
+        """A network total that wasn't kept can leave the network half-changed, so
+        put the network back as it was read, and say which state it ended in."""
+        wanted = GuestNetworkRateLimit.from_network(original)
+        try:
+            await self._write(
+                "PUT",
+                site_id,
+                f"networksSummary/{quote(network_id, safe='')}",
+                body=original,
+            )
+            restored = (
+                await self.get_guest_network_rate_limit(site_id, network_id) == wanted
+            )
+        except InstantOnError:
+            restored = False
+        if restored:
+            return InstantOnWriteNotConfirmedError(
+                "Instant On did not keep the network total. The previous setting "
+                "was put back.",
+                reason="network_total_not_kept_restored",
+            )
+        logger.warning(
+            "instant_on_network_total_state_unknown",
+            extra={"site_id": site_id, "network_id": network_id},
+        )
+        return InstantOnWriteNotConfirmedError(
+            "Instant On did not confirm the network total, and what is set now is "
+            "unknown. Check this network in the Instant On app.",
+            reason="network_total_state_unknown",
+        )
 
     # -- transport -------------------------------------------------------------
 

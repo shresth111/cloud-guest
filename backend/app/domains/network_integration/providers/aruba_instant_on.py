@@ -379,7 +379,9 @@ def map_event(element: dict[str, Any]) -> InstantOnEvent:
         state=_str(element.get("state")),
         category=_str(element.get("category")),
         occurred_at=_timestamp(element.get("occurrenceTime")),
-        device_name=_str(attributes.get("device")),
+        # Not attributes["device"]: the measured feed shows a guest's phone name
+        # with its MAC there. Stays out until a raw row proves otherwise.
+        device_name=None,
         network_name=_str(attributes.get("network")),
     )
 
