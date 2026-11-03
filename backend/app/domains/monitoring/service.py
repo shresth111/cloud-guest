@@ -1446,12 +1446,18 @@ class AlertService:
         severity: str,
         is_active: bool = True,
         notification_channel_ids: list[uuid.UUID] | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> AlertRule:
         validate_alert_rule_condition_config(
             trigger_type, target_component, condition_config
         )
         await self._require_access_point_silent_scope(
             target_component, organization_id
+        )
+        await self._require_rule_channels_allowed(
+            notification_channel_ids,
+            rule_organization_id=organization_id,
+            requesting_organization_id=requesting_organization_id,
         )
         rule = await self.repository.create_alert_rule(
             name=name,
@@ -1468,6 +1474,35 @@ class AlertService:
                 rule.id, notification_channel_ids
             )
         return rule
+
+    async def _require_rule_channels_allowed(
+        self,
+        channel_ids: list[uuid.UUID] | None,
+        *,
+        rule_organization_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> None:
+        """A rule's alerts go to its channels, so linking one is a tenant
+        boundary. An org caller may link only their own channels, and an org's
+        rule never notifies another org's channel, whoever is asking. A
+        platform-wide channel stays linkable by a platform caller."""
+        if not channel_ids:
+            return
+        channels = await self.repository.get_notification_channels_by_ids(
+            list(channel_ids)
+        )
+        found = {channel.id for channel in channels}
+        for channel_id in channel_ids:
+            if channel_id not in found:
+                raise NotificationChannelNotFoundError(channel_id)
+        for channel in channels:
+            _assert_owned_by(channel, requesting_organization_id)
+            if (
+                rule_organization_id is not None
+                and channel.organization_id is not None
+                and channel.organization_id != rule_organization_id
+            ):
+                raise CrossOrganizationAccessError()
 
     async def _require_access_point_silent_scope(
         self, target_component: object, organization_id: uuid.UUID | None
@@ -1530,6 +1565,11 @@ class AlertService:
                 prospective_target_component,
                 data.get("organization_id", rule.organization_id),
             )
+        await self._require_rule_channels_allowed(
+            notification_channel_ids,
+            rule_organization_id=data.get("organization_id", rule.organization_id),
+            requesting_organization_id=requesting_organization_id,
+        )
         if "trigger_type" in data:
             data["trigger_type"] = prospective_trigger_type.value
         updated = await self.repository.update_alert_rule(rule, data)
