@@ -1346,14 +1346,15 @@ class AlertService:
     is always part of the key too). See
     ``repository.MonitoringRepository.find_active_alert``.
 
-    ``subject_id`` is the fifth dimension, and only one branch passes it:
-    ``ALERT_TARGET_MONITORED_HARDWARE`` sets it to the device's own id.
+    ``subject_id`` is the fifth dimension. ``ALERT_TARGET_ISP_LINK`` sets it
+    to the link's own id, and ``ALERT_TARGET_MONITORED_HARDWARE`` to the
+    device's own id.
     Without it, that branch's key was ``(rule, organization, location,
     NULL)`` for **every** access point at a venue -- a monitored device is
     not a router -- so the second AP to go down produced no alert at all,
     and an open alert for a device that was still down blocked every other
-    device at that location. Every other branch passes ``None`` and
-    de-duplicates on exactly the key it always used.
+    device at that location. The other branches pass ``None`` and
+    de-duplicate on exactly the key it always used.
 
     Note what the key does **not** contain elsewhere: anything below a
     router. An ``ALERT_TARGET_ROGUE_DHCP_GUARD`` rule watches state the
@@ -1935,13 +1936,36 @@ class AlertService:
             links = await self.repository.list_isp_links(
                 organization_id=rule.organization_id
             )
+            # Keyed per line. On the router alone, one line down and another
+            # up shared one key, so the healthy line closed the alert the
+            # down line had just opened, on every pass, and a second dead
+            # line never alerted at all.
+            link_ids = {link.id for link in links}
+            for alert in await self.repository.list_open_alerts_for_rule(
+                rule_id=rule.id
+            ):
+                # Its line was deleted, or it predates the per-line key. Open
+                # rows here would never close; a line still down reopens below.
+                if alert.subject_id not in link_ids:
+                    resolved.append(
+                        await self._auto_resolve(
+                            alert,
+                            resolved_message=(
+                                "This internet line alert was closed because "
+                                "its line was removed or its alert was replaced."
+                            ),
+                        )
+                    )
             for link in links:
-                condition_met = link.health_status == expected_status
+                condition_met = (
+                    link.is_enabled and link.health_status == expected_status
+                )
                 existing = await self.repository.find_active_alert(
                     rule_id=rule.id,
                     organization_id=link.organization_id,
                     location_id=link.location_id,
                     router_id=link.router_id,
+                    subject_id=link.id,
                 )
                 if condition_met and existing is None:
                     alert = await self._create_alert(
@@ -1949,12 +1973,20 @@ class AlertService:
                         organization_id=link.organization_id,
                         location_id=link.location_id,
                         router_id=link.router_id,
+                        subject_id=link.id,
                         message=_health_status_message(
                             link.provider_name, link.health_status
                         ),
                     )
                     triggered.append(alert)
-                elif not condition_met and existing is not None:
+                # "unknown" on an enabled line means nothing was measured, so
+                # it is no evidence the line came back. "Site offline" reports
+                # the router meanwhile.
+                elif (
+                    not condition_met
+                    and existing is not None
+                    and (not link.is_enabled or link.health_status != "unknown")
+                ):
                     resolved.append(
                         await self._auto_resolve(
                             existing,
