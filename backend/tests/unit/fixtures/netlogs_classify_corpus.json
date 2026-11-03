@@ -1,0 +1,310 @@
+[
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 dhcp,info defconf assigned 192.168.88.10 for 02:00:00:00:0A:01 host-10",
+  "message": "defconf assigned 192.168.88.10 for 02:00:00:00:0A:01 host-10",
+  "topics": "dhcp,info",
+  "before": {
+   "category": "dhcp",
+   "protocol": "DHCP",
+   "src_ip": null,
+   "dst_ip": "192.168.88.10",
+   "status": "success",
+   "device_mac": "02:00:00:00:0A:01"
+  },
+  "summary_before": "IP assigned"
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 dhcp,info hotspot-dhcp deassigned 10.5.50.12 for 02:00:00:00:0A:02",
+  "message": "hotspot-dhcp deassigned 10.5.50.12 for 02:00:00:00:0A:02",
+  "topics": "dhcp,info",
+  "before": {
+   "category": "dhcp",
+   "protocol": "DHCP",
+   "src_ip": null,
+   "dst_ip": "10.5.50.12",
+   "status": "released",
+   "device_mac": "02:00:00:00:0A:02"
+  },
+  "summary_before": "IP released"
+ },
+ {
+  "raw": "<132>Oct 24 03:54:16 Hall wyfy-8a199617 wireless,warning 02:00:00:00:0A:01@wlan1: disconnected, received deauth",
+  "message": "02:00:00:00:0A:01@wlan1: disconnected, received deauth",
+  "topics": "wireless,warning",
+  "before": {
+   "category": "wireless",
+   "protocol": "WLAN",
+   "src_ip": null,
+   "dst_ip": null,
+   "status": "disconnected",
+   "device_mac": "02:00:00:00:0A:01"
+  },
+  "summary_before": "Device disconnected from WiFi"
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 wireless,info 02:00:00:00:0A:01@wlan1: connected, signal strength -55",
+  "message": "02:00:00:00:0A:01@wlan1: connected, signal strength -55",
+  "topics": "wireless,info",
+  "before": {
+   "category": "wireless",
+   "protocol": "WLAN",
+   "src_ip": null,
+   "dst_ip": null,
+   "status": "connected",
+   "device_mac": "02:00:00:00:0A:01"
+  },
+  "summary_before": "Device connected to WiFi"
+ },
+ {
+  "raw": "<130>Oct 24 03:54:16 Hall wyfy-8a199617 system,error,critical login failure for user admin from 10.66.0.1 via ssh",
+  "message": "login failure for user admin from 10.66.0.1 via ssh",
+  "topics": "system,error,critical",
+  "before": {
+   "category": "system",
+   "protocol": "SSH",
+   "src_ip": "10.66.0.1",
+   "dst_ip": null,
+   "status": "failure",
+   "device_mac": null
+  },
+  "summary_before": "Admin login failed"
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 system,info,account user admin logged in from 10.66.0.1 via winbox",
+  "message": "user admin logged in from 10.66.0.1 via winbox",
+  "topics": "system,info,account",
+  "before": {
+   "category": "system",
+   "protocol": "WINBOX",
+   "src_ip": "10.66.0.1",
+   "dst_ip": null,
+   "status": "success",
+   "device_mac": null
+  },
+  "summary_before": "Admin logged in"
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 firewall,info input: in:ether1 out:(unknown 0), proto TCP (SYN), 10.5.50.10:40000->1.1.1.1:443, len 60",
+  "message": "input: in:ether1 out:(unknown 0), proto TCP (SYN), 10.5.50.10:40000->1.1.1.1:443, len 60",
+  "topics": "firewall,info",
+  "before": {
+   "category": "firewall",
+   "protocol": "TCP",
+   "src_ip": "10.5.50.10",
+   "dst_ip": "1.1.1.1",
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": "Firewall match"
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 hotspot,account,info 9876598647 (10.5.50.12): logged in",
+  "message": "XXXXX98647 (10.5.50.12): logged in",
+  "topics": "hotspot,account,info",
+  "before": {
+   "category": "hotspot_auth",
+   "protocol": "HOTSPOT",
+   "src_ip": "10.5.50.12",
+   "dst_ip": null,
+   "status": "success",
+   "device_mac": null
+  },
+  "summary_before": "Guest signed in"
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 hotspot,info,debug 9876598647 (10.5.50.12): login failed: invalid username or password",
+  "message": "XXXXX98647 (10.5.50.12): login failed: invalid username or password",
+  "topics": "hotspot,info,debug",
+  "before": {
+   "category": "hotspot_auth",
+   "protocol": "HOTSPOT",
+   "src_ip": "10.5.50.12",
+   "dst_ip": null,
+   "status": "failure",
+   "device_mac": null
+  },
+  "summary_before": "Guest sign-in failed"
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 system,info fetch: file \"x\" downloaded",
+  "message": "fetch: file \"x\" downloaded",
+  "topics": "system,info",
+  "before": {
+   "category": "system",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 script,info hello from a script",
+  "message": "hello from a script",
+  "topics": "script,info",
+  "before": {
+   "category": "system",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall wyfy-8a199617 interface,info ether2 link up (speed 1G, full duplex)",
+  "message": "ether2 link up (speed 1G, full duplex)",
+  "topics": "interface,info",
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<134>Oct 24  3:54:11 QA-sim dhcp,info defconf assigned 192.168.88.6 for 02:00:00:00:06:01 qa-host-6",
+  "message": "Oct 24  3:54:11 QA-sim dhcp,info defconf assigned 192.168.88.6 for 02:00:00:00:06:01 qa-host-6",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<132>Oct 24  3:54:11 QA-sim wireless,warning 02:00:00:00:00:05@wlan1: disconnected, extensive data loss",
+  "message": "Oct 24  3:54:11 QA-sim wireless,warning 02:00:00:00:00:05@wlan1: disconnected, extensive data loss",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<130>Oct 24  3:54:11 QA-sim system,error,critical login failure for user admin from 203.0.113.5 via ssh",
+  "message": "Oct 24  3:54:11 QA-sim system,error,critical login failure for user admin from 203.0.113.5 via ssh",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<134>Oct 24  3:54:11 QA-sim firewall,info qa-fw input: in:ether1 out:(unknown 0), proto TCP (SYN), 10.5.50.10:40000->1.1.1.1:443, len 60",
+  "message": "Oct 24  3:54:11 QA-sim firewall,info qa-fw input: in:ether1 out:(unknown 0), proto TCP (SYN), 10.5.50.10:40000->1.1.1.1:443, len 60",
+  "topics": null,
+  "before": {
+   "category": "firewall",
+   "protocol": "TCP",
+   "src_ip": "10.5.50.10",
+   "dst_ip": "1.1.1.1",
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": "Firewall match"
+ },
+ {
+  "raw": "<134>Oct 24  3:54:11 QA-sim hotspot,account,info qa-guest-4 (192.168.88.4): logged in",
+  "message": "Oct 24  3:54:11 QA-sim hotspot,account,info qa-guest-4 (192.168.88.4): logged in",
+  "topics": null,
+  "before": {
+   "category": "hotspot_auth",
+   "protocol": "HOTSPOT",
+   "src_ip": "192.168.88.4",
+   "dst_ip": null,
+   "status": "success",
+   "device_mac": null
+  },
+  "summary_before": "Guest signed in"
+ },
+ {
+  "raw": "<134>Oct 24  3:54:11 QA-sim script,info hello",
+  "message": "Oct 24  3:54:11 QA-sim script,info hello",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "hello world",
+  "message": "hello world",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<134>not a syslog line at all",
+  "message": "not a syslog line at all",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<134>Oct 24 03:54:16 Hall plain text with no topics",
+  "message": "plain text with no topics",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ },
+ {
+  "raw": "<134>Oct 24  3:54:11 QA-sim 192.168.1.1,10.0.0.1 something",
+  "message": "Oct 24  3:54:11 QA-sim 192.168.1.1,10.0.0.1 something",
+  "topics": null,
+  "before": {
+   "category": "other",
+   "protocol": null,
+   "src_ip": null,
+   "dst_ip": null,
+   "status": null,
+   "device_mac": null
+  },
+  "summary_before": null
+ }
+]
