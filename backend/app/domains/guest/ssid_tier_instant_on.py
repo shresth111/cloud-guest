@@ -176,6 +176,15 @@ async def sync_ssid_tiers_to_instant_on(
                     )
                     item.before_download_mbps = before.download_mbps
                     item.before_upload_mbps = before.upload_mbps
+                    # Before "unchanged" and "preview": a sync forces per-client
+                    # mode, and equal-looking numbers are not the same limit.
+                    if before.other_mode_limit:
+                        item.status = "failed"
+                        item.message = (
+                            "This network has a network-wide limit set in the "
+                            "Instant On app. Change it there, then sync again."
+                        )
+                        continue
                     if (
                         before.download_mbps == item.download_mbps
                         and before.upload_mbps == item.upload_mbps

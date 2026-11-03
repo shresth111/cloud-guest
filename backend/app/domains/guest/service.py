@@ -242,7 +242,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from redis.asyncio import Redis
 
@@ -1884,6 +1884,15 @@ class QueueAssignmentProtocol(Protocol):
     ) -> object: ...
 
 
+class NasOnlyUsageCutDispatcherProtocol(Protocol):
+    """Publishes the cloud cut of a NAS-only session over its data cap, off the
+    accounting request. Must return quickly and never raise."""
+
+    async def __call__(
+        self, *, router_id: uuid.UUID | None, session_id: uuid.UUID, reason: str
+    ) -> None: ...
+
+
 class HotspotGateDispatcherProtocol(Protocol):
     """Publishes "open this session's hotspot gate on its router" to the
     background worker. Satisfied by ``tasks.enqueue_hotspot_gate_open``,
@@ -1958,6 +1967,77 @@ AccessTierForGuestLookup = Callable[
 ]
 
 
+#: A guest known to be NAS-only whose connected time can't be read right now:
+#: charge nothing this tick. Falling back to midnight would use up their day.
+SKIP_TIME_ACCRUAL: Final = "skip_time_accrual"
+
+#: ``guest_id -> started_at | SKIP_TIME_ACCRUAL | None``. ``None`` means this
+#: guest accrues as before. Built by ``nas_only_connected_since_lookup``;
+#: injected into the FUP time-accrual sweep.
+ConnectedSinceLookup = Callable[[uuid.UUID], Awaitable[datetime | str | None]]
+
+
+def nas_only_connected_since_lookup(
+    repository: GuestRepositoryProtocol,
+    router_lookup: RouterLookupProtocol,
+) -> ConnectedSinceLookup:
+    """The earliest ``started_at`` of a guest's ACTIVE sessions when all of them
+    run on NAS-only (Aruba Instant On) routers. Build one per sweep.
+
+    ``SKIP_TIME_ACCRUAL`` only with positive evidence of NAS-only: an
+    Accounting-Stop landed after the sweep listed a guest whose latest session
+    is NAS-only, or a NAS-only guest has another session whose vendor can't be
+    read. Every other case is ``None``, the old behaviour, so another vendor can
+    never be skipped.
+
+    A router read earlier in this sweep is remembered. A failed read of a router
+    not yet seen leaves the vendor unknown, and the answer is ``None``, including
+    for a NAS-only guest: nothing else says which vendor it is, and skipping
+    would change other vendors. Never raises."""
+    vendor_is_nas_only: dict[uuid.UUID, bool] = {}
+
+    async def is_on_nas_only_router(session: GuestSession) -> bool | None:
+        router_id = session.router_id
+        if router_id is None:
+            return False
+        if router_id not in vendor_is_nas_only:
+            try:
+                router = await router_lookup.get_router(
+                    router_id, include_deleted=True
+                )
+            except Exception as exc:  # noqa: BLE001 -- see docstring
+                logger.warning(
+                    "connected_since_vendor_unknown",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                return None
+            vendor_is_nas_only[router_id] = is_nas_only(router)
+        return vendor_is_nas_only[router_id]
+
+    async def lookup(guest_id: uuid.UUID) -> datetime | str | None:
+        try:
+            sessions = await repository.list_active_sessions_for_guest(guest_id)
+            if not sessions:
+                latest = await repository.get_latest_session_for_guest(guest_id)
+                if latest is not None and await is_on_nas_only_router(latest):
+                    return SKIP_TIME_ACCRUAL
+                return None
+        except Exception as exc:  # noqa: BLE001 -- see docstring
+            logger.warning(
+                "connected_since_sweep_lookup_failed",
+                extra={"guest_id": str(guest_id), "error": str(exc)},
+            )
+            return None
+        answers = [await is_on_nas_only_router(session) for session in sessions]
+        if False in answers or True not in answers:
+            return None
+        if None in answers:
+            return SKIP_TIME_ACCRUAL
+        return min(session.started_at for session in sessions)
+
+    return lookup
+
+
 def aruba_access_tier_lookup(
     repository: GuestRepositoryProtocol,
     router_lookup: RouterLookupProtocol,
@@ -2009,6 +2089,7 @@ async def run_fup_time_accrual(
     now: datetime,
     terminator: LiveSessionTerminatorProtocol | None = None,
     access_tier_lookup: AccessTierForGuestLookup | None = None,
+    connected_since_lookup: ConnectedSinceLookup | None = None,
 ) -> dict[str, int]:
     """Guest-level FUP time-quota accrual + enforcement, pulled out to
     module scope for the exact same reason ``enforce_session_timeouts``
@@ -2109,6 +2190,13 @@ async def run_fup_time_accrual(
                 )
         if not any(time_limits.values()):
             continue
+        connected_since = (
+            await connected_since_lookup(guest_id)
+            if connected_since_lookup is not None
+            else None
+        )
+        if connected_since == SKIP_TIME_ACCRUAL:
+            continue
         violated_period: str | None = None
         for period_type, limit_minutes in time_limits.items():
             usage = await get_or_reset_quota_usage(
@@ -2120,6 +2208,11 @@ async def run_fup_time_accrual(
                 now=now,
             )
             accrue_from = usage.last_accrued_at or usage.period_start
+            # Aruba Instant On only (the lookup answers None elsewhere): count
+            # time connected, not time since midnight or since their last
+            # visit, either of which uses up the allowance at the first sweep.
+            if isinstance(connected_since, datetime):
+                accrue_from = max(accrue_from, connected_since)
             elapsed_minutes = max(0, int((now - accrue_from).total_seconds() // 60))
             if elapsed_minutes > 0:
                 usage = await repository.update_quota_usage(
@@ -2444,6 +2537,80 @@ async def issue_live_disconnect(
     )
     await _record(True)
     return True
+
+
+async def nas_only_session_over_data_cap(
+    repository: Any,
+    policy_lookup: Any,
+    session: GuestSession,
+    *,
+    access_tier: AccessTier | None,
+    now: datetime,
+) -> bool:
+    """Is ``session`` still over a data cap right now? For the worker's cloud cut,
+    which can run well after the accounting packet that asked for it. The session's
+    own limit, then the guest's FUP data limits, as ``_enforce_fup_quota`` reads
+    them. Time quotas are not this cut's business. An unreadable policy answers
+    ``False``: the next interim still over the cap asks again."""
+    if is_quota_exceeded(session):
+        return True
+    try:
+        resolved = await policy_lookup.resolve_effective_policy(
+            policy_type=PolicyType.FUP,
+            organization_id=session.organization_id,
+            location_id=session.location_id,
+            guest_id=session.guest_id,
+        )
+        rules = _with_access_tier(PolicyType.FUP, resolved.rules, access_tier)
+        data_limits = {
+            QuotaPeriodType.DAILY: rules.get("daily_data_limit_mb"),
+            QuotaPeriodType.WEEKLY: rules.get("weekly_data_limit_mb"),
+            QuotaPeriodType.MONTHLY: rules.get("monthly_data_limit_mb"),
+        }
+        capped = [period for period, limit in data_limits.items() if limit is not None]
+        if not capped:
+            return False
+        usages = await get_or_reset_quota_usages(
+            repository,
+            guest_id=session.guest_id,
+            organization_id=session.organization_id,
+            period_types=capped,
+            tz_name=await repository.get_organization_timezone(session.organization_id),
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "guest_nas_only_usage_cut_cap_unreadable",
+            extra={"session_id": str(session.id), "error": str(exc)},
+        )
+        return False
+    return any(
+        is_fup_usage_exceeded(
+            used=usages[period].bytes_used, limit=data_limits[period] * BYTES_PER_MB
+        )
+        for period in capped
+    )
+
+
+async def expire_nas_only_session_over_cap(
+    repository: Any, session: GuestSession, *, reason: str, now: datetime
+) -> GuestSession:
+    """Close a NAS-only session whose device Instant On has confirmed removing.
+    Only ever called after that confirmation: see ``record_usage``."""
+    updated = await repository.update_session(
+        session,
+        {
+            "status": GuestSessionStatus.EXPIRED.value,
+            "ended_at": now,
+            "disconnect_reason": reason,
+            "disconnect_enforced": True,
+        },
+    )
+    logger.info(
+        "guest_usage_cap_reached_nas_only_session_ended_via_cloud",
+        extra={"session_id": str(updated.id), "reason": reason},
+    )
+    return updated
 
 
 def _removals_reported(outcome: object) -> int | None:
@@ -3046,6 +3213,7 @@ class GuestService:
         queue_assignment_hook: QueueAssignmentProtocol | None = None,
         queue_assignment_dispatcher: QueueAssignmentDispatcherProtocol | None = None,
         hotspot_gate_dispatcher: HotspotGateDispatcherProtocol | None = None,
+        nas_only_usage_cut_dispatcher: NasOnlyUsageCutDispatcherProtocol | None = None,
         session_end_hook: LiveSessionTerminatorProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
@@ -3068,6 +3236,7 @@ class GuestService:
         self.queue_assignment_hook = queue_assignment_hook
         self.queue_assignment_dispatcher = queue_assignment_dispatcher
         self.hotspot_gate_dispatcher = hotspot_gate_dispatcher
+        self.nas_only_usage_cut_dispatcher = nas_only_usage_cut_dispatcher
         self.session_end_hook = session_end_hook
         self.policy_lookup = policy_lookup
         # Request-scoped memo for _resolve_session_policy_rules -- see its
@@ -6041,6 +6210,25 @@ class GuestService:
         )
         if guest is not None and guest.is_blocked:
             return None
+        # Everything else ``login_via_mac_whitelist`` would refuse on. A hint
+        # for a device RADIUS is about to reject sends the portal straight to
+        # the AP login, and the guest gets the AP's generic error with no
+        # sign-in form and no explanation.
+        resolved = await self.captive_portal_service.resolve_portal_config(
+            organization_id=router.organization_id, location_id=router.location_id
+        )
+        try:
+            self._require_venue_open(resolved.config)
+        except VenueClosedError:
+            return None
+        if self.access_control_hook is not None and await is_blocklisted(
+            self.access_control_hook,
+            organization_id=router.organization_id,
+            location_id=router.location_id,
+            identifier=None,
+            mac_address=normalized,
+        ):
+            return None
         return identifier
 
     # ========================================================================
@@ -6696,19 +6884,23 @@ class GuestService:
                 if session_cap_reached
                 else f"fup_data_quota_exceeded_{violated_fup_period}"
             )
-            if await self._end_nas_only_session_via_cloud(updated):
-                updated = await self.repository.update_session(
-                    updated,
-                    {
-                        "status": GuestSessionStatus.EXPIRED.value,
-                        "ended_at": now,
-                        "disconnect_reason": reason,
-                        "disconnect_enforced": True,
-                    },
+            #
+            # On the accounting request this is published to the worker
+            # instead of called: rlm_rest waits seconds, an Instant On call can
+            # take 15, and a request that overruns gets no Accounting-Response
+            # (the AP retransmits) while holding a FreeRADIUS worker thread
+            # that MikroTik venues' packets also need. The row stays ACTIVE
+            # until the worker has Instant On's confirmation, and a failed cut
+            # is tried again at the next interim that is still over the cap.
+            if self.nas_only_usage_cut_dispatcher is not None:
+                await self.nas_only_usage_cut_dispatcher(
+                    router_id=updated.router_id,
+                    session_id=updated.id,
+                    reason=reason,
                 )
-                logger.info(
-                    "guest_usage_cap_reached_nas_only_session_ended_via_cloud",
-                    extra={"session_id": str(updated.id), "reason": reason},
+            elif await self._end_nas_only_session_via_cloud(updated):
+                updated = await expire_nas_only_session_over_cap(
+                    self.repository, updated, reason=reason, now=now
                 )
                 return updated
             logger.info(
@@ -10142,11 +10334,27 @@ class RadiusService:
         )
 
         if bytes_uploaded_total is not None or bytes_downloaded_total is not None:
+            # NAS-only: a Stop total is never below what is recorded. The AP's
+            # counters restart on a reconnect onto a reused session, and the
+            # shared listener sends 0 for a Stop without octets; either would
+            # erase the usage the logs already hold.
+            router = await self.router_lookup.get_router(
+                nas_client.router_id, include_deleted=True
+            )
+            keep_recorded = is_nas_only(router)
             update_data: dict[str, object] = {}
             if bytes_uploaded_total is not None:
-                update_data["bytes_uploaded"] = bytes_uploaded_total
+                update_data["bytes_uploaded"] = (
+                    max(bytes_uploaded_total, session.bytes_uploaded)
+                    if keep_recorded
+                    else bytes_uploaded_total
+                )
             if bytes_downloaded_total is not None:
-                update_data["bytes_downloaded"] = bytes_downloaded_total
+                update_data["bytes_downloaded"] = (
+                    max(bytes_downloaded_total, session.bytes_downloaded)
+                    if keep_recorded
+                    else bytes_downloaded_total
+                )
             session = await self.repository.update_session(session, update_data)
 
         if not session.is_active():
@@ -10247,7 +10455,10 @@ class RadiusService:
         guest = await self.repository.get_guest_by_identifier(
             router.organization_id, normalize_identifier(username)
         )
-        if guest is not None and not guest.is_blocked:
+        # A blocked guest at a NAS-only venue is still on the AP until the session
+        # ends: blocking only sets a flag, and authorize refuses them next time.
+        # Their usage and Stop are still facts about their session row.
+        if guest is not None and (not guest.is_blocked or is_nas_only(router)):
             candidate = await self.repository.get_latest_session_for_guest(guest.id)
             if candidate is not None and candidate.router_id == router.id:
                 by_device = await self._session_for_calling_station(
@@ -10505,6 +10716,7 @@ class GuestAnalyticsService:
 
 
 __all__ = [
+    "nas_only_connected_since_lookup",
     "GuestService",
     "RadiusService",
     "GuestAnalyticsService",

@@ -472,6 +472,7 @@ def _settings(**over: Any) -> SimpleNamespace:
 class _Limit:
     download_mbps: int | None
     upload_mbps: int | None
+    other_mode_limit: bool = False
 
 
 class FakeControlClient:
@@ -531,6 +532,27 @@ class TestInstantOnSync:
             settings=settings,
             client_factory=_factory(client) if client else None,
         )
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("limit", [_Limit(None, None, True), _Limit(10, 5, True)])
+    async def test_a_network_wide_limit_is_reported_never_replaced(
+        self, control_open, dry_run: bool, limit: _Limit
+    ) -> None:
+        """A sync forces per-client mode, so it must not touch a network whose
+        owner set a network-wide limit, not even when the numbers look equal."""
+        client = FakeControlClient(
+            [
+                {"id": "n1", "networkName": "WYFY_FREE"},
+                {"id": "n2", "networkName": "WYFY_PREMIUM"},
+            ],
+            {"n1": limit, "n2": limit},
+        )
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True), dry_run, client
+        )
+        assert client.writes == []
+        assert {i.status for i in result.items} == {"failed"}
+        assert all("network-wide" in i.message for i in result.items)
 
     async def test_flag_off_by_default_gives_manual_steps(self) -> None:
         result = await self._run(_settings())

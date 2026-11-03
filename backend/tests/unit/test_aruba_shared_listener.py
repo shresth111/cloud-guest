@@ -852,6 +852,70 @@ class TestMasterRoutes:
         )
         assert good.gaps == [] and good.available is True
 
+    async def _public_status(self, monkeypatch, nas, store_secret=SECRET):  # noqa: ANN001, ANN202
+        from app.domains.guest import router as guest_router
+
+        monkeypatch.setattr(
+            guest_router, "_aruba_shared_store", lambda s: _store_with(store_secret)
+        )
+        monkeypatch.setattr(
+            guest_router,
+            "get_settings",
+            lambda: SimpleNamespace(
+                hub_radius_aruba_shared_agent_url="http://agent/radius/shared-client",
+                hub_radius_public_address="13.207.123.212",
+                aruba_shared_radius_auth_port=1912,
+                aruba_shared_radius_acct_port=1913,
+                api_public_base_url="https://app.wyfyguest.com",
+            ),
+        )
+        router = _router()
+        router.location_id = uuid.uuid4()
+        router.organization_id = uuid.uuid4()
+        router.serial_number = "VNV5M1K1M6"
+
+        class Svc(FakeRadiusService):
+            async def list_nas_clients(self, **_: Any):  # noqa: ANN202
+                return [nas(router)], None
+
+            def shared_secret_fingerprint(self, _nas):  # noqa: ANN001, ANN202
+                return "abc", 32
+
+        response = await guest_router.get_public_radius_nas_status(
+            _http({}), router.id, service=Svc(router, None)
+        )
+        return response["data"]
+
+    async def test_a_shared_listener_venue_gets_its_portal_values(
+        self, monkeypatch
+    ) -> None:  # noqa: ANN001
+        """Live 2026-11-02: gaps=["hub_not_confirmed"] and portal_url null on a
+        working venue, because a row with no address has no stanza to confirm."""
+        data = await self._public_status(monkeypatch, _nas)
+        assert data["gaps"] == []
+        assert data["portal_url"] is not None
+        assert data["hub_confirmed"] is True
+        assert data["radius_server"]["auth_port"] == 1912
+        assert data["radius_server"]["accounting_port"] == 1913
+
+    async def test_a_row_with_an_address_still_needs_its_own_confirmation(
+        self, monkeypatch
+    ) -> None:  # noqa: ANN001
+        def with_address(router):  # noqa: ANN001, ANN202
+            row = _nas(router)
+            row.ip_address = "1.1.1.1"
+            return row
+
+        data = await self._public_status(monkeypatch, with_address)
+        assert data["gaps"] == ["hub_not_confirmed"]
+        assert data["portal_url"] is None
+        assert data["radius_server"]["auth_port"] == 1812
+
+    async def test_no_listener_secret_is_still_a_gap(self, monkeypatch) -> None:  # noqa: ANN001
+        data = await self._public_status(monkeypatch, _nas, store_secret=None)
+        assert data["gaps"] == ["hub_not_confirmed"]
+        assert data["portal_url"] is None
+
     async def test_register_shared_refuses_an_existing_unresolvable_identifier(
         self,
     ) -> None:

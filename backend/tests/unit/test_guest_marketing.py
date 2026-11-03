@@ -124,6 +124,19 @@ class FakeRepo:
     async def commit(self) -> None:
         self.commits += 1
 
+    async def rollback(self):
+        pass
+
+    async def due_campaign_ids(self, now):
+        return [
+            c.id
+            for c in self.campaigns.values()
+            if c.status == CampaignStatus.SCHEDULED.value and c.scheduled_at <= now
+        ]
+
+    async def sending_campaigns_without_progress(self, before):
+        return []
+
     async def refresh(self, instance: Any) -> None:
         return None
 
@@ -360,6 +373,7 @@ class FakeRepo:
             g
             for g in self.guests.values()
             if g.organization_id == criteria.organization_id
+            and (criteria.guest_ids is None or g.id in criteria.guest_ids)
             and (
                 criteria.location_ids is None
                 or any((g.id, loc) in self.visits for loc in criteria.location_ids)
@@ -1101,6 +1115,169 @@ class TestOrgWideCampaigns:
 # ============================================================================
 
 
+class TestManualSelection:
+    async def _send_to(self, world: World, service, guest_ids, scope=None) -> dict:
+        scope = scope or _scope(ORG_A)
+        created = await service.create_campaign(
+            scope,
+            CampaignCreate(
+                name="Picked",
+                channel=Channel.EMAIL,
+                template_id=world.template_a.id,
+                audience_filter=AudienceFilter(
+                    channel=Channel.EMAIL, guest_ids=guest_ids
+                ),
+            ),
+        )
+        return await service.schedule(
+            scope,
+            uuid.UUID(created["id"]),
+            scheduled_at=None,
+            idempotency_key="idem-" + uuid.uuid4().hex,
+        )
+
+    async def test_only_picked_guests_are_messaged(self) -> None:
+        world = _world()
+        service = world.service()
+        result = await self._send_to(world, service, [world.guest_ids["a1_in"]])
+        await service.send_batch(uuid.UUID(result["id"]))
+        assert world.email.sent == ["a1_in@guest.in"]
+
+    @pytest.mark.parametrize("guest", ["a2_none", "a1_out"])
+    async def test_picking_a_guest_without_consent_does_not_message_them(
+        self, guest: str
+    ) -> None:
+        world = _world()
+        service = world.service()
+        picked = [world.guest_ids[guest], world.guest_ids["a1_in"]]
+        result = await self._send_to(world, service, picked)
+        await service.send_batch(uuid.UUID(result["id"]))
+        assert world.email.sent == ["a1_in@guest.in"]
+
+    async def test_a_blocked_or_suppressed_pick_is_not_messaged(self) -> None:
+        world = _world()
+        world.repo.guests[world.guest_ids["a1_in"]].is_blocked = True
+        world.repo.suppressions.add((ORG_A, "email", "a2_in@guest.in"))
+        service = world.service()
+        preview = await service.audience_preview(
+            _scope(ORG_A),
+            AudienceFilter(
+                channel=Channel.EMAIL,
+                guest_ids=[world.guest_ids["a1_in"], world.guest_ids["a2_in"]],
+            ),
+        )
+        assert preview["reachable"] == 0
+        assert preview["excluded"]["blocked"] == 1
+        assert preview["excluded"]["suppressed"] == 1
+
+    async def test_consent_withdrawn_after_scheduling_still_wins(self) -> None:
+        world = _world()
+        service = world.service()
+        result = await self._send_to(world, service, [world.guest_ids["a1_in"]])
+        world.repo.consents[(world.guest_ids["a1_in"], "email")] = _row(
+            status="opted_out", source="unsubscribe_link"
+        )
+        await service.send_batch(uuid.UUID(result["id"]))
+        assert world.email.sent == []
+
+    async def test_another_orgs_guest_cannot_be_picked(self) -> None:
+        world = _world()
+        service = world.service()
+        picked = [world.guest_ids["b1_in"], world.guest_ids["a1_in"]]
+        preview = await service.audience_preview(
+            _scope(ORG_A), AudienceFilter(channel=Channel.EMAIL, guest_ids=picked)
+        )
+        assert preview["reachable"] == 1
+        assert preview["selected_outside_filters"] == 1
+        result = await self._send_to(world, service, picked)
+        await service.send_batch(uuid.UUID(result["id"]))
+        assert world.email.sent == ["a1_in@guest.in"]
+
+    async def test_location_scoped_caller_cannot_pick_other_venues_guest(self) -> None:
+        world = _world()
+        service = world.service()
+        preview = await service.audience_preview(
+            _scope(ORG_A, LOC_A1),
+            AudienceFilter(
+                channel=Channel.EMAIL,
+                guest_ids=[world.guest_ids["a2_in"], world.guest_ids["a1_in"]],
+            ),
+        )
+        assert [s["display_name"] for s in preview["sample"]] == ["a1_in"]
+
+    async def test_an_empty_pick_is_refused_not_everyone(self) -> None:
+        with pytest.raises(ValueError):
+            AudienceFilter(channel=Channel.EMAIL, guest_ids=[])
+
+    async def test_candidates_offer_only_reachable_guests_masked(self) -> None:
+        world = _world()
+        service = world.service()
+        result = await service.audience_candidates(
+            _scope(ORG_A),
+            AudienceFilter(channel=Channel.EMAIL),
+            search=None,
+            page=1,
+            page_size=50,
+        )
+        assert result["total"] == 2
+        assert {i["display_name"] for i in result["items"]} == {"a1_in", "a2_in"}
+        assert all("@guest.in" in i["masked_address"] for i in result["items"])
+        assert "a1_in@guest.in" not in [i["masked_address"] for i in result["items"]]
+        found = await service.audience_candidates(
+            _scope(ORG_A),
+            AudienceFilter(channel=Channel.EMAIL),
+            search="A2",
+            page=1,
+            page_size=50,
+        )
+        assert [i["display_name"] for i in found["items"]] == ["a2_in"]
+
+
+class TestDispatchSurvivesOneBadCampaign:
+    async def test_an_unexpected_error_fails_that_campaign_and_runs_the_next(
+        self,
+    ) -> None:
+        world = _world()
+        service = world.service()
+
+        async def entitled(_organization_id):
+            return True
+
+        service.entitlement_check = entitled
+        ids = []
+        for _ in range(2):
+            created = await _campaign(world, _scope(ORG_A))
+            ids.append(uuid.UUID(created["id"]))
+            await service.schedule(
+                _scope(ORG_A),
+                ids[-1],
+                scheduled_at=NOW + timedelta(hours=1),
+                idempotency_key="idem-" + uuid.uuid4().hex,
+            )
+            world.repo.campaigns[ids[-1]].scheduled_at = service._now() - timedelta(
+                minutes=1
+            )
+        real = service.materialize
+        calls = []
+
+        async def flaky(campaign):
+            calls.append(campaign.id)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return await real(campaign)
+
+        service.materialize = flaky
+        result = await service.dispatch_due()
+        assert result["failed"] == 1 and result["started"] == 1
+        statuses = sorted(world.repo.campaigns[i].status for i in ids)
+        assert statuses == [
+            CampaignStatus.FAILED.value,
+            CampaignStatus.SENDING.value,
+        ]
+        bad = world.repo.campaigns[calls[0]]
+        assert bad.last_error == "dispatch_failed"
+
+
 class TestSending:
     async def _send_now(self, world: World, service: MarketingService) -> dict:
         created = await _campaign(world, _scope(ORG_A))
@@ -1255,7 +1432,8 @@ MARKETING_ROUTES = _marketing_routes()
 
 def test_route_table_is_the_contract() -> None:
     # 23 + 6 BYO provider routes + GET campaigns/{id}/estimate (credits)
-    assert len(MARKETING_ROUTES) == 30, MARKETING_ROUTES
+    # + POST audience/candidates (manual recipient selection)
+    assert len(MARKETING_ROUTES) == 31, MARKETING_ROUTES
 
 
 @pytest.mark.parametrize(("method", "path"), MARKETING_ROUTES)
