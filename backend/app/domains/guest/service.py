@@ -3664,6 +3664,13 @@ class GuestService:
                 resolved.config.whitelist_only_denied_message
             ),
         )
+        await self._refuse_device_of_blocked_guest(
+            router_id=router_id,
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
+        )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         # The Access Tier this guest is mapped into here -- resolved for an
         # Aruba Instant On router only (None at MikroTik/Omada, which keep
@@ -3869,6 +3876,13 @@ class GuestService:
             whitelist_only_denied_message=(
                 resolved.config.whitelist_only_denied_message
             ),
+        )
+        await self._refuse_device_of_blocked_guest(
+            router_id=router_id,
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         # The Access Tier this guest is mapped into here -- resolved for an
@@ -4098,6 +4112,13 @@ class GuestService:
             whitelist_only_denied_message=(
                 resolved.config.whitelist_only_denied_message
             ),
+        )
+        await self._refuse_device_of_blocked_guest(
+            router_id=router_id,
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         # The Access Tier this guest is mapped into here -- resolved for an
@@ -4387,6 +4408,13 @@ class GuestService:
             whitelist_only_denied_message=(
                 resolved.config.whitelist_only_denied_message
             ),
+        )
+        await self._refuse_device_of_blocked_guest(
+            router_id=router_id,
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         # The Access Tier this guest is mapped into here -- resolved for an
@@ -7564,6 +7592,67 @@ class GuestService:
             mac_address=mac_address,
         )
 
+    async def _refuse_device_of_blocked_guest(
+        self,
+        *,
+        router_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        identifier: str,
+        device_mac: str | None,
+    ) -> None:
+        """NAS-only (Aruba Instant On): refuse a device whose last owner here
+        is blocked, whichever identifier is typed now.
+
+        A block names one identifier, and phone and email are separate guests,
+        so typing another one walked straight past it. The device is the only
+        link to the same person this platform has. Not used for a device whose
+        owner is the guest signing in (already checked) or who is not blocked.
+        A device that has never been seen, or last signed in as someone else,
+        is not caught. Other vendors never reach the check. Any lookup failure
+        admits, like ``is_blocklisted``: a database blip must not become nobody
+        at the venue getting online."""
+        if not device_mac:
+            return
+        try:
+            router = await self.router_lookup.get_router(router_id)
+            if not is_nas_only(router):
+                return
+            device = await self.repository.get_device_by_mac(
+                normalize_mac_address(device_mac)
+            )
+            if device is None or device.guest_id is None:
+                return
+            owner = await self.repository.get_guest_by_id(device.guest_id)
+            if (
+                owner is None
+                or owner.organization_id != organization_id
+                or owner.identifier == identifier
+            ):
+                return
+            refused = owner.is_blocked or (
+                self.access_control_hook is not None
+                and await is_blocklisted(
+                    self.access_control_hook,
+                    organization_id=organization_id,
+                    location_id=location_id,
+                    identifier=owner.identifier,
+                    mac_address=None,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: fails open
+            logger.warning(
+                "guest_blocked_owner_device_check_failed",
+                extra={"router_id": str(router_id), "error_type": type(exc).__name__},
+            )
+            return
+        if refused:
+            logger.info(
+                "guest_login_refused_blocked_owner_device",
+                extra={"router_id": str(router_id)},
+            )
+            raise GuestAccessDeniedError(None)
+
     async def _enforce_access_control(
         self,
         *,
@@ -8721,6 +8810,14 @@ class GuestService:
                 update_data["ip_address"] = ip_address
             if voucher_id is not None and reusable.voucher_id != voucher_id:
                 update_data["voucher_id"] = voucher_id
+            elif (
+                voucher_id is None
+                and reusable.voucher_id is not None
+                and is_nas_only(router)
+            ):
+                # Not a voucher login any more, so that voucher's revocation
+                # or expiry must not refuse or cap this session at the AP.
+                update_data["voucher_id"] = None
             reused = await self.repository.update_session(reusable, update_data)
             return reused, False
         session = await self._create_session(
