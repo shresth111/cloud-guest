@@ -97,6 +97,13 @@ class OtpRequest(BaseModel):
         nullable=True,
     )
 
+    # What the provider call did, not whether the handset got it: no carrier
+    # delivery receipt is received anywhere. Null on rows older than these
+    # columns. See ``OtpService._send_recorded``.
+    provider_outcome: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    provider_name: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    provider_response_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     __table_args__ = (
         Index("ix_otp_requests_identifier", "identifier"),
         Index("ix_otp_requests_purpose", "purpose"),

@@ -158,6 +158,9 @@ def _admin_response(otp_request: OtpRequest) -> OtpRequestAdminResponse:
         location_id=str(otp_request.location_id) if otp_request.location_id else None,
         created_at=otp_request.created_at,
         updated_at=otp_request.updated_at,
+        provider_outcome=otp_request.provider_outcome,
+        provider_name=otp_request.provider_name,
+        provider_response_ms=otp_request.provider_response_ms,
     )
 
 

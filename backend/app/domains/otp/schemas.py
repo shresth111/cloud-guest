@@ -138,6 +138,10 @@ class OtpRequestAdminResponse(BaseModel):
     location_id: str | None
     created_at: datetime
     updated_at: datetime
+    # What the provider call did. Not carrier delivery: no receipt is received.
+    provider_outcome: str | None = None
+    provider_name: str | None = None
+    provider_response_ms: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
