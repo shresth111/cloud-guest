@@ -219,6 +219,8 @@ UPSTREAM_PROBE_TARGETS = (
 )
 UPSTREAM_PROBE_PING_COUNT = 3
 UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX = "cloudguest-isp-probe-"
+# The gateway adapter's up-script finds its sibling watches by this prefix.
+LINE_WATCH_COMMENT_PREFIX = "cloudguest-line-watch-"
 
 # Real RouterOS /tool/ping parameters -- see device_adapters.py.
 ISP_PING_COUNT = 5
@@ -372,4 +374,5 @@ __all__ = [
     "UPSTREAM_PROBE_TARGETS",
     "UPSTREAM_PROBE_PING_COUNT",
     "UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX",
+    "LINE_WATCH_COMMENT_PREFIX",
 ]

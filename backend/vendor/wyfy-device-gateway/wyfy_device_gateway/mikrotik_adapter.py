@@ -6336,6 +6336,95 @@ class MikroTikAdapter:
         finally:
             api.close()
 
+    async def ensure_line_watch(
+        self,
+        creds: DeviceCredentials,
+        *,
+        host: str,
+        fallback_host: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        """See the contract. It runs on the router because the cloud cannot
+        make this decision: when the dead line carries the management tunnel,
+        the cloud loses the router at the moment the route has to move.
+        Tested against RouterOS 7.16.2 (CHR)."""
+        await asyncio.to_thread(
+            self._ensure_line_watch_sync, creds, host, fallback_host, gateway, comment
+        )
+
+    def _ensure_line_watch_sync(
+        self,
+        creds: DeviceCredentials,
+        host: str,
+        fallback_host: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        # `static`, not `dynamic=no`: a disabled route reads dynamic as nil, so
+        # `dynamic=no` finds nothing and the up-script would enable nothing.
+        routes = (
+            f'[/ip route find where dst-address="0.0.0.0/0" and gateway="{gateway}" '
+            "and static]"
+        )
+        others = (
+            '[:len [/ip route find where dst-address="0.0.0.0/0" and '
+            f'routing-table="main" and gateway!="{gateway}" and disabled=no and '
+            "inactive=no]]"
+        )
+        desired = {
+            "host": host,
+            "type": "icmp",
+            "interval": "10s",
+            # The default 5m after a reboot would leave a dead line carrying
+            # guests for five minutes.
+            "startup-delay": "1m",
+            "comment": comment,
+            "down-script": (
+                f":if ([/ping {fallback_host} count=3] = 0) do={{ "
+                f":if ({others} > 0) do={{ /ip route disable {routes}; "
+                f':log warning "{comment}: ISP not passing traffic, routes disabled" '
+                f'}} else={{ :log warning "{comment}: last usable line, routes kept" '
+                "} }"
+            ),
+            # A line kept because it was the last one gets no second "down"
+            # event, so it would stay in service, dead, after this one returns.
+            # Re-run the down script of every watch still down.
+            "up-script": (
+                f"/ip route enable {routes}; "
+                f':log info "{comment}: ISP back, routes enabled"; '
+                ':foreach w in=[/tool netwatch find where '
+                'comment~"^cloudguest-line-watch-" and status="down"] do={ '
+                "[:parse [/tool netwatch get $w down-script]] }"
+            ),
+        }
+        api = self._connect_api(creds)
+        try:
+            menu = api.path("tool", "netwatch")
+            try:
+                existing = [row for row in menu if row.get("comment") == comment]
+                if not existing:
+                    menu.add(**desired)
+                else:
+                    changed = {
+                        key: value
+                        for key, value in desired.items()
+                        if key in ("host", "down-script", "up-script")
+                        and str(existing[0].get(key) or "") != value
+                    }
+                    if changed:
+                        menu.update(**{".id": existing[0][".id"], **changed})
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_line_watch: {exc}"
+                ) from exc
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"ensure_line_watch: {_describe_exception(exc)}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
     async def ensure_host_route(
         self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
     ) -> None:

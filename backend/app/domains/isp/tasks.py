@@ -109,6 +109,9 @@ async def _run_isp_health_check_sweep_async() -> HealthCheckSweepSummary:
                     device_adapter_resolver=get_isp_health_adapter,
                     redis=redis,
                     upstream_probe_enabled=get_settings().isp_upstream_probe_enabled,
+                    upstream_probe_router_ids=(
+                        get_settings().isp_upstream_probe_router_id_set
+                    ),
                 )
                 await session.commit()
                 return summary

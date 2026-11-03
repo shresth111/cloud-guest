@@ -395,6 +395,17 @@ class _StubAdapter:
     ) -> None:
         raise self._not_implemented()
 
+    async def ensure_line_watch(
+        self,
+        creds: DeviceCredentials,
+        *,
+        host: str,
+        fallback_host: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        raise self._not_implemented()
+
     async def ensure_host_route(
         self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
     ) -> None:
@@ -471,6 +482,7 @@ class _StubAdapter:
             "delete_content_filter_rule": False,
             "ensure_wan_egress": False,
             "ensure_host_route": False,
+            "ensure_line_watch": False,
             "read_default_routes": False,
             "set_default_route_distances": False,
             "read_network_snapshot": False,
