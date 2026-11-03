@@ -163,7 +163,7 @@ from .dependencies import (
     get_sla_service,
     get_ztp_monitoring_service,
 )
-from .exceptions import UnspecifiedChannelOwnerError
+from .exceptions import AlertRuleNotFoundError, UnspecifiedChannelOwnerError
 from .models import (
     Alert,
     AlertRule,
@@ -581,12 +581,20 @@ def _sla_report_response(report: SlaReport) -> SlaReportResponse:
 async def create_alert_rule(
     request: Request,
     payload: AlertRuleCreateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
+    # The owner comes from the caller's scope, not the body: only a platform
+    # caller (None) may create a rule for another organization or a global one.
+    organization_id = payload.organization_id
+    if requesting_organization_id is not None:
+        if organization_id not in (None, requesting_organization_id):
+            raise AlertRuleNotFoundError(organization_id)
+        organization_id = requesting_organization_id
     rule = await service.create_alert_rule(
         name=payload.name,
         description=payload.description,
-        organization_id=payload.organization_id,
+        organization_id=organization_id,
         trigger_type=payload.trigger_type,
         target_component=payload.target_component,
         condition_config=payload.condition_config,
