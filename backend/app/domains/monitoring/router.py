@@ -601,6 +601,7 @@ async def create_alert_rule(
         severity=payload.severity.value,
         is_active=payload.is_active,
         notification_channel_ids=payload.notification_channel_ids,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
