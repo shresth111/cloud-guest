@@ -73,6 +73,7 @@ class InstantOnKind(StrEnum):
     ALERTS = "alerts"
     HEALTH = "health"
     CLIENT_USAGE = "client_usage"
+    EVENTS = "events"
 
 
 CUSTOMER_KINDS = frozenset(
@@ -81,12 +82,18 @@ CUSTOMER_KINDS = frozenset(
         InstantOnKind.CLIENTS,
         InstantOnKind.SSIDS,
         InstantOnKind.ALERTS,
+        InstantOnKind.EVENTS,
     }
 )
 
 
 def poll_period_seconds(kind: str, settings: Settings) -> int:
-    if kind in (InstantOnKind.ACCESS_POINTS, InstantOnKind.CLIENTS):
+    # Events: Instant On keeps a short window, so read it as often as clients.
+    if kind in (
+        InstantOnKind.ACCESS_POINTS,
+        InstantOnKind.CLIENTS,
+        InstantOnKind.EVENTS,
+    ):
         return settings.instant_on_fast_poll_seconds
     if kind == InstantOnKind.CLIENT_USAGE:
         return settings.instant_on_usage_poll_seconds

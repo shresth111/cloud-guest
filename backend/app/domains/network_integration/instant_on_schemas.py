@@ -102,6 +102,16 @@ class InstantOnAlertItem(_Item):
     device_name: str | None = None
 
 
+class InstantOnEventItem(_Item):
+    event_id: str | None = None
+    event: str
+    state: str | None = None
+    category: str | None = None
+    occurred_at: datetime | None = None
+    device_name: str | None = None
+    network_name: str | None = None
+
+
 class InstantOnHealthItem(_Item):
     score: int | None = None
     status: str | None = None
