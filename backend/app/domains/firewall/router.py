@@ -26,6 +26,8 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import AuthUser
+from app.domains.billing.constants import PlanFeatureKey
+from app.domains.billing.dependencies import RequireFeature
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -60,6 +62,14 @@ from .schemas import (
 from .service import FirewallService, FloodLimitState, GuestIsolationState
 
 router = APIRouter(prefix="/firewall-rules", tags=["Firewall Rule Management"])
+
+# The Firewall add-on (``PlanFeatureKey.FIREWALL``): 402
+# ``feature_not_entitled`` before the permission check, on every route a
+# venue uses -- the rules, the push, the flood limit and guest isolation.
+# The two band routes are left off on purpose: placing the band is a
+# GLOBAL-pinned Master operation and reading its state is how the Master
+# console checks a router, neither of which is the customer's add-on.
+_FIREWALL_ADDON = Depends(RequireFeature(PlanFeatureKey.FIREWALL))
 
 
 def _request_id(request: Request) -> str:
@@ -106,7 +116,10 @@ def _rule_response(rule: FirewallRule) -> FirewallRuleResponse:
     "",
     response_model=ApiResponse[FirewallRuleResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("firewall.create"))],
+    dependencies=[
+        _FIREWALL_ADDON,
+        Depends(RequirePermission("firewall.create")),
+    ],
 )
 async def create_firewall_rule(
     request: Request,
@@ -144,7 +157,10 @@ async def create_firewall_rule(
     "",
     response_model=ApiResponse[FirewallRuleListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("firewall.read"))],
+    dependencies=[
+        _FIREWALL_ADDON,
+        Depends(RequirePermission("firewall.read")),
+    ],
 )
 async def list_firewall_rules(
     request: Request,
@@ -175,7 +191,10 @@ async def list_firewall_rules(
     "/{rule_id}",
     response_model=ApiResponse[FirewallRuleResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("firewall.read"))],
+    dependencies=[
+        _FIREWALL_ADDON,
+        Depends(RequirePermission("firewall.read")),
+    ],
 )
 async def get_firewall_rule(
     request: Request,
@@ -198,7 +217,10 @@ async def get_firewall_rule(
     "/{rule_id}",
     response_model=ApiResponse[FirewallRuleResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("firewall.update"))],
+    dependencies=[
+        _FIREWALL_ADDON,
+        Depends(RequirePermission("firewall.update")),
+    ],
 )
 async def update_firewall_rule(
     request: Request,
@@ -233,7 +255,10 @@ async def update_firewall_rule(
     "/{rule_id}",
     response_model=ApiResponse[MessageResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("firewall.delete"))],
+    dependencies=[
+        _FIREWALL_ADDON,
+        Depends(RequirePermission("firewall.delete")),
+    ],
 )
 async def delete_firewall_rule(
     request: Request,
@@ -260,6 +285,7 @@ async def delete_firewall_rule(
     response_model=ApiResponse[FirewallPushResponse],
     status_code=status.HTTP_200_OK,
     dependencies=[
+        _FIREWALL_ADDON,
         Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
     ],
 )
@@ -407,7 +433,10 @@ def _flood_response(router_id: uuid.UUID, state: FloodLimitState) -> FloodLimitR
     "/routers/{router_id}/flood-limit",
     response_model=ApiResponse[FloodLimitResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+    dependencies=[
+        _FIREWALL_ADDON,
+        Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER)),
+    ],
 )
 async def get_flood_limit(
     request: Request,
@@ -434,6 +463,7 @@ async def get_flood_limit(
     response_model=ApiResponse[FloodLimitResponse],
     status_code=status.HTTP_200_OK,
     dependencies=[
+        _FIREWALL_ADDON,
         Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
     ],
 )
@@ -504,7 +534,10 @@ def _isolation_response(
     "/routers/{router_id}/guest-isolation",
     response_model=ApiResponse[GuestIsolationResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER))],
+    dependencies=[
+        _FIREWALL_ADDON,
+        Depends(RequirePermission("firewall.read", scope=ScopeType.ROUTER)),
+    ],
 )
 async def get_guest_isolation(
     request: Request,
@@ -530,6 +563,7 @@ async def get_guest_isolation(
     response_model=ApiResponse[GuestIsolationResponse],
     status_code=status.HTTP_200_OK,
     dependencies=[
+        _FIREWALL_ADDON,
         Depends(RequirePermission("firewall.execute", scope=ScopeType.ROUTER))
     ],
 )
