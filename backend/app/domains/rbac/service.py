@@ -547,6 +547,11 @@ class RBACService:
             raise SharedRoleImmutableError(
                 role.name, "activated" if is_active else "deactivated"
             )
+        # Every holder would lose the role's whole key set at once, including
+        # the last Super Admin, with no in-product way back. Activating stays
+        # allowed so a role already deactivated can be recovered.
+        if role.is_system_role and not is_active:
+            raise SystemRoleImmutableError(role.name, "deactivated")
         updated = await self.repository.update_role(
             role, {"is_active": is_active, "updated_by": actor_user_id}
         )

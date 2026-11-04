@@ -1681,6 +1681,32 @@ class TestEditExistingRoles:
             )
         assert role_b.name == "Org B Role"
 
+    async def test_system_role_cannot_be_deactivated_but_can_be_reactivated(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        role = await _shared_role_with_permissions(
+            repo, "Super Admin", ("roles.manage",), is_system_role=True
+        )
+
+        with pytest.raises(SystemRoleImmutableError):
+            await service.set_role_active(
+                actor_user_id=uuid.uuid4(),
+                role_id=role.id,
+                requesting_organization_id=None,
+                is_active=False,
+            )
+        assert role.is_active is True
+
+        role.is_active = False
+        updated = await service.set_role_active(
+            actor_user_id=uuid.uuid4(),
+            role_id=role.id,
+            requesting_organization_id=None,
+            is_active=True,
+        )
+        assert updated.is_active is True
+
     async def test_shared_role_cannot_be_deactivated_or_repermissioned_in_place(
         self,
     ) -> None:
