@@ -86,6 +86,7 @@ from librouteros.exceptions import LibRouterosError
 
 from . import mikrotik_firewall as _fw
 from . import mikrotik_guest_isolation as _iso
+from . import mikrotik_local_users as _users
 from . import mikrotik_snmp as _snmp
 from . import mikrotik_traffic_flow as _tflow
 from .contract import (
@@ -8668,6 +8669,48 @@ class MikroTikAdapter:
         return await asyncio.to_thread(
             self._execute_raw_command_over_api_sync, creds, command, *sentence
         )
+
+    async def probe_api_login(self, creds: DeviceCredentials) -> _users.LoginProbeResult:
+        """One login attempt with ``creds``, over 8728. See
+        :mod:`.mikrotik_local_users` for why this separates refused from
+        unreachable."""
+
+        def connect():  # noqa: ANN202
+            return librouteros.connect(
+                host=creds.host,
+                username=creds.username,
+                password=creds.secret,
+                port=creds.port or _DEFAULT_API_PORT,
+                timeout=creds.timeout_seconds,
+            )
+
+        return await asyncio.to_thread(_users.probe_login, connect)
+
+    async def list_local_users(self, creds: DeviceCredentials) -> list[_users.LocalUser]:
+        def run() -> list[_users.LocalUser]:
+            api = self._connect_api(creds)
+            try:
+                return _users.list_users(api)
+            except (LibRouterosError, OSError) as exc:
+                raise MikroTikDeviceError(creds.host, _describe_exception(exc)) from exc
+            finally:
+                self._safe_close(api)
+
+        return await asyncio.to_thread(run)
+
+    async def set_local_user_password(
+        self, creds: DeviceCredentials, *, username: str, new_password: str
+    ) -> None:
+        def run() -> None:
+            api = self._connect_api(creds)
+            try:
+                _users.set_password(api, username=username, new_password=new_password)
+            except (LibRouterosError, OSError) as exc:
+                raise MikroTikDeviceError(creds.host, _describe_exception(exc)) from exc
+            finally:
+                self._safe_close(api)
+
+        await asyncio.to_thread(run)
 
     def _execute_raw_command_over_api_sync(
         self,

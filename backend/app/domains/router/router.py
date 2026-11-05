@@ -172,6 +172,9 @@ from .schemas import (
     ProvisioningTokenResponse,
     RouterCreateRequest,
     RouterListResponse,
+    RouterLocalAdminApplyResponse,
+    RouterLocalAdminCheckResponse,
+    RouterLocalAdminSecretResponse,
     RouterManagementAccessRequest,
     RouterPlatformResponse,
     RouterResponse,
@@ -289,6 +292,8 @@ def _router_platform_response(
     field by forgetting to pass something.
     """
     return RouterPlatformResponse(
+        local_admin_password_status=router_device.local_admin_password_status,
+        local_admin_password_verified_at=router_device.local_admin_password_verified_at,
         **(
             _router_response(router_device, controller).model_dump()
             # Undo the customer redaction: the back-reference from a
@@ -875,6 +880,111 @@ async def get_device_connection(
             username=router_row.api_username,
             password=password,
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+_LOCAL_ADMIN_PERMISSION = Depends(
+    RequirePermission("routers.manage", scope=ScopeType.GLOBAL)
+)
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/check",
+    response_model=ApiResponse[RouterLocalAdminCheckResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def check_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Reports the device's local login state without changing it. A POST
+    because it attempts logins on the device and writes an audit row."""
+    result = await router_service.check_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin login checked",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/issue",
+    response_model=ApiResponse[RouterLocalAdminSecretResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def issue_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Returns the password the setup script should set, creating one the first
+    time. Generating a script again returns the same password."""
+    result = await router_service.issue_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin password issued",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/apply",
+    response_model=ApiResponse[RouterLocalAdminApplyResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def apply_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Makes the device match the stored password and proves it with a login.
+    Also the "verify" action: a device that already matches is not written to."""
+    result = await router_service.apply_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin password confirmed on the router",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/reveal",
+    response_model=ApiResponse[RouterLocalAdminSecretResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def reveal_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Hands one operator the plaintext, and records who. A POST so that no
+    cache or link preview can trigger it."""
+    result = await router_service.reveal_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin password revealed",
+        data=result.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

@@ -162,6 +162,8 @@ class RouterRepositoryProtocol(Protocol):
         self, router: Router, data: dict[str, object]
     ) -> Router: ...
 
+    async def commit(self) -> None: ...
+
     async def soft_delete_router(self, router: Router) -> Router: ...
 
     async def list_routers(
@@ -380,6 +382,11 @@ class RouterRepository:
 
     async def update_router(self, router: Router, data: dict[str, object]) -> Router:
         return await self.routers.update(router, data)
+
+    async def commit(self) -> None:
+        """Commits now, for a write that must survive a later failure in the
+        same request: ``get_db_session`` rolls back on any exception."""
+        await self.session.commit()
 
     async def soft_delete_router(self, router: Router) -> Router:
         return await self.routers.soft_delete(router)

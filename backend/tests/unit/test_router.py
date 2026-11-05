@@ -233,6 +233,7 @@ class FakeRouterRepository:
     # `controller_context`. A router missing from this dict has none, which
     # is `not_registered` and not an absence of data.
     integrations: dict[uuid.UUID, object] = field(default_factory=dict)
+    commits: int = 0
 
     async def get_by_id(
         self, router_id: uuid.UUID, *, include_deleted: bool = False
@@ -314,6 +315,9 @@ class FakeRouterRepository:
                 setattr(router, key, value)
         router.version += 1
         return router
+
+    async def commit(self) -> None:
+        self.commits += 1
 
     async def soft_delete_router(self, router: Router) -> Router:
         router.is_deleted = True

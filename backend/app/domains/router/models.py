@@ -174,6 +174,22 @@ class Router(BaseModel):
     api_username: Mapped[str | None] = mapped_column(String(100), nullable=True)
     api_credentials_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # The password of the device's own local ``admin`` account, Fernet-encrypted
+    # like the API credential above. Separate from it on purpose: that one is
+    # how the platform connects, this one is how a person logs in at the venue.
+    # Status is NULL until issued, ``pending`` until a real login with this
+    # password has succeeded, then ``active``. See
+    # ``RouterService.apply_local_admin_password``.
+    local_admin_password_encrypted: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    local_admin_password_status: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )
+    local_admin_password_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # SNMP metrics-polling configuration (see
     # app.domains.provisioning_engine.service.run_router_snmp_metrics_poll_sweep
     # and vendor/wyfy-device-gateway's own snmp_poller.py). A genuinely
