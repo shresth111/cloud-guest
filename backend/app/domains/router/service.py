@@ -2052,6 +2052,13 @@ class RouterService:
             raise RouterLocalAdminUnavailableError(
                 router.id, f"'{router.vendor}' devices are not supported"
             )
+        # Same refusal as `_local_admin_access`: a script setting this password
+        # would overwrite the credential the platform connects with.
+        if router.api_username == LOCAL_ADMIN_USERNAME:
+            raise RouterLocalAdminUnavailableError(
+                router.id,
+                f"the platform connects to this router as '{LOCAL_ADMIN_USERNAME}'",
+            )
         password = await self._ensure_local_admin_password(router)
         await self._audit(
             actor_user_id,

@@ -283,6 +283,15 @@ class TestRefusals:
         assert device.set_calls == []
         assert router.local_admin_password_encrypted is None
 
+    async def test_issue_refuses_when_the_platform_logs_in_as_admin(self) -> None:
+        service, _repo, router, _device, _audit = await _setup(api_username="admin")
+
+        with pytest.raises(RouterLocalAdminUnavailableError):
+            await service.issue_local_admin_password(
+                actor_user_id=ACTOR, router_id=router.id
+            )
+        assert router.local_admin_password_encrypted is None
+
     async def test_issue_refuses_other_vendors(self) -> None:
         service, _repo, router, _device, _audit = await _setup(vendor="aruba")
 
