@@ -304,6 +304,10 @@ CUSTOMER_FORBIDDEN_ROUTER_FIELDS: frozenset[str] = frozenset(
         "api_username",
         "api_secret",
         "api_credentials_encrypted",
+        "local_admin_password",
+        "local_admin_password_encrypted",
+        "local_admin_password_status",
+        "local_admin_password_verified_at",
         "snmp_enabled",
         "snmp_community",
         "snmp_community_encrypted",
@@ -406,6 +410,36 @@ class RouterPlatformResponse(RouterResponse):
     has_snmp_community: bool
     snmp_version: str | None = None
     snmp_port: int | None = None
+    # Whether a local admin password exists and has been proven on the device.
+    # Never the password: that leaves only through the audited reveal route.
+    local_admin_password_status: str | None = None
+    local_admin_password_verified_at: datetime | None = None
+
+
+class RouterLocalAdminCheckResponse(BaseModel):
+    """What the device says about its local login right now. Changes nothing."""
+
+    admin_exists: bool
+    # "blank" | "password_set" | "unreachable"
+    admin_login: str
+    # None when no password has been issued for this router yet.
+    stored_password_works: bool | None
+    other_full_access_users: list[str]
+
+
+class RouterLocalAdminApplyResponse(BaseModel):
+    status: str
+    verified_at: datetime | None
+    # Whether this call had to write to the device, or found it already correct.
+    device_changed: bool
+    other_full_access_users: list[str]
+
+
+class RouterLocalAdminSecretResponse(BaseModel):
+    username: str
+    password: str
+    status: str
+    verified_at: datetime | None
 
 
 class RouterListResponse(BaseModel):

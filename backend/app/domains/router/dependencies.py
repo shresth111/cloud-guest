@@ -29,12 +29,14 @@ from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .device_credential_rotator import GatewayDeviceCredentialRotator
+from .local_admin import GatewayLocalAdminDevice
 from .repository import RouterRepository, RouterRepositoryProtocol
 from .service import RouterService
 
 # Module-level singleton -- stateless (see GatewayDeviceCredentialRotator's
 # own docstring).
 _credential_rotator = GatewayDeviceCredentialRotator()
+_local_admin_device = GatewayLocalAdminDevice()
 
 
 def get_router_repository(
@@ -62,4 +64,5 @@ def get_router_service(
         # api_secret with no guarantee the physical device was ever told
         # about it.
         credential_rotator=_credential_rotator,
+        local_admin_device=_local_admin_device,
     )

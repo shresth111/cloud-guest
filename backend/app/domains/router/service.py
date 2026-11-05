@@ -53,7 +53,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from app.common.exceptions import CloudGuestError
 from app.database.utils.pagination import PaginationMeta
@@ -103,13 +103,31 @@ from .exceptions import (
     RemoteBootstrapNeverEnrolledError,
     RouterDecommissionedError,
     RouterLiveCredentialRotationFailedError,
+    RouterLocalAdminDeviceError,
+    RouterLocalAdminNotIssuedError,
+    RouterLocalAdminUnavailableError,
     RouterNotFoundError,
     RouterVendorChangeRefusedError,
     RouterVendorNotProvisionableError,
     RouterVendorNotSupportedError,
 )
+from .local_admin import (
+    LOCAL_ADMIN_STATUS_ACTIVE,
+    LOCAL_ADMIN_STATUS_PENDING,
+    LOCAL_ADMIN_USERNAME,
+    LocalAdminDeviceError,
+    LocalAdminDeviceProtocol,
+    LocalUser,
+    LoginProbeResult,
+    generate_local_admin_password,
+)
 from .models import Router, RouterProvisioningToken
 from .repository import RouterRepositoryProtocol
+from .schemas import (
+    RouterLocalAdminApplyResponse,
+    RouterLocalAdminCheckResponse,
+    RouterLocalAdminSecretResponse,
+)
 from .vendor_capabilities import (
     AGENT_EVIDENCE_FIELDS,
     ARUBA_INSTANT_ON_VENDOR,
@@ -278,6 +296,7 @@ class RouterService:
         audit_writer: AuditLogWriter | None = None,
         provisioning_token_ttl_hours: int = 24,
         credential_rotator: DeviceCredentialRotatorProtocol | None = None,
+        local_admin_device: LocalAdminDeviceProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.location_lookup = location_lookup
@@ -288,6 +307,7 @@ class RouterService:
         # ``_rotate_live_api_secret_if_needed``'s own docstring for exactly
         # what happens when this is unset vs. configured.
         self.credential_rotator = credential_rotator
+        self.local_admin_device = local_admin_device
 
     # -- reads -----------------------------------------------------------------
 
@@ -1910,6 +1930,256 @@ class RouterService:
             ),
         )
         return router
+
+    # -- local admin password ---------------------------------------------------
+
+    def _local_admin_access(self, router: Router) -> tuple[str, str, str]:
+        """Host, username and password the platform connects with. Refuses a
+        router whose connection account IS ``admin``: changing that password
+        would change the platform's own credential as well."""
+        if (router.vendor or "").lower() != "mikrotik":
+            raise RouterLocalAdminUnavailableError(
+                router.id, f"'{router.vendor}' devices are not supported"
+            )
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise RouterLocalAdminUnavailableError(
+                router.id, "the platform has no API access to this router yet"
+            )
+        if router.api_username == LOCAL_ADMIN_USERNAME:
+            raise RouterLocalAdminUnavailableError(
+                router.id,
+                f"the platform connects to this router as '{LOCAL_ADMIN_USERNAME}'",
+            )
+        return host, router.api_username, secret
+
+    def _local_admin_device(self) -> LocalAdminDeviceProtocol:
+        if self.local_admin_device is None:
+            raise RuntimeError("RouterService has no local_admin_device configured")
+        return self.local_admin_device
+
+    async def check_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminCheckResponse:
+        """Reads the device's login state. Writes nothing to the device, though
+        each login attempt appears in its log."""
+        router = await self.get_router(router_id)
+        host, api_user, api_secret = self._local_admin_access(router)
+        device = self._local_admin_device()
+        try:
+            users = await device.list_users(
+                host=host, username=api_user, password=api_secret
+            )
+        except LocalAdminDeviceError as exc:
+            raise RouterLocalAdminDeviceError(router.id, str(exc)) from exc
+        admin_exists = any(u.name == LOCAL_ADMIN_USERNAME for u in users)
+        blank = await device.probe_login(
+            host=host, username=LOCAL_ADMIN_USERNAME, password=""
+        )
+        stored_works: bool | None = None
+        if router.local_admin_password_encrypted is not None:
+            stored = await device.probe_login(
+                host=host,
+                username=LOCAL_ADMIN_USERNAME,
+                password=decrypt_secret(router.local_admin_password_encrypted),
+            )
+            stored_works = stored is LoginProbeResult.ACCEPTED
+        admin_login = {
+            LoginProbeResult.ACCEPTED: "blank",
+            LoginProbeResult.DENIED: "password_set",
+            LoginProbeResult.UNREACHABLE: "unreachable",
+        }[blank]
+        result = RouterLocalAdminCheckResponse(
+            admin_exists=admin_exists,
+            admin_login=admin_login,
+            stored_password_works=stored_works,
+            other_full_access_users=self._other_full_access_users(users, api_user),
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_CHECKED,
+            router=router,
+            description=f"Local admin login checked on router '{router.name}'",
+            metadata=result.model_dump(),
+        )
+        return result
+
+    @staticmethod
+    def _other_full_access_users(
+        users: Sequence[LocalUser], api_user: str
+    ) -> list[str]:
+        """Enabled full-access accounts other than ``admin`` and the platform's.
+        Any of them is another way in that this password does not close."""
+        return sorted(
+            u.name
+            for u in users
+            if u.group == "full"
+            and not u.disabled
+            and u.name not in {LOCAL_ADMIN_USERNAME, api_user}
+        )
+
+    async def _ensure_local_admin_password(self, router: Router) -> str:
+        if router.local_admin_password_encrypted is not None:
+            return decrypt_secret(router.local_admin_password_encrypted)
+        password = generate_local_admin_password()
+        await self.repository.update_router(
+            router,
+            {
+                "local_admin_password_encrypted": encrypt_secret(password),
+                "local_admin_password_status": LOCAL_ADMIN_STATUS_PENDING,
+            },
+        )
+        return password
+
+    def _local_admin_secret_response(
+        self, router: Router, password: str
+    ) -> RouterLocalAdminSecretResponse:
+        return RouterLocalAdminSecretResponse(
+            username=LOCAL_ADMIN_USERNAME,
+            password=password,
+            status=router.local_admin_password_status or LOCAL_ADMIN_STATUS_PENDING,
+            verified_at=router.local_admin_password_verified_at,
+        )
+
+    async def issue_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminSecretResponse:
+        """The password for a setup script. Stays ``pending`` until
+        :meth:`apply_local_admin_password` proves it with a login."""
+        router = await self.get_router(router_id)
+        if (router.vendor or "").lower() != "mikrotik":
+            raise RouterLocalAdminUnavailableError(
+                router.id, f"'{router.vendor}' devices are not supported"
+            )
+        password = await self._ensure_local_admin_password(router)
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_ISSUED,
+            router=router,
+            description=f"Local admin password issued for router '{router.name}'",
+        )
+        return self._local_admin_secret_response(router, password)
+
+    async def apply_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminApplyResponse:
+        """Makes the device's ``admin`` password match the stored one.
+
+        The password is committed before the device is touched. If the request
+        dies after the write, the platform still holds the password the device
+        now has, instead of a router whose password nobody knows.
+
+        ``active`` is only ever set after a fresh login with that password
+        succeeds, because RouterOS cannot read a password back.
+        """
+        router = await self.get_router(router_id)
+        host, api_user, api_secret = self._local_admin_access(router)
+        device = self._local_admin_device()
+        password = await self._ensure_local_admin_password(router)
+        await self.repository.commit()
+
+        before = await device.probe_login(
+            host=host, username=LOCAL_ADMIN_USERNAME, password=password
+        )
+        if before is LoginProbeResult.UNREACHABLE:
+            await self._fail_local_admin_apply(
+                actor_user_id, router, "the router could not be reached"
+            )
+
+        device_changed = before is LoginProbeResult.DENIED
+        if device_changed:
+            try:
+                await device.set_password(
+                    host=host,
+                    username=api_user,
+                    password=api_secret,
+                    target_username=LOCAL_ADMIN_USERNAME,
+                    new_password=password,
+                )
+            except LocalAdminDeviceError as exc:
+                await self._fail_local_admin_apply(actor_user_id, router, str(exc))
+            after = await device.probe_login(
+                host=host, username=LOCAL_ADMIN_USERNAME, password=password
+            )
+            if after is not LoginProbeResult.ACCEPTED:
+                await self._fail_local_admin_apply(
+                    actor_user_id,
+                    router,
+                    f"a login with the new password was {after.value}",
+                )
+
+        verified_at = datetime.now(UTC)
+        await self.repository.update_router(
+            router,
+            {
+                "local_admin_password_status": LOCAL_ADMIN_STATUS_ACTIVE,
+                "local_admin_password_verified_at": verified_at,
+            },
+        )
+        # Informational: not being able to list accounts does not undo a login
+        # that just succeeded.
+        try:
+            others = self._other_full_access_users(
+                await device.list_users(
+                    host=host, username=api_user, password=api_secret
+                ),
+                api_user,
+            )
+        except LocalAdminDeviceError:
+            others = []
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_APPLIED,
+            router=router,
+            description=f"Local admin password confirmed on router '{router.name}'",
+            metadata={
+                "device_changed": device_changed,
+                "other_full_access_users": others,
+            },
+        )
+        return RouterLocalAdminApplyResponse(
+            status=LOCAL_ADMIN_STATUS_ACTIVE,
+            verified_at=verified_at,
+            device_changed=device_changed,
+            other_full_access_users=others,
+        )
+
+    async def _fail_local_admin_apply(
+        self, actor_user_id: uuid.UUID | None, router: Router, detail: str
+    ) -> NoReturn:
+        """Records the failure and raises. Commits first, because the raise
+        rolls this request's session back. A password that was active is
+        no longer known to be, so it goes back to ``pending``."""
+        await self.repository.update_router(
+            router, {"local_admin_password_status": LOCAL_ADMIN_STATUS_PENDING}
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_APPLY_FAILED,
+            router=router,
+            description=(
+                f"Local admin password not confirmed on router '{router.name}'"
+            ),
+            metadata={"detail": detail},
+        )
+        await self.repository.commit()
+        raise RouterLocalAdminDeviceError(router.id, detail)
+
+    async def reveal_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminSecretResponse:
+        router = await self.get_router(router_id)
+        if router.local_admin_password_encrypted is None:
+            raise RouterLocalAdminNotIssuedError(router.id)
+        password = decrypt_secret(router.local_admin_password_encrypted)
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_REVEALED,
+            router=router,
+            description=f"Local admin password revealed for router '{router.name}'",
+        )
+        return self._local_admin_secret_response(router, password)
 
     # -- internal helpers -------------------------------------------------------
 

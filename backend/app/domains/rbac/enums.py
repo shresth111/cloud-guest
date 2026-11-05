@@ -332,6 +332,13 @@ class AuditAction(StrEnum):
     # doesn't change any state, it exposes a secret, so "who saw this and
     # when" is the whole point of logging it.
     ROUTER_CREDENTIALS_REVEALED = "router_credentials_revealed"
+    ROUTER_LOCAL_ADMIN_PASSWORD_CHECKED = "router_local_admin_password_checked"
+    ROUTER_LOCAL_ADMIN_PASSWORD_ISSUED = "router_local_admin_password_issued"
+    ROUTER_LOCAL_ADMIN_PASSWORD_APPLIED = "router_local_admin_password_applied"
+    ROUTER_LOCAL_ADMIN_PASSWORD_APPLY_FAILED = (
+        "router_local_admin_password_apply_failed"
+    )
+    ROUTER_LOCAL_ADMIN_PASSWORD_REVEALED = "router_local_admin_password_revealed"
     ROUTER_DECOMMISSIONED = "router_decommissioned"
     ROUTER_SUSPENDED = "router_suspended"
     ROUTER_REINSTATED = "router_reinstated"

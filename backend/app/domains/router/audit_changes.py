@@ -68,6 +68,7 @@ REDACTED_ROUTER_FIELDS: frozenset[str] = frozenset(
     {
         "api_secret",
         "api_credentials_encrypted",
+        "local_admin_password_encrypted",
         "snmp_community",
         "snmp_community_encrypted",
         "token_hash",
