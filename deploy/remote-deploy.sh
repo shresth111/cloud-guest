@@ -247,8 +247,9 @@ aws_error_code() {
 #     blip) -- the secret exists and SHOULD be read. The env file is left with
 #     its previous contents (last known good) instead of being emptied, and a
 #     `DEPLOY-WARNING:` line is printed. cd.yml turns each of those into a
-#     ::warning:: annotation and a job-summary entry, and fails the run after
-#     the deploy has completed. The deploy itself is not blocked: an optional
+#     ::warning:: annotation and a job-summary entry (and fails the run after
+#     the deploy has completed when the repository variable
+#     CD_FAIL_ON_SECRET_WARNINGS=true). The deploy itself is not blocked: an optional
 #     feature's secret must never stop the API from shipping.
 #
 # Before this, AccessDenied on the Slack secret emptied slack.env on six CD

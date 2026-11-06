@@ -417,8 +417,8 @@ jobs:
           # read a secret (e.g. AccessDenied on the Slack webhook secret). The
           # deploy itself goes ahead -- an unreadable optional secret must not
           # block shipping -- but it must not be silent either: surface each
-          # one as an annotation and in the job summary, and let the last step
-          # of this job turn the run red.
+          # one as an annotation and in the job summary. The last step of this
+          # job turns the run red only when CD_FAIL_ON_SECRET_WARNINGS=true.
           WARNINGS="$(grep -o 'DEPLOY-WARNING: .*' deploy-stdout.txt || true)"
           if [ -n "$WARNINGS" ]; then
             {
@@ -458,11 +458,16 @@ jobs:
       # Last, so it can only fire after the deploy and the public check have
       # both passed: the new image IS live. What it reports is that a secret
       # the box needed could not be read (today: the Slack webhook secret, an
-      # IAM grant missing on the instance role). Set the repository variable
-      # CD_ALLOW_SECRET_WARNINGS=true to downgrade this to the warning and
-      # summary above while the grant is being sorted out.
+      # IAM grant missing on the instance role).
+      #
+      # Opt-in, not the default. Until that grant exists every run would be
+      # red after a deploy that worked, and a run that is always red hides the
+      # run that is red for a real reason (and invites rolling back a good
+      # deploy). The warning annotations and the job summary above always
+      # appear. Set the repository variable CD_FAIL_ON_SECRET_WARNINGS=true
+      # once the instance role can read every secret.
       - name: Fail if the box could not read a secret
-        if: steps.wait.outputs.secret_warnings != '0' && vars.CD_ALLOW_SECRET_WARNINGS != 'true'
+        if: steps.wait.outputs.secret_warnings != '0' && vars.CD_FAIL_ON_SECRET_WARNINGS == 'true'
         env:
           COUNT: ${{ steps.wait.outputs.secret_warnings }}
         run: |
