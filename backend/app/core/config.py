@@ -3119,6 +3119,18 @@ class Settings(BaseSettings):
             "per UTC day (all channels). 0 disables the cap."
         ),
     )
+    voucher_login_max_attempts_per_ip_per_window: int = Field(
+        default=300,
+        ge=1,
+        le=100_000,
+        description=(
+            "QA 2026-11-06 M2: voucher sign-in attempts one client address "
+            "(as resolved through FORWARDED_ALLOW_IPS) may make per "
+            "voucher redemption window. Sized for a venue, because every "
+            "guest at one leaves through its single NAT address; before, the "
+            "bucket was keyed on a client-supplied value and so unbounded."
+        ),
+    )
     radius_authorize_device_binding_all_vendors: bool = Field(
         default=True,
         description=(

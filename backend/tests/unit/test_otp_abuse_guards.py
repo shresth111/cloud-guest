@@ -261,3 +261,39 @@ def test_settings_defaults_are_on() -> None:
     fields = Settings.model_fields
     assert fields["otp_daily_cap_per_location"].default > 0
     assert fields["otp_daily_cap_platform"].default > 0
+
+
+class TestLoggingWhatsAppProviderNeverLogsALiveCode:
+    """QA 2026-11-06 L6."""
+
+    async def test_outside_local_the_code_is_not_logged(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging
+
+        from app.core.config import get_settings
+        from app.domains.otp.service import LoggingWhatsAppProvider
+
+        monkeypatch.setattr(get_settings(), "environment", "production")
+        caplog.set_level(logging.INFO, logger="app.domains.otp.service")
+        await LoggingWhatsAppProvider().send(
+            "+15551234567", code="042817", message="Your code is 042817."
+        )
+        [record] = [r for r in caplog.records if r.message == "otp_whatsapp_would_send"]
+        assert "042817" not in str(record.__dict__)
+
+    async def test_locally_it_still_shows_the_code(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging
+
+        from app.core.config import get_settings
+        from app.domains.otp.service import LoggingWhatsAppProvider
+
+        monkeypatch.setattr(get_settings(), "environment", "local")
+        caplog.set_level(logging.INFO, logger="app.domains.otp.service")
+        await LoggingWhatsAppProvider().send(
+            "+15551234567", code="042817", message="Your code is 042817."
+        )
+        [record] = [r for r in caplog.records if r.message == "otp_whatsapp_would_send"]
+        assert record.code == "042817"

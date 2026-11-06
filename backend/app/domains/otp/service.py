@@ -340,14 +340,25 @@ class LoggingWhatsAppProvider:
     ``KeyError`` (this provider had the identical bug)."""
 
     async def send(self, phone_number: str, *, code: str, message: str) -> None:
-        logger.info(
-            "otp_whatsapp_would_send",
-            extra={
+        # QA 2026-11-06 L6: this is the default provider, so a deployment
+        # that turns WhatsApp OTP on without configuring a real provider
+        # would write every live code to the logs. Only a local/test
+        # environment (where reading the code back is the point) gets it.
+        from app.core.config import LOCAL_ENVIRONMENTS, get_settings
+
+        if get_settings().environment in LOCAL_ENVIRONMENTS:
+            extra: dict[str, object] = {
                 "phone_number": phone_number,
                 "code": code,
                 "whatsapp_message": message,
-            },
-        )
+            }
+        else:
+            extra = {
+                "phone_number": phone_number,
+                "whatsapp_message_length": len(message),
+                "delivered": False,
+            }
+        logger.info("otp_whatsapp_would_send", extra=extra)
 
 
 # ============================================================================

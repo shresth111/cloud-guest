@@ -921,6 +921,8 @@ async def guest_login_via_voucher(
         ip_address=ip_address,
         user_agent=user_agent,
         accept_language=accept_language,
+        # QA M2: the trusted address (FORWARDED_ALLOW_IPS), not the body's.
+        client_ip=request.client.host if request.client else None,
     )
     return build_response(
         success=True,

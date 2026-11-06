@@ -352,7 +352,6 @@ _ALLOWED_UNAUTHENTICATED_PREFIXES: tuple[tuple[str, str], ...] = (
         "Guest's initial captive-portal config lookup, pre-authentication.",
     ),
     ("/api/v1/vouchers/validate", "Guest voucher validation, pre-authentication."),
-    ("/api/v1/vouchers/redeem", "Guest voucher redemption, pre-authentication."),
     ("/api/v1/otp/request", "Guest OTP request, pre-authentication."),
     ("/api/v1/otp/verify", "Guest OTP verification, pre-authentication."),
 )

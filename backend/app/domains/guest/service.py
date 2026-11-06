@@ -327,6 +327,8 @@ from .constants import (
     MAX_BULK_VOUCHER_LOOKUP_IDS,
     NAME_REQUIRED_AUTH_METHODS,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
+    PASSWORD_LOCKOUT_MINUTES,
+    PASSWORD_MAX_ATTEMPTS,
     PIN_LENGTH,
     PIN_LOCKOUT_MINUTES,
     PIN_MAX_ATTEMPTS,
@@ -386,6 +388,7 @@ from .exceptions import (
     GuestDeviceLimitExceededError,
     GuestNameRequiredError,
     GuestNotFoundError,
+    GuestPasswordLockedError,
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
     GuestPasswordTooWeakError,
@@ -589,6 +592,56 @@ class GuestPinSecurity:
         current = await redis.incr(key)
         if current == 1:
             await redis.expire(key, PIN_LOCKOUT_MINUTES * 60)
+
+
+_PASSWORD_LOCKOUT_KEY_TEMPLATE = (
+    "guest_password:lockout:{organization_id}:{identifier}"
+)
+
+
+class GuestPasswordSecurity:
+    """Per-identifier lockout for ``GuestService.login_via_password`` (QA
+    2026-11-06, M6), mirroring ``GuestPinSecurity`` exactly: after
+    ``PASSWORD_MAX_ATTEMPTS`` failures for one ``(organization_id,
+    identifier)`` it refuses for ``PASSWORD_LOCKOUT_MINUTES`` with 423,
+    before the password is looked at. Before this, the per-IP middleware
+    limit was the only throttle, and an attacker spreading guesses over
+    addresses -- or simply staying under 60 a minute -- was unbounded.
+
+    A lockout is a nuisance, not an outage, for the real guest: OTP sign-in
+    is unaffected, and is how they would reset a forgotten password anyway.
+    """
+
+    @staticmethod
+    def _key(organization_id: uuid.UUID, identifier: str) -> str:
+        return _PASSWORD_LOCKOUT_KEY_TEMPLATE.format(
+            organization_id=organization_id, identifier=identifier
+        )
+
+    @staticmethod
+    async def check_lockout(
+        redis: Redis, *, organization_id: uuid.UUID, identifier: str
+    ) -> None:
+        key = GuestPasswordSecurity._key(organization_id, identifier)
+        attempts = await redis.get(key)
+        if attempts and int(attempts) >= PASSWORD_MAX_ATTEMPTS:
+            ttl = await redis.ttl(key)
+            locked_until = datetime.now(UTC) + timedelta(
+                seconds=ttl if ttl and ttl > 0 else PASSWORD_LOCKOUT_MINUTES * 60
+            )
+            raise GuestPasswordLockedError(locked_until)
+
+    @staticmethod
+    async def record_attempt(
+        redis: Redis, *, organization_id: uuid.UUID, identifier: str, success: bool
+    ) -> None:
+        key = GuestPasswordSecurity._key(organization_id, identifier)
+        if success:
+            await redis.delete(key)
+            return
+        current = await redis.incr(key)
+        if current == 1:
+            await redis.expire(key, PASSWORD_LOCKOUT_MINUTES * 60)
 
 
 def _event_extra(event: object) -> dict[str, object]:
@@ -1608,6 +1661,7 @@ class VoucherRedeemProtocol(Protocol):
         source: str,
         organization_id: uuid.UUID | None = None,
         location_id: uuid.UUID | None = None,
+        max_attempts_per_window: int | None = None,
     ) -> tuple[Voucher, VoucherBatch]: ...
 
     async def get_plan_queue_profile_id(
@@ -3861,6 +3915,7 @@ class GuestService:
         ip_address: str | None = None,
         user_agent: str | None = None,
         accept_language: str | None = None,
+        client_ip: str | None = None,
     ) -> GuestLoginResult:
         identifier = normalize_identifier(identifier)
         resolved = await self._require_method_enabled(
@@ -3937,7 +3992,14 @@ class GuestService:
             router_id, organization_id=resolved_org_id, location_id=location_id
         )
 
-        source = ip_address or "unknown"
+        # QA 2026-11-06 M2: the brute-force bucket is keyed on the address
+        # this API saw the request come from (``request.client.host``, which
+        # uvicorn resolves through FORWARDED_ALLOW_IPS), never on the
+        # body's ``ip_address`` -- that one is the device's LAN address as
+        # the portal reports it (needed for queue targeting and records), so
+        # a caller could rotate it for a fresh bucket per request. A venue's
+        # guests share one NAT address, so the bucket is venue-sized.
+        source = f"guest-login:{client_ip or 'unknown'}"
         try:
             voucher, batch = await self.voucher_service.redeem_voucher(
                 code=code,
@@ -3945,6 +4007,9 @@ class GuestService:
                 source=source,
                 organization_id=resolved_org_id,
                 location_id=location_id,
+                max_attempts_per_window=(
+                    get_settings().voucher_login_max_attempts_per_ip_per_window
+                ),
             )
         except CloudGuestError as exc:
             await self._record_login_failure(
@@ -4112,6 +4177,11 @@ class GuestService:
         )
         resolved_org_id = resolved.config.organization_id
 
+        if self.redis is not None:
+            await GuestPasswordSecurity.check_lockout(
+                self.redis, organization_id=resolved_org_id, identifier=identifier
+            )
+
         existing_guest = await self.repository.get_guest_by_identifier(
             resolved_org_id, identifier
         )
@@ -4175,6 +4245,13 @@ class GuestService:
         )
 
         if not self._verify_guest_password(existing_guest, password):
+            if self.redis is not None:
+                await GuestPasswordSecurity.record_attempt(
+                    self.redis,
+                    organization_id=resolved_org_id,
+                    identifier=identifier,
+                    success=False,
+                )
             await self._record_login_failure(
                 guest=existing_guest,
                 identifier=identifier,
@@ -4189,6 +4266,13 @@ class GuestService:
 
         guest = existing_guest
         assert guest is not None  # narrowed by _verify_guest_password above
+        if self.redis is not None:
+            await GuestPasswordSecurity.record_attempt(
+                self.redis,
+                organization_id=resolved_org_id,
+                identifier=identifier,
+                success=True,
+            )
         device = await self._maybe_get_or_create_device(
             guest_id=guest.id,
             mac_address=device_mac,

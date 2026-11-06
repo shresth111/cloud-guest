@@ -42,6 +42,9 @@ from fastapi import status
 from app.common.exceptions import CloudGuestError
 
 __all__ = [
+    "OtpPurposeNotAllowedError",
+    "OtpVenueRequiredError",
+    "OtpDailyCapReachedError",
     "OtpError",
     "InvalidOtpIdentifierError",
     "OtpRequestRateLimitExceededError",

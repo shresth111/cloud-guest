@@ -303,6 +303,7 @@ class FakeVoucherService:
         source: str,
         organization_id: uuid.UUID | None = None,
         location_id: uuid.UUID | None = None,
+        max_attempts_per_window: int | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         if code not in self.vouchers:
             raise VoucherNotFoundError()

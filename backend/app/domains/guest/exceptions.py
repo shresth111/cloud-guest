@@ -26,6 +26,9 @@ from app.common.exceptions import CloudGuestError
 from .constants import GUEST_NAME_INVALID_CODE, GUEST_NAME_REQUIRED_CODE
 
 __all__ = [
+    "RouterNotAtVenueError",
+    "GuestSessionProofRequiredError",
+    "GuestPasswordLockedError",
     "GuestNameInvalidError",
     "GuestNameRequiredError",
     "GuestError",
@@ -986,6 +989,19 @@ class GuestPinLockedError(GuestError):
         self.locked_until = locked_until
         super().__init__(
             "Too many incorrect PIN attempts. Please try again later, or "
+            "sign in with a one-time code instead.",
+            status_code=status.HTTP_423_LOCKED,
+        )
+
+
+class GuestPasswordLockedError(GuestError):
+    """``GuestService.login_via_password``'s per-identifier lockout (QA
+    2026-11-06, M6) -- the password twin of ``GuestPinLockedError``."""
+
+    def __init__(self, locked_until: datetime) -> None:
+        self.locked_until = locked_until
+        super().__init__(
+            "Too many incorrect password attempts. Please try again later, or "
             "sign in with a one-time code instead.",
             status_code=status.HTTP_423_LOCKED,
         )
