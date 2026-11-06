@@ -1072,7 +1072,10 @@ from celery.signals import (  # noqa: E402
     worker_ready,
 )
 
-from app.core.logging import append_extras_to_handlers  # noqa: E402
+from app.core.logging import (  # noqa: E402
+    append_extras_to_handlers,
+    quiet_http_client_loggers,
+)
 
 
 @after_setup_logger.connect
@@ -1083,6 +1086,10 @@ def _keep_structured_log_fields(logger=None, **_kwargs):  # noqa: ANN001
     ``app.core.logging.ExtrasAppendingFormatter``."""
     if logger is not None:
         append_extras_to_handlers(logger)
+    # The worker never runs ``configure_logging``, so httpx would still log
+    # each outbound URL at INFO here -- marketing SMS via Ping4SMS carries
+    # the API key in that URL. Same rule as the API process.
+    quiet_http_client_loggers()
 
 
 @worker_ready.connect

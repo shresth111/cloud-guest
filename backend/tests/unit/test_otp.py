@@ -1186,13 +1186,17 @@ class TestPing4SmsProvider:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         async def fake_get(self, url, *, params=None):  # noqa: ANN001
-            return httpx.Response(500, request=httpx.Request("GET", url))
+            return httpx.Response(500, request=httpx.Request("GET", url, params=params))
 
         monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
 
         provider = Ping4SmsProvider(api_key="key123", route="1", sender_id="TESTIN")
-        with pytest.raises(httpx.HTTPStatusError):
-            await provider.send("+919876543210", message="hi")
+        with pytest.raises(RuntimeError, match="HTTP 500") as excinfo:
+            await provider.send("+919876543210", message="482913 is your code")
+        # The unhandled-error handler logs this exception with its text; the
+        # request URL (API key + OTP) must not be in it.
+        assert "key123" not in str(excinfo.value)
+        assert "482913" not in str(excinfo.value)
 
 
 # ============================================================================
