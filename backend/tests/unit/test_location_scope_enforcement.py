@@ -157,8 +157,13 @@ class _FakeRole:
 
 
 class _FakeAssignmentRow:
+    """A role assigned at its own scope. Since the security review
+    (2026-11-06) the assignment's ``scope_type`` decides platform reach, not
+    the role's, so the fake carries both."""
+
     def __init__(self, scope_type: str) -> None:
         self.role = _FakeRole(scope_type)
+        self.scope_type = scope_type
 
 
 class _FakeRbacRepo:
