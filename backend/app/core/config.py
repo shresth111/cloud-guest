@@ -3061,6 +3061,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    radius_authorize_device_binding_all_vendors: bool = Field(
+        default=True,
+        description=(
+            "When true, RADIUS Authorize on every vendor (MikroTik, Omada, "
+            "NAS-only APs) requires the Access-Request's Calling-Station-Id "
+            "to own an ACTIVE session of the guest on that router, whenever "
+            "the session already knows its device. False restores the "
+            "pre-2026-11-06 behaviour where only NAS-only APs were bound to "
+            "the device -- a rollback lever for QA finding C2, not a "
+            "setting to run with."
+        ),
+    )
     rate_limit_max_requests: int = Field(
         default=60,
         ge=1,

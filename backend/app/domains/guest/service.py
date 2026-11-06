@@ -247,6 +247,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 from redis.asyncio import Redis
 
 from app.common.exceptions import CloudGuestError
+from app.core.config import get_settings
 from app.database.constants import SortOrder
 from app.domains.auth.password import (
     PasswordManager,
@@ -9933,12 +9934,26 @@ class RadiusService:
         # Only when the session already knows its device: a login that
         # carried no MAC is adopted above, exactly as before. A packet with
         # no parseable Calling-Station-Id is not second-guessed (nothing to
-        # compare). MikroTik and Omada never enter this block.
+        # compare).
+        #
+        # Every vendor, not only NAS-only APs (QA 2026-11-06, C2). MikroTik
+        # and Omada have the same hole: the portal's hotspot hand-off posts
+        # ``username=<identifier>`` with a fixed fallback password, so any
+        # client that knows an online guest's phone number could submit it
+        # from its own device and be admitted on that guest's session -- no
+        # OTP, no device limit, and the traffic attributed to the victim.
+        # MikroTik sends ``AA:BB:..``, Omada ``AA-BB-..``; both sides are
+        # compared through ``canonical_mac_key``, so spelling never decides.
+        # ``radius_authorize_device_binding_all_vendors=false`` restores the
+        # NAS-only-only behaviour without a code change (rollback lever).
         if (
             session is not None
             and session.device_id is not None
             and canonical_mac_key(calling_station_id) is not None
-            and is_nas_only(router)
+            and (
+                is_nas_only(router)
+                or get_settings().radius_authorize_device_binding_all_vendors
+            )
         ):
             by_device = await self._session_for_calling_station(
                 guest_id=session.guest_id,
