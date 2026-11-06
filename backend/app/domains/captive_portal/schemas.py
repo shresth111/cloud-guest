@@ -20,7 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from .constants import (
     CONTENT_BODY_MAX_LENGTH,
     CONTENT_HEADING_MAX_LENGTH,
+    DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_FEEDBACK_DWELL_MINUTES,
+    DEFAULT_GUEST_FONT_CHOICE,
     DEFAULT_LANGUAGE,
     DEFAULT_PORTAL_CONTENT_MODE,
     DEFAULT_PRIMARY_COLOR,
@@ -315,6 +317,25 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "(e.g. 'Ask reception to add your number'). Null leaves the "
             "frontend's generic default copy in place -- the identical "
             "contract `business_hours_closed_message` already has."
+        ),
+    )
+
+    # The dashboard's create call has always sent these two; before they
+    # were declared here they were silently dropped (extra keys are
+    # ignored) and every new config was born with the column defaults.
+    guest_font_choice: str = Field(
+        default=DEFAULT_GUEST_FONT_CHOICE.value,
+        max_length=20,
+        description=(
+            "Curated heading-font allowlist: 'system' | 'modern-sans' | "
+            "'editorial-serif' | 'bold-display'. Validated server-side."
+        ),
+    )
+    background_overlay_strength: int = Field(
+        default=DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
+        description=(
+            "Guest-facing background scrim peak opacity, 0-100. Validated "
+            "server-side to the full [0, 100] range."
         ),
     )
 

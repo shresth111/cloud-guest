@@ -497,6 +497,7 @@ async def _create_config(
     feedback_dwell_minutes: int = DEFAULT_FEEDBACK_DWELL_MINUTES,
     requesting_organization_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = None,
+    **extra: object,
 ) -> CaptivePortalConfig:
     return await fx.service.create_config(
         actor_user_id=uuid.uuid4(),
@@ -550,6 +551,7 @@ async def _create_config(
             if require_guest_name is None
             else {"require_guest_name": require_guest_name}
         ),
+        **extra,
     )
 
 
@@ -4111,3 +4113,74 @@ class TestRfc8908UserPortalUrl:
             f"{HOTSPOT_DNS_NAME}/"
         )
 
+
+
+# ============================================================================
+# Create persists guest_font_choice / background_overlay_strength. The
+# dashboard's create call always sent both, but the create schema did not
+# declare them (extra keys are ignored), so every new config was silently
+# born with the column defaults.
+# ============================================================================
+
+
+class TestCreatePersistsFontAndOverlay:
+    def test_create_schema_accepts_both_fields(self) -> None:
+        from app.domains.captive_portal.schemas import (
+            CaptivePortalConfigCreateRequest,
+        )
+
+        payload = CaptivePortalConfigCreateRequest(
+            organization_id=uuid.uuid4(),
+            name="P",
+            guest_font_choice="editorial-serif",
+            background_overlay_strength=30,
+        )
+        assert payload.guest_font_choice == "editorial-serif"
+        assert payload.background_overlay_strength == 30
+
+    def test_create_schema_defaults_match_the_columns(self) -> None:
+        from app.domains.captive_portal.constants import (
+            DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
+            DEFAULT_GUEST_FONT_CHOICE,
+        )
+        from app.domains.captive_portal.schemas import (
+            CaptivePortalConfigCreateRequest,
+        )
+
+        payload = CaptivePortalConfigCreateRequest(
+            organization_id=uuid.uuid4(), name="P"
+        )
+        assert payload.guest_font_choice == DEFAULT_GUEST_FONT_CHOICE.value
+        assert payload.background_overlay_strength == (
+            DEFAULT_BACKGROUND_OVERLAY_STRENGTH
+        )
+
+    def test_create_route_forwards_both_fields(self) -> None:
+        import inspect
+
+        from app.domains.captive_portal import router as router_module
+
+        source = inspect.getsource(router_module)
+        assert "guest_font_choice=payload.guest_font_choice" in source
+        assert (
+            "background_overlay_strength=payload.background_overlay_strength"
+            in source
+        )
+
+    async def test_create_stores_both_values(self) -> None:
+        fx = make_service()
+        config = await _create_config(
+            fx, guest_font_choice="bold-display", background_overlay_strength=20
+        )
+        assert config.guest_font_choice == "bold-display"
+        assert config.background_overlay_strength == 20
+
+    async def test_create_rejects_unknown_font(self) -> None:
+        fx = make_service()
+        with pytest.raises(InvalidGuestFontChoiceError):
+            await _create_config(fx, guest_font_choice="Comic Sans MS")
+
+    async def test_create_rejects_out_of_range_overlay(self) -> None:
+        fx = make_service()
+        with pytest.raises(InvalidBackgroundOverlayStrengthError):
+            await _create_config(fx, background_overlay_strength=101)
