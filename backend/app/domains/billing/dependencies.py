@@ -54,6 +54,7 @@ from .exceptions import (
     LicenseNotFoundError,
 )
 from .payment_gateways import RazorpayPaymentGateway, StripePaymentGateway
+from .reminder_dispatch import BillingReminderService
 from .renewal_service import PaymentGatewayProtocol, RenewalService
 from .repository import (
     BillingDashboardRepository,
@@ -705,6 +706,23 @@ def get_customer_billing_dashboard_service(
     )
 
 
+def get_billing_reminder_service(
+    db: AsyncSession = Depends(get_db_session),
+    organization_service: OrganizationService = Depends(get_organization_service),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> BillingReminderService:
+    """Master Console > Billing > Reminders "Send" (see
+    ``reminder_dispatch``)."""
+    return BillingReminderService(
+        organizations=organization_service,
+        payments=PaymentRepository(db),
+        invoices=InvoiceRepository(db),
+        subscriptions=SubscriptionRepository(db),
+        plans=PlanRepository(db),
+        audit_writer=audit_repository,
+    )
+
+
 __all__ = [
     "get_plan_repository",
     "get_license_repository",
@@ -735,4 +753,5 @@ __all__ = [
     "get_billing_dashboard_repository",
     "get_super_admin_billing_dashboard_service",
     "get_customer_billing_dashboard_service",
+    "get_billing_reminder_service",
 ]

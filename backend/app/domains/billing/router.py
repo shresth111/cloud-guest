@@ -181,6 +181,7 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 from .constants import DiscountType, InvoiceStatus, PaymentStatus, PlanType
 from .dependencies import (
     get_billing_profile_service,
+    get_billing_reminder_service,
     get_coupon_service,
     get_customer_billing_dashboard_service,
     get_invoice_service,
@@ -213,11 +214,14 @@ from .models import (
     Subscription,
     TaxRate,
 )
+from .reminder_dispatch import BillingReminderService, ReminderKind
 from .renewal_service import RenewalService
 from .repository import PaymentRepositoryProtocol
 from .schemas import (
     BillingProfileResponse,
     BillingProfileUpsertRequest,
+    BillingReminderSendRequest,
+    BillingReminderSendResponse,
     CheckoutOrderRequest,
     CheckoutOrderResponse,
     ChurnRateResponse,
@@ -2744,6 +2748,53 @@ async def get_super_admin_billing_dashboard(
         success=True,
         message="Super Admin Billing dashboard retrieved",
         data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/billing/reminders/send",
+    response_model=ApiResponse[BillingReminderSendResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))],
+)
+async def send_billing_reminder(
+    request: Request,
+    payload: BillingReminderSendRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: BillingReminderService = Depends(get_billing_reminder_service),
+    settings: Settings = Depends(get_settings),
+):
+    """Master Console > Billing > Reminders "Send": emails the organization's
+    contact address about a failed payment, unpaid invoices, or the end of
+    its subscription period. The target organization comes from the body,
+    not the header org (this is a GLOBAL, estate-wide operator action, the
+    same as the super-admin dashboard the Reminders panel reads). The email's
+    facts are read server-side; ``409`` when there is nothing to remind
+    about. Sent from the invoice/finance mailbox, synchronously, so
+    ``email_sent``/``email_error`` is the real outcome. Every attempt is
+    audited (``AuditAction.BILLING_REMINDER_EMAILED``)."""
+    result = await service.send(
+        actor_user_id=uuid.UUID(user.id),
+        organization_id=payload.organization_id,
+        kind=ReminderKind(payload.kind),
+        email_provider_factory=lambda: _get_invoice_email_provider(settings),
+    )
+    data = BillingReminderSendResponse(
+        kind=result.kind.value,
+        organization_id=result.organization_id,
+        email_sent=result.email_sent,
+        email_recipient=result.email_recipient,
+        email_error=result.email_error,
+    )
+    return build_response(
+        success=True,
+        message=(
+            f"Reminder emailed to {result.email_recipient}"
+            if result.email_sent
+            else "The reminder could not be sent"
+        ),
+        data=data.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 
