@@ -3061,6 +3061,33 @@ class Settings(BaseSettings):
         ),
     )
 
+    guest_session_token_ttl_seconds: int = Field(
+        default=12 * 3600,
+        ge=60,
+        le=7 * 24 * 3600,
+        description=(
+            "Lifetime of the signed session_token a guest login response "
+            "carries (app.domains.guest.session_token). The session-mutating "
+            "guest endpoints accept it as proof the caller is the browser "
+            "that signed in."
+        ),
+    )
+    guest_session_token_enforcement: str = Field(
+        default="off",
+        pattern="^(off|sensitive|all)$",
+        description=(
+            "Which session-mutating guest endpoints REQUIRE a valid "
+            "session_token (QA 2026-11-06, H1). 'off' (transition default): "
+            "the old guest_id+session_id pair is still accepted, because "
+            "portal bundles cached in captive sheets keep sending it; a "
+            "token that IS sent is always checked, and every call without "
+            "one logs guest_session_token_missing. 'sensitive': "
+            "/set-password, /set-pin, /profile and /marketing-consent "
+            "require it. 'all': every one of them, including "
+            "/session/disconnect, /sign-in-name and the review flags. Raise "
+            "it once guest_session_token_missing stops appearing."
+        ),
+    )
     radius_authorize_device_binding_all_vendors: bool = Field(
         default=True,
         description=(

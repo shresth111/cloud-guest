@@ -204,6 +204,7 @@ from .service import (
     GuestService,
     RadiusService,
 )
+from .session_token import issue_guest_session_token, require_guest_session_proof
 from .validators import (
     DevicePresenceObservation,
     device_online_for_session,
@@ -801,11 +802,25 @@ async def _login_payload(
     result: GuestLoginResult,
     marketing_offer: MarketingConsentOfferResolver,
     service: GuestService,
+    *,
+    resume: bool = False,
 ) -> dict:
     """The login response plus ``marketing_consent_offer`` (Guest Marketing
     contract §5.8) and the review-page bits. Neither resolver raises:
-    marketing and the review ask can never fail a guest login."""
+    marketing and the review ask can never fail a guest login.
+
+    ``resume`` is ``GET /session/active``, which anyone who knows a router
+    id and a device MAC can call (QA 2026-11-06, H1): it never issues a
+    ``session_token``, so once ``guest_session_token_enforcement`` is raised
+    the ids it returns stop being enough to change anything the token
+    guards. The identifier stays unmasked there for now: the portal posts it
+    as the hotspot ``username`` when it resumes, and RADIUS resolves the
+    session by it. A real login gets a fresh token."""
     response = _login_response(result)
+    if not resume:
+        response.session_token = issue_guest_session_token(
+            result.guest.id, result.session.id
+        )
     response.marketing_consent_offer = await marketing_offer.offer_for(result)
     response.review_prompt_due = await service.review_prompt_due(
         result.guest, result.session
@@ -1013,7 +1028,9 @@ async def guest_active_session(
         success=True,
         message="Active session found" if result else "No active session",
         data=(
-            (await _login_payload(result, marketing_offer, service)) if result else None
+            (await _login_payload(result, marketing_offer, service, resume=True))
+            if result
+            else None
         ),
         request_id=_request_id(request),
     )
@@ -1128,6 +1145,12 @@ async def guest_set_password(
     payload: GuestSetPasswordRequest,
     service: GuestService = Depends(get_guest_service),
 ):
+    require_guest_session_proof(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        session_token=payload.session_token,
+        sensitive=True,
+    )
     guest = await service.set_guest_password(
         guest_id=payload.guest_id,
         session_id=payload.session_id,
@@ -1153,6 +1176,12 @@ async def guest_set_pin(
     payload: GuestSetPinRequest,
     service: GuestService = Depends(get_guest_service),
 ):
+    require_guest_session_proof(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        session_token=payload.session_token,
+        sensitive=True,
+    )
     guest = await service.set_guest_pin(
         guest_id=payload.guest_id,
         session_id=payload.session_id,
@@ -1176,6 +1205,12 @@ async def guest_update_profile(
     payload: GuestUpdateProfileRequest,
     service: GuestService = Depends(get_guest_service),
 ):
+    require_guest_session_proof(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        session_token=payload.session_token,
+        sensitive=True,
+    )
     guest = await service.update_guest_profile(
         guest_id=payload.guest_id,
         session_id=payload.session_id,
@@ -1211,6 +1246,12 @@ async def guest_submit_sign_in_name(
     login, so the write is never racing the network handoff. Errors:
     400 ``guest_name_invalid`` (empty/whitespace/too long), 403 (no
     eligible session), 400 (venue does not collect names)."""
+    require_guest_session_proof(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        session_token=payload.session_token,
+        sensitive=False,
+    )
     guest = await service.submit_sign_in_name(
         guest_id=payload.guest_id,
         session_id=payload.session_id,
@@ -1253,6 +1294,12 @@ async def guest_review_link_opened(
     long the guest is connected, and under Google's Rating Manipulation
     policy nothing may.
     """
+    require_guest_session_proof(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        session_token=payload.session_token,
+        sensitive=False,
+    )
     guest = await service.record_review_link_opened(
         guest_id=payload.guest_id,
         session_id=payload.session_id,
@@ -1283,6 +1330,12 @@ async def guest_review_prompt_shown(
     Starts the per-location cooldown -- see
     ``GuestService.record_review_prompt_shown``. Called fire-and-forget by
     the portal; it changes nothing about the guest's connection."""
+    require_guest_session_proof(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        session_token=payload.session_token,
+        sensitive=False,
+    )
     await service.record_review_prompt_shown(
         guest_id=payload.guest_id,
         session_id=payload.session_id,
@@ -1305,6 +1358,12 @@ async def guest_disconnect_own_session(
     payload: GuestDisconnectRequest,
     service: GuestService = Depends(get_guest_service),
 ):
+    require_guest_session_proof(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        session_token=payload.session_token,
+        sensitive=False,
+    )
     session = await service.disconnect_own_session(
         guest_id=payload.guest_id,
         session_id=payload.session_id,

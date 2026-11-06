@@ -977,3 +977,18 @@ class GuestPinLockedError(GuestError):
             "sign in with a one-time code instead.",
             status_code=status.HTTP_423_LOCKED,
         )
+
+
+class GuestSessionProofRequiredError(GuestError):
+    """A session-mutating guest endpoint was called without a valid
+    ``session_token`` for the ``guest_id``/``session_id`` it names (QA
+    2026-11-06, H1). The ids alone are not a credential: ``GET
+    /guest/session/active`` hands them to anyone who knows a router id and a
+    device MAC. The remedy is the same whatever leg failed: sign in again."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Please sign in again to change this.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            data={"code": "GUEST_SESSION_PROOF_REQUIRED"},
+        )
