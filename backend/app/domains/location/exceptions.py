@@ -46,6 +46,22 @@ class LocationArchivedError(LocationError):
         )
 
 
+class LocationHasRoutersError(LocationError):
+    """``DELETE /locations/{id}`` refused because routers are still attached.
+
+    Archiving only soft-deletes the location row: the routers keep their
+    tunnel, RADIUS client and hotspot config and keep serving guests, but
+    vanish from every location-scoped screen. Decommission them first."""
+
+    def __init__(self, location_id: uuid.UUID, router_count: int) -> None:
+        noun = "router is" if router_count == 1 else "routers are"
+        super().__init__(
+            f"Location {location_id} cannot be deleted: {router_count} "
+            f"{noun} still attached. Decommission them first.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class LocationOrganizationImmutableError(LocationError):
     """A location's ``organization_id`` cannot be changed after creation --
     see ``docs/location/LOCATION_ARCHITECTURE.md`` for the reasoning."""
