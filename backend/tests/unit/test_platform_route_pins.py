@@ -28,8 +28,11 @@ PLATFORM_ONLY_MODULES = {
     "traffic_flows",
     "device_console",
 }
+# ``organizations.create`` is deliberately absent: MSP staff may create
+# children of their own MSP organization (owner decision 2026-11-06). That
+# rule lives in ``organization.router.authorize_organization_create`` and is
+# pinned in ``test_organization_create_authorization``.
 PLATFORM_ONLY_KEYS = {
-    "organizations.create",
     "subscriptions.create",
     "subscriptions.update",
 }

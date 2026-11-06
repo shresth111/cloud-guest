@@ -36,12 +36,16 @@ from app.domains.monitoring.dependencies import (
     get_notification_service,
 )
 from app.domains.monitoring.service import AlertService, NotificationService
+from app.domains.rbac.authorization import AccessValidator
+from app.domains.rbac.context import ScopeContext
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
+    get_access_validator,
 )
 from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.exceptions import PermissionDeniedError
 
 from .dependencies import get_organization_service
 from .enums import MembershipStatus, OrganizationStatus, OrganizationType
@@ -171,22 +175,85 @@ async def list_organizations(
     )
 
 
+async def authorize_organization_create(
+    *,
+    actor_user_id: uuid.UUID,
+    requested_parent_id: uuid.UUID | None,
+    requesting_organization_id: uuid.UUID | None,
+    access_validator: AccessValidator,
+    organization_service: OrganizationService,
+) -> uuid.UUID | None:
+    """Who may ``POST /organizations``, and under which parent. Returns the
+    parent the new organization gets.
+
+    * Platform staff (``organizations.create`` at GLOBAL scope): anything,
+      exactly as requested.
+    * An MSP organization's own staff (``organizations.create`` held in that
+      MSP organization): a child of THEIR MSP only. The parent defaults to
+      the caller's MSP organization -- the dashboard's OrganizationWizard
+      sends no ``parent_organization_id`` -- and naming any other parent is
+      refused (the body names the target, the header the caller's
+      organization; the two must agree, see ``wyfy_path_id_scoping``).
+    * Everyone else, including the owner of a plain (non-MSP) tenant: 403.
+      Before 2026-11-06 any tenant owner could create organizations, because
+      the check ran at the caller's own scope.
+    """
+    if await access_validator.has_permission(
+        actor_user_id,
+        "organizations.create",
+        scope_type=ScopeType.GLOBAL,
+        scope_context=ScopeContext.global_scope(),
+    ):
+        return requested_parent_id
+    denied = PermissionDeniedError("organizations.create", "your own MSP organization")
+    if requesting_organization_id is None:
+        raise denied
+    caller_org = await organization_service.get_organization(requesting_organization_id)
+    if caller_org is None or not caller_org.is_msp():
+        raise denied
+    if not await access_validator.has_permission(
+        actor_user_id,
+        "organizations.create",
+        scope_type=ScopeType.ORGANIZATION,
+        scope_context=ScopeContext.for_organization(requesting_organization_id),
+    ):
+        raise denied
+    if (
+        requested_parent_id is not None
+        and requested_parent_id != requesting_organization_id
+    ):
+        raise denied
+    return requesting_organization_id
+
+
 @router.post(
     "/organizations",
     response_model=ApiResponse[OrganizationResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[
-        Depends(RequirePermission("organizations.create", scope=ScopeType.GLOBAL))
-    ],
+    # Not pinned GLOBAL: MSP staff keep creating their own customers'
+    # organizations (owner decision 2026-11-06). This route-level check is
+    # the coarse gate main always had (the key at the caller's own scope);
+    # ``authorize_organization_create`` in the handler is the real rule, and
+    # refuses plain tenant owners and any parent but the caller's own MSP.
+    dependencies=[Depends(RequirePermission("organizations.create"))],
 )
 async def create_organization(
     request: Request,
     payload: OrganizationCreateRequest,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    access_validator: AccessValidator = Depends(get_access_validator),
     organization_service: OrganizationService = Depends(get_organization_service),
     alert_service: AlertService = Depends(get_alert_service),
     notification_service: NotificationService = Depends(get_notification_service),
 ):
+    parent_organization_id = await authorize_organization_create(
+        actor_user_id=uuid.UUID(user.id),
+        requested_parent_id=payload.parent_organization_id,
+        requesting_organization_id=requesting_organization_id,
+        access_validator=access_validator,
+        organization_service=organization_service,
+    )
     organization = await organization_service.create_organization(
         actor_user_id=uuid.UUID(user.id),
         name=payload.name,
@@ -194,7 +261,7 @@ async def create_organization(
         legal_name=payload.legal_name,
         org_type=payload.org_type,
         status=payload.status,
-        parent_organization_id=payload.parent_organization_id,
+        parent_organization_id=parent_organization_id,
         contact_email=payload.contact_email,
         contact_phone=payload.contact_phone,
         timezone=payload.timezone,
