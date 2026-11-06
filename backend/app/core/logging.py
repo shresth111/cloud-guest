@@ -151,6 +151,13 @@ def configure_logging(settings: Settings) -> None:
     # take credentials in the query string (Ping4SMS: ``key=``) and the OTP
     # text itself (``sms=``) therefore landed in plain text in the container
     # and file logs on every guest OTP. Warnings and errors still come through.
+    quiet_http_client_loggers(log_level)
+
+
+def quiet_http_client_loggers(log_level: int = logging.INFO) -> None:
+    """Keep httpx/httpcore at WARNING or above: their INFO line is the full
+    outbound URL, query string included (Ping4SMS ``key=`` and ``sms=``).
+    Called by ``configure_logging`` and by the Celery worker's logger hook."""
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(max(log_level, logging.WARNING))
 
