@@ -1024,6 +1024,9 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # Inert unless CLOUDGUEST_TRAFFIC_FLOW_ENABLED is true. See
         # app.domains.traffic_flow.tasks.
         "traffic-flow-pull-sweep",
+        # Read-only security detection rules every 5 minutes (QA 2026-11-06).
+        # See app.domains.monitoring.security_detections.
+        "security-detection-sweep",
     }
 
 
