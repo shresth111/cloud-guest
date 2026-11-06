@@ -10109,11 +10109,22 @@ class RadiusService:
                 calling_station_id=calling_station_id,
             )
             if by_device is None or not by_device.is_active():
-                logger.info(
-                    "radius_authorize_device_not_signed_in",
-                    extra={**decision_extra, "event_session_id": str(session.id)},
-                )
-                session = None
+                if (
+                    not is_nas_only(router)
+                    and get_settings().radius_authorize_device_binding_mode == "log"
+                ):
+                    # First-deploy mode for MikroTik/Omada: record what
+                    # enforcement would have refused, and admit as before.
+                    logger.warning(
+                        "radius_authorize_device_mismatch_admitted",
+                        extra={**decision_extra, "event_session_id": str(session.id)},
+                    )
+                else:
+                    logger.info(
+                        "radius_authorize_device_not_signed_in",
+                        extra={**decision_extra, "event_session_id": str(session.id)},
+                    )
+                    session = None
             else:
                 session = by_device
         # A session that has already spent its wall-clock allowance is not

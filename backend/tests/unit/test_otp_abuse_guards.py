@@ -217,6 +217,23 @@ class TestDailyCaps:
             location_id=other,
         )
 
+    async def test_log_mode_counts_but_still_sends(self) -> None:
+        """``otp_daily_cap_mode=log`` (the first-deploy default) must never
+        refuse a guest: it only records that the cap was passed."""
+        fx = make_service(max_requests_per_window=100)
+        fx.service.daily_cap_per_location = 1
+        fx.service.daily_cap_enforce = False
+        venue = uuid.uuid4()
+        for i in range(3):
+            await fx.service.request_otp(
+                identifier=f"+1555123456{i}",
+                channel=OtpChannel.SMS,
+                purpose=OtpPurpose.GUEST_LOGIN,
+                organization_id=None,
+                location_id=venue,
+            )
+        assert len(fx.sms_provider.sent) == 3
+
     async def test_platform_cap(self) -> None:
         fx = make_service(max_requests_per_window=100)
         fx.service.daily_cap_platform = 2
@@ -261,6 +278,9 @@ def test_settings_defaults_are_on() -> None:
     fields = Settings.model_fields
     assert fields["otp_daily_cap_per_location"].default > 0
     assert fields["otp_daily_cap_platform"].default > 0
+    # Counted from the first deploy, enforced only once sized against real
+    # peaks (no production volume figures were on hand).
+    assert fields["otp_daily_cap_mode"].default == "log"
 
 
 class TestLoggingWhatsAppProviderNeverLogsALiveCode:

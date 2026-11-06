@@ -26,6 +26,18 @@ async def _otp_login(fx, *, router_id, location_id):  # noqa: ANN001, ANN202
     )
 
 
+@pytest.fixture(autouse=True)
+def _enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped default is 'log' (first deploy); these pin enforcement."""
+    monkeypatch.setattr(get_settings(), "guest_login_router_venue_check", "enforce")
+
+
+def test_the_first_deploy_default_is_log_only() -> None:
+    from app.core.config import Settings
+
+    assert Settings.model_fields["guest_login_router_venue_check"].default == "log"
+
+
 class TestRouterMustBelongToTheVenue:
     async def test_the_venues_own_router_is_admitted(self) -> None:
         fx = make_fixture()

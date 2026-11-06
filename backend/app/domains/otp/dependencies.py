@@ -82,6 +82,7 @@ def get_otp_service(
         sms_message_template=settings.otp_sms_message_template,
         daily_cap_per_location=settings.otp_daily_cap_per_location,
         daily_cap_platform=settings.otp_daily_cap_platform,
+        daily_cap_enforce=settings.otp_daily_cap_mode == "enforce",
     )
 
 

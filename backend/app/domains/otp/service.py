@@ -1414,6 +1414,7 @@ class OtpService:
         sms_message_template: str = "",
         daily_cap_per_location: int = 0,
         daily_cap_platform: int = 0,
+        daily_cap_enforce: bool = True,
     ) -> None:
         self.repository = repository
         self.redis = redis
@@ -1434,6 +1435,7 @@ class OtpService:
         # 0 = no cap. Production values come from Settings (QA H4).
         self.daily_cap_per_location = daily_cap_per_location
         self.daily_cap_platform = daily_cap_platform
+        self.daily_cap_enforce = daily_cap_enforce
 
     # ========================================================================
     # Request
@@ -1521,9 +1523,11 @@ class OtpService:
                         "event_scope": scope,
                         "event_cap": cap,
                         "event_location_id": str(location_id),
+                        "event_enforced": self.daily_cap_enforce,
                     },
                 )
-                raise OtpDailyCapReachedError(scope)
+                if self.daily_cap_enforce:
+                    raise OtpDailyCapReachedError(scope)
 
     async def _dispatch(
         self,

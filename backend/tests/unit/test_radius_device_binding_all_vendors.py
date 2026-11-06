@@ -55,6 +55,15 @@ async def _sign_in(fx, mac: str | None = _MAC):  # noqa: ANN001, ANN202
 _VENDORS = ["mikrotik", "tplink_omada"]
 
 
+@pytest.fixture(autouse=True)
+def _enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped default is 'log' (first deploy); these pin enforcement.
+    The log-mode behaviour is pinned in ``TestFirstDeployLogMode``."""
+    monkeypatch.setattr(
+        get_settings(), "radius_authorize_device_binding_mode", "enforce"
+    )
+
+
 @pytest.mark.parametrize("vendor", _VENDORS)
 class TestDeviceBinding:
     async def test_the_signed_in_device_is_accepted(self, vendor: str) -> None:
@@ -124,3 +133,26 @@ class TestDeviceBinding:
             nas_client=nas, username=_PHONE, calling_station_id="0A:1B:2C:3D:4E:5F"
         )
         assert authz.authorized is True
+
+
+class TestFirstDeployLogMode:
+    @pytest.mark.parametrize("vendor", _VENDORS)
+    async def test_log_mode_admits_a_mismatch_on_mikrotik_and_omada(
+        self, vendor: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            get_settings(), "radius_authorize_device_binding_mode", "log"
+        )
+        fx = _fixture(vendor)
+        nas = await _nas(fx)
+        await _sign_in(fx)
+        authz = await fx.radius_service.authorize(
+            nas_client=nas, username=_PHONE, calling_station_id="0A:1B:2C:3D:4E:5F"
+        )
+        assert authz.authorized is True
+
+    def test_the_first_deploy_default_is_log_only(self) -> None:
+        from app.core.config import Settings
+
+        field = Settings.model_fields["radius_authorize_device_binding_mode"]
+        assert field.default == "log"

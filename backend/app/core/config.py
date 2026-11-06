@@ -3089,14 +3089,18 @@ class Settings(BaseSettings):
         ),
     )
     guest_login_router_venue_check: str = Field(
-        default="enforce",
+        default="log",
         pattern="^(enforce|log)$",
         description=(
             "QA 2026-11-06 H2: a guest login's router_id must belong to the "
             "organization and (when the router has one) the location the "
             "login names. 'enforce' refuses a mismatch with 403 "
             "ROUTER_NOT_AT_VENUE; 'log' only writes "
-            "guest_login_router_not_at_venue and admits (rollback lever)."
+            "guest_login_router_not_at_venue and admits. Defaults to 'log' "
+            "for the first deploy: a router moved to another location whose "
+            "portal URL still names the old one would otherwise lock real "
+            "guests out. Set 'enforce' once the log line is quiet and the "
+            "read-only router/location SQL in PR #501 shows no mismatch."
         ),
     )
     otp_daily_cap_per_location: int = Field(
@@ -3108,6 +3112,17 @@ class Settings(BaseSettings):
             "day (all channels), counted in Redis before a provider is paid. "
             "0 disables the cap. Backstop against SMS pumping, which rotates "
             "numbers and so defeats the per-identifier limit."
+        ),
+    )
+    otp_daily_cap_mode: str = Field(
+        default="log",
+        pattern="^(enforce|log)$",
+        description=(
+            "QA 2026-11-06 H4: what reaching otp_daily_cap_per_location / "
+            "otp_daily_cap_platform does. 'log' (first-deploy default) writes "
+            "otp_daily_cap_reached and still sends; 'enforce' refuses with "
+            "429. No production volume figures were on hand to size the caps "
+            "against real peaks (a temple festival day), so they log first."
         ),
     )
     otp_daily_cap_platform: int = Field(
@@ -3129,6 +3144,18 @@ class Settings(BaseSettings):
             "voucher redemption window. Sized for a venue, because every "
             "guest at one leaves through its single NAT address; before, the "
             "bucket was keyed on a client-supplied value and so unbounded."
+        ),
+    )
+    radius_authorize_device_binding_mode: str = Field(
+        default="log",
+        pattern="^(enforce|log)$",
+        description=(
+            "QA 2026-11-06 C2, MikroTik and Omada only (NAS-only APs always "
+            "enforce, as before). 'log' (first-deploy default) writes "
+            "radius_authorize_device_mismatch_admitted and accepts, so a MAC "
+            "format or Calling-Station-Id surprise on the live fleet shows in "
+            "the logs instead of locking guests out; 'enforce' rejects. Set "
+            "'enforce' once that line shows only genuine strangers."
         ),
     )
     radius_authorize_device_binding_all_vendors: bool = Field(
