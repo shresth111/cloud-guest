@@ -1283,7 +1283,7 @@ class TestUnconfiguredWebhookSecretRefused:
                 tolerance_seconds=300,
             )
 
-    def test_strict_check_and_startup_warning_name_unset_secrets(self) -> None:
+    def test_startup_warning_names_unset_secrets(self) -> None:
         from app.core.config import Settings
 
         prod = Settings(
@@ -1294,9 +1294,27 @@ class TestUnconfiguredWebhookSecretRefused:
         assert prod.unset_payment_webhook_secrets() == [
             "CLOUDGUEST_STRIPE_WEBHOOK_SECRET"
         ]
-        with pytest.raises(ValueError, match="CLOUDGUEST_STRIPE_WEBHOOK_SECRET"):
-            prod.validate_no_public_secrets()
         assert Settings(environment="local").unset_payment_webhook_secrets() == []
+
+    def test_an_unset_payment_secret_never_refuses_startup(self) -> None:
+        """A deployment that takes no Stripe payments leaves its secret empty.
+        With strict_production_secrets on, that must not stop the API (and
+        with it guest login) from booting; the webhook refuses instead."""
+        from cryptography.fernet import Fernet
+
+        from app.core.config import Settings
+
+        prod = Settings(
+            environment="production",
+            strict_production_secrets=True,
+            jwt_secret_key="a-real-secret-that-is-at-least-32-characters",
+            router_encryption_key=Fernet.generate_key().decode(),
+            network_integration_encryption_key=Fernet.generate_key().decode(),
+            mfa_encryption_key=Fernet.generate_key().decode(),
+            stripe_webhook_secret="",
+            razorpay_webhook_secret="",
+        )
+        prod.validate_no_public_secrets()
 
 
 # ============================================================================

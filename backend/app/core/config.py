@@ -3236,9 +3236,12 @@ class Settings(BaseSettings):
         environment. Used when strict_production_secrets is enabled."""
         if self.is_local_environment:
             return
-        defaulted = (
-            self.secrets_at_public_default() + self.unset_payment_webhook_secrets()
-        )
+        # Unset payment webhook secrets are NOT part of this. A deployment
+        # that does not take Stripe (or Razorpay) payments leaves that secret
+        # empty on purpose; refusing to boot over it would take guest WiFi
+        # login down with the API. The webhook itself refuses (503) and
+        # startup logs payment_webhook_secret_unset instead.
+        defaulted = self.secrets_at_public_default()
         if defaulted:
             raise ValueError(
                 f"Refusing to run in '{self.environment}' environment with secrets at "
