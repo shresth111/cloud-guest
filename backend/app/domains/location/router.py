@@ -51,6 +51,7 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 from app.domains.router.dependencies import get_router_service
+from app.domains.router.enums import RouterStatus
 from app.domains.router.service import RouterService
 from app.domains.vlan.dependencies import get_vlan_service
 from app.domains.vlan.service import VlanService
@@ -458,8 +459,22 @@ async def archive_location(
         page=1,
         page_size=1,
     )
-    if router_meta.total_items > 0:
-        raise LocationHasRoutersError(location_id, router_meta.total_items)
+    attached = router_meta.total_items
+    if attached > 0:
+        # ``list_routers`` hides soft-deleted rows only; a DECOMMISSIONED
+        # router is still listed. It no longer serves guests, so it must not
+        # block the archive -- otherwise a location whose router was
+        # decommissioned could never be deleted by anyone.
+        _, decommissioned_meta = await router_service.list_routers(
+            location_id=location_id,
+            requesting_organization_id=requesting_organization_id,
+            page=1,
+            page_size=1,
+            status=RouterStatus.DECOMMISSIONED,
+        )
+        attached -= decommissioned_meta.total_items
+    if attached > 0:
+        raise LocationHasRoutersError(location_id, attached)
     await location_service.archive_location(
         actor_user_id=uuid.UUID(user.id),
         location_id=location_id,

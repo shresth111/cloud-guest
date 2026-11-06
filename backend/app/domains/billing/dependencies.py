@@ -710,10 +710,12 @@ def get_billing_reminder_service(
     db: AsyncSession = Depends(get_db_session),
     organization_service: OrganizationService = Depends(get_organization_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    redis: Redis = Depends(get_redis_client),
 ) -> BillingReminderService:
     """Master Console > Billing > Reminders "Send" (see
     ``reminder_dispatch``)."""
     return BillingReminderService(
+        cooldown_store=redis,
         organizations=organization_service,
         payments=PaymentRepository(db),
         invoices=InvoiceRepository(db),

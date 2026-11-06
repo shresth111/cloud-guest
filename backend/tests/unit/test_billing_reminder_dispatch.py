@@ -23,6 +23,7 @@ from app.domains.billing.reminder_dispatch import (
     BillingReminderService,
     NothingToRemindError,
     ReminderKind,
+    ReminderRecentlySentError,
 )
 from app.domains.otp.service import LoggingEmailProvider
 from app.domains.rbac.enums import AuditAction
@@ -292,3 +293,89 @@ def test_route_is_registered_global_billing_manage() -> None:
         if "permission_key" in inspect.getclosurevars(d.dependency).nonlocals
     ]
     assert gates == [{"permission_key": "billing.manage", "scope": ScopeType.GLOBAL}]
+
+
+# ---------------------------------------------------------------------------
+# Cooldown: an operator double-click must not mail a customer twice.
+# ---------------------------------------------------------------------------
+
+
+class FakeCooldownStore:
+    """``SET NX EX`` / ``DEL`` semantics of the real Redis client."""
+
+    def __init__(self, *, broken: bool = False) -> None:
+        self.keys: dict[str, int] = {}
+        self.broken = broken
+
+    async def set(self, name: str, value: str, *, nx: bool, ex: int) -> bool | None:
+        if self.broken:
+            raise ConnectionError("redis down")
+        if nx and name in self.keys:
+            return None
+        self.keys[name] = ex
+        return True
+
+    async def delete(self, *names: str) -> int:
+        for name in names:
+            self.keys.pop(name, None)
+        return len(names)
+
+
+def _cooled_service(store: FakeCooldownStore) -> BillingReminderService:
+    svc = _service(invoices=[_invoice("INV-1", "issued")], audit=FakeAudit())
+    svc.cooldown_store = store
+    return svc
+
+
+async def test_a_second_send_inside_the_cooldown_is_refused_and_not_sent() -> None:
+    store = FakeCooldownStore()
+    svc = _cooled_service(store)
+    provider = RecordingProvider()
+    kwargs = dict(
+        actor_user_id=uuid.uuid4(),
+        organization_id=ORG,
+        kind=ReminderKind.INVOICE_DUE,
+        email_provider_factory=lambda: provider,
+    )
+    assert (await svc.send(**kwargs)).email_sent is True
+    with pytest.raises(ReminderRecentlySentError) as exc:
+        await svc.send(**kwargs)
+    assert exc.value.status_code == 409
+    assert len(provider.sent) == 1
+    # Another kind for the same org is a different reminder.
+    with pytest.raises(NothingToRemindError):
+        await svc.send(**{**kwargs, "kind": ReminderKind.PAYMENT_FAILED})
+
+
+async def test_a_failed_send_releases_the_slot_so_the_operator_can_retry() -> None:
+    store = FakeCooldownStore()
+    svc = _cooled_service(store)
+    failing = RecordingProvider(fail=RuntimeError("smtp 535"))
+    first = await svc.send(
+        actor_user_id=uuid.uuid4(),
+        organization_id=ORG,
+        kind=ReminderKind.INVOICE_DUE,
+        email_provider_factory=lambda: failing,
+    )
+    assert first.email_sent is False
+    assert store.keys == {}
+    provider = RecordingProvider()
+    second = await svc.send(
+        actor_user_id=uuid.uuid4(),
+        organization_id=ORG,
+        kind=ReminderKind.INVOICE_DUE,
+        email_provider_factory=lambda: provider,
+    )
+    assert second.email_sent is True
+
+
+async def test_redis_down_does_not_block_the_send() -> None:
+    svc = _cooled_service(FakeCooldownStore(broken=True))
+    provider = RecordingProvider()
+    result = await svc.send(
+        actor_user_id=uuid.uuid4(),
+        organization_id=ORG,
+        kind=ReminderKind.INVOICE_DUE,
+        email_provider_factory=lambda: provider,
+    )
+    assert result.email_sent is True

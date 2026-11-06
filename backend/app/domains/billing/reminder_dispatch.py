@@ -23,6 +23,11 @@ Design rules:
 * **Every attempt is audited**, success or failure, as
   ``AuditAction.BILLING_REMINDER_EMAILED`` with the outcome in the
   description and metadata.
+* **One email per (organization, kind) per cooldown.** A double-click, two
+  operators on the same row, or a retry after a slow response must not mail
+  a customer twice. A Redis ``SET NX`` claims the slot before sending (atomic
+  across api workers); a send that did not happen releases it so the
+  operator can retry at once. If Redis is unreachable the send goes ahead.
 """
 
 from __future__ import annotations
@@ -56,6 +61,11 @@ logger = logging.getLogger(__name__)
 NO_PROVIDER_ERROR = "No real email delivery provider is configured on this server."
 NO_RECIPIENT_ERROR = "This organization has no contact email on file."
 
+# A second reminder of the same kind to the same organization inside this
+# window is refused with 409.
+REMINDER_COOLDOWN_SECONDS = 10 * 60
+_REMINDER_COOLDOWN_KEY = "billing_reminder_sent:{organization_id}:{kind}"
+
 # How many unpaid invoices one reminder lists. An organization with more
 # than this gets the first N plus a count of the rest.
 _MAX_INVOICES_LISTED = 10
@@ -79,6 +89,23 @@ class NothingToRemindError(BillingError):
             status_code=status.HTTP_409_CONFLICT,
             data={"error_code": "nothing_to_remind", "kind": kind.value},
         )
+
+
+class ReminderRecentlySentError(BillingError):
+    def __init__(self, kind: ReminderKind) -> None:
+        minutes = REMINDER_COOLDOWN_SECONDS // 60
+        super().__init__(
+            "This reminder was already sent to this organization in the last "
+            f"{minutes} minutes. It was not sent again.",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"error_code": "reminder_recently_sent", "kind": kind.value},
+        )
+
+
+class _CooldownStore(Protocol):
+    async def set(self, name: str, value: str, *, nx: bool, ex: int) -> Any: ...
+
+    async def delete(self, *names: str) -> Any: ...
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +179,9 @@ class BillingReminderService:
         subscriptions: _SubscriptionLookup,
         plans: _PlanLookup,
         audit_writer: _AuditWriter | None,
+        cooldown_store: _CooldownStore | None = None,
     ) -> None:
+        self.cooldown_store = cooldown_store
         self.organizations = organizations
         self.payments = payments
         self.invoices = invoices
@@ -177,9 +206,14 @@ class BillingReminderService:
 
         email_sent = False
         email_error: str | None = None
+        cooldown_key = _REMINDER_COOLDOWN_KEY.format(
+            organization_id=organization_id, kind=kind.value
+        )
+        claimed = False
         if recipient is None:
             email_error = NO_RECIPIENT_ERROR
         else:
+            claimed = await self._claim_cooldown(cooldown_key, kind)
             try:
                 email_provider = email_provider_factory()
                 if isinstance(email_provider, LoggingEmailProvider):
@@ -197,6 +231,8 @@ class BillingReminderService:
                     },
                 )
                 email_error = str(exc) or exc.__class__.__name__
+        if claimed and not email_sent:
+            await self._release_cooldown(cooldown_key)
 
         await self._audit(
             actor_user_id=actor_user_id,
@@ -214,6 +250,32 @@ class BillingReminderService:
             email_recipient=recipient,
             email_error=email_error,
         )
+
+    async def _claim_cooldown(self, key: str, kind: ReminderKind) -> bool:
+        """``True`` when this call holds the slot, ``False`` when there is no
+        store or it failed (fail-open). Raises when another send holds it."""
+        if self.cooldown_store is None:
+            return False
+        try:
+            acquired = await self.cooldown_store.set(
+                key, "1", nx=True, ex=REMINDER_COOLDOWN_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 -- Redis down must not block billing mail
+            logger.warning(
+                "billing_reminder_cooldown_unavailable", extra={"error": str(exc)}
+            )
+            return False
+        if not acquired:
+            raise ReminderRecentlySentError(kind)
+        return True
+
+    async def _release_cooldown(self, key: str) -> None:
+        try:
+            await self.cooldown_store.delete(key)  # type: ignore[union-attr]
+        except Exception as exc:  # noqa: BLE001 -- the slot then just expires
+            logger.warning(
+                "billing_reminder_cooldown_release_failed", extra={"error": str(exc)}
+            )
 
     # ------------------------------------------------------------------
     # Content, built from server-side billing data only
