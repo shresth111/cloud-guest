@@ -236,6 +236,10 @@ class FakeVoucherService:
 
     vouchers: dict[str, tuple[Voucher, VoucherBatch]] = field(default_factory=dict)
     plan_queue_profiles: dict[uuid.UUID, uuid.UUID | None] = field(default_factory=dict)
+    # The org a registered batch belongs to unless the test names one --
+    # ``make_fixture`` points it at the fixture's own organization.
+    default_organization_id: uuid.UUID | None = None
+    redeem_calls: list[dict[str, object]] = field(default_factory=list)
 
     def register(
         self,
@@ -244,12 +248,16 @@ class FakeVoucherService:
         data_limit_mb: int | None,
         validity_minutes: int,
         plan_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         batch = VoucherBatch(
             **_base_fields(
                 name="Batch",
-                organization_id=uuid.uuid4(),
-                location_id=None,
+                organization_id=(
+                    organization_id or self.default_organization_id or uuid.uuid4()
+                ),
+                location_id=location_id,
                 plan_id=plan_id,
                 series_id=None,
                 quantity=1,
@@ -288,11 +296,31 @@ class FakeVoucherService:
         self.plan_queue_profiles[plan_id] = queue_profile_id
 
     async def redeem_voucher(
-        self, *, code: str, identifier: str, source: str
+        self,
+        *,
+        code: str,
+        identifier: str,
+        source: str,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         if code not in self.vouchers:
             raise VoucherNotFoundError()
-        return self.vouchers[code]
+        voucher, batch = self.vouchers[code]
+        # Mirrors VoucherService.redeem_voucher's venue rule (QA H3).
+        if organization_id is not None and (
+            batch.organization_id != organization_id
+            or (
+                location_id is not None
+                and batch.location_id is not None
+                and batch.location_id != location_id
+            )
+        ):
+            raise VoucherNotFoundError()
+        self.redeem_calls.append(
+            {"source": source, "organization_id": organization_id}
+        )
+        return voucher, batch
 
     async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
         return self.plan_queue_profiles.get(plan_id)
@@ -1727,6 +1755,7 @@ def make_fixture(
 
     organization_id = uuid.uuid4()
     location_id = uuid.uuid4()
+    voucher_service.default_organization_id = organization_id
     captive_portal_service.register(
         organization_id,
         otp_sms_enabled=otp_sms_enabled,

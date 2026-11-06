@@ -963,7 +963,13 @@ class VoucherService:
         )
 
     async def redeem_voucher(
-        self, *, code: str, identifier: str, source: str
+        self,
+        *,
+        code: str,
+        identifier: str,
+        source: str,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         """Redeems ``code`` exactly once, atomically.
 
@@ -1000,6 +1006,30 @@ class VoucherService:
         """
         await self._enforce_redemption_rate_limit(source)
         voucher, batch = await self._get_voucher_and_batch(code)
+        # QA 2026-11-06 H3: codes are looked up globally, so a venue must not
+        # accept another org's -- or, for a location-bound batch, another
+        # location's -- voucher. Answered as "not found" (no oracle for
+        # which venues a code belongs to), and before any write, so the
+        # voucher is neither burned nor marked as a failed attempt.
+        if organization_id is not None and (
+            batch.organization_id != organization_id
+            or (
+                location_id is not None
+                and batch.location_id is not None
+                and batch.location_id != location_id
+            )
+        ):
+            logger.info(
+                "voucher_redeem_wrong_venue",
+                extra={
+                    "event_voucher_id": str(voucher.id),
+                    "event_batch_organization_id": str(batch.organization_id),
+                    "event_batch_location_id": str(batch.location_id),
+                    "event_requested_organization_id": str(organization_id),
+                    "event_requested_location_id": str(location_id),
+                },
+            )
+            raise VoucherNotFoundError()
         now = datetime.now(UTC)
         reason = self._redemption_failure_reason(voucher, batch, now=now)
         if reason is not None:

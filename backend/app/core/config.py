@@ -3099,6 +3099,26 @@ class Settings(BaseSettings):
             "guest_login_router_not_at_venue and admits (rollback lever)."
         ),
     )
+    otp_daily_cap_per_location: int = Field(
+        default=2000,
+        ge=0,
+        le=1_000_000,
+        description=(
+            "QA 2026-11-06 H4: most OTP codes one location may send per UTC "
+            "day (all channels), counted in Redis before a provider is paid. "
+            "0 disables the cap. Backstop against SMS pumping, which rotates "
+            "numbers and so defeats the per-identifier limit."
+        ),
+    )
+    otp_daily_cap_platform: int = Field(
+        default=20000,
+        ge=0,
+        le=10_000_000,
+        description=(
+            "QA 2026-11-06 H4: most OTP codes the whole platform may send "
+            "per UTC day (all channels). 0 disables the cap."
+        ),
+    )
     radius_authorize_device_binding_all_vendors: bool = Field(
         default=True,
         description=(

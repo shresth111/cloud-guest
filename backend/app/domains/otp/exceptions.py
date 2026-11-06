@@ -145,3 +145,49 @@ class OtpCodeMismatchError(OtpError):
             status_code=status.HTTP_400_BAD_REQUEST,
             data={"attempts_remaining": attempts_remaining},
         )
+
+
+class OtpPurposeNotAllowedError(OtpError):
+    """The public ``/otp/request`` and ``/otp/verify`` serve guest login
+    only (QA 2026-11-06, M3). ``account_data_masking`` codes are requested
+    and verified by the authenticated ``/users/me`` endpoints, with the
+    identifier taken from the caller's session; through the public routes
+    anyone could mail any user a masking code, replace their live one, or
+    burn their attempts."""
+
+    def __init__(self, purpose: str) -> None:
+        super().__init__(
+            "This kind of verification code cannot be requested here.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"code": "OTP_PURPOSE_NOT_ALLOWED", "purpose": purpose},
+        )
+
+
+class OtpVenueRequiredError(OtpError):
+    """``/otp/request`` named no ``location_id`` (QA 2026-11-06, H4).
+    Without a venue every venue gate (whitelist, channel enabled, open
+    hours) is a no-op, and any caller could spend the platform's SMS
+    credit on any number. The portal always sends the venue."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Open the WiFi sign-in page of the venue you are at and try again.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"code": "OTP_VENUE_REQUIRED"},
+        )
+
+
+class OtpDailyCapReachedError(OtpError):
+    """A daily OTP send cap was reached (QA 2026-11-06, H4): per venue
+    (``Settings.otp_daily_cap_per_location``) or platform-wide
+    (``Settings.otp_daily_cap_platform``). The backstop against SMS
+    pumping that the per-identifier and per-IP limits cannot be, since a
+    pumper rotates numbers."""
+
+    def __init__(self, scope: str) -> None:
+        super().__init__(
+            "Sign-in codes are temporarily unavailable here. Please ask the "
+            "venue staff for help.",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            data={"code": "OTP_DAILY_CAP_REACHED", "scope": scope},
+        )

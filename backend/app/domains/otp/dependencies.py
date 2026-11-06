@@ -80,6 +80,8 @@ def get_otp_service(
         max_requests_per_window=settings.otp_max_requests_per_window,
         request_window_minutes=settings.otp_request_window_minutes,
         sms_message_template=settings.otp_sms_message_template,
+        daily_cap_per_location=settings.otp_daily_cap_per_location,
+        daily_cap_platform=settings.otp_daily_cap_platform,
     )
 
 

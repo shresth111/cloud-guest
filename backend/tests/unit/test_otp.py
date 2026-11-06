@@ -137,6 +137,25 @@ class FakeOtpRepository:
         otp_request.version += 1
         return otp_request
 
+    async def reserve_attempt(self, otp_request: OtpRequest) -> int | None:
+        # Same conditional increment as the SQL; no await between the check
+        # and the write, so it is atomic under asyncio like the UPDATE is.
+        row = self.requests[otp_request.id]
+        if row.is_consumed or row.attempt_count >= row.max_attempts:
+            return None
+        row.attempt_count += 1
+        row.version += 1
+        return row.attempt_count
+
+    async def consume(self, otp_request: OtpRequest, *, verified_at: object) -> bool:
+        row = self.requests[otp_request.id]
+        if row.is_consumed:
+            return False
+        row.is_consumed = True
+        row.verified_at = verified_at
+        row.version += 1
+        return True
+
     async def list_requests(
         self,
         *,
@@ -1547,11 +1566,11 @@ class TestOtpRequestEnforcesVenueGates:
         assert fx.repository.requests == {}
         assert fx.sms_provider.sent == []
 
-    async def test_no_venue_named_is_not_gated(self) -> None:
-        """A request naming no organization and no location carries no
-        venue for the venue gates to read (an account-level code) -- it is
-        allowed even with every channel flag off, mirroring
-        ``check_portal_admission``'s identical no-venue no-op."""
+    async def test_no_venue_named_is_refused(self) -> None:
+        """Was ``test_no_venue_named_is_not_gated``. QA 2026-11-06 H4: a
+        request naming no venue skipped every venue gate, so any caller
+        could spend the platform's SMS credit on any number. It is refused
+        now, before any send (the portal always names the venue)."""
         fx = make_service()
         app = _otp_venue_gate_app(fx, config=_venue_config(otp_sms_enabled=False))
 
@@ -1561,8 +1580,8 @@ class TestOtpRequestEnforcesVenueGates:
             identifier="+15551234567",
         )
 
-        assert resp.status_code == 201, resp.text
-        assert len(fx.sms_provider.sent) == 1
+        assert resp.status_code == 400, resp.text
+        assert fx.sms_provider.sent == []
 
 
 class TestProviderOutcome:

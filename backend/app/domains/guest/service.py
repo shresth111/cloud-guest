@@ -1601,7 +1601,13 @@ class OtpVerifyProtocol(Protocol):
 
 class VoucherRedeemProtocol(Protocol):
     async def redeem_voucher(
-        self, *, code: str, identifier: str, source: str
+        self,
+        *,
+        code: str,
+        identifier: str,
+        source: str,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
     ) -> tuple[Voucher, VoucherBatch]: ...
 
     async def get_plan_queue_profile_id(
@@ -3934,7 +3940,11 @@ class GuestService:
         source = ip_address or "unknown"
         try:
             voucher, batch = await self.voucher_service.redeem_voucher(
-                code=code, identifier=identifier, source=source
+                code=code,
+                identifier=identifier,
+                source=source,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
         except CloudGuestError as exc:
             await self._record_login_failure(
